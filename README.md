@@ -4103,6 +4103,7 @@ handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_
 inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
 inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
+missing_tests = false # when the deterministic `[missing_tests_gate]` is about to block, asks one metadata-only question from local numeric facts and skips that one block on a decisive "not owed" answer; ZIRV_CTX_JEV_MISSING_TESTS
 launch_effort = false # may steer a headless launch's first-turn CLAUDE_CODE_EFFORT_LEVEL pick, from local numeric facts only; see `[headless.effort]` below; ZIRV_CTX_JEV_LAUNCH_EFFORT
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
@@ -4624,6 +4625,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.inject_screen` | `ZIRV_CTX_JEV_INJECT_SCREEN` |
 | `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
+| `jev.missing_tests` | `ZIRV_CTX_JEV_MISSING_TESTS` |
 | `jev.launch_effort` | `ZIRV_CTX_JEV_LAUNCH_EFFORT` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
@@ -5434,6 +5436,20 @@ Stop-hook check -- on any doubt at all (an unreadable repo, no git, a config
 load failure). A repository checkout may only turn it off
 (`[missing_tests_gate] enabled = false` in `<repo>/.zirv/ctx.toml`), never
 force it on for an operator who disabled it.
+
+**`jev.missing_tests`** (off by default) softens that block with one Jev call
+instead of removing it: right before the deterministic gate above would block,
+it asks Jev a single metadata-only question built from local numeric facts
+alone (never a path, filename, or file content) — how many non-test source
+files changed, a changed-lines size bucket, whether the repo has any test
+files at all, how many existing test files already mention a changed module's
+own name, and the change's doc-only share — "is a new test owed for this
+change?". Only a decisive, strongly "not owed" answer (at or below Jev's own
+skip threshold) skips that one block, and skipping never persists it as
+blocked, so a later, still-test-less turn in the same session can still be
+asked or blocked. Anything else — the gate off, no credential, an indecisive
+or error answer, or a decisive answer that isn't strongly "not owed" — blocks
+exactly as the deterministic gate already does.
 
 **Scope guard** (`[scope_guard]`, default `enabled = true`) is a scope-creep
 guard, not a correctness check: it never decides whether an edit is right,

@@ -2186,6 +2186,9 @@ struct ScopeGuardBaselineEntry {
     exists: bool,
     #[serde(default)]
     size: u64,
+    /// Nanoseconds since `UNIX_EPOCH`, never whole seconds -- a same-size
+    /// rewrite that lands within the same second as the baseline still
+    /// changes this value, so it is never mistaken for "unchanged".
     #[serde(default)]
     mtime: u64,
 }
@@ -2201,7 +2204,7 @@ fn scope_guard_baseline_entry(repo: &Path, rel: &str) -> ScopeGuardBaselineEntry
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
             ScopeGuardBaselineEntry {
                 path: rel.to_string(),
@@ -2256,6 +2259,13 @@ fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEnt
         }
         let status = &line[..2];
         if status == "??" || status == "!!" {
+            continue;
+        }
+        // The INDEX column (`status`'s first byte) is `A` for a file
+        // created and staged THIS turn, never for one that existed before
+        // it -- `AM` (staged-new, then edited again) contains an `M` that
+        // would otherwise be read as an edit to an EXISTING tracked file.
+        if status.as_bytes()[0] == b'A' {
             continue;
         }
         if !status.contains('M') && !status.contains('D') {
@@ -2843,14 +2853,17 @@ fn scope_checkpoint_shell_text(
 /// and shell edits never sees the note twice.
 ///
 /// `None` on every gate below (not a shell tool, no session identity, no
-/// state dir, no recorded prompt, already shown, nothing changed, and --
-/// since neither `cfg.scope_guard.enabled` nor `missing_tests_owed` has
-/// anything to say -- both features off or neither applying to what
-/// changed) -- a silent skip, like every other advisory in this guard.
-/// Deliberately ordered cheapest-first: the `git status` re-query --
-/// this function's only non-trivial cost -- only ever runs once every
-/// cheaper gate above it (most of all `checkpoint_shown`) has already
-/// passed, since this runs after EVERY `Bash`/`PowerShell` call.
+/// state dir, no recorded prompt, already shown, a positively read-only
+/// command, nothing changed, and -- since neither `cfg.scope_guard.enabled`
+/// nor `missing_tests_owed` has anything to say -- both features off or
+/// neither applying to what changed) -- a silent skip, like every other
+/// advisory in this guard. Deliberately ordered cheapest-first: the `git
+/// status` re-query -- this function's only non-trivial cost -- only ever
+/// runs once every cheaper gate above it (most of all `checkpoint_shown` and
+/// the read-only check, which reuses `safety::jev_approve_is_read_only_
+/// local`) has already passed, since this runs after EVERY `Bash`/
+/// `PowerShell` call. A command the classifier cannot positively confirm
+/// read-only still runs the re-query below, unchanged from before.
 ///
 /// Folds in the missing-tests gate's own "tests owed" line the same way
 /// [`scope_checkpoint_note`] does ([`missing_tests_owed`]/
@@ -2862,6 +2875,7 @@ fn scope_guard_shell_checkpoint_note(
     cwd: &Path,
     cfg: &CtxConfig,
     payload_session_id: &str,
+    command: &str,
     env: EnvLookup<'_>,
 ) -> Option<String> {
     if !matches!(tool_name, "Bash" | "PowerShell") {
@@ -2875,6 +2889,16 @@ fn scope_guard_shell_checkpoint_note(
     let path = scope_guard_record_path(&state, &session);
     let mut record = load_scope_guard_record(&path)?;
     if record.checkpoint_shown {
+        return None;
+    }
+    // A positively read-only command (`git status`, `ls src`, ...) cannot
+    // itself have produced the shell edit this checkpoint looks for, so skip
+    // the `git status` re-query below entirely rather than run it after
+    // EVERY `Bash`/`PowerShell` call. `&[]` scratchpad roots is the
+    // conservative choice here (narrower than a caller's own configured
+    // roots, never wider), and anything the classifier cannot positively
+    // confirm still falls through to the re-query, unchanged.
+    if super::safety::jev_approve_is_read_only_local(command, &[]) {
         return None;
     }
     let changed = scope_guard_tracked_changes_since(cwd, &record.shell_baseline)?;
@@ -6362,6 +6386,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
                 &cwd,
                 &cfg,
                 &payload.session_id,
+                &payload.tool_input.command,
                 env,
             )
         });
@@ -14208,6 +14233,32 @@ capable a model does it actually need?",
         repo
     }
 
+    /// `git status --porcelain`'s `A `/`AM` INDEX codes mark a file created
+    /// and staged THIS turn -- never one that existed before it -- so `AM`'s
+    /// own `M` must not be read as an edit to an EXISTING tracked file.
+    #[test]
+    fn scope_guard_tracked_modified_excludes_a_staged_new_file() {
+        let repo = git_repo();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(repo.path().join("brand_new.txt"), "one\n").expect("write");
+        git(&["add", "brand_new.txt"]);
+        std::fs::write(repo.path().join("brand_new.txt"), "one\ntwo\n").expect("modify staged");
+
+        let modified = scope_guard_tracked_modified(repo.path()).expect("git status");
+        assert!(
+            modified.iter().all(|entry| entry.path != "brand_new.txt"),
+            "a file created and staged this turn must not be reported as an existing-tracked \
+             edit: {modified:?}"
+        );
+    }
+
     #[test]
     fn session_has_modification_is_false_without_an_edit_like_call() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -17416,6 +17467,57 @@ exactly as before.";
         assert!(
             !out.contains("Scope checkpoint"),
             "creating only a new untracked file must not trigger: {out}"
+        );
+    }
+
+    /// A positively read-only command (`safety::jev_approve_is_read_only_
+    /// local`) must skip the `git status` re-query entirely, even when a
+    /// real tracked-file edit is sitting there unreported -- and the
+    /// checkpoint must still fire on the very next NON-read-only call, since
+    /// skipping the query must never mark the checkpoint as shown.
+    #[test]
+    fn scope_guard_shell_checkpoint_skips_the_requery_for_a_read_only_command() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-readonly";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        // A real shell edit to an existing tracked file, exactly like
+        // behaviour (a) above -- but this time the FIRST `PostToolUse` call
+        // is a read-only command that cannot have produced it.
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let readonly_stdin =
+            scope_guard_bash_posttool_stdin(session, rig.repo.path(), "git status");
+        let mut readonly_out = Vec::new();
+        run_posttool(&mut readonly_out, &readonly_stdin, &lookup).expect("run_posttool");
+        let readonly_out = String::from_utf8(readonly_out).expect("utf8");
+        assert!(
+            !readonly_out.contains("Scope checkpoint"),
+            "a read-only command must skip the re-query and stay silent: {readonly_out}"
+        );
+
+        let stdin = scope_guard_bash_posttool_stdin(
+            session,
+            rig.repo.path(),
+            "sed -i 's/one/ONE/' tracked.txt",
+        );
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Scope checkpoint"),
+            "the next non-read-only call must still find the change and fire: {out}"
         );
     }
 

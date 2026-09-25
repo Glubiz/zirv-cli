@@ -10273,7 +10273,12 @@ fn jev_approve_program_is_read_only(program: &str, tokens: &[String]) -> bool {
 /// Anything this predicate cannot positively confirm falls through to
 /// `false`, which keeps calling Jev -- the issue's own "anything uncertain
 /// is NOT read-only" rule.
-fn jev_approve_is_read_only_local(command: &str, scratchpad_roots: &[String]) -> bool {
+///
+/// `pub(crate)`: also reused by `hook::scope_guard_shell_checkpoint_note`
+/// (with `scratchpad_roots: &[]`, conservative rather than duplicating this
+/// classifier) to skip its own `git status` re-query for a command that
+/// cannot itself have produced a tracked-file change.
+pub(crate) fn jev_approve_is_read_only_local(command: &str, scratchpad_roots: &[String]) -> bool {
     if command.contains(['\\', '$', '`', '\n']) {
         return false;
     }
