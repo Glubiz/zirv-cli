@@ -221,7 +221,9 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::Directory,
         &[
             "commands/ctx/task.rs",
-            "commands/ctx/agent.rs",
+            "commands/ctx/agent/mod.rs",
+            "commands/ctx/agent/run.rs",
+            "commands/ctx/agent/worktree_lifecycle.rs",
             "commands/ctx/native_worker.rs",
             "commands/ctx/reconcile.rs",
         ],
