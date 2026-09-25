@@ -1040,6 +1040,7 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
         || cfg.inject_screen
         || cfg.inject
         || cfg.stop_verify
+        || cfg.missing_tests
 }
 
 #[allow(dead_code)]

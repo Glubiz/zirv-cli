@@ -1829,16 +1829,229 @@ fn missing_tests_gate_reason(
     if !has_non_test_source_change || has_test_change {
         return None;
     }
+    // Issue 6a (`[jev] missing_tests`, off by default): a decisive "not
+    // owed" answer skips this ONE block without ever persisting it as
+    // blocked -- the record stays untouched, so a later, still-test-less
+    // turn in the same session can still be asked/blocked. Everything else
+    // (gate off, no credential, indecisive, an error, or a decisive but not
+    // strongly "not owed" answer) blocks exactly as the deterministic gate
+    // already does above.
+    if missing_tests_owed_jev_says_skip(state, cfg, repo, &changed) {
+        return None;
+    }
     let mut record = load_missing_tests_gate_record(&path);
     record.version = MISSING_TESTS_GATE_RECORD_VERSION;
     record.blocked = true;
     save_missing_tests_gate_record(&path, &record);
     Some(
         "zirv: this turn edited source files with no test of its own -- add a focused test for \
-         each behaviour change (including the invalid-input/unhappy path) and run the test \
-         suite, then finish."
+         each behaviour change the request asks for, asserting the exact formats, orderings and \
+         messages it states and the invalid-input/unhappy path, then run the test suite and \
+         finish."
             .to_string(),
     )
+}
+
+// -- Issue 6a: `[jev] missing_tests` -----------------------------------------
+
+/// At most this many tracked test files actually READ for the missing-
+/// tests-owed Jev gate's own "mentions" fact -- keeps a huge test suite from
+/// turning one Stop-hook call into an unbounded scan.
+const MISSING_TESTS_OWED_TEST_SCAN_CAP: usize = 50;
+
+/// The noul-probability floor a decisive answer must sit AT OR BELOW before
+/// `missing_tests_owed_jev_says_skip` treats it as "not owed" and skips the
+/// deterministic block. Mirrors [`STOP_VERIFY_MIN_PROBABILITY`]'s own
+/// conservative stance but inverted, and if anything stricter: skipping a
+/// real gate is riskier than one extra (already rare, once-per-session)
+/// false block, so only a strong "not owed" signal -- never merely "leaning
+/// no" -- may skip it.
+const MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY: f64 = 0.1;
+
+/// Every tracked path `git ls-files` reports that itself looks like a test
+/// file ([`path_looks_like_test_file`]) -- the missing-tests-owed Jev gate's
+/// own "does this repo even have tests" and "mentions" facts both read off
+/// this same listing. Empty on any doubt at all (git failure, no repo).
+fn missing_tests_owed_tracked_test_paths(repo: &Path) -> Vec<PathBuf> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .map(PathBuf::from)
+        .filter(|path| path_looks_like_test_file(path))
+        .collect()
+}
+
+/// Total added+removed lines across the working tree's own uncommitted
+/// changes (`git diff --numstat HEAD`) -- the missing-tests-owed Jev gate's
+/// own "how big is this change" fact. `0` on any doubt (git failure): the
+/// gate simply falls back to the coarsest bucket, never a hook failure.
+fn missing_tests_owed_changed_lines(repo: &Path) -> usize {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["diff", "--numstat", "HEAD"])
+        .current_dir(repo)
+        .output()
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let added: usize = fields.next()?.parse().ok()?;
+            let removed: usize = fields.next()?.parse().ok()?;
+            Some(added + removed)
+        })
+        .sum()
+}
+
+/// How many of `test_paths` (capped at [`MISSING_TESTS_OWED_TEST_SCAN_CAP`]
+/// files actually read) contain a plain substring match for at least one of
+/// `stems` (a changed non-test file's own file stem, e.g. `score` for
+/// `score.rs`) -- a cheap, deliberately approximate stand-in for "an
+/// existing test already imports/mentions this module". `0` when `stems` is
+/// empty or no test file matches.
+fn missing_tests_owed_mentions(repo: &Path, test_paths: &[PathBuf], stems: &[String]) -> usize {
+    if stems.is_empty() {
+        return 0;
+    }
+    test_paths
+        .iter()
+        .take(MISSING_TESTS_OWED_TEST_SCAN_CAP)
+        .filter(|path| {
+            std::fs::read_to_string(repo.join(path))
+                .ok()
+                .is_some_and(|text| stems.iter().any(|stem| text.contains(stem.as_str())))
+        })
+        .count()
+}
+
+/// The missing-tests-owed Jev gate's own local, numeric-only facts, folded
+/// from the SAME `changed` list the deterministic gate above already
+/// computed (never a fresh `changed_paths` re-query): `[non-test source
+/// files changed, changed-lines bucket (0 <10, 1 <100, 2 <500, 3 larger),
+/// whether the repo has any test files at all (0/1), how many existing test
+/// files mention a changed module's own name, doc-only share of the change
+/// (0-4, quarters)]`. Every cell a small capped integer -- never a path,
+/// filename, or file content.
+fn missing_tests_owed_facts(repo: &Path, changed: &[PathBuf]) -> Vec<u32> {
+    let non_test_source: Vec<&PathBuf> = changed
+        .iter()
+        .filter(|path| {
+            !path_looks_like_test_file(path)
+                && !super::lifecycle::changes_are_doc_only(std::slice::from_ref(path))
+        })
+        .collect();
+    let doc_only_count = changed
+        .iter()
+        .filter(|path| super::lifecycle::changes_are_doc_only(std::slice::from_ref(path)))
+        .count();
+    let lines_bucket = match missing_tests_owed_changed_lines(repo) {
+        0..10 => 0,
+        10..100 => 1,
+        100..500 => 2,
+        _ => 3,
+    };
+    let test_paths = missing_tests_owed_tracked_test_paths(repo);
+    let has_tests = u32::from(!test_paths.is_empty());
+    let stems: Vec<String> = non_test_source
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(str::to_string)
+        .collect();
+    let mentions = missing_tests_owed_mentions(repo, &test_paths, &stems);
+    let doc_only_share = if changed.is_empty() {
+        0
+    } else {
+        capped_u32(doc_only_count.saturating_mul(4) / changed.len())
+    };
+    vec![
+        capped_u32(non_test_source.len()),
+        lines_bucket,
+        has_tests,
+        capped_u32(mentions),
+        doc_only_share,
+    ]
+}
+
+fn missing_tests_owed_question() -> [super::jev::Question; 1] {
+    [super::jev::Question::metadata_noul(
+        "tests_owed",
+        // Kept under `safe_metadata_request`'s own 512-char instructions cap
+        // (checked once by `stop_verify_request_passes_the_metadata_guard`'s
+        // own sibling test below): an oversized instructions string fails
+        // that guard and `ask` never even reaches the network, which reads
+        // as a silent, permanent no-op for this whole gate.
+        "Facts [non-test source files changed, changed-lines bucket (0 <10, 1 <100, 2 <500, 3 \
+larger), repo has test files (0/1), test files mentioning a changed module, doc-only share (0-4, \
+quarters)] describe an uncommitted change with no test update. Is a new test owed? Answer false \
+only if clearly not owed. Answer true if unsure.",
+        "a new or updated test is owed for this change",
+        "no new test is owed for this change",
+    )]
+}
+
+/// Issue 6a: `[jev] missing_tests` (off by default). Asks Jev one metadata-
+/// only Noul question from [`missing_tests_owed_facts`] and returns `true`
+/// only for a DECISIVE, strongly "not owed" answer (at or below
+/// [`MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY`]) -- the one case
+/// `missing_tests_gate_reason` reads as "skip this block". `false` on every
+/// other outcome (the key off, no `[proxy.typesafe]` credential, no answer,
+/// an indecisive answer, or a decisive answer that is not strongly "not
+/// owed"): the deterministic gate then blocks exactly as it always has.
+fn missing_tests_owed_jev_says_skip(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    repo: &Path,
+    changed: &[PathBuf],
+) -> bool {
+    if !cfg.jev.missing_tests || !super::jev::available(&cfg.proxy.typesafe) {
+        return false;
+    }
+    let facts = missing_tests_owed_facts(repo, changed);
+    let advise_state = DispatchAdviseState {
+        metadata_only: true,
+        facts: vec![facts],
+    };
+    let Some(answers) = super::jev::advise(
+        cfg,
+        state,
+        "missing_tests",
+        cfg.jev.missing_tests,
+        &advise_state,
+        &missing_tests_owed_question(),
+    ) else {
+        return false;
+    };
+    let Some(answer) = answers.get("tests_owed") else {
+        return false;
+    };
+    if !answer.decisive(0.0, super::jev::DEFAULT_MIN_MARGIN) {
+        return false;
+    }
+    let Some(probability) = answer.as_noul() else {
+        return false;
+    };
+    if probability > MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY {
+        return false;
+    }
+    let effect = super::jev::JevEffect::new("missing_tests", "gate_skipped");
+    super::jev::record_effect(cfg, state, cfg.jev.missing_tests, &effect);
+    true
 }
 
 // -- Scope-creep guard ------------------------------------------------------
@@ -1861,7 +2074,18 @@ fn missing_tests_gate_reason(
 /// `ScopeGuardRecord`'s own schema version -- bumped if the shape ever
 /// changes, so an old record on disk reads back as "no record" rather than a
 /// deserialize failure or (worse) a wrongly-interpreted new field.
-const SCOPE_GUARD_RECORD_VERSION: u32 = 1;
+///
+/// v2 (the shell-edit checkpoint): adds `shell_baseline`, the tracked
+/// modified/deleted file snapshot `record_scope_guard_request` takes at
+/// `UserPromptSubmit`. Bumped rather than defaulted in place because an old
+/// v1 record on disk has no baseline at all -- reading it back as "no
+/// record" (forcing the next `UserPromptSubmit` to rebuild one) is safer
+/// than silently treating an absent baseline as "nothing was ever modified",
+/// which would make the very first shell edit after an upgrade look like a
+/// change against an empty baseline and fire the checkpoint immediately.
+///
+/// v3 (the stated-details checklist): adds `stated_details`.
+const SCOPE_GUARD_RECORD_VERSION: u32 = 3;
 
 /// At most this many characters across every extracted constraint sentence,
 /// joined -- keeps the checkpoint/backstop text bounded regardless of how
@@ -1902,6 +2126,165 @@ struct ScopeGuardRecord {
     /// prompt.
     #[serde(default)]
     stop_checked: bool,
+    /// The repo's tracked modified/deleted files (never untracked) at the
+    /// moment this prompt was recorded, each with a cheap size/mtime
+    /// fingerprint (never file contents) -- the baseline the `PostToolUse`
+    /// shell-edit checkpoint diffs its own re-query against, so a shell
+    /// command (`sed -i`, `python -c "open(p,'w')..."`, `cat > file`) that
+    /// changes an existing tracked file is visible even though it never
+    /// goes through `Edit`/`Write` at all. Empty when git failed, this is
+    /// not a git repo, or the guard was disabled -- see
+    /// `scope_guard_tracked_modified`'s own doc comment.
+    #[serde(default)]
+    shell_baseline: Vec<ScopeGuardBaselineEntry>,
+    /// The request's own stated, checkable details -- a quoted literal or an
+    /// ordering/format/exactness word (see
+    /// [`SCOPE_GUARD_STATED_DETAIL_RE`]) -- in prompt order, never
+    /// duplicating a sentence already captured in `constraints`. Shown in
+    /// the checkpoint as a numbered "Stated details to check before you
+    /// finish" list, governed by `cfg.scope_guard.enabled` the same as
+    /// `constraints` itself.
+    #[serde(default)]
+    stated_details: Vec<String>,
+}
+
+/// One tracked file's cheap fingerprint for the shell-edit checkpoint's own
+/// before/after comparison: never a content hash (CLAUDE.md: "a cheap
+/// fingerprint (size + mtime is fine; do not hash large file contents)").
+/// `exists` distinguishes a tracked file `git status` reports as deleted
+/// (no size/mtime to read) from one that is merely absent from a snapshot
+/// entirely -- so a delete, and a later re-create with different content,
+/// both still count as a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScopeGuardBaselineEntry {
+    /// Repo-relative, forward-slashed (`git status --porcelain`'s own
+    /// spelling) -- never a platform `PathBuf`, so the record round-trips
+    /// identically on every OS this hook runs on.
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    exists: bool,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    mtime: u64,
+}
+
+/// `ScopeGuardBaselineEntry` for one repo-relative path already known to be
+/// tracked-and-modified/deleted by `git status`: reads the file's current
+/// size/mtime off disk, or (a delete) records `exists: false` when it is not
+/// there at all. Never touches file contents.
+fn scope_guard_baseline_entry(repo: &Path, rel: &str) -> ScopeGuardBaselineEntry {
+    match std::fs::metadata(repo.join(rel)) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            ScopeGuardBaselineEntry {
+                path: rel.to_string(),
+                exists: true,
+                size: meta.len(),
+                mtime,
+            }
+        }
+        Err(_) => ScopeGuardBaselineEntry {
+            path: rel.to_string(),
+            exists: false,
+            size: 0,
+            mtime: 0,
+        },
+    }
+}
+
+/// The repo's currently tracked, modified-or-deleted files -- the shell-edit
+/// checkpoint's own snapshot, taken once at `UserPromptSubmit` as the
+/// baseline and re-taken on every qualifying `PostToolUse` shell call to
+/// diff against it. Deliberately narrower than
+/// `workflow::verification::changed_paths` (which also folds in untracked
+/// `??` files via `git ls-files --others`): an untracked file is a NEW file,
+/// never an edit to "existing code", so including it here would make the
+/// checkpoint fire for a shell command that only ever created something.
+///
+/// `None` on any doubt at all -- not a git repo, git missing, git failing
+/// for any other reason -- so both the baseline write and the later
+/// re-query degrade to silence together (see this guard's own module-level
+/// doc comment: "all three degrade to a silent no-op on any doubt at all").
+/// `Some(vec![])` is a real, successful "nothing is modified" answer, never
+/// conflated with the failure case.
+fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEntry>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--no-renames"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        // `git status --porcelain` lines are `XY PATH`, `XY` exactly two
+        // status characters, a space, then the path -- `??` (untracked) and
+        // `!!` (ignored) are the only two-letter codes with no tracked
+        // meaning at all; every other code names a real index/worktree
+        // change to a file git already tracks.
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..2];
+        if status == "??" || status == "!!" {
+            continue;
+        }
+        if !status.contains('M') && !status.contains('D') {
+            continue;
+        }
+        let rel = line[3..].trim();
+        if rel.is_empty() {
+            continue;
+        }
+        // Issue #229/#232's own exclusion, mirrored from `changed_paths`:
+        // the workflow's own `.zirv/work/<id>/*` artifacts are not the
+        // operator's change surface, and this benchmark's own transcripts
+        // are full of concurrent writes to them.
+        if crate::commands::workflow::classify::is_workflow_work_path(Path::new(rel)) {
+            continue;
+        }
+        entries.push(scope_guard_baseline_entry(repo, rel));
+    }
+    Some(entries)
+}
+
+/// Diffs `repo`'s CURRENT tracked modified/deleted snapshot against
+/// `baseline`: every path that is new (absent from `baseline`) or whose
+/// fingerprint differs, sorted. `None` when the current snapshot itself
+/// cannot be read (see [`scope_guard_tracked_modified`]) -- the caller reads
+/// that identically to "nothing changed" (silent), never as a real empty
+/// result.
+fn scope_guard_tracked_changes_since(
+    repo: &Path,
+    baseline: &[ScopeGuardBaselineEntry],
+) -> Option<Vec<String>> {
+    let current = scope_guard_tracked_modified(repo)?;
+    let prior: std::collections::HashMap<&str, &ScopeGuardBaselineEntry> = baseline
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|entry| {
+            prior.get(entry.path.as_str()).is_none_or(|before| {
+                before.exists != entry.exists
+                    || before.size != entry.size
+                    || before.mtime != entry.mtime
+            })
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    changed.sort();
+    Some(changed)
 }
 
 /// One file per session id, named after a hash of it -- identical layout to
@@ -1991,28 +2374,28 @@ static SCOPE_GUARD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid scope-guard constraint regex")
 });
 
-/// Extracts up to [`SCOPE_GUARD_MAX_CONSTRAINTS`] preservation/limitation
-/// sentences from `prompt`, trimmed, with the joined result capped at
-/// [`SCOPE_GUARD_CONSTRAINT_BUDGET`] characters. When more sentences match
-/// than fit the budget, the sentences CLOSEST TO THE END of the prompt win:
-/// a closing, clarifying sentence (e.g. "...exactly as before.") is kept
-/// over an earlier one that only incidentally matches the same conservative
-/// pattern (e.g. a feature sentence that happens to use the word "keep" for
-/// an unrelated tie-break rule -- see this guard's own worked example, where
-/// exactly that happens). Returned in the prompt's own original order.
-fn scope_guard_extract_constraints(prompt: &str) -> Vec<String> {
-    let matched: Vec<String> = scope_guard_split_sentences(prompt)
-        .into_iter()
-        .filter(|sentence| SCOPE_GUARD_CONSTRAINT_RE.is_match(sentence))
-        .collect();
+/// Shared selection algorithm for [`scope_guard_extract_constraints`]/
+/// [`scope_guard_extract_stated_details`]: keeps at most `max_count` of
+/// `candidates`, closest to the END of the prompt first -- a closing,
+/// clarifying sentence (e.g. "...exactly as before.") wins over an earlier
+/// one that only incidentally matches the same conservative pattern (e.g. a
+/// feature sentence that happens to use the word "keep" for an unrelated
+/// tie-break rule -- see this guard's own worked example, where exactly that
+/// happens) -- with the joined result capped at `budget` characters.
+/// Returned in the prompt's own original order.
+fn scope_guard_select_capped(
+    candidates: Vec<String>,
+    max_count: usize,
+    budget: usize,
+) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut total = 0usize;
-    for sentence in matched.into_iter().rev() {
-        if kept.len() >= SCOPE_GUARD_MAX_CONSTRAINTS {
+    for sentence in candidates.into_iter().rev() {
+        if kept.len() >= max_count {
             break;
         }
         let extra = sentence.chars().count() + usize::from(!kept.is_empty());
-        if total + extra > SCOPE_GUARD_CONSTRAINT_BUDGET {
+        if total + extra > budget {
             continue;
         }
         total += extra;
@@ -2020,6 +2403,85 @@ fn scope_guard_extract_constraints(prompt: &str) -> Vec<String> {
     }
     kept.reverse();
     kept
+}
+
+/// Extracts up to [`SCOPE_GUARD_MAX_CONSTRAINTS`] preservation/limitation
+/// sentences from `prompt`, trimmed, with the joined result capped at
+/// [`SCOPE_GUARD_CONSTRAINT_BUDGET`] characters -- see
+/// [`scope_guard_select_capped`] for the selection rule.
+fn scope_guard_extract_constraints(prompt: &str) -> Vec<String> {
+    let matched: Vec<String> = scope_guard_split_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| SCOPE_GUARD_CONSTRAINT_RE.is_match(sentence))
+        .collect();
+    scope_guard_select_capped(
+        matched,
+        SCOPE_GUARD_MAX_CONSTRAINTS,
+        SCOPE_GUARD_CONSTRAINT_BUDGET,
+    )
+}
+
+/// At most this many characters across every extracted stated-detail
+/// sentence, joined -- mirrors [`SCOPE_GUARD_CONSTRAINT_BUDGET`]'s own role.
+const SCOPE_GUARD_STATED_DETAIL_BUDGET: usize = 700;
+
+/// At most this many extracted stated-detail sentences.
+const SCOPE_GUARD_MAX_STATED_DETAILS: usize = 8;
+
+/// A stated, checkable detail: a backtick- or double-quoted literal (a
+/// literal value, name, or message the request pins down exactly), or an
+/// ordering/format/exactness word -- "sorted", "order", "ascending",
+/// "descending", "exactly", "exact", "format", "exit status"/"exit code",
+/// "stderr", "stdout", "print(s)", "message", "case-insensitive",
+/// "comma-separated", "no spaces", "trailing", "leading". Deliberately
+/// conservative like [`SCOPE_GUARD_CONSTRAINT_RE`]: favours catching a real
+/// stated detail over precision.
+static SCOPE_GUARD_STATED_DETAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?xi)
+        `[^`]+`
+        | "[^"]+"
+        | \bsorted\b
+        | \border\b
+        | \bascending\b
+        | \bdescending\b
+        | \bexactly\b
+        | \bexact\b
+        | \bformat\b
+        | exit\s+status
+        | exit\s+code
+        | \bstderr\b
+        | \bstdout\b
+        | \bprints?\b
+        | \bmessage\b
+        | case-insensitive
+        | comma-separated
+        | no\s+spaces
+        | \btrailing\b
+        | \bleading\b
+        "#,
+    )
+    .expect("valid scope-guard stated-detail regex")
+});
+
+/// Extracts up to [`SCOPE_GUARD_MAX_STATED_DETAILS`] stated-detail sentences
+/// from `prompt` (see [`SCOPE_GUARD_STATED_DETAIL_RE`]), skipping any
+/// sentence already captured in `constraints` (never duplicated between the
+/// scope guard's own preservation language and this checklist), with the
+/// joined result capped at [`SCOPE_GUARD_STATED_DETAIL_BUDGET`] characters --
+/// see [`scope_guard_select_capped`] for the selection rule.
+fn scope_guard_extract_stated_details(prompt: &str, constraints: &[String]) -> Vec<String> {
+    let matched: Vec<String> = scope_guard_split_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| {
+            SCOPE_GUARD_STATED_DETAIL_RE.is_match(sentence) && !constraints.contains(sentence)
+        })
+        .collect();
+    scope_guard_select_capped(
+        matched,
+        SCOPE_GUARD_MAX_STATED_DETAILS,
+        SCOPE_GUARD_STATED_DETAIL_BUDGET,
+    )
 }
 
 /// Whether the request itself already asks for a fix, anywhere in the
@@ -2057,13 +2519,25 @@ fn scope_guard_prompt_asks_for_fix(prompt: &str) -> bool {
 /// only channels that speak; this only persists state for them to read.
 /// Every gate below (config off, no session identity, no state dir) is a
 /// silent skip: a hook must never fail a prompt over this.
+///
+/// `repo` also seeds `shell_baseline` (the `PostToolUse` shell-edit
+/// checkpoint's own before-snapshot, [`scope_guard_tracked_modified`]) --
+/// best-effort like everything else here: a failed git query just leaves it
+/// empty, which reads downstream as "no baseline to diff against" and keeps
+/// that checkpoint silent too, never as a hook failure.
 fn record_scope_guard_request(
     cfg: &CtxConfig,
     payload_session_id: &str,
     prompt: &str,
+    repo: &Path,
     env: EnvLookup<'_>,
 ) {
-    if !cfg.scope_guard.enabled {
+    // The record now also backs the missing-tests "tests owed" line folded
+    // into this same checkpoint (see `missing_tests_owed`/`scope_checkpoint_
+    // combine`), which fires independently of `scope_guard.enabled` -- so a
+    // record must exist whenever EITHER feature is on, not only when the
+    // scope guard itself is.
+    if !cfg.scope_guard.enabled && !cfg.missing_tests_gate.enabled {
         return;
     }
     let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
@@ -2077,16 +2551,20 @@ fn record_scope_guard_request(
     let prompt_hash = input_hash(prompt);
     if load_scope_guard_record(&path).is_some_and(|existing| existing.prompt_hash == prompt_hash) {
         // The identical prompt was already recorded -- leave the flags
-        // (`checkpoint_shown`/`stop_checked`) exactly as they are.
+        // (`checkpoint_shown`/`stop_checked`) and the shell baseline exactly
+        // as they are.
         return;
     }
+    let constraints = scope_guard_extract_constraints(prompt);
     let record = ScopeGuardRecord {
         version: SCOPE_GUARD_RECORD_VERSION,
         prompt_hash,
-        constraints: scope_guard_extract_constraints(prompt),
+        stated_details: scope_guard_extract_stated_details(prompt, &constraints),
+        constraints,
         asks_for_fix: scope_guard_prompt_asks_for_fix(prompt),
         checkpoint_shown: false,
         stop_checked: false,
+        shell_baseline: scope_guard_tracked_modified(repo).unwrap_or_default(),
     };
     save_scope_guard_record(&path, &record);
     super::state::prune_to_newest(&state.scope_guard(), super::state::KEEP_NEWEST);
@@ -2094,12 +2572,23 @@ fn record_scope_guard_request(
 
 /// `PreToolUse`, `Edit`/`MultiEdit`/`NotebookEdit`/an existing-file `Write`
 /// only: the non-blocking scope checkpoint's own TEXT, shown once per prompt
-/// (the persisted `checkpoint_shown` flag). `None` on every gate below
-/// (config off, a tool this guard does not cover, a `Write` to a file that
-/// does not exist yet, no session identity, no recorded prompt at all,
-/// already shown for this prompt) -- a silent skip, like every other
-/// advisory in this file. Never changes `payload`'s own permission outcome:
-/// this only ever rides as a non-blocking `additionalContext` note.
+/// (the persisted `checkpoint_shown` flag). `None` on every gate below (a
+/// tool this guard does not cover, a `Write` to a file that does not exist
+/// yet, no session identity, no recorded prompt at all, already shown for
+/// this prompt, and -- since neither `cfg.scope_guard.enabled` nor
+/// `missing_tests_owed` has anything to say -- both features off or neither
+/// applying to this edit) -- a silent skip, like every other advisory in
+/// this file. Never changes `payload`'s own permission outcome: this only
+/// ever rides as a non-blocking `additionalContext` note.
+///
+/// Folds in the missing-tests gate's own "tests owed" line
+/// ([`missing_tests_owed`]/[`scope_checkpoint_combine`]) alongside the scope
+/// guard's own text: a headless session that would otherwise only learn it
+/// owes a test once the missing-tests Stop gate blocks it -- after the whole
+/// turn is already done -- sees it here instead, at the FIRST edit, in the
+/// same one-time note. Independent of `cfg.scope_guard.enabled`: the tests-
+/// owed line can fire this checkpoint on its own even with the scope guard
+/// itself turned off.
 ///
 /// Deliberately a pure read -- it never marks the checkpoint shown itself.
 /// `run_pretool`'s own orchestrator-write guard can still DENY this exact
@@ -2114,20 +2603,15 @@ fn scope_checkpoint_note(
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Option<String> {
-    if !cfg.scope_guard.enabled {
-        return None;
-    }
     if !matches!(
         payload.tool_name.as_str(),
         "Edit" | "MultiEdit" | "NotebookEdit" | "Write"
     ) {
         return None;
     }
-    if payload.tool_name == "Write" {
-        let target = normalized_write_target(payload, cwd)?;
-        if !target.is_file() {
-            return None;
-        }
+    let target = normalized_write_target(payload, cwd);
+    if payload.tool_name == "Write" && !target.as_deref().is_some_and(Path::is_file) {
+        return None;
     }
     let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
     if session.is_empty() {
@@ -2140,7 +2624,14 @@ fn scope_checkpoint_note(
         return None;
     }
     let headless = payload.permission_mode == "dontAsk";
-    Some(scope_checkpoint_text(&record.constraints, headless))
+    let scope_text = cfg
+        .scope_guard
+        .enabled
+        .then(|| scope_checkpoint_text(&record.constraints, &record.stated_details, headless));
+    let tests_owed = target
+        .as_deref()
+        .is_some_and(|target| missing_tests_owed(cfg, env, &[target]));
+    scope_checkpoint_combine(scope_text, tests_owed)
 }
 
 /// Commits [`scope_checkpoint_note`]'s own `checkpoint_shown` flag -- called
@@ -2167,33 +2658,249 @@ fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLookup<'_>) {
     save_scope_guard_record(&path, &record);
 }
 
+/// zirv's own tests-owed sentence, folded into the same one-time checkpoint
+/// as the scope guard's own text (see [`missing_tests_owed`]/
+/// [`scope_checkpoint_combine`]) rather than waiting for the missing-tests
+/// Stop gate ([`missing_tests_gate_reason`]) to say it after the whole turn
+/// has already finished -- that costs a whole extra round for a headless
+/// session that never touched a test file.
+const MISSING_TESTS_OWED_LINE: &str = "Write a focused test for each behaviour change in this same pass -- the run cannot finish \
+     without one.";
+
+/// Whether `path` is the kind of change the missing-tests gate itself cares
+/// about: not a test file ([`path_looks_like_test_file`]) and not doc-only
+/// ([`super::lifecycle::changes_are_doc_only`]). Shared by
+/// `missing_tests_gate_reason` (which classifies every path the WHOLE turn
+/// changed) and [`missing_tests_owed`] (which classifies only the path(s) a
+/// single checkpoint call already knows about); unlike
+/// `missing_tests_gate_reason`'s own `rust_change_touches_cfg_test` check,
+/// this never shells out to `git diff` -- the checkpoint fires before
+/// (`PreToolUse`) or immediately after (`PostToolUse`, already cheap on its
+/// own hot path) an edit, so it only ever has a filename shape to go on, not
+/// a diff.
+fn missing_tests_owed_by_path(path: &Path) -> bool {
+    !path_looks_like_test_file(path)
+        && !super::lifecycle::changes_are_doc_only(&[path.to_path_buf()])
+}
+
+/// Whether the checkpoint's own "tests owed" line
+/// ([`MISSING_TESTS_OWED_LINE`]) applies: the missing-tests gate is enabled,
+/// this is a HEADLESS session (`adapters::HEADLESS_ENV == "1"`, the same
+/// condition `missing_tests_gate_reason` itself checks), and at least one of
+/// `paths` is a non-test, non-doc source file
+/// ([`missing_tests_owed_by_path`]). Independent of `cfg.scope_guard.
+/// enabled` -- this can fire the checkpoint on its own even with the scope
+/// guard itself turned off, and never changes `missing_tests_gate_reason`'s
+/// own Stop-hook logic, which stays the backstop it always was.
+fn missing_tests_owed(cfg: &CtxConfig, env: EnvLookup<'_>, paths: &[&Path]) -> bool {
+    cfg.missing_tests_gate.enabled
+        && env(adapters::HEADLESS_ENV).as_deref() == Some("1")
+        && paths.iter().any(|path| missing_tests_owed_by_path(path))
+}
+
+/// Combines the scope guard's own checkpoint text (`None` when `cfg.
+/// scope_guard.enabled` is off) with [`MISSING_TESTS_OWED_LINE`] (only when
+/// [`missing_tests_owed`] says so) into the single note the checkpoint
+/// actually shows. `None` only when NEITHER part applies -- the caller's own
+/// "nothing to say" case; a record still gets read for this (see
+/// `record_scope_guard_request`'s own doc comment), but nothing is ever
+/// shown and `checkpoint_shown` is never set.
+fn scope_checkpoint_combine(scope_text: Option<String>, tests_owed: bool) -> Option<String> {
+    match (scope_text, tests_owed) {
+        (Some(text), true) => Some(format!("{text} {MISSING_TESTS_OWED_LINE}")),
+        (Some(text), false) => Some(text),
+        (None, true) => Some(format!("Scope checkpoint: {MISSING_TESTS_OWED_LINE}")),
+        (None, false) => None,
+    }
+}
+
+/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
+/// the request's own quoted preservation sentences, or empty when none were
+/// extracted.
+fn scope_guard_quoted_constraints(constraints: &[String]) -> String {
+    if constraints.is_empty() {
+        String::new()
+    } else {
+        format!("the request says: \"{}\". ", constraints.join(" "))
+    }
+}
+
+/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
+/// the stated-details checklist itself -- a numbered "(1) ... (2) ..." list
+/// appended to the checkpoint, or empty when nothing was extracted. Leads
+/// with a space so the caller can splice it straight onto the end of its own
+/// sentence.
+fn scope_guard_stated_details_line(details: &[String]) -> String {
+    if details.is_empty() {
+        return String::new();
+    }
+    let items = details
+        .iter()
+        .enumerate()
+        .map(|(index, detail)| format!("({}) {detail}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" Stated details to check before you finish: {items}")
+}
+
 /// The checkpoint's own wording: interactive asks the user before an
 /// unrequested fix/improvement; headless (`permission_mode == "dontAsk"`,
 /// the same signal `safety.rs`'s `hook_output` reads for the identical
 /// purpose on its own payload) has no one to ask, so it defers to the final
-/// report instead.
-fn scope_checkpoint_text(constraints: &[String], headless: bool) -> String {
+/// report instead. `stated_details` appends the queued item 2 checklist
+/// ([`scope_guard_stated_details_line`]) when the request pinned down any
+/// checkable detail.
+fn scope_checkpoint_text(
+    constraints: &[String],
+    stated_details: &[String],
+    headless: bool,
+) -> String {
     let action = if headless {
         "leave it and list it under 'Found, not changed' in your final report."
     } else {
         "ask the user first."
     };
-    let quoted = if constraints.is_empty() {
-        String::new()
-    } else {
-        format!("the request says: \"{}\". ", constraints.join(" "))
-    };
+    let quoted = scope_guard_quoted_constraints(constraints);
+    let details = scope_guard_stated_details_line(stated_details);
     format!(
         "Scope checkpoint: {quoted}Before changing existing code, check this edit is needed for \
          what was asked. If it fixes a bug or makes an improvement you noticed but were not \
-         asked for, don't make it: {action}"
+         asked for, don't make it: {action}{details}"
     )
 }
 
-/// A fix verb: `fixed`/`fixing`/`fix`/`corrected`/`repaired`/`patched`.
+/// At most this many changed paths named in the shell-edit checkpoint's own
+/// text -- keeps it bounded regardless of how many files one shell command
+/// touched.
+const SCOPE_GUARD_SHELL_PATH_CAP: usize = 5;
+
+/// The `PostToolUse`, after-the-fact counterpart to [`scope_checkpoint_text`]
+/// -- fires once the shell command has already changed `changed` (capped at
+/// [`SCOPE_GUARD_SHELL_PATH_CAP`] paths), so it names what changed and asks
+/// for an undo rather than warning before an edit. Shares
+/// [`scope_checkpoint_text`]'s own headless/interactive split, minus that
+/// variant's leading "leave it and" -- this sentence already opens with
+/// "undo it and".
+fn scope_checkpoint_shell_text(
+    constraints: &[String],
+    changed: &[String],
+    stated_details: &[String],
+    headless: bool,
+) -> String {
+    let action = if headless {
+        "list it under 'Found, not changed' in your final report."
+    } else {
+        "ask the user first."
+    };
+    let quoted = scope_guard_quoted_constraints(constraints);
+    let listed = changed
+        .iter()
+        .take(SCOPE_GUARD_SHELL_PATH_CAP)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details = scope_guard_stated_details_line(stated_details);
+    format!(
+        "Scope checkpoint: {quoted}You just changed existing file(s) {listed}. Check the change \
+         is needed for what was asked. If it fixes a bug or makes an improvement you noticed but \
+         were not asked for, undo it and {action}{details}"
+    )
+}
+
+/// `PostToolUse`, `Bash`/`PowerShell` only: the tool-agnostic, AFTER-the-fact
+/// counterpart to [`scope_checkpoint_note`]. Benchmark transcripts show a
+/// headless agent makes most of its edits to an existing file through the
+/// SHELL (`python -c "open(p,'w').write(...)"`, `sed -i`, `cat > file`),
+/// never touching `Edit`/`MultiEdit`/`NotebookEdit`/`Write` at all -- so that
+/// checkpoint never fires for it. This re-checks the repo's tracked-file
+/// state against the baseline `record_scope_guard_request` snapshotted at
+/// `UserPromptSubmit` ([`ScopeGuardRecord::shell_baseline`]), and the FIRST
+/// time anything differs, surfaces the same one-time note worded for a
+/// change that already happened ([`scope_checkpoint_shell_text`]). Shares
+/// `checkpoint_shown` with [`scope_checkpoint_note`]/
+/// [`scope_checkpoint_mark_shown`]: whichever path fires first is the only
+/// one that ever speaks for a given prompt, so an agent that mixes `Edit`
+/// and shell edits never sees the note twice.
+///
+/// `None` on every gate below (not a shell tool, no session identity, no
+/// state dir, no recorded prompt, already shown, nothing changed, and --
+/// since neither `cfg.scope_guard.enabled` nor `missing_tests_owed` has
+/// anything to say -- both features off or neither applying to what
+/// changed) -- a silent skip, like every other advisory in this guard.
+/// Deliberately ordered cheapest-first: the `git status` re-query --
+/// this function's only non-trivial cost -- only ever runs once every
+/// cheaper gate above it (most of all `checkpoint_shown`) has already
+/// passed, since this runs after EVERY `Bash`/`PowerShell` call.
+///
+/// Folds in the missing-tests gate's own "tests owed" line the same way
+/// [`scope_checkpoint_note`] does ([`missing_tests_owed`]/
+/// [`scope_checkpoint_combine`]), classified against `changed` (every path
+/// this call found different from the baseline) rather than a single
+/// target -- independent of `cfg.scope_guard.enabled`.
+fn scope_guard_shell_checkpoint_note(
+    tool_name: &str,
+    cwd: &Path,
+    cfg: &CtxConfig,
+    payload_session_id: &str,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !matches!(tool_name, "Bash" | "PowerShell") {
+        return None;
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
+    if session.is_empty() {
+        return None;
+    }
+    let state = StateDir::resolve(env).ok()?;
+    let path = scope_guard_record_path(&state, &session);
+    let mut record = load_scope_guard_record(&path)?;
+    if record.checkpoint_shown {
+        return None;
+    }
+    let changed = scope_guard_tracked_changes_since(cwd, &record.shell_baseline)?;
+    if changed.is_empty() {
+        return None;
+    }
+    // Unlike `scope_checkpoint_note`'s own `payload.permission_mode`, claude's
+    // documented `PostToolUse` payload carries no permission-mode field at
+    // all, so this reads the same headless signal `scope_guard_stop_reason`
+    // already uses for its own `PostToolUse`-adjacent (`Stop`) wording.
+    let headless = env(adapters::HEADLESS_ENV).as_deref() == Some("1");
+    let scope_text = cfg.scope_guard.enabled.then(|| {
+        scope_checkpoint_shell_text(
+            &record.constraints,
+            &changed,
+            &record.stated_details,
+            headless,
+        )
+    });
+    let changed_paths: Vec<&Path> = changed.iter().map(Path::new).collect();
+    let tests_owed = missing_tests_owed(cfg, env, &changed_paths);
+    let note = scope_checkpoint_combine(scope_text, tests_owed)?;
+    record.checkpoint_shown = true;
+    save_scope_guard_record(&path, &record);
+    Some(note)
+}
+
+/// A COMPLETED fix verb, past tense only: `fixed`/`corrected`/`repaired`/
+/// `patched`. Bare `fix`/`fixing` are deliberately excluded (a benchmark
+/// false positive: "Fixing it would change the `--legacy-order` output
+/// too." names a hypothetical the agent explicitly did NOT do, not a claimed
+/// change) -- see [`SCOPE_GUARD_HYPOTHETICAL_RE`] for the second, general
+/// guard against a conditional/hypothetical sentence being read as a claim
+/// at all.
 static SCOPE_GUARD_FIX_VERB_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:fixed|fixing|fix|corrected|repaired|patched)\b")
+    Regex::new(r"(?i)\b(?:fixed|corrected|repaired|patched)\b")
         .expect("valid scope-guard fix-verb regex")
+});
+
+/// Whether `sentence` reads as conditional/hypothetical rather than a
+/// completed action: "would", "could", "if". Checked alongside
+/// [`SCOPE_GUARD_FIX_VERB_RE`]'s own past-tense-only restriction so a
+/// hypothetical aside about what a fix WOULD do is never mistaken for a
+/// claim that the agent actually made one.
+static SCOPE_GUARD_HYPOTHETICAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:would|could|if)\b").expect("valid scope-guard hypothetical regex")
 });
 
 /// A word naming what the fix was for: `bug(s)`/`off-by-one`/`quirk`/
@@ -2225,16 +2932,22 @@ fn scope_guard_truncate(text: &str) -> String {
 }
 
 /// Whether a `Stop` closing message claims a fix the request never asked
-/// for: a fix verb ([`SCOPE_GUARD_FIX_VERB_RE`]) alongside a bug word
-/// ([`SCOPE_GUARD_BUG_WORD_RE`]) in the same sentence OR the very next one --
-/// a closing report often splits the claim and what it was for across two
-/// short adjacent sentences (this guard's own worked example: "I had to fix
-/// `report.page()` first. It had two bugs.") -- OR an explicit "also fixed/
-/// changed/updated/refactored", OR "while (I was) at it/there/here". Returns
-/// the first matching sentence, truncated, or `None`.
+/// for: a completed fix verb ([`SCOPE_GUARD_FIX_VERB_RE`]) alongside a bug
+/// word ([`SCOPE_GUARD_BUG_WORD_RE`]) in the same sentence OR the very next
+/// one -- a closing report often splits the claim and what it was for across
+/// two short adjacent sentences (this guard's own worked example: "`page()`
+/// had two bugs, and I fixed both.") -- OR an explicit "also fixed/changed/
+/// updated/refactored", OR "while (I was) at it/there/here". Every candidate
+/// sentence is first checked against [`SCOPE_GUARD_HYPOTHETICAL_RE`] and
+/// skipped if it reads as conditional/hypothetical ("Fixing it would change
+/// the `--legacy-order` output too." names something the agent did NOT do).
+/// Returns the first matching sentence, truncated, or `None`.
 fn scope_guard_unrequested_fix_sentence(closing: &str) -> Option<String> {
     let sentences = scope_guard_split_sentences(closing);
     for (index, sentence) in sentences.iter().enumerate() {
+        if SCOPE_GUARD_HYPOTHETICAL_RE.is_match(sentence) {
+            continue;
+        }
         if !SCOPE_GUARD_FIX_VERB_RE.is_match(sentence) {
             continue;
         }
@@ -2249,7 +2962,9 @@ fn scope_guard_unrequested_fix_sentence(closing: &str) -> Option<String> {
     sentences
         .iter()
         .find(|sentence| {
-            SCOPE_GUARD_ALSO_RE.is_match(sentence) || SCOPE_GUARD_WHILE_AT_IT_RE.is_match(sentence)
+            !SCOPE_GUARD_HYPOTHETICAL_RE.is_match(sentence)
+                && (SCOPE_GUARD_ALSO_RE.is_match(sentence)
+                    || SCOPE_GUARD_WHILE_AT_IT_RE.is_match(sentence))
         })
         .map(|sentence| scope_guard_truncate(sentence))
 }
@@ -3039,7 +3754,13 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
     // to read back later. Never emits anything and never affects the rest of
     // this handler -- see `record_scope_guard_request`'s own doc comment for
     // every gate that silently skips it.
-    record_scope_guard_request(&cfg, &payload.session_id, &prompt_text_from(stdin), env);
+    record_scope_guard_request(
+        &cfg,
+        &payload.session_id,
+        &prompt_text_from(stdin),
+        &repo,
+        env,
+    );
 
     // Issue #745: a closed-set, deterministic administrative dispatch that
     // answers a known-safe read-only request in-process and blocks the
@@ -5390,6 +6111,65 @@ fn posttool_value_output(value: serde_json::Value) -> String {
     .to_string()
 }
 
+/// A standalone `additionalContext` envelope for `PostToolUse` -- used when
+/// this hook has nothing else to say for this call (no compaction, no
+/// obfuscation) but the scope-guard shell checkpoint fired anyway. Claude
+/// Code's `PostToolUse` schema accepts `additionalContext` in the same
+/// `hookSpecificOutput` object as `updatedToolOutput`, alongside or instead
+/// of it -- see [`posttool_envelope_with_context`], which merges it into an
+/// envelope that already carries one.
+fn posttool_additional_context_output(note: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": note
+        }
+    })
+    .to_string()
+}
+
+/// Merges the scope-guard shell checkpoint's own note into an already-built
+/// `PostToolUse` envelope string (one of `posttool_output`'s/
+/// `posttool_value_output`'s own outputs), or returns it unchanged when
+/// `note` is `None`. Only one JSON object may ever be written per hook call,
+/// so this is the seam every `run_posttool` return path routes through
+/// rather than writing `additionalContext` as a second line: re-parses
+/// rather than threading a `Value` through every caller, which keeps
+/// `posttool_output`/`posttool_value_output` -- and every existing assertion
+/// against their exact shape -- untouched. Fails safe: an envelope that
+/// somehow does not round-trip through JSON is returned as-is, dropping the
+/// note rather than corrupting the envelope claude actually reads.
+fn posttool_envelope_with_context(envelope: String, note: Option<&str>) -> String {
+    let Some(note) = note else {
+        return envelope;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&envelope) else {
+        return envelope;
+    };
+    if let Some(hook_output) = value
+        .get_mut("hookSpecificOutput")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        hook_output.insert(
+            "additionalContext".to_string(),
+            serde_json::Value::String(note.to_string()),
+        );
+    }
+    value.to_string()
+}
+
+/// The shared tail for every `run_posttool` return point that has no
+/// compaction/obfuscation envelope of its own to attach the scope-guard
+/// shell checkpoint to: writes it alone (standalone `additionalContext`)
+/// when present, otherwise writes nothing at all -- exactly this function's
+/// previous behaviour for every one of those paths.
+fn posttool_finish<W: Write>(w: &mut W, note: Option<&str>) -> CtxResult<i32> {
+    if let Some(note) = note {
+        let _ = writeln!(w, "{}", posttool_additional_context_output(note));
+    }
+    Ok(0)
+}
+
 fn withhold_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
@@ -5538,11 +6318,46 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
 /// much this hook has actually saved without re-deriving it from the raw
 /// output-capture files.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    // Scope-creep guard (item 1): the tool-agnostic shell-edit checkpoint is
+    // computed first, independent of everything below, so its note can be
+    // merged into whichever envelope this call ends up emitting below --
+    // obfuscation's masked replacement, output compaction's summary, or (when
+    // neither fires) a standalone envelope of its own -- since only one JSON
+    // object may ever be written per hook call. This narrow parse only reads
+    // `tool_name`/`cwd`/`session_id`; the same `PostToolPayload` is parsed
+    // again below for the rest of this function's own, untouched control
+    // flow.
+    let shell_checkpoint = serde_json::from_str::<PostToolPayload>(stdin)
+        .ok()
+        .filter(|payload| matches!(payload.tool_name.as_str(), "Bash" | "PowerShell"))
+        .and_then(|payload| {
+            let cwd = if payload.cwd.is_empty() {
+                std::env::current_dir().ok()?
+            } else {
+                PathBuf::from(&payload.cwd)
+            };
+            let cfg = cfg_or_operator_only_gate(&cwd, env);
+            scope_guard_shell_checkpoint_note(
+                &payload.tool_name,
+                &cwd,
+                &cfg,
+                &payload.session_id,
+                env,
+            )
+        });
+
     // Runs before the Bash-specific parser below: Read/Grep/Glob and custom
     // tool results have different schemas, but their `tool_response` value
     // can still be replaced byte-for-byte after recursively masking strings.
     if let Some(masked) = obfuscated_posttool_response(stdin, env) {
-        let _ = writeln!(w, "{}", posttool_value_output(masked));
+        let _ = writeln!(
+            w,
+            "{}",
+            posttool_envelope_with_context(
+                posttool_value_output(masked),
+                shell_checkpoint.as_deref()
+            )
+        );
         return Ok(0);
     }
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
@@ -5564,7 +6379,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     }
 
     if payload.tool_name != "Bash" || payload.tool_response.is_image {
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let response = &payload.tool_response;
     let combined = if response.stderr.is_empty() {
@@ -5583,14 +6398,14 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // that record nothing at all: there is nowhere to key or write a row.
     let cwd = if payload.cwd.is_empty() {
         let Ok(cwd) = std::env::current_dir() else {
-            return Ok(0);
+            return posttool_finish(w, shell_checkpoint.as_deref());
         };
         cwd
     } else {
         PathBuf::from(&payload.cwd)
     };
     let Ok(state) = StateDir::resolve(env) else {
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     let program = payload
         .tool_input
@@ -5620,12 +6435,12 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
 
     if already_offloaded(&combined) {
         record(super::ledger::Outcome::Offloaded, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     if !cfg.output.compact {
         record(super::ledger::Outcome::Disabled, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     // How much of THIS command's output may be replaced at all. A reader --
     // `cat`, `sed -n`, `rg`, `git diff`, an operator's own `[output]
@@ -5641,7 +6456,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     let threshold = match scope {
         super::output::CompactionScope::Verbatim => {
             record(super::ledger::Outcome::Verbatim, bytes_in, None);
-            return Ok(0);
+            return posttool_finish(w, shell_checkpoint.as_deref());
         }
         super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
         super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
@@ -5660,7 +6475,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // replacing claude's agree on when a result is worth compacting.
     if !super::lifecycle::should_compact_result(combined.len(), true, threshold.saturating_sub(1)) {
         record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let command = if payload.tool_input.command.trim().is_empty() {
         vec!["(bash)".to_string()]
@@ -5681,7 +6496,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // summary whose retrieval line names a file that does not exist would
         // turn this from compression into loss.
         record(super::ledger::Outcome::PersistFailed, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     // `None` means the summary could not carry its own MANDATORY failure
     // content inside the cap. Replacing a result with a summary that had
@@ -5689,14 +6504,21 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // this fails open like every other path in here.
     let Some(summary) = summary else {
         record(super::ledger::Outcome::PersistFailed, bytes_in, Some(&id));
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     record(
         super::ledger::Outcome::Compacted,
         summary.len() as u64,
         Some(&id),
     );
-    let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
+    let _ = writeln!(
+        w,
+        "{}",
+        posttool_envelope_with_context(
+            posttool_output(&summary, response.interrupted),
+            shell_checkpoint.as_deref()
+        )
+    );
     Ok(0)
 }
 
@@ -16094,9 +16916,14 @@ exactly as before.";
         );
     }
 
-    /// `[scope_guard] enabled = false` in the repo's own `.zirv/ctx.toml`
-    /// (narrow-only, the operator's own home layer defaults it on): no
-    /// record is written, so no checkpoint ever shows.
+    /// `[scope_guard] enabled = false` AND `[missing_tests_gate] enabled =
+    /// false` in the repo's own `.zirv/ctx.toml` (narrow-only, the
+    /// operator's own home layer defaults both on): with NEITHER feature
+    /// this checkpoint now also backs left on, no record is written at all,
+    /// so no checkpoint ever shows. (`record_scope_guard_request` writes a
+    /// record whenever either feature is on, since item 1's "tests owed"
+    /// line can fire the checkpoint on its own -- see that function's own
+    /// doc comment.)
     #[test]
     fn scope_guard_disabled_shows_no_checkpoint_and_writes_no_record() {
         let home = tempfile::tempdir().expect("home");
@@ -16105,7 +16932,7 @@ exactly as before.";
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
-            "[scope_guard]\nenabled = false\n",
+            "[scope_guard]\nenabled = false\n[missing_tests_gate]\nenabled = false\n",
         )
         .expect("write");
         let state_dir = tempfile::tempdir().expect("state dir");
@@ -16164,7 +16991,7 @@ exactly as before.";
         .to_string()
     }
 
-    const SCOPE_GUARD_FIX_CLOSING: &str = "I had to fix `report.page()` first. It had two bugs.";
+    const SCOPE_GUARD_FIX_CLOSING: &str = "I fixed `report.page()` first. It had two bugs.";
 
     /// End to end: `Stop` blocks once when the closing report claims a fix
     /// the t24 step 4 request never asked for.
@@ -16202,7 +17029,7 @@ exactly as before.";
         assert_eq!(parsed["decision"], "block", "{parsed:?}");
         let reason = parsed["reason"].as_str().unwrap_or_default();
         assert!(
-            reason.contains("I had to fix `report.page()` first."),
+            reason.contains("I fixed `report.page()` first."),
             "must quote the unrequested-fix sentence: {reason}"
         );
         assert!(
@@ -16349,6 +17176,753 @@ exactly as before.";
         assert!(
             !out.contains("found-not-changed"),
             "disabled must never block: {out}"
+        );
+    }
+
+    // -- Scope guard: the shell-edit checkpoint (item 1) --------------------
+
+    /// A temp home + a real git repo (one committed, tracked `tracked.txt` --
+    /// `git_repo()`'s own layout) + a state dir, so `record_scope_guard_
+    /// request`'s own baseline git query and `run_posttool`'s cfg load never
+    /// touch the developer's own machine.
+    struct ScopeGuardShellRig {
+        _home_dir: tempfile::TempDir,
+        _home: crate::commands::ctx::testenv::HomeGuard,
+        repo: tempfile::TempDir,
+        _state: tempfile::TempDir,
+        env: std::collections::HashMap<String, String>,
+    }
+
+    fn scope_guard_shell_rig() -> ScopeGuardShellRig {
+        let home_dir = tempfile::tempdir().expect("home");
+        let home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        let repo = git_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        ScopeGuardShellRig {
+            _home_dir: home_dir,
+            _home: home,
+            repo,
+            _state: state_dir,
+            env,
+        }
+    }
+
+    fn scope_guard_bash_posttool_stdin(session: &str, cwd: &Path, command: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            },
+            "tool_use_id": "toolu_scope_guard_shell",
+        })
+        .to_string()
+    }
+
+    /// Behaviour (a) -- the headline case: a shell command that changes an
+    /// EXISTING tracked file after the prompt gets the same one-time
+    /// checkpoint the `PreToolUse` `Edit`/`Write` path would have shown, even
+    /// though it never touches `Edit`/`Write` at all, worded for a change
+    /// that already happened; a second shell call in the same prompt stays
+    /// silent.
+    #[test]
+    fn scope_guard_shell_checkpoint_fires_once_after_an_existing_tracked_file_changes() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        // The shell command has ALREADY run by the time `PostToolUse` fires
+        // -- this simulates that after-the-fact state (`sed -i`/`cat >`/a
+        // Python `open(p, "w")`), not something `run_posttool` itself does.
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = scope_guard_bash_posttool_stdin(
+            session,
+            rig.repo.path(),
+            "sed -i 's/one/ONE/' tracked.txt",
+        );
+        let mut first = Vec::new();
+        run_posttool(&mut first, &stdin, &lookup).expect("run_posttool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Scope checkpoint"),
+            "a shell edit to an existing tracked file must show the checkpoint: {first}"
+        );
+        assert!(
+            first.contains("tracked.txt"),
+            "must name the changed file: {first}"
+        );
+        assert!(
+            first.contains("You just changed existing file(s)"),
+            "must use the after-the-fact wording: {first}"
+        );
+        assert!(
+            first.contains("ask the user first."),
+            "interactive wording by default: {first}"
+        );
+
+        let mut second = Vec::new();
+        run_posttool(&mut second, &stdin, &lookup).expect("run_posttool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Scope checkpoint"),
+            "a second shell call in the same prompt must stay silent: {second}"
+        );
+    }
+
+    /// Behaviour (b): a tracked file already modified BEFORE the prompt --
+    /// captured in `record_scope_guard_request`'s own baseline -- that is
+    /// never touched again must not trigger the checkpoint.
+    #[test]
+    fn scope_guard_shell_checkpoint_ignores_a_file_already_modified_before_the_prompt() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-2";
+
+        std::fs::write(rig.repo.path().join("tracked.txt"), "one\nalready dirty\n")
+            .expect("pre-existing modification");
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let stdin = scope_guard_bash_posttool_stdin(session, rig.repo.path(), "echo unrelated");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "a file already modified before the prompt, untouched since, must not trigger: {out}"
+        );
+    }
+
+    /// Behaviour (c): creating only a brand-new UNTRACKED file must not
+    /// trigger the checkpoint -- a new file is not a change to existing
+    /// code.
+    #[test]
+    fn scope_guard_shell_checkpoint_ignores_a_brand_new_untracked_file() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(rig.repo.path().join("brand_new.txt"), "new\n").expect("new file");
+
+        let stdin =
+            scope_guard_bash_posttool_stdin(session, rig.repo.path(), "touch brand_new.txt");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "creating only a new untracked file must not trigger: {out}"
+        );
+    }
+
+    /// Behaviour (d): when the SAME `Bash` call also has output large enough
+    /// to compact, the checkpoint's `additionalContext` and the compaction's
+    /// own `updatedToolOutput` must both ride in the single envelope this
+    /// hook writes -- never two JSON objects, never one dropped for the
+    /// other.
+    #[test]
+    fn scope_guard_shell_checkpoint_merges_into_the_compaction_envelope() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-4";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = serde_json::json!({
+            "session_id": session,
+            "cwd": rig.repo.path().display().to_string(),
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+            "tool_response": {
+                "stdout": noisy_output(),
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            },
+            "tool_use_id": "toolu_scope_guard_compact",
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let hook = &parsed["hookSpecificOutput"];
+        assert_eq!(hook["hookEventName"], "PostToolUse");
+        assert!(
+            hook.get("updatedToolOutput")
+                .and_then(|v| v.get("stdout"))
+                .is_some(),
+            "the compaction envelope must still be present: {out}"
+        );
+        assert!(
+            hook["additionalContext"]
+                .as_str()
+                .is_some_and(|note| note.contains("Scope checkpoint")),
+            "the same envelope must also carry the checkpoint: {out}"
+        );
+    }
+
+    // -- Scope guard: the "tests owed" checkpoint line (queued item 1) ------
+
+    fn scope_guard_edit_stdin_for(
+        session: &str,
+        cwd: &Path,
+        permission_mode: &str,
+        target_rel: &str,
+    ) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": cwd.join(target_rel).display().to_string(),
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "permission_mode": permission_mode,
+        })
+        .to_string()
+    }
+
+    /// A headless session editing a non-test source file gets BOTH the
+    /// scope-guard text and the tests-owed line, in the same one-time note.
+    #[test]
+    fn scope_checkpoint_combines_tests_owed_with_scope_text_for_a_headless_edit() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Scope checkpoint") && out.contains("Before changing existing code"),
+            "must still carry the scope-guard text: {out}"
+        );
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "must also carry the tests-owed line: {out}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false` with the missing-tests gate left on
+    /// (its default): the checkpoint still fires, carrying ONLY the
+    /// tests-owed line.
+    #[test]
+    fn scope_checkpoint_shows_tests_owed_alone_when_scope_guard_is_disabled() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-2";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "must carry the tests-owed line even with scope_guard disabled: {out}"
+        );
+        assert!(
+            !out.contains("Before changing existing code"),
+            "must not carry the scope-guard's own body text: {out}"
+        );
+    }
+
+    /// An interactive session (no `ZIRV_CTX_HEADLESS=1`) never gets the
+    /// tests-owed line, even though the missing-tests gate itself is on.
+    #[test]
+    fn scope_checkpoint_never_shows_tests_owed_for_an_interactive_session() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "default", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains(MISSING_TESTS_OWED_LINE),
+            "an interactive session must never see the tests-owed line: {out}"
+        );
+    }
+
+    /// Editing a file that already looks like a test file never owes the
+    /// tests-owed line, even headlessly.
+    #[test]
+    fn scope_checkpoint_never_shows_tests_owed_for_a_test_file_edit() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-4";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "tests/feature_test.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains(MISSING_TESTS_OWED_LINE),
+            "editing a test file must never owe a test: {out}"
+        );
+        assert!(
+            out.contains("Scope checkpoint"),
+            "the scope-guard part must still fire: {out}"
+        );
+    }
+
+    /// The `PostToolUse` shell path folds in the same tests-owed line when a
+    /// headless shell command changes an existing non-test source file.
+    #[test]
+    fn scope_guard_shell_checkpoint_combines_tests_owed_for_a_headless_shell_edit() {
+        let rig = scope_guard_shell_rig();
+        let mut env = rig.env.clone();
+        env.insert(adapters::HEADLESS_ENV.to_string(), "1".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-5";
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(rig.repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(rig.repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        git(&["add", "src.rs"]);
+        git(&["commit", "-q", "-m", "add src.rs"]);
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(
+            rig.repo.path().join("src.rs"),
+            "fn main() { println!(\"x\"); }\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = scope_guard_bash_posttool_stdin(session, rig.repo.path(), "sed -i ... src.rs");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "a headless shell edit to a non-test source file must owe a test: {out}"
+        );
+    }
+
+    // -- Scope guard: the stated-details checklist (queued item 2) ----------
+
+    const SCOPE_GUARD_STATED_DETAILS_PROMPT: &str = "Please add a new export command. Print an \
+         exact `DONE` marker when it finishes. The rows must come out sorted in ascending order. \
+         This sentence is just plain descriptive prose about the feature with nothing special \
+         stated.";
+
+    /// Picks up a backtick-quoted literal AND an ordering word, and ignores
+    /// plain prose that matches neither.
+    #[test]
+    fn scope_guard_extract_stated_details_picks_up_quoted_literals_and_ordering_words() {
+        let details = scope_guard_extract_stated_details(SCOPE_GUARD_STATED_DETAILS_PROMPT, &[]);
+        assert!(
+            details.iter().any(|d| d.contains("`DONE`")),
+            "must pick up the backtick-quoted literal: {details:?}"
+        );
+        assert!(
+            details.iter().any(|d| d.contains("sorted")),
+            "must pick up the ordering word: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|d| d.contains("plain descriptive prose")),
+            "must ignore plain prose: {details:?}"
+        );
+    }
+
+    /// More than [`SCOPE_GUARD_MAX_STATED_DETAILS`] qualifying sentences
+    /// still caps out at the limit.
+    #[test]
+    fn scope_guard_extract_stated_details_respects_the_cap() {
+        let prompt: String = (1..=12)
+            .map(|i| format!("Field {i} must be formatted exactly as \"value{i}\". "))
+            .collect();
+        let details = scope_guard_extract_stated_details(&prompt, &[]);
+        assert_eq!(
+            details.len(),
+            SCOPE_GUARD_MAX_STATED_DETAILS,
+            "must cap at {SCOPE_GUARD_MAX_STATED_DETAILS}: {details:?}"
+        );
+    }
+
+    /// A sentence already captured as a scope constraint must never also
+    /// appear in the stated-details list.
+    #[test]
+    fn scope_guard_extract_stated_details_skips_a_sentence_already_captured_as_a_constraint() {
+        let prompt = "Keep the sort order exactly as before, unchanged and exact.";
+        let constraints = scope_guard_extract_constraints(prompt);
+        assert!(
+            !constraints.is_empty(),
+            "sanity: this sentence must match the constraint pattern too"
+        );
+        let details = scope_guard_extract_stated_details(prompt, &constraints);
+        assert!(
+            details.is_empty(),
+            "a sentence already captured as a constraint must not duplicate into stated details: \
+             {details:?}"
+        );
+    }
+
+    const SCOPE_GUARD_STATED_DETAILS_CHECKPOINT_PROMPT: &str = "Export contacts to CSV, but keep \
+         the existing pagination behaviour exactly as before. Sort rows by last name in \
+         ascending order. The header row must read exactly \"id,name,email\".";
+
+    /// End to end: the first `Edit` after a prompt with stated details shows
+    /// the numbered checklist exactly once; a second `Edit` in the same
+    /// prompt does not repeat it.
+    #[test]
+    fn scope_checkpoint_shows_the_stated_details_list_once() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-details-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(
+                session,
+                repo.path(),
+                SCOPE_GUARD_STATED_DETAILS_CHECKPOINT_PROMPT,
+            ),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut first = Vec::new();
+        run_pretool(&mut first, &edit_stdin, &lookup).expect("run_pretool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Stated details to check before you finish:"),
+            "must show the stated-details checklist: {first}"
+        );
+        assert!(first.contains("(1)"), "must number the first item: {first}");
+
+        let mut second = Vec::new();
+        run_pretool(&mut second, &edit_stdin, &lookup).expect("run_pretool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Stated details to check before you finish:"),
+            "must appear at most once per prompt: {second}"
+        );
+    }
+
+    // -- Scope guard Stop backstop: hypothetical-fix false positive fix -----
+
+    /// Benchmark false positive: a hypothetical aside about what a fix WOULD
+    /// do must never be read as a claimed, completed fix -- while the two
+    /// true positives that fired correctly in the same benchmark run must
+    /// still be caught.
+    #[test]
+    fn scope_guard_unrequested_fix_sentence_ignores_a_hypothetical_aside() {
+        assert!(
+            scope_guard_unrequested_fix_sentence("`page()` had two bugs, and I fixed both.")
+                .is_some(),
+            "a completed fix alongside a bug word must still block"
+        );
+        assert!(
+            scope_guard_unrequested_fix_sentence(
+                "I also changed `report.page()`, which you didn't ask for."
+            )
+            .is_some(),
+            "an explicit 'also changed' claim must still block"
+        );
+        assert!(
+            scope_guard_unrequested_fix_sentence(
+                "Fixing it would change the `--legacy-order` output too."
+            )
+            .is_none(),
+            "a hypothetical 'would' aside naming something the agent did NOT do must never block"
+        );
+    }
+
+    // -- Issue 6a: `[jev] missing_tests` -------------------------------------
+
+    fn missing_tests_owed_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.missing_tests = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    const TESTS_OWED_FALSE: &str = r#"{"model": "jev-latest", "answers": {
+        "tests_owed": {"type": "noul", "noul": 0.02}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    const TESTS_OWED_INDECISIVE: &str = r#"{"model": "jev-latest", "answers": {
+        "tests_owed": {"type": "noul", "noul": 0.5}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    /// Guards against the exact bug this gate shipped with once already: an
+    /// oversized `instructions` string fails `safe_metadata_request` and
+    /// `ask` never even reaches the network -- a silent, permanent no-op for
+    /// the whole gate that no other test here would ever catch, since every
+    /// mocked-server test below only proves the RESPONSE path.
+    #[test]
+    fn missing_tests_owed_request_passes_the_metadata_guard() {
+        let advise_state = DispatchAdviseState {
+            metadata_only: true,
+            facts: vec![vec![1_000_000; 5]],
+        };
+        let value = serde_json::to_value(&advise_state).expect("json");
+        assert!(super::super::jev::safe_metadata_request(
+            &value,
+            &missing_tests_owed_question(),
+            "jev-latest"
+        ));
+    }
+
+    /// Gate off (the default): behaviour is byte-identical to before this
+    /// feature existed -- the deterministic gate still blocks, and no Jev
+    /// call is ever made (a bad/unreachable `base_url` would otherwise hang
+    /// or fail this test).
+    #[test]
+    fn missing_tests_gate_unaffected_when_jev_missing_tests_is_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-a",
+            "sess-jev-a",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        assert!(
+            reason.is_some(),
+            "gate off must behave exactly as before (still blocks): {reason:?}"
+        );
+    }
+
+    /// A decisive, strongly "not owed" answer skips the block, and the skip
+    /// is never persisted as a block -- a later, still-test-less turn in the
+    /// same session can still be asked/blocked.
+    #[test]
+    fn missing_tests_gate_skips_the_block_on_a_decisive_not_owed_jev_answer() {
+        let (url, handle) =
+            crate::commands::ctx::jev::tests::one_shot_server(200, TESTS_OWED_FALSE);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let env_name = "HOOK_TEST_MISSING_TESTS_JEV_SKIP";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env_name, "secret") };
+        let cfg = missing_tests_owed_cfg(url, env_name);
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-b",
+            "sess-jev-b",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        unsafe { std::env::remove_var(env_name) };
+        handle.join().expect("server thread");
+        assert_eq!(
+            reason, None,
+            "a decisive not-owed answer must skip the block"
+        );
+        assert!(
+            !load_missing_tests_gate_record(&missing_tests_gate_record_path(&state, "sess-jev-b"))
+                .blocked,
+            "a skipped block must never be persisted as blocked"
+        );
+    }
+
+    /// An indecisive answer (thin margin) blocks exactly as today.
+    #[test]
+    fn missing_tests_gate_still_blocks_on_an_indecisive_jev_answer() {
+        let (url, handle) =
+            crate::commands::ctx::jev::tests::one_shot_server(200, TESTS_OWED_INDECISIVE);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let env_name = "HOOK_TEST_MISSING_TESTS_JEV_INDECISIVE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env_name, "secret") };
+        let cfg = missing_tests_owed_cfg(url, env_name);
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-c",
+            "sess-jev-c",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        unsafe { std::env::remove_var(env_name) };
+        handle.join().expect("server thread");
+        assert!(
+            reason.is_some(),
+            "an indecisive answer must block exactly as today: {reason:?}"
         );
     }
 }

@@ -5414,7 +5414,26 @@ improvement -- interactively, "ask the user first"; headlessly
 (`permission_mode == "dontAsk"`), "leave it and list it under 'Found, not
 changed' in your final report" instead, since there is no one to ask. It rides
 in the same `additionalContext` envelope as the orchestrator-write advisory and
-the reuse probe rather than replacing either. `Stop` is a backstop, run only
+the reuse probe rather than replacing either. The same one-time checkpoint
+also fires from `PostToolUse` after the first `Bash`/`PowerShell` command that
+changes an existing tracked file, worded for a change that already happened,
+for a headless agent that edits through the shell and never touches
+`Edit`/`Write` at all. The same checkpoint also folds in a "tests owed" line
+("Write a focused test for each behaviour change in this same pass -- the run
+cannot finish without one.") whenever the missing-tests gate below is enabled,
+the session is headless, and the file being changed is a non-test, non-doc
+source file -- fired at the FIRST edit rather than waiting for the
+missing-tests Stop gate to say it after the whole turn is already done. This
+line can fire the checkpoint on its own even with `[scope_guard] enabled =
+false`. `UserPromptSubmit` also extracts up to eight stated, checkable
+details -- a backtick- or double-quoted literal, or an ordering/format/
+exactness word ("sorted", "order", "ascending", "descending", "exactly",
+"exact", "format", "exit status"/"exit code", "stderr", "stdout", "print(s)",
+"message", "case-insensitive", "comma-separated", "no spaces", "trailing",
+"leading"), never duplicating a sentence already captured as a constraint --
+and the checkpoint appends them as a numbered "Stated details to check before
+you finish: (1) ... (2) ..." list, governed by `[scope_guard] enabled` like
+the constraints themselves. `Stop` is a backstop, run only
 after every other Stop gate/backstop above already had its chance to block (at
 most one block per Stop): when the request did NOT itself ask for a fix and the
 closing report's own wording claims one anyway (a fix verb alongside a bug

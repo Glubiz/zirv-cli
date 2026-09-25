@@ -2043,6 +2043,16 @@ pub struct JevConfig {
     pub inject: bool,
     /// Issue #786: Jev Stop-hook check for unverified completion claims.
     pub stop_verify: bool,
+    /// Off by default: when the deterministic missing-tests Stop gate
+    /// (`[missing_tests_gate]`) is about to block, asks Jev one metadata-only
+    /// Noul question from local numeric facts (non-test source files
+    /// changed, changed-lines bucket, whether the repo has any test files,
+    /// how many mention a changed module, doc-only share) -- "is a new test
+    /// owed for this change?". A decisive "not owed" answer skips that one
+    /// block without persisting it as blocked; anything else (indecisive, an
+    /// error, no credential, or this key off) blocks exactly as the
+    /// deterministic gate already does.
+    pub missing_tests: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -2072,6 +2082,7 @@ impl Default for JevConfig {
             inject_screen: false,
             inject: false,
             stop_verify: false,
+            missing_tests: false,
             cache_ttl_secs: 86_400,
         }
     }
@@ -4230,6 +4241,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_MISSING_TESTS",
+        &["jev", "missing_tests"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
@@ -5638,6 +5654,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "inject_screen"], "ZIRV_CTX_JEV_INJECT_SCREEN"),
     (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
+    (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
     // Issue #788: `[headless]` cost levers for a headless Claude Code
     // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
@@ -9091,6 +9108,7 @@ mod tests {
             ("[jev]\ninject_screen = true\n", "inject_screen"),
             ("[jev]\ninject = true\n", "inject"),
             ("[jev]\nstop_verify = true\n", "stop_verify"),
+            ("[jev]\nmissing_tests = true\n", "missing_tests"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -9130,6 +9148,7 @@ mod tests {
             ("ZIRV_CTX_JEV_INJECT_SCREEN", "true"),
             ("ZIRV_CTX_JEV_INJECT", "true"),
             ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
+            ("ZIRV_CTX_JEV_MISSING_TESTS", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -9154,6 +9173,7 @@ mod tests {
         assert!(cfg.jev.inject_screen);
         assert!(cfg.jev.inject);
         assert!(cfg.jev.stop_verify);
+        assert!(cfg.jev.missing_tests);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
