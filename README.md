@@ -4201,6 +4201,42 @@ config, an unreadable file -- silently rebuilds it from a full parse. See
 [Usage pacing](#usage-pacing) below for the `[pace]` table that governs
 subscription-window waiting.
 
+#### Headless cost levers
+
+Operator-only, off-by-default cost levers for the Claude Code
+sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
+`--prompt` path and its `-- claude -p ...` passthrough, plus `zirv agent
+claude` headless workers (they share `ctx exec`'s own launch builder).
+Interactive `wrap`/`chat`/dash sessions never read this table.
+
+Every key is unset or off by default. The example below is an opt-in configuration, not the defaults:
+
+```toml
+[headless]
+prompt_cache_ttl = "5m"          # "5m" | "1h", unset by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
+lean = true                      # adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer; ZIRV_CTX_HEADLESS_LEAN
+disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
+
+[headless.effort]
+trivial = "low"                  # low | medium | high | xhigh | max, unset by default; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
+bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
+substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL
+# architectural unset: Claude Code's own default effort; ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL
+```
+
+`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
+`effort` table classifies the prompt text with the SAME deterministic
+classifier the intake hook uses (`proxy::decision::try_classify_request`,
+never a Jev call) and sets env `CLAUDE_CODE_EFFORT_LEVEL` when the resolved
+complexity has a configured value; an operator's own `CLAUDE_CODE_EFFORT_LEVEL`
+or an argv that already carries `--effort` wins over it. `lean` and
+`disallowed_tools` only ever narrow a HEADLESS launch -- an interactive
+session, where a human is present, is untouched. With every key unset (the
+shipped default) a headless launch is byte-identical to one built before
+this table existed.
+
+The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
+
 #### Tool-output compaction
 
 `zirv setup` installs the claude `PostToolUse` hook: a large `Bash` result is
@@ -4263,6 +4299,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
@@ -4282,7 +4319,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
+`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
@@ -4524,6 +4561,13 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
+| `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
+| `headless.effort.trivial` | `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL` |
+| `headless.effort.bounded` | `ZIRV_CTX_HEADLESS_EFFORT_BOUNDED` |
+| `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
+| `headless.effort.architectural` | `ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL` |
+| `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
+| `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
 | `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |

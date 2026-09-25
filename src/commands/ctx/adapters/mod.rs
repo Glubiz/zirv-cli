@@ -1492,6 +1492,19 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = chat;
     }
 
+    /// Issue #788 (operator-only headless cost levers): attaches
+    /// `cfg.headless` to this adapter INSTANCE, mirroring `apply_chat_config`
+    /// immediately above -- `select`/`resolve_default` call this exactly
+    /// once, right after constructing the adapter, so `ClaudeAdapter::
+    /// default_sandbox_args`/`launch_settings_path`'s HEADLESS-only
+    /// `--disallowedTools`/lean-settings additions read the same resolved
+    /// `[headless]` table every other read of this adapter instance does.
+    /// Default no-op: only `ClaudeAdapter` overrides it today; codex has no
+    /// equivalent lever.
+    fn apply_headless_config(&mut self, headless: &super::config::HeadlessConfig) {
+        let _ = headless;
+    }
+
     /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
     /// attached endpoint override, or `None` when it has none -- what
     /// `harness_prompt_lines`'s roster line and `zirv ctx status` render as
@@ -3471,6 +3484,14 @@ fn apply_chat_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
     adapter.apply_chat_config(&cfg.chat);
 }
 
+/// Issue #788: attaches `cfg.headless` (via [`AgentAdapter::
+/// apply_headless_config`]) the same way [`apply_chat_override`] attaches
+/// `cfg.chat` immediately above -- called at each of that function's own
+/// call sites, right after constructing the adapter.
+fn apply_headless_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
+    adapter.apply_headless_config(&cfg.headless);
+}
+
 /// Issue #395: the credential-presence check both `ClaudeAdapter::ready`
 /// and `CodexAdapter::ready` apply when an operator endpoint override is
 /// configured. Named by the environment variable's own NAME only, never its
@@ -3891,6 +3912,7 @@ pub(crate) fn adapter_liveness(
     let mut adapter = if names_other { ctor(None) } else { ctor(bin) };
     apply_endpoint_override(&mut adapter, cfg);
     apply_chat_override(&mut adapter, cfg);
+    apply_headless_override(&mut adapter, cfg);
     adapter.ready().map_err(|err| err.to_string())?;
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
@@ -4574,6 +4596,7 @@ pub(crate) fn resolve_default_with_presence(
             })?;
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4596,6 +4619,7 @@ pub(crate) fn resolve_default_with_presence(
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(name) {
             // Final wave item 3: the same cross-adapter skip Medium 2 gave
             // the enabled-and-ready arm below, applied here too. Without
@@ -4845,6 +4869,7 @@ pub(crate) fn select_with_presence(
         })?;
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4856,6 +4881,7 @@ pub(crate) fn select_with_presence(
     if let Some(mut adapter) = adapters.into_iter().find(|a| a.detect(command)) {
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }

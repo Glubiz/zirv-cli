@@ -27,6 +27,7 @@ use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
 use super::{CtxResult, adapters, agent, handoff, log, objective, score};
+use crate::commands::workflow::classify::Complexity;
 
 /// The restart budget is spent and the session is still rotting. Callers apply
 /// their own policy from here.
@@ -834,6 +835,64 @@ fn headless_argv_len(command: &Command) -> usize {
         total += arg.len() + quotes + backslashes + 2;
     }
     total
+}
+
+/// Issue #788: the operator-only `[headless]` cost levers, applied to a
+/// CLAUDE headless launch `command` right after it is built. A no-op for
+/// every other adapter and for every unset key, so an unconfigured launch
+/// stays byte-identical to one built before this table existed.
+///
+/// `prompt` is `None` only when this run's own prompt text is genuinely
+/// unknown here (a bare resume with no new text) -- effort classification is
+/// skipped in that case, since there is nothing to classify; the TTL lever
+/// does not need it at all.
+fn apply_headless_cost_levers(
+    command: &mut Command,
+    cfg: &CtxConfig,
+    adapter_name: &str,
+    prompt: Option<&str>,
+) {
+    if adapter_name != "claude" {
+        return;
+    }
+    let headless = &cfg.headless;
+    if let Some(ttl) = headless.prompt_cache_ttl.as_deref() {
+        let operator_env_wins = [
+            "CLAUDE_CODE_PROMPT_CACHE_TTL",
+            "FORCE_PROMPT_CACHING_5M",
+            "ENABLE_PROMPT_CACHING_1H",
+        ]
+        .iter()
+        .any(|name| std::env::var(name).is_ok());
+        if !operator_env_wins {
+            command.env("CLAUDE_CODE_PROMPT_CACHE_TTL", ttl);
+        }
+    }
+    let Some(prompt) = prompt else {
+        return;
+    };
+    if std::env::var("CLAUDE_CODE_EFFORT_LEVEL").is_ok() {
+        return;
+    }
+    let argv_has_effort = command.get_args().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--effort" || arg.starts_with("--effort=")
+    });
+    if argv_has_effort {
+        return;
+    }
+    let Some(classification) = super::proxy::decision::try_classify_request(prompt) else {
+        return;
+    };
+    let effort = match classification.complexity {
+        Complexity::Trivial => headless.effort.trivial.as_deref(),
+        Complexity::Bounded => headless.effort.bounded.as_deref(),
+        Complexity::Substantial => headless.effort.substantial.as_deref(),
+        Complexity::Architectural => headless.effort.architectural.as_deref(),
+    };
+    if let Some(effort) = effort {
+        command.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    }
 }
 
 /// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
@@ -1861,10 +1920,13 @@ fn run_with_clock_inner<W: Write>(
         let probe = adapter.headless_cmd(&prompt_text, session, extra);
         let argv_total_len = headless_argv_len(&probe);
         if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
-            && let Some(command) = adapter.headless_cmd_stdin(session, extra)
+            && let Some(mut command) = adapter.headless_cmd_stdin(session, extra)
         {
+            apply_headless_cost_levers(&mut command, &cfg, adapter.name(), Some(&prompt_text));
             return Ok((command, Some(prompt_text)));
         }
+        let mut probe = probe;
+        apply_headless_cost_levers(&mut probe, &cfg, adapter.name(), Some(&prompt_text));
         Ok((probe, None))
     };
 
@@ -1927,7 +1989,8 @@ fn run_with_clock_inner<W: Write>(
                 .cloned()
                 .collect(),
         );
-        let command = build_command(&argv, repo)?;
+        let mut command = build_command(&argv, repo)?;
+        apply_headless_cost_levers(&mut command, &cfg, adapter.name(), prompt.as_deref());
         (command, None)
     };
     apply_session_env(&mut command, &session);
@@ -4676,6 +4739,131 @@ mod tests {
             headless_prompt_via_stdin(false, total),
             "a prompt safely under budget on its own must still route to stdin once the other \
              arguments on the same command line push the WHOLE argv over budget"
+        );
+    }
+
+    /// Issue #788: with every `[headless]` key unset (the shipped default),
+    /// a headless launch stays byte-identical to one built before this
+    /// table existed -- no `CLAUDE_CODE_PROMPT_CACHE_TTL`/`CLAUDE_CODE_
+    /// EFFORT_LEVEL` env is added, whatever prompt text is passed.
+    #[test]
+    fn apply_headless_cost_levers_is_a_noop_with_unset_config() {
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+            ("CLAUDE_CODE_EFFORT_LEVEL", None),
+        ]);
+        let cfg = CtxConfig::default();
+        let mut command = Command::new("claude");
+        command.arg("-p").arg("do a small thing");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("do a small thing"));
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "an unconfigured [headless] table must add no env"
+        );
+    }
+
+    /// Issue #788: `headless.prompt_cache_ttl` sets `CLAUDE_CODE_PROMPT_
+    /// CACHE_TTL` when configured, and the operator's own process env --
+    /// `CLAUDE_CODE_PROMPT_CACHE_TTL` itself, or either alias the vendor
+    /// docs name -- wins over it.
+    #[test]
+    fn apply_headless_cost_levers_sets_prompt_cache_ttl_and_operator_env_wins() {
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+        ]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.prompt_cache_ttl = Some("1h".to_string());
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", None);
+        let ttl = command
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_PROMPT_CACHE_TTL")
+            .and_then(|(_, value)| value);
+        assert_eq!(ttl, Some(std::ffi::OsStr::new("1h")));
+
+        let _operator_env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FORCE_PROMPT_CACHING_5M", Some("1"))]);
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", None);
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "the operator's own FORCE_PROMPT_CACHING_5M must win over a configured ttl"
+        );
+    }
+
+    /// Issue #788: `headless.effort.<class>` sets `CLAUDE_CODE_EFFORT_LEVEL`
+    /// for a request that classifies into a CONFIGURED class, and adds
+    /// nothing for one that classifies into an UNCONFIGURED class -- the
+    /// deterministic size-floor classifier (`proxy::decision::
+    /// try_classify_request`) is text-only, never a Jev call.
+    #[test]
+    fn apply_headless_cost_levers_sets_effort_for_a_configured_class_and_skips_an_unset_one() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        // `bounded` is deliberately left unset.
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+        let effort = command
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            effort,
+            Some(std::ffi::OsStr::new("low")),
+            "a short, unenumerated request classifies Trivial"
+        );
+
+        let bounded_request = "word ".repeat(150);
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", Some(&bounded_request));
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "a 150-word request floors to Bounded, which has no configured effort"
+        );
+    }
+
+    /// Issue #788: the operator's own `CLAUDE_CODE_EFFORT_LEVEL` process env,
+    /// and an operator argv that already carries `--effort`, each independently
+    /// win over a configured `headless.effort.*` value.
+    #[test]
+    fn apply_headless_cost_levers_skips_effort_when_the_operator_env_or_argv_already_wins() {
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+
+        {
+            let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                "CLAUDE_CODE_EFFORT_LEVEL",
+                Some("high"),
+            )]);
+            let mut command = Command::new("claude");
+            apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+            assert_eq!(
+                command.get_envs().count(),
+                0,
+                "the operator's own CLAUDE_CODE_EFFORT_LEVEL must win"
+            );
+        }
+
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut command = Command::new("claude");
+        command.arg("--effort").arg("max");
+        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "an argv that already carries --effort must win"
         );
     }
 

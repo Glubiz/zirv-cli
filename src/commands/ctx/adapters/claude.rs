@@ -1204,6 +1204,13 @@ pub struct ClaudeAdapter {
     /// overriding the operator's own `permissions.defaultMode`, which a CLI
     /// flag outranks.
     claude_permission_mode: Option<String>,
+    /// Issue #788: an operator-only `[headless]` cost-lever table, attached
+    /// post-construction via `AgentAdapter::apply_headless_config`
+    /// (production) or `with_headless_config` (tests/direct construction) --
+    /// mirrors `claude_permission_mode`'s own pattern immediately above.
+    /// Default (unset) is byte-identical to every launch before this table
+    /// existed.
+    headless: super::super::config::HeadlessConfig,
     #[cfg(test)]
     forced_file_support: Option<bool>,
     #[cfg(test)]
@@ -1230,6 +1237,7 @@ impl ClaudeAdapter {
             home: None,
             endpoint: None,
             claude_permission_mode: None,
+            headless: super::super::config::HeadlessConfig::default(),
             #[cfg(test)]
             forced_file_support: None,
             #[cfg(test)]
@@ -1260,6 +1268,17 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_claude_permission_mode(mut self, mode: impl Into<String>) -> Self {
         self.claude_permission_mode = Some(mode.into());
+        self
+    }
+
+    /// Issue #788: attaches an operator `[headless]` cost-lever table.
+    /// Production code reaches this through `AgentAdapter::
+    /// apply_headless_config` (see `adapters::apply_headless_override`),
+    /// mirroring `with_claude_permission_mode` immediately above; this
+    /// builder is only the direct-construction path tests use.
+    #[cfg(test)]
+    pub fn with_headless_config(mut self, headless: super::super::config::HeadlessConfig) -> Self {
+        self.headless = headless;
         self
     }
 
@@ -1343,10 +1362,15 @@ impl ClaudeAdapter {
     /// Zirv home. The write is atomic and private on Unix; if either step
     /// fails, the caller deliberately falls back to Claude's native prompt
     /// flow without adding a blanket Bash allow.
+    /// `lean`: issue #788's `[headless] lean` lever, resolved by the caller
+    /// (`default_sandbox_args`) to true only for a HEADLESS launch with the
+    /// operator's `[headless] lean = true` -- never for an interactive one,
+    /// whatever this table holds.
     fn launch_settings_path(
         &self,
         sandbox: &super::super::config::SandboxConfig,
         safety: &super::super::safety::SafetyPolicy,
+        lean: bool,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
@@ -1360,6 +1384,7 @@ impl ClaudeAdapter {
         let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
         let mut launch_environment = LaunchEnvironment::resolve();
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
+        launch_environment.lean = lean;
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -1532,6 +1557,11 @@ struct LaunchEnvironment {
     /// `[sandbox] scrub_subprocess_env` -- see `SandboxConfig`'s doc comment
     /// for what the upstream switch does and why it is off by default.
     scrub_subprocess_env: bool,
+    /// Issue #788: `[headless] lean`, already narrowed to HEADLESS-only by
+    /// `launch_settings_path`'s own caller -- see that field's doc comment.
+    /// Adds `autoMemoryEnabled: false`/`disableBundledSkills: true` to the
+    /// settings layer `launch_settings_value` builds.
+    lean: bool,
 }
 
 impl LaunchEnvironment {
@@ -1579,6 +1609,7 @@ impl LaunchEnvironment {
             ssh_auth_sock,
             workspace_write_roots,
             scrub_subprocess_env: false,
+            lean: false,
         }
     }
 }
@@ -1854,6 +1885,13 @@ fn launch_settings_value(
     // forces the permission mode to `default` -- see `SandboxConfig`.
     if launch_environment.scrub_subprocess_env {
         settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = serde_json::json!("1");
+    }
+    // Issue #788: operator opt-in only (`[headless] lean`), already narrowed
+    // to a headless launch by the caller -- see `LaunchEnvironment::lean`'s
+    // own doc comment.
+    if launch_environment.lean {
+        settings["autoMemoryEnabled"] = serde_json::json!(false);
+        settings["disableBundledSkills"] = serde_json::json!(true);
     }
 
     let additional_directories: Vec<&String> = launch_environment
@@ -2268,6 +2306,14 @@ impl AgentAdapter for ClaudeAdapter {
     /// `apply_endpoint` immediately above.
     fn apply_chat_config(&mut self, chat: &super::super::config::ChatConfig) {
         self.claude_permission_mode = chat.claude_permission_mode.clone();
+    }
+
+    /// Issue #788: the production seam (`adapters::apply_headless_override`,
+    /// called by `select`/`resolve_default`) that attaches the operator's
+    /// `[headless]` cost-lever table after construction, mirroring
+    /// `apply_chat_config` immediately above.
+    fn apply_headless_config(&mut self, headless: &super::super::config::HeadlessConfig) {
+        self.headless = headless.clone();
     }
 
     fn endpoint_vendor(&self) -> Option<&str> {
@@ -2862,6 +2908,15 @@ impl AgentAdapter for ClaudeAdapter {
             );
         }
         deny_entries.extend(sandbox.extra_deny.iter().cloned());
+        // Issue #788: `[headless] disallowed_tools` -- operator-only extra
+        // tool names appended to the SAME `--disallowedTools` deny list
+        // above, exactly like `sandbox.extra_deny` right above it, rather
+        // than a second `--disallowedTools` flag. Headless only, like the
+        // `safety.ask` fold-in above: an interactive session has a human
+        // present to answer a prompt, so this lever never narrows it.
+        if !mode.is_interactive() {
+            deny_entries.extend(self.headless.disallowed_tools.iter().cloned());
+        }
         let deny = deny_entries.join(",");
 
         // `dontAsk` is "don't prompt, deny if not pre-approved" (the
@@ -2913,7 +2968,11 @@ impl AgentAdapter for ClaudeAdapter {
         }
         args.push(format!("--allowedTools={allow}"));
         args.push(format!("--disallowedTools={deny}"));
-        if let Some(path) = self.launch_settings_path(sandbox, safety) {
+        // Issue #788: `[headless] lean` only ever narrows a HEADLESS launch's
+        // settings layer -- see `launch_settings_path`/`launch_settings_
+        // value`'s own doc comments.
+        let lean = !mode.is_interactive() && self.headless.lean;
+        if let Some(path) = self.launch_settings_path(sandbox, safety, lean) {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
@@ -4499,6 +4558,32 @@ mod tests {
         assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
     }
 
+    /// Issue #788: `[headless] lean` adds `autoMemoryEnabled: false` and
+    /// `disableBundledSkills: true` to the settings layer only when the
+    /// caller (`default_sandbox_args`, headless-only) resolved `lean` true --
+    /// same opt-in shape as `scrub_subprocess_env` right above.
+    #[test]
+    fn launch_settings_emit_the_lean_keys_only_on_operator_opt_in() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                lean: true,
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(settings["autoMemoryEnabled"], false);
+        assert_eq!(settings["disableBundledSkills"], true);
+
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(settings["autoMemoryEnabled"].is_null());
+        assert!(settings["disableBundledSkills"].is_null());
+    }
+
     /// Writes the mutual link git keeps between `<repo>/.git/worktrees/
     /// <name>` and `<worktree>/.git`; `back_link` lets a test forge a
     /// worktree whose `.git` file points somewhere else.
@@ -5259,7 +5344,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&Default::default(), &policy)
+            .launch_settings_path(&Default::default(), &policy, false)
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -5773,6 +5858,46 @@ mod tests {
         assert!(
             deny_arg.contains("Bash(sudo *)"),
             "the shipped deny entries must still be present, not replaced: {deny_arg}"
+        );
+    }
+
+    /// Issue #788: `[headless] disallowed_tools` appends to the SAME
+    /// `--disallowedTools` deny list, headless only -- an interactive launch
+    /// (a human present to answer a prompt) is never narrowed by this lever,
+    /// whatever the operator configured.
+    #[test]
+    fn default_sandbox_args_appends_headless_disallowed_tools_only_when_headless() {
+        let adapter = ClaudeAdapter::new(None).with_headless_config(
+            crate::commands::ctx::config::HeadlessConfig {
+                disallowed_tools: vec!["WebFetch".to_string()],
+                ..Default::default()
+            },
+        );
+        let headless_args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &[],
+            super::super::LaunchMode::Headless,
+        );
+        let deny_arg = headless_args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(deny_arg.contains("WebFetch"), "got {deny_arg}");
+
+        let interactive_args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &[],
+            super::super::LaunchMode::Interactive,
+        );
+        let deny_arg = interactive_args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(
+            !deny_arg.contains("WebFetch"),
+            "interactive must not be narrowed by a headless-only lever: {deny_arg}"
         );
     }
 

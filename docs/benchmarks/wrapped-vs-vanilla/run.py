@@ -1063,6 +1063,8 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         "total_cost_usd": None, "agent_cost_usd": None,
         "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
         "output_tokens": 0,
+        "cache_creation_ephemeral_1h_input_tokens": None,
+        "cache_creation_ephemeral_5m_input_tokens": None,
         "subagents_spawned": 0, "permission_denials": 0, "is_error": False, "exit_code": None,
         "zirv_cmds": {"workflow": 0, "skill": 0, "agent": 0, "ctx": 0, "other": 0},
         "tool_calls": 0,
@@ -1219,6 +1221,14 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         result["cache_creation_input_tokens"] = usage.get("cache_creation_input_tokens", 0) or 0
         result["cache_read_input_tokens"] = usage.get("cache_read_input_tokens", 0) or 0
         result["output_tokens"] = usage.get("output_tokens", 0) or 0
+        # Issue #788: the ephemeral 1h/5m split of `cache_creation_input_tokens`
+        # (present since prompt-cache-TTL support), null when the `-p` JSON
+        # result carries no `usage.cache_creation` object at all.
+        cache_creation = usage.get("cache_creation") or {}
+        result["cache_creation_ephemeral_1h_input_tokens"] = cache_creation.get(
+            "ephemeral_1h_input_tokens")
+        result["cache_creation_ephemeral_5m_input_tokens"] = cache_creation.get(
+            "ephemeral_5m_input_tokens")
         subagent_stats = obj.get("subagent_stats", {}) or {}
         result["subagents_spawned"] = subagent_stats.get("spawned", 0) or 0
         pd = obj.get("permission_denials", [])
@@ -1319,6 +1329,8 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
         "total_cost_usd": 0.0, "agent_cost_usd": 0.0,
         "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
         "output_tokens": 0,
+        "cache_creation_ephemeral_1h_input_tokens": None,
+        "cache_creation_ephemeral_5m_input_tokens": None,
         "subagents_spawned": 0, "permission_denials": 0, "is_error": False, "exit_code": 0,
         "zirv_cmds": {"workflow": 0, "skill": 0, "agent": 0, "ctx": 0, "other": 0},
         "tool_calls": 0,
@@ -1547,6 +1559,17 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
             result["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0) or 0
             result["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0) or 0
             result["output_tokens"] += step_record["output_tokens"]
+            # Issue #788: summed across steps, staying null when no step's
+            # `usage.cache_creation` ever carried the field at all.
+            cache_creation = usage.get("cache_creation") or {}
+            h1 = cache_creation.get("ephemeral_1h_input_tokens")
+            m5 = cache_creation.get("ephemeral_5m_input_tokens")
+            if h1 is not None:
+                result["cache_creation_ephemeral_1h_input_tokens"] = (
+                    result["cache_creation_ephemeral_1h_input_tokens"] or 0) + h1
+            if m5 is not None:
+                result["cache_creation_ephemeral_5m_input_tokens"] = (
+                    result["cache_creation_ephemeral_5m_input_tokens"] or 0) + m5
             result["num_turns"] += step_record["num_turns"] or 0
             result["duration_ms"] += obj.get("duration_ms") or 0
             result["duration_api_ms"] += obj.get("duration_api_ms") or 0

@@ -56,6 +56,9 @@ Invocation: `python grade.py <repo_dir> <result_text_file>` (cwd irrelevant). Pr
  "wall_s": float, "duration_ms": int, "duration_api_ms": int, "num_turns": int,
  "total_cost_usd": float,
  "input_tokens": int, "cache_creation_input_tokens": int, "cache_read_input_tokens": int, "output_tokens": int,
+ "cache_creation_ephemeral_1h_input_tokens": int|null, "cache_creation_ephemeral_5m_input_tokens": int|null,
+   # the `usage.cache_creation` 1h/5m split from the `-p` JSON result (issue #788's prompt-cache-TTL
+   # lever); null when the result carries no `usage.cache_creation` object at all
  "subagents_spawned": int, "permission_denials": int, "is_error": bool, "exit_code": int,
  "zirv_cmds": {"workflow": n, "skill": n, "agent": n, "ctx": n, "other": n},   # Bash tool calls in the transcript starting with `zirv ...`
  "tool_calls": int,                                                            # total tool_use blocks in the transcript

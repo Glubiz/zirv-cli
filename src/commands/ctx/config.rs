@@ -2049,6 +2049,51 @@ impl Default for JevConfig {
     }
 }
 
+/// Issue #788: operator-only, off-by-default cost levers for the Claude Code
+/// sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
+/// `--prompt` path and its `-- claude -p ...` passthrough, plus `zirv agent
+/// claude` headless workers (they share `ctx exec`'s own launch builder).
+/// Interactive `wrap`/`chat`/dash sessions never read this table. Every key
+/// is `REPO_FORBIDDEN`, same trust asymmetry as `[jev]` above: a repo
+/// checkout must not be able to turn on prompt-cache billing behavior,
+/// per-request effort, or a narrower tool/memory surface for itself. With
+/// every key unset (the shipped default) a headless launch is byte-identical
+/// to one built before this table existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadlessEffortConfig {
+    pub trivial: Option<String>,
+    pub bounded: Option<String>,
+    pub substantial: Option<String>,
+    pub architectural: Option<String>,
+}
+
+/// Issue #788: `[headless]` itself -- see [`HeadlessEffortConfig`]'s own doc
+/// comment for the trust/scope statement shared by every key here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadlessConfig {
+    /// `"5m"` or `"1h"`, unset by default. When set, a headless claude
+    /// launch gets env `CLAUDE_CODE_PROMPT_CACHE_TTL=<value>` -- skipped
+    /// when the operator's own process environment already sets
+    /// `CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M` or
+    /// `ENABLE_PROMPT_CACHING_1H` (the operator's own env wins).
+    pub prompt_cache_ttl: Option<String>,
+    /// Per intake-complexity `CLAUDE_CODE_EFFORT_LEVEL`, from the same
+    /// deterministic classifier the intake hook uses
+    /// (`proxy::decision::try_classify_request`), text only -- never a Jev
+    /// call. Every class unset by default; skipped when the operator's own
+    /// process environment already sets `CLAUDE_CODE_EFFORT_LEVEL` or the
+    /// claude argv already carries `--effort`.
+    pub effort: HeadlessEffortConfig,
+    /// When true, a headless launch's settings layer adds
+    /// `"autoMemoryEnabled": false` and `"disableBundledSkills": true`.
+    pub lean: bool,
+    /// Extra tool names appended to a headless launch's `--disallowedTools`
+    /// deny list. Empty by default.
+    pub disallowed_tools: Vec<String>,
+}
+
 /// Per-agent override for which model runs code review, keyed the same way
 /// as `UseCreditsConfig` (operator thinks in agent names). `None` -- the
 /// default for both -- defers to that adapter's own `AgentAdapter::
@@ -3133,6 +3178,10 @@ pub struct CtxConfig {
     /// proxy may consult the shared Jev client. Every key is
     /// `REPO_FORBIDDEN`; see [`JevConfig`].
     pub jev: JevConfig,
+    /// Issue #788: operator-only, off-by-default cost levers for a headless
+    /// (`-p`) Claude Code launch. Every key is `REPO_FORBIDDEN`; see
+    /// [`HeadlessConfig`].
+    pub headless: HeadlessConfig,
     /// Issue #352's experimental persistent-runtime gate. Every key is
     /// `REPO_FORBIDDEN`; see [`SessionConfig`].
     pub session: SessionConfig,
@@ -4150,6 +4199,43 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
+    ),
+    // Issue #788: the operator's own override for every `[headless]` cost
+    // lever -- see that same const's own entries in `REPO_FORBIDDEN`, below.
+    // `headless.disallowed_tools` has no `ENV_MAP` entry: like `sandbox.
+    // extra_allow`/`dash.workdir_roots`, `EnvKind` has no list-shaped
+    // variant, so `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` is a plain
+    // comma-separated override applied directly to `cfg.headless.
+    // disallowed_tools` after `ENV_MAP` runs.
+    (
+        "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
+        &["headless", "prompt_cache_ttl"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL",
+        &["headless", "effort", "trivial"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED",
+        &["headless", "effort", "bounded"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
+        &["headless", "effort", "substantial"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL",
+        &["headless", "effort", "architectural"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_LEAN",
+        &["headless", "lean"],
+        EnvKind::Bool,
     ),
 ];
 
@@ -5512,6 +5598,34 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
+    // Issue #788: `[headless]` cost levers for a headless Claude Code
+    // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
+    // reasoning as `[jev]` right above.
+    (
+        &["headless", "prompt_cache_ttl"],
+        "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
+    ),
+    (
+        &["headless", "effort", "trivial"],
+        "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL",
+    ),
+    (
+        &["headless", "effort", "bounded"],
+        "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED",
+    ),
+    (
+        &["headless", "effort", "substantial"],
+        "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
+    ),
+    (
+        &["headless", "effort", "architectural"],
+        "ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL",
+    ),
+    (&["headless", "lean"], "ZIRV_CTX_HEADLESS_LEAN"),
+    (
+        &["headless", "disallowed_tools"],
+        "ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS",
+    ),
 ];
 
 /// Operator-only keys nested inside array-of-table configuration. `value_at`
@@ -7043,6 +7157,15 @@ impl CtxConfig {
             cfg.dash.workdir_roots = split_csv_list(&raw);
         }
 
+        // Same operator-only override shape as `dash.workdir_roots` right
+        // above: `headless.disallowed_tools` is `REPO_FORBIDDEN` outright, so
+        // there is no repo contribution to union in -- only the operator's
+        // own home layer, or `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` replacing
+        // it outright when set.
+        if let Some(raw) = env("ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS") {
+            cfg.headless.disallowed_tools = split_csv_list(&raw);
+        }
+
         // Same operator-only override shape as `extra_allow` right above:
         // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
         // whatever `workflow.check_env_passthrough` the merged TOML layers
@@ -7162,6 +7285,42 @@ impl CtxConfig {
                 )
                 .into(),
             ));
+        }
+
+        // Issue #788: `headless.prompt_cache_ttl` reaches a headless launch's
+        // `CLAUDE_CODE_PROMPT_CACHE_TTL` env verbatim -- the same "loud
+        // rather than silent" constraint as `chat.claude_permission_mode`
+        // right above, against the two values Claude Code's own docs name.
+        if let Some(ttl) = cfg.headless.prompt_cache_ttl.as_deref()
+            && !matches!(ttl, "5m" | "1h")
+        {
+            return Err(add_config_error_prefix(
+                format!("headless.prompt_cache_ttl must be \"5m\" or \"1h\", got \"{ttl}\"").into(),
+            ));
+        }
+        for (key, effort) in [
+            ("headless.effort.trivial", &cfg.headless.effort.trivial),
+            ("headless.effort.bounded", &cfg.headless.effort.bounded),
+            (
+                "headless.effort.substantial",
+                &cfg.headless.effort.substantial,
+            ),
+            (
+                "headless.effort.architectural",
+                &cfg.headless.effort.architectural,
+            ),
+        ] {
+            if let Some(level) = effort.as_deref()
+                && !matches!(level, "low" | "medium" | "high" | "xhigh" | "max")
+            {
+                return Err(add_config_error_prefix(
+                    format!(
+                        "{key} must be \"low\", \"medium\", \"high\", \"xhigh\" or \"max\", got \
+                         \"{level}\""
+                    )
+                    .into(),
+                ));
+            }
         }
 
         // `review.claude`/`review.codex` land in injected prompt text (see
@@ -8948,6 +9107,110 @@ mod tests {
         assert!(cfg.jev.inject);
         assert!(cfg.jev.stop_verify);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
+    }
+
+    /// Every `[headless]` key is `REPO_FORBIDDEN`: a repo checkout must not
+    /// be able to turn on a headless cost lever for itself -- same reasoning
+    /// as `jev_keys_are_repo_forbidden` above.
+    #[test]
+    fn headless_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            (
+                "[headless]\nprompt_cache_ttl = \"1h\"\n",
+                "prompt_cache_ttl",
+            ),
+            ("[headless]\nlean = true\n", "lean"),
+            (
+                "[headless]\ndisallowed_tools = [\"WebFetch\"]\n",
+                "disallowed_tools",
+            ),
+            ("[headless.effort]\ntrivial = \"low\"\n", "effort.trivial"),
+            (
+                "[headless.effort]\nbounded = \"medium\"\n",
+                "effort.bounded",
+            ),
+            (
+                "[headless.effort]\nsubstantial = \"high\"\n",
+                "effort.substantial",
+            ),
+            (
+                "[headless.effort]\narchitectural = \"max\"\n",
+                "effort.architectural",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set headless.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "headless.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_HEADLESS_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_headless_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL", "5m"),
+            ("ZIRV_CTX_HEADLESS_LEAN", "true"),
+            ("ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS", "WebFetch, Task"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "low"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_BOUNDED", "medium"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL", "high"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL", "max"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert_eq!(cfg.headless.prompt_cache_ttl.as_deref(), Some("5m"));
+        assert!(cfg.headless.lean);
+        assert_eq!(
+            cfg.headless.disallowed_tools,
+            vec!["WebFetch".to_string(), "Task".to_string()]
+        );
+        assert_eq!(cfg.headless.effort.trivial.as_deref(), Some("low"));
+        assert_eq!(cfg.headless.effort.bounded.as_deref(), Some("medium"));
+        assert_eq!(cfg.headless.effort.substantial.as_deref(), Some("high"));
+        assert_eq!(cfg.headless.effort.architectural.as_deref(), Some("max"));
+    }
+
+    /// `headless.prompt_cache_ttl` and `headless.effort.*` are constrained to
+    /// exactly the values Claude Code's own CLI/env accept -- an
+    /// unrecognized value is a load-time error naming the key, the same
+    /// "loud rather than silent" style `chat.claude_permission_mode`'s own
+    /// validation above uses.
+    #[test]
+    fn headless_prompt_cache_ttl_and_effort_reject_bad_values() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL", "30m")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an unrecognized ttl must be refused");
+        assert!(
+            err.to_string().contains("headless.prompt_cache_ttl"),
+            "got {err}"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "extreme")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an unrecognized effort level must be refused");
+        assert!(
+            err.to_string().contains("headless.effort.trivial"),
+            "got {err}"
+        );
     }
 
     #[test]
