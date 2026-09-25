@@ -90,12 +90,7 @@ JEV_GATE_KEYS = [
     # Issues #781-#786 (PR #790).
     "approve", "approve_allow", "classify", "handoff_select", "inject_screen",
     "inject", "stop_verify",
-    # Issue #537 headless follow-up: landing in parallel with this benchmark
-    # round (ZIRV_CTX_JEV_MISSING_TESTS / ZIRV_CTX_JEV_LAUNCH_EFFORT /
-    # ZIRV_CTX_JEV_COMPACTION_SELECT via jev_env_var) -- listed here ahead of
-    # the binary that reads them landing so zirv-jev-full/zirv-nojev are
-    # ready to turn them on/off the moment it does; an unrecognised env var
-    # on a binary that doesn't know it yet is a harmless no-op.
+    # Round 7: headless missing-tests, launch-effort and compaction keep-list gates.
     "missing_tests", "launch_effort", "compaction_select",
 ]
 JEV_FULL_COND = "zirv-jev-full"
