@@ -132,16 +132,6 @@ pub struct ResultArgs {
     pub max_bytes: Option<usize>,
 }
 
-fn require(value: &str, field: &str) -> Result<(), ToolError> {
-    if value.trim().is_empty() {
-        return Err(ToolError::new(
-            ToolErrorCode::InvalidArguments,
-            format!("{field} must not be empty"),
-        ));
-    }
-    Ok(())
-}
-
 /// The id rule the delegation store itself enforces, applied at the argument
 /// boundary so a malformed id from provider output is an `InvalidArguments`
 /// error rather than a path the service has to reject later.
@@ -162,18 +152,18 @@ pub fn validate_handle(delegation: &str) -> Result<(), ToolError> {
 
 impl DelegateArgs {
     pub fn validate(&self) -> Result<(), ToolError> {
-        require(&self.brief, "brief")?;
+        super::non_empty(self.brief.trim(), "brief")?;
         if let Some(target) = &self.target {
-            require(target, "target")?;
+            super::non_empty(target.trim(), "target")?;
         }
         if let Some(role) = &self.role {
-            require(role, "role")?;
+            super::non_empty(role.trim(), "role")?;
         }
         if let Some(task) = &self.task {
-            require(task, "task")?;
+            super::non_empty(task.trim(), "task")?;
         }
         if let Some(manifest) = &self.manifest {
-            require(manifest, "manifest")?;
+            super::non_empty(manifest.trim(), "manifest")?;
         }
         Ok(())
     }

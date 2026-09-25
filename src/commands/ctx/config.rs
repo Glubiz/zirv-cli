@@ -4718,30 +4718,33 @@ fn float_at(value: Option<toml::Value>) -> Option<f64> {
     })
 }
 
-/// T9: the repo-narrowing fold for `pace.enabled`, mirroring `policy::
-/// EffectivePolicy::narrowed_by`'s own `Stance::max` -- `true` (the gate is
-/// on) is the stricter value, so it wins regardless of which layer set it.
-/// `repo` absent (`None`) contributes nothing: a repo that never mentions
-/// `pace.enabled` must not accidentally *turn it on* against an operator who
-/// deliberately left it at `home`'s value (which could itself be the
-/// built-in default, already folded in by the caller). This is genuinely
-/// the same shape `policy::resolve` uses -- a repo checkout may push
-/// *stricter* than whatever the operator configured, never looser -- unlike
-/// every other `REPO_FORBIDDEN` key, which the repo may not touch at all;
-/// see this module's own `REPO_FORBIDDEN` doc comment for why `pace.enabled`
-/// deliberately is not on that list.
-fn narrow_pace_bool(home: bool, repo: Option<bool>) -> bool {
-    home.max(repo.unwrap_or(false))
+/// Shared repo-narrowing fold: the smaller of `home` and `repo` (`repo`
+/// absent treated as `absent`) wins -- used by every key below where a
+/// lower value is stricter, including `bool` (`false` stricter than
+/// `true`). Not for `f64`: use [`narrow_min_f64`], since `f64::min` treats
+/// `NaN` differently than a plain `PartialOrd` comparison.
+fn narrow_min<T: PartialOrd + Copy>(home: T, repo: Option<T>, absent: T) -> T {
+    let repo = repo.unwrap_or(absent);
+    if repo < home { repo } else { home }
 }
 
-/// T9: the repo-narrowing fold for `pace.max_percent`/`pace.soft_percent` --
-/// lower is stricter (a tighter ceiling or an earlier soft-throttle band),
-/// so the smaller of the two layers wins. `repo` absent contributes nothing
-/// (folds in as `f64::INFINITY`, which `min` never picks over a real
-/// `home` value), the numeric mirror of `narrow_pace_bool`'s own
-/// `unwrap_or(false)`.
-fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
-    home.min(repo.unwrap_or(f64::INFINITY))
+/// The `max` mirror of [`narrow_min`]: the larger of `home` and `repo`
+/// wins. Not for `f64`: use [`narrow_max_f64`].
+fn narrow_max<T: PartialOrd + Copy>(home: T, repo: Option<T>, absent: T) -> T {
+    let repo = repo.unwrap_or(absent);
+    if repo > home { repo } else { home }
+}
+
+/// [`narrow_min`] for `f64`, via the primitive `f64::min` so `NaN` is
+/// ignored rather than compared, matching the original per-key folds.
+fn narrow_min_f64(home: f64, repo: Option<f64>, absent: f64) -> f64 {
+    home.min(repo.unwrap_or(absent))
+}
+
+/// [`narrow_max`] for `f64`, via the primitive `f64::max`; see
+/// [`narrow_min_f64`].
+fn narrow_max_f64(home: f64, repo: Option<f64>, absent: f64) -> f64 {
+    home.max(repo.unwrap_or(absent))
 }
 
 /// Issue #358 T8: the repo-narrowing fold for `supervise.orchestrator_
@@ -4751,8 +4754,7 @@ fn narrow_pace_percent(home: f64, repo: Option<f64>) -> f64 {
 /// asking for a stricter posture than the operator configured wins, a repo
 /// asking for a looser one is ignored. `repo` absent contributes nothing
 /// (folds in as `Allow`, the loosest value, so an untouched repo layer never
-/// tightens a home layer that left this at `Allow`) -- the enum mirror of
-/// `narrow_pace_bool`'s own `unwrap_or(false)`.
+/// tightens a home layer that left this at `Allow`).
 fn narrow_orchestrator_writes(
     home: OrchestratorWrites,
     repo: Option<OrchestratorWrites>,
@@ -4776,156 +4778,6 @@ fn orchestrator_writes_at(
         .transpose()
 }
 
-/// Issue #155, Phase 3: the repo-narrowing fold for `context.dedupe_native`
-/// -- the mirror of `narrow_pace_bool` with the opposite polarity. There,
-/// `true` (the gate is on) is strict; here `false` (always inject, never
-/// trust a native file) is strict, because that is this key's safe
-/// direction. `repo` absent contributes nothing (folds in as `true`, the
-/// loose value, so an untouched repo layer never forces the strict `false`
-/// on a home layer that left dedupe on) -- the mirror of `narrow_pace_bool`'s
-/// own `unwrap_or(false)`.
-fn narrow_dedupe_bool(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #539 fix round (inline-argv budget regression): the repo-narrowing
-/// fold for `prompt.skill_index` -- the same polarity as `narrow_dedupe_
-/// bool`, since `false` (the layer is off) is this key's strict direction.
-/// A repo checkout may turn the index off for itself but never force it back
-/// on for an operator who disabled it (e.g. to work around a host's own
-/// inline-argv limits).
-fn narrow_skill_index_bool(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #753: the repo-narrowing fold for `prompt.intake_discipline` --
-/// `false` (no intake note) is this key's strict direction, exactly like
-/// `narrow_skill_index_bool`.
-fn narrow_intake_discipline_bool(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #309: the repo-narrowing fold for `verify_on_stop.enabled` -- the
-/// same polarity as `narrow_dedupe_bool`, since `false` (the nudge is off) is
-/// this key's strict direction. `repo` absent contributes nothing (folds in
-/// as `true`, the loose value), so an untouched repo layer never forces the
-/// feature off for an operator who left it on, but a repo layer cannot flip
-/// an operator's own `enabled = false` back to `true` either.
-fn narrow_verify_on_stop_enabled(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #309: the repo-narrowing fold for `verify_on_stop.max_nudges` --
-/// lower is stricter (fewer nudges per session), the numeric mirror of
-/// `narrow_pace_percent`. `repo` absent contributes nothing (folds in as
-/// `u32::MAX`, which `min` never picks over a real `home` value).
-fn narrow_max_nudges(home: u32, repo: Option<u32>) -> u32 {
-    home.min(repo.unwrap_or(u32::MAX))
-}
-
-/// Issue #308 stage 1: the repo-narrowing fold for `diagnostics.enabled` --
-/// the same polarity as `narrow_verify_on_stop_enabled`, since `false` (the
-/// checker never runs) is this key's strict direction.
-fn narrow_diagnostics_enabled(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Q1: the repo-narrowing fold for `missing_tests_gate.enabled` -- the same
-/// polarity as `narrow_verify_on_stop_enabled`/`narrow_diagnostics_enabled`,
-/// since `false` (the check never blocks) is this key's strict direction.
-fn narrow_missing_tests_gate_enabled(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #774: the repo-narrowing fold for `subagent_stop_gate.enabled` --
-/// identical shape/polarity to `narrow_missing_tests_gate_enabled` above.
-fn narrow_subagent_stop_gate_enabled(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// The repo-narrowing fold for `scope_guard.enabled` -- identical
-/// shape/polarity to `narrow_missing_tests_gate_enabled`/`narrow_subagent_
-/// stop_gate_enabled` above.
-fn narrow_scope_guard_enabled(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #308 stage 1: the repo-narrowing fold for
-/// `diagnostics.max_diagnostics` -- lower is stricter, the identical shape as
-/// `narrow_max_nudges`.
-fn narrow_max_diagnostics(home: u32, repo: Option<u32>) -> u32 {
-    home.min(repo.unwrap_or(u32::MAX))
-}
-
-/// Issue #308 stage 1: the repo-narrowing fold for `diagnostics.timeout_secs`
-/// -- a shorter timeout is stricter (a repo cannot make the checker run
-/// longer than the operator allows), the `u64` mirror of `narrow_max_nudges`.
-fn narrow_diagnostics_timeout_secs(home: u64, repo: Option<u64>) -> u64 {
-    home.min(repo.unwrap_or(u64::MAX))
-}
-
-/// Issue #312: the repo-narrowing fold for `compact_advisory.min_reclaim_tokens`
-/// -- HIGHER is stricter here (the advisory fires less eagerly), the opposite
-/// polarity from `narrow_max_nudges`: a repo checkout may quieten the Stop
-/// hook's compact suggestion, never make it nag every turn.
-fn narrow_compact_advisory_min_reclaim(home: u64, repo: Option<u64>) -> u64 {
-    home.max(repo.unwrap_or(0))
-}
-
-/// Issue #312: the same fold for `compact_advisory.window_fraction` -- a
-/// higher fraction means the advisory waits for a fuller window.
-fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 {
-    home.max(repo.unwrap_or(0.0))
-}
-
-/// Issue #311: the repo-narrowing fold for `supervise.loop_backoff_ceiling_
-/// secs` -- lower is stricter (the self-paced loop checks in sooner), the
-/// identical shape as `narrow_max_nudges`: `repo` absent contributes nothing
-/// (folds in as `u64::MAX`, which `min` never picks over a real `home`
-/// value).
-fn narrow_loop_backoff_ceiling_secs(home: u64, repo: Option<u64>) -> u64 {
-    home.min(repo.unwrap_or(u64::MAX))
-}
-
-/// Issue #412: the repo-narrowing fold for `output.diff_max_bytes` -- lower
-/// is stricter (a diff is replaced by a bounded listing sooner), the
-/// identical shape as `narrow_loop_backoff_ceiling_secs`: `repo` absent
-/// contributes nothing (folds in as `u64::MAX`, which `min` never picks over
-/// a real `home` value).
-fn narrow_diff_max_bytes(home: u64, repo: Option<u64>) -> u64 {
-    home.min(repo.unwrap_or(u64::MAX))
-}
-
-/// Issue #262: the repo-narrowing fold for `worker.max_depth` -- lower is
-/// stricter (fewer hops of delegation reach), the `u8` mirror of
-/// `narrow_max_nudges`.
-fn narrow_worker_max_depth(home: u8, repo: Option<u8>) -> u8 {
-    home.min(repo.unwrap_or(u8::MAX))
-}
-
-/// Issue #262: the repo-narrowing fold for `worker.deny_network` -- `true`
-/// (network denied) is the strict direction, the same polarity as
-/// `narrow_pace_bool`: a repo checkout may deny network access for every
-/// delegated worker it hosts, but may never reopen it once the operator (or
-/// another repo layer) has denied it.
-fn narrow_worker_deny_network(home: bool, repo: Option<bool>) -> bool {
-    home.max(repo.unwrap_or(false))
-}
-
-/// Issue #718: the repo-narrowing fold for `worktree.idle_pool_max` -- lower
-/// is stricter (a smaller warm pool), the `u32` mirror of `narrow_max_
-/// nudges`.
-fn narrow_worktree_idle_pool_max(home: u32, repo: Option<u32>) -> u32 {
-    home.min(repo.unwrap_or(u32::MAX))
-}
-
-/// Issue #718: the repo-narrowing fold for `worktree.idle_ttl_secs` -- lower
-/// is stricter (an idle tree is retired sooner), the identical shape as
-/// `narrow_loop_backoff_ceiling_secs`.
-fn narrow_worktree_idle_ttl_secs(home: u64, repo: Option<u64>) -> u64 {
-    home.min(repo.unwrap_or(u64::MAX))
-}
-
 /// Issue #314: the repo-narrowing fold for `objective.gates` -- the exact
 /// same shape as [`narrow_fallback_order`] (a repo checkout may drop entries
 /// from the operator's own list, never add or reorder one), reused here
@@ -4933,40 +4785,6 @@ fn narrow_worktree_idle_ttl_secs(home: u64, repo: Option<u64>) -> u64 {
 /// commands run, in the operator's own order" folds.
 fn narrow_objective_gates(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<String> {
     narrow_fallback_order(home, repo)
-}
-
-/// Issue #314: the repo-narrowing fold for
-/// `objective.max_cycles_without_progress` -- lower is stricter (the loop
-/// gives up sooner), the identical shape as `narrow_max_nudges`.
-fn narrow_max_cycles_without_progress(home: u32, repo: Option<u32>) -> u32 {
-    home.min(repo.unwrap_or(u32::MAX))
-}
-
-/// Issue #314: the repo-narrowing fold for `objective.judge` -- `false` (the
-/// judge is off) is the strict direction, the identical polarity as
-/// `narrow_verify_on_stop_enabled`/`narrow_diagnostics_enabled`: a repo
-/// checkout may turn the judge off for itself (falling back to gates and a
-/// manual `zirv ctx objective close`), but may never force it back on
-/// against an operator (or another layer) that left it off.
-fn narrow_objective_judge(home: bool, repo: Option<bool>) -> bool {
-    home.min(repo.unwrap_or(true))
-}
-
-/// Issue #272: the repo-narrowing fold for every `[screen]` `u32` threshold
-/// (`repetition_min_fragment`/`_window`/`_min_repeats`) -- lower is stricter
-/// (detection fires on a shorter fragment, a smaller window, or fewer
-/// repeats), the identical shape as `narrow_max_nudges`.
-fn narrow_screen_threshold(home: u32, repo: Option<u32>) -> u32 {
-    home.min(repo.unwrap_or(u32::MAX))
-}
-
-/// Issue #272: the repo-narrowing fold for `screen.repetition_dominance_pct`
-/// -- lower is stricter here too (less of the fragment needs to be repeats
-/// before it counts as dominated), the `f64` mirror of `narrow_screen_
-/// threshold` rather than `narrow_compact_advisory_window_fraction`'s
-/// opposite (higher-is-stricter) polarity.
-fn narrow_screen_dominance_pct(home: f64, repo: Option<f64>) -> f64 {
-    home.min(repo.unwrap_or(f64::MAX))
 }
 
 /// Finding 4 (review): the one comma-separated-list splitter shared by every
@@ -6753,11 +6571,12 @@ impl CtxConfig {
             &mut merged,
             &["supervise", "loop_backoff_ceiling_secs"],
             toml::Value::Integer(
-                i64::try_from(narrow_loop_backoff_ceiling_secs(
+                i64::try_from(narrow_min(
                     home_loop_backoff_ceiling
                         .and_then(|v| u64::try_from(v).ok())
                         .unwrap_or(default_supervise.loop_backoff_ceiling_secs),
                     repo_loop_backoff_ceiling.and_then(|v| u64::try_from(v).ok()),
+                    u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -6771,11 +6590,12 @@ impl CtxConfig {
             &mut merged,
             &["output", "diff_max_bytes"],
             toml::Value::Integer(
-                i64::try_from(narrow_diff_max_bytes(
+                i64::try_from(narrow_min(
                     home_output_diff_max_bytes
                         .and_then(|v| u64::try_from(v).ok())
                         .unwrap_or(default_output.diff_max_bytes as u64),
                     repo_output_diff_max_bytes.and_then(|v| u64::try_from(v).ok()),
+                    u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -6788,60 +6608,67 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["pace", "enabled"],
-            toml::Value::Boolean(narrow_pace_bool(
+            toml::Value::Boolean(narrow_max(
                 home_pace_enabled.unwrap_or(default_pace.enabled),
                 repo_pace_enabled,
+                false,
             )),
         );
         insert_path(
             &mut merged,
             &["pace", "max_percent"],
-            toml::Value::Float(narrow_pace_percent(
+            toml::Value::Float(narrow_min_f64(
                 home_pace_max_percent.unwrap_or(default_pace.max_percent),
                 repo_pace_max_percent,
+                f64::INFINITY,
             )),
         );
         insert_path(
             &mut merged,
             &["pace", "soft_percent"],
-            toml::Value::Float(narrow_pace_percent(
+            toml::Value::Float(narrow_min_f64(
                 home_pace_soft_percent.unwrap_or(default_pace.soft_percent),
                 repo_pace_soft_percent,
+                f64::INFINITY,
             )),
         );
         let default_context = ContextConfig::default();
         insert_path(
             &mut merged,
             &["context", "dedupe_native"],
-            toml::Value::Boolean(narrow_dedupe_bool(
+            toml::Value::Boolean(narrow_min(
                 home_context_dedupe_native.unwrap_or(default_context.dedupe_native),
                 repo_context_dedupe_native,
+                true,
             )),
         );
         let default_prompt = PromptConfig::default();
         insert_path(
             &mut merged,
             &["prompt", "skill_index"],
-            toml::Value::Boolean(narrow_skill_index_bool(
+            toml::Value::Boolean(narrow_min(
                 home_prompt_skill_index.unwrap_or(default_prompt.skill_index),
                 repo_prompt_skill_index,
+                true,
             )),
         );
         insert_path(
             &mut merged,
             &["prompt", "intake_discipline"],
-            toml::Value::Boolean(narrow_intake_discipline_bool(
+            toml::Value::Boolean(narrow_min(
                 home_prompt_intake_discipline.unwrap_or(default_prompt.intake_discipline),
                 repo_prompt_intake_discipline,
+                true,
             )),
         );
         let default_verify_on_stop = VerifyOnStopConfig::default();
         insert_path(
             &mut merged,
             &["verify_on_stop", "enabled"],
-            toml::Value::Boolean(narrow_verify_on_stop_enabled(
+            toml::Value::Boolean(narrow_min(
                 home_verify_on_stop_enabled.unwrap_or(default_verify_on_stop.enabled),
                 repo_verify_on_stop_enabled,
+                true,
             )),
         );
         let home_max_nudges = home_verify_on_stop_max_nudges
@@ -6851,9 +6678,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["verify_on_stop", "max_nudges"],
-            toml::Value::Integer(i64::from(narrow_max_nudges(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_max_nudges,
                 repo_max_nudges,
+                u32::MAX,
             ))),
         );
 
@@ -6861,9 +6689,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["diagnostics", "enabled"],
-            toml::Value::Boolean(narrow_diagnostics_enabled(
+            toml::Value::Boolean(narrow_min(
                 home_diagnostics_enabled.unwrap_or(default_diagnostics.enabled),
                 repo_diagnostics_enabled,
+                true,
             )),
         );
         let home_max_diagnostics = home_diagnostics_max
@@ -6873,9 +6702,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["diagnostics", "max_diagnostics"],
-            toml::Value::Integer(i64::from(narrow_max_diagnostics(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_max_diagnostics,
                 repo_max_diagnostics,
+                u32::MAX,
             ))),
         );
         let home_diagnostics_timeout_secs = home_diagnostics_timeout
@@ -6887,9 +6717,10 @@ impl CtxConfig {
             &mut merged,
             &["diagnostics", "timeout_secs"],
             toml::Value::Integer(
-                i64::try_from(narrow_diagnostics_timeout_secs(
+                i64::try_from(narrow_min(
                     home_diagnostics_timeout_secs,
                     repo_diagnostics_timeout_secs,
+                    u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -6899,9 +6730,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["missing_tests_gate", "enabled"],
-            toml::Value::Boolean(narrow_missing_tests_gate_enabled(
+            toml::Value::Boolean(narrow_min(
                 home_missing_tests_gate_enabled.unwrap_or(default_missing_tests_gate.enabled),
                 repo_missing_tests_gate_enabled,
+                true,
             )),
         );
 
@@ -6909,9 +6741,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["subagent_stop_gate", "enabled"],
-            toml::Value::Boolean(narrow_subagent_stop_gate_enabled(
+            toml::Value::Boolean(narrow_min(
                 home_subagent_stop_gate_enabled.unwrap_or(default_subagent_stop_gate.enabled),
                 repo_subagent_stop_gate_enabled,
+                true,
             )),
         );
 
@@ -6919,9 +6752,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["scope_guard", "enabled"],
-            toml::Value::Boolean(narrow_scope_guard_enabled(
+            toml::Value::Boolean(narrow_min(
                 home_scope_guard_enabled.unwrap_or(default_scope_guard.enabled),
                 repo_scope_guard_enabled,
+                true,
             )),
         );
 
@@ -6933,9 +6767,10 @@ impl CtxConfig {
             &mut merged,
             &["compact_advisory", "min_reclaim_tokens"],
             toml::Value::Integer(
-                i64::try_from(narrow_compact_advisory_min_reclaim(
+                i64::try_from(narrow_max(
                     home_compact_advisory_min_reclaim_tokens,
                     repo_compact_advisory_min_reclaim.and_then(|v| u64::try_from(v).ok()),
+                    0,
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -6943,10 +6778,11 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["compact_advisory", "window_fraction"],
-            toml::Value::Float(narrow_compact_advisory_window_fraction(
+            toml::Value::Float(narrow_max_f64(
                 home_compact_advisory_window_fraction
                     .unwrap_or(default_compact_advisory.window_fraction),
                 repo_compact_advisory_window_fraction,
+                0.0,
             )),
         );
 
@@ -6958,17 +6794,19 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["worker", "max_depth"],
-            toml::Value::Integer(i64::from(narrow_worker_max_depth(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_worker_max_depth_value,
                 repo_worker_max_depth_value,
+                u8::MAX,
             ))),
         );
         insert_path(
             &mut merged,
             &["worker", "deny_network"],
-            toml::Value::Boolean(narrow_worker_deny_network(
+            toml::Value::Boolean(narrow_max(
                 home_worker_deny_network.unwrap_or(default_worker.deny_network),
                 repo_worker_deny_network,
+                false,
             )),
         );
 
@@ -6981,9 +6819,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["worktree", "idle_pool_max"],
-            toml::Value::Integer(i64::from(narrow_worktree_idle_pool_max(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_worktree_idle_pool_max_value,
                 repo_worktree_idle_pool_max_value,
+                u32::MAX,
             ))),
         );
         let home_worktree_idle_ttl_secs_value = home_worktree_idle_ttl_secs
@@ -6995,9 +6834,10 @@ impl CtxConfig {
             &mut merged,
             &["worktree", "idle_ttl_secs"],
             toml::Value::Integer(
-                i64::try_from(narrow_worktree_idle_ttl_secs(
+                i64::try_from(narrow_min(
                     home_worktree_idle_ttl_secs_value,
                     repo_worktree_idle_ttl_secs_value,
+                    u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -7024,17 +6864,19 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["objective", "max_cycles_without_progress"],
-            toml::Value::Integer(i64::from(narrow_max_cycles_without_progress(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_objective_max_cycles_value,
                 repo_objective_max_cycles_value,
+                u32::MAX,
             ))),
         );
         insert_path(
             &mut merged,
             &["objective", "judge"],
-            toml::Value::Boolean(narrow_objective_judge(
+            toml::Value::Boolean(narrow_min(
                 home_objective_judge.unwrap_or(default_objective.judge),
                 repo_objective_judge,
+                true,
             )),
         );
 
@@ -7047,9 +6889,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["screen", "repetition_min_fragment"],
-            toml::Value::Integer(i64::from(narrow_screen_threshold(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_screen_min_fragment_value,
                 repo_screen_min_fragment_value,
+                u32::MAX,
             ))),
         );
         let home_screen_window_value = home_screen_window
@@ -7059,9 +6902,10 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["screen", "repetition_window"],
-            toml::Value::Integer(i64::from(narrow_screen_threshold(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_screen_window_value,
                 repo_screen_window_value,
+                u32::MAX,
             ))),
         );
         let home_screen_min_repeats_value = home_screen_min_repeats
@@ -7072,17 +6916,19 @@ impl CtxConfig {
         insert_path(
             &mut merged,
             &["screen", "repetition_min_repeats"],
-            toml::Value::Integer(i64::from(narrow_screen_threshold(
+            toml::Value::Integer(i64::from(narrow_min(
                 home_screen_min_repeats_value,
                 repo_screen_min_repeats_value,
+                u32::MAX,
             ))),
         );
         insert_path(
             &mut merged,
             &["screen", "repetition_dominance_pct"],
-            toml::Value::Float(narrow_screen_dominance_pct(
+            toml::Value::Float(narrow_min_f64(
                 home_screen_dominance_pct.unwrap_or(default_screen.repetition_dominance_pct),
                 repo_screen_dominance_pct,
+                f64::MAX,
             )),
         );
 
@@ -8473,12 +8319,12 @@ mod tests {
     fn compact_advisory_repo_layer_may_only_quieten_the_advisory() {
         assert_eq!(CompactAdvisoryConfig::default().min_reclaim_tokens, 4096);
         assert_eq!(CompactAdvisoryConfig::default().window_fraction, 0.6);
-        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(2048)), 4096);
-        assert_eq!(narrow_compact_advisory_min_reclaim(4096, Some(8192)), 8192);
-        assert_eq!(narrow_compact_advisory_min_reclaim(4096, None), 4096);
-        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.5)), 0.6);
-        assert_eq!(narrow_compact_advisory_window_fraction(0.6, Some(0.9)), 0.9);
-        assert_eq!(narrow_compact_advisory_window_fraction(0.6, None), 0.6);
+        assert_eq!(narrow_max(4096u64, Some(2048), 0), 4096);
+        assert_eq!(narrow_max(4096u64, Some(8192), 0), 8192);
+        assert_eq!(narrow_max(4096u64, None, 0), 4096);
+        assert_eq!(narrow_max_f64(0.6, Some(0.5), 0.0), 0.6);
+        assert_eq!(narrow_max_f64(0.6, Some(0.9), 0.0), 0.9);
+        assert_eq!(narrow_max_f64(0.6, None, 0.0), 0.6);
 
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -8521,9 +8367,9 @@ mod tests {
     #[test]
     fn loop_backoff_ceiling_repo_layer_may_only_lower_it() {
         assert_eq!(SuperviseConfig::default().loop_backoff_ceiling_secs, 900);
-        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(1800)), 900);
-        assert_eq!(narrow_loop_backoff_ceiling_secs(900, Some(300)), 300);
-        assert_eq!(narrow_loop_backoff_ceiling_secs(900, None), 900);
+        assert_eq!(narrow_min(900, Some(1800), u64::MAX), 900);
+        assert_eq!(narrow_min(900, Some(300), u64::MAX), 300);
+        assert_eq!(narrow_min(900, None, u64::MAX), 900);
 
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -8560,9 +8406,9 @@ mod tests {
     #[test]
     fn diff_max_bytes_repo_layer_may_only_lower_it() {
         assert_eq!(OutputConfig::default().diff_max_bytes, 65536);
-        assert_eq!(narrow_diff_max_bytes(65536, Some(131072)), 65536);
-        assert_eq!(narrow_diff_max_bytes(65536, Some(2048)), 2048);
-        assert_eq!(narrow_diff_max_bytes(65536, None), 65536);
+        assert_eq!(narrow_min(65536, Some(131072), u64::MAX), 65536);
+        assert_eq!(narrow_min(65536, Some(2048), u64::MAX), 2048);
+        assert_eq!(narrow_min(65536, None, u64::MAX), 65536);
 
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -9974,21 +9820,21 @@ mod tests {
     #[test]
     fn the_pace_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // enabled: true (stricter) wins no matter which layer set it.
-        assert!(narrow_pace_bool(true, None));
-        assert!(narrow_pace_bool(true, Some(false)), "repo may not weaken");
-        assert!(narrow_pace_bool(false, Some(true)), "repo may tighten");
-        assert!(!narrow_pace_bool(false, None), "both loose: stays loose");
-        assert!(!narrow_pace_bool(false, Some(false)));
+        assert!(narrow_max(true, None, false));
+        assert!(narrow_max(true, Some(false), false), "repo may not weaken");
+        assert!(narrow_max(false, Some(true), false), "repo may tighten");
+        assert!(!narrow_max(false, None, false), "both loose: stays loose");
+        assert!(!narrow_max(false, Some(false), false));
 
         // percent: lower (stricter) wins no matter which layer set it.
-        assert_eq!(narrow_pace_percent(90.0, None), 90.0);
+        assert_eq!(narrow_min_f64(90.0, None, f64::INFINITY), 90.0);
         assert_eq!(
-            narrow_pace_percent(70.0, Some(99.0)),
+            narrow_min_f64(70.0, Some(99.0), f64::INFINITY),
             70.0,
             "repo may not raise the ceiling above home's own"
         );
         assert_eq!(
-            narrow_pace_percent(99.0, Some(60.0)),
+            narrow_min_f64(99.0, Some(60.0), f64::INFINITY),
             60.0,
             "repo may lower it below home's own"
         );
@@ -10235,26 +10081,23 @@ mod tests {
     fn the_verify_on_stop_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // enabled: false (stricter, the feature is off) wins no matter which
         // layer set it.
-        assert!(narrow_verify_on_stop_enabled(true, None));
+        assert!(narrow_min(true, None, true));
         assert!(
-            !narrow_verify_on_stop_enabled(false, Some(true)),
+            !narrow_min(false, Some(true), true),
             "repo may not re-enable an operator-disabled feature"
         );
-        assert!(
-            !narrow_verify_on_stop_enabled(true, Some(false)),
-            "repo may disable it"
-        );
-        assert!(narrow_verify_on_stop_enabled(true, Some(true)));
+        assert!(!narrow_min(true, Some(false), true), "repo may disable it");
+        assert!(narrow_min(true, Some(true), true));
 
         // max_nudges: lower (stricter) wins no matter which layer set it.
-        assert_eq!(narrow_max_nudges(2, None), 2);
+        assert_eq!(narrow_min(2, None, u32::MAX), 2);
         assert_eq!(
-            narrow_max_nudges(2, Some(10)),
+            narrow_min(2, Some(10), u32::MAX),
             2,
             "repo may not raise the cap above home's own"
         );
         assert_eq!(
-            narrow_max_nudges(5, Some(1)),
+            narrow_min(5, Some(1), u32::MAX),
             1,
             "repo may lower it below home's own"
         );
@@ -10266,17 +10109,17 @@ mod tests {
     #[test]
     fn the_diagnostics_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // enabled: home true / repo false -> false (repo may disable it).
-        assert!(!narrow_diagnostics_enabled(true, Some(false)));
+        assert!(!narrow_min(true, Some(false), true));
         // enabled: home false / repo true -> false (repo may not re-enable an
         // operator-disabled feature).
-        assert!(!narrow_diagnostics_enabled(false, Some(true)));
-        assert!(narrow_diagnostics_enabled(true, None));
-        assert!(narrow_diagnostics_enabled(true, Some(true)));
+        assert!(!narrow_min(false, Some(true), true));
+        assert!(narrow_min(true, None, true));
+        assert!(narrow_min(true, Some(true), true));
 
         // max_diagnostics: home 10 / repo 5 -> 5 (repo may tighten the cap).
-        assert_eq!(narrow_max_diagnostics(10, Some(5)), 5);
+        assert_eq!(narrow_min(10, Some(5), u32::MAX), 5);
         // max_diagnostics: home 10 / repo 20 -> 10 (repo may not raise it).
-        assert_eq!(narrow_max_diagnostics(10, Some(20)), 10);
+        assert_eq!(narrow_min(10, Some(20), u32::MAX), 10);
     }
 
     /// Q1: the fold rule itself, pure and direct -- the same shape as
@@ -10284,12 +10127,12 @@ mod tests {
     #[test]
     fn the_missing_tests_gate_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // enabled: home true / repo false -> false (repo may disable it).
-        assert!(!narrow_missing_tests_gate_enabled(true, Some(false)));
+        assert!(!narrow_min(true, Some(false), true));
         // enabled: home false / repo true -> false (repo may not re-enable an
         // operator-disabled check).
-        assert!(!narrow_missing_tests_gate_enabled(false, Some(true)));
-        assert!(narrow_missing_tests_gate_enabled(true, None));
-        assert!(narrow_missing_tests_gate_enabled(true, Some(true)));
+        assert!(!narrow_min(false, Some(true), true));
+        assert!(narrow_min(true, None, true));
+        assert!(narrow_min(true, Some(true), true));
     }
 
     /// Issue #262: the fold rule itself, the same no-config-file, no-
@@ -10298,18 +10141,18 @@ mod tests {
     #[test]
     fn the_worker_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // max_depth: home 5 / repo 1 -> 1 (repo may tighten the cap).
-        assert_eq!(narrow_worker_max_depth(5, Some(1)), 1);
+        assert_eq!(narrow_min(5, Some(1), u8::MAX), 1);
         // max_depth: home 1 / repo 5 -> 1 (repo may not raise it).
-        assert_eq!(narrow_worker_max_depth(1, Some(5)), 1);
-        assert_eq!(narrow_worker_max_depth(5, None), 5);
+        assert_eq!(narrow_min(1, Some(5), u8::MAX), 1);
+        assert_eq!(narrow_min(5, None, u8::MAX), 5);
 
         // deny_network: home false / repo true -> true (repo may deny it).
-        assert!(narrow_worker_deny_network(false, Some(true)));
+        assert!(narrow_max(false, Some(true), false));
         // deny_network: home true / repo false -> true (repo may not reopen
         // network access an operator (or another repo layer) already denied).
-        assert!(narrow_worker_deny_network(true, Some(false)));
-        assert!(!narrow_worker_deny_network(false, None));
-        assert!(!narrow_worker_deny_network(false, Some(false)));
+        assert!(narrow_max(true, Some(false), false));
+        assert!(!narrow_max(false, None, false));
+        assert!(!narrow_max(false, Some(false), false));
     }
 
     /// Issue #262: the full `CtxConfig::load` integration -- a repo-layer
@@ -10368,15 +10211,15 @@ mod tests {
     #[test]
     fn the_worktree_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
         // idle_pool_max: home 4 / repo 1 -> 1 (repo may shrink the pool).
-        assert_eq!(narrow_worktree_idle_pool_max(4, Some(1)), 1);
+        assert_eq!(narrow_min(4, Some(1), u32::MAX), 1);
         // idle_pool_max: home 1 / repo 4 -> 1 (repo may not grow it).
-        assert_eq!(narrow_worktree_idle_pool_max(1, Some(4)), 1);
-        assert_eq!(narrow_worktree_idle_pool_max(4, None), 4);
+        assert_eq!(narrow_min(1, Some(4), u32::MAX), 1);
+        assert_eq!(narrow_min(4, None, u32::MAX), 4);
 
         // idle_ttl_secs: the identical shape, one level up in width.
-        assert_eq!(narrow_worktree_idle_ttl_secs(3600, Some(60)), 60);
-        assert_eq!(narrow_worktree_idle_ttl_secs(3600, Some(7200)), 3600);
-        assert_eq!(narrow_worktree_idle_ttl_secs(3600, None), 3600);
+        assert_eq!(narrow_min(3600, Some(60), u64::MAX), 60);
+        assert_eq!(narrow_min(3600, Some(7200), u64::MAX), 3600);
+        assert_eq!(narrow_min(3600, None, u64::MAX), 3600);
     }
 
     /// Issue #718: the full `CtxConfig::load` integration -- a repo-layer
@@ -10459,30 +10302,30 @@ mod tests {
 
         // max_cycles_without_progress: lower (stricter) wins no matter which
         // layer set it.
-        assert_eq!(narrow_max_cycles_without_progress(5, None), 5);
+        assert_eq!(narrow_min(5, None, u32::MAX), 5);
         assert_eq!(
-            narrow_max_cycles_without_progress(5, Some(20)),
+            narrow_min(5, Some(20), u32::MAX),
             5,
             "a repo may not raise the backstop above the operator's own"
         );
         assert_eq!(
-            narrow_max_cycles_without_progress(5, Some(1)),
+            narrow_min(5, Some(1), u32::MAX),
             1,
             "a repo may lower it below the operator's own"
         );
 
         // judge: false (the judge never runs) is the strict direction, the
         // same polarity as verify_on_stop.enabled/diagnostics.enabled.
-        assert!(narrow_objective_judge(true, None));
+        assert!(narrow_min(true, None, true));
         assert!(
-            !narrow_objective_judge(false, Some(true)),
+            !narrow_min(false, Some(true), true),
             "a repo may not force the judge on for an operator who turned it off"
         );
         assert!(
-            !narrow_objective_judge(true, Some(false)),
+            !narrow_min(true, Some(false), true),
             "a repo may turn the judge off for itself"
         );
-        assert!(narrow_objective_judge(true, Some(true)));
+        assert!(narrow_min(true, Some(true), true));
     }
 
     /// Issue #314: the full `CtxConfig::load` integration -- a repo layer may
@@ -10598,17 +10441,17 @@ mod tests {
                 "a repo may lower a threshold below the operator's own",
             ),
         ] {
-            assert_eq!(narrow_screen_threshold(home, repo), expected, "{why}");
+            assert_eq!(narrow_min(home, repo, u32::MAX), expected, "{why}");
         }
 
-        assert_eq!(narrow_screen_dominance_pct(0.5, None), 0.5);
+        assert_eq!(narrow_min_f64(0.5, None, f64::MAX), 0.5);
         assert_eq!(
-            narrow_screen_dominance_pct(0.5, Some(0.9)),
+            narrow_min_f64(0.5, Some(0.9), f64::MAX),
             0.5,
             "a repo may not raise the dominance floor above the operator's own"
         );
         assert_eq!(
-            narrow_screen_dominance_pct(0.5, Some(0.1)),
+            narrow_min_f64(0.5, Some(0.1), f64::MAX),
             0.1,
             "a repo may lower the dominance floor below the operator's own"
         );
@@ -10884,17 +10727,17 @@ mod tests {
     /// the opposite polarity -- `false` is strict here, not `true`.
     #[test]
     fn the_dedupe_narrowing_fold_rule_favours_always_injecting() {
-        assert!(!narrow_dedupe_bool(false, None));
+        assert!(!narrow_min(false, None, true));
         assert!(
-            !narrow_dedupe_bool(false, Some(true)),
+            !narrow_min(false, Some(true), true),
             "repo may not re-enable a skip the operator disabled"
         );
         assert!(
-            !narrow_dedupe_bool(true, Some(false)),
+            !narrow_min(true, Some(false), true),
             "repo may disable a skip the operator left on"
         );
-        assert!(narrow_dedupe_bool(true, None), "both loose: stays loose");
-        assert!(narrow_dedupe_bool(true, Some(true)));
+        assert!(narrow_min(true, None, true), "both loose: stays loose");
+        assert!(narrow_min(true, Some(true), true));
     }
 
     /// `context.dedupe_native` is deliberately NOT `REPO_FORBIDDEN`, unlike
