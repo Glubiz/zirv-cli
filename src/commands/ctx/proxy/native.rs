@@ -15,9 +15,9 @@ use crate::commands::ctx::provider::config::NativeConfig;
 /// vendor (e.g. `"claude-fable-5"`). `None` when no route matches -- the
 /// caller keeps its configured role route in that case, exactly as the
 /// spec's "Apply -- native runtime" section describes.
-// T2 is the first caller (`spawn_interactive`'s submit loop); exercised
-// here only by this module's own tests in the meantime.
-#[allow(dead_code)]
+// `runtime::native`'s own route resolution now calls this; `spawn_interactive`'s
+// submit loop (T2) is still the pending live-wiring caller outside the
+// not-yet-wired native runtime (see `runtime/mod.rs`'s own doc comment).
 pub fn route_for_decision(decision: &ProxyDecision, cfg: &NativeConfig) -> Option<RouteId> {
     let vendor_slug = adapters::provider_for_agent_name(Some(&decision.orchestrator.harness));
     let canonical_id = catalogue::vendor(vendor_slug)

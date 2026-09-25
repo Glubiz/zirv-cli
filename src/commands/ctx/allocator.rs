@@ -27,7 +27,6 @@ impl HarnessState {
     /// `pub` and exercised by this module's own tests now, the same
     /// task-ordering shape `FallbackConfig::rollover_headroom_pct` already
     /// documents for itself.
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -225,7 +224,6 @@ pub enum Exclusion {
 impl Exclusion {
     /// Same task-ordering note as `HarnessState::as_str`: the human-facing
     /// surface this labels for lands in a later issue #358 task.
-    #[allow(dead_code)]
     pub fn label(&self) -> String {
         match self {
             Self::Disabled => "disabled".to_string(),

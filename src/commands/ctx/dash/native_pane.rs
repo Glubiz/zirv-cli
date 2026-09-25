@@ -1074,7 +1074,7 @@ pub struct FileRef {
 /// canonical workdir; anything that escapes it -- or that cannot be
 /// canonicalized at all, e.g. because it does not exist -- reads as
 /// `exists: false` rather than being trusted.
-#[allow(dead_code)] // see `FileRef`'s own doc comment
+#[allow(dead_code)]
 pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
     let workdir_canonical = std::fs::canonicalize(workdir).ok();
     let mut refs = Vec::new();
@@ -1112,6 +1112,7 @@ pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
 /// `root`. A candidate that fails to canonicalize (missing, a dangling
 /// symlink, a permissions error) is never treated as inside `root` --
 /// refusing is the safe default, not a guess.
+#[allow(dead_code)] // only called by `resolve_file_refs`, itself test-only today
 fn path_resolves_under(root: &Path, candidate: &Path) -> bool {
     std::fs::canonicalize(candidate)
         .map(|resolved| resolved.starts_with(root))

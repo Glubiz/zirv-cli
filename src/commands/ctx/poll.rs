@@ -8,20 +8,15 @@ use super::config::PaceConfig;
 use super::state::StateDir;
 use super::window::UsageWindows;
 
-#[allow(dead_code)]
 const ANTHROPIC_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-#[allow(dead_code)]
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// UNVERIFIED (2026-08-16: no readable token on the reference machine to
 /// exercise it). Ships best-effort; see Known Issues.
-#[allow(dead_code)]
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
-#[allow(dead_code)]
 const HTTP_TIMEOUT_SECS: u64 = 10;
 /// Distinct from the overall/body timeout above: an unreachable endpoint
 /// must not hold a supervisor's cycle-launch gate for up to `HTTP_TIMEOUT_
 /// SECS` per attempt just to fail to connect.
-#[allow(dead_code)]
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// Same magnitude as `HTTP_CONNECT_TIMEOUT_SECS` and the same reasoning:
 /// `security find-generic-password` reading a keychain item this process is
@@ -29,7 +24,7 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// `anthropic_token_from_keychain`'s doc comment), and on a headless/SSH
 /// session with nobody to answer it, `security` would otherwise block
 /// forever. This bounds that to a fast, honest `None` instead.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_TIMEOUT_SECS: u64 = HTTP_CONNECT_TIMEOUT_SECS;
 
 /// Pure half of the bounded keychain wait below: whether `elapsed` has
@@ -39,7 +34,7 @@ const KEYCHAIN_TIMEOUT_SECS: u64 = HTTP_CONNECT_TIMEOUT_SECS;
 /// including this crate's own Windows CI, matching the clock-injected-pure-
 /// core convention `pace::wait_deadline`/`chrome::bar_should_disable` already
 /// use elsewhere in this codebase.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn keychain_wait_expired(elapsed: std::time::Duration, timeout: std::time::Duration) -> bool {
     elapsed >= timeout
 }
@@ -51,14 +46,12 @@ fn keychain_wait_expired(elapsed: std::time::Duration, timeout: std::time::Durat
 // cleanup pass confirms which items every build target actually reaches.
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct PollReading {
     pub windows: UsageWindows,
     /// Vendor-side credits state, advisory only (anthropic: extra_usage.is_enabled).
     pub vendor_credits_enabled: Option<bool>,
 }
 
-#[allow(dead_code)]
 pub trait UsagePoller {
     fn poll(&self, provider: &str) -> Option<PollReading>;
 }
@@ -70,7 +63,6 @@ pub trait UsagePoller {
 /// site redirects home via `HomeGuard` so no token file is ever readable
 /// (this module's tests never touch the network; see the module-level
 /// security constraint).
-#[allow(dead_code)]
 pub struct HttpPoller {
     /// `cfg.chrome.events` at construction time, threaded in rather than
     /// read internally: `UsagePoller::poll`'s signature carries no
@@ -98,10 +90,8 @@ impl HttpPoller {
 /// timeout (`HTTP_TIMEOUT_SECS`) so an unreachable endpoint fails fast
 /// instead of blocking a supervisor's cycle-launch gate for up to 10s per
 /// attempt.
-#[allow(dead_code)]
 static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
 
-#[allow(dead_code)]
 fn shared_agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
@@ -114,7 +104,6 @@ fn shared_agent() -> &'static ureq::Agent {
     })
 }
 
-#[allow(dead_code)]
 fn parse_anthropic_usage(body: &str, now: u64) -> Option<PollReading> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let read_window = |key: &str| -> Option<super::window::Window> {
@@ -143,7 +132,6 @@ fn parse_anthropic_usage(body: &str, now: u64) -> Option<PollReading> {
     })
 }
 
-#[allow(dead_code)]
 fn parse_codex_usage(body: &str, now: u64) -> Option<PollReading> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let limits = v.get("rate_limits").unwrap_or(&v);
@@ -208,7 +196,6 @@ fn parse_claude_credentials_json(raw: &str) -> Option<String> {
 /// setups"). The file is tried first on every platform (unchanged behavior,
 /// and still correct for a macOS install that happens to have one); only when
 /// that comes back empty does a macOS build fall back to Keychain.
-#[allow(dead_code)]
 fn anthropic_token(chrome_events_enabled: bool) -> Option<String> {
     let path = crate::utils::home_dir()
         .ok()?
@@ -265,7 +252,6 @@ fn anthropic_token(chrome_events_enabled: bool) -> Option<String> {
 /// [[Usage and Pacing]]/[[Ctx Supervisors]]), so that invariant is structural,
 /// not merely a property of this timeout.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 fn anthropic_token_from_keychain(chrome_events_enabled: bool) -> Option<String> {
     announce_keychain_prompt_once(chrome_events_enabled);
 
@@ -320,7 +306,6 @@ fn anthropic_token_from_keychain(chrome_events_enabled: bool) -> Option<String> 
 /// caller-threaded flag because `UsagePoller::poll` has no per-run state of
 /// its own to carry one in (see `HttpPoller`'s own doc comment).
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 fn announce_keychain_prompt_once(chrome_events_enabled: bool) {
     static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !chrome_events_enabled {
@@ -344,7 +329,6 @@ fn announce_keychain_prompt_once(chrome_events_enabled: bool) {
 /// Same contract as [`anthropic_token`]: read fresh on every call, never
 /// cached or logged, and resolved the same env-aware way for the same
 /// reason.
-#[allow(dead_code)]
 fn codex_token() -> Option<String> {
     let path = crate::utils::home_dir()
         .ok()?
@@ -369,7 +353,6 @@ fn codex_token() -> Option<String> {
 /// even had a token to try" -- both routes leave nothing on disk -- so this
 /// names every plausible cause rather than claiming a single, unverifiable
 /// one.
-#[allow(dead_code)]
 pub fn usage_source_hint(provider: &str) -> String {
     let tee_hint = "the statusline tee needs no credentials at all and works on every platform -- \
                      wire it with `zirv ctx usage tee -- <your statusline command>` in Claude \
@@ -453,12 +436,10 @@ impl UsagePoller for HttpPoller {
 /// counts against `poll_min_interval_secs` and a provider with a broken
 /// token does not retry on every single call.
 #[derive(Serialize, Deserialize)]
-#[allow(dead_code)]
 struct PollMarker {
     last_attempt: u64,
 }
 
-#[allow(dead_code)]
 fn last_attempt(state: &StateDir, provider: &str) -> Option<u64> {
     let contents = std::fs::read_to_string(state.poll_marker_for(provider)).ok()?;
     serde_json::from_str::<PollMarker>(&contents)
@@ -471,7 +452,6 @@ fn last_attempt(state: &StateDir, provider: &str) -> Option<u64> {
 /// truncated marker. Best-effort: marker I/O failures degrade to "not
 /// floored" rather than surfacing as an error, same as every other failure
 /// path in this module.
-#[allow(dead_code)]
 fn record_attempt(state: &StateDir, provider: &str, now: u64) {
     let path = state.poll_marker_for(provider);
     let Some(parent) = path.parent() else {
@@ -490,7 +470,6 @@ fn record_attempt(state: &StateDir, provider: &str, now: u64) {
 /// "not needed", "floored", "disabled" and "failed" alike — callers never
 /// branch on why. The reading carries the vendor_credits_enabled advisory for
 /// callers that surface it (`zirv ctx usage`).
-#[allow(dead_code)]
 pub fn maybe_poll(
     state: &StateDir,
     cfg: &PaceConfig,

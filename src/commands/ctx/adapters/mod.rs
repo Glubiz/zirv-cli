@@ -420,9 +420,9 @@ pub enum LaunchMode {
     Headless,
 }
 
-// Task 1 lands these accessors before the later policy/report tasks consume
-// them in production; the seam tests exercise both in the meantime.
-#[allow(dead_code)]
+// `policy::evaluate`'s report rendering and the adapters' own `policy_support`
+// arms now consume both accessors in production (`zirv agent`'s headless
+// warning path, issue #230 item 3, among others).
 impl LaunchMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -2081,9 +2081,9 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// itself (zirv is imposing nothing, so there is no mechanism to name), so
     /// an implementation may leave it to a catch-all arm.
     ///
-    /// `allow(dead_code)` for the same reason `model_args` below carries one:
-    /// the only caller, `policy::evaluate`, has no production caller of its own
-    /// until issues #44/#46 wire it in. Both adapters override it already, and
+    /// `policy::evaluate` is `policy_support`'s only caller; `agent.rs`'s
+    /// `zirv agent` headless-warning path (issue #230 item 3) is its own
+    /// production caller now. Both adapters override this default, and
     /// `policy.rs`'s own tests exercise every arm.
     ///
     /// This method only ever sees one `(capability, stance)` pair at a time,
@@ -2095,7 +2095,6 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// a stance onto a real launch, needs the whole `EffectivePolicy` in
     /// hand to exploit an implication like that; it is not visible from this
     /// signature alone.
-    #[allow(dead_code)]
     fn policy_support(
         &self,
         capability: super::policy::Capability,
@@ -2310,10 +2309,9 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// (`system_prompt_args`, `base_system_prompt`): an adapter with no
     /// verified flag ships with no model selection rather than a guess.
     ///
-    /// Both current adapters override this, so nothing calls the default body
-    /// through `dyn AgentAdapter` yet -- wired into the orchestrator pane's
-    /// argv when `chat.rs` builds it (dashboard Task 6).
-    #[allow(dead_code)]
+    /// Both current adapters override this default. `chat.rs` (dashboard
+    /// Task 6) now calls `model_args` through `dyn AgentAdapter` when it
+    /// builds the orchestrator pane's argv.
     fn model_args(&self, model: &str) -> Vec<String> {
         let _ = model;
         Vec::new()

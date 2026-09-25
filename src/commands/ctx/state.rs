@@ -865,10 +865,9 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 /// whatever permissions the process umask would give any other file zirv
 /// writes into a checkout (the same convention `zirv init` already uses for
 /// `.zirv/` itself), not `write_private`'s "private machine secret"
-/// treatment. Not yet called from any non-test code -- `memory::upsert_shared`
-/// is its first consumer, itself dormant until `zirv memory` (Task 3) wires a
-/// CLI verb on top of it.
-#[allow(dead_code)]
+/// treatment. `memory::upsert_shared` is its consumer, wired end to end
+/// through the `zirv memory`/`zirv ctx remember --repo` CLI verbs
+/// (`memory_cli.rs`).
 pub fn write_shared(path: &Path, contents: &str) -> std::io::Result<()> {
     write_atomic(path, contents, false)
 }
@@ -1132,7 +1131,6 @@ impl StateDir {
     /// stored usage reading looks -- a failed attempt still writes the marker,
     /// so a provider with no working token does not retry every call. The slug
     /// is sanitised by [`provider_slug`], mirroring [`Self::usage_for`].
-    #[allow(dead_code)]
     pub fn poll_marker_for(&self, provider: &str) -> PathBuf {
         self.0
             .join(format!("poll-{}.json", provider_slug(provider)))
@@ -1193,7 +1191,6 @@ impl StateDir {
     /// one: `transcript_source` is dormant until a wave-1 adapter (issues
     /// #384-#386) exists to call it, so nothing outside that module's own
     /// tests names this method yet.
-    #[allow(dead_code)]
     pub fn shadow(&self) -> PathBuf {
         self.0.join("shadow")
     }

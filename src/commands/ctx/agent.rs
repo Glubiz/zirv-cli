@@ -13725,7 +13725,6 @@ mod tests {
         #[derive(Debug, clap::Parser)]
         struct OnlyAgent {
             #[command(flatten)]
-            #[allow(dead_code)]
             args: AgentArgs,
         }
 

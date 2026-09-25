@@ -4,8 +4,6 @@
 //! own the agent loop, execute tools, choose a fallback route, or persist the
 //! conversation. Those remain Zirv runtime responsibilities.
 
-#![allow(dead_code)] // N09 wires this provider-neutral contract into the runtime loop.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +94,7 @@ pub struct ProviderRequest {
 }
 
 impl ProviderRequest {
+    #[allow(dead_code)] // native roadmap N07+: the persistent runtime loop is its first caller
     pub fn from_compiled(
         model: impl Into<String>,
         compiled: &CompiledNativeContext,
@@ -584,7 +583,9 @@ impl ProviderFailure {
 }
 
 pub trait ProviderAdapter: std::fmt::Debug + Send + Sync {
+    #[allow(dead_code)] // native roadmap N07+: no caller inspects an adapter's protocol/target yet
     fn protocol(&self) -> Protocol;
+    #[allow(dead_code)] // native roadmap N07+: no caller inspects an adapter's protocol/target yet
     fn target(&self) -> &ProviderTarget;
     fn redact_failure(&self, failure: ProviderFailure) -> ProviderFailure {
         redact_failure(failure, &[])

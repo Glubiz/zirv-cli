@@ -644,7 +644,7 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
 /// oldest first (the same order `list` already returns) -- so a CLI surface
 /// or a test can read back what an agent loaded for itself without
 /// re-deriving the filter each time.
-// #[allow(dead_code)]: no CLI surface reads this back yet; only the native
+// no CLI surface reads this back yet; only the native
 // tool/MCP bridge tests call it today, to assert what `record_skill_
 // activation` wrote.
 #[allow(dead_code)]

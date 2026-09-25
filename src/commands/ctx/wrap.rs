@@ -646,6 +646,7 @@ pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
 /// discoverable, but never written any more: two concurrent supervisors
 /// clobbered each other's entry, and whoever read it afterwards got a socket
 /// belonging to somebody else's session.
+#[allow(dead_code)] // read only by `read_socket_path`, itself test-only today
 pub const SOCKET_PATH_FILE: &str = "socket-path";
 
 /// `<state>/socket-path-<short8>`, one per supervisor, named after the same
@@ -699,7 +700,7 @@ pub fn unpublish_socket_path(state: &StateDir, session: &str) {
 /// writer whose naming scheme has no canonical reader is how the pre-F5
 /// global file's semantics got lost in the first place. The pty tests are its
 /// in-tree consumer.
-#[allow(dead_code)]
+#[allow(dead_code)] // no production caller yet; the pty tests are its in-tree consumer
 pub fn read_socket_path(state: &StateDir, session: Option<&str>) -> Option<String> {
     let read = |path: PathBuf| -> Option<String> {
         std::fs::read_to_string(path)

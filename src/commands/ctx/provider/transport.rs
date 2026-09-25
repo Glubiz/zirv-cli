@@ -7,8 +7,6 @@
 //! bounded event channel is the backpressure seam: a slow consumer stalls
 //! the reader instead of growing an unbounded queue.
 
-#![allow(dead_code)] // N09 wires the direct providers into the runtime loop.
-
 use std::io::{BufRead, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -4754,8 +4754,8 @@ pub struct PreToolPayload {
     #[serde(default)]
     pub agent_id: String,
     #[serde(default)]
-    #[allow(dead_code)]
     // retained from Claude's documented payload; agent_id is the discriminator
+    #[allow(dead_code)]
     pub agent_type: String,
     /// Claude's own session mode (documented values include `"default"`,
     /// `"plan"`, `"acceptEdits"`, `"dontAsk"`, ...) -- the scope-guard

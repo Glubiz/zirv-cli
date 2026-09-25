@@ -789,6 +789,7 @@ impl JobGuard {
         Self
     }
 
+    #[allow(dead_code)] // test-only, like the `#[cfg(windows)]` `JobGuard::is_active`
     pub fn is_active(&self) -> bool {
         false
     }
