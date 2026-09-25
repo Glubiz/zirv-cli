@@ -22,6 +22,8 @@ Changes are relative to vanilla + superpowers. "sig" means the paired-bootstrap 
 | r5 | 4.30.0 (2b95a3b7): all 17 Jev gates on, headless levers (5m TTL, lean, medium effort) | subset + t23 (30) | −15% / −12% / +1% | −16% / −8% / +1% | Valid; t23 hit by the effort-flip cache bug (+8% / +5% cost) |
 | r5b | 2e943093 + d41e9976: sticky effort, no Jev approve call under dontAsk | t23 chain (6) | **−24% / −25% / +23%** | **−47% / −36% / +23%** | Valid, 1 task × 2 reps |
 | r5b-t24 | same as r5b | t24 22-step chain (6) | **−27%** / −15% / +0% | **−29%** / −16% / +0% | Valid; no compaction or restart fired (1M window) |
+| r6 | aee6d976: + read-only approve skip, Jev keep-alive relay, scope guard | subset + t23 (30) | **−28% / −12% / +10% sig** | −22% / −6% / +4% | Valid; t17 Jev on r1 was handed to codex at the session limit and re-run (harness fix a1617d4b) |
+| r6-t24 | same as r6 | t24 22-step chain (6) | **−33% / −20% / +7%** (+5 score pts) | **−33%** / −13% / +7% (+4 pts) | Valid; Jev off meets the target on t24 |
 
 About r1–r3: from fc59babb on, the harness ran zirv with `--setting-sources project,local`, which drops `~/.claude/settings.json`, where zirv's own hooks live. Fixed in d256124e. From r3b on, zirv keeps the user layer and vanilla receives the same `enabledPlugins` through `--settings`.
 
@@ -76,6 +78,13 @@ Before any rot event (steps 1–14) the runs compare as follows:
 - **Why Jev on was not better than Jev off.** The conditions differ by more than Jev: only `zirv-jev-full` runs the harness intake, which routes every XL task to an orchestrator seat and starts a workflow, and the deterministic intake makes the same call, so that part is not Jev. Jev's own cost was the approve gate: 240 calls in r5 (84 uncached at ~0.7 s), 23 escalations and 0 effects, because under `dontAsk` the hook emits nothing for allow or ask. Fixed in d41e9976 (no call under `dontAsk`) and 59f3e608 (no call for read-only local commands). About 75% of a Jev call is TCP+TLS setup from a fresh hook process (~570 ms of three ~190 ms round trips); Jev's own inference is ~100–150 ms.
 - **Scope creep is not zirv-specific.** At t24 step 4, Jev on scored 0.0 twice, vanilla 0.0 and 0.5, Jev off 1.0 and 0.5. Jev off's winning report left the pagination bug alone and asked.
 - **t24 steps 9 and 14 look like task defects.** Every condition loses the same hidden test in every run. Step 14's failing test calls `cashflow(..., to_usd=True)`, a keyword the step-14 prompt never names. The loss is equal across conditions, so it compresses scores without biasing them.
+
+## Round 6 results (r6, r6-t24)
+
+- **The scope guard works where it matters.** At t24 step 4 (the scope-creep trap) the Stop backstop fired in all four zirv runs, and all four then scored 1.0; vanilla scored 0 in both reps. One block was a false positive on a hypothetical ("Fixing it would change ... too"), tightened in round 7. The first-edit checkpoint rarely fires, because every condition edits mostly through Bash (`python - <<EOF`, `sed -i`), not Edit/Write; round 7 adds a shell-change trigger.
+- **Where the time goes on the XL tasks.** zirv is +7–11% slower on t16–t22. On t18 the missing-tests Stop gate adds a blocked turn (~10 s) that vanilla never spends. On t16 zirv has missed the same spec details since r3b ("sorted", "no spaces after the commas"). The harness intake costs only ~0.5 s now.
+- **A usage limit contaminated one run.** At the 16:40 session limit, `zirv ctx exec` handed t17 Jev on r1 to codex, which finished it; run.py then crashed on codex's prose. Since a1617d4b, zirv conditions run with `ZIRV_CTX_FALLBACK=false`, a zirv run that parks on a limit is killed and retried like vanilla's, and `parse_last_json` keeps JSON objects only. No earlier round was affected.
+- **The cold cache after a pause is an artifact.** t18 Jev off r1 wrote 28.8k cache tokens on its first request after the one-hour pause, because the 5m-TTL prefix had expired while vanilla's 1h prefix survived. Back-to-back zirv runs read 20.4k of cached prefix.
 
 ## Round 5 (implementation notes)
 
