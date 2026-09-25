@@ -10748,8 +10748,14 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     // contract. Placed here (not earlier) so Jev only ever sees the FINAL
     // deterministic verdict, and an escalation correctly falls through the
     // `additional_context = None` cleanup just below, the same as any other
-    // guard that turns an `Allow` into something stricter.
-    if let Ok(state) = super::state::StateDir::resolve(env) {
+    // guard that turns an `Allow` into something stricter. Skipped under
+    // `dontAsk` (a headless launch): `hook_output` emits nothing for either
+    // `Allow` or a non-operator `Ask` there, so the answer could never change
+    // the decision and the synchronous Jev call would only add latency to
+    // every tool call.
+    if payload.permission_mode != "dontAsk"
+        && let Ok(state) = super::state::StateDir::resolve(env)
+    {
         outcome = apply_jev_approve_outcome(
             cfg,
             &state,
@@ -21902,6 +21908,27 @@ mod tests {
             Some(Verdict::Ask),
             "headless unmatched default is Ask"
         );
+        assert!(!state_dir.path().join("jev-effects.jsonl").exists());
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+    }
+
+    /// Under `dontAsk` the hook emits nothing for `Allow` or a non-operator
+    /// `Ask`, so Jev's answer could never change the decision: no call runs.
+    #[test]
+    fn approve_makes_no_jev_call_under_dont_ask() {
+        let credential_env = "SAFETY_TEST_JEV_APPROVE_DONT_ASK";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_approve_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("state");
+
+        let verdict = run_jev_approve_hook(&cfg, "git status", "dontAsk", state_dir.path());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(verdict, Some(Verdict::Allow));
         assert!(!state_dir.path().join("jev-effects.jsonl").exists());
         assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
     }

@@ -6333,8 +6333,10 @@ credential path), pipe/redirect/command-substitution counts, a
 secret-placeholder count from the same detector `[obfuscate]` uses (issue
 #466), and a shell/eval/inline-interpreter wrapper flag — never the command
 text, paths, arguments, env values, or file contents; the request must pass
-`jev::safe_metadata_request` like every other `[jev]`-gated site.
-`approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
+`jev::safe_metadata_request` like every other `[jev]`-gated site. Neither key
+makes a call under `dontAsk` (every headless launch): the hook emits nothing
+there for `allow` or a non-operator `ask`, so the answer could not change the
+decision. `approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
 answer; widening what may be escalated is always safe, so this direction has
 no further restriction. `approve_allow` (effective only when `approve` is
 also on) may only LOWER an `ask` to `allow`, on a decisive `safe` answer
