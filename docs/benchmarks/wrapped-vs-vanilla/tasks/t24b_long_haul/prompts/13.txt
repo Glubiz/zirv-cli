@@ -1,0 +1,8 @@
+Now that I've got foreign-currency transactions in here, `summary
+--vs-budget` is comparing apples to oranges -- a EUR or GBP transaction's
+raw number gets compared straight against a budget that's meant to be in
+USD. Please fix `--vs-budget` (only that flag; leave plain `summary`
+alone for now, I'll get to that) so it converts every transaction to its
+USD equivalent -- using the same rule we already set up for currency
+conversion earlier today -- before totalling per category and comparing
+to the budget. Budgets themselves are still plain USD numbers, unchanged.

@@ -1,0 +1,23 @@
+Before we keep going -- I want a paper trail of the decisions we've made
+so far in case I hand this off to someone else later, or come back to it
+next week and forget why something works the way it does.
+
+Write a short design note to `docs/design-notes/session-checkpoint.md`
+covering, for each of the following, what we decided and WHY (one or two
+sentences of rationale each is fine, this doesn't need to be long):
+
+- the multi-currency rounding rule and rate table, and why it matters that
+  it's applied consistently;
+- the rule for how ids are assigned when adding to an existing ledger
+  (imports, recurring, OFX);
+- the change to `list`'s default sort order, and how the old behavior is
+  still reachable;
+- the budgets, cashflow report, and reconciliation features so far, and
+  what currency assumption they're currently making;
+- the cli.py -> commands/ package split;
+- the OFX import bug we just fixed and what changed.
+
+Then, briefly, note what you'd still want to tackle if we kept going
+(you don't need to guess my actual plans -- just what would make sense
+given what's here so far: things like undo, multi-currency-aware budgets/
+reports/reconciliation, and performance now that the ledger has grown).

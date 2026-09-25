@@ -218,3 +218,14 @@ Every reference score above was verified by applying that step's cumulative
 running that step's own hidden tests against it (score 1.0, `visible_ok`
 true, the template's one known baseline-red visible test excepted); the same
 hidden tests against an unpatched pristine copy score ~0.
+
+## t24b_long_haul: corrected copy of t24_long_haul
+
+`t24b_long_haul` is a byte-identical copy of `t24_long_haul` (a 22-step
+`kind=chain` task) except for its step 09 and step 14 prompts, which state
+two requirements their hidden tests already checked but the original
+wording never named: step 09's `read_ofx` needs the same `start_id`
+parameter `read_csv` already has, and step 14's `report.cashflow()` needs
+its own `to_usd` keyword parameter (not just the CLI's `--usd` flag). Use
+t24b in place of t24 for any run where those two steps should be
+solvable from the prompt alone.

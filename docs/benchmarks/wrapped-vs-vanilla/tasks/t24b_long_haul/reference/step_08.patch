@@ -1,0 +1,1043 @@
+diff --git a/ledgerlite/budgets.py b/ledgerlite/budgets.py
+new file mode 100644
+index 0000000..f6a33d5
+--- /dev/null
++++ b/ledgerlite/budgets.py
+@@ -0,0 +1,26 @@
++"""Per-category monthly budgets for ledgerlite."""
++
++from __future__ import annotations
++
++from decimal import Decimal
++from pathlib import Path
++from typing import Dict, Union
++
++from . import store
++
++BUDGETS_KEY = "budgets"
++
++
++def load_budgets(path: Union[str, Path]) -> Dict[str, Decimal]:
++    raw = store.load_key(path, BUDGETS_KEY, default={})
++    return {category: Decimal(limit) for category, limit in raw.items()}
++
++
++def save_budgets(path: Union[str, Path], budgets: Dict[str, Decimal]) -> None:
++    store.save_key(path, BUDGETS_KEY, {category: str(limit) for category, limit in budgets.items()})
++
++
++def set_budget(path: Union[str, Path], category: str, limit: Decimal) -> None:
++    budgets = load_budgets(path)
++    budgets[category] = limit
++    save_budgets(path, budgets)
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..78ac383 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -1,17 +1,20 @@
+-"""Command-line interface for ledgerlite: `python -m ledgerlite <command>`."""
++"""Command-line interface for ledgerlite: `python -m ledgerlite <command>`.
++
++Each command FAMILY lives in its own `ledgerlite.commands.*` module (see
++that package's docstring); this file just wires them all into one parser
++and one dispatch table.
++"""
+ 
+ from __future__ import annotations
+ 
+ import argparse
+-from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+-from . import report
+-from .parse import read_csv
+-from .rules import DEFAULT_RULES, categorize
+-from .store import load, save
++from .commands import (
++    budget_cli, core, currency_cli, reconcile_cli, recurring_cli, report_cli,
++)
+ 
+-DEFAULT_STORE = "ledger.json"
++_MODULES = [core, currency_cli, recurring_cli, budget_cli, report_cli, reconcile_cli]
+ 
+ 
+ def _build_parser() -> argparse.ArgumentParser:
+@@ -19,99 +22,14 @@ def _build_parser() -> argparse.ArgumentParser:
+         prog="ledgerlite", description="A tiny personal-finance ledger."
+     )
+     sub = parser.add_subparsers(dest="command", required=True)
+-
+-    p_import = sub.add_parser("import", help="import transactions from a CSV file")
+-    p_import.add_argument("csv_path", help="path to a bank-export CSV file")
+-    p_import.add_argument(
+-        "--store", default=DEFAULT_STORE, help="ledger JSON file to write (default: %(default)s)"
+-    )
+-
+-    p_list = sub.add_parser("list", help="list stored transactions")
+-    p_list.add_argument(
+-        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
+-    )
+-    p_list.add_argument("--page", type=int, default=1, help="page number, 1-indexed (default: %(default)s)")
+-    p_list.add_argument(
+-        "--page-size", type=int, default=10, dest="page_size", help="rows per page (default: %(default)s)"
+-    )
+-
+-    p_summary = sub.add_parser("summary", help="show per-category totals")
+-    p_summary.add_argument(
+-        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
+-    )
+-
+-    p_categorize = sub.add_parser(
+-        "categorize", help="(re)apply the default rules to stored transactions"
+-    )
+-    p_categorize.add_argument(
+-        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+-    )
+-
++    for module in _MODULES:
++        module.add_subparser(sub)
+     return parser
+ 
+ 
+-def _cmd_import(args: argparse.Namespace) -> int:
+-    txns = read_csv(args.csv_path)
+-    for txn in txns:
+-        if txn.category is None:
+-            txn.category = categorize(txn, DEFAULT_RULES)
+-    save(args.store, txns)
+-    print(f"Imported {len(txns)} transactions into {args.store}")
+-    return 0
+-
+-
+-def _cmd_list(args: argparse.Namespace) -> int:
+-    txns = load(args.store)
+-    rows = report.page(txns, args.page, args.page_size)
+-    if not rows:
+-        print("No transactions on this page.")
+-        return 0
+-    print(f"{'ID':>4}  {'Date':<10}  {'Amount':>10}  {'Payee':<24}  {'Category':<14}  Memo")
+-    for txn in rows:
+-        print(
+-            f"{txn.id:>4}  {txn.date.isoformat():<10}  {txn.amount:>10}  "
+-            f"{txn.payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
+-        )
+-    return 0
+-
+-
+-def _cmd_summary(args: argparse.Namespace) -> int:
+-    txns = load(args.store)
+-
+-    # NOTE: this re-derives per-category totals and percent share instead of
+-    # calling report.category_totals()/report.summarize() -- see D5.
+-    totals: dict = {}
+-    for txn in txns:
+-        key = txn.category or report.UNCATEGORIZED
+-        totals[key] = totals.get(key, Decimal("0")) + txn.amount
+-    magnitude_sum = sum((abs(v) for v in totals.values()), Decimal("0"))
+-
+-    print(f"{'Category':<14}  {'Total':>10}  {'Share':>7}")
+-    for category, amount in sorted(totals.items()):
+-        percent = (abs(amount) / magnitude_sum * 100) if magnitude_sum else Decimal("0")
+-        print(f"{category:<14}  {amount:>10}  {percent:>6.1f}%")
+-    return 0
+-
+-
+-def _cmd_categorize(args: argparse.Namespace) -> int:
+-    txns = load(args.store)
+-    changed = 0
+-    for txn in txns:
+-        new_category = categorize(txn, DEFAULT_RULES)
+-        if new_category != txn.category:
+-            txn.category = new_category
+-            changed += 1
+-    save(args.store, txns)
+-    print(f"Re-categorized {changed} of {len(txns)} transactions")
+-    return 0
+-
+-
+-_HANDLERS = {
+-    "import": _cmd_import,
+-    "list": _cmd_list,
+-    "summary": _cmd_summary,
+-    "categorize": _cmd_categorize,
+-}
++_HANDLERS = {}
++for _module in _MODULES:
++    _HANDLERS.update(_module.HANDLERS)
+ 
+ 
+ def main(argv: Optional[Sequence[str]] = None) -> int:
+diff --git a/ledgerlite/commands/__init__.py b/ledgerlite/commands/__init__.py
+new file mode 100644
+index 0000000..4f9e46d
+--- /dev/null
++++ b/ledgerlite/commands/__init__.py
+@@ -0,0 +1,10 @@
++"""Each `ledgerlite.commands.*` module owns one command family: it adds its
++own subparser(s) to the shared top-level parser via `add_subparser(sub)`
++and exposes a `HANDLERS` dict mapping command name -> handler function.
++`ledgerlite.cli` collects both across every module in `MODULES` below --
++this is a pure reorganisation of `cli.py`, behavior is unchanged.
++"""
++
++from __future__ import annotations
++
++DEFAULT_STORE = "ledger.json"
+diff --git a/ledgerlite/commands/budget_cli.py b/ledgerlite/commands/budget_cli.py
+new file mode 100644
+index 0000000..f4c3f25
+--- /dev/null
++++ b/ledgerlite/commands/budget_cli.py
+@@ -0,0 +1,40 @@
++"""The `budget` command family."""
++
++from __future__ import annotations
++
++import argparse
++from decimal import Decimal
++
++from ..budgets import load_budgets, set_budget
++from . import DEFAULT_STORE
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_budget = sub.add_parser("budget", help="per-category monthly budgets")
++    budget_sub = p_budget.add_subparsers(dest="budget_command", required=True)
++    p_budget_set = budget_sub.add_parser("set", help="set (or replace) a category's budget")
++    p_budget_set.add_argument("--category", required=True)
++    p_budget_set.add_argument("--limit", required=True)
++    p_budget_set.add_argument("--store", default=DEFAULT_STORE)
++    p_budget_list = budget_sub.add_parser("list", help="list saved budgets")
++    p_budget_list.add_argument("--store", default=DEFAULT_STORE)
++
++
++def _cmd_budget(args: argparse.Namespace) -> int:
++    if args.budget_command == "set":
++        limit = Decimal(args.limit)
++        set_budget(args.store, args.category, limit)
++        print(f"Set budget for {args.category}: {limit:.2f}")
++        return 0
++    if args.budget_command == "list":
++        budgets = load_budgets(args.store)
++        if not budgets:
++            print("No budgets.")
++            return 0
++        for category in sorted(budgets):
++            print(f"{category}: {budgets[category]:.2f}")
++        return 0
++    raise ValueError(f"unknown budget command: {args.budget_command!r}")
++
++
++HANDLERS = {"budget": _cmd_budget}
+diff --git a/ledgerlite/commands/core.py b/ledgerlite/commands/core.py
+new file mode 100644
+index 0000000..0561033
+--- /dev/null
++++ b/ledgerlite/commands/core.py
+@@ -0,0 +1,149 @@
++"""The original core commands: import, list, summary, categorize."""
++
++from __future__ import annotations
++
++import argparse
++from decimal import Decimal
++
++from .. import report
++from ..budgets import load_budgets
++from ..parse import read_csv
++from ..rules import DEFAULT_RULES, categorize
++from ..store import load, next_id, save
++from . import DEFAULT_STORE
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_import = sub.add_parser("import", help="import transactions from a CSV file")
++    p_import.add_argument("csv_path", help="path to a bank-export CSV file")
++    p_import.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to write (default: %(default)s)"
++    )
++    p_import.add_argument(
++        "--currency", default="USD",
++        help="currency for rows with no currency column of their own (default: %(default)s)",
++    )
++    p_import.add_argument(
++        "--append", action="store_true",
++        help="add to the existing store instead of replacing it (default: replace)",
++    )
++
++    p_list = sub.add_parser("list", help="list stored transactions")
++    p_list.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++    p_list.add_argument("--page", type=int, default=1, help="page number, 1-indexed (default: %(default)s)")
++    p_list.add_argument(
++        "--page-size", type=int, default=10, dest="page_size", help="rows per page (default: %(default)s)"
++    )
++    p_list.add_argument(
++        "--legacy-order", action="store_true", dest="legacy_order",
++        help="keep the old raw store order (ascending id) instead of the default most-recent-first",
++    )
++
++    p_summary = sub.add_parser("summary", help="show per-category totals")
++    p_summary.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++    p_summary.add_argument(
++        "--vs-budget", action="store_true", dest="vs_budget",
++        help="show each category's budget and remaining amount instead of its share",
++    )
++
++    p_categorize = sub.add_parser(
++        "categorize", help="(re)apply the default rules to stored transactions"
++    )
++    p_categorize.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++
++def _parse_year_month(text: str):
++    year_str, month_str = text.split("-", 1)
++    return int(year_str), int(month_str)
++
++
++def _cmd_import(args: argparse.Namespace) -> int:
++    existing = load(args.store) if args.append else []
++    start_id = next_id(existing) if args.append else 1
++    new_txns = read_csv(args.csv_path, default_currency=args.currency, start_id=start_id)
++    for txn in new_txns:
++        if txn.category is None:
++            txn.category = categorize(txn, DEFAULT_RULES)
++    save(args.store, existing + new_txns)
++    print(f"Imported {len(new_txns)} transactions into {args.store}")
++    return 0
++
++
++def _cmd_list(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    if not args.legacy_order:
++        # Most-recent-first by date; ties broken by id ascending. Python's
++        # sort is stable, so sorting by id first and then (stably) by date
++        # gives exactly that tie-break without a compound key.
++        txns = sorted(txns, key=lambda t: t.id)
++        txns = sorted(txns, key=lambda t: t.date, reverse=True)
++    rows = report.page(txns, args.page, args.page_size)
++    if not rows:
++        print("No transactions on this page.")
++        return 0
++    print(f"{'ID':>4}  {'Date':<10}  {'Amount':>10}  {'Payee':<24}  {'Category':<14}  Memo")
++    for txn in rows:
++        print(
++            f"{txn.id:>4}  {txn.date.isoformat():<10}  {txn.amount:>10}  "
++            f"{txn.payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
++        )
++    return 0
++
++
++def _cmd_summary(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++
++    # NOTE: this re-derives per-category totals and percent share instead of
++    # calling report.category_totals()/report.summarize() -- see D5.
++    totals: dict = {}
++    for txn in txns:
++        key = txn.category or report.UNCATEGORIZED
++        totals[key] = totals.get(key, Decimal("0")) + txn.amount
++
++    if args.vs_budget:
++        budgets = load_budgets(args.store)
++        print(f"{'Category':<14}  {'Total':>10}  {'Budget':>10}  {'Remaining':>10}")
++        for category, amount in sorted(totals.items()):
++            limit = budgets.get(category)
++            if limit is None:
++                budget_disp = "-"
++                remaining_disp = "-"
++            else:
++                budget_disp = f"{limit:.2f}"
++                remaining_disp = f"{(limit - abs(amount)):.2f}"
++            print(f"{category:<14}  {amount:>10}  {budget_disp:>10}  {remaining_disp:>10}")
++        return 0
++
++    magnitude_sum = sum((abs(v) for v in totals.values()), Decimal("0"))
++    print(f"{'Category':<14}  {'Total':>10}  {'Share':>7}")
++    for category, amount in sorted(totals.items()):
++        percent = (abs(amount) / magnitude_sum * 100) if magnitude_sum else Decimal("0")
++        print(f"{category:<14}  {amount:>10}  {percent:>6.1f}%")
++    return 0
++
++
++def _cmd_categorize(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    changed = 0
++    for txn in txns:
++        new_category = categorize(txn, DEFAULT_RULES)
++        if new_category != txn.category:
++            txn.category = new_category
++            changed += 1
++    save(args.store, txns)
++    print(f"Re-categorized {changed} of {len(txns)} transactions")
++    return 0
++
++
++HANDLERS = {
++    "import": _cmd_import,
++    "list": _cmd_list,
++    "summary": _cmd_summary,
++    "categorize": _cmd_categorize,
++}
+diff --git a/ledgerlite/commands/currency_cli.py b/ledgerlite/commands/currency_cli.py
+new file mode 100644
+index 0000000..8fb70e4
+--- /dev/null
++++ b/ledgerlite/commands/currency_cli.py
+@@ -0,0 +1,29 @@
++"""The `fx` command family."""
++
++from __future__ import annotations
++
++import argparse
++from decimal import Decimal
++
++from .. import currency
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_fx = sub.add_parser("fx", help="currency conversion helpers")
++    fx_sub = p_fx.add_subparsers(dest="fx_command", required=True)
++    p_fx_convert = fx_sub.add_parser("convert", help="convert an amount between currencies")
++    p_fx_convert.add_argument("amount", help="amount to convert")
++    p_fx_convert.add_argument("from_currency", metavar="FROM", help="source currency code")
++    p_fx_convert.add_argument("to_currency", metavar="TO", help="destination currency code")
++
++
++def _cmd_fx(args: argparse.Namespace) -> int:
++    if args.fx_command == "convert":
++        amount = Decimal(args.amount)
++        result = currency.convert(amount, args.from_currency, args.to_currency)
++        print(f"{result:.2f}")
++        return 0
++    raise ValueError(f"unknown fx command: {args.fx_command!r}")
++
++
++HANDLERS = {"fx": _cmd_fx}
+diff --git a/ledgerlite/commands/reconcile_cli.py b/ledgerlite/commands/reconcile_cli.py
+new file mode 100644
+index 0000000..dbc3b5a
+--- /dev/null
++++ b/ledgerlite/commands/reconcile_cli.py
+@@ -0,0 +1,43 @@
++"""The `reconcile` command family."""
++
++from __future__ import annotations
++
++import argparse
++from decimal import Decimal
++
++from ..reconcile import cleared_total, load_cleared, mark_cleared
++from ..store import load
++from . import DEFAULT_STORE
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_reconcile = sub.add_parser("reconcile", help="bank reconciliation")
++    reconcile_sub = p_reconcile.add_subparsers(dest="reconcile_command", required=True)
++    p_rec_mark = reconcile_sub.add_parser("mark", help="mark transactions as cleared")
++    p_rec_mark.add_argument("ids", nargs="+", type=int, metavar="ID")
++    p_rec_mark.add_argument("--store", default=DEFAULT_STORE)
++    p_rec_status = reconcile_sub.add_parser("status", help="compare cleared total to a statement balance")
++    p_rec_status.add_argument("--statement-balance", dest="statement_balance", required=True)
++    p_rec_status.add_argument("--store", default=DEFAULT_STORE)
++
++
++def _cmd_reconcile(args: argparse.Namespace) -> int:
++    if args.reconcile_command == "mark":
++        mark_cleared(args.store, args.ids)
++        print(f"Marked {len(args.ids)} transactions as cleared")
++        return 0
++    if args.reconcile_command == "status":
++        txns = load(args.store)
++        cleared_ids = load_cleared(args.store)
++        total = cleared_total(txns, cleared_ids)
++        statement_balance = Decimal(args.statement_balance)
++        difference = statement_balance - total
++        print(f"Cleared total: {total:.2f}")
++        print(f"Statement balance: {statement_balance:.2f}")
++        print(f"Difference: {difference:.2f}")
++        print(f"Status: {'reconciled' if difference == 0 else 'out of balance'}")
++        return 0
++    raise ValueError(f"unknown reconcile command: {args.reconcile_command!r}")
++
++
++HANDLERS = {"reconcile": _cmd_reconcile}
+diff --git a/ledgerlite/commands/recurring_cli.py b/ledgerlite/commands/recurring_cli.py
+new file mode 100644
+index 0000000..5bbd9e7
+--- /dev/null
++++ b/ledgerlite/commands/recurring_cli.py
+@@ -0,0 +1,75 @@
++"""The `recurring` command family."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from decimal import Decimal
++
++from ..recurring import RecurringRule, generate, load_rules, save_rules
++from ..store import load, next_id, save
++from . import DEFAULT_STORE
++from .core import _parse_year_month
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_recurring = sub.add_parser("recurring", help="recurring transaction rules")
++    recurring_sub = p_recurring.add_subparsers(dest="recurring_command", required=True)
++
++    p_rec_add = recurring_sub.add_parser("add", help="add a recurring rule")
++    p_rec_add.add_argument("--payee", required=True)
++    p_rec_add.add_argument("--amount", required=True)
++    p_rec_add.add_argument("--day", type=int, required=True, help="day of month, 1-28")
++    p_rec_add.add_argument("--category", default=None)
++    p_rec_add.add_argument("--currency", default="USD")
++    p_rec_add.add_argument("--memo", default="")
++    p_rec_add.add_argument("--store", default=DEFAULT_STORE)
++
++    p_rec_list = recurring_sub.add_parser("list", help="list recurring rules")
++    p_rec_list.add_argument("--store", default=DEFAULT_STORE)
++
++    p_rec_apply = recurring_sub.add_parser(
++        "apply", help="generate transactions for a month range and add them to the store"
++    )
++    p_rec_apply.add_argument("--from", dest="from_month", required=True, metavar="YYYY-MM")
++    p_rec_apply.add_argument("--to", dest="to_month", required=True, metavar="YYYY-MM")
++    p_rec_apply.add_argument("--store", default=DEFAULT_STORE)
++
++
++def _cmd_recurring(args: argparse.Namespace) -> int:
++    if args.recurring_command == "add":
++        if not (1 <= args.day <= 28):
++            print(f"error: --day must be between 1 and 28, got {args.day}", file=sys.stderr)
++            return 2
++        rules = load_rules(args.store)
++        rules.append(RecurringRule(
++            payee=args.payee, amount=Decimal(args.amount), day=args.day,
++            category=args.category, currency=args.currency, memo=args.memo,
++        ))
++        save_rules(args.store, rules)
++        print(f"Added recurring {args.payee}: {Decimal(args.amount)} on day {args.day}")
++        return 0
++    if args.recurring_command == "list":
++        rules = load_rules(args.store)
++        if not rules:
++            print("No recurring rules.")
++            return 0
++        for rule in rules:
++            print(f"{rule.payee}: {rule.amount} {rule.currency} day {rule.day}")
++        return 0
++    if args.recurring_command == "apply":
++        rules = load_rules(args.store)
++        existing = load(args.store)
++        from_year, from_month = _parse_year_month(args.from_month)
++        to_year, to_month = _parse_year_month(args.to_month)
++        new_txns = generate(
++            rules, from_year, from_month, to_year, to_month,
++            start_id=next_id(existing),
++        )
++        save(args.store, existing + new_txns)
++        print(f"Applied {len(new_txns)} recurring transactions")
++        return 0
++    raise ValueError(f"unknown recurring command: {args.recurring_command!r}")
++
++
++HANDLERS = {"recurring": _cmd_recurring}
+diff --git a/ledgerlite/commands/report_cli.py b/ledgerlite/commands/report_cli.py
+new file mode 100644
+index 0000000..983bf3d
+--- /dev/null
++++ b/ledgerlite/commands/report_cli.py
+@@ -0,0 +1,35 @@
++"""The `report` command family."""
++
++from __future__ import annotations
++
++import argparse
++
++from .. import report
++from ..store import load
++from . import DEFAULT_STORE
++from .core import _parse_year_month
++
++
++def add_subparser(sub: argparse._SubParsersAction) -> None:
++    p_report = sub.add_parser("report", help="reports across the whole ledger")
++    report_sub = p_report.add_subparsers(dest="report_command", required=True)
++    p_report_cashflow = report_sub.add_parser("cashflow", help="monthly income/expense/net")
++    p_report_cashflow.add_argument("--from", dest="from_month", required=True, metavar="YYYY-MM")
++    p_report_cashflow.add_argument("--to", dest="to_month", required=True, metavar="YYYY-MM")
++    p_report_cashflow.add_argument("--store", default=DEFAULT_STORE)
++
++
++def _cmd_report(args: argparse.Namespace) -> int:
++    if args.report_command == "cashflow":
++        txns = load(args.store)
++        from_year, from_month = _parse_year_month(args.from_month)
++        to_year, to_month = _parse_year_month(args.to_month)
++        rows = report.cashflow(txns, from_year, from_month, to_year, to_month)
++        print(f"{'Month':<7}  {'Income':>10}  {'Expense':>10}  {'Net':>10}")
++        for month, income, expense, net in rows:
++            print(f"{month:<7}  {income:>10.2f}  {expense:>10.2f}  {net:>10.2f}")
++        return 0
++    raise ValueError(f"unknown report command: {args.report_command!r}")
++
++
++HANDLERS = {"report": _cmd_report}
+diff --git a/ledgerlite/currency.py b/ledgerlite/currency.py
+new file mode 100644
+index 0000000..e227ca3
+--- /dev/null
++++ b/ledgerlite/currency.py
+@@ -0,0 +1,70 @@
++"""Multi-currency support for ledgerlite.
++
++`RATES` gives, for each supported non-USD currency code, how many US
++dollars one unit of that currency is worth (e.g. `RATES["EUR"] = 1.09`
++means 1 EUR = 1.09 USD). USD is the implicit base currency and is not a
++key in `RATES`.
++
++Rounding rule (load-bearing for every feature that converts currencies --
++do not change without updating every caller): every conversion result is
++rounded to exactly 2 decimal places using `decimal.ROUND_HALF_UP` (halfway
++values always round away from zero, e.g. 17.145 -> 17.15), applied ONCE to
++the final result of a conversion, never to an intermediate USD amount.
++"""
++
++from __future__ import annotations
++
++from decimal import Decimal, ROUND_HALF_UP
++from typing import Dict
++
++#: USD value of one unit of each supported non-USD currency.
++RATES: Dict[str, Decimal] = {
++    "EUR": Decimal("1.09"),
++    "GBP": Decimal("1.27"),
++}
++
++BASE_CURRENCY = "USD"
++
++_CENTS = Decimal("0.01")
++
++
++def _round(amount: Decimal) -> Decimal:
++    return amount.quantize(_CENTS, rounding=ROUND_HALF_UP)
++
++
++def to_usd(amount: Decimal, currency: str) -> Decimal:
++    """Convert `amount` (denominated in `currency`) to USD.
++
++    Raises `KeyError` if `currency` is neither `"USD"` nor a key of
++    `RATES`.
++    """
++    if currency == BASE_CURRENCY:
++        return _round(amount)
++    rate = RATES[currency]
++    return _round(amount * rate)
++
++
++def from_usd(amount: Decimal, currency: str) -> Decimal:
++    """Convert a USD `amount` to `currency`.
++
++    Raises `KeyError` if `currency` is neither `"USD"` nor a key of
++    `RATES`.
++    """
++    if currency == BASE_CURRENCY:
++        return _round(amount)
++    rate = RATES[currency]
++    return _round(amount / rate)
++
++
++def convert(amount: Decimal, from_currency: str, to_currency: str) -> Decimal:
++    """Convert `amount` from `from_currency` to `to_currency`, via USD.
++
++    The USD intermediate is kept at full precision; only the final result
++    is rounded (see module docstring). Raises `KeyError` if either
++    currency is neither `"USD"` nor a key of `RATES`.
++    """
++    if from_currency == to_currency:
++        return _round(amount)
++    usd = amount if from_currency == BASE_CURRENCY else amount * RATES[from_currency]
++    result = usd if to_currency == BASE_CURRENCY else usd / RATES[to_currency]
++    return _round(result)
+diff --git a/ledgerlite/models.py b/ledgerlite/models.py
+index 4cfa174..6130459 100644
+--- a/ledgerlite/models.py
++++ b/ledgerlite/models.py
+@@ -20,6 +20,8 @@ class Transaction:
+             statement.
+         memo: a free-text note or the statement's own description field.
+         category: the assigned spending category, or None if uncategorized.
++        currency: the ISO-ish code the amount is denominated in (see
++            `ledgerlite.currency`). Defaults to `"USD"`.
+     """
+ 
+     id: int
+@@ -28,6 +30,7 @@ class Transaction:
+     payee: str
+     memo: str
+     category: Optional[str] = None
++    currency: str = "USD"
+ 
+ 
+ def parse_money(text: str) -> Decimal:
+diff --git a/ledgerlite/parse.py b/ledgerlite/parse.py
+index 65717e0..5ea8870 100644
+--- a/ledgerlite/parse.py
++++ b/ledgerlite/parse.py
+@@ -23,30 +23,38 @@ def _parse_date(text: str) -> date:
+     raise ValueError(f"unrecognised date format: {text!r}")
+ 
+ 
+-def read_csv(path: Union[str, Path]) -> List[Transaction]:
++def read_csv(
++    path: Union[str, Path], default_currency: str = "USD", start_id: int = 1
++) -> List[Transaction]:
+     """Read a bank-export CSV into a list of `Transaction` records.
+ 
+     The file must have a header row with at least `date`, `amount`, `payee`,
+-    and `memo` columns; `category` is optional. Dates may be ISO
+-    (`YYYY-MM-DD`) or `DD-MM-YYYY`. Amounts are parsed with `parse_money`,
+-    so a leading `$` or parenthesized negatives are accepted.
++    and `memo` columns; `category` and `currency` are optional. Dates may be
++    ISO (`YYYY-MM-DD`) or `DD-MM-YYYY`. Amounts are parsed with
++    `parse_money`, so a leading `$` or parenthesized negatives are accepted.
+ 
+-    Transaction ids are assigned sequentially starting at 1, in file order.
++    A row's `currency` column, if present and non-empty, is used as-is
++    (no validation); otherwise `default_currency` is used.
++
++    Transaction ids are assigned sequentially starting at `start_id`
++    (default 1), in file order.
+     """
+     path = Path(path)
+     txns: List[Transaction] = []
+     with path.open("r", newline="", encoding="utf-8") as fh:
+         reader = csv.DictReader(fh)
+-        for i, row in enumerate(reader, start=1):
++        for offset, row in enumerate(reader):
+             category = (row.get("category") or "").strip() or None
++            currency = (row.get("currency") or "").strip() or default_currency
+             txns.append(
+                 Transaction(
+-                    id=i,
++                    id=start_id + offset,
+                     date=_parse_date(row["date"]),
+                     amount=parse_money(row["amount"]),
+                     payee=(row.get("payee") or "").strip(),
+                     memo=(row.get("memo") or "").strip(),
+                     category=category,
++                    currency=currency,
+                 )
+             )
+     return txns
+diff --git a/ledgerlite/reconcile.py b/ledgerlite/reconcile.py
+new file mode 100644
+index 0000000..8b2092a
+--- /dev/null
++++ b/ledgerlite/reconcile.py
+@@ -0,0 +1,28 @@
++"""Bank reconciliation for ledgerlite: marking transactions as cleared and
++comparing their total against a bank statement balance."""
++
++from __future__ import annotations
++
++from decimal import Decimal
++from pathlib import Path
++from typing import List, Set, Union
++
++from . import store
++from .models import Transaction
++
++CLEARED_KEY = "cleared_ids"
++
++
++def load_cleared(path: Union[str, Path]) -> Set[int]:
++    raw = store.load_key(path, CLEARED_KEY, default=[])
++    return set(raw)
++
++
++def mark_cleared(path: Union[str, Path], ids: List[int]) -> None:
++    cleared = load_cleared(path)
++    cleared.update(ids)
++    store.save_key(path, CLEARED_KEY, sorted(cleared))
++
++
++def cleared_total(txns: List[Transaction], cleared_ids: Set[int]) -> Decimal:
++    return sum((t.amount for t in txns if t.id in cleared_ids), Decimal("0"))
+diff --git a/ledgerlite/recurring.py b/ledgerlite/recurring.py
+new file mode 100644
+index 0000000..744c250
+--- /dev/null
++++ b/ledgerlite/recurring.py
+@@ -0,0 +1,101 @@
++"""Recurring transaction rules for ledgerlite.
++
++A rule fires once per calendar month, on a fixed day-of-month, generating
++one `Transaction`. To sidestep short-month edge cases entirely, `day` must
++be between 1 and 28 inclusive (every month has at least 28 days) -- this
++is enforced by the CLI layer, not here.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import date
++from decimal import Decimal
++from pathlib import Path
++from typing import List, Optional, Union
++
++from . import store
++from .models import Transaction
++
++RECURRING_KEY = "recurring"
++
++
++@dataclass
++class RecurringRule:
++    payee: str
++    amount: Decimal
++    day: int
++    category: Optional[str] = None
++    currency: str = "USD"
++    memo: str = ""
++
++
++def _rule_to_dict(rule: RecurringRule) -> dict:
++    return {
++        "payee": rule.payee,
++        "amount": str(rule.amount),
++        "day": rule.day,
++        "category": rule.category,
++        "currency": rule.currency,
++        "memo": rule.memo,
++    }
++
++
++def _rule_from_dict(data: dict) -> RecurringRule:
++    return RecurringRule(
++        payee=data["payee"],
++        amount=Decimal(data["amount"]),
++        day=data["day"],
++        category=data.get("category"),
++        currency=data.get("currency") or "USD",
++        memo=data.get("memo") or "",
++    )
++
++
++def load_rules(path: Union[str, Path]) -> List[RecurringRule]:
++    raw = store.load_key(path, RECURRING_KEY, default=[])
++    return [_rule_from_dict(d) for d in raw]
++
++
++def save_rules(path: Union[str, Path], rules: List[RecurringRule]) -> None:
++    store.save_key(path, RECURRING_KEY, [_rule_to_dict(r) for r in rules])
++
++
++def _months_between(from_year: int, from_month: int, to_year: int, to_month: int):
++    y, m = from_year, from_month
++    while (y, m) <= (to_year, to_month):
++        yield y, m
++        m += 1
++        if m > 12:
++            m = 1
++            y += 1
++
++
++def generate(
++    rules: List[RecurringRule],
++    from_year: int, from_month: int,
++    to_year: int, to_month: int,
++    start_id: int,
++) -> List[Transaction]:
++    """One `Transaction` per rule per calendar month in the inclusive
++    `[from_year-from_month, to_year-to_month]` range, in rule order within
++    each month, months in chronological order. Ids are assigned
++    sequentially starting at `start_id`, in the same order.
++    """
++    txns: List[Transaction] = []
++    next_id = start_id
++    for year, month in _months_between(from_year, from_month, to_year, to_month):
++        for rule in rules:
++            txns.append(
++                Transaction(
++                    id=next_id,
++                    date=date(year, month, rule.day),
++                    amount=rule.amount,
++                    payee=rule.payee,
++                    memo=rule.memo,
++                    category=rule.category,
++                    currency=rule.currency,
++                )
++            )
++            next_id += 1
++    return txns
+diff --git a/ledgerlite/report.py b/ledgerlite/report.py
+index 8abef48..e873e0b 100644
+--- a/ledgerlite/report.py
++++ b/ledgerlite/report.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from decimal import Decimal
+-from typing import Dict, List, Sequence, TypeVar
++from typing import Dict, List, Sequence, Tuple, TypeVar
+ 
+ from .models import Transaction
+ 
+@@ -34,6 +34,46 @@ def category_totals(txns: List[Transaction]) -> Dict[str, Decimal]:
+     return totals
+ 
+ 
++def _months_in_range(from_year: int, from_month: int, to_year: int, to_month: int):
++    y, m = from_year, from_month
++    while (y, m) <= (to_year, to_month):
++        yield y, m
++        m += 1
++        if m > 12:
++            m = 1
++            y += 1
++
++
++def cashflow(
++    txns: List[Transaction], from_year: int, from_month: int, to_year: int, to_month: int
++) -> List[Tuple[str, Decimal, Decimal, Decimal]]:
++    """Monthly income/expense/net for every calendar month in the inclusive
++    range, in chronological order -- including months with no activity at
++    all (all three figures `Decimal("0")`).
++
++    `income` sums positive amounts, `expense` sums the absolute value of
++    negative amounts (so it is reported as a positive figure), and
++    `net = income - expense` (equivalently, the sum of the raw signed
++    amounts for that month).
++    """
++    by_month: Dict[str, Tuple[Decimal, Decimal]] = {}
++    for txn in txns:
++        key = f"{txn.date.year:04d}-{txn.date.month:02d}"
++        income, expense = by_month.get(key, (Decimal("0"), Decimal("0")))
++        if txn.amount >= 0:
++            income += txn.amount
++        else:
++            expense += -txn.amount
++        by_month[key] = (income, expense)
++
++    rows = []
++    for year, month in _months_in_range(from_year, from_month, to_year, to_month):
++        key = f"{year:04d}-{month:02d}"
++        income, expense = by_month.get(key, (Decimal("0"), Decimal("0")))
++        rows.append((key, income, expense, income - expense))
++    return rows
++
++
+ def page(items: Sequence[T], page_no: int, page_size: int) -> List[T]:
+     """Return the `page_no`-th page (1-indexed) of `items`, `page_size` per page.
+ 
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..c340f1e 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -1,4 +1,4 @@
+-"""JSON persistence for ledgerlite transactions."""
++"""JSON persistence for ledgerlite transactions (and other top-level keys)."""
+ 
+ from __future__ import annotations
+ 
+@@ -6,7 +6,7 @@ import json
+ from datetime import date
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import List, Union
++from typing import Any, List, Union
+ 
+ from .models import Transaction
+ 
+@@ -19,6 +19,7 @@ def _txn_to_dict(txn: Transaction) -> dict:
+         "payee": txn.payee,
+         "memo": txn.memo,
+         "category": txn.category,
++        "currency": txn.currency,
+     }
+ 
+ 
+@@ -30,16 +31,70 @@ def _txn_from_dict(data: dict) -> Transaction:
+         payee=data["payee"],
+         memo=data["memo"],
+         category=data.get("category"),
++        # Ledgers written before multi-currency support have no "currency"
++        # key at all; treat those rows as USD.
++        currency=data.get("currency") or "USD",
+     )
+ 
+ 
+-def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
++def _load_raw(path: Union[str, Path]) -> dict:
++    """The whole store file as a dict, or `{}` if it does not exist yet (or
++    does not parse as a JSON object)."""
++    p = Path(path)
++    if not p.exists():
++        return {}
++    try:
++        payload = json.loads(p.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError):
++        return {}
++    return payload if isinstance(payload, dict) else {}
++
++
++def _write_raw(path: Union[str, Path], payload: dict) -> None:
+     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
++def save(path: Union[str, Path], txns: List[Transaction]) -> None:
++    """Write `txns` to `path` as JSON, overwriting any existing file.
++
++    Merges onto whatever else is already stored at `path` (budgets,
++    recurring rules, reconciliation state, undo history, ...) instead of
++    clobbering it -- only the `"transactions"` key is replaced.
++    """
++    raw = _load_raw(path)
++    raw["transactions"] = [_txn_to_dict(t) for t in txns]
++    _write_raw(path, raw)
++
++
+ def load(path: Union[str, Path]) -> List[Transaction]:
+     """Read a list of `Transaction` from a JSON file written by `save`."""
+-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+-    return [_txn_from_dict(d) for d in payload.get("transactions", [])]
++    raw = _load_raw(path)
++    return [_txn_from_dict(d) for d in raw.get("transactions", [])]
++
++
++def load_key(path: Union[str, Path], key: str, default: Any = None) -> Any:
++    """Read one top-level key from the store file, `default` if absent."""
++    raw = _load_raw(path)
++    return raw.get(key, default)
++
++
++def save_key(path: Union[str, Path], key: str, value: Any) -> None:
++    """Write one top-level key into the store file, preserving every other
++    key already there (`"transactions"` included)."""
++    raw = _load_raw(path)
++    raw[key] = value
++    _write_raw(path, raw)
++
++
++def next_id(txns: List[Transaction]) -> int:
++    """The id to assign to the next NEW transaction appended to `txns`:
++    one past the highest id already present, or `1` if `txns` is empty.
++
++    Every feature that ADDS transactions to an existing store (append
++    imports, OFX imports, recurring rules, batch imports, ...) uses this
++    same rule, so ids stay unique and monotonically increasing across the
++    whole store no matter which feature wrote them.
++    """
++    if not txns:
++        return 1
++    return max(t.id for t in txns) + 1

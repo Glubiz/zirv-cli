@@ -1,0 +1,8 @@
+I've got six months of CSV statements sitting in a folder and I don't
+want to run `import` six separate times. Add `python -m ledgerlite
+import-batch CSV_PATH [CSV_PATH ...] --store PATH [--currency CODE]`:
+imports each file in the order given on the command line, adding to the
+ledger the same way you already add to an existing one elsewhere in this
+app (this always adds, there's no "replace" mode for this one -- that
+wouldn't make sense for a batch). Print the same per-file message you
+already print for a single `import`, once per file, in order.
