@@ -774,11 +774,22 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
 
             if super::exec::should_attempt_compact(compact_requested, limit_hit) {
+                // Issue #789 (`[jev] compaction_select`): same best-effort,
+                // off-by-default seam as `exec.rs`'s own `zirv ctx exec`
+                // compaction -- `zirv ctx loop` composes the identical
+                // `compact_in_place` call, so it gets the identical keep-list
+                // treatment.
+                let compact_focus = {
+                    let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                    handoff::compaction_focus_text(&cfg, &state, &ctx, supervise::COMPACT_FOCUS)
+                };
                 let compact_result = super::exec::compact_in_place(
                     adapter.as_ref(),
                     Some(&transcript),
                     Duration::from_millis(cfg.supervise.compact_timeout_ms),
                     poll,
+                    &compact_focus,
                     |compact_prompt| {
                         let session_ref = SessionRef {
                             id: session.clone(),

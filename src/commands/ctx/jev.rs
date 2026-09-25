@@ -1037,6 +1037,7 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
         || cfg.approve_allow
         || cfg.classify
         || cfg.handoff_select
+        || cfg.compaction_select
         || cfg.inject_screen
         || cfg.inject
         || cfg.stop_verify

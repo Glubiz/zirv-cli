@@ -607,6 +607,7 @@ struct CompactPlan<'a> {
 fn compact_plan<'a>(
     adapter: &dyn adapters::AgentAdapter,
     transcript: Option<&'a Path>,
+    focus: &str,
 ) -> Result<CompactPlan<'a>, String> {
     let command = adapter.compact_command().ok_or_else(|| {
         format!(
@@ -618,7 +619,7 @@ fn compact_plan<'a>(
         .filter(|path| path.is_file())
         .ok_or_else(|| "no transcript reported, compaction unverifiable".to_string())?;
     Ok(CompactPlan {
-        prompt: supervise::compact_prompt(command),
+        prompt: supervise::compact_prompt(command, focus),
         transcript,
     })
 }
@@ -673,12 +674,13 @@ pub(crate) fn compact_in_place<F>(
     transcript: Option<&Path>,
     hard_timeout: Duration,
     poll: Duration,
+    focus: &str,
     build: F,
 ) -> Result<(), String>
 where
     F: FnOnce(&str) -> Option<(Command, Option<String>)>,
 {
-    let plan = compact_plan(adapter, transcript)?;
+    let plan = compact_plan(adapter, transcript, focus)?;
     let mut watcher = supervise::Watcher::new(plan.transcript.to_path_buf());
     watcher
         .read_appended()
@@ -2656,11 +2658,23 @@ fn run_with_clock_inner<W: Write>(
                 .chain(user_extra.iter().cloned())
                 .chain(prompt_args.iter().cloned())
                 .collect();
+            // Issue #789 (`[jev] compaction_select`): best-effort, off by
+            // default -- gate off, no credential, or an indecisive/failed
+            // call all leave `compact_focus` byte-identical to
+            // `supervise::COMPACT_FOCUS`, so reading and parsing the
+            // transcript here costs nothing observable on that (today's
+            // default) path beyond the read itself.
+            let compact_focus = {
+                let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
+                let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
+                handoff::compaction_focus_text(&cfg, &state, &ctx, supervise::COMPACT_FOCUS)
+            };
             let compact_result = compact_in_place(
                 adapter.as_ref(),
                 Some(&transcript),
                 Duration::from_millis(cfg.supervise.compact_timeout_ms),
                 poll,
+                &compact_focus,
                 |compact_prompt| {
                     let session_ref = SessionRef {
                         id: session.clone(),
@@ -7014,6 +7028,7 @@ mod tests {
                 Some(&transcript),
                 Duration::ZERO,
                 Duration::ZERO,
+                supervise::COMPACT_FOCUS,
                 |_| {
                     attempts.set(attempts.get() + 1);
                     None
@@ -7027,10 +7042,17 @@ mod tests {
         let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
         let attempts = Cell::new(0);
         assert_eq!(
-            compact_in_place(&claude, None, Duration::ZERO, Duration::ZERO, |_| {
-                attempts.set(attempts.get() + 1);
-                None
-            },)
+            compact_in_place(
+                &claude,
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                supervise::COMPACT_FOCUS,
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                },
+            )
             .expect_err("missing transcript must fail closed"),
             "no transcript reported, compaction unverifiable"
         );
@@ -7077,6 +7099,7 @@ mod tests {
             Some(&transcript),
             Duration::from_secs(5),
             Duration::from_millis(20),
+            supervise::COMPACT_FOCUS,
             build,
         );
         assert!(
@@ -7118,6 +7141,7 @@ mod tests {
             Some(&transcript),
             hard_timeout,
             Duration::from_millis(20),
+            supervise::COMPACT_FOCUS,
             build,
         );
         let elapsed = started.elapsed();

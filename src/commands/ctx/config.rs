@@ -2036,6 +2036,9 @@ pub struct JevConfig {
     pub classify: bool,
     /// Issue #783: Jev keep/drop scoring of handoff candidate items.
     pub handoff_select: bool,
+    /// Issue #789: Jev-ranked keep list appended to a compaction's own focus
+    /// text.
+    pub compaction_select: bool,
     /// Issue #784: Jev prompt-injection screening of untrusted inputs.
     pub inject_screen: bool,
     /// Issue #785: Jev inject-now/defer gate for automatic compact/restart/
@@ -2092,6 +2095,7 @@ impl Default for JevConfig {
             approve_allow: false,
             classify: false,
             handoff_select: false,
+            compaction_select: false,
             inject_screen: false,
             inject: false,
             stop_verify: false,
@@ -4248,6 +4252,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_COMPACTION_SELECT",
+        &["jev", "compaction_select"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_INJECT_SCREEN",
         &["jev", "inject_screen"],
         EnvKind::Bool,
@@ -5674,6 +5683,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "approve_allow"], "ZIRV_CTX_JEV_APPROVE_ALLOW"),
     (&["jev", "classify"], "ZIRV_CTX_JEV_CLASSIFY"),
     (&["jev", "handoff_select"], "ZIRV_CTX_JEV_HANDOFF_SELECT"),
+    (
+        &["jev", "compaction_select"],
+        "ZIRV_CTX_JEV_COMPACTION_SELECT",
+    ),
     (&["jev", "inject_screen"], "ZIRV_CTX_JEV_INJECT_SCREEN"),
     (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
@@ -9077,6 +9090,7 @@ mod tests {
         assert!(!cfg.approve_allow);
         assert!(!cfg.classify);
         assert!(!cfg.handoff_select);
+        assert!(!cfg.compaction_select);
         assert!(!cfg.inject_screen);
         assert!(!cfg.inject);
         assert!(!cfg.stop_verify);
@@ -9130,6 +9144,7 @@ mod tests {
             ("[jev]\napprove_allow = true\n", "approve_allow"),
             ("[jev]\nclassify = true\n", "classify"),
             ("[jev]\nhandoff_select = true\n", "handoff_select"),
+            ("[jev]\ncompaction_select = true\n", "compaction_select"),
             ("[jev]\ninject_screen = true\n", "inject_screen"),
             ("[jev]\ninject = true\n", "inject"),
             ("[jev]\nstop_verify = true\n", "stop_verify"),
@@ -9171,6 +9186,7 @@ mod tests {
             ("ZIRV_CTX_JEV_APPROVE_ALLOW", "true"),
             ("ZIRV_CTX_JEV_CLASSIFY", "true"),
             ("ZIRV_CTX_JEV_HANDOFF_SELECT", "true"),
+            ("ZIRV_CTX_JEV_COMPACTION_SELECT", "true"),
             ("ZIRV_CTX_JEV_INJECT_SCREEN", "true"),
             ("ZIRV_CTX_JEV_INJECT", "true"),
             ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
@@ -9197,6 +9213,7 @@ mod tests {
         assert!(cfg.jev.approve_allow);
         assert!(cfg.jev.classify);
         assert!(cfg.jev.handoff_select);
+        assert!(cfg.jev.compaction_select);
         assert!(cfg.jev.inject_screen);
         assert!(cfg.jev.inject);
         assert!(cfg.jev.stop_verify);

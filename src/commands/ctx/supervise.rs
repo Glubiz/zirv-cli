@@ -14,8 +14,12 @@ use super::sessions::is_alive;
 /// use this one composition seam.
 pub const COMPACT_FOCUS: &str = "Preserve the current task and its acceptance criteria, any constraints the operator stated, the file paths touched so far, decisions already made and the reasoning behind them, any unresolved errors or failing tests, and the exact next step. Drop resolved tangents and full file dumps.";
 
-pub fn compact_prompt(compact_command: &str) -> String {
-    format!("{compact_command} {COMPACT_FOCUS}")
+/// `focus` is `COMPACT_FOCUS` at every call site today, unless `[jev]
+/// compaction_select` (issue #789) appended its own short keep list to it
+/// first (`handoff::compaction_focus_text`) -- this function itself stays
+/// unaware of that gate, same as it always has been.
+pub fn compact_prompt(compact_command: &str, focus: &str) -> String {
+    format!("{compact_command} {focus}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

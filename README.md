@@ -4100,6 +4100,7 @@ approve = false     # safety-hook risk check: sends local facts only (program/su
 approve_allow = false # opt-in auto-approve, effective only when `approve` is also true: may lower a SIMPLE unmatched-default ask to allow (single segment, no pipe/redirect/substitution/env-prefix/code-bearing argument, program not a shell/eval/wrapper/refused-destructive program, not destructive/network/privilege) on a high-confidence/margin answer, with every check ALSO re-run on each token suffix to defeat launcher prefixes (nohup, timeout N, nice, ...); never a hard deny, and never a matched deny/ask rule (rm -rf, force-push, credential paths, ...) -- see "Command safety policy" below for the full structural rule; ZIRV_CTX_JEV_APPROVE_ALLOW (#781)
 classify = false    # intent refinement for `zirv workflow start`/`classify` (classify also adds domain tags); ZIRV_CTX_JEV_CLASSIFY (#782)
 handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_JEV_HANDOFF_SELECT (#783)
+compaction_select = false # appends a short Jev-chosen keep list ("Keep in particular: ...") to a compaction's own focus text, from candidates (edited files, an unresolved failing test, first-prompt constraints, the latest plan) extracted deterministically from the transcript; ZIRV_CTX_JEV_COMPACTION_SELECT (#789)
 inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
 inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
@@ -4622,6 +4623,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.approve_allow` | `ZIRV_CTX_JEV_APPROVE_ALLOW` |
 | `jev.classify` | `ZIRV_CTX_JEV_CLASSIFY` |
 | `jev.handoff_select` | `ZIRV_CTX_JEV_HANDOFF_SELECT` |
+| `jev.compaction_select` | `ZIRV_CTX_JEV_COMPACTION_SELECT` |
 | `jev.inject_screen` | `ZIRV_CTX_JEV_INJECT_SCREEN` |
 | `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |

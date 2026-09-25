@@ -1377,14 +1377,19 @@ fn unread_mail_counts(
 /// same-burst trailing `\r` correctly, so `defer` is `false` there; a
 /// codex successor needs the same paste-fold protection
 /// `write_mail_advisory` already gives its mail advisory.
-pub fn inject_compact(sink: &mut dyn Write, compact_command: &str, defer: bool) -> CtxResult<()> {
+pub fn inject_compact(
+    sink: &mut dyn Write,
+    compact_command: &str,
+    focus: &str,
+    defer: bool,
+) -> CtxResult<()> {
     // A TUI submits on carriage return, not newline. Built as a full string
     // first and written in one `write_all` call, the same convention
     // `mail_advisory_bytes`/`write_mail_advisory_phase1` use -- `write!`
     // directly on a generic sink can fragment one format string across
     // several `write_all` calls, which would blur the phase boundary this
     // function depends on.
-    let text = compact_prompt(compact_command);
+    let text = compact_prompt(compact_command, focus);
     if !defer {
         sink.write_all(format!("{text}\r").as_bytes())?;
         sink.flush()?;
@@ -4123,12 +4128,32 @@ fn pump(
                     supervision.signals_seen,
                 );
                 let defer = adapter.capabilities().defer_injection_submit;
+                // Issue #789 (`[jev] compaction_select`): best-effort, off by
+                // default -- see the identical comment at `exec.rs`'s own
+                // headless `compact_in_place` call site. Reading and parsing
+                // the transcript here costs nothing observable when the gate
+                // is off (today's default), since `compaction_focus_text`
+                // returns `COMPACT_FOCUS` byte-identical in that case.
+                let compact_focus = {
+                    let jsonl = transcript
+                        .path()
+                        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+                        .unwrap_or_default();
+                    let ctx = adapter.structural_context(&jsonl, tail_items);
+                    handoff::compaction_focus_text(
+                        cfg,
+                        state_dir,
+                        &ctx,
+                        super::supervise::COMPACT_FOCUS,
+                    )
+                };
                 let injected = writer
                     .lock()
                     .map_err(|_| "pty writer poisoned".to_string())
                     .and_then(|mut sink| {
                         let command = adapter.compact_command().unwrap_or("/compact");
-                        inject_compact(&mut *sink, command, defer).map_err(|e| e.to_string())
+                        inject_compact(&mut *sink, command, &compact_focus, defer)
+                            .map_err(|e| e.to_string())
                     });
 
                 // Arm the cooldown before verifying so a failed verification
@@ -7549,7 +7574,7 @@ mod tests {
     #[test]
     fn the_injected_command_carries_focus_instructions_and_ends_with_a_carriage_return() {
         let mut sink: Vec<u8> = Vec::new();
-        inject_compact(&mut sink, "/compact", false).expect("inject");
+        inject_compact(&mut sink, "/compact", COMPACT_FOCUS, false).expect("inject");
         let text = String::from_utf8(sink).expect("utf8");
         assert!(text.starts_with("/compact "), "got {text:?}");
         assert!(text.contains(COMPACT_FOCUS));
@@ -7569,7 +7594,7 @@ mod tests {
     #[test]
     fn inject_compact_stays_single_burst_for_a_non_deferring_adapter() {
         let mut writer = RecordingWriter::default();
-        inject_compact(&mut writer, "/compact", false).expect("inject");
+        inject_compact(&mut writer, "/compact", COMPACT_FOCUS, false).expect("inject");
         let chunks = writer.chunks.lock().expect("lock");
         assert_eq!(chunks.len(), 1, "one write, not two: {chunks:?}");
         assert_eq!(
@@ -7589,7 +7614,7 @@ mod tests {
     fn inject_compact_defers_the_submitting_cr_for_a_deferring_adapter() {
         let mut writer = RecordingWriter::default();
         let started = std::time::Instant::now();
-        inject_compact(&mut writer, "/compact", true).expect("inject");
+        inject_compact(&mut writer, "/compact", COMPACT_FOCUS, true).expect("inject");
         assert!(
             started.elapsed() >= INJECTION_SUBMIT_DELAY,
             "the CR must not land before the submit delay has passed"
