@@ -2,7 +2,7 @@
 
 **Target (operator):** zirv with Jev **off** and zirv with Jev **on** must each be at least **20% cheaper**, at least **20% faster**, and at least **1% better in work quality** than vanilla Claude Code with the superpowers plugin (v6.4.1). Tasks should be large or long-running. Beating the target is welcome.
 
-**Status: not met.** The best fair round (r4) has Jev off at −6% cost, −7% time and +7% judged quality (significant), and Jev on at −5% / −6% / +4%. Round 5 is implemented and not yet benchmarked.
+**Status: not met overall.** Round 5 (4.30.0 with the operator's `[headless]` levers and every Jev gate on) has Jev off at −15% cost / −12% time / +1% judge and Jev on at −16% / −8% / +1% on the subset + t23. After the effort-flip and approve fixes (r5b), the t23 chain clears the target in both conditions (−24%/−25%/+23% and −47%/−36%/+23%, 2 reps), and t24 clears it on cost only (−27%/−15% and −29%/−16%, judge tied).
 
 Every round directory here holds one `<task>__<cond>__rN.json` per run (the harness's `result.json`) and a `report.md` regenerated with the current `compare.py`. To recompute a report, copy a round's JSON files back into `<dir>/<name>/result.json` and run `compare.py --runs <dir>`.
 
@@ -19,6 +19,9 @@ Changes are relative to vanilla + superpowers. "sig" means the paired-bootstrap 
 | r3b | 1e1add75, fair harness | subset + t23 (30) | +2% / +6% / **+7% sig** | −19% / −10% / +5% | Valid |
 | r4 | 5ca6b180 + 6414a21c | subset + t23 (30) | **−6% / −7% / +7% sig** | −5% / −6% / +4% | Valid |
 | r4-t24 | same as r4 | t24 22-step pilot (3, 1 rep) | see below | see below | **Broken:** rot-handling bugs; costs undercounted |
+| r5 | 4.30.0 (2b95a3b7): all 17 Jev gates on, headless levers (5m TTL, lean, medium effort) | subset + t23 (30) | −15% / −12% / +1% | −16% / −8% / +1% | Valid; t23 hit by the effort-flip cache bug (+8% / +5% cost) |
+| r5b | 2e943093 + d41e9976: sticky effort, no Jev approve call under dontAsk | t23 chain (6) | **−24% / −25% / +23%** | **−47% / −36% / +23%** | Valid, 1 task × 2 reps |
+| r5b-t24 | same as r5b | t24 22-step chain (6) | **−27%** / −15% / +0% | **−29%** / −16% / +0% | Valid; no compaction or restart fired (1M window) |
 
 About r1–r3: from fc59babb on, the harness ran zirv with `--setting-sources project,local`, which drops `~/.claude/settings.json`, where zirv's own hooks live. Fixed in d256124e. From r3b on, zirv keeps the user layer and vanilla receives the same `enabledPlugins` through `--settings`.
 
@@ -67,9 +70,14 @@ Before any rot event (steps 1–14) the runs compare as follows:
 | 9c046123 | Review fixes: rollover switch checked on cadence only; usage cache checks mtime and prunes; compaction waits on the hard bound only; learned window bounded to 8,192–10,000,000 and written atomically | – |
 | bench commits | `zirv-nojev` condition, `--stagger-s`, `compare.py`, t16–t24 tasks, chain kind, blind opus quality judge (+ retry), usage-limit pause/retry, chain cost deltas and session-switch following | – |
 
-## Round 5 (implemented, not benchmarked)
+## Round 5 results (r5, r5b, r5b-t24)
 
-The operator stopped before the round-5 benchmark.
+- **Effort flips broke the prompt cache on resumed sessions.** `[headless.effort]` re-classified every `--resume` launch, so effort flipped between turns and each flip re-wrote the whole conversation cache (t23 Jev off: 164k cache writes vs 49k). Fixed in 2e943093: effort is decided at a session's first launch and replayed; in-place compaction launches now get the levers too.
+- **Why Jev on was not better than Jev off.** The conditions differ by more than Jev: only `zirv-jev-full` runs the harness intake, which routes every XL task to an orchestrator seat and starts a workflow, and the deterministic intake makes the same call, so that part is not Jev. Jev's own cost was the approve gate: 240 calls in r5 (84 uncached at ~0.7 s), 23 escalations and 0 effects, because under `dontAsk` the hook emits nothing for allow or ask. Fixed in d41e9976 (no call under `dontAsk`) and 59f3e608 (no call for read-only local commands). About 75% of a Jev call is TCP+TLS setup from a fresh hook process (~570 ms of three ~190 ms round trips); Jev's own inference is ~100–150 ms.
+- **Scope creep is not zirv-specific.** At t24 step 4, Jev on scored 0.0 twice, vanilla 0.0 and 0.5, Jev off 1.0 and 0.5. Jev off's winning report left the pagination bug alone and asked.
+- **t24 steps 9 and 14 look like task defects.** Every condition loses the same hidden test in every run. Step 14's failing test calls `cashflow(..., to_usd=True)`, a keyword the step-14 prompt never names. The loss is equal across conditions, so it compresses scores without biasing them.
+
+## Round 5 (implementation notes)
 
 Operator decision: compaction should fire when the context actually rots, not at a token count far below the model's window. Let the session gather context until it starts to rot.
 
