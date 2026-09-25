@@ -40,6 +40,8 @@ use super::adapters::AgentAdapter;
 use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::handoff::{self, Handoff};
+use super::jev;
+use super::jev_relay;
 use super::pace;
 use super::prompt::PromptRole;
 use super::rot::Verdict;
@@ -1976,6 +1978,22 @@ pub fn run_with(
 
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
+
+    // Issue jev-relay: unlike `exec`, `wrap`'s own `session` never gets
+    // reminted mid-run (a harness handover keeps the same id, see
+    // `relaunch`'s own doc comment), so the relay is started exactly once
+    // here and held for this whole interactive supervisor's lifetime --
+    // `_jev_relay_handle`'s drop (at `run_with`'s return, whichever arm)
+    // stops it. `start` itself is a no-op `None` (no bind at all) whenever
+    // no `[jev]` gate is on or there is no credential, and never blocks this
+    // function's own startup: binding is fast local filesystem/pipe setup,
+    // and the accept loop moves to its own thread before `start` returns.
+    let _jev_relay_handle = jev_relay::start(
+        &cfg.proxy.typesafe,
+        jev::any_gate_enabled(&cfg.jev),
+        &state_dir,
+        session.as_str(),
+    );
 
     // T10: the launch-time pacing gate -- before this fix, `wrap` (and, by
     // extension, `zirv ctx chat`'s orchestrator and every dashboard pane,
@@ -9797,8 +9815,24 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut sockets = Vec::new();
             while Instant::now() < deadline && sockets.is_empty() {
+                // Issue jev-relay: `state/s/` can now also hold this
+                // session's own Jev relay endpoint (`jev_relay::start`,
+                // whenever the OPERATOR's real config has a `[jev]` gate on
+                // and a credential present -- this test spawns the real
+                // `zirv` binary against the real `~/.zirv/ctx.toml`, not an
+                // isolated one), an extensionless file `is_endpoint_file`
+                // already excludes -- the same discriminator `status.rs`'s
+                // own `orphan_sockets` scan of this same directory uses, so
+                // this assertion and that production scan never drift on
+                // what counts as a turn-signal endpoint here.
                 sockets = std::fs::read_dir(state.join("s"))
-                    .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|path| crate::commands::ctx::sessions::is_endpoint_file(path))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if sockets.is_empty() {
                     std::thread::sleep(Duration::from_millis(100));

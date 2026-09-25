@@ -46,6 +46,7 @@ pub(crate) mod hook_project;
 pub(crate) mod inject_gate;
 pub mod inject_screen;
 pub mod jev;
+pub mod jev_relay;
 pub mod judge;
 pub mod learn;
 pub mod ledger;

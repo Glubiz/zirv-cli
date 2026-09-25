@@ -28,7 +28,7 @@ use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, agent, handoff, log, objective, score};
+use super::{CtxResult, adapters, agent, handoff, jev, jev_relay, log, objective, score};
 use crate::commands::workflow::classify::Complexity;
 
 /// The restart budget is spent and the session is still rotting. Callers apply
@@ -1931,7 +1931,26 @@ fn run_with_clock_inner<W: Write>(
     // supervisor. A worker legitimately runs inside a session (that is what
     // `zirv ctx agent` is), but it must still speak with its own identity or
     // none at all.
-    let apply_session_env = |command: &mut Command, session: &SessionId| {
+    // Issue jev-relay: the relay is (re)hosted from inside this same closure
+    // rather than at each of its own call sites, since this is already "the
+    // one place a launch's session identity is applied" for every relaunch
+    // path -- see this closure's own doc comment above. Rebinding only when
+    // `session` actually changed since the last call (`jev_relay_session`)
+    // keeps a same-session re-application (the in-place compaction arms
+    // below) from tearing down and rebuilding a perfectly live relay for no
+    // reason.
+    let mut jev_relay_handle: Option<jev_relay::Handle> = None;
+    let mut jev_relay_session: Option<String> = None;
+    let mut apply_session_env = |command: &mut Command, session: &SessionId| {
+        if jev_relay_session.as_deref() != Some(session.as_str()) {
+            jev_relay_handle = jev_relay::start(
+                &cfg.proxy.typesafe,
+                jev::any_gate_enabled(&cfg.jev),
+                &state,
+                session.as_str(),
+            );
+            jev_relay_session = Some(session.as_str().to_string());
+        }
         super::sessions::scrub_supervision_env_cmd(command);
         for (key, value) in turn_env_for(session) {
             command.env(key, value);

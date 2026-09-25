@@ -45,13 +45,15 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::commands::ctx::adapters;
 use crate::commands::ctx::agent;
-use crate::commands::ctx::config::{CtxConfig, ProxyTypesafeConfig};
+use crate::commands::ctx::config::{CtxConfig, JevConfig, ProxyTypesafeConfig};
+use crate::commands::ctx::jev_relay;
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{self, StateDir};
 
@@ -377,7 +379,7 @@ impl std::fmt::Display for JevError {
 
 impl std::error::Error for JevError {}
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NoulCriteria {
     #[serde(rename = "true", skip_serializing_if = "Option::is_none")]
     when_true: Option<String>,
@@ -385,7 +387,7 @@ struct NoulCriteria {
     when_false: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum QuestionSpec {
     Choice {
@@ -398,12 +400,17 @@ enum QuestionSpec {
     },
     Noul {
         instructions: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
 }
 
-#[derive(Debug, Serialize)]
+/// Also `Deserialize` (issue jev-relay), unlike every other outgoing-only
+/// wire type in this module: the relay (`jev_relay::forward`) parses an
+/// already-encoded body it did NOT build itself back into this exact shape
+/// to cheaply re-validate it (see [`safe_wire_request`]) before spending its
+/// own credential forwarding it anywhere.
+#[derive(Debug, Serialize, Deserialize)]
 struct SystemOneRequest {
     state: serde_json::Value,
     model: String,
@@ -545,7 +552,10 @@ fn to_answers(questions: &[Question], raw: &BTreeMap<String, SystemOneAnswer>) -
     out
 }
 
-fn status_error(status: u16) -> JevError {
+/// Shared by the direct call's own status handling and the relay's own
+/// forwarding (`jev_relay::forward`), so a caller gets the identical
+/// `JevError` variant for a given HTTP status whichever path answered.
+pub(crate) fn status_error(status: u16) -> JevError {
     match status {
         401 => JevError::Auth,
         422 => JevError::Invalid,
@@ -600,13 +610,12 @@ fn encoded_request(
     Ok((payload, cache_key))
 }
 
-pub(crate) fn safe_metadata_request(
-    state: &serde_json::Value,
-    questions: &[Question],
-    model: &str,
-) -> bool {
-    let value = state;
-    let Some(object) = value.as_object() else {
+/// The `state` half of [`safe_metadata_request`]'s check, split out (issue
+/// jev-relay) so [`safe_wire_request`] can re-run exactly this on a
+/// wire-format body's own `state` field without needing a local `Question`
+/// list at all.
+fn safe_metadata_state(state: &serde_json::Value) -> bool {
+    let Some(object) = state.as_object() else {
         return false;
     };
     if object.len() != 2
@@ -633,27 +642,45 @@ pub(crate) fn safe_metadata_request(
     {
         return false;
     }
-    if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 8 * 1024) {
+    serde_json::to_vec(state).is_ok_and(|bytes| bytes.len() <= 8 * 1024)
+}
+
+/// A bounded, single-word identifier: a question id or a choice option key.
+/// Split out (issue jev-relay) so [`safe_wire_request`] can apply the exact
+/// same charset/length rule to a wire-format question id without a local
+/// `Question` to read it off.
+fn valid_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphabetic()
+            } else {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            }
+        })
+}
+
+/// The charset a Jev `model` name must stay inside -- split out (issue
+/// jev-relay) for the same reason as [`valid_atom`].
+fn valid_model_charset(model: &str) -> bool {
+    model
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub(crate) fn safe_metadata_request(
+    state: &serde_json::Value,
+    questions: &[Question],
+    model: &str,
+) -> bool {
+    if !safe_metadata_state(state) {
         return false;
     }
     if questions.is_empty() || questions.len() > 32 || model.len() > 64 {
         return false;
     }
-    let valid_atom = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 32
-            && value.bytes().enumerate().all(|(index, byte)| {
-                if index == 0 {
-                    byte.is_ascii_alphabetic()
-                } else {
-                    byte.is_ascii_alphanumeric() || byte == b'_'
-                }
-            })
-    };
-    if !model
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    if !valid_model_charset(model) {
         return false;
     }
     questions.iter().all(|question| {
@@ -690,6 +717,74 @@ pub(crate) fn safe_metadata_request(
     })
 }
 
+/// The relay's own cheap re-validation (issue jev-relay) of an
+/// already-encoded request body it did not build itself: parses it back into
+/// the exact wire shape `encoded_request` produces (`SystemOneRequest`, now
+/// also `Deserialize` for this one purpose) and re-runs every structural
+/// check [`safe_metadata_request`] applies to `state`/`model`/each
+/// question's id and criteria -- everything BUT the `metadata_signature`
+/// provenance check, which hashes a question's own static instructions/
+/// criteria at construction time and has no wire-format equivalent to check
+/// against. A relay forwards only a body that passes this; anything else
+/// gets an `{"error": ...}` frame back, which `jev::ask`'s own relay step
+/// treats as "fall back to a direct call", never as a forwarded answer.
+pub(crate) fn safe_wire_request(payload: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<SystemOneRequest>(payload) else {
+        return false;
+    };
+    if !safe_metadata_state(&parsed.state) {
+        return false;
+    }
+    if parsed.questions.is_empty() || parsed.questions.len() > 32 || parsed.model.len() > 64 {
+        return false;
+    }
+    if !valid_model_charset(&parsed.model) {
+        return false;
+    }
+    parsed.questions.iter().all(|(id, spec)| {
+        valid_atom(id)
+            && match spec {
+                QuestionSpec::Choice {
+                    instructions,
+                    criteria,
+                } => {
+                    !instructions.is_empty()
+                        && instructions.len() <= 512
+                        && !criteria.is_empty()
+                        && criteria.len() <= 16
+                        && criteria.iter().all(|(key, description)| {
+                            valid_atom(key)
+                                && description
+                                    .as_deref()
+                                    .is_some_and(|value| value.len() <= 512)
+                        })
+                }
+                QuestionSpec::Score {
+                    instructions,
+                    criteria,
+                } => {
+                    !instructions.is_empty()
+                        && instructions.len() <= 512
+                        && !criteria.is_empty()
+                        && criteria.len() <= 16
+                        && criteria.iter().all(|level| level.len() <= 512)
+                }
+                QuestionSpec::Noul {
+                    instructions,
+                    criteria,
+                } => {
+                    !instructions.is_empty()
+                        && instructions.len() <= 512
+                        && criteria.as_ref().is_none_or(|value| {
+                            [&value.when_true, &value.when_false]
+                                .into_iter()
+                                .all(|side| side.as_deref().is_none_or(|s| s.len() <= 512))
+                        })
+                }
+            }
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn cache_key_for(
     state: &impl Serialize,
@@ -697,6 +792,18 @@ pub(crate) fn cache_key_for(
     model: &str,
 ) -> Result<String, JevError> {
     encoded_request(state, questions, model).map(|(_, cache_key)| cache_key)
+}
+
+/// Test seam for `jev_relay`'s own tests: the exact encoded request body
+/// [`ask`] would send, so a test can dial a relay directly with a
+/// byte-identical payload without duplicating [`build_request`]'s encoding.
+#[cfg(test)]
+pub(crate) fn encode_for_test(
+    state: &impl Serialize,
+    questions: &[Question],
+    model: &str,
+) -> Result<String, JevError> {
+    encoded_request(state, questions, model).map(|(payload, _)| payload)
 }
 
 /// `Some(entry)` for a cache file that parses and is younger than
@@ -757,6 +864,94 @@ fn write_cache_entry(
 /// the network. The returned `bool` is whether this answer was served from
 /// the cache -- callers that record a decision line (`record`, below) pass
 /// it through as `cached`.
+/// The process-wide keep-alive `ureq::Agent` every Jev call now shares
+/// (issue jev-relay), built once: constructing a fresh `Agent` means a fresh
+/// rustls config/root store, and -- the whole point -- a fresh TCP+TLS
+/// handshake on every call, roughly 400ms of fixed network setup dwarfing
+/// Jev's own ~100-150ms of actual inference. This amortises that cost away
+/// for any process that makes more than one Jev call: several `[jev]` gates
+/// firing in the same short-lived hook process, or (the bigger win) the
+/// relay's own supervisor process forwarding many hook-side calls, one warm
+/// connection reused throughout. Timeouts are NOT baked in here -- they vary
+/// per call (`cfg.timeout_secs`, operator-only via `REPO_FORBIDDEN`, but
+/// still not a compile-time constant) -- they are applied per REQUEST
+/// instead, in [`send_request`], via ureq 3's own `RequestBuilder::config()`
+/// override; the connection pool this agent owns is unaffected either way.
+static SHARED_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn shared_agent() -> &'static ureq::Agent {
+    SHARED_AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            .build()
+            .into()
+    })
+}
+
+/// Posts one already-encoded Jev request body to `{base_url}/systemone`
+/// through the process-wide [`shared_agent`], honouring `timeout_secs` for
+/// THIS call only (see that function's own doc comment), and maps the
+/// result the same way a direct call always has. Shared by [`ask`]'s own
+/// direct-call fallback and the relay's own forwarding (`jev_relay::
+/// forward`), so a caller gets byte-identical error mapping whichever path
+/// answered. The credential is a plain owned `&str` -- never logged, and
+/// this function is the only place it is ever attached to a request.
+pub(crate) fn send_request(
+    base_url: &str,
+    credential: &str,
+    timeout_secs: u64,
+    payload: String,
+) -> Result<String, JevError> {
+    let url = format!("{}/systemone", base_url.trim_end_matches('/'));
+    let response = shared_agent()
+        .post(&url)
+        .config()
+        .timeout_connect(Some(Duration::from_secs(timeout_secs)))
+        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+        .build()
+        .header("authorization", format!("Bearer {credential}"))
+        .header("content-type", "application/json")
+        .header("user-agent", format!("zirv/{}", env!("CARGO_PKG_VERSION")))
+        .send(payload);
+
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(status)) => return Err(status_error(status)),
+        Err(ureq::Error::Timeout(_)) => return Err(JevError::Timeout),
+        Err(error) => return Err(JevError::Transport(error.to_string())),
+    };
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(status_error(status));
+    }
+
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| JevError::Transport(error.to_string()))
+}
+
+/// Tries this session's own relay (issue jev-relay) before falling back to a
+/// direct call: `None` whenever there is nothing useful to relay through --
+/// no `ZIRV_CTX_SESSION` (never a supervised call at all, e.g. a bare `zirv
+/// ctx jev status`), this very process IS the relay host (see
+/// `jev_relay::is_relay_host`'s own doc comment for why that must never dial
+/// itself), or the relay could not answer for any other reason at all (see
+/// `jev_relay::try_via_relay`'s own doc comment for the full list). The
+/// caller (`ask`, below) then falls straight through to [`send_request`]
+/// exactly as it always has -- a relay is an optimisation, never required.
+fn relay_send(state_dir: &Path, payload: &str) -> Option<Result<String, JevError>> {
+    let session = std::env::var(adapters::SESSION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    jev_relay::try_via_relay(
+        &StateDir::from_path(state_dir.to_path_buf()),
+        &session,
+        payload,
+    )
+}
+
 pub(crate) fn ask(
     cfg: &ProxyTypesafeConfig,
     state_dir: &Path,
@@ -790,37 +985,10 @@ pub(crate) fn ask(
         ));
     }
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .timeout_connect(Some(Duration::from_secs(cfg.timeout_secs)))
-        .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
-        .build()
-        .into();
-
-    let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
-    let response = agent
-        .post(&url)
-        .header("authorization", format!("Bearer {credential}"))
-        .header("content-type", "application/json")
-        .header("user-agent", format!("zirv/{}", env!("CARGO_PKG_VERSION")))
-        .send(payload);
-
-    let mut response = match response {
-        Ok(response) => response,
-        Err(ureq::Error::StatusCode(status)) => return Err(status_error(status)),
-        Err(ureq::Error::Timeout(_)) => return Err(JevError::Timeout),
-        Err(error) => return Err(JevError::Transport(error.to_string())),
+    let body = match relay_send(state_dir, &payload) {
+        Some(result) => result?,
+        None => send_request(&cfg.base_url, &credential, cfg.timeout_secs, payload)?,
     };
-
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(status_error(status));
-    }
-
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| JevError::Transport(error.to_string()))?;
     let parsed: SystemOneResponse =
         serde_json::from_str(&body).map_err(|error| JevError::Malformed(error.to_string()))?;
 
@@ -845,6 +1013,33 @@ pub(crate) fn available(cfg: &ProxyTypesafeConfig) -> bool {
     std::env::var(&cfg.credential_env)
         .map(|value| !value.is_empty())
         .unwrap_or(false)
+}
+
+/// Whether at least one `[jev]` gate is on -- the other half of
+/// [`available`]'s own check (see that function's doc comment) for deciding
+/// whether a `[jev]`-gated site would ever call [`ask`] at all, and (issue
+/// jev-relay) now also whether hosting a relay for a session
+/// (`jev_relay::start`) could possibly be useful: a relay bound for a
+/// session with every gate off, or no credential, would sit there accepting
+/// connections that never come, for no benefit at all.
+pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
+    cfg.memory
+        || cfg.supervisor
+        || cfg.dispatch
+        || cfg.review
+        || cfg.gates
+        || cfg.context
+        || cfg.intake_savings
+        || cfg.review_reuse
+        || cfg.harvest_screen
+        || cfg.admin_dispatch
+        || cfg.approve
+        || cfg.approve_allow
+        || cfg.classify
+        || cfg.handoff_select
+        || cfg.inject_screen
+        || cfg.inject
+        || cfg.stop_verify
 }
 
 #[allow(dead_code)]
