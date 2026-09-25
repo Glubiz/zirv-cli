@@ -4103,6 +4103,7 @@ handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_
 inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
 inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
+launch_effort = false # may steer a headless launch's first-turn CLAUDE_CODE_EFFORT_LEVEL pick, from local numeric facts only; see `[headless.effort]` below; ZIRV_CTX_JEV_LAUNCH_EFFORT
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
@@ -4270,7 +4271,8 @@ substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also 
 `prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
 `effort` table classifies the prompt text with the SAME deterministic
 classifier the intake hook uses (`proxy::decision::try_classify_request`,
-never a Jev call) and sets env `CLAUDE_CODE_EFFORT_LEVEL` when the resolved
+text-only by default -- see `jev.launch_effort` below for the opt-in
+exception) and sets env `CLAUDE_CODE_EFFORT_LEVEL` when the resolved
 complexity has a configured value; an operator's own `CLAUDE_CODE_EFFORT_LEVEL`
 or an argv that already carries `--effort` wins over it. `lean` and
 `disallowed_tools` only ever narrow a HEADLESS launch -- an interactive
@@ -4281,6 +4283,23 @@ this table existed.
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
 
 The effort decision is made ONCE, from the FIRST headless launch of a conversation, and every later launch of that SAME session -- a `--resume`, an in-place compaction, any other relaunch that keeps the id -- reuses it regardless of its own prompt text, including a bare resume with no new prompt at all. Changing `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation invalidates Claude's whole prompt cache, not just that turn's own addition to it, so re-classifying every launch independently was actively counter-productive.
+
+**`jev.launch_effort`** (off by default) may refine that FIRST launch's pick:
+when the gate is on and Jev is available (same `[proxy.typesafe]` credential
+every other `[jev]` site shares), a metadata-only Noul question asks whether
+the request is unusually hard, deliberate work (-> `headless.effort.
+substantial`) or a small, low-deliberation follow-up (-> `headless.effort.
+trivial`), from local numeric facts only -- prompt word-count bucket,
+enumerated-item count, the deterministic classifier's own complexity index,
+and whether the prompt reads as a question -- never the prompt text itself.
+An indecisive answer, a failed call, an unavailable credential, or a decisive
+pick whose tier has no configured value all fall back to the plain
+deterministic classification above, exactly as with the gate off. Whichever
+value wins goes through the SAME sticky, per-session record as the
+deterministic path: a resumed session never re-asks and never changes effort
+mid-conversation, and this can never override an explicit `--effort` or the
+operator's own `CLAUDE_CODE_EFFORT_LEVEL` (both checks happen before the
+sticky decision is even reached).
 
 #### Tool-output compaction
 
@@ -4605,6 +4624,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.inject_screen` | `ZIRV_CTX_JEV_INJECT_SCREEN` |
 | `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
+| `jev.launch_effort` | `ZIRV_CTX_JEV_LAUNCH_EFFORT` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
 | `headless.effort.trivial` | `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL` |

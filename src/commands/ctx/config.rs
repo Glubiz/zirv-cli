@@ -2053,6 +2053,19 @@ pub struct JevConfig {
     /// error, no credential, or this key off) blocks exactly as the
     /// deterministic gate already does.
     pub missing_tests: bool,
+    /// Jev refinement of `[headless.effort]`'s own deterministic pick, at a
+    /// headless launch's first turn only: a metadata-only low/high call
+    /// (`exec.rs`'s `sticky_headless_effort`) that may steer the launch
+    /// toward `headless.effort.trivial` (low) or `headless.effort.substantial`
+    /// (high) instead of the plain classifier's own class. Effective only
+    /// when `[headless.effort]` itself has at least one key set -- with none
+    /// set, `apply_headless_cost_levers` never reaches the sticky decision at
+    /// all, Jev included. An indecisive, failed, or unavailable answer falls
+    /// back to the deterministic class exactly as with the gate off, and the
+    /// chosen value is recorded through the same sticky, per-session record
+    /// as the deterministic path, so a resumed session never re-asks or
+    /// changes effort mid-conversation.
+    pub launch_effort: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -2083,6 +2096,7 @@ impl Default for JevConfig {
             inject: false,
             stop_verify: false,
             missing_tests: false,
+            launch_effort: false,
             cache_ttl_secs: 86_400,
         }
     }
@@ -2125,10 +2139,14 @@ pub struct HeadlessConfig {
     pub prompt_cache_ttl: Option<String>,
     /// Per intake-complexity `CLAUDE_CODE_EFFORT_LEVEL`, from the same
     /// deterministic classifier the intake hook uses
-    /// (`proxy::decision::try_classify_request`), text only -- never a Jev
-    /// call. Every class unset by default; skipped when the operator's own
-    /// process environment already sets `CLAUDE_CODE_EFFORT_LEVEL` or the
-    /// claude argv already carries `--effort`.
+    /// (`proxy::decision::try_classify_request`), text-only by default --
+    /// `[jev] launch_effort` may steer a first launch's pick toward `trivial`
+    /// or `substantial` instead, from local numeric facts only (see that
+    /// field's own doc comment); with the gate off this stays a pure
+    /// classifier lookup, never a Jev call. Every class unset by default;
+    /// skipped when the operator's own process environment already sets
+    /// `CLAUDE_CODE_EFFORT_LEVEL` or the claude argv already carries
+    /// `--effort`.
     pub effort: HeadlessEffortConfig,
     /// When true, a headless launch's settings layer adds
     /// `"autoMemoryEnabled": false` and `"disableBundledSkills": true`.
@@ -4246,6 +4264,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_LAUNCH_EFFORT",
+        &["jev", "launch_effort"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
@@ -5655,6 +5678,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
     (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
+    (&["jev", "launch_effort"], "ZIRV_CTX_JEV_LAUNCH_EFFORT"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
     // Issue #788: `[headless]` cost levers for a headless Claude Code
     // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
@@ -9056,6 +9080,7 @@ mod tests {
         assert!(!cfg.inject_screen);
         assert!(!cfg.inject);
         assert!(!cfg.stop_verify);
+        assert!(!cfg.launch_effort);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
@@ -9109,6 +9134,7 @@ mod tests {
             ("[jev]\ninject = true\n", "inject"),
             ("[jev]\nstop_verify = true\n", "stop_verify"),
             ("[jev]\nmissing_tests = true\n", "missing_tests"),
+            ("[jev]\nlaunch_effort = true\n", "launch_effort"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -9149,6 +9175,7 @@ mod tests {
             ("ZIRV_CTX_JEV_INJECT", "true"),
             ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
             ("ZIRV_CTX_JEV_MISSING_TESTS", "true"),
+            ("ZIRV_CTX_JEV_LAUNCH_EFFORT", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -9174,6 +9201,7 @@ mod tests {
         assert!(cfg.jev.inject);
         assert!(cfg.jev.stop_verify);
         assert!(cfg.jev.missing_tests);
+        assert!(cfg.jev.launch_effort);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
