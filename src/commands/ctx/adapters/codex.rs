@@ -4125,6 +4125,7 @@ mod tests {
                 &adapter,
                 &[],
                 super::super::LaunchMode::Interactive,
+                crate::commands::ctx::prompt::PromptRole::Orchestrator,
             );
             let command = adapter.interactive_cmd(Some("Acknowledge the handoff only."), &extra);
             let argv = std::iter::once(std::ffi::OsString::from("codex"))
@@ -4619,6 +4620,7 @@ mod tests {
             &adapter,
             &flags,
             super::super::LaunchMode::Headless,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
         );
         assert!(
             out.is_empty(),

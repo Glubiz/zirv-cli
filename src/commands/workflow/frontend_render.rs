@@ -878,6 +878,35 @@ pub(crate) fn discover_browser() -> Option<String> {
     discover_browser_verbose().0
 }
 
+/// A launch-free counterpart to [`discover_browser`]: the first candidate
+/// that EXISTS on disk (a `PATH` entry or a known bundle path), with no
+/// attempt to launch it. `capabilities::discover`'s Browser/`FrontendRender`
+/// gate check used `discover_browser` directly, which spends up to
+/// `probe_browser_launch`'s own timeout PER installed candidate; on a
+/// machine where `--headless ... --version` does not exit promptly (a real
+/// Chrome/Edge install can spend most of a minute tearing its own process
+/// tree back down rather than the few hundred ms the flag combination
+/// promises), `zirv workflow start`'s capability check measured ~15s of
+/// idle wall time for this alone -- and `discover()` called it twice.
+/// `capabilities::discover` now uses this instead, reporting
+/// [`super::capability::IntegrationStatus::unverified`] rather than
+/// `available` -- the exact same "configured/present but not contacted this
+/// run" honesty that row already gives a configured MCP server, never
+/// claiming a launch that was never attempted actually works. The real
+/// capture path (anything that would actually open a page) still resolves
+/// through `discover_browser`/a direct launch of its own binary, so a
+/// browser that is present but broken is still caught the moment something
+/// tries to render, just not at every workflow-start gate check.
+pub(crate) fn browser_present() -> Option<String> {
+    machine_browser_candidates().into_iter().find(|candidate| {
+        if candidate.contains('/') || candidate.contains('\\') {
+            Path::new(candidate).is_file()
+        } else {
+            crate::commands::ctx::adapters::program_is_present(candidate)
+        }
+    })
+}
+
 /// Every candidate this machine could have a Chromium-family browser under:
 /// the bare `PATH` names plus the macOS and Windows bundle paths.
 fn machine_browser_candidates() -> Vec<String> {
@@ -2054,6 +2083,35 @@ mod tests {
             discover_browser_among(["chromium", "google-chrome"].map(String::from));
         assert_eq!(browser.as_deref(), Some("google-chrome"));
         assert!(skipped.iter().any(|name| name == "chromium"), "{skipped:?}");
+    }
+
+    /// F5 (wrapper-overhead benchmark, 2026-09-24): `browser_present` is the
+    /// launch-free counterpart `capabilities::discover` now uses for its
+    /// gate check, in place of `discover_browser`'s live `--headless
+    /// ... --version` probe (which took ~15s combined on a machine where
+    /// that flag combination does not exit promptly). A candidate that
+    /// EXISTS but is not a real, launchable browser at all -- this stub
+    /// contains no shebang and is never made executable -- must still be
+    /// reported present: the whole point is that this function never
+    /// attempts to launch anything, so it cannot tell (and does not try to
+    /// tell) a working browser from a broken file at this path.
+    #[test]
+    fn browser_present_finds_a_candidate_it_never_launches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = if cfg!(windows) {
+            "google-chrome.exe"
+        } else {
+            "google-chrome"
+        };
+        std::fs::write(dir.path().join(name), b"not a real browser, never executed")
+            .expect("write stub");
+
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        assert_eq!(browser_present().as_deref(), Some("google-chrome"));
     }
 
     /// The `cfg!(test)` gate on `discover_browser_verbose` is what keeps the

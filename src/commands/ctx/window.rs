@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -281,6 +282,14 @@ pub fn parse_iso8601_utc_ms(ts: &str) -> Option<u64> {
 /// Cache reads are excluded by default: they are the dominant class in a cached
 /// session and are discounted by the API, and the notes file records that the
 /// limiter's real weighting is undocumented.
+///
+/// Issue #779: production no longer calls this (or `sum_file` below) --
+/// `sum_transcripts` folds cached `CachedUsageEvent`s through `fold_events_
+/// into_sums` instead, which applies the identical `count_cache_reads`
+/// formula inline. Kept `#[cfg(test)]`, not deleted: it is the uncached
+/// reference implementation `the_cache_matches_a_full_reparse_for_both_
+/// readers` checks the cache against.
+#[cfg(test)]
 pub fn usage_tokens_of(usage: &Value, count_cache_reads: bool) -> u64 {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let mut total =
@@ -329,6 +338,12 @@ fn same_api_response(row: &Value, last_id: &mut Option<String>) -> bool {
 /// Accumulates one transcript's assistant usage into the trailing windows.
 /// Events without a parseable timestamp cannot be placed in a window and are
 /// skipped rather than counted at the wrong time.
+///
+/// Issue #779: kept `#[cfg(test)]`, not deleted -- see `usage_tokens_of`'s
+/// matching doc comment just above. This is the uncached, single-pass
+/// reference `sum_transcripts` is checked against, not a second production
+/// code path.
+#[cfg(test)]
 pub fn sum_file(jsonl: &str, now: u64, count_cache_reads: bool, into: &mut TokenSums) {
     let mut last_id: Option<String> = None;
     for line in jsonl.lines() {
@@ -379,6 +394,440 @@ pub fn projects_root() -> CtxResult<PathBuf> {
     Ok(crate::utils::home_dir()?.join(".claude").join("projects"))
 }
 
+// Issue #779: `sum_transcripts`/`session_spend` used to `std::fs::read_to_
+// string` and re-parse every line of EVERY transcript under `projects_root`
+// on every single call -- no matter that `zirv ctx usage`/`status` are run
+// dozens of times an hour against the same, mostly-unchanged files. On a
+// machine with a few thousand transcripts (hundreds of benchmark runs plus
+// one long-lived orchestrator transcript) that is gigabytes of JSON re-
+// parsed from scratch every time, which is exactly what made both commands
+// take tens of seconds to minutes instead of the sub-second reads they
+// actually need to do (issue #779).
+//
+// The fix caches each transcript's own parsed, deduplicated usage EVENTS
+// (`CachedUsageEvent`: a unix-second timestamp plus the four raw token
+// counts) on disk, keyed by the transcript's path -- never a pre-summed
+// total, because a total already commits to one `now`, one window length and
+// one `count_cache_reads` choice, and this cache has to answer all of
+// `session_spend`'s 24h window, `sum_transcripts`' 5h/7d windows, and the
+// `count_cache_reads` toggle alike. Only `now`/the window/`count_cache_reads`
+// are ever applied when FOLDING cached events (`fold_events_into_sums`/
+// `fold_events_for_session`), never baked into the cache itself, so the
+// numbers this reports are identical to a fresh full re-parse for any of
+// those choices -- see `the_cache_matches_a_full_reparse_for_both_readers`.
+//
+// A cache entry records `parsed_len`, the byte offset its `events` already
+// account for, so a transcript that grew since the last read is re-parsed
+// only from that offset onward -- an actively-written transcript is never
+// more than one turn's worth of new lines behind. Every byte read is treated
+// as consumed (`sum_file`/`session_spend_of`'s own `str::lines` contract: a
+// final line with no trailing `\n` still counts), so a finished transcript
+// whose last write never appended a trailing newline is still fully counted,
+// not held back forever waiting for one. A transcript whose length has gone
+// BACKWARDS since the cache was written (log rotation, not ordinary growth)
+// invalidates the whole entry: `load_transcript_cache` refuses it and the
+// file is re-parsed from byte 0, exactly the pre-cache behaviour for that
+// one file.
+//
+// On top of the incremental read, a transcript whose own mtime is already
+// older than the longest window any caller folds against cannot contain a
+// single event any such window would still count -- see `sum_file`'s and
+// `session_spend_of`'s own per-row age checks -- so it is skipped without
+// being opened at all (`is_older_than_retention`), which is what makes a
+// machine with hundreds of long-finished benchmark transcripts cheap to
+// scan: only transcripts touched inside the window are ever read.
+
+/// Bumped when [`CachedTranscript`]'s on-disk shape changes: an older cache
+/// entry is discarded and the transcript re-parsed from byte 0 rather than
+/// resumed under a format this build no longer writes.
+///
+/// Issue #779: bumped to 2 when `mtime_nanos` was added, so a pre-existing
+/// entry written under version 1 (no mtime recorded) is discarded rather than
+/// silently trusted as "unchanged" by length alone.
+const TRANSCRIPT_CACHE_VERSION: u32 = 2;
+
+/// `mtime`, keyed as nanoseconds since the Unix epoch for exact equality
+/// comparison and JSON storage. `None` (metadata unreadable, or a clock
+/// before the epoch) never matches any stored value -- see this module's
+/// "on any doubt" caching policy -- so a transcript whose mtime cannot be
+/// read is always treated as changed rather than risking a false "unchanged".
+fn mtime_key(mtime: SystemTime) -> Option<u128> {
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos())
+}
+
+/// One already-parsed, already-deduplicated assistant-usage row, independent
+/// of any `now`/window/`count_cache_reads` choice: `at` is the row's own
+/// unix-second timestamp, and the four counts are exactly
+/// `adapters::claude::usage_categories`'s fields (the same raw
+/// `usage.*_tokens` fields `sum_file`'s `usage_tokens_of` reads). See this
+/// section's own module-level comment for why nothing "now"-dependent is
+/// ever folded in before caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedUsageEvent {
+    at: u64,
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// One transcript's cache entry. `parsed_len` is always a line boundary (0,
+/// or one past a `\n` this entry has already folded), so resuming from it
+/// never splits a JSON row across two reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedTranscript {
+    version: u32,
+    /// The transcript this entry describes; a cache that outlived its file
+    /// (a hash collision, or a stale entry copied by hand) is never applied
+    /// to a different path.
+    path: String,
+    parsed_len: u64,
+    /// Issue #779: the transcript's mtime (as of the last successful parse),
+    /// alongside `parsed_len`. A file rewritten to exactly the same byte
+    /// length (log rotation, a rewritten checkpoint) changes its mtime
+    /// without changing `parsed_len`, and `parsed_len` alone cannot tell that
+    /// apart from an untouched file -- see [`transcript_events`].
+    mtime_nanos: Option<u128>,
+    #[serde(default)]
+    last_response_id: Option<String>,
+    events: Vec<CachedUsageEvent>,
+}
+
+/// One file per transcript, named after a hash of its path -- the same
+/// scheme `score.rs`'s `checkpoint_path` uses for its own per-transcript
+/// checkpoints, and for the same reason: the path itself carries the session
+/// id and is far too long to be a filename.
+fn transcript_cache_path(state: &StateDir, transcript: &Path) -> PathBuf {
+    state.usage_scan_cache().join(format!(
+        "{:016x}.json",
+        super::event::input_hash(&transcript.display().to_string())
+    ))
+}
+
+/// `None` on any doubt at all -- unreadable, corrupt, the wrong schema
+/// version, a different transcript (hash collision), or a `parsed_len` past
+/// the file's CURRENT length (the file is shorter now than when this entry
+/// was written: rotation or truncation, never ordinary growth) -- which
+/// sends the caller back to a full parse from byte 0, exactly the pre-cache
+/// behaviour.
+fn load_transcript_cache(
+    cache_path: &Path,
+    transcript: &Path,
+    current_len: u64,
+) -> Option<CachedTranscript> {
+    let cached: CachedTranscript =
+        serde_json::from_str(&std::fs::read_to_string(cache_path).ok()?).ok()?;
+    let usable = cached.version == TRANSCRIPT_CACHE_VERSION
+        && cached.path == transcript.display().to_string()
+        && cached.parsed_len <= current_len;
+    usable.then_some(cached)
+}
+
+/// Best-effort, like `score.rs`'s `save_checkpoint`: a cache entry that fails
+/// to write just costs the next call a full re-parse of this one file, which
+/// is exactly what happened before there was a cache at all. Written via a
+/// temp-sibling-then-`rename` so a process killed mid-write leaves the
+/// previous entry intact rather than a truncated one.
+fn save_transcript_cache(cache_path: &Path, cached: &CachedTranscript) {
+    let Ok(json) = serde_json::to_string(cached) else {
+        return;
+    };
+    let Some(dir) = cache_path.parent() else {
+        return;
+    };
+    if super::state::create_private_dir_all(dir).is_err() {
+        return;
+    }
+    let staged = dir.join(format!("{}.tmp", std::process::id()));
+    if super::state::write_private(&staged, &json).is_ok() {
+        let _ = std::fs::rename(&staged, cache_path);
+    }
+}
+
+/// Issue #779: `save_transcript_cache` never pruned `<state>/usage-scan/`, so
+/// a deleted or renamed transcript, or one that has simply aged out of every
+/// window this module ever folds against, left its cache entry on disk
+/// forever. Called at most once per [`sum_transcripts`]/[`session_spend`]
+/// call -- never per file scanned -- so the extra directory read costs one
+/// call, not one per transcript.
+///
+/// An entry is removed when either:
+/// - its source transcript (the cache's own recorded `path`) no longer
+///   exists, or
+/// - the CACHE FILE itself (not the transcript) is older than the longest
+///   retention window any caller in this module ever folds against
+///   (`SEVEN_DAY_SECS`) -- by then `is_older_than_retention` would skip the
+///   transcript unread anyway, so the entry is dead weight regardless of
+///   whether the transcript still exists.
+///
+/// Best-effort, like every other cache access in this module: a directory
+/// that cannot be read, an entry that cannot be parsed, or a file that cannot
+/// be removed, is simply left alone.
+fn prune_transcript_cache_dir(dir: &Path, now: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if is_older_than_retention(&meta, now, SEVEN_DAY_SECS) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(cached) = serde_json::from_str::<CachedTranscript>(&text) else {
+            continue;
+        };
+        if !Path::new(&cached.path).exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Parses `text` -- assumed to start exactly at a line boundary -- into
+/// `events`, extending it and advancing `last_id`'s dedup state. The same
+/// per-row logic `sum_file`/`session_spend_of` apply (including their own
+/// `str::lines` contract: a final line with no trailing `\n` still counts,
+/// exactly as `std::fs::read_to_string(...).lines()` already treated it),
+/// minus the `now`-dependent future-skew/window filters, which stay
+/// query-time-only (see this section's own module-level comment). The whole
+/// of `text` is always considered consumed -- see [`transcript_events`]'s own
+/// doc comment for why a chunk is never held back waiting for a trailing
+/// newline.
+fn extract_usage_events(
+    text: &str,
+    last_id: &mut Option<String>,
+    events: &mut Vec<CachedUsageEvent>,
+) {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if same_api_response(&row, last_id) {
+            continue;
+        }
+        let Some(at) = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc)
+        else {
+            continue;
+        };
+        let Some(usage) = row.get("message").and_then(|m| m.get("usage")) else {
+            continue;
+        };
+        let categories = super::adapters::claude::usage_categories(usage);
+        events.push(CachedUsageEvent {
+            at,
+            input_tokens: categories.input_tokens,
+            cache_creation_input_tokens: categories.cache_creation_input_tokens,
+            cache_read_input_tokens: categories.cache_read_input_tokens,
+            output_tokens: categories.output_tokens,
+        });
+    }
+}
+
+/// The cached, deduplicated usage events for one transcript, doing the
+/// minimum I/O its growth since the last call requires: nothing at all when
+/// `current_len` already matches the cached `parsed_len` (the common,
+/// steady-state case), only the bytes appended since otherwise, and a full
+/// re-read only when [`load_transcript_cache`] refuses a shrunk entry.
+///
+/// The whole of what gets read is always treated as consumed, matching
+/// `sum_file`/`session_spend_of`'s own `str::lines` contract exactly -- a
+/// transcript is not required to end its last line with `\n` (a finished
+/// session's final write commonly does not), and a cache that instead held
+/// such a chunk back waiting for a trailing newline that will never arrive
+/// would never count that transcript's last row at all. `parsed_len` is
+/// advanced by the ACTUAL number of bytes read (`cached.parsed_len +
+/// text.len()`), not derived from `current_len`, so a file that grew again
+/// in the gap between this function's caller stat-ing it and this function
+/// opening it is still accounted for correctly next call, never double- or
+/// under-counted.
+fn transcript_events(
+    state: &StateDir,
+    transcript: &Path,
+    current_len: u64,
+    current_mtime: Option<SystemTime>,
+) -> Vec<CachedUsageEvent> {
+    let cache_path = transcript_cache_path(state, transcript);
+    let current_mtime_key = current_mtime.and_then(mtime_key);
+    let fresh = || CachedTranscript {
+        version: TRANSCRIPT_CACHE_VERSION,
+        path: transcript.display().to_string(),
+        parsed_len: 0,
+        mtime_nanos: current_mtime_key,
+        last_response_id: None,
+        events: Vec::new(),
+    };
+    let mut cached =
+        load_transcript_cache(&cache_path, transcript, current_len).unwrap_or_else(fresh);
+
+    // Issue #779: `parsed_len` alone treats a same-length rewrite as
+    // "unchanged" and serves stale events. Both must match for that; a same
+    // length with a different (or newly unreadable) mtime means the file was
+    // rewritten under our feet, so nothing cached can be trusted -- start
+    // over from byte 0 rather than resuming from an offset that would read
+    // zero new bytes and never notice.
+    if cached.parsed_len == current_len {
+        if cached.mtime_nanos == current_mtime_key {
+            return cached.events;
+        }
+        cached = fresh();
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(transcript) else {
+        return cached.events;
+    };
+    if file.seek(SeekFrom::Start(cached.parsed_len)).is_err() {
+        return cached.events;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return cached.events;
+    }
+    if buf.is_empty() {
+        return cached.events;
+    }
+    // A torn read racing an in-progress append (a multi-byte UTF-8 character
+    // split across two writes) or genuinely corrupt bytes: try again next
+    // call rather than guessing at partial content. `parsed_len` is left
+    // untouched, so the next call re-reads this same chunk in full.
+    let Ok(text) = String::from_utf8(buf) else {
+        return cached.events;
+    };
+
+    let mut last_id = cached.last_response_id.take();
+    let consumed = text.len() as u64;
+    extract_usage_events(&text, &mut last_id, &mut cached.events);
+    cached.parsed_len += consumed;
+    cached.mtime_nanos = current_mtime_key;
+    cached.last_response_id = last_id;
+    cached.version = TRANSCRIPT_CACHE_VERSION;
+    cached.path = transcript.display().to_string();
+    save_transcript_cache(&cache_path, &cached);
+    cached.events
+}
+
+/// Folds cached events into `into`, applying exactly the `now`-dependent
+/// filters `sum_file` applies inline (the future-skew tolerance and the 5h/7d
+/// windows) plus `count_cache_reads` -- the only things a cached event's raw
+/// numbers still need decided at query time. Byte-for-byte the same
+/// accumulation `sum_file` does, just reading a pre-parsed event instead of
+/// a raw JSON row.
+fn fold_events_into_sums(
+    events: &[CachedUsageEvent],
+    now: u64,
+    count_cache_reads: bool,
+    into: &mut TokenSums,
+) {
+    for e in events {
+        if e.at > now.saturating_add(FUTURE_SKEW_TOLERANCE_SECS) {
+            continue;
+        }
+        let age = now.saturating_sub(e.at);
+        if age > SEVEN_DAY_SECS {
+            continue;
+        }
+        let mut tokens = e.input_tokens + e.cache_creation_input_tokens + e.output_tokens;
+        if count_cache_reads {
+            tokens += e.cache_read_input_tokens;
+        }
+
+        into.events_counted += 1;
+        into.seven_day += tokens;
+        note_oldest(&mut into.oldest_in_seven_day, e.at);
+        if age <= FIVE_HOUR_SECS {
+            into.five_hour += tokens;
+            note_oldest(&mut into.oldest_in_five_hour, e.at);
+        }
+    }
+}
+
+/// Folds one transcript's cached events into a `SessionSpend`, applying
+/// exactly the `now`-dependent filters `session_spend_of` applies inline.
+/// Mirrors `session_spend_of`'s own "no in-window rows, no entry" contract.
+fn fold_events_for_session(
+    session: &str,
+    events: &[CachedUsageEvent],
+    now: u64,
+    window_secs: u64,
+) -> Option<SessionSpend> {
+    let mut spend = SessionSpend {
+        session: session.to_string(),
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+        events: 0,
+        newest_at: 0,
+    };
+    for e in events {
+        if e.at > now.saturating_add(FUTURE_SKEW_TOLERANCE_SECS) {
+            continue;
+        }
+        let age = now.saturating_sub(e.at);
+        if age > window_secs {
+            continue;
+        }
+        spend.input_tokens = spend.input_tokens.saturating_add(e.input_tokens);
+        spend.cache_creation_input_tokens = spend
+            .cache_creation_input_tokens
+            .saturating_add(e.cache_creation_input_tokens);
+        spend.cache_read_input_tokens = spend
+            .cache_read_input_tokens
+            .saturating_add(e.cache_read_input_tokens);
+        spend.output_tokens = spend.output_tokens.saturating_add(e.output_tokens);
+        spend.events += 1;
+        if e.at > spend.newest_at {
+            spend.newest_at = e.at;
+        }
+    }
+    (spend.events > 0).then_some(spend)
+}
+
+/// Unix seconds `modified` sits behind `now` by, or `None` when the mtime
+/// itself cannot be read (never treated as "old" in that case -- a doubt
+/// about a file's age must never be the reason its content goes unread).
+fn mtime_age_secs(meta: &std::fs::Metadata, now: u64) -> Option<u64> {
+    let modified = meta.modified().ok()?;
+    let modified_secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(modified_secs))
+}
+
+/// Whether `meta`'s own mtime is already older than `retention_secs` -- in
+/// which case the file cannot contain a single event any window that short
+/// or shorter would still count (`sum_file`/`session_spend_of` both drop an
+/// event once its age exceeds the window), so it is skipped without being
+/// opened at all. `retention_secs` is the caller's own longest window
+/// (`SEVEN_DAY_SECS` for `sum_transcripts`, `window_secs` for
+/// `session_spend`), never a fixed constant, so this can only ever skip a
+/// file the caller could not have counted anyway.
+fn is_older_than_retention(meta: &std::fs::Metadata, now: u64, retention_secs: u64) -> bool {
+    mtime_age_secs(meta, now).is_some_and(|age| age > retention_secs)
+}
+
 /// One transcript's spend in the four raw classes, over a trailing window.
 /// `session` is the file stem, `events` counts how many in-window assistant
 /// rows contributed, and `newest_at` is the newest counted row's unix second
@@ -402,6 +851,12 @@ pub struct SessionSpend {
 /// future, and is within `window_secs` of `now`. The four classes come from
 /// `super::adapters::claude::usage_categories`, so this function and
 /// `TranscriptUsage` can never disagree about what a class is.
+///
+/// Issue #779: kept `#[cfg(test)]`, not deleted -- see `usage_tokens_of`'s
+/// matching doc comment above `sum_file`. This is the uncached, single-pass
+/// reference `session_spend` is checked against, not a second production
+/// code path.
+#[cfg(test)]
 fn session_spend_of(
     session: &str,
     jsonl: &str,
@@ -475,7 +930,20 @@ fn session_spend_of(
 /// `subagents/`, for the same reason: those tokens are charged), but folds
 /// per file instead of into one combined total. The session name is the
 /// file stem.
-pub fn session_spend(projects_root: &Path, now: u64, window_secs: u64) -> Vec<SessionSpend> {
+///
+/// Issue #779: each file's own cached, deduplicated events
+/// (`transcript_events`) are read incrementally rather than re-parsed whole
+/// on every call -- see this module's own "Issue #779" comment above
+/// `TRANSCRIPT_CACHE_VERSION` for the full design and the correctness
+/// argument. `state` is where that cache lives; a caller with no `StateDir`
+/// has no persistent cache to consult, not a reason to fail the walk.
+pub fn session_spend(
+    state: &StateDir,
+    projects_root: &Path,
+    now: u64,
+    window_secs: u64,
+) -> Vec<SessionSpend> {
+    prune_transcript_cache_dir(&state.usage_scan_cache(), now);
     let mut out = Vec::new();
     let mut stack = vec![projects_root.to_path_buf()];
 
@@ -492,15 +960,19 @@ pub fn session_spend(projects_root: &Path, now: u64, window_secs: u64) -> Vec<Se
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
+            if is_older_than_retention(&meta, now, window_secs) {
+                continue;
+            }
             let session = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            if let Some(spend) = session_spend_of(&session, &text, now, window_secs) {
+            let events = transcript_events(state, &path, meta.len(), meta.modified().ok());
+            if let Some(spend) = fold_events_for_session(&session, &events, now, window_secs) {
                 out.push(spend);
             }
         }
@@ -511,7 +983,17 @@ pub fn session_spend(projects_root: &Path, now: u64, window_secs: u64) -> Vec<Se
 /// Walks every transcript under the projects root, including the `subagents/`
 /// subdirectories, because subagent turns live in their own files and still
 /// spend the account's budget.
-pub fn sum_transcripts(projects_root: &Path, now: u64, count_cache_reads: bool) -> TokenSums {
+///
+/// Issue #779: same incremental-cache treatment as `session_spend` above,
+/// folded against `SEVEN_DAY_SECS` -- the longest window this function itself
+/// ever counts against, regardless of what a caller passes as `now`.
+pub fn sum_transcripts(
+    state: &StateDir,
+    projects_root: &Path,
+    now: u64,
+    count_cache_reads: bool,
+) -> TokenSums {
+    prune_transcript_cache_dir(&state.usage_scan_cache(), now);
     let mut sums = TokenSums::default();
     let mut stack = vec![projects_root.to_path_buf()];
 
@@ -528,11 +1010,15 @@ pub fn sum_transcripts(projects_root: &Path, now: u64, count_cache_reads: bool) 
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
+            if is_older_than_retention(&meta, now, SEVEN_DAY_SECS) {
+                continue;
+            }
+            let events = transcript_events(state, &path, meta.len(), meta.modified().ok());
             sums.files_scanned += 1;
-            sum_file(&text, now, count_cache_reads, &mut sums);
+            fold_events_into_sums(&events, now, count_cache_reads, &mut sums);
         }
     }
     sums
@@ -1801,7 +2287,8 @@ mod tests {
         // A non-transcript file must not be parsed.
         std::fs::write(session_dir.join("notes.txt"), "ignore me").expect("write txt");
 
-        let sums = sum_transcripts(&projects, now, false);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let sums = sum_transcripts(&state, &projects, now, false);
         assert_eq!(sums.files_scanned, 2, "main plus subagent, not the txt");
         assert_eq!(
             sums.five_hour, 125,
@@ -1811,7 +2298,14 @@ mod tests {
 
     #[test]
     fn an_absent_projects_root_sums_to_zero() {
-        let sums = sum_transcripts(std::path::Path::new("/nonexistent/projects"), 100, false);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let sums = sum_transcripts(
+            &state,
+            std::path::Path::new("/nonexistent/projects"),
+            100,
+            false,
+        );
         assert_eq!(sums, TokenSums::default());
     }
 
@@ -2479,7 +2973,9 @@ mod tests {
         .expect("write");
 
         let now = parse_iso8601_utc("2026-08-26T11:00:00Z").expect("now");
-        let mut spend = session_spend(root.path(), now, 86_400);
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let mut spend = session_spend(&state, root.path(), now, 86_400);
         spend.sort_by(|a, b| a.session.cmp(&b.session));
         assert_eq!(spend.len(), 2);
         assert_eq!(spend[0].session, "sess-a");
@@ -2504,6 +3000,273 @@ mod tests {
         )
         .expect("write");
         let now = parse_iso8601_utc("2026-08-26T11:00:00Z").expect("now");
-        assert!(session_spend(root.path(), now, 86_400).is_empty());
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        assert!(session_spend(&state, root.path(), now, 86_400).is_empty());
+    }
+
+    /// Issue #779: the whole point of the cache is that `sum_transcripts`/
+    /// `session_spend` report EXACTLY what a full, uncached re-parse
+    /// (`sum_file`/`session_spend_of` on the raw text directly) would --
+    /// never a shortcut that happens to look close. Also proves a second,
+    /// fully-cached call reproduces the first call's own numbers, which is
+    /// the failure mode a caching layer would actually introduce (answering
+    /// differently once warm).
+    #[test]
+    fn the_cache_matches_a_full_reparse_for_both_readers() {
+        let sess_a = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-26T09:00:00Z\",\"message\":{\"usage\":",
+            "{\"input_tokens\":10,\"cache_creation_input_tokens\":100,",
+            "\"cache_read_input_tokens\":900,\"output_tokens\":5}}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-26T10:30:00Z\",\"message\":{\"usage\":",
+            "{\"input_tokens\":3,\"output_tokens\":2}}}\n",
+        );
+        // Outside `session_spend`'s 24h window but inside `sum_transcripts`'
+        // 7-day one -- exercises both readers' own window boundary alike.
+        let sess_b = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-20T10:00:00Z\",\"message\":{\"usage\":",
+            "{\"input_tokens\":7,\"output_tokens\":1}}}\n",
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        std::fs::write(projects.join("sess-a.jsonl"), sess_a).expect("write a");
+        std::fs::write(projects.join("sess-b.jsonl"), sess_b).expect("write b");
+
+        let now = parse_iso8601_utc("2026-08-26T11:00:00Z").expect("now");
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        // Reference: a direct, uncached full re-parse. `sum_file` itself
+        // never touches `files_scanned` (its caller, `sum_transcripts`, is
+        // the one that counts files), so the reference increments it the
+        // same way, once per file, to stay comparable.
+        let mut expected_sums = TokenSums::default();
+        sum_file(sess_a, now, false, &mut expected_sums);
+        expected_sums.files_scanned += 1;
+        sum_file(sess_b, now, false, &mut expected_sums);
+        expected_sums.files_scanned += 1;
+        let mut expected_spend: Vec<SessionSpend> = [
+            session_spend_of("sess-a", sess_a, now, 86_400),
+            session_spend_of("sess-b", sess_b, now, 86_400),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        expected_spend.sort_by(|a, b| a.session.cmp(&b.session));
+
+        // Under test: the cached, directory-walking readers.
+        let got_sums = sum_transcripts(&state, &projects, now, false);
+        let mut got_spend = session_spend(&state, &projects, now, 86_400);
+        got_spend.sort_by(|a, b| a.session.cmp(&b.session));
+
+        assert_eq!(got_sums, expected_sums);
+        assert_eq!(got_spend, expected_spend);
+
+        // Warm second call, nothing on disk changed: identical numbers.
+        let got_sums_again = sum_transcripts(&state, &projects, now, false);
+        let mut got_spend_again = session_spend(&state, &projects, now, 86_400);
+        got_spend_again.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(got_sums_again, got_sums);
+        assert_eq!(got_spend_again, got_spend);
+    }
+
+    /// The incremental half of the cache (issue #779): a transcript that
+    /// grows between two calls -- exactly what an actively-written session
+    /// does -- must have its cache entry advance to the new length and gain
+    /// the new row, not just its old length and row.
+    #[test]
+    fn a_transcripts_cache_entry_advances_its_parsed_offset_as_the_file_grows() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        let transcript = projects.join("sess.jsonl");
+        std::fs::write(&transcript, transcript_with_ages(now, &[600], 100)).expect("write first");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let first = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(first.five_hour, 100);
+
+        let cache_path = transcript_cache_path(&state, &transcript);
+        let cached: CachedTranscript =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).expect("cache written"))
+                .expect("cache parses");
+        let first_len = std::fs::metadata(&transcript).expect("meta").len();
+        assert_eq!(
+            cached.parsed_len, first_len,
+            "a fresh parse consumes the whole file"
+        );
+        assert_eq!(cached.events.len(), 1);
+
+        // Grow the file the way an actively-written transcript does: append,
+        // never rewrite what is already there.
+        let mut appended = std::fs::read_to_string(&transcript).expect("read");
+        appended.push_str(&transcript_with_ages(now, &[500], 50));
+        std::fs::write(&transcript, &appended).expect("write grown");
+
+        let second = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(
+            second.five_hour, 150,
+            "both rows must be counted after growth"
+        );
+
+        let cached_after: CachedTranscript = serde_json::from_str(
+            &std::fs::read_to_string(&cache_path).expect("cache written again"),
+        )
+        .expect("cache parses");
+        let grown_len = std::fs::metadata(&transcript).expect("meta").len();
+        assert_eq!(
+            cached_after.parsed_len, grown_len,
+            "the cache advances to the file's new length, not just its old one"
+        );
+        assert_eq!(
+            cached_after.events.len(),
+            2,
+            "the appended row extends, rather than replaces, the cached events"
+        );
+    }
+
+    /// The invalidation half (issue #779): a transcript that is now SHORTER
+    /// than the cached `parsed_len` (log rotation or truncation, never
+    /// ordinary growth) must be reparsed from byte 0, not resumed from an
+    /// offset that no longer exists in the file.
+    #[test]
+    fn a_shrunk_transcript_invalidates_its_cache_and_is_reparsed_from_scratch() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        let transcript = projects.join("sess.jsonl");
+        let long = transcript_with_ages(now, &[600, 500, 400], 1000);
+        std::fs::write(&transcript, &long).expect("write long");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let first = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(first.five_hour, 3000, "three rows of 1000 each");
+
+        // Replace with SHORTER, entirely different content.
+        let rotated = transcript_with_ages(now, &[100], 7);
+        assert!(
+            (rotated.len() as u64) < (long.len() as u64),
+            "the replacement must actually be shorter for this test to prove anything"
+        );
+        std::fs::write(&transcript, &rotated).expect("write rotated");
+
+        let second = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(
+            second.five_hour, 7,
+            "the rotated file's own single row, not the old total plus or instead of it"
+        );
+
+        let cache_path = transcript_cache_path(&state, &transcript);
+        let cached: CachedTranscript =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).expect("cache written"))
+                .expect("cache parses");
+        let rotated_len = std::fs::metadata(&transcript).expect("meta").len();
+        assert_eq!(cached.parsed_len, rotated_len);
+        assert_eq!(
+            cached.events.len(),
+            1,
+            "the stale pre-rotation events must not survive"
+        );
+    }
+
+    /// The same-length rewrite (issue #779): `parsed_len` alone cannot tell a
+    /// transcript rewritten to the EXACT same byte length apart from an
+    /// untouched one, and serving the old cache entry in that case would
+    /// report the pre-rewrite numbers forever. The mtime is bumped explicitly
+    /// rather than relying on real-clock/filesystem resolution, so the test
+    /// is deterministic.
+    #[test]
+    fn a_same_length_rewrite_with_a_new_mtime_is_reparsed_not_served_stale() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        let transcript = projects.join("sess.jsonl");
+        let original = transcript_with_ages(now, &[600], 100);
+        std::fs::write(&transcript, &original).expect("write first");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let first = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(first.five_hour, 100);
+
+        // Rewrite with different content of the EXACT same byte length (same
+        // digit width on the token count), then bump the mtime forward
+        // explicitly so the test does not depend on the filesystem's mtime
+        // resolution or clock granularity.
+        let rewritten = transcript_with_ages(now, &[600], 900);
+        assert_eq!(
+            rewritten.len(),
+            original.len(),
+            "the rewrite must be same-length for this test to prove anything"
+        );
+        std::fs::write(&transcript, &rewritten).expect("write rewritten");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .expect("reopen for mtime bump");
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        file.set_modified(bumped).expect("set mtime");
+
+        let second = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(
+            second.five_hour, 900,
+            "a same-length rewrite with a new mtime must be reparsed, not served from the stale cache"
+        );
+    }
+
+    /// Issue #779: `<state>/usage-scan/` used to grow forever -- a cache
+    /// entry for a transcript that no longer exists (deleted, or a fixture
+    /// cleaned up between runs) had nothing to ever remove it.
+    #[test]
+    fn an_orphaned_cache_entry_for_a_deleted_transcript_is_pruned() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        // A cache entry for a transcript that has since been deleted (or
+        // never existed under this exact path).
+        let ghost_transcript = projects.join("deleted-session.jsonl");
+        let cache_path = transcript_cache_path(&state, &ghost_transcript);
+        std::fs::create_dir_all(cache_path.parent().expect("cache dir")).expect("mkdir cache dir");
+        let orphan = CachedTranscript {
+            version: TRANSCRIPT_CACHE_VERSION,
+            path: ghost_transcript.display().to_string(),
+            parsed_len: 42,
+            mtime_nanos: Some(1),
+            last_response_id: None,
+            events: Vec::new(),
+        };
+        std::fs::write(
+            &cache_path,
+            serde_json::to_string(&orphan).expect("serialize orphan"),
+        )
+        .expect("write orphan cache entry");
+        assert!(
+            cache_path.exists(),
+            "precondition: the orphaned cache entry is on disk"
+        );
+
+        // No transcripts exist at all; the walk still runs its once-per-call
+        // prune of the cache directory.
+        let _ = sum_transcripts(&state, &projects, now, false);
+
+        assert!(
+            !cache_path.exists(),
+            "a cache entry whose source transcript no longer exists must be pruned"
+        );
     }
 }

@@ -5041,7 +5041,12 @@ mod tests {
             home.join(".claude").join("settings.json"),
             serde_json::json!({
                 "a": {"command": "zirv ctx hook posttool"},
-                "b": {"command": "zirv ctx safety check"},
+                // Issue #769: the safety check no longer has its own
+                // separate registration -- `claude_compaction_and_safety_
+                // hooks_installed` now looks for the consolidated pretool
+                // hook instead (`CLAUDE_REHYDRATE_HOOK`'s own command),
+                // which also runs the safety check itself.
+                "b": {"command": "zirv ctx hook pretool"},
             })
             .to_string(),
         )

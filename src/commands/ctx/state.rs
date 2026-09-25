@@ -1110,6 +1110,17 @@ impl StateDir {
         self.0.join("scoring")
     }
 
+    /// Per-transcript usage-scan cache (issue #779): `<state>/usage-scan/
+    /// <hash>.json`, one file per transcript, keyed the same way
+    /// `scoring()`'s checkpoints are -- a hash of the transcript's own path,
+    /// since the path itself is far too long for a filename. Lets
+    /// `window::session_spend`/`sum_transcripts` answer from the cache alone
+    /// in steady state instead of re-reading and re-parsing every transcript
+    /// on the machine on every `zirv ctx usage`/`status` call.
+    pub fn usage_scan_cache(&self) -> PathBuf {
+        self.0.join("usage-scan")
+    }
+
     /// Session registry: `<state>/sessions/<short8>.json`, one file per live
     /// supervisor. See `super::sessions` for the record format and the short
     /// id derivation, which matches `socket_for`'s own exactly.

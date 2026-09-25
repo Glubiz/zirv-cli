@@ -505,7 +505,7 @@ pub fn run_with<W: Write>(
             // resolve the projects root degrades to an empty window (`n/a`)
             // rather than turning a working `zirv ctx usage` into an error.
             let mut spend = window::projects_root()
-                .map(|root| window::session_spend(&root, now, 86_400))
+                .map(|root| window::session_spend(&state, &root, now, 86_400))
                 .unwrap_or_default();
             writeln!(w, "{}", cache_hit_line(&spend))?;
 

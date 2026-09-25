@@ -861,9 +861,13 @@ mod tests {
             adapter.context_window_tokens(Some("claude-sonnet-5")),
             catalogue::context_window(anthropic, Some("claude-sonnet-5"))
         );
+        // Round 4 bug 4a: the catalogue's own `sonnet` rung was corrected
+        // from an understated 200_000 to the verified 1_000_000 (see
+        // `catalogue::ANTHROPIC_RUNGS`'s own doc comment) -- pinned here too
+        // since this adapter reads the SAME catalogue entry directly.
         assert_eq!(
             adapter.context_window_tokens(Some("claude-sonnet-5")),
-            Some(200_000)
+            Some(1_000_000)
         );
 
         // An unrecognized model/seat falls back to the trait's own "no

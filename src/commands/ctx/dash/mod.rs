@@ -1900,6 +1900,21 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.duration_since(last) >= interval
 }
 
+/// Issue #780: [`due`], but also advances `*last` to `now` whenever the
+/// cadence comes due -- regardless of what the caller does next. Used where a
+/// cheap cadence check gates a second, expensive check (e.g. `auto_rollover.
+/// is_enabled()`'s two `stat`s): without advancing `*last` unconditionally, a
+/// negative outcome of that second check (the switch found disabled) would
+/// leave `*last` stale forever, so `due` alone would keep reporting "due" on
+/// every subsequent tick and the expensive check would run every tick again.
+fn due_advancing(last: &mut Instant, now: Instant, interval: Duration) -> bool {
+    let is_due = due(*last, now, interval);
+    if is_due {
+        *last = now;
+    }
+    is_due
+}
+
 /// How often [`handle_spawn_requests`] actually reads its intake directories.
 /// One `read_dir` for the dashboard's shared channel plus one per live pane,
 /// on a tick rate that reaches 100/s while the operator is typing, is a
@@ -6019,12 +6034,17 @@ fn worker_pane_extra_args(
     // `req.interactive`.
     let surface_mode = adapters::LaunchMode::Interactive;
     let mut extra = pane_model_args(req, cfg, adapter);
+    // Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    // `spawnreq::role_of` is the same Worker/SubOrchestrator read the depth
+    // cap already uses -- a Worker pane skips the native skill plugin, a
+    // SubOrchestrator still needs it (it may itself dispatch Workers).
     extra.extend(adapters::policy_launch_args_for_surface(
         cfg,
         adapter,
         &req.flags,
         approval_mode,
         surface_mode,
+        spawnreq::role_of(req),
     ));
     // 2026-09-06: the trailing `-- <flags>` the requester typed, in the same
     // position `agent::worker_launch_flags` puts them for an inline
@@ -11926,6 +11946,15 @@ fn run_dashboard_inner(
     // transaction that may be open at a time. Seeded with this dashboard's
     // start so no usage I/O runs while it is still coming up.
     let mut last_rollover_eval = Instant::now();
+    // Issue #780: `cfg` above is loaded once at dash start-up and held for
+    // the dashboard's whole life, so a gate reading `cfg.
+    // auto_orchestrator_rollover()` never sees a later `zirv ctx config set
+    // fallback.auto_orchestrator_rollover false` -- see `LiveAutoRollover`'s
+    // own doc comment. Seeded from `cfg`'s own value so the very first tick
+    // (before either `ctx.toml` could possibly have changed) matches what
+    // start-up already decided.
+    let mut auto_rollover =
+        super::rollover::LiveAutoRollover::new(repo, env, cfg.auto_orchestrator_rollover());
     let mut reactive_pending = panes
         .iter()
         .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
@@ -12072,16 +12101,23 @@ fn run_dashboard_inner(
         // settled against a seat that no longer existed: `seat::abort`
         // failed, the prepared transaction ended with no terminal row at
         // all, and neither the source relaunch nor the park could run.
-        if cfg.auto_orchestrator_rollover() {
-            settle_pending_rollover(
-                &mut panes,
-                cfg,
-                repo,
-                state,
-                &mut pending_rollover,
-                &mut errors,
-            );
-        }
+        //
+        // Issue #780: unconditional, deliberately NOT gated by
+        // `auto_orchestrator_rollover` (live or otherwise). An operator
+        // disabling the switch must stop any NEW rollover from being
+        // prepared, but a transaction already open when they do must still
+        // reach commit or abort -- gating this on the switch orphaned the
+        // successor pane the moment a disable landed mid-transaction.
+        // `settle_pending_rollover` is a cheap no-op whenever nothing is
+        // pending, so there is no cost to calling it every tick regardless.
+        settle_pending_rollover(
+            &mut panes,
+            cfg,
+            repo,
+            state,
+            &mut pending_rollover,
+            &mut errors,
+        );
         enforce_pane_token_budgets(
             &mut panes,
             cfg,
@@ -12209,34 +12245,52 @@ fn run_dashboard_inner(
         }
         // Issue #358 (task 5): the orchestrator pane's automatic rollover.
         // The evaluation half costs a capacity snapshot, so it runs on its own
-        // cadence; its readiness watch is pure in-memory state and runs every
-        // tick, above the reap (issue #440). Both are no-ops until
-        // `fallback.auto_orchestrator_rollover` is on.
-        if cfg.auto_orchestrator_rollover()
-            && pending_rollover.is_none()
-            && due(
-                last_rollover_eval,
+        // cadence; its readiness watch (`settle_pending_rollover`, above) is
+        // pure in-memory state and runs every tick, above the reap (issue
+        // #440). This half -- the one that can PREPARE a new transaction --
+        // is a no-op until `fallback.auto_orchestrator_rollover` is on.
+        //
+        // Issue #780: `pending_rollover.is_none()` is checked first so
+        // nothing below runs while a transaction is already open (nothing to
+        // prepare then anyway). The cadence check (`due`, a cheap `Instant`
+        // comparison) runs BEFORE `auto_rollover.is_enabled()` (two `stat`s),
+        // so the live reload only ever costs a syscall once per interval, not
+        // on every tick -- this loop's tick rate can be as low as 10ms.
+        // `last_rollover_eval` advances whenever the cadence comes due,
+        // whether or not the switch is enabled: otherwise a disabled switch
+        // would leave `due()` permanently true and `is_enabled()` would run
+        // every tick again anyway. `auto_rollover.is_enabled()` re-derives
+        // the switch from a fresh layered load, not the dashboard's stale
+        // start-up `cfg` -- so an operator's `zirv ctx config set
+        // fallback.auto_orchestrator_rollover false` takes effect on this
+        // dashboard's very next check, no restart required. A failed reload
+        // never enables it (see `LiveAutoRollover`'s own doc comment), and a
+        // disable always wins over an eval that came due.
+        if pending_rollover.is_none() {
+            let eval_due = due_advancing(
+                &mut last_rollover_eval,
                 sweep_now,
                 super::rollover::evaluate_interval(cfg, reactive_pending),
-            )
-        {
-            last_rollover_eval = sweep_now;
-            rollover_sweep(
-                &mut panes,
-                cfg,
-                repo,
-                state,
-                &mut pending_rollover,
-                &mut errors,
             );
-            reactive_pending = panes
-                .iter()
-                .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
-                .and_then(|pane| super::seat::load(state, pane.short()))
-                .and_then(|seat| seat.pending)
-                .is_some_and(|pending| {
-                    matches!(pending.cause, super::seat::Cause::Reactive { .. })
-                });
+            if eval_due && auto_rollover.is_enabled() {
+                let live_cfg = auto_rollover.patched(cfg);
+                rollover_sweep(
+                    &mut panes,
+                    &live_cfg,
+                    repo,
+                    state,
+                    &mut pending_rollover,
+                    &mut errors,
+                );
+                reactive_pending = panes
+                    .iter()
+                    .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+                    .and_then(|pane| super::seat::load(state, pane.short()))
+                    .and_then(|seat| seat.pending)
+                    .is_some_and(|pending| {
+                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                    });
+            }
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
@@ -31416,6 +31470,34 @@ mod tests {
             now + Duration::from_secs(5),
             Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn due_advancing_advances_last_only_when_due_regardless_of_what_the_caller_does_next() {
+        // Issue #780: a disabled `auto_orchestrator_rollover` must not leave
+        // `last` stale -- otherwise the cheap cadence check alone keeps
+        // reporting "due" every tick, forcing the caller's expensive
+        // `is_enabled()` (two `stat`s) to run every tick too.
+        let start = Instant::now();
+        let mut last = start;
+        let interval = Duration::from_secs(1);
+
+        assert!(!due_advancing(&mut last, start, interval));
+        assert_eq!(last, start);
+
+        let tick = start + Duration::from_secs(1);
+        assert!(due_advancing(&mut last, tick, interval));
+        assert_eq!(last, tick);
+
+        // Immediately after, the cadence is not due again -- the caller's
+        // expensive check is not run again on the very next tick, whether or
+        // not that check ends up finding the switch disabled.
+        assert!(!due_advancing(
+            &mut last,
+            tick + Duration::from_millis(100),
+            interval
+        ));
+        assert_eq!(last, tick);
     }
 
     /// M7: a modified special key carries its modifiers through the standard

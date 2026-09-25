@@ -370,10 +370,17 @@ fn take_ack(state: &StateDir, short: &str) -> Option<HandoverAck> {
 /// `carries_handoff`: whether the caller will deliver the handoff packet as
 /// this launch's initial prompt. It decides whether a resume is even
 /// possible -- see [`resumes_conversation`].
+///
+/// `role`: the successor's own compiled prompt role -- a swap never changes
+/// what role the session runs as, so both callers pass through whatever
+/// role the swapped-out session already had (`wrap::run_with`'s own `role`
+/// parameter; `Pane::role()` on the dashboard side). Forwarded to
+/// `policy_launch_args` alone (skill-listing overhead fix, 2026-09-24).
 pub fn resolve_swap_launch(
     cfg: &CtxConfig,
     req: &HandoverRequest,
     carries_handoff: bool,
+    role: super::prompt::PromptRole,
 ) -> CtxResult<(Box<dyn adapters::AgentAdapter>, Vec<String>)> {
     let new_adapter = adapters::select(Some(&req.target_agent), &[], cfg)?;
     let mut extra = adapters::policy_launch_args(
@@ -385,6 +392,7 @@ pub fn resolve_swap_launch(
         } else {
             adapters::LaunchMode::Headless
         },
+        role,
     );
     if let Some(model) = &req.target_model {
         extra.extend(new_adapter.model_args(model));
@@ -1174,7 +1182,13 @@ mod tests {
             target_runtime: None,
             target_route: None,
         };
-        let (adapter, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
+        let (adapter, extra) = resolve_swap_launch(
+            &cfg,
+            &req,
+            true,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        )
+        .expect("resolves");
         assert!(
             !resumes_conversation(adapter.as_ref(), &req, true),
             "a handoff-carrying resume needs both halves"
@@ -1186,7 +1200,13 @@ mod tests {
 
         // The same request WITHOUT a packet to deliver (issue #440's
         // same-harness recovery) resumes exactly as before.
-        let (adapter, extra) = resolve_swap_launch(&cfg, &req, false).expect("resolves");
+        let (adapter, extra) = resolve_swap_launch(
+            &cfg,
+            &req,
+            false,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        )
+        .expect("resolves");
         assert!(resumes_conversation(adapter.as_ref(), &req, false));
         assert!(
             extra.iter().any(|arg| arg == "conv-1"),
@@ -1210,7 +1230,13 @@ mod tests {
             target_runtime: None,
             target_route: None,
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
+        let (_, extra) = resolve_swap_launch(
+            &cfg,
+            &req,
+            true,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        )
+        .expect("resolves");
         assert!(
             extra.contains(&"--permission-mode".to_string())
                 && extra.contains(&"dontAsk".to_string()),
@@ -1240,7 +1266,13 @@ mod tests {
             target_runtime: None,
             target_route: None,
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &cold, true).expect("resolves");
+        let (_, extra) = resolve_swap_launch(
+            &cfg,
+            &cold,
+            true,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        )
+        .expect("resolves");
         assert!(
             !extra.contains(&"--resume".to_string()),
             "an ordinary swap has no conversation of its own to resume: {extra:?}"
@@ -1252,7 +1284,13 @@ mod tests {
             target_route: None,
             ..cold
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &resumed, true).expect("resolves");
+        let (_, extra) = resolve_swap_launch(
+            &cfg,
+            &resumed,
+            true,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        )
+        .expect("resolves");
         let at = extra
             .iter()
             .position(|arg| arg == "--resume")

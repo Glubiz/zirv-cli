@@ -9213,6 +9213,18 @@ fn hook_output_with_extras(
 ///   `hook.rs::run_pretool` already holds to. Always exits 0 in this mode:
 ///   `Deny`/`Ask` are expressed through the structured `hookSpecificOutput`
 ///   envelope (`hook_output`), not the process exit code.
+///
+/// Issue #769: hook mode self-suppresses (prints nothing, exits 0, evaluates
+/// nothing) when `setup::claude_pretool_hook_runs_bash_safety_itself` reports
+/// that the consolidated `zirv ctx hook pretool` entry is ALSO installed at
+/// its own `Bash|PowerShell`-covering slot -- meaning this standalone
+/// registration is a stale leftover from before that consolidation (an
+/// un-migrated `~/.claude/settings.json` still carries both). Without this, a
+/// tool call on such a settings file would get evaluated twice: once here,
+/// once again inside `hook::run_pretool` for the exact same call. CLI mode
+/// (`-- <command>`) is never affected -- an operator running `zirv ctx safety
+/// check -- <command>` directly wants an answer regardless of what is
+/// installed as a hook.
 pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
 
@@ -9236,6 +9248,9 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(outcome.verdict.exit_code());
     }
 
+    if crate::commands::setup::claude_pretool_hook_runs_bash_safety_itself() {
+        return Ok(0);
+    }
     run_check_hook_mode_for_agent(&cfg, w, &read_stdin(), env, args.agent.as_deref())
 }
 
@@ -9250,7 +9265,15 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
 /// project/run/translate shape `hook::run_pretool_for_agent` uses, so a
 /// denial from either surface reaches a non-claude agent through one shared
 /// translation, never a per-agent copy of it.
-fn run_check_hook_mode_for_agent<W: Write>(
+///
+/// Issue #769: `pub(crate)`, not private -- `hook::run_pretool_bash_or_
+/// powershell` calls this directly (with `agent: None`) to run this EXACT
+/// safety check in-process for the consolidated `PreToolUse` hook, rather
+/// than `zirv ctx safety check` being spawned as its own separate process for
+/// the same tool call. Nothing about this function's own behavior changes:
+/// it is the same call `run_check`'s own hook mode already made, from a
+/// second call site.
+pub(crate) fn run_check_hook_mode_for_agent<W: Write>(
     cfg: &CtxConfig,
     w: &mut W,
     stdin: &str,
@@ -18319,6 +18342,95 @@ mod tests {
         assert_eq!(code, Verdict::Ask.exit_code());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("ask"), "got {text}");
+    }
+
+    // -- Issue #769: hook-mode self-suppression on a duplicate install ------
+
+    /// The standalone `zirv ctx safety check` hook must not re-evaluate a
+    /// tool call the consolidated `zirv ctx hook pretool` entry already
+    /// covers -- an un-migrated `~/.claude/settings.json` (an operator who
+    /// has not re-run `zirv setup apply` since #769) still carries both. The
+    /// suppression check runs BEFORE `read_stdin()`, so this needs no real
+    /// process stdin to prove: `command` is empty (hook mode), and the
+    /// consolidated entry being present on disk is reason enough for `run_
+    /// check` to exit having read nothing and printed nothing, whatever a
+    /// genuine invocation's stdin might have said.
+    #[test]
+    fn run_check_hook_mode_self_suppresses_when_the_consolidated_pretool_hook_is_also_installed() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let settings_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir");
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                        "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write settings");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let args = CheckArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: Vec::new(),
+            agent: None,
+        };
+        let empty: HashMap<String, String> = HashMap::new();
+        let mut out = Vec::new();
+        let code = run_check(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a leftover standalone safety hook must stay silent once the consolidated \
+             pretool hook also covers Bash|PowerShell: {out:?}"
+        );
+    }
+
+    /// Sibling of the test above, in CLI mode: `-- <command>` must never
+    /// self-suppress even when the consolidated hook is ALSO installed --
+    /// only hook mode (empty `command`, reading a claude payload from stdin)
+    /// is what a stale duplicate registration could ever invoke, and an
+    /// operator running `zirv ctx safety check -- <command>` by hand always
+    /// wants a real answer.
+    #[test]
+    fn run_check_cli_mode_never_self_suppresses_even_with_the_consolidated_hook_installed() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let settings_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&settings_dir).expect("mkdir");
+        std::fs::write(
+            settings_dir.join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                        "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write settings");
+
+        let repo = tempfile::tempdir().expect("repo");
+        let args = CheckArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: vec!["rm".to_string(), "-rf".to_string(), "/".to_string()],
+            agent: None,
+        };
+        let empty: HashMap<String, String> = HashMap::new();
+        let mut out = Vec::new();
+        let code = run_check(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Ask.exit_code());
+        assert!(!out.is_empty(), "CLI mode must never go silent");
     }
 
     #[cfg(unix)]

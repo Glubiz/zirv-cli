@@ -586,8 +586,22 @@ impl CompiledContext {
             let is_last = i + 1 == composed.sources.len();
             let found: Option<(usize, Option<usize>, Option<&'static str>)> = match source {
                 // Always first when present -- `prompt::compose`'s own first
-                // line is `String::from(DEFAULT_PROMPT)`.
-                PromptSource::Default => Some((0, Some(prompt::DEFAULT_PROMPT.len()), None)),
+                // line is `String::from(default_prompt_for(role))`. Issue
+                // #772: exactly one of the two role-tiered constants is ever
+                // actually used (`DEFAULT_PROMPT` for Orchestrator/
+                // SubOrchestrator, `DEFAULT_PROMPT_WORKER` for Worker/
+                // Single), and this method has no role to key on (see its own
+                // doc comment) -- so, exactly like `PromptSource::Harness`
+                // just below tries all three verbosity tiers, this tries both
+                // and takes whichever literal search actually matches. Their
+                // distinct headers ("(v7)" vs. "(worker, v1)") mean at most
+                // one can ever be a substring of `text`.
+                PromptSource::Default => [prompt::DEFAULT_PROMPT, prompt::DEFAULT_PROMPT_WORKER]
+                    .iter()
+                    .find_map(|candidate| {
+                        find_after(text, cursor, candidate)
+                            .map(|start| (start, Some(start + candidate.len()), None))
+                    }),
                 // Issue #427: exactly one of the three tiered constants is
                 // ever actually spliced in by `prompt::compose` (selected by
                 // `cfg.prompt.verbosity`, not available here -- this method
@@ -2009,9 +2023,12 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         .map(|c| c.sources.as_slice())
         .unwrap_or(&[]);
 
+    // Issue #772: role-tiered, same as `harness_prompt_for` just below --
+    // Worker/Single get `DEFAULT_PROMPT_WORKER`'s smaller byte count, not
+    // `DEFAULT_PROMPT`'s.
     rows.push(measure_row(
         "default prompt",
-        prompt::DEFAULT_PROMPT.len(),
+        prompt::default_prompt_for(role).len(),
         "",
     ));
 

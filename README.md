@@ -456,15 +456,26 @@ same stored answer instead of asking Jev again, at zero additional cost.
 a model decision can raise them but never lower them — and `validation` is
 recomputed from the merged complexity and risk, so a raise always
 propagates. `execution`, seat tier, worker tier and seat role then derive
-entirely from that merged `complexity`: Trivial → direct/cheap/single seat,
+entirely from that merged `complexity`: Trivial → direct/standard/single seat,
 Bounded → bounded/standard/single seat, Substantial or Architectural →
 orchestrated/orchestrator seat — floored upward when risk reaches
 High (at least Bounded) or the request names a security surface, and a
-Direct execution always clears any chosen workflow back to none. An
-orchestrated seat runs the frontier tier only for Architectural complexity
-or High-or-worse risk; a Substantial one stays on the standard tier. When a
-workflow starts, the proxy layer names its id so the seat can run
-`zirv workflow status` and follow the current step. The
+Direct execution always clears any chosen workflow back to none. `execution`
+alone never routes to the cheap seat tier any more (cheap-seat overhead fix,
+wrapper-overhead benchmark 2026-09-24): a live 85-run replay found `Direct`
+sending 16/28 runs to haiku, which then took 2-5x the turns of a sonnet run
+on the same code task for +133% wall time and no cost saving, so `Direct`
+now maps to the same `Standard` seat tier `Bounded` already used; `worker_tier`
+is unaffected. An orchestrated seat runs the frontier tier only for
+Architectural complexity or High-or-worse risk; a Substantial one stays on
+the standard tier. The baseline's own deterministic pick of a workflow to
+start (`selection::select_definition`) fires only at Substantial or
+Architectural complexity — the same 2026-09-24 benchmark found intake
+starting a workflow for every Bounded-complexity headless run even though
+headless agents never read it, adding ~11s/run; an explicit "start a
+`<name>` workflow" request still starts one at any complexity, exactly as
+before. When a workflow starts, the proxy layer names its id so the seat can
+run `zirv workflow status` and follow the current step. The
 winning decision is then validated against the live roster (an unready
 harness falls back to the baseline harness, its model re-derived for the
 decision's own seat tier; an unknown workflow id falls back to the baseline)
@@ -1953,15 +1964,22 @@ substantial/high-risk work, spec) artifact gates plus an approval-gated design
 step. Frontend work overlays the same engine rather than running a separate
 one, selected automatically from task language and changed frontend paths.
 
-Artifact steps write fixed templates to `.zirv/work/<workflow-id>/` (`intent.md`,
-`spec.md`, `plan.md`, ...) committed to the repository. `zirv workflow approve`
-refuses an untouched template, then pins the accepted file's SHA-256 digest and
-timestamp in private state; a later step folds only accepted, hash-matching
-artifacts into prompt context. Editing or deleting an accepted file after the
-fact reopens its acceptance gate and invalidates later completed steps, so
+Artifact steps name a fixed template path under `.zirv/work/<workflow-id>/`
+(`intent.md`, `spec.md`, `plan.md`, ...) for the agent to write itself — `zirv
+workflow start`/advance/resume never pre-create the file or touch the git
+index (issue F6: a blind reviewer flagged the untouched, unfilled file as a
+stray addition), so nothing appears in the worktree until the agent actually
+fills it in. `zirv workflow status`/`context` print both the path and the
+template text for a step whose artifact does not exist yet, so it stays
+discoverable either way. `zirv workflow approve` treats a still-missing file
+exactly like an untouched template and refuses it the same way, then pins the
+accepted file's SHA-256 digest and timestamp in private state once it is
+genuinely filled in; a later step folds only accepted, hash-matching artifacts
+into prompt context. Editing or deleting an accepted file after the fact
+reopens its acceptance gate and invalidates later completed steps, so
 implementation can never silently proceed against a plan that changed
-underneath it — `zirv workflow artifacts <id>` shows pending/accepted/drifted
-state directly.
+underneath it — `zirv workflow artifacts <id>` shows pending/accepted/drifted/
+missing state directly.
 
 Classification is re-measured (never downgraded) whenever a workflow advances
 into a review or verify step, so a review/verify gate the initial `workflow
@@ -3929,7 +3947,7 @@ ordinary zirv CLI for that repository before starting the host.
 
 ### Signals and verdicts
 
-Four signals over the trailing window (default 10 turns):
+Five signals over the trailing window (default 10 turns):
 
 1. **Context size** (a gate, not a vote). The floor and ceiling scale with the
    model's real context window (issue #155): by default the floor sits at 50%
@@ -3947,6 +3965,19 @@ Four signals over the trailing window (default 10 turns):
    (weight 30).
 4. **Reply-marker misses** on final answers (weight 30, active only when the
    marker hook is installed and the session is at least 10 turns old).
+5. **Same-error loops** (weight 120 by default, `score.same_error_weight`):
+   the longest run of consecutive identical (normalized) tool-result errors
+   across *different* attempts, distinct from the repetition signal above,
+   which needs the identical call repeated. Trips at `score.
+   same_error_threshold` repeats (default 3); `0.0` restores the pre-#763,
+   fully inert behaviour. The default weight is calibrated, not measured, so
+   that a freshly-tripped streak alone -- the ramp's lowest nonzero point,
+   `1 / same_error_threshold` -- raises an otherwise healthy score to exactly
+   `advise_at`'s default (40): the first action this signal can ever cause is
+   an advisory ("the fix isn't landing, try a different approach"), never an
+   immediate `compact`/`restart`. Further repeats ramp it the same way every
+   other signal ramps, through the identical weighted-sum/threshold verdict
+   below.
 
 Verdicts: score 40 or more is `advise`, 60 or more is `compact`, 80 or more is
 `restart`. At the token ceiling a score of 60 or more escalates to `restart`.
@@ -4387,6 +4418,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `supervise.in_tool_secs` | `ZIRV_CTX_SUPERVISE_IN_TOOL_SECS` |
 | `supervise.stall_grace_secs` | `ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS` |
 | `supervise.compact_stall_secs` | `ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS` |
+| `supervise.compact_timeout_ms` | `ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS` |
 | `supervise.chain_max_restarts` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS` |
 | `supervise.chain_max_gap_secs` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
@@ -5232,13 +5264,14 @@ Add to `~/.claude/settings.json`:
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook prompt" }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook pre-compact" }] }],
     "PreToolUse": [{
-      "matcher": "Agent|Task",
+      "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task",
       "hooks": [{ "type": "command", "command": "zirv ctx hook pretool" }]
     }],
     "SessionStart": [{
       "matcher": "resume|clear",
       "hooks": [{ "type": "command", "command": "zirv ctx hook session-start" }]
-    }]
+    }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook subagent-stop" }] }]
   }
 }
 ```
@@ -5246,10 +5279,53 @@ Add to `~/.claude/settings.json`:
 `SessionStart` (issue #244) re-injects the latest stored handoff on `resume`/`clear` — a bare
 `claude --resume` or `/clear` sees it too, not only `zirv ctx resume`'s own explicit flow.
 
+Issue #769: a single `PreToolUse` entry now covers every tool name zirv's own
+guards care about, dispatching internally by `tool_name` — the command-safety
+check for `Bash`/`PowerShell` (previously its own separate `zirv ctx safety
+check` registration, matched on `Bash|PowerShell` alone), placeholder
+rehydration for shell/write/lookup tools, the orchestrator-write guard for
+file-modification tools, and the expensive-seat/skill-pointer guard for
+`Agent|Task`. `zirv setup apply` migrates an operator's own
+`~/.claude/settings.json` away from the old, separately-registered safety
+hook automatically; `zirv ctx safety check` itself is unaffected as a
+standalone CLI command (`-- <command>`) and still self-suppresses if invoked
+as a leftover hook on a settings file that has not been migrated yet, so the
+two never evaluate the same tool call twice.
+
+`SubagentStop` (issue #774) gates a native `Task` subagent's own final report
+against a few cheap, deterministic checks read from the SUBAGENT's own
+transcript — never the lead's — before it reaches the lead: a declared
+`OUTPUT CONTRACT` block with no fenced JSON reply at all, a claimed test run
+with no matching verification command anywhere in the transcript, and a bare
+`BLOCKED` report with no reason after it. The first violation found blocks
+with `{"decision": "block", "reason": "..."}`, capped at one block per
+subagent, ever, and fails open on any doubt (an unreadable transcript,
+`stop_hook_active`, or an unresolvable state dir). `[subagent_stop_gate]
+enabled` (default `true`) gates it, the identical narrow-only fold
+`[missing_tests_gate] enabled` uses below — a repository checkout may only
+turn it off, never force it on for an operator who disabled it.
+
 The Stop hook forwards verdicts to a supervising `wrap` or `exec` when one owns
-the session, and otherwise prints a non-blocking advisory. It never blocks a
-stop, and it exits 0 even when it is invoked wrongly, because Claude Code reads
-a Stop hook's exit 2 as "block the stop".
+the session, and otherwise prints a non-blocking advisory. It exits 0 even when
+it is invoked wrongly, because Claude Code reads a Stop hook's exit 2 as
+"block the stop" -- a real block instead uses the JSON `{"decision": "block",
+"reason": "..."}` envelope on stdout with exit 0.
+
+The one case where the Stop hook actually blocks is the missing-tests gate
+(`[missing_tests_gate]`, default `enabled = true`): for a HEADLESS Worker/
+Single session (`ZIRV_CTX_HEADLESS=1` -- an interactive session is never
+affected) that edited or created a non-test source file this turn but touched
+no test file for the change (a `tests`/`test` path component, a
+`test_*`/`*_test.*`/`*.test.*` filename, or -- Rust only -- a change on or
+after a file's own `#[cfg(test)]` line), it blocks once with a reason asking
+for a focused test of the behaviour change, including the invalid-input path,
+then a test-suite run. It never blocks a second time in the same session (a
+persisted per-session marker, independent of `stop_hook_active`), never fires
+when `stop_hook_active` is already true, and fails open -- like every other
+Stop-hook check -- on any doubt at all (an unreadable repo, no git, a config
+load failure). A repository checkout may only turn it off
+(`[missing_tests_gate] enabled = false` in `<repo>/.zirv/ctx.toml`), never
+force it on for an operator who disabled it.
 
 The Stop hook is also how a supervisor learns which file the agent is writing:
 the agent mints its own session id, so the transcript path travels on the turn
@@ -5974,6 +6050,19 @@ stop after 2 fix rounds. It is `REPO_FORBIDDEN`: set it in
 verbosity = "verbose"
 ```
 
+Issue #772 also tiers the shipped engineering-standard floor itself
+(`DEFAULT_PROMPT`/`DEFAULT_PROMPT_WORKER`, not a `[prompt]` key -- there is
+nothing to configure): an Orchestrator/SubOrchestrator session gets the full
+standard, while a delegated Worker/Single session -- already handed a
+bounded, pre-sized task -- gets a compact variant that keeps every rule that
+changes behaviour (verify with evidence, one focused test per behaviour
+change, no slop, deliver exactly what was asked, honest report) and drops the
+full sizing taxonomy's own long-form explanation and the UI/design-thinking
+bullet, the same role split the standing skill index already draws (`prompt.
+skill_index`) for the identical reason: a delegated worker re-reads this
+layer on every headless turn, so its cost is not amortised the way an
+interactive session's is.
+
 Pass `--simple` to any of the four verbs to start the agent with no zirv text at
 all, shipped default included. Supervision, pacing and hooks are unaffected.
 Whether a prompt was injected, and from which layers, is recorded in the decision
@@ -5996,7 +6085,8 @@ text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough
 or the explicit opt-out below do.
 
 - **Claude interactive:** `--permission-mode default`, native workspace/tool
-  scoping, and a `Bash|PowerShell` `PreToolUse` safety hook attested on every
+  scoping, and a `PreToolUse` safety hook (covering `Bash`/`PowerShell` among
+  the other tool names its own consolidated matcher names) attested on every
   Zirv launch through fingerprinted settings and immutable policy snapshots
   under `~/.zirv/runtime/` as the sole per-command gate. The hook evaluates
   both the launch snapshot and the policy resolved now, keeps the stricter
@@ -6011,7 +6101,8 @@ or the explicit opt-out below do.
   `sudo apt install bubblewrap socat` on Debian/Ubuntu to enable it. When they
   are missing, Zirv still launches Claude Code, which prints "Sandbox disabled"
   and runs Bash without OS sandboxing; Zirv's permission mode, allowed/disallowed
-  tools and `zirv ctx safety check` PreToolUse hook remain in force.
+  tools and the safety check running inside the `PreToolUse` hook (`zirv ctx
+  hook pretool`) remain in force.
   macOS uses the built-in `sandbox-exec`. Native Windows has no OS sandbox
   and receives the hook and credential rules. The interactive `Edit(./**)`/
   `Read(./**)` scope also covers Claude Code's own agent-worktree convention
@@ -6180,11 +6271,12 @@ zirv ctx safety list                     # the effective merged policy, with eac
 zirv ctx safety explain --mode headless -- git push --force  # rule plus launch consequence
 ```
 
-`zirv ctx safety check` (with no trailing command) is also what `zirv setup
-apply` wires into claude's `PreToolUse` hook for `Bash` and `PowerShell` calls,
-so the same
-evaluator zirv's own CLI uses is what claude consults before running a
-command — see [Context Management](#context-management-zirv-ctx).
+`zirv ctx safety check` (with no trailing command) is the hook-mode entrypoint
+`hook::run_pretool` calls in-process for `Bash`/`PowerShell` calls (issue
+#769: `zirv setup apply` no longer wires it in as its own separate
+`PreToolUse` registration — see [Hook registration](#hook-registration-claude-code)),
+so the same evaluator zirv's own CLI uses is what claude consults before
+running a command — see [Context Management](#context-management-zirv-ctx).
 
 `[jev] approve`/`approve_allow` (issue #781, both operator-only and off by
 default) add an optional Jev risk check on top of this deterministic policy,

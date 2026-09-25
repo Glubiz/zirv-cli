@@ -2024,8 +2024,18 @@ fn dash_orchestrator_pane_with_task(
     // args`) scans the argv built so far, so an operator's own explicit
     // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
     // `--disallowedTools` (passed after `--` on `zirv chat`) still wins.
-    let sandbox_extra =
-        adapters::policy_launch_args(cfg, adapter, &argv, adapters::LaunchMode::Interactive);
+    // Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    // `launch.role` (not a hardcoded `Orchestrator`) -- this shared pane
+    // builder also launches `PromptRole::Single` sessions (the proxy's own
+    // direct/bounded decision), which must skip the native skill plugin the
+    // same as a headless Worker does.
+    let sandbox_extra = adapters::policy_launch_args(
+        cfg,
+        adapter,
+        &argv,
+        adapters::LaunchMode::Interactive,
+        launch.role,
+    );
     // Visible, not silent: the one interactive pane a human is actually
     // watching gets the same announcement every headless seam does. `Chrome
     // events`/`--quiet` govern it identically (`cfg.chrome.events`); no

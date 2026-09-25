@@ -18,28 +18,44 @@ pub(crate) const HARNESS_HOOKS: [(&str, Option<&str>, &str); 4] = [
     ("PreToolUse", Some("Agent|Task"), "zirv ctx hook pretool"),
 ];
 
-/// Issue #83's command safety hook: `zirv ctx safety check`, matched on
-/// `Bash|PowerShell` calls (a distinct `PreToolUse` matcher from `HARNESS_HOOKS`'s
-/// own `Agent|Task` entry above -- both coexist in the same event array,
-/// `ensure_harness_hook` pushes a new entry per distinct command string
-/// rather than replacing). Wired into **claude only**
-/// (`install_claude_integration`), not `HARNESS_HOOKS` itself: unlike the
-/// four hooks above, codex has no verified equivalent of claude's
-/// `hookSpecificOutput.permissionDecision` PreToolUse contract this hook
-/// relies on (see `safety::hook_output`'s own doc comment), so wiring it
-/// into `install_codex_hooks` too -- which shares `HARNESS_HOOKS` with the
-/// claude path -- would write a hook codex has no verified way to honor.
-/// With no trailing command, `zirv ctx safety check` reads the hook's JSON
-/// payload from stdin (`tool_name`/`tool_input.command`) instead of `--
-/// <command>` argv, and always exits 0 -- see `safety::run_check`'s own doc
-/// comment for why (the decision is expressed in the JSON envelope, not the
-/// exit code, mirroring `hook::run_pretool`).
+/// Issue #83's command safety hook, ORIGINALLY `zirv ctx safety check`
+/// registered as its own separate `PreToolUse` entry matched on
+/// `Bash|PowerShell`. Issue #769 folded that entry's own job into
+/// `CLAUDE_REHYDRATE_HOOK` below (`hook::run_pretool_bash_or_powershell` now
+/// runs the exact same check, in-process, for `Bash`/`PowerShell` tool
+/// calls) -- a guarded `Bash` call used to spawn both this hook's own process
+/// AND `CLAUDE_REHYDRATE_HOOK`'s, back to back, for the identical tool call.
+///
+/// No longer installed by `install_claude_integration` (removed from
+/// `CLAUDE_ONLY_HOOKS`); this constant survives ONLY so `install_claude_
+/// integration`'s own migration call (`remove_harness_hook_at_slot`) can
+/// still recognize and remove the OLD standalone slot from an operator's
+/// already-installed `~/.claude/settings.json`, and so
+/// `zirv ctx safety check`'s own hook-mode entrypoint
+/// (`claude_pretool_hook_runs_bash_safety_itself`, used by `safety::
+/// run_check`'s own self-suppression check) can still recognize it. `zirv
+/// ctx safety check -- <command>` (CLI mode) is completely unaffected: this
+/// is a change to what gets WRITTEN into `settings.json`, never to the
+/// command itself. With no trailing command, hook mode reads the payload
+/// from stdin (`tool_name`/`tool_input.command`) instead of `-- <command>`
+/// argv, and always exits 0 -- see `safety::run_check`'s own doc comment for
+/// why (the decision is expressed in the JSON envelope, not the exit code,
+/// mirroring `hook::run_pretool`).
 pub(crate) const CLAUDE_SAFETY_HOOK: (&str, Option<&str>, &str) = (
     "PreToolUse",
     Some("Bash|PowerShell"),
     "zirv ctx safety check",
 );
 
+/// Issue #769: this is now the ONLY `PreToolUse` slot claude ever gets for
+/// `Bash`/`PowerShell`/file-modification tools -- `hook::run_pretool`
+/// dispatches internally by `tool_name`, running the safety check itself for
+/// `Bash`/`PowerShell` (`hook::run_pretool_bash_or_powershell`, byte-for-byte
+/// the same verdict/rewrite/allow behavior `CLAUDE_SAFETY_HOOK` used to
+/// provide from its own separate process) alongside the rehydration/
+/// orchestrator-write guards this matcher already ran for. A guarded `Bash`
+/// call used to spawn two `PreToolUse` processes (`CLAUDE_SAFETY_HOOK`'s own,
+/// plus this one) for the identical tool call; now it spawns one.
 pub(crate) const CLAUDE_REHYDRATE_HOOK: (&str, Option<&str>, &str) = (
     "PreToolUse",
     Some("Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"),
@@ -91,15 +107,29 @@ pub(crate) const CLAUDE_PERMISSION_REQUEST_HOOK: (&str, Option<&str>, &str) =
 pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
     ("PermissionDenied", None, "zirv ctx hook permission");
 
+/// Issue #774: claude's `SubagentStop` hook, fired once a native `Task`
+/// subagent's own turn ends -- gates a small set of cheap, deterministic
+/// result-contract checks against the SUBAGENT's own transcript before its
+/// report reaches the lead (`hook::run_subagent_stop`'s own doc comment has
+/// the checks and the fail-open/cap-at-one-block contract). No matcher, like
+/// `Stop`/`PreCompact`/`SessionStart` above: `SubagentStop` fires once per
+/// finished subagent regardless of which tool it used. Claude-only, same
+/// reasoning as `CLAUDE_SAFETY_HOOK`: codex has no verified equivalent event.
+pub(crate) const CLAUDE_SUBAGENT_STOP_HOOK: (&str, Option<&str>, &str) =
+    ("SubagentStop", None, "zirv ctx hook subagent-stop");
+
 /// Every claude-only hook (`install_claude_integration`), never wired into
-/// `install_codex_hooks`.
+/// `install_codex_hooks`. `CLAUDE_SAFETY_HOOK` is deliberately absent (issue
+/// #769: its own job now lives inside `CLAUDE_REHYDRATE_HOOK`'s dispatch, see
+/// that constant's own doc comment) -- it stays defined above only for the
+/// legacy-slot migration and self-suppression checks.
 pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 6] = [
-    CLAUDE_SAFETY_HOOK,
     CLAUDE_REHYDRATE_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
     CLAUDE_PERMISSION_REQUEST_HOOK,
     CLAUDE_PERMISSION_DENIED_HOOK,
+    CLAUDE_SUBAGENT_STOP_HOOK,
 ];
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
@@ -642,13 +672,25 @@ fn command_live_at_slot(
 }
 
 /// Issue #424: whether claude's own `settings.json` currently has BOTH the
-/// compact-output `PostToolUse` hook and the safety `PreToolUse` hook
-/// installed -- the two commands `zirv ctx status`'s own bounded
+/// compact-output `PostToolUse` hook and the safety-carrying `PreToolUse`
+/// hook installed -- the two commands `zirv ctx status`'s own bounded
 /// hook-health check treats as "the hook is wired up at all". Resolves its
 /// own home directory rather than taking one, so `status.rs` (a different
 /// module tree) never needs to reach into this module's private
 /// `home_dir`/`claude_config_dir` helpers directly. Read-only: never
 /// touches `HARNESS_HOOKS`'s own install path.
+///
+/// Issue #769: the second check used to look for `CLAUDE_SAFETY_HOOK.2`
+/// (`"zirv ctx safety check"`) directly. That command is no longer what `zirv
+/// setup` writes into `settings.json` at all -- `CLAUDE_REHYDRATE_HOOK.2`
+/// (`"zirv ctx hook pretool"`) now carries the safety check too (see that
+/// constant's own doc comment) -- so checking for the OLD command here would
+/// report the safety layer as permanently uninstalled on every fresh install
+/// from this point on. Checking for `CLAUDE_REHYDRATE_HOOK.2` instead keeps
+/// this function's own contract ("is the hook wired up at all") true under
+/// both the old and new shapes: `contains_command` is a whole-tree search, so
+/// a not-yet-migrated settings file carrying the OLD command too still
+/// matches on the harness `PreToolUse` entry alone.
 ///
 /// Fails open (`true`, meaning "assume installed, stay silent") only when
 /// the home directory itself cannot be resolved -- an environment this
@@ -662,7 +704,39 @@ pub(crate) fn claude_compaction_and_safety_hooks_installed() -> bool {
     let claude_settings = load_json_object(&claude_config_dir(&home).join("settings.json"))
         .unwrap_or_else(|_| json!({}));
     contains_command(&claude_settings, CLAUDE_COMPACT_OUTPUT_HOOK.2)
-        && contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2)
+        && contains_command(&claude_settings, CLAUDE_REHYDRATE_HOOK.2)
+}
+
+/// Issue #769: whether claude's own `settings.json` has the consolidated
+/// `PreToolUse` hook (`CLAUDE_REHYDRATE_HOOK`) live at its own scoped slot --
+/// the signal `safety::run_check`'s own hook-mode entrypoint reads to tell
+/// whether the standalone `zirv ctx safety check` hook (`CLAUDE_SAFETY_HOOK`)
+/// invoking it is a stale duplicate of logic the consolidated hook now runs
+/// itself, rather than evaluating the same tool call's safety twice. Slot-
+/// scoped (`command_live_at_slot`), not `contains_command`: the consolidated
+/// hook's own matcher is what proves it actually covers `Bash`/`PowerShell`,
+/// not merely that the command string appears somewhere in the tree.
+///
+/// Fails open to `false` ("assume not migrated yet, keep running the check")
+/// when the home directory cannot be resolved -- the opposite polarity from
+/// `claude_compaction_and_safety_hooks_installed` above, deliberately: that
+/// function fails open to "assume installed, stay silent" for a status
+/// DISPLAY, where an unusual environment is not evidence of anything wrong,
+/// but here failing open the other way would mean silently skipping the only
+/// safety check that would otherwise have run. Redundantly running it twice
+/// in that unusual case is harmless; silently skipping it is not.
+pub(crate) fn claude_pretool_hook_runs_bash_safety_itself() -> bool {
+    let Ok(home) = home_dir() else {
+        return false;
+    };
+    let claude_settings = load_json_object(&claude_config_dir(&home).join("settings.json"))
+        .unwrap_or_else(|_| json!({}));
+    command_live_at_slot(
+        &claude_settings,
+        CLAUDE_REHYDRATE_HOOK.0,
+        CLAUDE_REHYDRATE_HOOK.1,
+        CLAUDE_REHYDRATE_HOOK.2,
+    )
 }
 
 pub(crate) fn load_json_object(path: &Path) -> SetupResult<Value> {
@@ -743,6 +817,66 @@ fn push_harness_hook_entry(
     }
     entries.push(entry);
     Ok(())
+}
+
+/// Issue #769 migration: at `event`'s own slot, for every entry whose
+/// `matcher` equals `matcher` (or is absent, when `matcher` is `None`),
+/// removes just the `{"type":"command","command":command}` item from that
+/// entry's own `hooks` array -- the mirror image of `push_harness_hook_
+/// entry`'s own insertion, used to take OUT a hook shape that used to be
+/// installed but no longer should be, rather than to add one. Returns
+/// whether anything was actually removed, the same shape `ensure_harness_
+/// hook_at_slot` returns for an insertion, so both can feed the identical
+/// `hooks_added`-style bookkeeping in `install_claude_integration`.
+///
+/// Review finding (post-#769): an entry is dropped ENTIRELY only once its
+/// own `hooks` array is left empty by that removal -- never merely because
+/// ONE of the hooks it carries matched. An operator hook sharing the exact
+/// same slot as `command` (`{"matcher":"Bash","hooks":[{command},{"type":
+/// "command","command":"/home/op/my-audit.sh"}]}`, an entry a human hand-
+/// edited or a different tool wrote into the same matcher) must survive
+/// this migration with its own hook intact; deleting the whole entry would
+/// silently take the operator's own audit hook out with it.
+///
+/// Scoped to the exact (event, matcher, command) triple, not `contains_
+/// command`'s whole-tree match: touching every entry that merely mentions
+/// `command` ANYWHERE would also reach a slot that happens to share the
+/// command string under a different matcher on purpose (Change 5d's
+/// `PermissionRequest`/`PermissionDenied` pair is exactly that shape), which
+/// this must never touch.
+fn remove_harness_hook_at_slot(
+    settings: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> bool {
+    let Some(entries) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut removed_any = false;
+    entries.retain_mut(|entry| {
+        if entry.get("matcher").and_then(Value::as_str) != matcher {
+            return true;
+        }
+        let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| {
+            !(hook.get("type").and_then(Value::as_str) == Some("command")
+                && hook.get("command").and_then(Value::as_str) == Some(command))
+        });
+        if hooks.len() != before {
+            removed_any = true;
+        }
+        // Only an entry left with NO hooks of its own is dropped entirely.
+        !hooks.is_empty()
+    });
+    removed_any
 }
 
 /// Issue #93: how a Claude `statusLine.command` string relates to zirv's own
@@ -906,6 +1040,23 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             hooks_added += 1;
         }
     }
+    // Issue #769 migration: an operator whose `~/.claude/settings.json` still
+    // carries the OLD standalone safety hook (installed by a binary from
+    // before this consolidation) gets it removed here, on every `zirv setup
+    // apply` -- its own job now lives inside `CLAUDE_REHYDRATE_HOOK`'s own
+    // dispatch (see that constant's doc comment), so leaving the old slot in
+    // place would keep spawning a second, now-redundant process per guarded
+    // `Bash`/`PowerShell` call. `safety::run_check`'s own hook-mode
+    // entrypoint also self-suppresses if this migration has not run yet
+    // (`claude_pretool_hook_runs_bash_safety_itself`), so a settings file
+    // that skips this exact `apply` call is never evaluated twice, only less
+    // efficiently than after a fresh `apply`.
+    let legacy_safety_hook_removed = remove_harness_hook_at_slot(
+        &mut settings,
+        CLAUDE_SAFETY_HOOK.0,
+        CLAUDE_SAFETY_HOOK.1,
+        CLAUDE_SAFETY_HOOK.2,
+    );
     let root = settings.as_object_mut().expect("validated object");
     let statusline_added = if root.contains_key("statusLine") {
         false
@@ -916,7 +1067,7 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         );
         true
     };
-    if !dry_run && (hooks_added > 0 || statusline_added) {
+    if !dry_run && (hooks_added > 0 || statusline_added || legacy_safety_hook_removed) {
         std::fs::create_dir_all(
             settings_path
                 .parent()
@@ -4624,12 +4775,13 @@ mod tests {
         assert!(contains_command(&settings, "zirv ctx hook stop"));
     }
 
-    /// Issue #83: `zirv setup apply` wires `zirv ctx safety check` into
-    /// claude's `PreToolUse` hooks, matched on `Bash|PowerShell` (distinct from the
-    /// existing `Agent|Task`-matched `PreToolUse` entry `HARNESS_HOOKS`
-    /// already installs -- both must coexist in the same event array), and
-    /// idempotently (a second `apply` adds nothing more, backed up via the
-    /// same manifest system every other hook write already uses).
+    /// Issue #769 (supersedes issue #83's own original wiring): `zirv setup
+    /// apply` no longer writes a standalone `zirv ctx safety check`
+    /// `PreToolUse` entry at all -- `hook::run_pretool` now runs that check
+    /// itself for `Bash`/`PowerShell`, from inside the existing rehydrate
+    /// entry's own `PreToolUse` slot (`CLAUDE_REHYDRATE_HOOK`'s own doc
+    /// comment). Idempotent, same as before (a second `apply` adds nothing
+    /// more).
     #[test]
     fn install_claude_integration_wires_the_safety_hook_idempotently() {
         let home = tempfile::tempdir().expect("home");
@@ -4641,15 +4793,19 @@ mod tests {
 
         let settings_path = claude_config_dir(home.path()).join("settings.json");
         let settings = load_json_object(&settings_path).expect("settings");
-        assert!(contains_command(&settings, "zirv ctx safety check"));
+        assert!(
+            !contains_command(&settings, "zirv ctx safety check"),
+            "issue #769: the safety check no longer gets its own standalone hook: {settings}"
+        );
         let pretool_entries = settings["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse array");
         assert!(
-            pretool_entries
-                .iter()
-                .any(|entry| entry["matcher"] == "Bash|PowerShell"),
-            "the safety hook must guard both shell tool names: {pretool_entries:?}"
+            pretool_entries.iter().any(|entry| entry["matcher"]
+                == "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"
+                && entry["hooks"][0]["command"] == "zirv ctx hook pretool"),
+            "the consolidated pretool hook must guard every shell/file tool name, safety \
+             included: {pretool_entries:?}"
         );
         assert!(
             pretool_entries
@@ -4661,6 +4817,130 @@ mod tests {
         let (hooks_added_again, _) =
             install_claude_integration(home.path(), false).expect("re-apply");
         assert_eq!(hooks_added_again, 0, "a second apply must add nothing more");
+    }
+
+    /// Issue #769 migration: an operator's `~/.claude/settings.json` written
+    /// by a binary from BEFORE this consolidation still carries the OLD
+    /// standalone safety hook (`CLAUDE_SAFETY_HOOK`'s own slot) alongside the
+    /// rehydrate hook. `zirv setup apply` on the new binary must remove that
+    /// stale slot outright -- not merely leave it inert -- so the operator
+    /// actually gets the reduced-process-count fix rather than depending
+    /// solely on `safety::run_check`'s own self-suppression net.
+    #[test]
+    fn install_claude_integration_migrates_away_the_legacy_standalone_safety_hook() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash|PowerShell",
+                            "hooks": [{"type": "command", "command": "zirv ctx safety check"}]
+                        },
+                        {
+                            "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                            "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]
+                        },
+                        {
+                            "matcher": "Agent|Task",
+                            "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed a pre-#769 settings file");
+
+        install_claude_integration(home.path(), false).expect("apply");
+
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(
+            !contains_command(&settings, "zirv ctx safety check"),
+            "the legacy standalone safety hook must be migrated away: {settings}"
+        );
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "PreToolUse",
+                Some("Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"),
+                "zirv ctx hook pretool"
+            ),
+            "the consolidated hook slot must survive the migration untouched: {settings}"
+        );
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "PreToolUse",
+                Some("Agent|Task"),
+                "zirv ctx hook pretool"
+            ),
+            "the Agent|Task slot must survive the migration untouched too: {settings}"
+        );
+        assert!(
+            claude_pretool_hook_runs_bash_safety_itself(),
+            "the consolidated hook must be detected as covering Bash/PowerShell safety after \
+             migration"
+        );
+    }
+
+    /// Review finding (post-#769, commit 5ca6b180): an operator hook sharing
+    /// the LEGACY safety hook's own slot -- `{"matcher":"Bash","hooks":[
+    /// {zirv ctx safety check},{/home/op/my-audit.sh}]}`, a shape a human or a
+    /// different tool could have hand-edited into `~/.claude/settings.json`
+    /// -- must survive the #769 migration with its own hook intact.
+    /// `remove_harness_hook_at_slot` used to drop the WHOLE entry the moment
+    /// ANY hook inside it matched, silently deleting the operator's own
+    /// unrelated audit hook along with the now-redundant safety check.
+    #[test]
+    fn migration_keeps_an_operator_hook_that_shares_the_legacy_safety_hook_slot() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash|PowerShell",
+                            "hooks": [
+                                {"type": "command", "command": "zirv ctx safety check"},
+                                {"type": "command", "command": "/home/op/my-audit.sh"}
+                            ]
+                        },
+                        {
+                            "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit",
+                            "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed a shared-slot legacy settings file");
+
+        install_claude_integration(home.path(), false).expect("apply");
+
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(
+            !contains_command(&settings, "zirv ctx safety check"),
+            "the legacy standalone safety hook must still be migrated away: {settings}"
+        );
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "PreToolUse",
+                Some("Bash|PowerShell"),
+                "/home/op/my-audit.sh"
+            ),
+            "an operator hook sharing that same slot must survive: {settings}"
+        );
     }
 
     /// Change 5d: `zirv setup apply` wires `zirv ctx hook permission` into
@@ -5314,13 +5594,13 @@ mod tests {
         }
     }
 
-    /// Every `CLAUDE_ONLY_HOOKS` entry (the safety hook, the SessionStart
-    /// handoff hook) must count toward claude's own installed/total, but
-    /// never codex's -- codex has no verified equivalent of claude's
-    /// `PreToolUse` permission-decision contract, and no `SessionStart`
-    /// event at all, so `install_codex_hooks` never writes either (see
-    /// `CLAUDE_SAFETY_HOOK`'s and `CLAUDE_SESSION_START_HOOK`'s own doc
-    /// comments).
+    /// Every `CLAUDE_ONLY_HOOKS` entry (the consolidated pretool/safety hook,
+    /// the SessionStart handoff hook, the SubagentStop result-contract gate)
+    /// must count toward claude's own installed/total, but never codex's --
+    /// codex has no verified equivalent of claude's `PreToolUse` permission-
+    /// decision contract, and no `SessionStart`/`SubagentStop` event at all,
+    /// so `install_codex_hooks` never writes any of them (see each
+    /// constant's own doc comment).
     #[test]
     fn status_counts_the_claude_only_hooks_toward_claude_only() {
         let repo = tempfile::tempdir().expect("repo");
@@ -5346,16 +5626,34 @@ mod tests {
             HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len()
         );
 
-        // The SessionStart hook specifically must never reach codex's own
-        // hooks.json -- it shares `HARNESS_HOOKS`' install path with codex
-        // for every OTHER hook, but `CLAUDE_ONLY_HOOKS` is never wired into
-        // `install_codex_hooks`.
+        // Issue #774: the SubagentStop hook specifically is actually live at
+        // its own scoped slot, not merely counted.
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(
+            command_live_at_slot(
+                &settings,
+                CLAUDE_SUBAGENT_STOP_HOOK.0,
+                CLAUDE_SUBAGENT_STOP_HOOK.1,
+                CLAUDE_SUBAGENT_STOP_HOOK.2
+            ),
+            "SubagentStop must be installed at its own slot: {settings}"
+        );
+
+        // The SessionStart/SubagentStop hooks specifically must never reach
+        // codex's own hooks.json -- they share `HARNESS_HOOKS`' install path
+        // with codex for every OTHER hook, but `CLAUDE_ONLY_HOOKS` is never
+        // wired into `install_codex_hooks`.
         let codex_hooks_path = codex_config_dir(home.path()).join("hooks.json");
         install_codex_hooks(home.path(), &codex_hooks_path, false).expect("install codex");
         let codex_hooks = load_json_object(&codex_hooks_path).expect("load codex hooks");
         assert!(
             !contains_command(&codex_hooks, CLAUDE_SESSION_START_HOOK.2),
             "SessionStart must not reach codex's hooks.json: {codex_hooks}"
+        );
+        assert!(
+            !contains_command(&codex_hooks, CLAUDE_SUBAGENT_STOP_HOOK.2),
+            "SubagentStop must not reach codex's hooks.json: {codex_hooks}"
         );
         assert!(
             !contains_command(&codex_hooks, CLAUDE_SAFETY_HOOK.2),
@@ -5381,6 +5679,28 @@ mod tests {
         assert!(
             claude_compaction_and_safety_hooks_installed(),
             "both hooks are installed after `zirv setup`"
+        );
+    }
+
+    /// Issue #769: `claude_pretool_hook_runs_bash_safety_itself` reads
+    /// `false` before `zirv setup` has ever run (nothing to self-suppress
+    /// against yet) and `true` once `zirv setup apply` has installed the
+    /// consolidated pretool hook -- what `safety::run_check`'s own hook-mode
+    /// entrypoint gates its self-suppression on.
+    #[test]
+    fn claude_pretool_hook_runs_bash_safety_itself_reflects_the_settings_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        assert!(
+            !claude_pretool_hook_runs_bash_safety_itself(),
+            "nothing is installed on a fresh home"
+        );
+
+        install_claude_integration(home.path(), false).expect("apply");
+        assert!(
+            claude_pretool_hook_runs_bash_safety_itself(),
+            "the consolidated pretool hook is installed after `zirv setup`"
         );
     }
 

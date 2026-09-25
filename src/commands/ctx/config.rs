@@ -61,9 +61,21 @@ pub struct ScoreConfig {
     pub weight_marker: f64,
     /// Score weight for a stuck same-error loop -- the longest run of
     /// consecutive identical (normalized) tool-result error texts within
-    /// the window (`rot::Signals::same_error_repeats`). Default `0.0`: this
-    /// signal ships inert so it never moves an existing verdict fixture
-    /// until an operator opts in deliberately by raising it.
+    /// the window (`rot::Signals::same_error_repeats`).
+    ///
+    /// Issue #763: default `120.0`, enabling the signal that used to ship
+    /// inert (`0.0`). Chosen, not measured, so that a FRESHLY-tripped streak
+    /// -- exactly `same_error_threshold` (default `3`) consecutive identical
+    /// errors, `rot::repetition_component`'s own ramp at its lowest nonzero
+    /// point, `1 / same_error_threshold` -- raises the score to exactly
+    /// `advise_at`'s default (`120.0 * (1.0 / 3.0) == 40.0`) in an otherwise
+    /// healthy session: the FIRST action this signal can ever cause is
+    /// `advise`, never `compact`/`restart`, matching `DEFAULT_PROMPT`'s own
+    /// "stuck twice on the same error: change approach" bullet. A session
+    /// that keeps repeating past that point escalates the same way every
+    /// other signal does, through the identical weighted-sum/threshold
+    /// machinery -- see `rot::score_from`/`verdict_for`. Set `0.0` to restore
+    /// the old, fully inert behaviour.
     pub same_error_weight: f64,
     pub repetition_threshold: usize,
     /// Repeat count of the SAME normalized error text before the
@@ -90,7 +102,7 @@ impl Default for ScoreConfig {
             weight_tool_failure: 40.0,
             weight_repetition: 30.0,
             weight_marker: 30.0,
-            same_error_weight: 0.0,
+            same_error_weight: 120.0,
             repetition_threshold: 3,
             same_error_threshold: 3,
             advise_at: 40,
@@ -268,6 +280,29 @@ pub struct SuperviseConfig {
     /// repo raising its own compaction fuse could silently defeat the
     /// detector for a session running against it.
     pub compact_stall_secs: u64,
+    /// Round 4 bug 2: the hard upper bound `exec`'s and `loop`'s headless
+    /// in-place compaction (`exec::compact_in_place`) waits for the compact
+    /// child to exit and, after that, for the transcript's own
+    /// `compact_boundary` verification marker. Previously this reused
+    /// `wrap.inject_timeout_ms` (20s) -- a value sized for `wrap` injecting a
+    /// nudge into an already-running interactive PTY session, not for a
+    /// whole model turn's worth of headless compute. A real ~150k-token
+    /// compaction takes minutes, so the 20s reuse killed compactions that
+    /// were actively in progress (see the production incident this field
+    /// exists to fix). 600_000ms (10 minutes) mirrors `compact_stall_secs`'s
+    /// own evidence: "5-6.5 minutes" is the slowest compaction actually
+    /// observed elsewhere in this codebase, so 10 minutes is a safe margin
+    /// above it. `compact_in_place` uses no transcript-growth stall clock at
+    /// all: a single headless compaction turn writes nothing back until it
+    /// completes, so growth is not a valid liveness signal for it. This bound
+    /// is the only thing that can kill an in-progress compaction -- see
+    /// `compact_in_place`'s own doc comment.
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
+    /// repo shortening this could force premature restarts of a session
+    /// running against it, and lengthening it could hide a truly hung
+    /// compaction past its usefulness.
+    pub compact_timeout_ms: u64,
     /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
     /// this many unplanned, same-class respawns, each no more than
     /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
@@ -340,6 +375,7 @@ impl Default for SuperviseConfig {
             in_tool_secs: 1200,
             stall_grace_secs: 120,
             compact_stall_secs: 600,
+            compact_timeout_ms: 600_000,
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
@@ -605,6 +641,52 @@ impl Default for VerifyOnStopConfig {
             enabled: true,
             max_nudges: 2,
         }
+    }
+}
+
+/// Q1 (blind-review completion quality): whether the Stop hook may block a
+/// HEADLESS Worker/Single session (`ZIRV_CTX_HEADLESS=1`) once when it
+/// edited/created non-test source files this turn but touched no test file
+/// for the change -- see `hook::missing_tests_gate_reason`'s own doc comment
+/// for the detector and `hook::run_stop`'s own doc comment for every other
+/// gate (interactive, `stop_hook_active`, already-blocked-this-session).
+///
+/// `enabled` goes through the same T9 repo-narrowing fold `verify_on_stop.
+/// enabled` already uses (`narrow_missing_tests_gate_enabled` below), not
+/// `REPO_FORBIDDEN`: an operator who wants the check is never blocked by the
+/// repo, but a repo checkout may only ever turn it off, never force it on
+/// for an operator who disabled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MissingTestsGateConfig {
+    pub enabled: bool,
+}
+
+impl Default for MissingTestsGateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Issue #774: whether claude's `SubagentStop` hook may block a native `Task`
+/// subagent's own final turn once, on a cheap deterministic result-contract
+/// violation -- see `hook::run_subagent_stop`'s own doc comment for the three
+/// checks and the fail-open/cap-at-one-block contract.
+///
+/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
+/// tests_gate.enabled` already uses (`narrow_subagent_stop_gate_enabled`
+/// below), not `REPO_FORBIDDEN`: an operator who wants the gate is never
+/// blocked by the repo, but a repo checkout may only ever turn it off, never
+/// force it on for an operator who disabled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubagentStopGateConfig {
+    pub enabled: bool,
+}
+
+impl Default for SubagentStopGateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -3011,6 +3093,8 @@ pub struct CtxConfig {
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub missing_tests_gate: MissingTestsGateConfig,
+    pub subagent_stop_gate: SubagentStopGateConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -3254,6 +3338,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
         &["supervise", "compact_stall_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS",
+        &["supervise", "compact_timeout_ms"],
         EnvKind::Int,
     ),
     (
@@ -4394,6 +4483,19 @@ fn narrow_diagnostics_enabled(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
+/// Q1: the repo-narrowing fold for `missing_tests_gate.enabled` -- the same
+/// polarity as `narrow_verify_on_stop_enabled`/`narrow_diagnostics_enabled`,
+/// since `false` (the check never blocks) is this key's strict direction.
+fn narrow_missing_tests_gate_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #774: the repo-narrowing fold for `subagent_stop_gate.enabled` --
+/// identical shape/polarity to `narrow_missing_tests_gate_enabled` above.
+fn narrow_subagent_stop_gate_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
 /// Issue #308 stage 1: the repo-narrowing fold for
 /// `diagnostics.max_diagnostics` -- lower is stricter, the identical shape as
 /// `narrow_max_nudges`.
@@ -4926,6 +5028,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["supervise", "compact_stall_secs"],
         "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
+    ),
+    // Round 4 bug 2: same trust asymmetry -- a repo checkout shortening the
+    // headless in-place compaction's hard timeout could force premature
+    // restarts of a session running against it (see `SuperviseConfig::
+    // compact_timeout_ms`'s own doc comment).
+    (
+        &["supervise", "compact_timeout_ms"],
+        "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS",
     ),
     // Same reasoning, for the 3b restart-chain breaker: a repo checkout
     // raising its own restart budget or gap window could silently defeat
@@ -5829,6 +5939,15 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Q1: `missing_tests_gate.enabled` gets the identical lift-before-merge
+        // treatment -- see `narrow_missing_tests_gate_enabled` below.
+        let home_missing_tests_gate_enabled =
+            bool_at(take_nested(&mut merged, "missing_tests_gate", "enabled"));
+        // Issue #774: `subagent_stop_gate.enabled` gets the identical
+        // lift-before-merge treatment -- see `narrow_subagent_stop_gate_
+        // enabled` below.
+        let home_subagent_stop_gate_enabled =
+            bool_at(take_nested(&mut merged, "subagent_stop_gate", "enabled"));
         // Issue #312: both `compact_advisory` keys are narrow-only in the
         // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
         let home_compact_advisory_min_reclaim = integer_at(take_nested(
@@ -6030,6 +6149,16 @@ impl CtxConfig {
         ));
         let repo_diagnostics_timeout =
             integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_missing_tests_gate_enabled = bool_at(take_nested(
+            &mut repo_layer,
+            "missing_tests_gate",
+            "enabled",
+        ));
+        let repo_subagent_stop_gate_enabled = bool_at(take_nested(
+            &mut repo_layer,
+            "subagent_stop_gate",
+            "enabled",
+        ));
         let repo_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut repo_layer,
             "compact_advisory",
@@ -6367,6 +6496,26 @@ impl CtxConfig {
                 ))
                 .unwrap_or(i64::MAX),
             ),
+        );
+
+        let default_missing_tests_gate = MissingTestsGateConfig::default();
+        insert_path(
+            &mut merged,
+            &["missing_tests_gate", "enabled"],
+            toml::Value::Boolean(narrow_missing_tests_gate_enabled(
+                home_missing_tests_gate_enabled.unwrap_or(default_missing_tests_gate.enabled),
+                repo_missing_tests_gate_enabled,
+            )),
+        );
+
+        let default_subagent_stop_gate = SubagentStopGateConfig::default();
+        insert_path(
+            &mut merged,
+            &["subagent_stop_gate", "enabled"],
+            toml::Value::Boolean(narrow_subagent_stop_gate_enabled(
+                home_subagent_stop_gate_enabled.unwrap_or(default_subagent_stop_gate.enabled),
+                repo_subagent_stop_gate_enabled,
+            )),
         );
 
         let default_compact_advisory = CompactAdvisoryConfig::default();
@@ -9473,12 +9622,19 @@ mod tests {
         assert_eq!(narrow_max_diagnostics(10, Some(5)), 5);
         // max_diagnostics: home 10 / repo 20 -> 10 (repo may not raise it).
         assert_eq!(narrow_max_diagnostics(10, Some(20)), 10);
-        assert_eq!(narrow_max_diagnostics(10, None), 10);
+    }
 
-        // timeout_secs: the identical shape, one level up in width.
-        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(30)), 30);
-        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(600)), 120);
-        assert_eq!(narrow_diagnostics_timeout_secs(120, None), 120);
+    /// Q1: the fold rule itself, pure and direct -- the same shape as
+    /// `the_diagnostics_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_missing_tests_gate_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: home true / repo false -> false (repo may disable it).
+        assert!(!narrow_missing_tests_gate_enabled(true, Some(false)));
+        // enabled: home false / repo true -> false (repo may not re-enable an
+        // operator-disabled check).
+        assert!(!narrow_missing_tests_gate_enabled(false, Some(true)));
+        assert!(narrow_missing_tests_gate_enabled(true, None));
+        assert!(narrow_missing_tests_gate_enabled(true, Some(true)));
     }
 
     /// Issue #262: the fold rule itself, the same no-config-file, no-
@@ -9927,6 +10083,84 @@ mod tests {
             cfg.verify_on_stop.max_nudges, 1,
             "a repo may still tighten the nudge cap"
         );
+    }
+
+    /// Q1: the full `CtxConfig::load` integration -- the same shape as
+    /// `a_repo_layer_may_only_narrow_verify_on_stop_enabled_and_max_nudges`:
+    /// a repo-layer `missing_tests_gate.enabled = true` must not resurrect a
+    /// check the operator's own `~/.zirv/ctx.toml` turned off, but a repo
+    /// layer may still turn an operator-enabled check off for itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_missing_tests_gate_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[missing_tests_gate]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[missing_tests_gate]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.missing_tests_gate.enabled,
+            "a repo may not re-enable an operator-disabled missing_tests_gate"
+        );
+    }
+
+    /// Q1: default-on, unlike `diagnostics` -- an operator who never touches
+    /// `missing_tests_gate` still gets the check.
+    #[test]
+    fn missing_tests_gate_defaults_on() {
+        assert!(MissingTestsGateConfig::default().enabled);
+    }
+
+    /// Issue #774: identical shape to `a_repo_layer_may_only_narrow_missing_
+    /// tests_gate_enabled` -- a repo-layer `subagent_stop_gate.enabled = true`
+    /// must not resurrect a gate the operator's own `~/.zirv/ctx.toml` turned
+    /// off, but a repo layer may still turn an operator-enabled gate off for
+    /// itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_subagent_stop_gate_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[subagent_stop_gate]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[subagent_stop_gate]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.subagent_stop_gate.enabled,
+            "a repo may not re-enable an operator-disabled subagent_stop_gate"
+        );
+    }
+
+    /// Issue #774: default-on, the same as `missing_tests_gate` -- an
+    /// operator who never touches `subagent_stop_gate` still gets the check.
+    #[test]
+    fn subagent_stop_gate_defaults_on() {
+        assert!(SubagentStopGateConfig::default().enabled);
     }
 
     /// Issue #155, Phase 3: the fold rule itself, mirroring `the_pace_
@@ -11301,6 +11535,14 @@ intake_discipline = true
         let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS", "90")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.supervise.compact_stall_secs, 90);
+    }
+
+    #[test]
+    fn compact_timeout_ms_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS", "12345")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.compact_timeout_ms, 12345);
     }
 
     #[test]
@@ -13103,6 +13345,7 @@ intake_discipline = true
         ("supervise", "in_tool_secs"),
         ("supervise", "stall_grace_secs"),
         ("supervise", "compact_stall_secs"),
+        ("supervise", "compact_timeout_ms"),
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),

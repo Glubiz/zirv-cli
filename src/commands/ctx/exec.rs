@@ -354,6 +354,51 @@ fn is_joined_form(arg: &str, flags: &[&str]) -> bool {
         .is_some_and(|(name, _)| flags.contains(&name))
 }
 
+/// Issue #778: the resume-pinning tokens already in `command` (a
+/// [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`] flag, either spelling),
+/// verbatim, plus the explicit conversation id when the flag names one
+/// directly. `(Vec::new(), None)` when nothing pins a conversation, or the
+/// adapter does not recognise these flags at all (`adapter_has_resume_
+/// flags`) -- codex mints its own session id and has no verified pin flag,
+/// so this is always a no-op for it. The id is `None` for a bare pin (`-c`/
+/// `--continue`/`--fork-session`, which resumes "whichever conversation is
+/// most recent" with no id readable off argv) even though the tokens
+/// themselves are still returned.
+///
+/// The single source of truth `run_with_clock_inner`'s very first launch
+/// reads to honour an operator's own `-- --resume <id>`/`--continue`
+/// instead of silently minting an unrelated fresh session -- see that
+/// function's own `resume_pin` call site and `ClaudeAdapter::headless_cmd`,
+/// which skips its own `--session-id` injection whenever the tokens this
+/// returns (or any equivalent already on `extra`) are present. At most one
+/// flag is ever returned: claude itself refuses more than one
+/// conversation-pinning flag per launch.
+fn resume_pin(command: &[String], adapter_name: &str) -> (Vec<String>, Option<String>) {
+    if !adapter_has_resume_flags(adapter_name) {
+        return (Vec::new(), None);
+    }
+    for (index, arg) in command.iter().enumerate() {
+        if let Some((name, value)) = arg.split_once('=') {
+            if RESUME_FLAGS_WITH_VALUE.contains(&name) {
+                return (vec![arg.clone()], Some(value.to_string()));
+            }
+            if RESUME_FLAGS_BARE.contains(&name) {
+                return (vec![arg.clone()], None);
+            }
+        }
+        if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+            return match command.get(index + 1).filter(|next| !next.starts_with('-')) {
+                Some(value) => (vec![arg.clone(), value.clone()], Some(value.clone())),
+                None => (vec![arg.clone()], None),
+            };
+        }
+        if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
+            return (vec![arg.clone()], None);
+        }
+    }
+    (Vec::new(), None)
+}
+
 /// Locates the token that carries the prompt in a headless agent command, and
 /// the prompt itself when that token is followed by one.
 ///
@@ -623,7 +668,7 @@ fn protect_compaction_continuation(
 pub(crate) fn compact_in_place<F>(
     adapter: &dyn adapters::AgentAdapter,
     transcript: Option<&Path>,
-    timeout: Duration,
+    hard_timeout: Duration,
     poll: Duration,
     build: F,
 ) -> Result<(), String>
@@ -644,25 +689,46 @@ where
     })?;
     let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)
         .map_err(|error| format!("compact command failed to start: {error}"))?;
-    let outcome = supervise::supervise_child(
-        &mut child,
-        Instant::now() + timeout,
-        poll.max(Duration::from_millis(10)),
-        &mut || Tick::Continue,
-    )
-    .map_err(|error| format!("compact command failed: {error}"))?;
+    let poll = poll.max(Duration::from_millis(10));
+    // Round 4 bug 2: a real ~150k-token compaction ran past the single flat
+    // deadline `compact_in_place` used to wait on the compact child's exit
+    // (20s, `cfg.wrap.inject_timeout_ms` -- a value meant for `wrap`'s
+    // interactive nudge injection, not for a whole model turn's worth of
+    // headless compute), so zirv killed a compaction that was actively making
+    // progress.
+    //
+    // The fix used to be a transcript-growth "stall" clock reset on every
+    // observed byte -- but a single headless compaction turn appends NOTHING
+    // to the transcript until the whole turn completes, so that clock could
+    // just as easily kill a real, healthy compaction that simply has not
+    // written anything back yet. There is no reliable mid-turn liveness
+    // signal for a single headless child, so the child's exit is bounded by
+    // `hard_timeout` alone (`SuperviseConfig::compact_timeout_ms`, default 10
+    // minutes, REPO_FORBIDDEN so a repo cannot weaken it) and `on_tick` never
+    // asks to stop early.
+    let outcome =
+        supervise::supervise_child(&mut child, Instant::now() + hard_timeout, poll, &mut || {
+            Tick::Continue
+        })
+        .map_err(|error| format!("compact command failed: {error}"))?;
     let _ = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
     match outcome {
         Outcome::Exited(0) => {}
         Outcome::Exited(code) => return Err(format!("compact command exited with code {code}")),
-        Outcome::TimedOut => return Err("compact command timed out".to_string()),
+        Outcome::TimedOut => {
+            return Err(format!(
+                "compact command exceeded its {}s hard timeout",
+                hard_timeout.as_secs()
+            ));
+        }
         Outcome::StoppedByTick(reason) => {
             return Err(format!("compact command stopped unexpectedly: {reason}"));
         }
     }
 
-    let verified = supervise::verify_compaction(&mut watcher, adapter, Instant::now() + timeout)
-        .map_err(|error| format!("compaction verification failed: {error}"))?;
+    let verified =
+        supervise::verify_compaction(&mut watcher, adapter, Instant::now() + hard_timeout)
+            .map_err(|error| format!("compaction verification failed: {error}"))?;
     if !verified {
         return Err("compaction not verified".to_string());
     }
@@ -1247,13 +1313,28 @@ fn run_with_clock_inner<W: Write>(
     let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
         .and_then(|(index, value)| value.map(|_| index + 1));
 
+    // Issue #778: the operator's own trailing args may already name an
+    // existing conversation to resume (`-- --resume <id>`), for zirv to
+    // track under that SAME id -- transcript derivation, the registry short
+    // id and every decision-log entry below -- rather than a fresh, unrelated
+    // one that has nothing to do with the conversation actually being
+    // resumed. `resume_pin` reads the same `RESUME_FLAGS_WITH_VALUE`/
+    // `RESUME_FLAGS_BARE` list `pins_an_existing_conversation`/`extra_launch_
+    // flags` already use; `resume_pin_tokens` (its other half) is consulted
+    // further down, only for the very first launch's own `extra`, once
+    // `user_extra` below has already stripped them the same way it would for
+    // a restart.
+    let (resume_pin_tokens, resumed_session_id) = resume_pin(&args.command, adapter.name());
     // Determined before mail is listed (N3: delivery is scoped to this
     // session's own short id, so the id has to exist first) and before
     // `prompt_args` (M7 needs a session id to name the private prompt file
-    // after) rather than after, as this used to be.
+    // after) rather than after, as this used to be. `args.session_id` --
+    // zirv's own flag -- still wins outright over a resumed id: an operator
+    // who names both gets what they explicitly pinned.
     let session_raw = args
         .session_id
         .clone()
+        .or(resumed_session_id)
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
 
@@ -1470,6 +1551,7 @@ fn run_with_clock_inner<W: Write>(
             adapter.as_ref(),
             &user_extra,
             adapters::LaunchMode::Headless,
+            super::prompt::PromptRole::Worker,
         )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
@@ -1802,10 +1884,19 @@ fn run_with_clock_inner<W: Write>(
             cfg.mail.max_delivered_bytes,
             parent_short.as_deref(),
         );
+        // Issue #778: `resume_pin_tokens` re-adds, for this very first launch
+        // only, exactly the resume-pinning flag `user_extra` above already
+        // stripped out (`extra_launch_flags`'s own resume-flag handling,
+        // unchanged, still governs every relaunch below via the same
+        // `user_extra` binding) -- so an operator's own `-- --resume <id>`/
+        // `--continue` reaches the adapter's argv here, and `ClaudeAdapter::
+        // headless_cmd` sees it and skips minting its own conflicting
+        // `--session-id`.
         let extra: Vec<String> = policy_extra
             .iter()
             .cloned()
             .chain(user_extra.iter().cloned())
+            .chain(resume_pin_tokens.iter().cloned())
             .chain(prompt_args.iter().cloned())
             .collect();
         let (mut command, stdin_prompt) = build_headless(&prompt_text, &session, &extra)?;
@@ -2123,6 +2214,23 @@ fn run_with_clock_inner<W: Write>(
             account_pattern = None;
         } else {
             let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
+            // Round 4 bug 4a: a `--output-format json` result's own
+            // `modelUsage.<model>.contextWindow` is the real window for the
+            // model that actually ran -- learned here, once, the moment it
+            // is seen, rather than trusting the catalogue's possibly-stale
+            // number forever. Best-effort and silent: most launches print
+            // no such result at all (interactive sessions, `--output-format
+            // text`), which reads as "nothing observed", never an error.
+            if let Some((model_id, window)) =
+                super::model_window::parse_observed_window(&final_lines.join("\n"))
+                && let Ok(home) = crate::utils::home_dir()
+            {
+                super::model_window::record(
+                    &home,
+                    &[model_id.as_str(), execution_model.as_deref().unwrap_or("")],
+                    window,
+                );
+            }
             let limit_text_seen = pace::scan_for_limit(
                 &final_lines,
                 &state,
@@ -2216,7 +2324,7 @@ fn run_with_clock_inner<W: Write>(
             let compact_result = compact_in_place(
                 adapter.as_ref(),
                 Some(&transcript),
-                Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                Duration::from_millis(cfg.supervise.compact_timeout_ms),
                 poll,
                 |compact_prompt| {
                     let session_ref = SessionRef {
@@ -4143,7 +4251,43 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     }
     let mut args = args.clone();
     args.runtime = choice.kind.as_str().to_string();
-    run_with(&args, w, &repo, &env)
+    // Round 4B (stdout/stderr separation): a harness launch's child inherits
+    // nothing of its own -- `supervise::forward` echoes the CHILD's stdout
+    // line by line straight to this process's own real `std::io::stdout()`,
+    // on its own thread, entirely independent of `w`. Every "zirv ctx exec:
+    // ..." notice the harness path (`run_with_clock`/`run_with_clock_inner`)
+    // writes to `w` used to go to that SAME real stdout too -- on this, the
+    // one production call site (`mod.rs`'s `CtxVerb::Exec` dispatch), `w` IS
+    // `std::io::Stdout` -- racing the forwarding thread and landing a notice
+    // (`pace::wait_for_window`'s usage-limit line, a restart/nudge/backoff
+    // line, and so on) in front of a child's own `--output-format json`
+    // stream, which a machine consumer piping this process's stdout cannot
+    // recover from. `--runtime native`'s `w` argument IS the contract
+    // instead (`--view json/plain`'s structured result, `run_native`'s own
+    // `writeln!(w, ...)` calls), so only the harness branch is redirected --
+    // this mirrors `run_with`'s own branch exactly, just choosing the writer
+    // per arm rather than sharing one across both. `run_with` itself (and
+    // every other caller -- `script_runner::agent_command`, every test that
+    // still passes its own buffer) is untouched: this function alone owns
+    // the real-process CLI entry, so redirecting here cannot perturb a test
+    // that asserts on a harness notice via its own `Vec<u8>` writer through
+    // `run_with`/`run_with_clock` directly.
+    match choice.kind {
+        super::runtime::RuntimeKind::Native => run_native(&args, w, &repo, &env),
+        super::runtime::RuntimeKind::Harness => run_with_clock(
+            &args,
+            &mut std::io::stderr(),
+            &repo,
+            &env,
+            &super::state::now_secs,
+            &|d: Duration| std::thread::sleep(d),
+        ),
+        super::runtime::RuntimeKind::Unknown => Err(format!(
+            "--runtime '{}': expected `harness` or `native`",
+            args.runtime
+        )
+        .into()),
+    }
 }
 
 /// Issue #491: the `[runtime]` resolution `run` applies before anything
@@ -4950,6 +5094,82 @@ mod tests {
             "approval_policy=never".to_string(),
         ];
         assert!(!pins_an_existing_conversation(&argv, "codex"));
+    }
+
+    /// Issue #778: `resume_pin` is what `run_with_clock_inner`'s very first
+    /// launch reads to honour an operator's own `-- --resume <id>` instead of
+    /// silently minting an unrelated fresh session -- both the flag(s) to put
+    /// back on `extra` and, when the flag names one directly, the id itself
+    /// for zirv's own bookkeeping (`session_raw`). Both spellings of the
+    /// value-carrying flags recover the id; the bare pins carry no id at all,
+    /// same as `pins_an_existing_conversation` already treats them, but still
+    /// return their own token so the launch still tells claude to resume.
+    #[test]
+    fn resume_pin_recovers_the_flag_and_the_id_when_one_is_named() {
+        let with_id = [
+            (
+                vec!["--resume".to_string(), "abc".to_string()],
+                vec!["--resume".to_string(), "abc".to_string()],
+            ),
+            (
+                vec!["--resume=abc".to_string()],
+                vec!["--resume=abc".to_string()],
+            ),
+            (
+                vec!["--session-id".to_string(), "abc".to_string()],
+                vec!["--session-id".to_string(), "abc".to_string()],
+            ),
+        ];
+        for (command, expected_tokens) in with_id {
+            assert_eq!(
+                resume_pin(&command, "claude"),
+                (expected_tokens, Some("abc".to_string())),
+                "got a mismatch for {command:?}"
+            );
+        }
+
+        for bare in [["-c"], ["--continue"], ["--fork-session"]] {
+            let command = vec![bare[0].to_string()];
+            assert_eq!(
+                resume_pin(&command, "claude"),
+                (vec![bare[0].to_string()], None),
+                "a bare pin carries the token but no id: {bare:?}"
+            );
+        }
+
+        assert_eq!(
+            resume_pin(&["--model".to_string(), "opus".to_string()], "claude"),
+            (Vec::new(), None),
+            "no pinning flag at all means nothing to report"
+        );
+    }
+
+    /// Codex mints its own session id and has no verified pin flag -- see
+    /// `pins_an_existing_conversation_is_always_false_for_an_adapter_with_
+    /// no_resume_flags`'s identical reasoning. `resume_pin` must be an
+    /// equally total no-op for it, or a codex launch would start forwarding
+    /// claude-shaped flags it never asked for.
+    #[test]
+    fn resume_pin_is_always_a_no_op_for_an_adapter_with_no_resume_flags() {
+        let command = vec!["--resume".to_string(), "abc".to_string()];
+        assert_eq!(resume_pin(&command, "codex"), (Vec::new(), None));
+    }
+
+    /// `--resume` with a flag after it took no value (same shape `a_valueless_
+    /// resume_does_not_swallow_the_next_flag` already pins for `extra_launch_
+    /// flags`): the next token belongs to the operator, so `resume_pin` must
+    /// not report it as the id or swallow it into the returned tokens.
+    #[test]
+    fn resume_pin_does_not_swallow_the_next_flag_after_a_valueless_resume() {
+        let command = vec![
+            "--resume".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            resume_pin(&command, "claude"),
+            (vec!["--resume".to_string()], None)
+        );
     }
 
     /// `--resume` with a flag after it took no value, so swallowing the next
@@ -5938,6 +6158,55 @@ mod tests {
         assert_eq!(attempts.get(), 0, "missing transcript must not launch");
     }
 
+    /// Compaction stall-detection correction: `compact_in_place` used to reset
+    /// a "stall" clock on every observed byte of transcript growth and kill
+    /// the child once that clock ran out with NO growth at all. But a single
+    /// headless compaction turn appends nothing to the transcript until the
+    /// whole turn completes, so that clock could just as easily kill a real,
+    /// healthy compaction as a genuine hang -- exactly the production
+    /// incident this reproduces at unit-test scale (a real ~150k-token
+    /// compaction can run well past what any short stall grace would
+    /// tolerate while writing nothing back). The fake compact command here
+    /// appends NOTHING to the transcript for several poll intervals, then
+    /// finally emits `compact_boundary` and exits 0, well inside the hard
+    /// timeout. It must not be killed: `compact_in_place` no longer uses
+    /// transcript growth to decide liveness at all, relying on
+    /// `supervise.compact_timeout_ms`'s hard bound alone. Durations are kept
+    /// short (milliseconds) so the test never sleeps anywhere near the old
+    /// 60s grace.
+    #[test]
+    fn a_compaction_with_no_transcript_growth_at_all_finishes_inside_the_hard_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("seed transcript");
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+
+        // No writes to the transcript at all until the very end -- exactly
+        // what a real headless compaction turn does while still computing.
+        let script = format!(
+            "sleep 0.3; printf '{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"c\"}}\\n' >> '{path}'",
+            path = transcript.display()
+        );
+        let build = |_: &str| -> Option<(Command, Option<String>)> {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(&script);
+            Some((cmd, None))
+        };
+
+        let result = compact_in_place(
+            &claude,
+            Some(&transcript),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            build,
+        );
+        assert!(
+            result.is_ok(),
+            "a compaction that appends nothing until it completes must not be killed for lack \
+             of transcript growth, as long as it finishes inside the hard timeout: {result:?}"
+        );
+    }
+
     #[test]
     fn compact_budget_arms_before_an_attempt_and_resets_only_after_progress_and_the_window() {
         let now = Instant::now();
@@ -5998,7 +6267,10 @@ mod tests {
         let argv_log = tmp.path().join("argv.log");
         std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
         let mut env = base_env(&state);
-        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "2000".to_string());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -6065,7 +6337,10 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
         let mut env = base_env(&state);
-        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "300".to_string());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "300".to_string(),
+        );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8281,6 +8556,66 @@ mod tests {
             "",
             "must not export the inherited parent onward to the launched child: \
              {logged_parent:?}"
+        );
+    }
+
+    /// Round 4B (stdout/stderr separation): a real harness launch's child
+    /// forwards its OWN stdout independently, line by line, straight to this
+    /// process's real `std::io::stdout()` (`supervise::forward`) -- entirely
+    /// apart from whatever `w` this function was handed. `run()`'s one
+    /// production caller (`mod.rs`'s `CtxVerb::Exec` dispatch) hands it that
+    /// SAME real stdout, so any supervisor notice ("zirv ctx exec: ...")
+    /// still written to `w` used to race the forwarding thread on the
+    /// identical stream -- landing in front of, or inside, a child's own
+    /// `--output-format json` output, which a downstream consumer piping
+    /// this process's stdout could never recover from. Triggers the
+    /// cheapest deterministic notice: `command` carries no `-p`/`--print`/
+    /// `exec` token and `prompt` is unset, so `extract_prompt` finds nothing
+    /// and the "no prompt could be found" notice fires unconditionally, with
+    /// no pacing, timing or usage history involved.
+    #[test]
+    fn direct_exec_entry_never_leaks_a_harness_notice_into_its_own_writer() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session = "dedededd-2222-4333-8444-555555555555";
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state_dir.to_str()),
+            ("ZIRV_CTX_PACE", Some("false")),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("ZIRV_CTX_PROMPT_SKILL_INDEX", Some("false")),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            // Deliberately no `--prompt`, and `command` carries no `-p`/
+            // `--print`/`exec` token either -- fake-agent.sh's own argv
+            // parser (a `case` loop with `*) shift ;;`) tolerates the
+            // missing flag fine, but `extract_prompt` has nothing to find.
+            command: vec![
+                "sh".to_string(),
+                fixture("fake-agent.sh").display().to_string(),
+                "--session-id".to_string(),
+                session.to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            !rendered.contains("zirv ctx exec:"),
+            "a supervisor notice reached the caller's own writer instead of stderr: {rendered}"
         );
     }
 

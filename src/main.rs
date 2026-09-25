@@ -403,8 +403,25 @@ fn maybe_run_first_run_wizard(stdin_is_tty: bool, stdout_is_tty: bool, allow_nes
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Issue #771: the multi-thread tokio runtime `.zirv` scripts need for their
+/// own `agent:`/parallel steps ([`execute`]'s own `.await` tree), built
+/// lazily and ONLY on the one path that reaches a script with real async
+/// work to run. Before this, `#[tokio::main]` built this exact runtime (and
+/// spawned its worker threads) unconditionally, before `main` even looked at
+/// argv -- paid by every single invocation, including the hook fast path
+/// (`is_top_level_ctx`, checked first, dispatches straight into the
+/// synchronous `ctx::dispatch`) that a Claude Code hook spawns on every tool
+/// call and never awaits anything. Mirrors the exact idiom `ctx::mcp::serve`/
+/// `ctx::mcp::doctor::run` already use for their own async work: a runtime
+/// built with `Builder` and driven with `block_on`, not the `#[tokio::main]`
+/// macro, so nothing forces it to exist before the call site that needs it.
+fn build_script_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if is_top_level_ctx(&argv) {
         std::process::exit(ctx::dispatch(&argv[1..]));
@@ -530,11 +547,12 @@ async fn main() {
         // panes -- neither clears the environment before spawning) inherits
         // it.
         //
-        // SAFETY: `#[tokio::main]`'s runtime worker threads already exist at
-        // this point, but nothing has been scheduled onto them yet --
-        // `ctx::dispatch` below is the first call that does real work, and
-        // it has not run yet -- so no other thread in this process can be
-        // reading or writing the environment concurrently here.
+        // SAFETY: issue #771 made `main` a plain synchronous function again
+        // (no `#[tokio::main]`, no runtime built yet at all) -- this process
+        // has spawned no thread of its own by this point, and `ctx::dispatch`
+        // below is the first call that does real work and has not run yet,
+        // so no other thread in this process can be reading or writing the
+        // environment concurrently here.
         unsafe {
             std::env::set_var(ctx::chat::NATIVE_ALIAS_ENV, "true");
         }
@@ -690,7 +708,18 @@ async fn main() {
         ctx::priority::apply_process(ctx::priority::posture_for(ctx::prompt::PromptRole::Worker));
     }
 
-    if let Err(e) = execute(&script, &input.params, input.dry_run).await {
+    // Issue #771: built here, not by `#[tokio::main]` wrapping this whole
+    // function -- every branch above (help/version/ctx/setup/workflow/...)
+    // returns or exits well before this line, so none of them ever pay for
+    // a runtime they never use.
+    let runtime = match build_script_runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            output::error(format!("failed to start the async runtime: {e}"));
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = runtime.block_on(execute(&script, &input.params, input.dry_run)) {
         output::error(&e);
         std::process::exit(1);
     }
@@ -702,6 +731,18 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Issue #771: `main` is a plain synchronous function now, so the only
+    /// thing standing in for its old `#[tokio::main]`-provided runtime is
+    /// `build_script_runtime`'s own contract -- it must actually build a real
+    /// multi-thread runtime capable of driving `execute(...)`'s async work
+    /// via `block_on`, on demand, every time the script path calls it.
+    #[test]
+    fn build_script_runtime_can_block_on_async_work() {
+        let runtime = build_script_runtime().expect("runtime should build");
+        let result = runtime.block_on(async { 1 + 1 });
+        assert_eq!(result, 2);
     }
 
     #[test]

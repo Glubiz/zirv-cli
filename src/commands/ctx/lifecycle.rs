@@ -477,6 +477,15 @@ pub struct StopSignals {
     pub verification: VerificationDecision,
     /// A workflow gate that refuses completion, with its own message.
     pub workflow_gate: Option<String>,
+    /// Headless completion-quality gate (Q1): `Some(reason)` when this
+    /// session edited/created non-test source files but touched no test
+    /// file for the change. The caller is responsible for computing this
+    /// (reading the transcript/repo is not this pure module's job -- see
+    /// this module's own header comment) and for only ever setting it once
+    /// per session: `hook::run_stop` persists its own per-session marker so
+    /// a second stop in the same session passes `None` here regardless of
+    /// whether tests were ever added.
+    pub missing_tests_gate: Option<String>,
 }
 
 /// The stop service. A model's own "I am done" token is an INPUT here, never
@@ -498,6 +507,9 @@ pub fn stop(signals: &StopSignals) -> StopDecision {
     }
     if let Some(gate) = &signals.workflow_gate {
         return StopDecision::Block(gate.clone());
+    }
+    if let Some(reason) = &signals.missing_tests_gate {
+        return StopDecision::Block(reason.clone());
     }
     match &signals.verification {
         VerificationDecision::Required { command } => StopDecision::AllowWithNote(format!(
@@ -671,6 +683,7 @@ mod tests {
             incomplete_tools: vec!["call_1".to_string()],
             verification: VerificationDecision::NotRequired,
             workflow_gate: None,
+            missing_tests_gate: None,
         });
         assert!(matches!(decision, StopDecision::Block(reason) if reason.contains("call_1")));
     }
@@ -684,8 +697,42 @@ mod tests {
                 command: "zirv test changed",
             },
             workflow_gate: Some("gate".to_string()),
+            missing_tests_gate: Some("add a test".to_string()),
         });
         assert_eq!(decision, StopDecision::Allow);
+    }
+
+    /// Q1: a session with no incomplete tools and no workflow gate, but a
+    /// missing-tests reason, blocks on that reason -- the caller (`hook::
+    /// run_stop`) is what guarantees this is only ever passed once per
+    /// session.
+    #[test]
+    fn stop_blocks_on_a_missing_tests_gate() {
+        let decision = stop(&StopSignals {
+            already_blocked: false,
+            incomplete_tools: Vec::new(),
+            verification: VerificationDecision::NotRequired,
+            workflow_gate: None,
+            missing_tests_gate: Some(
+                "zirv: add a focused test for each behaviour change".to_string(),
+            ),
+        });
+        assert!(matches!(decision, StopDecision::Block(reason) if reason.contains("test")));
+    }
+
+    /// A workflow gate is evaluated first: a caller that populated both
+    /// never has the missing-tests wording silently replace the workflow
+    /// gate's own, more specific reason.
+    #[test]
+    fn a_workflow_gate_outranks_the_missing_tests_gate() {
+        let decision = stop(&StopSignals {
+            already_blocked: false,
+            incomplete_tools: Vec::new(),
+            verification: VerificationDecision::NotRequired,
+            workflow_gate: Some("gate".to_string()),
+            missing_tests_gate: Some("add a test".to_string()),
+        });
+        assert_eq!(decision, StopDecision::Block("gate".to_string()));
     }
 
     #[test]

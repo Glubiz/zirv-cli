@@ -2758,6 +2758,11 @@ impl<'a> NativeLoop<'a> {
             incomplete_tools: incomplete.iter().cloned().collect(),
             verification: lifecycle::VerificationDecision::NotRequired,
             workflow_gate,
+            // Q1's missing-tests gate is `hook::run_stop`'s own concern (it
+            // needs a persisted per-session marker and the headless/config
+            // gating hook.rs already owns); a native session's completion
+            // path is untouched by this task.
+            missing_tests_gate: None,
         });
         let blocked_reason = match &stop {
             lifecycle::StopDecision::Block(reason) => Some(reason.clone()),

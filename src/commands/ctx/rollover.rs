@@ -17,14 +17,15 @@
 //! `log::SafetyDecision`'s own doc comment for the same rule applied to
 //! command policy).
 
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::adapters;
 use super::allocator::{self, HarnessState};
-use super::config::CtxConfig;
+use super::config::{CtxConfig, EnvLookup};
 use super::fallback;
 use super::handover::{self, HandoverRequest};
 use super::log;
@@ -359,6 +360,90 @@ pub fn evaluate_interval(cfg: &CtxConfig, reactive_pending: bool) -> Duration {
     } else {
         cfg.pace.collector_max_age_secs.max(60)
     })
+}
+
+/// Issue #780: `dash` and `wrap` each load a `CtxConfig` once at start-up and
+/// hold that one copy for their whole (long-lived) process life, so a gate
+/// that reads `cfg.auto_orchestrator_rollover()` straight off it never sees a
+/// later `zirv ctx config set fallback.auto_orchestrator_rollover false` --
+/// an explicit operator disable silently kept losing to the stale in-memory
+/// `true` it started with.
+///
+/// This re-derives just that one switch from a fresh layered load
+/// (`CtxConfig::load_for_launch`, the same operator + repo + `ZIRV_CTX_*`
+/// precedence every other read uses -- no parallel loader), cached by the
+/// operator's and the repo's `ctx.toml` mtimes so the hot path -- checked on
+/// every rollover-eligible tick -- costs two `stat`s on the common case
+/// rather than a re-parse. `load_for_launch` (not the plainer `load`) is
+/// deliberate: a repo-layer parse error still just narrows-or-skips, exactly
+/// as `load` does, but an unparsable OPERATOR layer -- a syntax typo landed
+/// mid hand-edit of the very file this switch lives in -- is a hard `Err`
+/// there instead of a silent fall-back to `[fallback]`'s defaults, which for
+/// this key could otherwise resolve to "on" (`None` means "decide from the
+/// roster"). Either way, a failed reload never enables rollover: it keeps the
+/// last value a load actually produced, seeded from the `cfg` the caller
+/// already loaded successfully at start-up. Never panics; no hot-path
+/// `unwrap`/`expect`.
+pub struct LiveAutoRollover<'a> {
+    repo: PathBuf,
+    env: EnvLookup<'a>,
+    checked: Option<(Option<SystemTime>, Option<SystemTime>)>,
+    last_good: bool,
+}
+
+impl<'a> LiveAutoRollover<'a> {
+    /// `initial` is the switch's value on the `cfg` the caller already
+    /// loaded successfully at start-up -- the seed a first, still-unchecked
+    /// tick reports, and the fallback a later reload failure returns to.
+    pub fn new(repo: &Path, env: EnvLookup<'a>, initial: bool) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            env,
+            checked: None,
+            last_good: initial,
+        }
+    }
+
+    fn mtimes(&self) -> (Option<SystemTime>, Option<SystemTime>) {
+        let mtime_of = |path: Option<PathBuf>| {
+            path.and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok())
+        };
+        let operator = mtime_of(super::config::operator_path().ok());
+        let repo_layer = mtime_of(Some(
+            self.repo
+                .join(crate::utils::SCRIPT_DIR_NAME)
+                .join(super::config::CTX_CONFIG_FILE),
+        ));
+        (operator, repo_layer)
+    }
+
+    /// The switch's current value, re-derived from disk only when either
+    /// layer's `ctx.toml` mtime has moved since the last check.
+    pub fn is_enabled(&mut self) -> bool {
+        let mtimes = self.mtimes();
+        if self.checked != Some(mtimes) {
+            self.checked = Some(mtimes);
+            if let Ok(cfg) = CtxConfig::load_for_launch(&self.repo, self.env) {
+                self.last_good = cfg.auto_orchestrator_rollover();
+            }
+            // A failed load leaves `last_good` exactly as it was -- see this
+            // type's own doc comment for why that is never a widening.
+        }
+        self.last_good
+    }
+
+    /// `cfg`, with only `fallback.auto_orchestrator_rollover` overridden to
+    /// this switch's live value. Every other field stays the caller's own
+    /// (otherwise stale) `cfg`, unchanged: this hands [`evaluate`]/
+    /// [`on_resume`] the live switch without duplicating the AND-fold
+    /// `CtxConfig::auto_orchestrator_rollover` already performs, and without
+    /// turning into a general config hot-reload.
+    pub fn patched(&mut self, cfg: &CtxConfig) -> CtxConfig {
+        let mut live = cfg.clone();
+        live.fallback.auto_orchestrator_rollover = Some(self.is_enabled());
+        live
+    }
 }
 
 /// Decides whether `seat_short`'s orchestrator seat should roll onto another
@@ -1795,6 +1880,117 @@ mod tests {
         cfg.fallback.orchestrator_rollover_headroom_pct = Some(20.0);
         cfg.fallback.min_candidate_headroom_pct = 10.0;
         cfg
+    }
+
+    /// Bumps `path`'s mtime forward so a second write in the same test is
+    /// unambiguously "later" -- `LiveAutoRollover::mtimes` keys its cache off
+    /// this, and two writes issued back to back can otherwise land inside the
+    /// same filesystem mtime tick.
+    fn touch_later(path: &std::path::Path) {
+        let future = SystemTime::now() + Duration::from_secs(5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("reopen for a later mtime")
+            .set_modified(future)
+            .expect("bump mtime forward");
+    }
+
+    /// Issue #780: a `dash`/`wrap` session that started with the switch on
+    /// must still see an operator's later `zirv ctx config set fallback.
+    /// auto_orchestrator_rollover false` land on disk, without a restart --
+    /// this is what actually broke (the evidence in the issue: the switch was
+    /// disabled at 16:54, the same running dash still prepared a rollover at
+    /// 19:05).
+    #[test]
+    fn live_auto_rollover_honours_a_disable_written_to_disk_after_start_up() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let operator_path =
+            crate::commands::ctx::config::operator_path().expect("operator config path");
+        std::fs::create_dir_all(operator_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &operator_path,
+            "[fallback]\nauto_orchestrator_rollover = true\n",
+        )
+        .expect("write operator config");
+
+        let env: EnvLookup = &|_| None;
+        let mut live = LiveAutoRollover::new(repo.path(), env, true);
+        assert!(
+            live.is_enabled(),
+            "the operator's own explicit true must be honoured"
+        );
+
+        // The operator disables it, exactly as `zirv ctx config set
+        // fallback.auto_orchestrator_rollover false` would -- on a session
+        // that is already running.
+        std::fs::write(
+            &operator_path,
+            "[fallback]\nauto_orchestrator_rollover = false\n",
+        )
+        .expect("rewrite operator config");
+        touch_later(&operator_path);
+
+        assert!(
+            !live.is_enabled(),
+            "a disable written to disk after start-up must flip a live check -- no restart"
+        );
+    }
+
+    /// Issue #780: a fresh reload that fails outright (a syntax error landed
+    /// mid hand-edit of the operator's own `ctx.toml`) must never enable
+    /// rollover -- it falls back to the last value a load actually produced,
+    /// which here started disabled.
+    #[test]
+    fn live_auto_rollover_never_enables_after_a_failed_reload() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let operator_path =
+            crate::commands::ctx::config::operator_path().expect("operator config path");
+        std::fs::create_dir_all(operator_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &operator_path,
+            "[fallback]\nauto_orchestrator_rollover = false\n",
+        )
+        .expect("write operator config");
+
+        let env: EnvLookup = &|_| None;
+        let mut live = LiveAutoRollover::new(repo.path(), env, false);
+        assert!(!live.is_enabled(), "seeded disabled, and the load agrees");
+
+        // A stray keystroke mid hand-edit leaves the operator's own file
+        // syntactically broken. `CtxConfig::load_for_launch` hard-errors on
+        // an unparsable HOME layer rather than silently falling back to
+        // `[fallback]`'s roster-decided default (which, with two enabled
+        // harnesses, would read as "on") -- see `LiveAutoRollover`'s own doc
+        // comment for why `load_for_launch`, not the plainer `load`.
+        std::fs::write(
+            &operator_path,
+            "[fallback]\nauto_orchestrator_rollover = tr",
+        )
+        .unwrap();
+        touch_later(&operator_path);
+
+        assert!(
+            !live.is_enabled(),
+            "a failed reload must never enable rollover, even transiently"
+        );
+
+        // And once the operator finishes the edit correctly, the switch
+        // resumes tracking the file again -- the failure was not sticky.
+        std::fs::write(
+            &operator_path,
+            "[fallback]\nauto_orchestrator_rollover = true\n",
+        )
+        .expect("finish the edit");
+        touch_later(&operator_path);
+        assert!(
+            live.is_enabled(),
+            "a later, valid reload must take effect once the syntax error is fixed"
+        );
     }
 
     fn store_usage(state: &StateDir, provider: &str, used_pct: f64, observed_at: u64) {

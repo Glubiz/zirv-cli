@@ -795,27 +795,53 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         &capabilities.web,
     ));
 
-    rows.push(match browser_binary(&capabilities.browser) {
-        _ if !capabilities.enabled => IntegrationStatus::unavailable(
+    // F5 (wrapper-overhead benchmark, 2026-09-24): computed ONCE and shared
+    // by the Browser and FrontendRender rows below (this used to call
+    // `browser_binary` -- a live `--headless ... --version` LAUNCH probe,
+    // `match` on it as the scrutinee so it ran even when the guard below it
+    // would refuse anyway -- separately, unconditionally, for BOTH rows).
+    // On a machine where that flag combination does not exit promptly (a
+    // real Chrome/Edge install can spend most of a minute tearing its own
+    // process tree back down rather than the sub-second the flags promise),
+    // `zirv workflow start`'s capability check measured ~15s of idle wall
+    // time here alone. `browser_present` is launch-free (an existence check
+    // only), so this row is now `unverified` rather than `available` --
+    // the identical "configured/present but not contacted this run" honesty
+    // already given a configured MCP server above, never claiming a launch
+    // that was never attempted actually works. The real capture path still
+    // resolves through `discover_browser`/a direct launch, so a present but
+    // broken browser is still caught the moment something tries to render.
+    let browser = if capabilities.browser.binary.is_some() {
+        browser_binary(&capabilities.browser)
+    } else {
+        crate::commands::workflow::frontend_render::browser_present()
+    };
+    rows.push(if !capabilities.enabled {
+        IntegrationStatus::unavailable(
             IntegrationId::Browser,
             "capabilities.enabled is false",
             "set capabilities.enabled in ~/.zirv/ctx.toml or ZIRV_CTX_CAPABILITIES",
-        ),
-        _ if !capabilities.browser.enabled => IntegrationStatus::unavailable(
+        )
+    } else if !capabilities.browser.enabled {
+        IntegrationStatus::unavailable(
             IntegrationId::Browser,
             "capabilities.browser.enabled is false",
             "set capabilities.browser.enabled = true",
-        ),
-        Some(binary) => IntegrationStatus::available(
-            IntegrationId::Browser,
-            format!("headless browser `{binary}`"),
-        ),
-        None => IntegrationStatus::unavailable(
-            IntegrationId::Browser,
-            "no Chromium-family browser was discovered",
-            "install chromium/google-chrome/microsoft-edge, or set `binary` under \
-             [capabilities.browser] in ~/.zirv/ctx.toml",
-        ),
+        )
+    } else {
+        match &browser {
+            Some(binary) => IntegrationStatus::unverified(
+                IntegrationId::Browser,
+                format!("headless browser `{binary}` (present; not launched this run)"),
+                "not launched this run; a real render or capture step will fail loudly if it cannot actually launch headless",
+            ),
+            None => IntegrationStatus::unavailable(
+                IntegrationId::Browser,
+                "no Chromium-family browser was discovered",
+                "install chromium/google-chrome/microsoft-edge, or set `binary` under \
+                 [capabilities.browser] in ~/.zirv/ctx.toml",
+            ),
+        }
     });
 
     let diagnostics = diagnostics_report(repo);
@@ -838,10 +864,11 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         IntegrationId::ArtifactRender,
         "zirv artifact registry and static renderer",
     ));
-    rows.push(match browser_binary(&capabilities.browser) {
-        Some(binary) => IntegrationStatus::available(
+    rows.push(match &browser {
+        Some(binary) => IntegrationStatus::unverified(
             IntegrationId::FrontendRender,
-            format!("frontend render and capture via `{binary}`"),
+            format!("frontend render and capture via `{binary}` (present; not launched this run)"),
+            "not launched this run; a real render or capture step will fail loudly if it cannot actually launch headless",
         ),
         None => IntegrationStatus::unavailable(
             IntegrationId::FrontendRender,

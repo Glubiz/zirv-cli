@@ -1238,6 +1238,26 @@ fn rollover_eval_due(
     })
 }
 
+/// Issue #780: [`rollover_eval_due`], but also advances `*last` whenever the
+/// cadence comes due -- regardless of whether the caller goes on to find the
+/// switch disabled. Without this, a disabled `fallback.auto_orchestrator_
+/// rollover` would leave `*last` stale forever, so this cheap check alone
+/// would keep reporting "due" on every subsequent tick and the caller's
+/// `auto_rollover.is_enabled()` (two `stat`s) would run every tick again --
+/// exactly the syscall storm this issue is about avoiding.
+fn rollover_eval_due_advancing(
+    last: &mut Option<Instant>,
+    now: Instant,
+    cfg: &CtxConfig,
+    reactive_pending: bool,
+) -> bool {
+    let due = rollover_eval_due(*last, now, cfg, reactive_pending);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
 /// Whether this session was launched interactively, read back from the
 /// durable launch-mode pin its own `turn_env` carries -- the same derivation
 /// `dash::pane::Pane::spawn` makes from the identical vector, rather than a
@@ -2105,6 +2125,7 @@ pub fn run_with(
             adapter.as_ref(),
             rest,
             launch_mode_from_interactive(interactive_launch),
+            role,
         )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
@@ -2659,6 +2680,7 @@ pub fn run_with(
         debounce,
         inject_timeout,
         repo,
+        env,
         cfg.handoff.tail_items,
         &mut distiller_model,
         Duration::from_secs(cfg.handoff.timeout_secs),
@@ -3331,7 +3353,8 @@ fn perform_handover_swap(
     // `relaunch` below always hands the successor the handoff packet as its
     // initial prompt, so this launch can only resume a conversation on a
     // harness that accepts both.
-    let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req, true)?;
+    let (new_adapter, new_extra_flags) =
+        super::handover::resolve_swap_launch(cfg, req, true, role)?;
     // Finding #10 (issue #358 review): the successor must carry a fencing
     // generation of its own. `req.generation` is the PREPARED generation an
     // automatic swap's `seat::commit` is about to promote to `Seat::
@@ -3467,6 +3490,9 @@ fn pump(
     debounce: Duration,
     inject_timeout: Duration,
     repo: &Path,
+    // Issue #780: needed for `LiveAutoRollover`'s own fresh, layered
+    // `CtxConfig::load` -- see the seat-rollover-enabled gate below.
+    env: EnvLookup<'_>,
     tail_items: usize,
     // T84: `&mut String`, not `&str` -- a handover swap recomputes this for
     // the new adapter's own distiller default, so a rot-triggered restart
@@ -3518,8 +3544,20 @@ fn pump(
         .and_then(|seat| seat.pending)
         .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
     let mut pending_rollover: Option<PendingRollover> = None;
-    let seat_rollover_enabled =
-        cfg.auto_orchestrator_rollover() && role == PromptRole::Orchestrator;
+    let is_orchestrator = role == PromptRole::Orchestrator;
+    // Issue #780: `cfg` above is loaded once at this session's launch and
+    // held for the whole (potentially very long) wrapped session, so a gate
+    // reading `cfg.auto_orchestrator_rollover()` never sees a later `zirv ctx
+    // config set fallback.auto_orchestrator_rollover false` -- see
+    // `rollover::LiveAutoRollover`'s own doc comment. Seeded from `cfg`'s own
+    // value so the very first tick (before either `ctx.toml` could possibly
+    // have changed) matches what launch already decided. The readiness watch
+    // for an already-open transaction (below, gated only on `pending_rollover
+    // .is_some()`) is deliberately NOT behind this switch either -- a live
+    // disable must stop a NEW rollover from being prepared, but a
+    // transaction already open must still reach commit or abort.
+    let mut auto_rollover =
+        super::rollover::LiveAutoRollover::new(repo, env, cfg.auto_orchestrator_rollover());
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -3690,27 +3728,50 @@ fn pump(
                 reactive_pending = false;
                 Some(req)
             }
-            None if seat_rollover_enabled
-                && pending_rollover.is_none()
-                && rollover_eval_due(last_rollover_eval, now, cfg, reactive_pending) =>
-            {
-                last_rollover_eval = Some(now);
-                let request = automatic_rollover_request(
-                    state_dir,
+            // Issue #780: `pending_rollover.is_none()` and `is_orchestrator`
+            // come first so nothing below runs when there is nothing to
+            // prepare or this is not the orchestrator seat at all. The
+            // cadence check (`rollover_eval_due`, a cheap `Instant`
+            // comparison) runs BEFORE `auto_rollover.is_enabled()` (two
+            // `stat`s), so the live reload only ever costs a syscall once
+            // per interval, not on every tick. `last_rollover_eval` advances
+            // whenever the cadence comes due, whether or not the switch is
+            // enabled: otherwise a disabled switch would leave `due()`
+            // permanently true and `is_enabled()` would run every tick again
+            // anyway. `auto_rollover.is_enabled()` re-derives the switch from
+            // a fresh layered load rather than this session's stale start-up
+            // `cfg`, so a live operator disable takes effect on the very next
+            // check -- no restart required. A failed reload never enables it
+            // (see `LiveAutoRollover`'s own doc comment), and a disable
+            // always wins over an eval that came due.
+            None if pending_rollover.is_none() && is_orchestrator => {
+                let eval_due = rollover_eval_due_advancing(
+                    &mut last_rollover_eval,
+                    now,
                     cfg,
-                    session.as_str(),
-                    &seat_short,
-                    adapter.provider_for_model(seat_model_from_turn_env(turn_env)),
-                    supervision,
-                    debounce,
-                    interactive_from_turn_env(turn_env),
+                    reactive_pending,
                 );
-                reactive_pending = super::seat::load(state_dir, &seat_short)
-                    .and_then(|seat| seat.pending)
-                    .is_some_and(|pending| {
-                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
-                    });
-                request
+                if eval_due && auto_rollover.is_enabled() {
+                    let live_cfg = auto_rollover.patched(cfg);
+                    let request = automatic_rollover_request(
+                        state_dir,
+                        &live_cfg,
+                        session.as_str(),
+                        &seat_short,
+                        adapter.provider_for_model(seat_model_from_turn_env(turn_env)),
+                        supervision,
+                        debounce,
+                        interactive_from_turn_env(turn_env),
+                    );
+                    reactive_pending = super::seat::load(state_dir, &seat_short)
+                        .and_then(|seat| seat.pending)
+                        .is_some_and(|pending| {
+                            matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                        });
+                    request
+                } else {
+                    None
+                }
             }
             None => None,
         };
@@ -4793,6 +4854,44 @@ mod tests {
             &cfg,
             false
         ));
+    }
+
+    #[test]
+    fn rollover_eval_due_advancing_advances_last_only_when_due_regardless_of_what_the_caller_does_next()
+     {
+        // Issue #780: a disabled `auto_orchestrator_rollover` must not leave
+        // `last` stale -- otherwise the cheap cadence check alone keeps
+        // reporting "due" every tick, forcing the caller's expensive
+        // `is_enabled()` (two `stat`s) to run every tick too.
+        let mut cfg = CtxConfig::default();
+        cfg.pace.collector_max_age_secs = 900;
+        let start = Instant::now();
+        let mut last = Some(start);
+
+        // Not yet due: no advance.
+        assert!(!rollover_eval_due_advancing(
+            &mut last,
+            start + Duration::from_secs(59),
+            &cfg,
+            true
+        ));
+        assert_eq!(last, Some(start));
+
+        // Due: advances, whether or not the caller ends up finding the
+        // switch disabled.
+        let tick = start + Duration::from_secs(60);
+        assert!(rollover_eval_due_advancing(&mut last, tick, &cfg, true));
+        assert_eq!(last, Some(tick));
+
+        // Immediately after, the cadence is not due again -- `is_enabled()`
+        // is not called again on the very next tick.
+        assert!(!rollover_eval_due_advancing(
+            &mut last,
+            tick + Duration::from_millis(100),
+            &cfg,
+            true
+        ));
+        assert_eq!(last, Some(tick));
     }
 
     #[test]

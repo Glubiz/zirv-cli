@@ -1507,7 +1507,7 @@ mod tests {
                 case.name
             );
             let expected_seat_tier = match decision.execution {
-                ExecutionMode::Direct => decision::SeatTier::Cheap,
+                ExecutionMode::Direct => decision::SeatTier::Standard,
                 ExecutionMode::Bounded => decision::SeatTier::Standard,
                 ExecutionMode::Orchestrated => {
                     if decision.complexity == Complexity::Architectural

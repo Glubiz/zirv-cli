@@ -51,32 +51,65 @@ pub fn spawn(mut command: Command) -> CtxResult<Child> {
         .spawn()?)
 }
 
-/// Polls the child, calling `on_tick` at every interval. Stops on child exit,
-/// on the deadline, or when a tick asks to stop; in the last two cases it
-/// terminates the Unix process group or the Windows process tree rooted
-/// at the child: a shim launch (`cmd.exe /c
+/// The exit-check granularity: how often `child.try_wait()` is polled,
+/// independent of `poll` (which paces `on_tick`'s own cadence -- scoring and
+/// transcript reads are not free, so it must not run more often than the
+/// caller asked). Before this constant existed, the loop below checked
+/// `try_wait` once, then slept the WHOLE `poll` duration before checking
+/// again -- so a child that exits almost immediately (the common case: a
+/// clean, fast headless turn) still paid the full `poll` window, by default
+/// 2s (`SuperviseConfig::poll_ms`), as pure dead time between its own exit
+/// and this function noticing it. Bounded loose enough to keep CPU use
+/// negligible, tight enough that a clean exit is never mistaken for a
+/// multi-second hang.
+const EXIT_CHECK_GRANULARITY: Duration = Duration::from_millis(20);
+
+/// Polls the child, calling `on_tick` at every `poll` interval. Stops on
+/// child exit, on the deadline, or when a tick asks to stop; in the last two
+/// cases it terminates the Unix process group or the Windows process tree
+/// rooted at the child: a shim launch (`cmd.exe /c
 /// claude.cmd`) runs the real agent as a `node` grandchild, and killing only
 /// cmd.exe would leave that grandchild alive to run alongside a freshly
 /// spawned replacement -- two live sessions on one repo. See `terminate`.
+///
+/// `child.try_wait()` is polled at [`EXIT_CHECK_GRANULARITY`], not `poll`,
+/// specifically so a clean, fast exit returns promptly instead of waiting out
+/// the rest of `poll` (see that constant's own doc comment); `on_tick` itself
+/// still fires on exactly the same cadence as before -- immediately on the
+/// first iteration, then every `poll` thereafter.
 pub fn supervise_child(
     child: &mut Child,
     deadline: Instant,
     poll: Duration,
     on_tick: &mut dyn FnMut() -> Tick,
 ) -> CtxResult<Outcome> {
+    // Due now, not `+ poll`: the very first iteration must still fire
+    // `on_tick` immediately, exactly like the pre-fix loop's own first pass
+    // (`try_wait` -> deadline -> `on_tick` -> sleep, in that order, with no
+    // wait ahead of that first tick).
+    let mut next_tick = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Outcome::Exited(status.code().unwrap_or(1)));
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             terminate(child, Duration::from_secs(5))?;
             return Ok(Outcome::TimedOut);
         }
-        if let Tick::Stop(reason) = on_tick() {
-            terminate(child, Duration::from_secs(5))?;
-            return Ok(Outcome::StoppedByTick(reason));
+        if now >= next_tick {
+            if let Tick::Stop(reason) = on_tick() {
+                terminate(child, Duration::from_secs(5))?;
+                return Ok(Outcome::StoppedByTick(reason));
+            }
+            // Measured after `on_tick` returns: a slow tick must still be
+            // followed by a full `poll` gap, never an immediate re-fire.
+            next_tick = Instant::now() + poll;
         }
-        std::thread::sleep(poll);
+        let now = Instant::now();
+        let until_tick = next_tick.saturating_duration_since(now);
+        let until_deadline = deadline.saturating_duration_since(now);
+        std::thread::sleep(EXIT_CHECK_GRANULARITY.min(until_tick).min(until_deadline));
     }
 }
 
@@ -1062,6 +1095,32 @@ mod tests {
         assert!(
             ticks >= 3,
             "expected several ticks before exit, got {ticks}"
+        );
+    }
+
+    /// Round 4B: before `EXIT_CHECK_GRANULARITY` existed, `try_wait` was
+    /// checked once, then the WHOLE `poll` duration was slept before checking
+    /// again -- so a child that exits almost immediately (the common case)
+    /// still paid the full `poll` window as pure dead time. `poll` here
+    /// mirrors the production default (`SuperviseConfig::poll_ms`, 2s) so the
+    /// bug this closes would make this test itself take on that order,
+    /// failing the loose bound below by a wide margin.
+    #[test]
+    fn a_fast_clean_exit_is_noticed_well_under_the_poll_interval() {
+        let mut child = spawn(sh("exit 0")).expect("spawn");
+        let started = Instant::now();
+        let outcome = supervise_child(
+            &mut child,
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(2),
+            &mut || Tick::Continue,
+        )
+        .expect("supervise");
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a clean exit must not pay the whole poll window as dead time: {:?}",
+            started.elapsed()
         );
     }
 
