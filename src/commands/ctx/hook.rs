@@ -460,7 +460,27 @@ fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
 /// observation landing between check and act cannot be clobbered.
 /// Best-effort like every other attention write in this file: a failure to
 /// read or persist never affects the calling hook's own exit code.
+///
+/// Perf: this runs on EVERY `PreToolUse`/`PostToolUse`/
+/// `PermissionRequest`/`PermissionDenied` hook invocation -- the single
+/// hottest call in the hook fleet, since it fires several times per turn
+/// where every other per-turn hook fires once. `record_if` already skips its
+/// own write once `applies` reads false under the lock, but still pays for
+/// the lock file's open-and-lock round trip to reach that check. An
+/// `Approval` latch is the rare case (a permission prompt is not pending for
+/// most tool calls), so a plain unlocked [`super::attention::load`] first
+/// avoids that lock entirely on the common path; only a read that might
+/// actually need clearing falls through to the locked, race-safe
+/// `record_if`, which re-reads and re-checks under the lock exactly as
+/// before -- this pre-check changes nothing about what gets persisted, only
+/// how often the lock is taken to find out there is nothing to do. A stale
+/// or missed read here can only ever skip a clear it would have skipped
+/// anyway on the next call (this hook always runs again), the same
+/// best-effort tolerance `record_if`'s own doc comment already states.
 fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
+    if super::attention::load(state, short).attention != super::attention::Attention::Approval {
+        return;
+    }
     let _ = super::attention::record_if(
         state,
         short,
@@ -10705,6 +10725,56 @@ mod tests {
             super::super::attention::load(&state, &short).attention,
             super::super::attention::Attention::WriterConflict,
             "a posttool must never clear an attention it did not itself raise"
+        );
+    }
+
+    /// Perf: the fast unlocked pre-check in
+    /// `clear_resolved_approval` must skip `record_if`'s lock entirely when
+    /// there is no `Approval` latch to clear at all -- the common case on
+    /// every `PreToolUse`/`PostToolUse` call. Proven directly: a session with
+    /// no attention recorded yet (so nothing under `state.attention()` exists
+    /// for its short id) gets a plain `PostToolUse` hook call, and neither
+    /// the status file nor the lock file `record_if`'s own `lock_status`
+    /// would otherwise create is ever written.
+    #[test]
+    fn posttool_never_touches_the_attention_lock_when_nothing_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        // Nothing recorded yet: `state.attention()` may not even exist.
+        assert!(
+            !state.attention().join(format!("{short}.json")).exists(),
+            "test setup: no status file should exist before the hook runs"
+        );
+        assert!(
+            !state.attention().join(format!("{short}.lock")).exists(),
+            "test setup: no lock file should exist before the hook runs"
+        );
+
+        let posttool_stdin = serde_json::json!({
+            "session_id": "abc123",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {"stdout": "hi", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo",
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &posttool_stdin, &lookup).expect("never errors");
+
+        assert!(
+            !state.attention().join(format!("{short}.lock")).exists(),
+            "the fast unlocked pre-check must skip record_if's lock entirely when there is \
+             nothing to clear"
+        );
+        assert!(
+            !state.attention().join(format!("{short}.json")).exists(),
+            "nothing to clear must never write a status file either"
         );
     }
 
