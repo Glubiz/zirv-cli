@@ -1768,10 +1768,27 @@ fn rust_change_touches_cfg_test(repo: &Path, path: &Path) -> bool {
 /// supervised run, so `stable_short` is keyed on, not the rotating
 /// `SESSION_ENV`/`payload.session_id` -- see [`missing_tests_gate_record_path`]'s
 /// own doc comment.
+///
+/// F6 residual (review round 2): `stable_short` is `short_id(&payload.
+/// session_id)` (`sessions::short_id`, ASCII-alphanumeric only) whenever no
+/// socket was ever bound -- an unsupervised/`--no-supervise` launch, or the
+/// codex `Notify` path -- and `short_id` degrades to the EMPTY string for a
+/// session id that is itself empty or carries no ASCII-alphanumeric
+/// character at all. Keying `missing_tests_gate_record_path` on that empty
+/// string would hash every such identity-less session onto the SAME record,
+/// letting one unrelated session's `blocked = true` silently suppress the
+/// gate for every other one. `raw_session_id` (`payload.session_id`,
+/// unfiltered -- `input_hash` hashes arbitrary UTF-8 bytes, not just ASCII)
+/// is the fallback key when `stable_short` is empty; when BOTH are empty
+/// there is no identity to key a shared, persisted record on at all, so the
+/// gate is skipped outright -- never blocks, never reads or writes a record
+/// -- rather than risk a cross-session collision. Supervision must never
+/// worsen a session.
 fn missing_tests_gate_reason(
     state: &StateDir,
     repo: &Path,
     stable_short: &str,
+    raw_session_id: &str,
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Option<String> {
@@ -1781,7 +1798,14 @@ fn missing_tests_gate_reason(
     if env(adapters::HEADLESS_ENV).as_deref() != Some("1") {
         return None;
     }
-    let path = missing_tests_gate_record_path(state, stable_short);
+    let gate_key = if !stable_short.is_empty() {
+        stable_short
+    } else if !raw_session_id.is_empty() {
+        raw_session_id
+    } else {
+        return None;
+    };
+    let path = missing_tests_gate_record_path(state, gate_key);
     if load_missing_tests_gate_record(&path).blocked {
         return None;
     }
@@ -2220,7 +2244,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
         stop_verify_block = stop_verify_reason(&state, &cfg, verify_nudge.is_some(), transcript);
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
-        missing_tests_gate = missing_tests_gate_reason(&state, &repo, &stable_short, &cfg, env);
+        missing_tests_gate =
+            missing_tests_gate_reason(&state, &repo, &stable_short, &payload.session_id, &cfg, env);
         // Issue #312: independent of the rot `Verdict` ladder above -- a
         // cost-driven tier of its own, gated on stale tool-result tokens and
         // window fraction, never on `score.verdict`.
@@ -13148,10 +13173,11 @@ capable a model does it actually need?",
         let env: std::collections::HashMap<String, String> =
             [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
 
-        let reason = missing_tests_gate_reason(&state, repo.path(), "sess-q1-a", &cfg, &|k| {
-            env.get(k).cloned()
-        })
-        .expect("non-test source change with no test change must block");
+        let reason =
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-a", "sess-q1-a", &cfg, &|k| {
+                env.get(k).cloned()
+            })
+            .expect("non-test source change with no test change must block");
         assert!(reason.contains("test"), "{reason}");
     }
 
@@ -13170,7 +13196,7 @@ capable a model does it actually need?",
             [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
 
         assert_eq!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-b", &cfg, &|k| {
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-b", "sess-q1-b", &cfg, &|k| {
                 env.get(k).cloned()
             }),
             None,
@@ -13192,11 +13218,12 @@ capable a model does it actually need?",
         let lookup = |k: &str| env.get(k).cloned();
 
         assert!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", &cfg, &lookup).is_some(),
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", "sess-q1-c", &cfg, &lookup)
+                .is_some(),
             "first stop with missing tests must block"
         );
         assert_eq!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", &cfg, &lookup),
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", "sess-q1-c", &cfg, &lookup),
             None,
             "a second stop in the same session must never block again"
         );
@@ -13213,9 +13240,71 @@ capable a model does it actually need?",
         let cfg = CtxConfig::default();
 
         assert_eq!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-d", &cfg, &|_| None),
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-d", "sess-q1-d", &cfg, &|_| {
+                None
+            }),
             None,
             "an interactive session (no ZIRV_CTX_HEADLESS=1) must never block"
+        );
+    }
+
+    /// F6 residual (review round 2): with NEITHER `stable_short` nor the raw
+    /// session id carrying any identity (both empty -- an unsupervised
+    /// launch whose session id is itself empty or has no ASCII-alphanumeric
+    /// character at all), the gate must skip entirely: never block, and
+    /// never persist a record at the shared empty-string hash -- otherwise
+    /// one such identity-less session's block would silently suppress the
+    /// gate for every other one.
+    #[test]
+    fn missing_tests_gate_skips_entirely_with_no_identity_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "", "", &cfg, &|k| {
+                env.get(k).cloned()
+            }),
+            None,
+            "no identity at all must never block"
+        );
+        let collision_path = missing_tests_gate_record_path(&state, "");
+        assert!(
+            !collision_path.exists(),
+            "a no-identity session must never persist a record at the shared empty-key path"
+        );
+    }
+
+    /// F6 residual (review round 2): when `stable_short` is empty (no
+    /// socket bound and the rotating session id filtered to nothing) but the
+    /// raw session id is non-empty, the gate keys on the raw id instead of
+    /// collapsing every such session onto the shared empty-string record --
+    /// two different raw ids get two independent records, neither inheriting
+    /// the other's block.
+    #[test]
+    fn missing_tests_gate_falls_back_to_the_raw_session_id_when_stable_short_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        assert!(
+            missing_tests_gate_reason(&state, repo.path(), "", "raw-session-one", &cfg, &lookup)
+                .is_some(),
+            "the raw session id must still key a real, blockable identity"
+        );
+        assert!(
+            missing_tests_gate_reason(&state, repo.path(), "", "raw-session-two", &cfg, &lookup)
+                .is_some(),
+            "an unrelated raw session id must not inherit another session's own block"
         );
     }
 
@@ -13233,7 +13322,7 @@ capable a model does it actually need?",
             [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
 
         assert_eq!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-e", &cfg, &|k| {
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-e", "sess-q1-e", &cfg, &|k| {
                 env.get(k).cloned()
             }),
             None
@@ -13253,7 +13342,7 @@ capable a model does it actually need?",
             [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
 
         assert_eq!(
-            missing_tests_gate_reason(&state, repo.path(), "sess-q1-f", &cfg, &|k| {
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-f", "sess-q1-f", &cfg, &|k| {
                 env.get(k).cloned()
             }),
             None

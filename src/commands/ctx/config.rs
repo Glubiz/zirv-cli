@@ -2064,8 +2064,13 @@ impl Default for JevConfig {
 pub struct HeadlessEffortConfig {
     pub trivial: Option<String>,
     pub bounded: Option<String>,
+    /// Also what a request classifying `Complexity::Architectural` reads:
+    /// the deterministic classifier this table's own caller uses
+    /// (`proxy::decision::try_classify_request`) is TEXT-ONLY (no paths/
+    /// changed lines), and `infer_complexity`/the request-size floor it
+    /// folds in can never return `Architectural` from text alone -- so
+    /// there is no separate `architectural` key to configure.
     pub substantial: Option<String>,
-    pub architectural: Option<String>,
 }
 
 /// Issue #788: `[headless]` itself -- see [`HeadlessEffortConfig`]'s own doc
@@ -4228,11 +4233,6 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
-        "ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL",
-        &["headless", "effort", "architectural"],
-        EnvKind::Str,
-    ),
-    (
         "ZIRV_CTX_HEADLESS_LEAN",
         &["headless", "lean"],
         EnvKind::Bool,
@@ -5616,10 +5616,6 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["headless", "effort", "substantial"],
         "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
-    ),
-    (
-        &["headless", "effort", "architectural"],
-        "ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL",
     ),
     (&["headless", "lean"], "ZIRV_CTX_HEADLESS_LEAN"),
     (
@@ -7304,10 +7300,6 @@ impl CtxConfig {
             (
                 "headless.effort.substantial",
                 &cfg.headless.effort.substantial,
-            ),
-            (
-                "headless.effort.architectural",
-                &cfg.headless.effort.architectural,
             ),
         ] {
             if let Some(level) = effort.as_deref()
@@ -9137,10 +9129,6 @@ mod tests {
                 "[headless.effort]\nsubstantial = \"high\"\n",
                 "effort.substantial",
             ),
-            (
-                "[headless.effort]\narchitectural = \"max\"\n",
-                "effort.architectural",
-            ),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -9168,7 +9156,6 @@ mod tests {
             ("ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "low"),
             ("ZIRV_CTX_HEADLESS_EFFORT_BOUNDED", "medium"),
             ("ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL", "high"),
-            ("ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL", "max"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
@@ -9184,7 +9171,6 @@ mod tests {
         assert_eq!(cfg.headless.effort.trivial.as_deref(), Some("low"));
         assert_eq!(cfg.headless.effort.bounded.as_deref(), Some("medium"));
         assert_eq!(cfg.headless.effort.substantial.as_deref(), Some("high"));
-        assert_eq!(cfg.headless.effort.architectural.as_deref(), Some("max"));
     }
 
     /// `headless.prompt_cache_ttl` and `headless.effort.*` are constrained to

@@ -1381,7 +1381,21 @@ impl ClaudeAdapter {
         let fingerprint = super::super::safety::policy_fingerprint(safety).ok()?;
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
-        let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
+        // Issue #788 review finding L1: `fingerprint` is hashed from
+        // `SafetyPolicy` alone, so a `lean` and a non-`lean` launch under the
+        // identical safety policy used to collide on the SAME settings file
+        // (`claude-launch-settings-{fingerprint}.json`) while writing
+        // DIFFERENT content -- a concurrent headless-lean worker and an
+        // interactive dash pane under the same policy raced that one path,
+        // and the interactive session could start with the lean settings.
+        // The `-lean` suffix folds the lever into the file name itself, so
+        // the two contents never share a path; `lean == false` keeps the
+        // pre-#788 name byte-identical.
+        let path = if lean {
+            dir.join(format!("claude-launch-settings-{fingerprint}-lean.json"))
+        } else {
+            dir.join(format!("claude-launch-settings-{fingerprint}.json"))
+        };
         let mut launch_environment = LaunchEnvironment::resolve();
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
         launch_environment.lean = lean;
@@ -5389,6 +5403,63 @@ mod tests {
         )
         .expect("valid policy JSON");
         assert_eq!(snapshotted, policy);
+    }
+
+    /// Issue #788 review finding L1: `lean` and non-`lean` launches under the
+    /// IDENTICAL safety policy must never materialize to the same settings
+    /// path -- their JSON bodies differ (`autoMemoryEnabled`/
+    /// `disableBundledSkills`), so sharing a path lets one overwrite the
+    /// other and lets an unrelated interactive launch start from a headless
+    /// worker's lean settings, or vice versa. With `lean == false` the path
+    /// must stay byte-identical to the pre-#788 name (pinned by
+    /// `launch_settings_are_materialized_atomically_under_the_zirv_home`
+    /// right above).
+    #[test]
+    fn lean_and_non_lean_launches_never_share_a_settings_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("state");
+        let _state = super::super::super::testenv::VarGuard::set(&[(
+            super::super::super::state::STATE_ENV,
+            Some(state.path().to_str().expect("utf8 state path")),
+        )]);
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings();
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let fingerprint =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
+
+        let lean_path = adapter
+            .launch_settings_path(&Default::default(), &policy, true)
+            .expect("lean settings materialized");
+        let plain_path = adapter
+            .launch_settings_path(&Default::default(), &policy, false)
+            .expect("non-lean settings materialized");
+
+        assert_ne!(
+            lean_path, plain_path,
+            "a lean and a non-lean launch under the same policy must never share a path"
+        );
+        assert_eq!(
+            plain_path,
+            home.path()
+                .join(".zirv")
+                .join("runtime")
+                .join(format!("claude-launch-settings-{fingerprint}.json")),
+            "lean == false must keep the pre-#788 file name byte-identical"
+        );
+
+        let lean_written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&lean_path).expect("read lean settings"))
+                .expect("valid settings JSON");
+        let plain_written: Value = serde_json::from_str(
+            &std::fs::read_to_string(&plain_path).expect("read non-lean settings"),
+        )
+        .expect("valid settings JSON");
+        assert_eq!(lean_written["autoMemoryEnabled"], false);
+        assert_eq!(lean_written["disableBundledSkills"], true);
+        assert!(plain_written["autoMemoryEnabled"].is_null());
+        assert!(plain_written["disableBundledSkills"].is_null());
     }
 
     /// If the private settings file cannot be materialized, the projection

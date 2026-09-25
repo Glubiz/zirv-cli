@@ -884,14 +884,27 @@ fn apply_headless_cost_levers(
     let Some(classification) = super::proxy::decision::try_classify_request(prompt) else {
         return;
     };
-    let effort = match classification.complexity {
-        Complexity::Trivial => headless.effort.trivial.as_deref(),
-        Complexity::Bounded => headless.effort.bounded.as_deref(),
-        Complexity::Substantial => headless.effort.substantial.as_deref(),
-        Complexity::Architectural => headless.effort.architectural.as_deref(),
-    };
-    if let Some(effort) = effort {
+    if let Some(effort) = headless_effort_for(&headless.effort, classification.complexity) {
         command.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    }
+}
+
+/// The configured `CLAUDE_CODE_EFFORT_LEVEL` for a classified `complexity`,
+/// or `None` when that class has no configured value. `Complexity::
+/// Architectural` reads the SAME `substantial` value: `try_classify_request`
+/// (the only caller that ever produces a `Classification` here) is
+/// text-only, and `infer_complexity`/its own request-size floor can never
+/// return `Architectural` from text alone, so there is no separate
+/// `headless.effort.architectural` key -- this arm exists only so the match
+/// stays exhaustive against a future caller that does pass real diff data.
+fn headless_effort_for(
+    effort: &super::config::HeadlessEffortConfig,
+    complexity: Complexity,
+) -> Option<&str> {
+    match complexity {
+        Complexity::Trivial => effort.trivial.as_deref(),
+        Complexity::Bounded => effort.bounded.as_deref(),
+        Complexity::Substantial | Complexity::Architectural => effort.substantial.as_deref(),
     }
 }
 
@@ -4830,6 +4843,27 @@ mod tests {
             command.get_envs().count(),
             0,
             "a 150-word request floors to Bounded, which has no configured effort"
+        );
+    }
+
+    /// Issue #788 review finding L3: the text-only classifier
+    /// (`try_classify_request`) can never produce `Complexity::
+    /// Architectural`, so there is no separate `headless.effort.
+    /// architectural` key -- `Architectural` reads the SAME `substantial`
+    /// value instead of silently doing nothing.
+    #[test]
+    fn headless_effort_for_maps_architectural_to_the_substantial_value() {
+        let effort = crate::commands::ctx::config::HeadlessEffortConfig {
+            substantial: Some("high".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            headless_effort_for(&effort, Complexity::Architectural),
+            Some("high")
+        );
+        assert_eq!(
+            headless_effort_for(&effort, Complexity::Substantial),
+            Some("high")
         );
     }
 

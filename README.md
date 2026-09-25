@@ -4220,8 +4220,7 @@ disallowed_tools = []            # extra tool names appended to the launch's --d
 [headless.effort]
 trivial = "low"                  # low | medium | high | xhigh | max, unset by default; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
 bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
-substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL
-# architectural unset: Claude Code's own default effort; ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL
+substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also what an Architectural-complexity request reads; see below
 ```
 
 `prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
@@ -4235,7 +4234,7 @@ session, where a human is present, is untouched. With every key unset (the
 shipped default) a headless launch is byte-identical to one built before
 this table existed.
 
-The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
+The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
 
 #### Tool-output compaction
 
@@ -4565,7 +4564,6 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `headless.effort.trivial` | `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL` |
 | `headless.effort.bounded` | `ZIRV_CTX_HEADLESS_EFFORT_BOUNDED` |
 | `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
-| `headless.effort.architectural` | `ZIRV_CTX_HEADLESS_EFFORT_ARCHITECTURAL` |
 | `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
 | `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
