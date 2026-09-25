@@ -351,6 +351,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             .iter()
             .map(|(path, msg)| {
                 super::mail::message_with_delivery_envelope(
+                    &cfg,
                     &state,
                     path,
                     msg,

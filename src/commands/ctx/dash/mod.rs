@@ -6605,6 +6605,7 @@ fn compose_worker_prompt(
         .iter()
         .map(|(path, message)| {
             mail::message_with_delivery_envelope(
+                cfg,
                 state,
                 path,
                 message,
@@ -10146,7 +10147,8 @@ fn log_mail_attention_event(
 /// uses.
 /// `screen_thresholds` (issue #272 review round 1) is the caller's own
 /// resolved `[screen]` config, threaded straight through to
-/// `mail::message_with_delivery_envelope` below.
+/// `mail::message_with_delivery_envelope` below, alongside `cfg` itself
+/// (issue #784, that same function's own `[jev] inject_screen` call).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_one_pane<I: Injector>(
     injector: &mut I,
@@ -10155,6 +10157,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
     // takes as `session_id`, matching `report_back_reminder_sweep`'s own
     // `Decision::session` convention.
     session_id: &str,
+    cfg: &CtxConfig,
     state: &StateDir,
     slug: &str,
     agent: &str,
@@ -10207,8 +10210,14 @@ pub(crate) fn sweep_one_pane<I: Injector>(
     // D5: label and body share one budget. The label carries the sender's own
     // `from_agent`, which is untrusted and unbounded, so capping only the body
     // left the injection as a whole uncapped.
-    let delivered =
-        mail::message_with_delivery_envelope(state, &path, &msg, parent_short, screen_thresholds);
+    let delivered = mail::message_with_delivery_envelope(
+        cfg,
+        state,
+        &path,
+        &msg,
+        parent_short,
+        screen_thresholds,
+    );
     let (label, body) = pane::capped_injection(
         &mail_injection_label(&msg.from_agent, &msg.from_session, is_parent),
         &delivered.body,
@@ -10434,6 +10443,7 @@ fn mail_sweep(
             sweep_one_pane(
                 pane,
                 &session_id,
+                cfg,
                 state,
                 &slug,
                 &agent,
@@ -20725,6 +20735,7 @@ mod tests {
         let delivered = sweep_one_pane(
             &mut injector,
             "session-a",
+            &cfg,
             &state,
             slug,
             "claude",
@@ -20784,6 +20795,7 @@ mod tests {
         let delivered = sweep_one_pane(
             &mut injector,
             "session-a",
+            &cfg,
             &state,
             slug,
             "claude",
@@ -20812,11 +20824,13 @@ mod tests {
     fn a_sweep_of_an_empty_mailbox_delivers_nothing_and_reports_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
         let mut injector = SucceedingInjector { calls: Vec::new() };
         let mut errors = ErrorLog::default();
         assert!(!sweep_one_pane(
             &mut injector,
             "session-a",
+            &cfg,
             &state,
             "-work-repo",
             "claude",
@@ -20857,6 +20871,7 @@ mod tests {
         assert!(!sweep_one_pane(
             &mut FailingInjector,
             "session-a",
+            &cfg,
             &state,
             slug,
             "claude",
@@ -26716,6 +26731,7 @@ mod tests {
         assert!(sweep_one_pane(
             &mut injector,
             "session-a",
+            &cfg,
             &state,
             slug,
             "claude",
@@ -26775,6 +26791,7 @@ mod tests {
         assert!(sweep_one_pane(
             &mut injector,
             "session-a",
+            &cfg,
             &state,
             slug,
             "claude",

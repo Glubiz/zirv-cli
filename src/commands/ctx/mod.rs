@@ -43,6 +43,8 @@ pub mod helper;
 pub mod hook;
 pub(crate) mod hook_integrity;
 pub(crate) mod hook_project;
+pub(crate) mod inject_gate;
+pub mod inject_screen;
 pub mod jev;
 pub mod judge;
 pub mod learn;

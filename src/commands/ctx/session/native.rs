@@ -482,6 +482,7 @@ impl NativeSessions {
             super::super::dash::sweep_one_pane(
                 &mut injector,
                 &id,
+                cfg,
                 &self.state,
                 &slug,
                 RuntimeKind::Native.as_str(),

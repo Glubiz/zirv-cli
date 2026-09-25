@@ -1531,6 +1531,176 @@ fn verify_on_stop_nudge(
     ))
 }
 
+/// Issue #786: minimum `true` probability before `stop_verify` blocks a Stop.
+/// Basis: jev-belay reached 1% false blocks with the closing TEXT; facts-only
+/// state is untested, so the floor sits well above the default margin.
+const STOP_VERIFY_MIN_PROBABILITY: f64 = 0.9;
+
+/// How much of the transcript tail `stop_verify` parses for the closing turn.
+const STOP_VERIFY_TAIL_BYTES: u64 = 512 * 1024;
+
+const STOP_VERIFY_REASON: &str = "zirv: this turn edited files and presents the work as finished, \
+but nothing verified it since. Run the relevant tests or checks, then finish.";
+
+/// Completion claims in a closing message, matched lowercase, locally only.
+const COMPLETION_CLAIM_PHRASES: [&str; 10] = [
+    "done",
+    "complete",
+    "implemented",
+    "fixed",
+    "finished",
+    "resolved",
+    "all set",
+    "ready to",
+    "now works",
+    "is now",
+];
+
+/// "Tests pass"-style verification claims.
+const TEST_PASS_CLAIM_PHRASES: [&str; 8] = [
+    "tests pass",
+    "all tests",
+    "all green",
+    "passing",
+    "passes",
+    "verified",
+    "build succeeds",
+    "compiles",
+];
+
+/// Hedges that make a message NOT a finished-work claim.
+const HEDGE_PHRASES: [&str; 12] = [
+    "should ",
+    "might",
+    "may ",
+    "probably",
+    "likely",
+    "i think",
+    "not sure",
+    "untested",
+    "not tested",
+    "haven't",
+    "have not",
+    "unverified",
+];
+
+/// Local facts for the closing turn (events after the last human prompt):
+/// `[completion claims, hedges, test-pass claims, question marks, length
+/// bucket, edit calls, shell calls]`. `None` when the turn edited nothing or
+/// the closing message claims nothing -- neither can be a false "done".
+fn stop_verify_facts(events: &[NormalizedEvent]) -> Option<Vec<u32>> {
+    let start = events
+        .iter()
+        .rposition(|event| matches!(event, NormalizedEvent::TurnStart { .. }))
+        .map_or(0, |index| index + 1);
+    let turn = &events[start..];
+    let edits = adoption::signals(turn).edit_like_calls;
+    if edits == 0 {
+        return None;
+    }
+    let shell_calls = turn
+        .iter()
+        .filter(|event| {
+            matches!(event, NormalizedEvent::ToolCall { name, .. }
+                if ["bash", "powershell", "shell", "exec_command", "local_shell"]
+                    .iter()
+                    .any(|shell| name.eq_ignore_ascii_case(shell)))
+        })
+        .count();
+    let closing = turn.iter().rev().find_map(|event| match event {
+        NormalizedEvent::AssistantFinal { text, .. } if !text.trim().is_empty() => Some(text),
+        _ => None,
+    })?;
+    let lower = closing.to_lowercase();
+    let completion = count_keyword_class(&lower, &COMPLETION_CLAIM_PHRASES);
+    let test_claims = count_keyword_class(&lower, &TEST_PASS_CLAIM_PHRASES);
+    if completion == 0 && test_claims == 0 {
+        return None;
+    }
+    let length_bucket = match closing.len() {
+        0..200 => 0,
+        200..1000 => 1,
+        1000..4000 => 2,
+        _ => 3,
+    };
+    Some(vec![
+        completion,
+        count_keyword_class(&lower, &HEDGE_PHRASES),
+        test_claims,
+        capped_u32(closing.matches('?').count()),
+        length_bucket,
+        capped_u32(edits),
+        capped_u32(shell_calls),
+    ])
+}
+
+fn stop_verify_question() -> [super::jev::Question; 1] {
+    [super::jev::Question::metadata_noul(
+        "unverified_done",
+        "Facts [completion-claim phrases, hedge phrases, tests-pass-style claims, question marks, \
+length bucket (0 <200B, 1 <1KB, 2 <4KB, 3 larger), files-edit calls this turn, shell commands this \
+turn] describe an agent's closing message after a turn that edited files with no passing check \
+since. Does it present unverified work as finished? Answer false if unsure.",
+        "presents unverified work as finished",
+        "hedged, partial, or insufficient evidence",
+    )]
+}
+
+/// Issue #786 (`[jev] stop_verify`, facts-only stage): only when a check is
+/// owed (`verify_owed`, the verify-on-stop signal) and this turn edited files,
+/// asks one Noul from local counts of the closing message. A decisive `true`
+/// returns the block reason; anything else -- gate off, no credential, no
+/// claim, error, indecisive -- is `None` and the Stop proceeds as today.
+/// `stop_hook_active` is handled by `run_stop`'s own early return, so this
+/// can never block twice in a row.
+fn stop_verify_reason(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    verify_owed: bool,
+    transcript: &Path,
+) -> Option<&'static str> {
+    if !verify_owed || !cfg.jev.stop_verify || !super::jev::available(&cfg.proxy.typesafe) {
+        return None;
+    }
+    let adapter = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg).ok()?;
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let start = file
+        .metadata()
+        .ok()?
+        .len()
+        .saturating_sub(STOP_VERIFY_TAIL_BYTES);
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines = match start {
+        0 => &text[..],
+        _ => text.split_once('\n').map_or("", |(_, rest)| rest),
+    };
+    let facts = stop_verify_facts(&adapter.parse_events(lines))?;
+    let advise_state = DispatchAdviseState {
+        metadata_only: true,
+        facts: vec![facts],
+    };
+    let answers = super::jev::advise(
+        cfg,
+        state,
+        "stop_verify",
+        cfg.jev.stop_verify,
+        &advise_state,
+        &stop_verify_question(),
+    )?;
+    let answer = answers.get("unverified_done")?;
+    if !answer.decisive(0.0, super::jev::DEFAULT_MIN_MARGIN)
+        || answer.as_noul()? < STOP_VERIFY_MIN_PROBABILITY
+    {
+        return None;
+    }
+    let effect = super::jev::JevEffect::new("stop_verify", "stop_blocked");
+    super::jev::record_effect(cfg, state, cfg.jev.stop_verify, &effect);
+    Some(STOP_VERIFY_REASON)
+}
+
 /// Issue #308 stage 1: the Stop-hook wiring for `diagnostics::post_edit_nudge`
 /// -- `cfg.diagnostics.enabled` is checked here, BEFORE the transcript is
 /// re-read and re-parsed for `files_modified`, so a session with the feature
@@ -1618,6 +1788,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut verify_nudge = None;
     let mut diagnostics_nudge = None;
     let mut compact_advisory_nudge = None;
+    let mut rot_advisory_deferred = false;
+    let mut stop_verify_block = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -1746,6 +1918,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             adoption_stop_nudge(&state, &repo, &session, &cfg, &score, transcript, env);
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
+        stop_verify_block = stop_verify_reason(&state, &cfg, verify_nudge.is_some(), transcript);
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
         // Issue #312: independent of the rot `Verdict` ladder above -- a
         // cost-driven tier of its own, gated on stale tool-result tokens and
@@ -1760,6 +1933,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 adapter.as_ref(),
             );
         }
+        rot_advisory_deferred =
+            stop_rot_advisory_deferred(&state, &cfg, &stable_short, &score, socket.is_some());
     }
 
     // Issue #309 rides the same single advisory line `adoption_nudge`
@@ -1809,17 +1984,87 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     .collect::<Vec<_>>();
     let combined_nudge = (!combined_nudge.is_empty()).then(|| combined_nudge.join("\n"));
 
-    if let Some(line) = stop_output(
+    // Issue #785: a deferred rot advisory is dropped for this Stop only;
+    // every other nudge above still rides through `stop_output`.
+    let shown_score = shown_stop_score(&score, rot_advisory_deferred);
+    let line = stop_output(
         &payload,
-        &score,
+        &shown_score,
         socket.as_deref(),
         optimize_recommended,
         combined_nudge.as_deref(),
         cfg.score.same_error_threshold,
-    ) {
+    );
+    let line = match stop_verify_block {
+        Some(reason) => Some(with_stop_block(line.as_deref(), reason)),
+        None => line,
+    };
+    if let Some(line) = line {
         let _ = writeln!(w, "{line}");
     }
     Ok(0)
+}
+
+/// Issue #785: the score `stop_output` renders -- a deferred rot advisory is
+/// a healthy verdict for this Stop, so only the rot line drops.
+fn shown_stop_score(score: &Score, deferred: bool) -> std::borrow::Cow<'_, Score> {
+    if !deferred {
+        return std::borrow::Cow::Borrowed(score);
+    }
+    std::borrow::Cow::Owned(Score {
+        verdict: Verdict::Healthy,
+        ..score.clone()
+    })
+}
+
+/// Issue #786: adds a Stop block to whatever advisory `stop_output` already
+/// produced, so the block never suppresses it.
+fn with_stop_block(line: Option<&str>, reason: &str) -> String {
+    let mut object = line
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    object.insert("decision".to_string(), serde_json::json!("block"));
+    object.insert("reason".to_string(), serde_json::json!(reason));
+    serde_json::Value::Object(object).to_string()
+}
+
+/// Issue #785: whether the `[jev] inject` gate defers this Stop's rot
+/// advisory. Only asked when `stop_output` would print one at all
+/// (unsupervised, non-healthy); gate off is `false` with no work done.
+fn stop_rot_advisory_deferred(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    session_short: &str,
+    score: &Score,
+    supervised: bool,
+) -> bool {
+    use super::inject_gate::{self, Decision, InjectFacts, InjectKind};
+    if supervised || score.verdict == Verdict::Healthy || !inject_gate::enabled(cfg) {
+        return false;
+    }
+    let facts = InjectFacts {
+        context_pct: cfg
+            .score
+            .model_context_tokens
+            .filter(|window| *window > 0)
+            .map(|window| score.context_tokens.saturating_mul(100) / window),
+        rot_score: Some(score.score),
+        restart_at: cfg.score.restart_at,
+        turns_since_user_prompt: Some(0),
+        ..InjectFacts::default()
+    };
+    inject_gate::decide_persisted(
+        cfg,
+        state,
+        session_short,
+        InjectKind::StopAdvisory,
+        facts,
+        now_secs(),
+    ) == Decision::Defer
 }
 
 /// UserPromptSubmit is the only hook that can add context to the model, which
@@ -1850,19 +2095,21 @@ pub fn prompt_output(
     adoption_nudge: Option<&str>,
     repo: &Path,
     env: EnvLookup<'_>,
+    cfg: &CtxConfig,
 ) -> String {
     let mail = super::mail::session_identity(env)
         .and_then(|short| {
             let state = StateDir::resolve(env).ok()?;
-            super::mail::list(
+            let messages = super::mail::list(
                 &state,
                 &super::state::repo_slug(repo),
                 env(adapters::AGENT_ENV).as_deref(),
                 Some(&short),
             )
-            .ok()
+            .ok()?;
+            (!messages.is_empty() && !mail_note_deferred(&state, &short, &messages, cfg, env))
+                .then_some(messages)
         })
-        .filter(|messages| !messages.is_empty())
         .map(|messages| super::lifecycle::mail_note(messages.len()));
     // Issue #478: assembled by the shared prompt service, so a native session
     // injects the same notes in the same order with no hook in the picture.
@@ -1878,6 +2125,46 @@ pub fn prompt_output(
         }
     })
     .to_string()
+}
+
+/// Issue #785: whether the `[jev] inject` gate defers this prompt's mail
+/// note, using the hook's already-loaded `cfg`; gate off or no credential is
+/// `false` before any fact is computed.
+fn mail_note_deferred(
+    state: &StateDir,
+    short: &str,
+    messages: &[(PathBuf, super::mail::Message)],
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> bool {
+    use super::inject_gate::{self, Decision, InjectFacts, InjectKind};
+    if !inject_gate::enabled(cfg) {
+        return false;
+    }
+    let now = now_secs();
+    let parent = super::agent::parent_identity(env);
+    let facts = InjectFacts {
+        unread: Some(messages.len() as u64),
+        oldest_unread_age_secs: messages
+            .iter()
+            .map(|(_, message)| now.saturating_sub(message.sent))
+            .max(),
+        sender: messages
+            .iter()
+            .map(|(_, message)| {
+                inject_gate::sender_class(
+                    &message.from_agent,
+                    &super::sessions::short_id(&message.from_session),
+                    parent.as_deref(),
+                )
+            })
+            .max()
+            .unwrap_or_default(),
+        turns_since_user_prompt: Some(0),
+        ..InjectFacts::default()
+    };
+    inject_gate::decide_persisted(cfg, state, short, InjectKind::MailNote, facts, now)
+        == Decision::Defer
 }
 
 fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
@@ -1980,7 +2267,7 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
 ",
         )
     });
-    let output = prompt_output(&cfg.score.marker, extra.as_deref(), &repo, env);
+    let output = prompt_output(&cfg.score.marker, extra.as_deref(), &repo, env, &cfg);
     if !output.is_empty() {
         let _ = writeln!(w, "{output}");
     }
@@ -6850,7 +7137,9 @@ mod tests {
     /// second line.
     #[test]
     fn prompt_output_is_empty_when_no_context_is_available() {
-        assert!(prompt_output("", None, Path::new("."), &|_| None).is_empty());
+        assert!(
+            prompt_output("", None, Path::new("."), &|_| None, &CtxConfig::default()).is_empty()
+        );
     }
 
     #[test]
@@ -6863,7 +7152,10 @@ mod tests {
             adapters::AGENT_ENV => Some("claude".to_string()),
             _ => None,
         };
-        assert!(!prompt_output("[zirv]", None, tmp.path(), &env).contains("[zirv ▸ mail]"));
+        assert!(
+            !prompt_output("[zirv]", None, tmp.path(), &env, &CtxConfig::default())
+                .contains("[zirv ▸ mail]")
+        );
         let path = super::super::mail::store(
             &state,
             &super::super::state::repo_slug(tmp.path()),
@@ -6879,7 +7171,7 @@ mod tests {
         )
         .expect("store");
         for marker in ["", "[zirv]"] {
-            let out = prompt_output(marker, None, tmp.path(), &env);
+            let out = prompt_output(marker, None, tmp.path(), &env, &CtxConfig::default());
             assert!(
                 out.contains("[zirv ▸ mail] 1 unread -- run zirv ctx inbox"),
                 "{out}"
@@ -6895,6 +7187,7 @@ mod tests {
             Some("[zirv workflow] substantial work detected"),
             Path::new("."),
             &|_| None,
+            &CtxConfig::default(),
         );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let context = parsed["hookSpecificOutput"]["additionalContext"]
@@ -7348,7 +7641,13 @@ mod tests {
 
     #[test]
     fn prompt_hook_emits_the_documented_injection_shape() {
-        let out = prompt_output("[zirv]", None, Path::new("."), &|_| None);
+        let out = prompt_output(
+            "[zirv]",
+            None,
+            Path::new("."),
+            &|_| None,
+            &CtxConfig::default(),
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
@@ -7371,7 +7670,13 @@ mod tests {
 
     #[test]
     fn prompt_hook_uses_the_configured_marker() {
-        let out = prompt_output("[acme]", None, Path::new("."), &|_| None);
+        let out = prompt_output(
+            "[acme]",
+            None,
+            Path::new("."),
+            &|_| None,
+            &CtxConfig::default(),
+        );
         assert!(out.contains("[acme]"));
         assert!(
             !out.contains("[zirv]"),
@@ -7387,9 +7692,14 @@ mod tests {
     /// even if `hookSpecificOutput`'s envelope grows for an unrelated reason.
     #[test]
     fn prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&prompt_output("[zirv]", None, Path::new("."), &|_| None))
-                .expect("valid json");
+        let parsed: serde_json::Value = serde_json::from_str(&prompt_output(
+            "[zirv]",
+            None,
+            Path::new("."),
+            &|_| None,
+            &CtxConfig::default(),
+        ))
+        .expect("valid json");
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext")
@@ -12662,5 +12972,277 @@ capable a model does it actually need?",
         let again =
             String::from_utf8(run_prompt_captured(&cwd, SUBSTANTIAL_PROMPT, &env)).expect("utf8");
         assert!(!again.contains("[zirv intake]"), "{again}");
+    }
+
+    // -- issue #786: `[jev] stop_verify` --------------------------------
+
+    fn claiming_transcript(dir: &Path, closing: &str) -> PathBuf {
+        let path = dir.join("stop-verify.jsonl");
+        let text = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Edit\",\"input\":{{}}}}],\"usage\":{{\"input_tokens\":100}}}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{closing}\"}}],\"usage\":{{\"input_tokens\":100}}}}}}\n"
+        );
+        std::fs::write(&path, text).expect("write transcript");
+        path
+    }
+
+    fn stop_verify_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.stop_verify = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    const CLAIM: &str = "Done: implemented the fix and all tests pass.";
+    const UNVERIFIED_DONE: &str = r#"{"model": "jev-latest", "answers": {
+        "unverified_done": {"type": "noul", "noul": 0.97}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    #[test]
+    fn stop_verify_facts_count_claims_only_for_an_editing_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter =
+            adapters::select_for_identity(None, &[], &CtxConfig::default()).expect("adapter");
+        let events = |closing: &str| {
+            let path = claiming_transcript(dir.path(), closing);
+            adapter.parse_events(&std::fs::read_to_string(path).expect("read"))
+        };
+        let facts = stop_verify_facts(&events(CLAIM)).expect("an editing, claiming turn");
+        assert_eq!(facts.len(), 7);
+        assert!(facts[0] >= 2 && facts[2] >= 1, "{facts:?}");
+        assert_eq!(facts[5], 1, "one edit call this turn");
+        assert_eq!(
+            stop_verify_facts(&events("Here is what I changed")),
+            None,
+            "a message that claims nothing is never asked about"
+        );
+        let read_only = transcript_with_edits(dir.path(), 1, 0);
+        let read_only = adapter.parse_events(&std::fs::read_to_string(read_only).expect("read"));
+        assert_eq!(stop_verify_facts(&read_only), None);
+    }
+
+    #[test]
+    fn stop_verify_key_off_never_asks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = claiming_transcript(dir.path(), CLAIM);
+        let env = "HOOK_TEST_STOP_VERIFY_OFF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let mut cfg = stop_verify_cfg("http://127.0.0.1:9".to_string(), env);
+        cfg.jev.stop_verify = false;
+        let reason = stop_verify_reason(&state, &cfg, true, &transcript);
+        cfg.jev.stop_verify = true;
+        let not_owed = stop_verify_reason(&state, &cfg, false, &transcript);
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(reason, None);
+        assert_eq!(not_owed, None, "no owed check means no call at all");
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+    }
+
+    #[test]
+    fn stop_verify_blocks_on_a_decisive_answer_and_keeps_the_advisory() {
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, UNVERIFIED_DONE);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = claiming_transcript(dir.path(), CLAIM);
+        let env = "HOOK_TEST_STOP_VERIFY_BLOCK";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let cfg = stop_verify_cfg(url, env);
+        let reason = stop_verify_reason(&state, &cfg, true, &transcript);
+        unsafe { std::env::remove_var(env) };
+        handle.join().expect("server thread");
+        let reason = reason.expect("a decisive answer blocks");
+        let merged: serde_json::Value = serde_json::from_str(&with_stop_block(
+            Some(r#"{"systemMessage":"zirv ctx: advisory"}"#),
+            reason,
+        ))
+        .expect("json");
+        assert_eq!(merged["decision"], "block");
+        assert_eq!(merged["systemMessage"], "zirv ctx: advisory");
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("effect recorded");
+        assert!(effects.contains("stop_blocked"), "{effects}");
+    }
+
+    /// Direction: an answer below the floor never blocks.
+    #[test]
+    fn stop_verify_never_blocks_below_the_floor() {
+        let body = r#"{"model": "jev-latest", "answers": {
+            "unverified_done": {"type": "noul", "noul": 0.8}},
+            "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = claiming_transcript(dir.path(), CLAIM);
+        let env = "HOOK_TEST_STOP_VERIFY_FLOOR";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let reason = stop_verify_reason(&state, &stop_verify_cfg(url, env), true, &transcript);
+        unsafe { std::env::remove_var(env) };
+        handle.join().expect("server thread");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn stop_verify_falls_back_on_a_500() {
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = claiming_transcript(dir.path(), CLAIM);
+        let env = "HOOK_TEST_STOP_VERIFY_500";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let reason = stop_verify_reason(&state, &stop_verify_cfg(url, env), true, &transcript);
+        unsafe { std::env::remove_var(env) };
+        handle.join().expect("server thread");
+        assert_eq!(reason, None);
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    #[test]
+    fn stop_verify_request_passes_the_metadata_guard() {
+        let advise_state = DispatchAdviseState {
+            metadata_only: true,
+            facts: vec![vec![1_000_000; 7]],
+        };
+        let value = serde_json::to_value(&advise_state).expect("json");
+        assert!(super::super::jev::safe_metadata_request(
+            &value,
+            &stop_verify_question(),
+            "jev-latest"
+        ));
+    }
+
+    // -- issue #785: `[jev] inject` at the hook sites ---------------------
+
+    const INJECT_DEFER: &str = r#"{"model": "jev-latest", "answers": {
+        "defer": {"type": "noul", "noul": 0.95}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    fn inject_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.inject = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// Stores one worker message for session `aaaa1111` and returns the
+    /// env lookup a prompt hook in that session would see.
+    fn mail_waiting(tmp: &Path, state: &StateDir) -> impl Fn(&str) -> Option<String> {
+        super::super::mail::store(
+            state,
+            &super::super::state::repo_slug(tmp),
+            &super::super::mail::Message {
+                from_session: "bbbb2222".to_string(),
+                from_agent: "codex".to_string(),
+                to: "claude".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: now_secs(),
+                body: "done".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store");
+        let root = state.root().display().to_string();
+        move |key: &str| match key {
+            super::super::state::STATE_ENV => Some(root.clone()),
+            SESSION_ENV => Some("aaaa1111-2222-4333-8444-555555555555".to_string()),
+            adapters::AGENT_ENV => Some("claude".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn inject_gate_off_keeps_stop_and_mail_paths_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let credential_env = "HOOK_TEST_INJECT_OFF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let mut cfg = inject_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        cfg.jev.inject = false;
+        let mut score = score_with_turns(3);
+        score.verdict = Verdict::Compact;
+        let stop_deferred = stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false);
+        let env = mail_waiting(tmp.path(), &state);
+        let out = prompt_output("[zirv]", None, tmp.path(), &env, &cfg);
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(!stop_deferred);
+        assert!(out.contains("[zirv ▸ mail] 1 unread"), "{out}");
+        assert!(!state.root().join("jev-inject").exists());
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+    }
+
+    #[test]
+    fn inject_gate_on_defers_the_mail_note() {
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, INJECT_DEFER);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let credential_env = "HOOK_TEST_INJECT_MAIL_DEFER";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let cfg = inject_cfg(url, credential_env);
+        let env = mail_waiting(tmp.path(), &state);
+        let out = prompt_output("[zirv]", None, tmp.path(), &env, &cfg);
+        unsafe { std::env::remove_var(credential_env) };
+        handle.join().expect("server thread");
+        assert!(!out.contains("[zirv ▸ mail]"), "{out}");
+        assert!(
+            out.contains("[zirv]"),
+            "the marker line is never deferred: {out}"
+        );
+    }
+
+    /// Runs the real Stop deferral path (`stop_rot_advisory_deferred` then
+    /// `shown_stop_score`, exactly as `run_stop` does): the rot line drops,
+    /// every other nudge still prints.
+    #[test]
+    fn inject_deferral_never_suppresses_other_stop_nudges() {
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, INJECT_DEFER);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let credential_env = "HOOK_TEST_INJECT_STOP_DEFER";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let cfg = inject_cfg(url, credential_env);
+        let mut score = score_with_turns(3);
+        score.verdict = Verdict::Compact;
+        score.score = cfg.score.compact_at;
+        let deferred = stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false);
+        unsafe { std::env::remove_var(credential_env) };
+        handle.join().expect("server thread");
+        assert!(deferred, "a decisive defer below restart_at is honoured");
+        let payload = HookPayload::default();
+        let nudge = Some("zirv: verify owed");
+        let shown = stop_output(
+            &payload,
+            &shown_stop_score(&score, deferred),
+            None,
+            None,
+            nudge,
+            3,
+        )
+        .expect("the nudge survives a deferred rot advisory");
+        assert!(shown.contains("verify owed"), "{shown}");
+        assert!(!shown.contains("Consider /compact"), "{shown}");
+        let undeferred = stop_output(
+            &payload,
+            &shown_stop_score(&score, false),
+            None,
+            None,
+            nudge,
+            3,
+        )
+        .expect("advisory");
+        assert!(undeferred.contains("Consider /compact"), "{undeferred}");
     }
 }

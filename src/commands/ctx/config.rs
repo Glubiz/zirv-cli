@@ -1911,6 +1911,28 @@ pub struct JevConfig {
     pub review_reuse: bool,
     pub harvest_screen: bool,
     pub admin_dispatch: bool,
+    /// Issue #781: a safety-hook Jev risk check that may only ESCALATE a
+    /// deterministic `allow` verdict to `ask`/`deny`, never loosen one.
+    pub approve: bool,
+    /// Issue #781: opt-in auto-approve on top of `approve` -- Jev may LOWER
+    /// a deterministic `ask` verdict to `allow`. Effective only when
+    /// `approve` is also `true`; `approve_allow` alone (with `approve`
+    /// false) never runs a Jev call and never changes a verdict.
+    pub approve_allow: bool,
+    /// Issue #782: Jev intent refinement for a plain `zirv workflow start`/
+    /// `classify` with no other routing signal; `classify` also adds
+    /// additive domain tags to its own `ExecutionProfile` output (`start`
+    /// classifies before one exists, so it gets intent only).
+    pub classify: bool,
+    /// Issue #783: Jev keep/drop scoring of handoff candidate items.
+    pub handoff_select: bool,
+    /// Issue #784: Jev prompt-injection screening of untrusted inputs.
+    pub inject_screen: bool,
+    /// Issue #785: Jev inject-now/defer gate for automatic compact/restart/
+    /// mail/Stop injections.
+    pub inject: bool,
+    /// Issue #786: Jev Stop-hook check for unverified completion claims.
+    pub stop_verify: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -1933,6 +1955,13 @@ impl Default for JevConfig {
             review_reuse: false,
             harvest_screen: false,
             admin_dispatch: false,
+            approve: false,
+            approve_allow: false,
+            classify: false,
+            handoff_select: false,
+            inject_screen: false,
+            inject: false,
+            stop_verify: false,
             cache_ttl_secs: 86_400,
         }
     }
@@ -4005,6 +4034,29 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["jev", "admin_dispatch"],
         EnvKind::Bool,
     ),
+    ("ZIRV_CTX_JEV_APPROVE", &["jev", "approve"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_APPROVE_ALLOW",
+        &["jev", "approve_allow"],
+        EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_JEV_CLASSIFY", &["jev", "classify"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_HANDOFF_SELECT",
+        &["jev", "handoff_select"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_JEV_INJECT_SCREEN",
+        &["jev", "inject_screen"],
+        EnvKind::Bool,
+    ),
+    ("ZIRV_CTX_JEV_INJECT", &["jev", "inject"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_JEV_STOP_VERIFY",
+        &["jev", "stop_verify"],
+        EnvKind::Bool,
+    ),
     (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
@@ -5342,6 +5394,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "review_reuse"], "ZIRV_CTX_JEV_REVIEW_REUSE"),
     (&["jev", "harvest_screen"], "ZIRV_CTX_JEV_HARVEST_SCREEN"),
     (&["jev", "admin_dispatch"], "ZIRV_CTX_JEV_ADMIN_DISPATCH"),
+    (&["jev", "approve"], "ZIRV_CTX_JEV_APPROVE"),
+    (&["jev", "approve_allow"], "ZIRV_CTX_JEV_APPROVE_ALLOW"),
+    (&["jev", "classify"], "ZIRV_CTX_JEV_CLASSIFY"),
+    (&["jev", "handoff_select"], "ZIRV_CTX_JEV_HANDOFF_SELECT"),
+    (&["jev", "inject_screen"], "ZIRV_CTX_JEV_INJECT_SCREEN"),
+    (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
+    (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
 ];
 
@@ -8617,6 +8676,13 @@ mod tests {
         assert!(!cfg.review_reuse);
         assert!(!cfg.harvest_screen);
         assert!(!cfg.admin_dispatch);
+        assert!(!cfg.approve);
+        assert!(!cfg.approve_allow);
+        assert!(!cfg.classify);
+        assert!(!cfg.handoff_select);
+        assert!(!cfg.inject_screen);
+        assert!(!cfg.inject);
+        assert!(!cfg.stop_verify);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
@@ -8660,6 +8726,15 @@ mod tests {
             ("[jev]\ncontext = true\n", "context"),
             ("[jev]\nintake_savings = true\n", "intake_savings"),
             ("[jev]\nreview_reuse = true\n", "review_reuse"),
+            ("[jev]\nharvest_screen = true\n", "harvest_screen"),
+            ("[jev]\nadmin_dispatch = true\n", "admin_dispatch"),
+            ("[jev]\napprove = true\n", "approve"),
+            ("[jev]\napprove_allow = true\n", "approve_allow"),
+            ("[jev]\nclassify = true\n", "classify"),
+            ("[jev]\nhandoff_select = true\n", "handoff_select"),
+            ("[jev]\ninject_screen = true\n", "inject_screen"),
+            ("[jev]\ninject = true\n", "inject"),
+            ("[jev]\nstop_verify = true\n", "stop_verify"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -8692,6 +8767,13 @@ mod tests {
             ("ZIRV_CTX_JEV_REVIEW_REUSE", "true"),
             ("ZIRV_CTX_JEV_HARVEST_SCREEN", "true"),
             ("ZIRV_CTX_JEV_ADMIN_DISPATCH", "true"),
+            ("ZIRV_CTX_JEV_APPROVE", "true"),
+            ("ZIRV_CTX_JEV_APPROVE_ALLOW", "true"),
+            ("ZIRV_CTX_JEV_CLASSIFY", "true"),
+            ("ZIRV_CTX_JEV_HANDOFF_SELECT", "true"),
+            ("ZIRV_CTX_JEV_INJECT_SCREEN", "true"),
+            ("ZIRV_CTX_JEV_INJECT", "true"),
+            ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -8709,6 +8791,13 @@ mod tests {
         assert!(cfg.jev.review_reuse);
         assert!(cfg.jev.harvest_screen);
         assert!(cfg.jev.admin_dispatch);
+        assert!(cfg.jev.approve);
+        assert!(cfg.jev.approve_allow);
+        assert!(cfg.jev.classify);
+        assert!(cfg.jev.handoff_select);
+        assert!(cfg.jev.inject_screen);
+        assert!(cfg.jev.inject);
+        assert!(cfg.jev.stop_verify);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 

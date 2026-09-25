@@ -4774,7 +4774,15 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         branch: args.branch.clone(),
         json: false,
     };
-    let classification = classify::from_args(&classify_args)?;
+    let mut classification = classify::from_args(&classify_args)?;
+    // Issue #782: the same off-by-default Jev intent refinement `zirv
+    // workflow classify` runs, applied before `selection::select_definition`
+    // so a decisively replaced intent steers pack selection here too. No
+    // domain tags: `start_workflow` has no `ExecutionProfile` surface to add
+    // one to (see `profile::refine_intent_via_jev`'s own doc comment) -- a
+    // silent no-op unless `[jev] classify` is on and a credential is set, so
+    // this stays byte-identical to today either way.
+    super::profile::refine_intent_via_jev(&repo, &args.task, &mut classification);
     let selection = if requested_id.is_none() {
         Some(super::selection::select_definition(
             &classification,
@@ -4952,14 +4960,24 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
         WorkflowSubcommand::Classify(args) => {
-            let value = classify::from_args(args)?;
+            let classification = classify::from_args(args)?;
             // Issue #542 chunk 3b: best-effort, so an unreadable registry
             // (an unusual environment problem, not classify's own concern)
             // never breaks `workflow classify` -- it just omits `selection`.
             let repo = resolve_repo(args.repo.as_deref())?;
-            let selection = load_workflow_registry(&repo, false)
-                .ok()
-                .map(|registry| super::selection::select_definition(&value, &registry, &args.task));
+            // Issue #541 decision 1: the minimal execution profile derived
+            // from this same classification, embedded alongside it rather
+            // than requiring a second call. Issue #782: an off-by-default
+            // Jev refinement runs here too, before `selection` so a
+            // decisively replaced intent still drives it -- a silent no-op
+            // unless `[jev] classify` is on and a credential is set, so
+            // `profile`/`classification` (and this command's output) stay
+            // byte-identical to today either way.
+            let mut profile = super::profile::ExecutionProfile::derive(&args.task, &classification);
+            super::profile::refine_via_jev(&repo, &args.task, &mut profile);
+            let selection = load_workflow_registry(&repo, false).ok().map(|registry| {
+                super::selection::select_definition(&profile.classification, &registry, &args.task)
+            });
             if args.json {
                 #[derive(Serialize)]
                 struct ClassifyOutput<'a> {
@@ -4968,18 +4986,17 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                     /// Issue #541 decision 1: the minimal execution profile
                     /// derived from this same classification, embedded
                     /// alongside it rather than requiring a second call.
-                    profile: super::profile::ExecutionProfile,
+                    profile: &'a super::profile::ExecutionProfile,
                     /// Issue #542 chunk 3b: best-effort registry selection,
                     /// omitted when the registry could not be loaded.
                     #[serde(skip_serializing_if = "Option::is_none")]
                     selection: Option<&'a super::selection::Selection>,
                 }
-                let profile = super::profile::ExecutionProfile::derive(&args.task, &value);
                 serde_json::to_writer_pretty(
                     &mut *writer,
                     &ClassifyOutput {
-                        classification: &value,
-                        profile,
+                        classification: &profile.classification,
+                        profile: &profile,
                         selection: selection.as_ref(),
                     },
                 )?;
@@ -4988,13 +5005,13 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 writeln!(
                     writer,
                     "intent={:?} domain={:?} complexity={:?} risk={:?} score={}",
-                    value.intent,
-                    value.work_domain.domain,
-                    value.complexity,
-                    value.risk,
-                    value.risk_score
+                    profile.classification.intent,
+                    profile.classification.work_domain.domain,
+                    profile.classification.complexity,
+                    profile.classification.risk,
+                    profile.classification.risk_score
                 )?;
-                for reason in value.reasons {
+                for reason in &profile.classification.reasons {
                     writeln!(writer, "- {reason}")?;
                 }
                 if let Some(selection) = &selection {
@@ -8387,6 +8404,61 @@ mod tests {
         assert_eq!(
             state.definition.as_ref().map(|d| d.id.as_str()),
             Some("bugfix")
+        );
+    }
+
+    /// Issue #782: `start_workflow` now runs the same off-by-default Jev
+    /// intent refinement `zirv workflow classify` does, right before
+    /// `selection::select_definition` -- with the gate at its default (off),
+    /// this must leave the deterministic classification (and the pack
+    /// `selection` it drives) completely untouched.
+    #[test]
+    fn start_leaves_intent_and_selection_untouched_when_the_jev_classify_gate_is_off() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Start(StartArgs {
+                id: None,
+                task: "fix a database retry bug".into(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+                changed_lines: Some(40),
+                tests_changed: true,
+                complexity: None,
+                risk: None,
+                branch: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: None,
+                json: false,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).expect("start");
+
+        let state_dir = resolve_state().unwrap();
+        let state = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(state.classification.intent, Intent::Bugfix);
+        assert!(
+            !state
+                .classification
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("jev:")),
+            "{:?}",
+            state.classification.reasons
+        );
+        assert_eq!(
+            state.kind,
+            WorkflowKind::Bugfix,
+            "selection must still pick the bugfix pack from the untouched intent"
         );
     }
 

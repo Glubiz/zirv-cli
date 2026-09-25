@@ -341,26 +341,32 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
 /// persisted `TeamPlan` (issue #541 chunk C, decision 3).
 pub const MAX_CHANGED_PATHS: usize = 200;
 
+/// The task-text keywords [`infer_work_domain`] scans for a frontend
+/// surface, promoted out of it so the workflow module's own metadata-only
+/// Jev classify refinement (issue #782, `profile::refine_via_jev`) can count
+/// the same keyword hits as one of its per-domain facts instead of carrying
+/// a second copy of this list.
+pub(crate) const FRONTEND_TASK_TERMS: [&str; 10] = [
+    "frontend",
+    "front-end",
+    "user interface",
+    " ui ",
+    "component",
+    "responsive",
+    "accessibility",
+    "landing page",
+    "dashboard",
+    "design system",
+];
+
 fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
     let mut score = 0u8;
     let mut reasons = Vec::new();
-    let task_terms = [
-        "frontend",
-        "front-end",
-        "user interface",
-        " ui ",
-        "component",
-        "responsive",
-        "accessibility",
-        "landing page",
-        "dashboard",
-        "design system",
-    ];
     // #255: capped below the 45 selection threshold -- task text alone can
     // no longer select the Frontend domain. The bare word "frontend" shows
     // up in plenty of non-UI work (permission families, CLI flags, docs);
     // Frontend must also see at least one real frontend path signal below.
-    if task_terms.iter().any(|term| task.contains(term))
+    if FRONTEND_TASK_TERMS.iter().any(|term| task.contains(term))
         || task.starts_with("ui ")
         || task.ends_with(" ui")
     {

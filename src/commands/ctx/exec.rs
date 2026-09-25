@@ -1365,6 +1365,7 @@ fn run_with_clock_inner<W: Write>(
         .iter()
         .map(|(path, msg)| {
             super::mail::message_with_delivery_envelope(
+                &cfg,
                 &state,
                 path,
                 msg,
