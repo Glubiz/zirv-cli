@@ -878,21 +878,28 @@ pub(crate) fn discover_browser() -> Option<String> {
     discover_browser_verbose().0
 }
 
-/// The browser `discover_browser` would choose, plus every candidate that
-/// was actually present but failed the headless launch probe (issue #676: an
-/// Ubuntu snap `chromium` stub exits non-zero for every headless run while
-/// `google-chrome` on the same `PATH` works). A candidate that is simply
-/// absent is not reported here -- only one that exists and could not launch,
-/// so a render report names the stub that was skipped rather than every
-/// browser this machine does not have.
-fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
+/// Every candidate this machine could have a Chromium-family browser under:
+/// the bare `PATH` names plus the macOS and Windows bundle paths.
+fn machine_browser_candidates() -> Vec<String> {
     let mut candidates: Vec<String> = BROWSER_PATH_CANDIDATES
         .iter()
         .map(|name| (*name).to_string())
         .collect();
     candidates.extend(macos_bundle_candidates());
     candidates.extend(windows_bundle_candidates());
+    candidates
+}
 
+/// Probes `candidates` in order and returns the first that launches
+/// headless, plus every candidate that was actually present but failed the
+/// headless launch probe (issue #676: an Ubuntu snap `chromium` stub exits
+/// non-zero for every headless run while `google-chrome` on the same `PATH`
+/// works). A candidate that is simply absent is not reported here -- only
+/// one that exists and could not launch, so a render report names the stub
+/// that was skipped rather than every browser this machine does not have.
+fn discover_browser_among(
+    candidates: impl IntoIterator<Item = String>,
+) -> (Option<String>, Vec<String>) {
     let mut skipped = Vec::new();
     for candidate in candidates {
         match probe_browser_launch(&candidate) {
@@ -902,6 +909,22 @@ fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
         }
     }
     (None, skipped)
+}
+
+/// The browser `discover_browser` would choose, plus every candidate that
+/// was actually present but failed the headless launch probe. Gated to never
+/// probe in a unit-test executable (mirrors `ctx::runtime::native_available`'s
+/// `cfg!(test)` gate): every capability report a test builds with the
+/// default config reaches `browser_binary` (`ctx/runtime/capabilities.rs`),
+/// which used to fall through to this probe and launch the operator's real
+/// Chrome from `/Applications` on every test run, bouncing the Dock icon.
+/// Tests that need the real probe call `discover_browser_among` directly
+/// with explicit candidates.
+fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
+    if cfg!(test) {
+        return (None, Vec::new());
+    }
+    discover_browser_among(machine_browser_candidates())
 }
 
 /// A disposable Chrome/Chromium `--user-data-dir`, hand-rolled under
@@ -2027,9 +2050,49 @@ mod tests {
             Some(dir.path().to_str().expect("utf8 tempdir path")),
         )]);
 
-        let (browser, skipped) = discover_browser_verbose();
+        let (browser, skipped) =
+            discover_browser_among(["chromium", "google-chrome"].map(String::from));
         assert_eq!(browser.as_deref(), Some("google-chrome"));
         assert!(skipped.iter().any(|name| name == "chromium"), "{skipped:?}");
+    }
+
+    /// The `cfg!(test)` gate on `discover_browser_verbose` is what keeps the
+    /// unit-test suite from launching the operator's real browser: every
+    /// capability report a test builds with the default config reaches
+    /// `discover_browser`, and before this gate that probe launched the
+    /// operator's actual Google Chrome from `/Applications` on every test
+    /// run. This pins the gate by proving the production entry point never
+    /// even executes a browser candidate under test.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_never_launches_a_machine_browser_under_test() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("invoked");
+        let stub = dir.path().join("google-chrome");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod +x");
+
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+
+        assert_eq!(discover_browser(), None);
+        assert!(
+            !marker.exists(),
+            "the stub was executed even though discovery is gated under test"
+        );
     }
 
     /// PR #748 gave the headless launch PROBE an explicit disposable
@@ -2201,7 +2264,7 @@ mod tests {
     #[test]
     #[ignore = "needs a working headless browser on PATH; run with --ignored where one is confirmed"]
     fn a_frontend_run_inspect_capture_review_scenario_runs_live_or_names_exactly_what_is_missing() {
-        let Some(browser) = discover_browser() else {
+        let Some(browser) = discover_browser_among(machine_browser_candidates()).0 else {
             eprintln!(
                 "skipping: no supported local Chromium-family browser was discovered on PATH \
                  (chromium, chromium-browser, google-chrome, google-chrome-stable, \
