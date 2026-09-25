@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
@@ -1839,6 +1841,499 @@ fn missing_tests_gate_reason(
     )
 }
 
+// -- Scope-creep guard ------------------------------------------------------
+//
+// Operator-requested guard: a hidden benchmark task asked for a sort-order
+// change plus "pagination works the same as always" and a `--legacy-order`
+// flag preserving "the old raw order exactly as before"; one agent noticed a
+// pre-existing pagination off-by-one, decided it "looked like an outright
+// bug" and fixed it unasked, and hidden tests expecting unchanged pagination
+// failed. This never blocks scope creep outright (that would need real
+// review); it only makes the request's own preservation language visible at
+// the moment of editing (`PreToolUse`) and catches an unrequested-fix claim
+// once at the end (`Stop`) as a backstop.
+//
+// `UserPromptSubmit` records the request's own state; `PreToolUse` reads it
+// for the checkpoint; `Stop` reads it for the backstop. All three degrade to
+// a silent no-op on any doubt at all (config off, no session identity, no
+// state dir, an I/O failure) -- a hook must never break a session over this.
+
+/// `ScopeGuardRecord`'s own schema version -- bumped if the shape ever
+/// changes, so an old record on disk reads back as "no record" rather than a
+/// deserialize failure or (worse) a wrongly-interpreted new field.
+const SCOPE_GUARD_RECORD_VERSION: u32 = 1;
+
+/// At most this many characters across every extracted constraint sentence,
+/// joined -- keeps the checkpoint/backstop text bounded regardless of how
+/// verbose the request was.
+const SCOPE_GUARD_CONSTRAINT_BUDGET: usize = 400;
+
+/// At most this many extracted constraint sentences.
+const SCOPE_GUARD_MAX_CONSTRAINTS: usize = 3;
+
+/// At most this many characters of the quoted "unrequested fix" sentence in
+/// a Stop block reason.
+const SCOPE_GUARD_QUOTE_BUDGET: usize = 200;
+
+/// Per-session scope-guard state, one record per prompt: a new prompt (a
+/// different `prompt_hash`) replaces the whole record rather than
+/// accumulating. Mirrors `AdoptionRecord`'s own per-session file layout
+/// (`state::scope_guard`, keyed the same way `adoption_record_path` is).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ScopeGuardRecord {
+    #[serde(default)]
+    version: u32,
+    /// `input_hash` of the prompt this record was built from.
+    #[serde(default)]
+    prompt_hash: u64,
+    /// The extracted preservation/limitation sentences, in prompt order.
+    #[serde(default)]
+    constraints: Vec<String>,
+    /// Whether the request itself already asks for a fix -- the Stop
+    /// backstop never fires when it does: there is no "unrequested" fix to
+    /// catch.
+    #[serde(default)]
+    asks_for_fix: bool,
+    /// Whether `PreToolUse` has already shown the checkpoint for this
+    /// prompt.
+    #[serde(default)]
+    checkpoint_shown: bool,
+    /// Whether `Stop` has already checked (and possibly blocked) this
+    /// prompt.
+    #[serde(default)]
+    stop_checked: bool,
+}
+
+/// One file per session id, named after a hash of it -- identical layout to
+/// [`adoption_record_path`].
+fn scope_guard_record_path(state: &StateDir, session: &str) -> PathBuf {
+    state
+        .scope_guard()
+        .join(format!("{:016x}.json", input_hash(session)))
+}
+
+/// `None` on any doubt at all -- missing, corrupt, or a different schema
+/// version -- deliberately unlike [`load_adoption_record`]'s always-`Default`
+/// contract: an absent record here means no `UserPromptSubmit` ever ran for
+/// this session (the guard disabled, no session identity, a write failure),
+/// and the checkpoint/backstop must have nothing to say rather than
+/// synthesizing an empty one from scratch.
+fn load_scope_guard_record(path: &Path) -> Option<ScopeGuardRecord> {
+    let record = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ScopeGuardRecord>(&body).ok())?;
+    (record.version == SCOPE_GUARD_RECORD_VERSION).then_some(record)
+}
+
+/// Best-effort, like every other hook checkpoint write: a save that fails
+/// costs the guard for this one prompt, never a hook failure.
+fn save_scope_guard_record(path: &Path, record: &ScopeGuardRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Splits `text` into naive sentences on `.`/`!`/`?` followed by whitespace
+/// or end-of-text -- good enough for classifying a user's own prose prompt
+/// or an assistant's own closing report (never source code), where an
+/// abbreviation-heavy false split costs nothing worse than one extra,
+/// harmless candidate sentence.
+fn scope_guard_split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let end = i + ch.len_utf8();
+        if !text[end..].chars().next().is_none_or(char::is_whitespace) {
+            continue;
+        }
+        let sentence = text[start..end].trim();
+        if !sentence.is_empty() {
+            sentences.push(sentence.to_string());
+        }
+        start = end;
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        sentences.push(tail.to_string());
+    }
+    sentences
+}
+
+/// Preservation/limitation phrasing (deliberately conservative -- favours
+/// catching a real constraint over precision): "same as always/before",
+/// "works the same", "as before", "exactly as", "unchanged", "keep ",
+/// "preserve", "don't/do not/never change/touch/modify/alter", "only ",
+/// "backward(s) compat[ible]", "existing behavio(u)r", "leave ... alone".
+static SCOPE_GUARD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?xi)
+        same\s+as\s+(?:always|before)
+        | works\s+the\s+same
+        | as\s+before
+        | exactly\s+as
+        | unchanged
+        | keep\s
+        | preserve
+        | (?:don'?t|do\ not|never)\s+(?:change|touch|modify|alter)
+        | only\s
+        | backwards?[\s-]*compat
+        | existing\s+behaviou?r
+        | leave\b[\s\S]*?\balone\b
+        ",
+    )
+    .expect("valid scope-guard constraint regex")
+});
+
+/// Extracts up to [`SCOPE_GUARD_MAX_CONSTRAINTS`] preservation/limitation
+/// sentences from `prompt`, trimmed, with the joined result capped at
+/// [`SCOPE_GUARD_CONSTRAINT_BUDGET`] characters. When more sentences match
+/// than fit the budget, the sentences CLOSEST TO THE END of the prompt win:
+/// a closing, clarifying sentence (e.g. "...exactly as before.") is kept
+/// over an earlier one that only incidentally matches the same conservative
+/// pattern (e.g. a feature sentence that happens to use the word "keep" for
+/// an unrelated tie-break rule -- see this guard's own worked example, where
+/// exactly that happens). Returned in the prompt's own original order.
+fn scope_guard_extract_constraints(prompt: &str) -> Vec<String> {
+    let matched: Vec<String> = scope_guard_split_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| SCOPE_GUARD_CONSTRAINT_RE.is_match(sentence))
+        .collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for sentence in matched.into_iter().rev() {
+        if kept.len() >= SCOPE_GUARD_MAX_CONSTRAINTS {
+            break;
+        }
+        let extra = sentence.chars().count() + usize::from(!kept.is_empty());
+        if total + extra > SCOPE_GUARD_CONSTRAINT_BUDGET {
+            continue;
+        }
+        total += extra;
+        kept.push(sentence);
+    }
+    kept.reverse();
+    kept
+}
+
+/// Whether the request itself already asks for a fix, anywhere in the
+/// prompt, case-insensitive. A superset of every word the Stop backstop's
+/// own [`SCOPE_GUARD_FIX_VERB_RE`]/[`SCOPE_GUARD_BUG_WORD_RE`] look for, so
+/// a request phrased as "resolve the pagination issue" can never have its
+/// own requested fix blocked as unrequested.
+fn scope_guard_prompt_asks_for_fix(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    [
+        "fix",
+        "bug",
+        "broken",
+        "error",
+        "wrong",
+        "crash",
+        "regression",
+        "off-by-one",
+        "issue",
+        "quirk",
+        "problem",
+        "resolve",
+        "correct",
+        "repair",
+        "patch",
+        "fail",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+/// `UserPromptSubmit`: records this session's scope-guard state for the
+/// CURRENT prompt, replacing any record from an earlier one (a different
+/// `prompt_hash`). Never emits anything -- the checkpoint/backstop are the
+/// only channels that speak; this only persists state for them to read.
+/// Every gate below (config off, no session identity, no state dir) is a
+/// silent skip: a hook must never fail a prompt over this.
+fn record_scope_guard_request(
+    cfg: &CtxConfig,
+    payload_session_id: &str,
+    prompt: &str,
+    env: EnvLookup<'_>,
+) {
+    if !cfg.scope_guard.enabled {
+        return;
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
+    if session.is_empty() {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let path = scope_guard_record_path(&state, &session);
+    let prompt_hash = input_hash(prompt);
+    if load_scope_guard_record(&path).is_some_and(|existing| existing.prompt_hash == prompt_hash) {
+        // The identical prompt was already recorded -- leave the flags
+        // (`checkpoint_shown`/`stop_checked`) exactly as they are.
+        return;
+    }
+    let record = ScopeGuardRecord {
+        version: SCOPE_GUARD_RECORD_VERSION,
+        prompt_hash,
+        constraints: scope_guard_extract_constraints(prompt),
+        asks_for_fix: scope_guard_prompt_asks_for_fix(prompt),
+        checkpoint_shown: false,
+        stop_checked: false,
+    };
+    save_scope_guard_record(&path, &record);
+    super::state::prune_to_newest(&state.scope_guard(), super::state::KEEP_NEWEST);
+}
+
+/// `PreToolUse`, `Edit`/`MultiEdit`/`NotebookEdit`/an existing-file `Write`
+/// only: the non-blocking scope checkpoint's own TEXT, shown once per prompt
+/// (the persisted `checkpoint_shown` flag). `None` on every gate below
+/// (config off, a tool this guard does not cover, a `Write` to a file that
+/// does not exist yet, no session identity, no recorded prompt at all,
+/// already shown for this prompt) -- a silent skip, like every other
+/// advisory in this file. Never changes `payload`'s own permission outcome:
+/// this only ever rides as a non-blocking `additionalContext` note.
+///
+/// Deliberately a pure read -- it never marks the checkpoint shown itself.
+/// `run_pretool`'s own orchestrator-write guard can still DENY this exact
+/// call after this function returns `Some`, in which case nothing is ever
+/// actually surfaced to the model; the caller commits the flag with
+/// [`scope_checkpoint_mark_shown`] only once it knows the text is really
+/// going out, so a denied write never silently spends the one checkpoint a
+/// later, actually-allowed edit still needed.
+fn scope_checkpoint_note(
+    payload: &PreToolPayload,
+    cwd: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !cfg.scope_guard.enabled {
+        return None;
+    }
+    if !matches!(
+        payload.tool_name.as_str(),
+        "Edit" | "MultiEdit" | "NotebookEdit" | "Write"
+    ) {
+        return None;
+    }
+    if payload.tool_name == "Write" {
+        let target = normalized_write_target(payload, cwd)?;
+        if !target.is_file() {
+            return None;
+        }
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+    if session.is_empty() {
+        return None;
+    }
+    let state = StateDir::resolve(env).ok()?;
+    let path = scope_guard_record_path(&state, &session);
+    let record = load_scope_guard_record(&path)?;
+    if record.checkpoint_shown {
+        return None;
+    }
+    let headless = payload.permission_mode == "dontAsk";
+    Some(scope_checkpoint_text(&record.constraints, headless))
+}
+
+/// Commits [`scope_checkpoint_note`]'s own `checkpoint_shown` flag -- called
+/// only once its text is actually about to reach the model (see that
+/// function's own doc comment for why this is split out). Best-effort, like
+/// every other state write in this file: a save that fails costs the guard
+/// for this one prompt, never a hook failure.
+fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLookup<'_>) {
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+    if session.is_empty() {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let path = scope_guard_record_path(&state, &session);
+    let Some(mut record) = load_scope_guard_record(&path) else {
+        return;
+    };
+    if record.checkpoint_shown {
+        return;
+    }
+    record.checkpoint_shown = true;
+    save_scope_guard_record(&path, &record);
+}
+
+/// The checkpoint's own wording: interactive asks the user before an
+/// unrequested fix/improvement; headless (`permission_mode == "dontAsk"`,
+/// the same signal `safety.rs`'s `hook_output` reads for the identical
+/// purpose on its own payload) has no one to ask, so it defers to the final
+/// report instead.
+fn scope_checkpoint_text(constraints: &[String], headless: bool) -> String {
+    let action = if headless {
+        "leave it and list it under 'Found, not changed' in your final report."
+    } else {
+        "ask the user first."
+    };
+    let quoted = if constraints.is_empty() {
+        String::new()
+    } else {
+        format!("the request says: \"{}\". ", constraints.join(" "))
+    };
+    format!(
+        "Scope checkpoint: {quoted}Before changing existing code, check this edit is needed for \
+         what was asked. If it fixes a bug or makes an improvement you noticed but were not \
+         asked for, don't make it: {action}"
+    )
+}
+
+/// A fix verb: `fixed`/`fixing`/`fix`/`corrected`/`repaired`/`patched`.
+static SCOPE_GUARD_FIX_VERB_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:fixed|fixing|fix|corrected|repaired|patched)\b")
+        .expect("valid scope-guard fix-verb regex")
+});
+
+/// A word naming what the fix was for: `bug(s)`/`off-by-one`/`quirk`/
+/// `broken`/`wrong`/`issue`. Plural `bugs` alongside the design's own
+/// singular `bug`, since a real closing report ("It had two bugs") uses it.
+static SCOPE_GUARD_BUG_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:bugs?|off-by-one|quirk|broken|wrong|issue)\b")
+        .expect("valid scope-guard bug-word regex")
+});
+
+/// "also fixed/changed/updated/refactored".
+static SCOPE_GUARD_ALSO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\balso\s+(?:fixed|changed|updated|refactored)\b")
+        .expect("valid scope-guard also-fixed regex")
+});
+
+/// "while (I was) at it/there/here".
+static SCOPE_GUARD_WHILE_AT_IT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bwhile\s+(?:i\s+was\s+)?(?:at\s+it|there|here)\b")
+        .expect("valid scope-guard while-at-it regex")
+});
+
+/// Truncates `text` to [`SCOPE_GUARD_QUOTE_BUDGET`] characters.
+fn scope_guard_truncate(text: &str) -> String {
+    if text.chars().count() <= SCOPE_GUARD_QUOTE_BUDGET {
+        return text.to_string();
+    }
+    text.chars().take(SCOPE_GUARD_QUOTE_BUDGET).collect()
+}
+
+/// Whether a `Stop` closing message claims a fix the request never asked
+/// for: a fix verb ([`SCOPE_GUARD_FIX_VERB_RE`]) alongside a bug word
+/// ([`SCOPE_GUARD_BUG_WORD_RE`]) in the same sentence OR the very next one --
+/// a closing report often splits the claim and what it was for across two
+/// short adjacent sentences (this guard's own worked example: "I had to fix
+/// `report.page()` first. It had two bugs.") -- OR an explicit "also fixed/
+/// changed/updated/refactored", OR "while (I was) at it/there/here". Returns
+/// the first matching sentence, truncated, or `None`.
+fn scope_guard_unrequested_fix_sentence(closing: &str) -> Option<String> {
+    let sentences = scope_guard_split_sentences(closing);
+    for (index, sentence) in sentences.iter().enumerate() {
+        if !SCOPE_GUARD_FIX_VERB_RE.is_match(sentence) {
+            continue;
+        }
+        let window = match sentences.get(index + 1) {
+            Some(next) => format!("{sentence} {next}"),
+            None => sentence.clone(),
+        };
+        if SCOPE_GUARD_BUG_WORD_RE.is_match(&window) {
+            return Some(scope_guard_truncate(sentence));
+        }
+    }
+    sentences
+        .iter()
+        .find(|sentence| {
+            SCOPE_GUARD_ALSO_RE.is_match(sentence) || SCOPE_GUARD_WHILE_AT_IT_RE.is_match(sentence)
+        })
+        .map(|sentence| scope_guard_truncate(sentence))
+}
+
+/// The last `budget` bytes of `path`'s content, lossily decoded and (unless
+/// this IS the file's start) trimmed back to the next full line -- the
+/// identical tail-read `stop_verify_reason` uses, so a Stop hook never
+/// re-parses a whole long-running transcript on every turn.
+fn scope_guard_tail_text(path: &Path, budget: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(budget);
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(if start == 0 {
+        text
+    } else {
+        text.split_once('\n')
+            .map_or_else(String::new, |(_, rest)| rest.to_string())
+    })
+}
+
+/// The current turn's closing assistant message -- everything after the last
+/// `TurnStart`, the identical window `stop_verify_facts` uses -- or `None`
+/// when there is none.
+fn scope_guard_closing_text(events: &[NormalizedEvent]) -> Option<&str> {
+    let start = events
+        .iter()
+        .rposition(|event| matches!(event, NormalizedEvent::TurnStart { .. }))
+        .map_or(0, |index| index + 1);
+    events[start..].iter().rev().find_map(|event| match event {
+        NormalizedEvent::AssistantFinal { text, .. } if !text.trim().is_empty() => {
+            Some(text.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// `Stop` backstop: blocks once, after every other Stop gate/backstop has
+/// already had its chance (see `run_stop`'s own call site -- this runs only
+/// when `stop_verify_block` did not already fire, so at most one block per
+/// Stop), when the closing report claims a fix the request never asked for.
+/// `None` on every gate below (config off, no session identity, no recorded
+/// prompt, already checked this prompt, the request itself asks for a fix,
+/// no adapter, an unreadable transcript, no unrequested-fix sentence found)
+/// -- a silent skip, like every other Stop-hook check in this file.
+fn scope_guard_stop_reason(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    session: &str,
+    transcript: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !cfg.scope_guard.enabled || session.is_empty() {
+        return None;
+    }
+    let path = scope_guard_record_path(state, session);
+    let mut record = load_scope_guard_record(&path)?;
+    if record.stop_checked || record.asks_for_fix {
+        return None;
+    }
+    let adapter = adapters::select_for_identity(
+        env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
+        &[],
+        cfg,
+    )
+    .ok()?;
+    let tail = scope_guard_tail_text(transcript, STOP_VERIFY_TAIL_BYTES)?;
+    let events = adapter.parse_events(&tail);
+    let closing = scope_guard_closing_text(&events)?;
+    let sentence = scope_guard_unrequested_fix_sentence(closing)?;
+    record.stop_checked = true;
+    save_scope_guard_record(&path, &record);
+    let headless = env(adapters::HEADLESS_ENV).as_deref() == Some("1");
+    let suffix = if headless { "" } else { " or ask the user." };
+    let constraints = record.constraints.join(" ");
+    Some(format!(
+        "Your report says you changed something the request did not ask for: \"{sentence}\". \
+         The request said: \"{constraints}\". Unless that change was strictly required to \
+         deliver the request, revert it and report it as found-not-changed{suffix}"
+    ))
+}
+
 /// Issue #786: minimum `true` probability before `stop_verify` blocks a Stop.
 /// Basis: jev-belay reached 1% false blocks with the closing TEXT; facts-only
 /// state is untested, so the floor sits well above the default margin.
@@ -2114,6 +2609,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut missing_tests_gate = None;
     let mut rot_advisory_deferred = false;
     let mut stop_verify_block = None;
+    let mut scope_guard_block = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -2243,6 +2739,12 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
         stop_verify_block = stop_verify_reason(&state, &cfg, verify_nudge.is_some(), transcript);
+        // Scope-creep guard backstop: runs only when the jev-based
+        // unverified-done backstop above did not already block this Stop --
+        // at most one block per Stop, applied in the same order below.
+        if stop_verify_block.is_none() {
+            scope_guard_block = scope_guard_stop_reason(&state, &cfg, &session, transcript, env);
+        }
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
         missing_tests_gate =
             missing_tests_gate_reason(&state, &repo, &stable_short, &payload.session_id, &cfg, env);
@@ -2347,7 +2849,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     );
     let line = match stop_verify_block {
         Some(reason) => Some(with_stop_block(line.as_deref(), reason)),
-        None => line,
+        None => match &scope_guard_block {
+            Some(reason) => Some(with_stop_block(line.as_deref(), reason)),
+            None => line,
+        },
     };
     if let Some(line) = line {
         let _ = writeln!(w, "{line}");
@@ -2528,6 +3033,13 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
     // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
     // `.ok()` fallback for the adoption marker.
     let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+
+    // Scope-creep guard: records this prompt's own preservation/limitation
+    // language (if any) for the `PreToolUse` checkpoint and `Stop` backstop
+    // to read back later. Never emits anything and never affects the rest of
+    // this handler -- see `record_scope_guard_request`'s own doc comment for
+    // every gate that silently skips it.
+    record_scope_guard_request(&cfg, &payload.session_id, &prompt_text_from(stdin), env);
 
     // Issue #745: a closed-set, deterministic administrative dispatch that
     // answers a known-safe read-only request in-process and blocks the
@@ -3426,6 +3938,13 @@ pub struct PreToolPayload {
     #[allow(dead_code)]
     // retained from Claude's documented payload; agent_id is the discriminator
     pub agent_type: String,
+    /// Claude's own session mode (documented values include `"default"`,
+    /// `"plan"`, `"acceptEdits"`, `"dontAsk"`, ...) -- the scope-guard
+    /// checkpoint's own headless signal, the identical field/value
+    /// `safety.rs`'s `hook_output` reads for the same purpose on its own
+    /// (separately modelled) `Bash`/`PowerShell` payload.
+    #[serde(default)]
+    pub permission_mode: String,
 }
 
 /// `tool_input` is tool-specific, so only the subagent tool's own parameters
@@ -4673,6 +5192,10 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     // before that guard's own "outside my scope" early return.
     let reuse_note = reuse_advice(&payload, &cwd, &cfg, env, &session);
 
+    // The scope-creep guard's own checkpoint is likewise independent of the
+    // write guard below -- every seat gets it, orchestrator or not.
+    let checkpoint_note = scope_checkpoint_note(&payload, &cwd, &cfg, env);
+
     let outcome = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env, posture);
     match &outcome {
         // The deny path is untouched by the reuse probe: a refused write has
@@ -4693,8 +5216,16 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
             // One envelope, however many notes: claude reads a single
             // `additionalContext` per hook, so a second `writeln!` would
             // throw one of them away.
-            if let Some(note) = join_advisory_notes(advisory, reuse_note.as_deref()) {
+            if let Some(note) =
+                join_advisory_notes(&[advisory, reuse_note.as_deref(), checkpoint_note.as_deref()])
+            {
                 let _ = writeln!(w, "{}", pretool_advise_output(&note));
+            }
+            // Only committed here, now that the checkpoint text is actually
+            // going out (this branch is never reached on a `Deny` above) --
+            // see `scope_checkpoint_note`'s own doc comment.
+            if checkpoint_note.is_some() {
+                scope_checkpoint_mark_shown(&payload, env);
             }
         }
     }
@@ -4721,14 +5252,18 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     Ok(0)
 }
 
-/// The two non-blocking notes `run_pretool` can produce, joined into the one
-/// `additionalContext` string claude reads -- `None` when neither fired.
-fn join_advisory_notes(orchestrator: Option<&str>, reuse: Option<&str>) -> Option<String> {
-    match (orchestrator, reuse) {
-        (None, None) => None,
-        (Some(note), None) | (None, Some(note)) => Some(note.to_string()),
-        (Some(first), Some(second)) => Some(format!("{first}\n{second}")),
-    }
+/// The non-blocking notes `run_pretool` can produce, joined into the one
+/// `additionalContext` string claude reads -- `None` when none of them
+/// fired. Never drops one for another: claude reads a single
+/// `additionalContext` per hook, so every note that fired rides in the same
+/// envelope, newline-separated.
+fn join_advisory_notes(notes: &[Option<&str>]) -> Option<String> {
+    let joined = notes
+        .iter()
+        .filter_map(|note| *note)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Issue #406 layer 1: the pre-write reuse probe's own note, or `None` when
@@ -15269,5 +15804,551 @@ capable a model does it actually need?",
         )
         .expect("advisory");
         assert!(undeferred.contains("Consider /compact"), "{undeferred}");
+    }
+
+    // -- Scope-creep guard ---------------------------------------------------
+
+    /// The real t24 step 4 benchmark prompt, verbatim: a benchmark agent
+    /// treated its own pagination off-by-one as "an outright bug rather than
+    /// something to preserve" and fixed it unasked, failing hidden tests that
+    /// expected unchanged pagination.
+    const SCOPE_GUARD_T24_PROMPT: &str = r"I've got thousands of transactions in here now between imports and
+recurring rules, and `list` showing the oldest ones first means I have to
+page through everything to see what I did yesterday. Please make `list`
+show the most recent transactions first by default (sort by date
+descending; when two transactions share a date, keep the one with the
+lower id first). Pagination (`--page`/`--page-size`) works the same as
+always, just over this newly-ordered sequence.
+
+I know some of my own scripts probably depend on the old oldest-first
+order though, so keep it available: add a `--legacy-order` flag to `list`
+that skips the new sorting and shows transactions in the old raw order
+exactly as before.";
+
+    /// Constraint extraction picks the two sentences that actually restrict
+    /// what may change, and never the plain informational opener.
+    #[test]
+    fn scope_guard_extracts_the_preservation_sentences_from_the_t24_prompt() {
+        let constraints = scope_guard_extract_constraints(SCOPE_GUARD_T24_PROMPT);
+        assert!(
+            constraints
+                .iter()
+                .any(|s| s.contains("works the same as") && s.contains("Pagination")),
+            "must pick the pagination sentence: {constraints:?}"
+        );
+        assert!(
+            constraints.iter().any(|s| s.contains("exactly as before")),
+            "must pick the exactly-as-before sentence: {constraints:?}"
+        );
+        assert!(
+            !constraints
+                .iter()
+                .any(|s| s.contains("thousands of transactions")),
+            "must ignore the plain informational opener: {constraints:?}"
+        );
+    }
+
+    fn scope_guard_prompt_stdin(session: &str, cwd: &Path, prompt: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "prompt": prompt,
+        })
+        .to_string()
+    }
+
+    fn scope_guard_edit_stdin(session: &str, cwd: &Path, permission_mode: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": cwd.join("src/lib.rs").display().to_string(),
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "permission_mode": permission_mode,
+        })
+        .to_string()
+    }
+
+    /// End to end: the first `Edit` after a prompt gets the checkpoint, a
+    /// second `Edit` in the same prompt does not, and a new prompt re-arms
+    /// it.
+    #[test]
+    fn scope_guard_checkpoint_fires_once_then_a_new_prompt_rearms_it() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut first = Vec::new();
+        run_pretool(&mut first, &edit_stdin, &lookup).expect("run_pretool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Scope checkpoint"),
+            "the first Edit must show the checkpoint: {first}"
+        );
+        assert!(
+            first.contains("ask the user first."),
+            "interactive wording: {first}"
+        );
+
+        let mut second = Vec::new();
+        run_pretool(&mut second, &edit_stdin, &lookup).expect("run_pretool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Scope checkpoint"),
+            "a second Edit in the same prompt must stay silent: {second}"
+        );
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), "A different, unrelated request."),
+            &lookup,
+        )
+        .expect("run_prompt");
+        let mut third = Vec::new();
+        run_pretool(&mut third, &edit_stdin, &lookup).expect("run_pretool");
+        let third = String::from_utf8(third).expect("utf8");
+        assert!(
+            third.contains("Scope checkpoint"),
+            "a new prompt must re-arm the checkpoint: {third}"
+        );
+    }
+
+    /// A `Write` to a file that does not exist yet is a new file, not a
+    /// change to existing code, so it must not consume the checkpoint -- a
+    /// following `Edit` still gets it.
+    #[test]
+    fn scope_guard_checkpoint_ignores_a_write_to_a_new_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-2";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let write_stdin = serde_json::json!({
+            "session_id": session,
+            "cwd": repo.path().display().to_string(),
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": repo.path().join("brand_new.rs").display().to_string(),
+                "content": "fn x() {}\n",
+            },
+            "permission_mode": "default",
+        })
+        .to_string();
+        let mut write_out = Vec::new();
+        run_pretool(&mut write_out, &write_stdin, &lookup).expect("run_pretool");
+        let write_out = String::from_utf8(write_out).expect("utf8");
+        assert!(
+            !write_out.contains("Scope checkpoint"),
+            "a Write to a brand-new file must not trigger the checkpoint: {write_out}"
+        );
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut edit_out = Vec::new();
+        run_pretool(&mut edit_out, &edit_stdin, &lookup).expect("run_pretool");
+        let edit_out = String::from_utf8(edit_out).expect("utf8");
+        assert!(
+            edit_out.contains("Scope checkpoint"),
+            "the new-file Write must not have consumed the checkpoint: {edit_out}"
+        );
+    }
+
+    /// Headless (`permission_mode == "dontAsk"`) gets the "found, not
+    /// changed" wording instead of "ask the user first.".
+    #[test]
+    fn scope_guard_checkpoint_uses_headless_wording_under_dont_ask() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "dontAsk");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Found, not changed"),
+            "headless wording: {out}"
+        );
+        assert!(
+            !out.contains("ask the user first."),
+            "headless must not ask: {out}"
+        );
+    }
+
+    /// A `Write`/`Edit` the orchestrator-write guard DENIES must not consume
+    /// the checkpoint: nothing was ever shown to the model, so the very next
+    /// actually-allowed edit in the same prompt still gets it.
+    #[test]
+    fn scope_guard_checkpoint_survives_a_denied_orchestrator_write() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-deny-1";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let denied_edit = orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            session,
+            "Edit",
+            serde_json::json!({"file_path": repo.path().join("src/x.rs").display().to_string()}),
+        );
+        let mut denied_out = Vec::new();
+        run_pretool(&mut denied_out, &denied_edit, &lookup).expect("run_pretool");
+        let denied_out = String::from_utf8(denied_out).expect("utf8");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(denied_out.trim()).expect("json")["hookSpecificOutput"]
+                ["permissionDecision"],
+            "deny",
+            "{denied_out}"
+        );
+        assert!(
+            !denied_out.contains("Scope checkpoint"),
+            "a denied write must never show the checkpoint: {denied_out}"
+        );
+
+        // The same prompt's checkpoint must still be available for a real
+        // edit -- here, no orchestrator role at all, so the write proceeds.
+        let plain_env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let plain_lookup = |k: &str| plain_env.get(k).cloned();
+        let allowed_edit = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut allowed_out = Vec::new();
+        run_pretool(&mut allowed_out, &allowed_edit, &plain_lookup).expect("run_pretool");
+        let allowed_out = String::from_utf8(allowed_out).expect("utf8");
+        assert!(
+            allowed_out.contains("Scope checkpoint"),
+            "the denied attempt must not have consumed the checkpoint: {allowed_out}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false` in the repo's own `.zirv/ctx.toml`
+    /// (narrow-only, the operator's own home layer defaults it on): no
+    /// record is written, so no checkpoint ever shows.
+    #[test]
+    fn scope_guard_disabled_shows_no_checkpoint_and_writes_no_record() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-disabled-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "disabled must never show the checkpoint: {out}"
+        );
+        let record_dir = state_dir.path().join("scope-guard");
+        assert!(
+            !record_dir.exists() || std::fs::read_dir(&record_dir).unwrap().next().is_none(),
+            "disabled must never write a scope-guard record"
+        );
+    }
+
+    /// A transcript whose last assistant message is `closing`, with a single
+    /// preceding user turn -- the identical minimal shape
+    /// `transcript_with_edits`/`rotting_transcript` already use elsewhere in
+    /// this file's own test suite.
+    fn scope_guard_transcript(dir: &Path, closing: &str) -> PathBuf {
+        let path = dir.join("scope-guard-stop.jsonl");
+        let text = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n{{\"type\":\"assistant\",\
+             \"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{}}}],\"usage\":{{\
+             \"input_tokens\":100}}}}}}\n",
+            serde_json::to_string(closing).expect("json string")
+        );
+        std::fs::write(&path, text).expect("write");
+        path
+    }
+
+    fn scope_guard_stop_stdin(session: &str, transcript: &Path, cwd: &Path) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript.display().to_string(),
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string()
+    }
+
+    const SCOPE_GUARD_FIX_CLOSING: &str = "I had to fix `report.page()` first. It had two bugs.";
+
+    /// End to end: `Stop` blocks once when the closing report claims a fix
+    /// the t24 step 4 request never asked for.
+    #[test]
+    fn scope_guard_stop_blocks_once_on_an_unrequested_fix_claim() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-1";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).expect("utf8").trim()).expect("json");
+        assert_eq!(parsed["decision"], "block", "{parsed:?}");
+        let reason = parsed["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("I had to fix `report.page()` first."),
+            "must quote the unrequested-fix sentence: {reason}"
+        );
+        assert!(
+            reason.contains("works the same as") || reason.contains("exactly as before"),
+            "must quote the request's own constraints: {reason}"
+        );
+        assert!(
+            reason.contains("or ask the user."),
+            "interactive suffix: {reason}"
+        );
+
+        // Never blocks twice for the same prompt.
+        let mut second = Vec::new();
+        let code = run_stop(&mut second, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("found-not-changed"),
+            "must not block a second time: {second}"
+        );
+    }
+
+    /// The backstop never fires when the request itself already asked for a
+    /// fix -- there is no "unrequested" fix to catch.
+    #[test]
+    fn scope_guard_stop_does_not_block_when_the_request_itself_asks_for_a_fix() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-2";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(
+                session,
+                repo.path(),
+                "Please resolve the pagination issue in report.page().",
+            ),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &lookup).expect("runs");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("found-not-changed"),
+            "a requested fix must never trigger the backstop: {out}"
+        );
+    }
+
+    /// `stop_hook_active: true` must never block, exactly like every other
+    /// Stop-hook check in this file.
+    #[test]
+    fn scope_guard_stop_never_blocks_when_stop_hook_active_is_set() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-3";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript.display().to_string(),
+            "cwd": repo.path().display().to_string(),
+            "stop_hook_active": true,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "stop_hook_active must short-circuit before any hook output at all: {out:?}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false`: no block either, even with an
+    /// otherwise-qualifying unrequested-fix closing message.
+    #[test]
+    fn scope_guard_stop_does_not_block_when_disabled() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-4";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &lookup).expect("runs");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("found-not-changed"),
+            "disabled must never block: {out}"
+        );
     }
 }

@@ -690,6 +690,34 @@ impl Default for SubagentStopGateConfig {
     }
 }
 
+/// The scope-creep guard: a `UserPromptSubmit`-recorded, per-session note of
+/// any preservation/limitation language the request itself used (`hook::
+/// record_scope_guard_request`), a non-blocking `PreToolUse` checkpoint on
+/// the first `Edit`/`MultiEdit`/`NotebookEdit`/existing-file `Write` after
+/// each new prompt (`hook::scope_checkpoint_note`), and a once-per-prompt
+/// `Stop` backstop that blocks when the closing report claims an
+/// unrequested fix the request never asked for (`hook::
+/// scope_guard_stop_reason`).
+///
+/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
+/// tests_gate.enabled`/`subagent_stop_gate.enabled` already use
+/// (`narrow_scope_guard_enabled` below), not `REPO_FORBIDDEN`: an operator
+/// who wants the guard is never blocked by the repo, but a repo checkout may
+/// only ever turn it off, never force it on for an operator who disabled it.
+/// Disabled means no record is ever written, no checkpoint is ever shown,
+/// and no Stop is ever blocked.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScopeGuardConfig {
+    pub enabled: bool,
+}
+
+impl Default for ScopeGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Issue #308 stage 1: whether the Stop hook may run a fast local checker
 /// (`cargo check`/`tsc --noEmit`) after a turn that edited files, and inject
 /// only the diagnostics that are NEW since this session's own baseline as one
@@ -3145,6 +3173,7 @@ pub struct CtxConfig {
     pub diagnostics: DiagnosticsConfig,
     pub missing_tests_gate: MissingTestsGateConfig,
     pub subagent_stop_gate: SubagentStopGateConfig,
+    pub scope_guard: ScopeGuardConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -4237,6 +4266,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["headless", "lean"],
         EnvKind::Bool,
     ),
+    (
+        "ZIRV_CTX_SCOPE_GUARD_ENABLED",
+        &["scope_guard", "enabled"],
+        EnvKind::Bool,
+    ),
 ];
 
 /// Parsed `ctx.toml` surfaces that do not have scalar environment overrides
@@ -4579,6 +4613,13 @@ fn narrow_missing_tests_gate_enabled(home: bool, repo: Option<bool>) -> bool {
 /// Issue #774: the repo-narrowing fold for `subagent_stop_gate.enabled` --
 /// identical shape/polarity to `narrow_missing_tests_gate_enabled` above.
 fn narrow_subagent_stop_gate_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// The repo-narrowing fold for `scope_guard.enabled` -- identical
+/// shape/polarity to `narrow_missing_tests_gate_enabled`/`narrow_subagent_
+/// stop_gate_enabled` above.
+fn narrow_scope_guard_enabled(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
@@ -6058,6 +6099,9 @@ impl CtxConfig {
         // enabled` below.
         let home_subagent_stop_gate_enabled =
             bool_at(take_nested(&mut merged, "subagent_stop_gate", "enabled"));
+        // `scope_guard.enabled` gets the identical lift-before-merge
+        // treatment -- see `narrow_scope_guard_enabled` below.
+        let home_scope_guard_enabled = bool_at(take_nested(&mut merged, "scope_guard", "enabled"));
         // Issue #312: both `compact_advisory` keys are narrow-only in the
         // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
         let home_compact_advisory_min_reclaim = integer_at(take_nested(
@@ -6269,6 +6313,8 @@ impl CtxConfig {
             "subagent_stop_gate",
             "enabled",
         ));
+        let repo_scope_guard_enabled =
+            bool_at(take_nested(&mut repo_layer, "scope_guard", "enabled"));
         let repo_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut repo_layer,
             "compact_advisory",
@@ -6625,6 +6671,16 @@ impl CtxConfig {
             toml::Value::Boolean(narrow_subagent_stop_gate_enabled(
                 home_subagent_stop_gate_enabled.unwrap_or(default_subagent_stop_gate.enabled),
                 repo_subagent_stop_gate_enabled,
+            )),
+        );
+
+        let default_scope_guard = ScopeGuardConfig::default();
+        insert_path(
+            &mut merged,
+            &["scope_guard", "enabled"],
+            toml::Value::Boolean(narrow_scope_guard_enabled(
+                home_scope_guard_enabled.unwrap_or(default_scope_guard.enabled),
+                repo_scope_guard_enabled,
             )),
         );
 
@@ -10410,6 +10466,67 @@ mod tests {
     #[test]
     fn subagent_stop_gate_defaults_on() {
         assert!(SubagentStopGateConfig::default().enabled);
+    }
+
+    /// Identical shape to `a_repo_layer_may_only_narrow_subagent_stop_gate_
+    /// enabled` -- a repo-layer `scope_guard.enabled = true` must not
+    /// resurrect a guard the operator's own `~/.zirv/ctx.toml` turned off,
+    /// but a repo layer may still turn an operator-enabled guard off for
+    /// itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_scope_guard_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.scope_guard.enabled,
+            "a repo may not re-enable an operator-disabled scope_guard"
+        );
+    }
+
+    /// Default-on, the same as `missing_tests_gate`/`subagent_stop_gate` --
+    /// an operator who never touches `scope_guard` still gets the guard.
+    #[test]
+    fn scope_guard_defaults_on() {
+        assert!(ScopeGuardConfig::default().enabled);
+    }
+
+    /// The operator environment override wins outright, the same as every
+    /// other `ENV_MAP` entry.
+    #[test]
+    fn scope_guard_env_override_wins_over_a_disabling_home_layer() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SCOPE_GUARD_ENABLED", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            cfg.scope_guard.enabled,
+            "ZIRV_CTX_SCOPE_GUARD_ENABLED must override the home layer"
+        );
     }
 
     /// Issue #155, Phase 3: the fold rule itself, mirroring `the_pace_

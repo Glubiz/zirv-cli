@@ -3583,7 +3583,10 @@ lists against what serde actually writes — so the documentation cannot drift
 from the wire.
 
 **Transport.** A unix domain socket at `<state>/s/api.sock` on unix, a named
-pipe on Windows, carrying NDJSON in both directions. The server writes one
+pipe on Windows, carrying NDJSON in both directions. The same transport also
+backs one other owner-only, per-session endpoint outside this protocol: the
+Jev session relay at `<state>/s/jev-<hash-of-session-id>` (see
+[`[jev]`](#configuration)'s "Session relay" above). The server writes one
 `hello` frame per connection before reading anything; a client intersects the
 capabilities that frame advertises with its own and disables locally whatever
 is missing, which is how an older client connects to a newer server and vice
@@ -4083,6 +4086,26 @@ cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
+
+**Session relay.** Every Jev call now goes through a process-wide keep-alive
+`ureq::Agent` instead of opening a fresh connection each time, which already
+helps any process making more than one call. Most `[jev]`-gated sites,
+though, run inside a short-lived, one-per-tool-call `zirv ctx hook`/`zirv ctx
+safety check` process, so there is nothing for that agent to keep alive
+across calls on its own. When at least one `[jev]` gate is on and a
+credential is present, `zirv ctx exec`/`zirv ctx wrap`'s own long-lived
+supervisor hosts a small per-session relay for the duration of the session:
+an owner-only duplex endpoint (the same NDJSON transport `zirv ctx api`
+uses, `<state>/s/jev-<hash-of-session-id>` — a sibling of that command's own
+`<state>/s/api.sock`) that a hook process dials, over its own `ZIRV_CTX_
+SESSION`, to reuse the supervisor's warm connection instead of paying a
+fresh TCP+TLS handshake. The client never sends its credential over that
+socket — the relay forwards with its own `[proxy.typesafe]` credential — and
+falls straight through to a normal direct call whenever there is no relay to
+dial, the relay times out, or it reports its own failure; caching, decision
+recording and error mapping are identical either way. A relay is always an
+optimisation: it is never required, and its absence never changes an answer,
+only how fast it arrives.
 
 Jev requests now accept only a bounded numeric metadata envelope with static
 questions. The shared client rejects text, paths, diffs, secrets, dynamic
@@ -5370,6 +5393,43 @@ Stop-hook check -- on any doubt at all (an unreadable repo, no git, a config
 load failure). A repository checkout may only turn it off
 (`[missing_tests_gate] enabled = false` in `<repo>/.zirv/ctx.toml`), never
 force it on for an operator who disabled it.
+
+**Scope guard** (`[scope_guard]`, default `enabled = true`) is a scope-creep
+guard, not a correctness check: it never decides whether an edit is right,
+only makes the request's own preservation language visible at the moment of
+editing and catches an unrequested-fix claim once at the end. `UserPromptSubmit`
+splits the prompt into sentences and keeps up to three (capped at 400 characters
+joined) that use preservation/limitation language -- "same as always/before",
+"works the same", "as before", "exactly as", "unchanged", "keep ", "preserve",
+"don't/do not/never change/touch/modify/alter", "only ", "backward(s) compat",
+"existing behavio(u)r", "leave ... alone" -- plus whether the request itself
+already asks for a fix (fix/bug/broken/error/wrong/crash/regression/off-by-one
+wording), into a small per-session record; a new prompt replaces the record.
+`PreToolUse` shows a non-blocking checkpoint (`additionalContext`, never a
+permission change) on the first `Edit`/`MultiEdit`/`NotebookEdit` call, or a
+`Write` to a file that already exists, after each new prompt: it quotes the
+extracted constraints (when there are any) and asks the agent to check the
+edit is actually needed for what was asked, rather than an unrequested fix or
+improvement -- interactively, "ask the user first"; headlessly
+(`permission_mode == "dontAsk"`), "leave it and list it under 'Found, not
+changed' in your final report" instead, since there is no one to ask. It rides
+in the same `additionalContext` envelope as the orchestrator-write advisory and
+the reuse probe rather than replacing either. `Stop` is a backstop, run only
+after every other Stop gate/backstop above already had its chance to block (at
+most one block per Stop): when the request did NOT itself ask for a fix and the
+closing report's own wording claims one anyway (a fix verb alongside a bug
+word in the same or the next sentence, "also fixed/changed/updated/refactored",
+or "while (I was) at it/there/here"), it blocks once, quoting the offending
+sentence and the request's own constraints, asking the agent to revert the
+change and report it as "found, not changed" unless it was strictly required
+-- interactively, or ask the user first. It never fires twice for the same
+prompt, never fires when `stop_hook_active` is already true, and fails open on
+any doubt at all (no session identity, no recorded prompt, an unreadable
+transcript). A repository checkout may only turn it off
+(`[scope_guard] enabled = false` in `<repo>/.zirv/ctx.toml`, or the operator's
+own `ZIRV_CTX_SCOPE_GUARD_ENABLED`), never force it on for an operator who
+disabled it; disabled means no record is ever written, no checkpoint is ever
+shown, and Stop never blocks for it.
 
 The Stop hook is also how a supervisor learns which file the agent is writing:
 the agent mints its own session id, so the transcript path travels on the turn

@@ -1044,6 +1044,16 @@ impl StateDir {
         self.0.join("status-snapshots")
     }
 
+    /// Scope-guard bookkeeping (`zirv skill`-adjacent scope-creep guard on
+    /// the Claude hooks): one small per-session record
+    /// (`<state>/scope-guard/<hash>.json`), keyed the same way `adoption()`
+    /// is -- a hash of the session id, refreshed on every `UserPromptSubmit`
+    /// and read back (never re-derived) by the `PreToolUse` checkpoint and
+    /// the `Stop` backstop. Mirrors `adoption()`'s own per-session layout.
+    pub fn scope_guard(&self) -> PathBuf {
+        self.0.join("scope-guard")
+    }
+
     /// Autonomous frontend profiles and visual evidence. Profiles are local
     /// derived state: repository files remain the source of truth and are
     /// never modified while Zirv infers a design direction.

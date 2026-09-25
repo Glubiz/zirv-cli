@@ -59,6 +59,9 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // Its three timing knobs (`open_after_failures`, `window_secs`,
     // `cooldown_secs`) are `REPO_FORBIDDEN` outright.
     "fallback.health.enabled",
+    // The scope-creep guard: a repo may switch it off, never on for an
+    // operator who disabled it (`narrow_scope_guard_enabled`).
+    "scope_guard.enabled",
     // Issue #466: a repo may request `mask` (narrower: strips the retained
     // domain hint), never force the operator's `mask` back to `keep`. See
     // config.rs's fold right beside `obfuscate.literals_file`'s own
