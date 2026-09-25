@@ -706,10 +706,19 @@ where
     // `hard_timeout` alone (`SuperviseConfig::compact_timeout_ms`, default 10
     // minutes, REPO_FORBIDDEN so a repo cannot weaken it) and `on_tick` never
     // asks to stop early.
-    let outcome =
-        supervise::supervise_child(&mut child, Instant::now() + hard_timeout, poll, &mut || {
-            Tick::Continue
-        })
+    // F4 (codex review fix): one deadline covers the whole call -- the
+    // compact child's own exit AND the verification that follows -- rather
+    // than each phase getting its own fresh `Instant::now() + hard_timeout`.
+    // A compact child that takes close to the full `hard_timeout` to exit
+    // used to hand verification an entirely new, equally long window on top
+    // of that, so a real (if slow) compaction could block this call for
+    // close to twice `hard_timeout`. `verify_compaction`'s own loop already
+    // treats a deadline that has already passed as "not verified" rather
+    // than erroring, so a child that consumed nearly the whole budget just
+    // exiting correctly leaves little to no time to verify, instead of a
+    // second full window.
+    let deadline = Instant::now() + hard_timeout;
+    let outcome = supervise::supervise_child(&mut child, deadline, poll, &mut || Tick::Continue)
         .map_err(|error| format!("compact command failed: {error}"))?;
     let _ = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
     match outcome {
@@ -726,9 +735,8 @@ where
         }
     }
 
-    let verified =
-        supervise::verify_compaction(&mut watcher, adapter, Instant::now() + hard_timeout)
-            .map_err(|error| format!("compaction verification failed: {error}"))?;
+    let verified = supervise::verify_compaction(&mut watcher, adapter, deadline)
+        .map_err(|error| format!("compaction verification failed: {error}"))?;
     if !verified {
         return Err("compaction not verified".to_string());
     }
@@ -6204,6 +6212,54 @@ mod tests {
             result.is_ok(),
             "a compaction that appends nothing until it completes must not be killed for lack \
              of transcript growth, as long as it finishes inside the hard timeout: {result:?}"
+        );
+    }
+
+    /// F4 (codex review, cff7ff57 follow-up): `compact_in_place` used to hand
+    /// the post-exit verification step an entirely fresh `Instant::now() +
+    /// hard_timeout` deadline, independent of how long the compact child
+    /// itself had already taken to exit -- so a slow compaction could block
+    /// this call for close to TWO full `hard_timeout` periods instead of
+    /// one. The fake compact command sleeps most of the budget away, then
+    /// exits 0 without ever appending a compaction marker, so verification
+    /// can never find one and is guaranteed to spin out its own full
+    /// window rather than returning early -- the one scenario that actually
+    /// measures whether that window is bounded by the SAME deadline as the
+    /// child's own exit wait, rather than a second one.
+    #[test]
+    fn compact_in_place_bounds_total_wait_to_one_hard_timeout_not_two() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("seed transcript");
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+
+        let script = "sleep 0.7";
+        let build = |_: &str| -> Option<(Command, Option<String>)> {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            Some((cmd, None))
+        };
+
+        let hard_timeout = Duration::from_millis(1000);
+        let started = Instant::now();
+        let result = compact_in_place(
+            &claude,
+            Some(&transcript),
+            hard_timeout,
+            Duration::from_millis(20),
+            build,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "the child never writes a compaction marker, so this must report unverified, not \
+             success: {result:?}"
+        );
+        assert!(
+            elapsed < hard_timeout * 3 / 2,
+            "one hard_timeout must cover the child's exit AND verification together, not two \
+             separate full windows: elapsed {elapsed:?}, hard_timeout {hard_timeout:?}"
         );
     }
 

@@ -1625,12 +1625,19 @@ struct MissingTestsGateRecord {
     blocked: bool,
 }
 
-fn missing_tests_gate_record_path(state: &StateDir, session: &str) -> PathBuf {
+// F6 (codex review fix): keyed by `stable_short` (the socket-derived
+// identifier `run_stop`'s own caller already computes -- issue #243, see its
+// doc comment there), NOT the rotating session id -- a supervised restart
+// mints a fresh `SESSION_ENV`/`payload.session_id`, and this gate's own
+// contract above ("at most once per session, full stop") means the whole
+// supervised run, which `stable_short` -- unlike the rotating id -- actually
+// tracks across a restart.
+fn missing_tests_gate_record_path(state: &StateDir, stable_short: &str) -> PathBuf {
     // Mirrors `verify_on_stop_record_path`'s own naming/hash scheme, in the
     // same scoring directory.
     state.scoring().join(format!(
         "{:016x}-missing-tests-gate.json",
-        input_hash(session)
+        input_hash(stable_short)
     ))
 }
 
@@ -1757,11 +1764,14 @@ fn rust_change_touches_cfg_test(repo: &Path, path: &Path) -> bool {
 /// session, which never sets it, is never blocked by this), and only once
 /// per session (the persisted [`MissingTestsGateRecord`] -- a later call
 /// that finds `blocked` already `true` returns `None` regardless of what
-/// changed since).
+/// changed since). F6 (codex review fix): "session" here means the whole
+/// supervised run, so `stable_short` is keyed on, not the rotating
+/// `SESSION_ENV`/`payload.session_id` -- see [`missing_tests_gate_record_path`]'s
+/// own doc comment.
 fn missing_tests_gate_reason(
     state: &StateDir,
     repo: &Path,
-    session: &str,
+    stable_short: &str,
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Option<String> {
@@ -1771,7 +1781,7 @@ fn missing_tests_gate_reason(
     if env(adapters::HEADLESS_ENV).as_deref() != Some("1") {
         return None;
     }
-    let path = missing_tests_gate_record_path(state, session);
+    let path = missing_tests_gate_record_path(state, stable_short);
     if load_missing_tests_gate_record(&path).blocked {
         return None;
     }
@@ -2210,7 +2220,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
         stop_verify_block = stop_verify_reason(&state, &cfg, verify_nudge.is_some(), transcript);
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
-        missing_tests_gate = missing_tests_gate_reason(&state, &repo, &session, &cfg, env);
+        missing_tests_gate = missing_tests_gate_reason(&state, &repo, &stable_short, &cfg, env);
         // Issue #312: independent of the rot `Verdict` ladder above -- a
         // cost-driven tier of its own, gated on stale tool-result tokens and
         // window fraction, never on `score.verdict`.
@@ -4345,23 +4355,22 @@ fn run_pretool_bash_rewrite<W: Write>(
     w: &mut W,
     payload: &PreToolPayload,
     env: EnvLookup<'_>,
+    attested_verdict: Option<super::safety::Verdict>,
 ) -> CtxResult<i32> {
     let command = payload.tool_input.command.trim();
     if command.is_empty() {
         return Ok(0);
     }
-    let cwd = if !payload.cwd.is_empty() {
-        PathBuf::from(&payload.cwd)
-    } else {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Ok(0);
-        };
-        cwd
-    };
-    let cfg = cfg_or_operator_only_gate(&cwd, env);
-    let outcome =
-        super::safety::evaluate(&cfg.safety, command, super::adapters::LaunchMode::Headless);
-    if outcome.verdict != super::safety::Verdict::Allow {
+    // F1 (codex review fix): the rewrite/headless-allow logic below may only
+    // fire once the FULL attested/pinned safety check (`attested_verdict`,
+    // computed by the caller against both the launch snapshot and today's
+    // policy -- `safety::evaluate_with_attestation_evidence`) has itself
+    // resolved to `Allow`. Evaluating fresh, un-pinned config here (as
+    // before) could see today's home policy after an operator widened it
+    // mid-session, silently overriding the launch snapshot's stricter,
+    // pinned verdict -- the one `hook_output_with_extras` correctly (and
+    // deliberately) stays silent about under headless `dontAsk`.
+    if attested_verdict != Some(super::safety::Verdict::Allow) {
         return Ok(0);
     }
 
@@ -4470,9 +4479,22 @@ fn run_pretool_bash_or_powershell<W: Write>(
     payload: &PreToolPayload,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    let safety_envelope = parsed_hook_envelope_from(Path::new("."), env, |cfg, buf| {
-        super::safety::run_check_hook_mode_for_agent(cfg, buf, stdin, env, None)
+    // F1 (codex review fix): calls `run_check_hook_with_verdict` directly
+    // (the same function `run_check_hook_mode_for_agent`'s `agent: None` arm
+    // reduces to, so the rendered envelope is byte-for-byte unchanged) to
+    // also capture the REAL, pinned verdict -- needed below so
+    // `run_pretool_bash_rewrite` can gate its own rewrite/headless-allow
+    // logic on it even on the `dontAsk` path where the rendered envelope
+    // itself stays silent for a pinned-stricter `Ask` (see that function's
+    // own doc comment).
+    let cfg = CtxConfig::load(Path::new("."), env).ok();
+    let mut safety_buf: Vec<u8> = Vec::new();
+    let attested_verdict = cfg.as_ref().and_then(|cfg| {
+        super::safety::run_check_hook_with_verdict(cfg, &mut safety_buf, stdin, env)
+            .ok()
+            .flatten()
     });
+    let safety_envelope = parsed_json_envelope(safety_buf);
 
     let is_deny_or_ask = safety_envelope.as_ref().is_some_and(|value| {
         matches!(
@@ -4493,7 +4515,7 @@ fn run_pretool_bash_or_powershell<W: Write>(
     }
 
     let mut rewrite_buf: Vec<u8> = Vec::new();
-    run_pretool_bash_rewrite(&mut rewrite_buf, payload, env)?;
+    run_pretool_bash_rewrite(&mut rewrite_buf, payload, env, attested_verdict)?;
     let rewrite_envelope = parsed_json_envelope(rewrite_buf);
 
     match (safety_envelope, rewrite_envelope) {
@@ -4532,22 +4554,6 @@ fn parsed_json_envelope(buf: Vec<u8>) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_str(trimmed).ok()
-}
-
-/// Loads config from `cwd` and calls `f` with it and a fresh buffer, then
-/// parses whatever `f` wrote as one JSON envelope via [`parsed_json_envelope`].
-/// `None` on any doubt at all -- a config load failure, `f` itself returning
-/// `Err`, or `f`'s own output failing to parse -- never a hard failure passed
-/// up to the caller.
-fn parsed_hook_envelope_from(
-    cwd: &Path,
-    env: EnvLookup<'_>,
-    f: impl FnOnce(&CtxConfig, &mut Vec<u8>) -> CtxResult<i32>,
-) -> Option<serde_json::Value> {
-    let cfg = CtxConfig::load(cwd, env).ok()?;
-    let mut buf: Vec<u8> = Vec::new();
-    f(&cfg, &mut buf).ok()?;
-    parsed_json_envelope(buf)
 }
 
 /// Runs four independent guards against the same payload: the expensive-seat
@@ -12185,6 +12191,73 @@ capable a model does it actually need?",
         );
     }
 
+    /// F1 (codex review, cff7ff57 follow-up): a session launched with the
+    /// pinned snapshot's `default = Ask` (issue #139's attestation), whose
+    /// home policy was then widened to `allow` mid-session. The full
+    /// attested check (`evaluate_with_attestation_evidence`) correctly keeps
+    /// the snapshot's stricter `Ask` -- which `hook_output_with_extras` then
+    /// silences under headless `dontAsk` by design (deferring to claude's
+    /// own permission flow) -- so `run_pretool_bash_rewrite`'s own F7
+    /// explicit-allow fallback must NOT independently re-evaluate against
+    /// today's (widened) policy and print its own `allow`: that would bypass
+    /// the pinned verdict entirely. Silence here is the correct, fail-closed
+    /// outcome: claude's own `dontAsk` plus its static `--allowedTools` list
+    /// denies anything not explicitly allowed.
+    #[test]
+    fn run_pretool_bash_headless_allow_never_bypasses_a_pinned_stricter_snapshot() {
+        let repo = orchestrator_repo();
+        let snapshot_dir = tempfile::tempdir().expect("tempdir");
+        let snapshot_path = snapshot_dir.path().join("policy.json");
+        // The launch-time snapshot: the shipped default policy, whose
+        // headless `default` is `Ask` (see `SafetyPolicy::default`'s own doc
+        // comment).
+        let launch_policy = super::super::safety::SafetyPolicy::default();
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string(&launch_policy).expect("serializes"),
+        )
+        .expect("writes snapshot");
+        let fingerprint =
+            super::super::safety::policy_fingerprint(&launch_policy).expect("fingerprints");
+
+        let env: std::collections::HashMap<String, String> = [
+            (super::adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            // The operator widened the home policy AFTER this session's own
+            // launch pinned `ask` -- exactly issue #139's divergence case.
+            ("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string()),
+            (
+                super::super::safety::POLICY_FINGERPRINT_ENV.to_string(),
+                fingerprint,
+            ),
+            (
+                super::super::safety::POLICY_SNAPSHOT_ENV.to_string(),
+                snapshot_path.to_str().expect("utf8 path").to_string(),
+            ),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": "claude-session-id",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": repo.path().display().to_string(),
+            "permission_mode": "dontAsk",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat > f.py <<'EOF'\nprint(1)\nEOF"},
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_pretool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.trim().is_empty(),
+            "a pinned-stricter Ask must stay silent (fail-closed under dontAsk), never an \
+             explicit allow from the un-pinned fallback: {printed}"
+        );
+    }
+
     /// The same operator default, but NOT headless. Before issue #769 this
     /// meant `run_pretool_bash_rewrite`'s own F7 explicit-allow logic (gated
     /// on `HEADLESS_ENV`) stayed silent -- the SEPARATE `zirv ctx safety
@@ -13221,6 +13294,69 @@ capable a model does it actually need?",
                 .unwrap_or_default()
                 .contains("test"),
             "{parsed:?}"
+        );
+    }
+
+    /// F6 (codex review, cff7ff57 follow-up): the missing-tests gate's own
+    /// per-session block record used to be keyed by the ROTATING session id
+    /// (`env(SESSION_ENV)`/`payload.session_id`), which changes on every
+    /// supervised restart -- so the gate could fire again after a restart
+    /// despite its own "blocks at most once per session, full stop"
+    /// contract. `stable_short` (issue #243) is computed in this same
+    /// `run_stop` block from `SOCKET_ENV`'s file stem, which stays bound
+    /// for the life of the whole supervised run across a restart -- exactly
+    /// the identifier this gate needed and `run_stop` already had in hand.
+    #[test]
+    fn missing_tests_gate_never_blocks_twice_across_a_supervised_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+
+        let state = dir.path().join("state");
+        let stable_short = "aaaa1111";
+        let socket_path = state.join("sockets").join(format!("{stable_short}.sock"));
+        let base_env: Vec<(String, String)> = vec![
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            (SOCKET_ENV.to_string(), socket_path.display().to_string()),
+        ];
+
+        // First run of the supervised session.
+        let mut env: std::collections::HashMap<String, String> = base_env.iter().cloned().collect();
+        env.insert(
+            SESSION_ENV.to_string(),
+            "session-before-restart".to_string(),
+        );
+        let stdin = stop_payload(&transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(
+            parsed["decision"], "block",
+            "the first stop with a missing-tests change set must block: {parsed:?}"
+        );
+
+        // A supervised restart: the SAME socket (`stable_short`), a
+        // DIFFERENT (rotated) session id, the identical still-test-less
+        // change set.
+        let mut env: std::collections::HashMap<String, String> = base_env.into_iter().collect();
+        env.insert(SESSION_ENV.to_string(), "session-after-restart".to_string());
+        let stdin = stop_payload(&transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("no test of its own"),
+            "the gate must not block a second time after a supervised restart, keyed only by a \
+             rotated session id: {text}"
         );
     }
 

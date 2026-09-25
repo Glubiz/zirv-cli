@@ -697,6 +697,33 @@ fn transcript_events(
     let Ok(mut file) = std::fs::File::open(transcript) else {
         return cached.events;
     };
+    // F3 (codex review fix): `current_len`/`current_mtime` above are the
+    // CALLER's own stat of `transcript`'s path, taken before this
+    // `File::open` -- a window in which the path can be unlinked and
+    // replaced (log rotation, a rewritten checkpoint) before the open
+    // resolves it, landing this handle on a DIFFERENT underlying file than
+    // the one `cached` was validated against. Re-checked here from the OPEN
+    // HANDLE's own metadata instead (a rename never affects an already-open
+    // file description, so this is immune to a later replace of the path):
+    // a handle length shorter than `cached.parsed_len` proves a seek to
+    // that offset would not land on a continuation of the cached file at
+    // all, and a handle mtime that no longer matches what the caller
+    // observed just before the open proves the file underneath the path
+    // moved between that stat and this open -- either way, this restarts
+    // from a fresh, empty entry (never blindly seeks a stranger file's tail
+    // onto the old file's cached events) exactly like an ordinary
+    // shrunk-file rotation.
+    let handle_meta = file.metadata().ok();
+    let handle_len = handle_meta.as_ref().map(std::fs::Metadata::len);
+    let handle_mtime_key = handle_meta
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(mtime_key);
+    if handle_len.is_some_and(|len| len < cached.parsed_len)
+        || handle_mtime_key != current_mtime_key
+    {
+        cached = fresh();
+    }
     if file.seek(SeekFrom::Start(cached.parsed_len)).is_err() {
         return cached.events;
     }
@@ -715,9 +742,34 @@ fn transcript_events(
         return cached.events;
     };
 
+    // F2 (codex review fix): a live transcript can be read mid-append, so
+    // `text` may end with a partial JSON row with no trailing `\n` yet.
+    // `extract_usage_events`'s own `str::lines()` still yields that trailing
+    // partial row as its own line, fails to parse it as JSON, and silently
+    // skips it -- but `consumed` used to cover it regardless, permanently
+    // losing that row's usage once the rest of it lands (the next read
+    // starts AFTER it, so only the suffix is ever parsed). Held back here
+    // instead: a trailing, `\n`-less line that fails to parse as a complete
+    // JSON value is trimmed off `text` before anything is counted as
+    // consumed, so the next call re-reads it whole. A trailing `\n`-less
+    // line that DOES parse as complete JSON (an ordinary finished session's
+    // last write, which commonly omits the final newline) is unaffected --
+    // still consumed immediately, exactly as before.
+    let mut text = text.as_str();
+    if !text.ends_with('\n') {
+        let last_line_start = text.rfind('\n').map_or(0, |idx| idx + 1);
+        let last_line = text[last_line_start..].trim();
+        if !last_line.is_empty() && serde_json::from_str::<Value>(last_line).is_err() {
+            text = &text[..last_line_start];
+        }
+    }
+    if text.is_empty() {
+        return cached.events;
+    }
+
     let mut last_id = cached.last_response_id.take();
     let consumed = text.len() as u64;
-    extract_usage_events(&text, &mut last_id, &mut cached.events);
+    extract_usage_events(text, &mut last_id, &mut cached.events);
     cached.parsed_len += consumed;
     cached.mtime_nanos = current_mtime_key;
     cached.last_response_id = last_id;
@@ -3221,6 +3273,123 @@ mod tests {
         assert_eq!(
             second.five_hour, 900,
             "a same-length rewrite with a new mtime must be reparsed, not served from the stale cache"
+        );
+    }
+
+    /// F3 (codex review, cff7ff57 follow-up): a stat/open race. A caller
+    /// stats `transcript`'s path (file A) and passes that snapshot in as
+    /// `current_len`/`current_mtime`, but by the time this function's own
+    /// `File::open` resolves the path, it has been replaced with a
+    /// DIFFERENT, unrelated file (B, log rotation or a rewritten
+    /// checkpoint). Before this fix, the stale `cached.parsed_len` from A
+    /// was seeked into the freshly-opened B regardless -- when B is at
+    /// least that long (as here), the bytes read from that offset are B's
+    /// own unrelated content, not a continuation of A, and got appended
+    /// onto A's already-cached events as if they were. Simulated
+    /// deterministically (no real race needed) by calling `transcript_events`
+    /// directly with a stale, pre-replace `current_mtime` against a path
+    /// that has since been overwritten.
+    #[test]
+    fn transcript_events_restarts_from_zero_when_the_open_handle_disagrees_with_the_caller_stat() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        let transcript = projects.join("sess.jsonl");
+        let original = transcript_with_ages(now, &[600], 100);
+        std::fs::write(&transcript, &original).expect("write original");
+        let stale_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&transcript)
+            .expect("reopen for mtime pin")
+            .set_modified(stale_mtime)
+            .expect("pin mtime");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let original_len = original.len() as u64;
+        let first = transcript_events(&state, &transcript, original_len, Some(stale_mtime));
+        assert_eq!(first.len(), 1);
+
+        // Replace the path with an entirely unrelated, LONGER file -- three
+        // rows nothing to do with the original, the way a rewritten
+        // checkpoint might land. Its real mtime is left as "now" (whatever
+        // this write sets it to), deliberately NOT pinned, so it provably
+        // differs from `stale_mtime` below.
+        let replacement = transcript_with_ages(now, &[900, 800, 700], 9999);
+        assert!(
+            (replacement.len() as u64) >= original_len,
+            "the replacement must be at least as long as the original for this test to exercise \
+             a successful seek into it, not just an empty read past EOF"
+        );
+        std::fs::write(&transcript, &replacement).expect("write replacement");
+
+        // Deliberately pass a `current_len` that forces the incremental
+        // (open+seek) path -- not the "nothing changed" fast path that
+        // never opens the file at all -- alongside the STALE, pre-replace
+        // mtime: exactly what a caller that stat'd path A just before the
+        // replace, and is only now asking this function to process it,
+        // would still be holding.
+        let events = transcript_events(&state, &transcript, original_len + 1, Some(stale_mtime));
+        assert_eq!(
+            events.len(),
+            3,
+            "the replacement file's own three fresh rows, never the stale first row glued to a \
+             slice of the replacement's unrelated tail bytes: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event.input_tokens == 9999),
+            "every counted row must be the replacement's own, not a stale or spliced one: \
+             {events:?}"
+        );
+    }
+
+    /// F2 (codex review, cff7ff57 follow-up): a live transcript can be read
+    /// mid-append, leaving a partial, unterminated JSON row as the last
+    /// bytes on disk. Before this fix, that row was silently skipped (it
+    /// fails to parse) but `parsed_len` still advanced past it, so once the
+    /// writer finished appending the rest of the row, the next read started
+    /// AFTER it and only ever saw the row's suffix -- that row's usage was
+    /// lost for good, not merely delayed.
+    #[test]
+    fn a_partial_trailing_row_is_held_back_until_it_completes_not_lost() {
+        let now = 1_785_507_315;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        let transcript = projects.join("sess.jsonl");
+
+        let complete = transcript_with_ages(now, &[600], 100);
+        let full_second_row = transcript_with_ages(now, &[500], 50);
+        // Simulate a writer mid-append: the second row's bytes are cut
+        // short, with no closing brace and no trailing newline.
+        let partial_row = &full_second_row[..full_second_row.len() - 15];
+        assert!(
+            !partial_row.ends_with('\n'),
+            "the fixture itself must be a genuinely unterminated partial row"
+        );
+        std::fs::write(&transcript, format!("{complete}{partial_row}")).expect("write partial");
+
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let first = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(
+            first.five_hour, 100,
+            "the partial trailing row must not be counted while it is still incomplete"
+        );
+
+        // The writer finishes the row and appends its trailing newline.
+        std::fs::write(&transcript, format!("{complete}{full_second_row}"))
+            .expect("write completed");
+
+        let second = sum_transcripts(&state, &projects, now, false);
+        assert_eq!(
+            second.five_hour, 150,
+            "the row must be counted once it completes, not lost because parsed_len already \
+             skipped past its partial bytes"
         );
     }
 
