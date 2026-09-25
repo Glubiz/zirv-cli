@@ -19,8 +19,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{NormalizedEvent, SessionId, SessionRef, TranscriptUsage};
+use super::event::{NormalizedEvent, SessionId, SessionRef, TranscriptUsage, input_hash};
 use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
@@ -843,14 +845,16 @@ fn headless_argv_len(command: &Command) -> usize {
 /// stays byte-identical to one built before this table existed.
 ///
 /// `prompt` is `None` only when this run's own prompt text is genuinely
-/// unknown here (a bare resume with no new text) -- effort classification is
-/// skipped in that case, since there is nothing to classify; the TTL lever
-/// does not need it at all.
+/// unknown here (a bare resume with no new text). `state`/`session` key the
+/// sticky effort decision -- see [`sticky_headless_effort`] -- and are
+/// otherwise unused by the TTL lever.
 fn apply_headless_cost_levers(
     command: &mut Command,
     cfg: &CtxConfig,
     adapter_name: &str,
     prompt: Option<&str>,
+    state: &StateDir,
+    session: &SessionId,
 ) {
     if adapter_name != "claude" {
         return;
@@ -868,9 +872,6 @@ fn apply_headless_cost_levers(
             command.env("CLAUDE_CODE_PROMPT_CACHE_TTL", ttl);
         }
     }
-    let Some(prompt) = prompt else {
-        return;
-    };
     if std::env::var("CLAUDE_CODE_EFFORT_LEVEL").is_ok() {
         return;
     }
@@ -878,14 +879,94 @@ fn apply_headless_cost_levers(
         let arg = arg.to_string_lossy();
         arg == "--effort" || arg.starts_with("--effort=")
     });
-    if argv_has_effort {
+    if argv_has_effort || headless.effort == super::config::HeadlessEffortConfig::default() {
         return;
     }
-    let Some(classification) = super::proxy::decision::try_classify_request(prompt) else {
+    if let Some(effort) = sticky_headless_effort(state, session, headless, prompt) {
+        command.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    }
+}
+
+/// Issue #788 follow-up (benchmark-verified): the effort lever's decision for
+/// `session`'s WHOLE conversation, decided ONCE -- at its first headless
+/// launch -- and replayed byte-identically for every later launch of the SAME
+/// session id (a `--resume` relaunch, an in-place compaction, any other
+/// relaunch that keeps the id), regardless of that later launch's own prompt
+/// text, and even when it has none (`prompt == None`, a bare resume with
+/// nothing new to say). A benchmarked 9-step resume chain that let effort
+/// flip between turns wrote 164k prompt-cache tokens; pinned to the first
+/// turn's decision, the same chain wrote 49k -- flipping `CLAUDE_CODE_
+/// EFFORT_LEVEL` mid-conversation invalidates Claude's WHOLE prompt cache,
+/// not just this turn's own addition to it.
+///
+/// Both the read and the write are best-effort: any state-dir I/O doubt --
+/// missing, corrupt, unwritable -- falls back to today's behaviour, classify
+/// THIS launch from its own prompt and record nothing, since supervision
+/// must stay a pure passthrough on failure here (never `unwrap`/`expect`).
+fn sticky_headless_effort(
+    state: &StateDir,
+    session: &SessionId,
+    headless: &super::config::HeadlessConfig,
+    prompt: Option<&str>,
+) -> Option<String> {
+    let record_path = headless_effort_record_path(state, session);
+    if let Some(record) = load_headless_effort_record(&record_path) {
+        return record.effort;
+    }
+    let effort = prompt
+        .and_then(super::proxy::decision::try_classify_request)
+        .and_then(|classification| headless_effort_for(&headless.effort, classification.complexity))
+        .map(str::to_string);
+    save_headless_effort_record(
+        state,
+        &record_path,
+        &HeadlessEffortRecord {
+            effort: effort.clone(),
+        },
+    );
+    effort
+}
+
+/// The persisted record [`sticky_headless_effort`] reads and writes.
+/// `effort` is `None` when the first launch's own classification produced no
+/// configured value for its complexity class -- still a real, sticky
+/// decision ("no effort" for this whole conversation), not a signal to
+/// reclassify on the next launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HeadlessEffortRecord {
+    effort: Option<String>,
+}
+
+/// `<state>/headless-effort/<hash of session id>.json`, mirroring `hook.rs`'s
+/// `adoption_record_path`/`status.rs`'s `status_snapshot_path` exactly.
+fn headless_effort_record_path(state: &StateDir, session: &SessionId) -> PathBuf {
+    state
+        .headless_effort()
+        .join(format!("{:016x}.json", input_hash(session.as_str())))
+}
+
+/// Best-effort, like `hook.rs`'s `load_adoption_record`: missing, corrupt, or
+/// otherwise unreadable all read as "no decision recorded yet" (`None`)
+/// rather than an error.
+fn load_headless_effort_record(path: &Path) -> Option<HeadlessEffortRecord> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Best-effort, like `hook.rs`'s `save_adoption_record`: a record that fails
+/// to write costs the NEXT launch of this session a re-classification (the
+/// pre-fix behaviour), never this launch's own success. Prunes the directory
+/// to `KEEP_NEWEST` after a successful write, the same retention `adoption()`/
+/// `intake()` get (`hook.rs::claim_first_prompt`).
+fn save_headless_effort_record(state: &StateDir, path: &Path, record: &HeadlessEffortRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
         return;
     };
-    if let Some(effort) = headless_effort_for(&headless.effort, classification.complexity) {
-        command.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    if super::state::write_private(path, &json).is_ok() {
+        super::state::prune_to_newest(&state.headless_effort(), super::state::KEEP_NEWEST);
     }
 }
 
@@ -1935,11 +2016,25 @@ fn run_with_clock_inner<W: Write>(
         if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
             && let Some(mut command) = adapter.headless_cmd_stdin(session, extra)
         {
-            apply_headless_cost_levers(&mut command, &cfg, adapter.name(), Some(&prompt_text));
+            apply_headless_cost_levers(
+                &mut command,
+                &cfg,
+                adapter.name(),
+                Some(&prompt_text),
+                &state,
+                session,
+            );
             return Ok((command, Some(prompt_text)));
         }
         let mut probe = probe;
-        apply_headless_cost_levers(&mut probe, &cfg, adapter.name(), Some(&prompt_text));
+        apply_headless_cost_levers(
+            &mut probe,
+            &cfg,
+            adapter.name(),
+            Some(&prompt_text),
+            &state,
+            session,
+        );
         Ok((probe, None))
     };
 
@@ -2003,7 +2098,14 @@ fn run_with_clock_inner<W: Write>(
                 .collect(),
         );
         let mut command = build_command(&argv, repo)?;
-        apply_headless_cost_levers(&mut command, &cfg, adapter.name(), prompt.as_deref());
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            adapter.name(),
+            prompt.as_deref(),
+            &state,
+            &session,
+        );
         (command, None)
     };
     apply_session_env(&mut command, &session);
@@ -2423,6 +2525,14 @@ fn run_with_clock_inner<W: Write>(
                         prompt_via_stdin,
                     )?;
                     compact.current_dir(repo);
+                    apply_headless_cost_levers(
+                        &mut compact,
+                        &cfg,
+                        adapter.name(),
+                        Some(compact_prompt),
+                        &state,
+                        &session,
+                    );
                     apply_session_env(&mut compact, &session);
                     Some((compact, stdin_prompt))
                 },
@@ -2451,6 +2561,14 @@ fn run_with_clock_inner<W: Write>(
                     )
                 })?;
                 command.current_dir(repo);
+                apply_headless_cost_levers(
+                    &mut command,
+                    &cfg,
+                    adapter.name(),
+                    Some(&continuation),
+                    &state,
+                    &session,
+                );
                 apply_session_env(&mut command, &session);
                 Ok((command, stdin_prompt))
             });
@@ -4768,9 +4886,19 @@ mod tests {
             ("CLAUDE_CODE_EFFORT_LEVEL", None),
         ]);
         let cfg = CtxConfig::default();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
         let mut command = Command::new("claude");
         command.arg("-p").arg("do a small thing");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("do a small thing"));
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("do a small thing"),
+            &state,
+            &session,
+        );
         assert_eq!(
             command.get_envs().count(),
             0,
@@ -4791,9 +4919,18 @@ mod tests {
         ]);
         let mut cfg = CtxConfig::default();
         cfg.headless.prompt_cache_ttl = Some("1h".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
 
         let mut command = Command::new("claude");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", None);
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            None,
+            &state,
+            &SessionId::new_v4(),
+        );
         let ttl = command
             .get_envs()
             .find(|(key, _)| *key == "CLAUDE_CODE_PROMPT_CACHE_TTL")
@@ -4803,7 +4940,14 @@ mod tests {
         let _operator_env =
             crate::commands::ctx::testenv::VarGuard::set(&[("FORCE_PROMPT_CACHING_5M", Some("1"))]);
         let mut command = Command::new("claude");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", None);
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            None,
+            &state,
+            &SessionId::new_v4(),
+        );
         assert_eq!(
             command.get_envs().count(),
             0,
@@ -4823,9 +4967,18 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.headless.effort.trivial = Some("low".to_string());
         // `bounded` is deliberately left unset.
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
 
         let mut command = Command::new("claude");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
         let effort = command
             .get_envs()
             .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
@@ -4836,9 +4989,18 @@ mod tests {
             "a short, unenumerated request classifies Trivial"
         );
 
+        // A different session id, so this is a fresh classification and not
+        // the first call's record being replayed.
         let bounded_request = "word ".repeat(150);
         let mut command = Command::new("claude");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", Some(&bounded_request));
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &SessionId::new_v4(),
+        );
         assert_eq!(
             command.get_envs().count(),
             0,
@@ -4874,6 +5036,8 @@ mod tests {
     fn apply_headless_cost_levers_skips_effort_when_the_operator_env_or_argv_already_wins() {
         let mut cfg = CtxConfig::default();
         cfg.headless.effort.trivial = Some("low".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
 
         {
             let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
@@ -4881,7 +5045,14 @@ mod tests {
                 Some("high"),
             )]);
             let mut command = Command::new("claude");
-            apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+            apply_headless_cost_levers(
+                &mut command,
+                &cfg,
+                "claude",
+                Some("fix the typo"),
+                &state,
+                &SessionId::new_v4(),
+            );
             assert_eq!(
                 command.get_envs().count(),
                 0,
@@ -4893,11 +5064,173 @@ mod tests {
             crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
         let mut command = Command::new("claude");
         command.arg("--effort").arg("max");
-        apply_headless_cost_levers(&mut command, &cfg, "claude", Some("fix the typo"));
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
         assert_eq!(
             command.get_envs().count(),
             0,
             "an argv that already carries --effort must win"
+        );
+    }
+
+    /// Issue #788 follow-up: a second launch of the SAME session, whose own
+    /// prompt would classify to a DIFFERENT configured effort than the first
+    /// launch's, keeps the first launch's decision -- a resume must never
+    /// flip `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation, since that
+    /// invalidates the whole prompt cache.
+    #[test]
+    fn apply_headless_cost_levers_keeps_the_first_launchs_effort_across_a_differently_classified_resume()
+     {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.bounded = Some("medium".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "the first launch classifies Trivial"
+        );
+
+        // A resume of the SAME session, with a prompt that on its own would
+        // classify Bounded.
+        let bounded_request = "word ".repeat(150);
+        let mut resumed = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut resumed,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            resumed
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "a resume of the SAME session must replay the first launch's effort, not reclassify \
+             its own differently-sized prompt"
+        );
+    }
+
+    /// Issue #788 follow-up: a bare resume with no new prompt text
+    /// (`prompt == None`) of an ALREADY-decided session must still get that
+    /// session's recorded effort -- not silently skip the lever, which would
+    /// itself be a flip (configured effort, then none).
+    #[test]
+    fn apply_headless_cost_levers_reuses_the_recorded_effort_when_a_resume_has_no_new_prompt() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low"))
+        );
+
+        let mut resumed = Command::new("claude");
+        apply_headless_cost_levers(&mut resumed, &cfg, "claude", None, &state, &session);
+        assert_eq!(
+            resumed
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "prompt == None on a resume of the SAME session must reuse the recorded effort, not \
+             skip the lever"
+        );
+    }
+
+    /// Issue #788 follow-up: a DIFFERENT session id has no recorded decision
+    /// yet, so it classifies its own prompt fresh rather than inheriting
+    /// another, unrelated session's record.
+    #[test]
+    fn apply_headless_cost_levers_classifies_fresh_for_a_different_session_id() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.bounded = Some("medium".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let session_a = SessionId::new_v4();
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session_a,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low"))
+        );
+
+        let session_b = SessionId::new_v4();
+        let bounded_request = "word ".repeat(150);
+        let mut second = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut second,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &session_b,
+        );
+        assert_eq!(
+            second
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("medium")),
+            "a DIFFERENT session id must classify its own prompt fresh, not inherit another \
+             session's record"
         );
     }
 
@@ -6603,6 +6936,60 @@ mod tests {
             transcripts_in(&home).len(),
             1,
             "same session, same transcript"
+        );
+    }
+
+    #[test]
+    fn a_verified_compaction_keeps_the_sessions_headless_effort() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "abababab-3333-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        let effort_log = tmp.path().join("effort.log");
+        std::fs::write(
+            &modes,
+            "compact-tier
+healthy
+",
+        )
+        .expect("write modes");
+        let mut env = base_env(&state);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        );
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+        env.insert(
+            "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL".to_string(),
+            "low".to_string(),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("30")),
+            ("FAKE_AGENT_EFFORT_ENV_LOG", effort_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let efforts = std::fs::read_to_string(&effort_log).expect("effort log");
+        assert_eq!(
+            efforts.lines().collect::<Vec<_>>(),
+            ["low", "low", "low"],
+            "the first, compact and continuation launches share one effort"
         );
     }
 

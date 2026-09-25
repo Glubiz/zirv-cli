@@ -1023,6 +1023,19 @@ impl StateDir {
         self.0.join("intake")
     }
 
+    /// Issue #788 follow-up: the `[headless.effort]` lever's decision, made
+    /// ONCE at a session's first headless launch and replayed for every later
+    /// launch of the SAME session id (`--resume`, in-place compaction) --
+    /// one record per session id (`<state>/headless-effort/<hash>.json`),
+    /// mirroring `adoption()`'s own per-session layout. Flipping the
+    /// classified effort mid-conversation invalidates Claude's whole prompt
+    /// cache, so this exists to make the decision sticky rather than
+    /// re-derived from each relaunch's own, possibly differently classified,
+    /// prompt text. See `exec.rs`'s `sticky_headless_effort`.
+    pub fn headless_effort(&self) -> PathBuf {
+        self.0.join("headless-effort")
+    }
+
     /// Issue #246: `status --diff`'s per-session snapshot of the previous
     /// `--diff` call's rendered sections, one file per session id
     /// (`<state>/status-snapshots/<session-id>.json`), mirroring

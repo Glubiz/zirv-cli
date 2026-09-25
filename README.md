@@ -4236,6 +4236,8 @@ this table existed.
 
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
 
+The effort decision is made ONCE, from the FIRST headless launch of a conversation, and every later launch of that SAME session -- a `--resume`, an in-place compaction, any other relaunch that keeps the id -- reuses it regardless of its own prompt text, including a bare resume with no new prompt at all. Changing `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation invalidates Claude's whole prompt cache, not just that turn's own addition to it, so re-classifying every launch independently was actively counter-productive.
+
 #### Tool-output compaction
 
 `zirv setup` installs the claude `PostToolUse` hook: a large `Bash` result is
