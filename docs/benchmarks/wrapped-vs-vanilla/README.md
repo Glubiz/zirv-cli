@@ -17,18 +17,37 @@ Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
   operator's own global zirv hooks can't leak in) and restates
   `bypassPermissions` explicitly, so the plugin's own `SessionStart` hook
   still runs.
-- `zirv` -- `zirv ctx exec --agent claude --prompt <prompt> -- ...`.
-- `zirv-proxy` -- `zirv ctx proxy --json <prompt>` first (to pick a seat
-  tier / model and optionally start a workflow), then launches like `zirv`
-  with a `[zirv proxy]` layer prepended to the prompt.
-- `zirv-jev-full` (issue #758) -- identical launch to `zirv-proxy`, with
-  every `[jev]` advisory gate (`config.rs::JevConfig`: `memory`,
-  `supervisor`, `dispatch`, `review`, `gates`, `context`,
-  `intake_savings`, `review_reuse`, `harvest_screen`, `admin_dispatch`)
-  turned on via `ZIRV_CTX_JEV_*` env vars for the proxy call, the
-  workflow start, and the exec launch alike -- isolates every advisory
-  site's effect beyond zirv-proxy's own intake routing. Needs a Jev
-  credential in the environment, same as `zirv-proxy`.
+- `zirv` -- `zirv ctx exec --agent claude --prompt <prompt> -- ...`, no proxy
+  call at all.
+- `zirv-nojev` -- the fair "zirv minus Jev" baseline for `zirv-jev-full`
+  (issue #537 headless follow-up). Launches exactly like `zirv-jev-full`: a
+  headless `zirv ctx proxy --json --headless <prompt>` call first (to pick a
+  seat tier / model and optionally start a workflow), then launches like
+  `zirv` with a `[zirv proxy]` layer prepended to the prompt -- but with
+  every `[jev]` advisory gate forced `false` AND the Jev credential removed
+  from the child environment (`cond_env_for`), so `jev::available` is false
+  at every site regardless of what the calling shell or `~/.zirv/ctx.toml`
+  happen to hold, and the proxy always resolves through the deterministic
+  decider. `--headless` (issue #537) tells the proxy this is an unattended
+  launch, so an `orchestrated`/`Orchestrator` decision downgrades to
+  `bounded`/single-seat instead of routing a headless benchmark run to a
+  team it has nobody to run past.
+- `zirv-proxy` -- the same headless-proxy launch shape as `zirv-nojev`, with
+  the `[jev]` gates simply left unset rather than forced off. Kept for
+  historical grids; `zirv-nojev` is the condition to pair against
+  `zirv-jev-full` going forward, since the two then differ ONLY by whether
+  `[jev]` is on.
+- `zirv-jev-full` (issue #758) -- identical launch to `zirv-proxy`/
+  `zirv-nojev` (same headless proxy call), with every `[jev]` advisory gate
+  (`config.rs::JevConfig`: `memory`, `supervisor`, `dispatch`, `review`,
+  `gates`, `context`, `intake_savings`, `review_reuse`, `harvest_screen`,
+  `admin_dispatch`, `approve`, `approve_allow`, `classify`,
+  `handoff_select`, `inject_screen`, `inject`, `stop_verify`,
+  `missing_tests`, `launch_effort`, `compaction_select`) turned on via
+  `ZIRV_CTX_JEV_*` env vars for the proxy call, the workflow start, and the
+  exec launch alike -- isolates every advisory site's effect beyond
+  `zirv-nojev`'s own model/seat/workflow routing. Needs a Jev credential in
+  the environment, same as `zirv-proxy`.
 - `zirv-jev-<gate>` (issue #758) -- same as `zirv-jev-full` but with only
   that one gate on, e.g. `zirv-jev-memory`, `zirv-jev-dispatch`. Cheap
   per-gate ablations for deciding which gates earn default-on status.
@@ -129,18 +148,25 @@ that crosses into a run's repo).
 ## Measuring the `[jev]` gates (issue #758, not yet run)
 
 ```
-python run.py --tasks all --conds vanilla,zirv,zirv-proxy,zirv-jev-full --reps 3 --model sonnet --parallel 3 \
+python run.py --tasks all --conds vanilla,zirv-nojev,zirv-jev-full --reps 3 --model sonnet --parallel 3 \
   --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
 python aggregate.py --runs runs --out report-jev-full-sonnet.md
 ```
 
+`zirv-nojev`, not `zirv-proxy`, is the right baseline here: both it and
+`zirv-jev-full` call the same headless proxy and launch the same way, so the
+grid isolates the `[jev]` gates' own effect rather than also picking up
+whatever the calling shell happened to have set for the Jev credential.
+
 Or list individual `zirv-jev-<gate>` conditions (any subset of `memory`,
 `supervisor`, `dispatch`, `review`, `gates`, `context`, `intake_savings`,
-`review_reuse`, `harvest_screen`, `admin_dispatch`) alongside `zirv-proxy`
-for a cheaper per-gate ablation:
+`review_reuse`, `harvest_screen`, `admin_dispatch`, `approve`,
+`approve_allow`, `classify`, `handoff_select`, `inject_screen`, `inject`,
+`stop_verify`, `missing_tests`, `launch_effort`, `compaction_select`)
+alongside `zirv-nojev` for a cheaper per-gate ablation:
 
 ```
-python run.py --tasks all --conds vanilla,zirv-proxy,zirv-jev-memory,zirv-jev-dispatch \
+python run.py --tasks all --conds vanilla,zirv-nojev,zirv-jev-memory,zirv-jev-dispatch \
   --reps 3 --model sonnet --parallel 3 \
   --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
 python aggregate.py --runs runs --out report-jev-ablation-sonnet.md

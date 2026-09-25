@@ -5,29 +5,54 @@ the zirv proxy / Jev intake layer) wrapping claude.
 Conditions:
   vanilla        -- claude -p directly, prompt on stdin.
   zirv           -- zirv ctx exec --agent claude --prompt <prompt> -- ...
-  zirv-proxy     -- runs `zirv ctx proxy --json <prompt>` first (headless
-                     `zirv ctx exec` skips the `zirv chat` Jev intake step),
-                     maps the decided seat_tier to a claude model, optionally
-                     starts a workflow, prepends a `[zirv proxy]` layer to the
-                     prompt, then launches exactly like `zirv`.
-  zirv-jev-full  -- identical to zirv-proxy (same proxy call, same launch),
-                     with every `[jev]` advisory gate (issue #537's site
-                     list: memory, supervisor, dispatch, review, gates,
-                     context, intake_savings, review_reuse, harvest_screen,
-                     admin_dispatch) turned on via `ZIRV_CTX_JEV_*` env vars
-                     for the proxy call, the workflow start, and the exec
-                     launch alike -- see `jev.rs`/`config.rs` for the gate
-                     list. Isolates every advisory site's combined effect
-                     beyond zirv-proxy's own model/seat/workflow routing.
+                     (no proxy call at all -- the plain wrapped harness).
+  zirv-nojev     -- launches exactly like zirv-proxy/zirv-jev-full: a headless
+                     `zirv ctx proxy --json --headless <prompt>` call first
+                     (issue #537's headless single-seat flag -- an
+                     `orchestrated`/`Orchestrator` decision downgrades to
+                     `bounded`/single-seat, since a headless benchmark run
+                     has nobody to run a spawned team past), maps the decided
+                     seat_tier to a claude model, optionally starts a
+                     workflow, prepends a `[zirv proxy]` layer to the prompt,
+                     then launches like `zirv` -- but with every `[jev]`
+                     advisory gate forced `false` AND the Jev credential
+                     removed from the child environment (`cond_env_for`), so
+                     `jev::available` is false at every site regardless of
+                     what the calling shell or ~/.zirv/ctx.toml happen to
+                     hold and the proxy always resolves through the
+                     deterministic decider. This is the fair "zirv minus
+                     Jev" baseline for zirv-jev-full: the two now differ ONLY
+                     by whether `[jev]` is on, never by whether the proxy/
+                     workflow/model-routing machinery runs at all.
+  zirv-proxy     -- same launch shape as zirv-nojev (headless proxy call,
+                     optional workflow, `[zirv proxy]` layer), with the
+                     `[jev]` gates simply left unset (not forced either way)
+                     -- kept for historical grids; zirv-nojev is the
+                     deliberately-forced-off condition to pair against
+                     zirv-jev-full.
+  zirv-jev-full  -- identical to zirv-proxy/zirv-nojev (same headless proxy
+                     call, same launch), with every `[jev]` advisory gate
+                     (issue #537's site list: memory, supervisor, dispatch,
+                     review, gates, context, intake_savings, review_reuse,
+                     harvest_screen, admin_dispatch, plus issues #781-#786's
+                     approve, approve_allow, classify, handoff_select,
+                     inject_screen, inject, stop_verify, plus
+                     missing_tests, launch_effort, compaction_select) turned
+                     on via `ZIRV_CTX_JEV_*` env vars for the proxy call, the
+                     workflow start, and the exec launch alike -- see
+                     `jev.rs`/`config.rs` for the gate list. Isolates every
+                     advisory site's combined effect beyond zirv-nojev's own
+                     model/seat/workflow routing.
   zirv-jev-<gate> -- same as zirv-jev-full but with only that one `[jev]`
                      gate on, e.g. zirv-jev-memory, zirv-jev-dispatch. Cheap
                      per-gate ablations for deciding which gates earn
                      default-on status (issue #758).
 
-Every `zirv-jev-*` condition needs a Jev credential (`TYPESAFE_API_KEY` by
-default) exported in the environment this script runs in, same as
-zirv-proxy -- gate env vars alone never make an advisory site active,
-`jev::available` also has to see the credential.
+Every `zirv-jev-*`/zirv-proxy condition needs a Jev credential
+(`TYPESAFE_API_KEY` by default) exported in the environment this script runs
+in -- gate env vars alone never make an advisory site active, `jev::
+available` also has to see the credential. zirv-nojev is the one exception:
+it removes that credential outright (see `cond_env_for`), by design.
 
 See CONTRACT.md in this directory for the full spec. stdlib only (3.11).
 """
@@ -65,6 +90,13 @@ JEV_GATE_KEYS = [
     # Issues #781-#786 (PR #790).
     "approve", "approve_allow", "classify", "handoff_select", "inject_screen",
     "inject", "stop_verify",
+    # Issue #537 headless follow-up: landing in parallel with this benchmark
+    # round (ZIRV_CTX_JEV_MISSING_TESTS / ZIRV_CTX_JEV_LAUNCH_EFFORT /
+    # ZIRV_CTX_JEV_COMPACTION_SELECT via jev_env_var) -- listed here ahead of
+    # the binary that reads them landing so zirv-jev-full/zirv-nojev are
+    # ready to turn them on/off the moment it does; an unrecognised env var
+    # on a binary that doesn't know it yet is a harmless no-op.
+    "missing_tests", "launch_effort", "compaction_select",
 ]
 JEV_FULL_COND = "zirv-jev-full"
 # zirv-nojev launches exactly like zirv but with Jev fully off: every gate
@@ -74,9 +106,15 @@ NOJEV_COND = "zirv-nojev"
 JEV_CREDENTIAL_ENV = "TYPESAFE_API_KEY"
 JEV_GATE_CONDS = [f"zirv-jev-{g}" for g in JEV_GATE_KEYS]
 JEV_ABLATION_CONDS = [JEV_FULL_COND] + JEV_GATE_CONDS
-# zirv-jev-full/zirv-jev-<gate> launch exactly like zirv-proxy: a
-# `zirv ctx proxy --json` call first, then the same `zirv ctx exec` shape.
-JEV_PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
+# zirv-nojev/zirv-jev-full/zirv-jev-<gate> all launch exactly like
+# zirv-proxy: a headless `zirv ctx proxy --json --headless` call first, then
+# the same `zirv ctx exec` shape. zirv-nojev belongs here -- without it, this
+# harness's headline zirv-nojev-vs-zirv-jev-full comparison silently compared
+# "no proxy/workflow/model-routing at all" against "proxy + every [jev] gate
+# on", conflating the Jev advisory layer's own effect with the proxy's
+# routing machinery. Both now differ ONLY by which `[jev]` gates are on
+# (`cond_env_for`), never by whether the proxy runs at all.
+JEV_PROXY_LIKE_CONDS = {"zirv-proxy", NOJEV_COND, *JEV_ABLATION_CONDS}
 # The operator's `[headless]` cost levers (issue #788: prompt-cache TTL,
 # effort by intake class, lean launch), set on every zirv condition through
 # their `ZIRV_CTX_HEADLESS_*` env vars so a grid never depends on what the
@@ -959,8 +997,19 @@ def default_proxy_meta():
 
 
 def call_proxy(repo_dir, prompt_text, timeout_s, env_extra=None):
-    """Run `zirv ctx proxy --json <prompt>`. Returns (obj, elapsed_s, error_note, raw_stdout)."""
-    argv = [zirv_exe(), "ctx", "proxy", "--json", prompt_text]
+    """Run `zirv ctx proxy --json --headless <prompt>`.
+
+    `--headless` (issue #537): this is always a headless, unattended launch
+    -- an external harness calling `zirv ctx proxy --json` outside any
+    session, exactly the caller `--headless` was added for -- so the decision
+    it returns must never be `orchestrated`/`Orchestrator` (see
+    `decision::force_single_seat`); `build_proxy_layer` below mirrors
+    whatever seat that flag actually decided, byte-for-byte with
+    `proxy::mod::prompt_layer`.
+
+    Returns (obj, elapsed_s, error_note, raw_stdout).
+    """
+    argv = [zirv_exe(), "ctx", "proxy", "--json", "--headless", prompt_text]
     env = child_env(env_extra)
     t0 = time.time()
     try:
