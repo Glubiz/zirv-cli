@@ -4226,6 +4226,7 @@ mod tests {
             elapsed_ms: 12,
             usage: None,
             created_at: 0,
+            headless: false,
         };
         crate::commands::ctx::proxy::persist(state.root(), &decision).expect("persist");
 

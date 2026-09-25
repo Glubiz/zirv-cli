@@ -42,6 +42,22 @@ const CLARIFICATION_CATEGORY_ID: &str = "clarification_category";
 /// ambiguous" is the more likely reading than "clear enough".
 pub(crate) const CLARIFY_THRESHOLD: f32 = 0.5;
 
+/// [`prompt_layer`]'s `clarify:` line for an interactive (non-headless)
+/// decision -- unchanged from before the headless override existed.
+pub(crate) const INTERACTIVE_CLARIFY_LINE: &str =
+    "clarify: ask the user one precise question before acting";
+
+/// [`prompt_layer`]'s `clarify:` line for a headless decision (issue #537
+/// headless follow-up): a headless launch works unattended, so telling it to
+/// "ask the user" only tells it to stall -- nobody is there to answer. This
+/// tells it to make its own reasonable call and record the assumption
+/// instead, the same discipline `zirv ctx proxy --json`'s own `headless`
+/// field lets an external harness (`run.py::build_proxy_layer`) mirror
+/// without re-deriving the condition itself.
+pub(crate) const HEADLESS_CLARIFY_LINE: &str = "clarify: nobody can answer in this run -- pick \
+                                                 the most reasonable reading and name the \
+                                                 assumption in your final report";
+
 #[derive(Debug, Args)]
 pub struct ProxyArgs {
     /// Print the full `ProxyDecision` as JSON instead of the human summary.
@@ -385,6 +401,7 @@ pub fn decide(
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     result.usage = usage;
     result.created_at = state::now_secs();
+    result.headless = headless;
     if headless {
         decision::force_single_seat(&mut result);
     }
@@ -480,6 +497,14 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 /// and a clarify instruction, and (`Single` only) one line telling the
 /// session plainly that it is the one doing the work, not an orchestrator.
 ///
+/// The clarify line (issue #537 headless follow-up) reads `decision.
+/// headless` to pick its text: [`INTERACTIVE_CLARIFY_LINE`] ("ask the user")
+/// for an ordinary decision, [`HEADLESS_CLARIFY_LINE`] ("nobody can answer
+/// in this run") for one `decide()` computed with `headless: true` -- an
+/// unattended launch telling itself to "ask the user" would just stall.
+/// Gating (the `needs_clarification`/`needs_clarification_decisive`
+/// threshold check) is identical either way; only the wording changes.
+///
 /// `started_workflow_id` (wrapper-overhead benchmark, 2026-09-22 change 2):
 /// the instance id `proxy::launch::start_workflow_for` actually started for
 /// this launch, when it did -- `chat.rs` threads it through from the SAME
@@ -528,7 +553,11 @@ pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>)
         lines.push(format!("domains: {}", decision.domains.join(", ")));
     }
     if decision.needs_clarification >= CLARIFY_THRESHOLD && decision.needs_clarification_decisive {
-        lines.push("clarify: ask the user one precise question before acting".to_string());
+        lines.push(if decision.headless {
+            HEADLESS_CLARIFY_LINE.to_string()
+        } else {
+            INTERACTIVE_CLARIFY_LINE.to_string()
+        });
     }
     if decision.seat_role == SeatRole::Single {
         lines.push(
@@ -801,6 +830,7 @@ mod tests {
             elapsed_ms: 12,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 
@@ -1016,6 +1046,44 @@ mod tests {
         decision.needs_clarification_decisive = false;
         let layer = prompt_layer(&decision, None);
         assert!(!layer.contains("clarify:"), "{layer}");
+    }
+
+    /// Issue #537 headless follow-up: a headless launch has nobody to answer
+    /// a clarifying question, so its `clarify:` line must never tell it to
+    /// "ask the user" -- only the headless "name the assumption" wording,
+    /// under the identical decisive-only gating `prompt_layer_shows_domains_
+    /// and_a_clarify_instruction_when_present`/`prompt_layer_omits_clarify_
+    /// when_needs_clarification_is_not_decisive` already cover for the
+    /// interactive case.
+    #[test]
+    fn prompt_layer_uses_the_headless_clarify_line_for_a_headless_decision() {
+        let mut decision = sample_decision();
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
+        decision.headless = true;
+        let layer = prompt_layer(&decision, None);
+        assert!(
+            layer.contains(
+                "clarify: nobody can answer in this run -- pick the most reasonable reading \
+                 and name the assumption in your final report"
+            ),
+            "{layer}"
+        );
+        assert!(
+            !layer.contains("clarify: ask the user one precise question before acting"),
+            "{layer}"
+        );
+
+        decision.headless = false;
+        let interactive_layer = prompt_layer(&decision, None);
+        assert!(
+            interactive_layer.contains("clarify: ask the user one precise question before acting"),
+            "{interactive_layer}"
+        );
+        assert!(
+            !interactive_layer.contains("nobody can answer in this run"),
+            "{interactive_layer}"
+        );
     }
 
     #[test]

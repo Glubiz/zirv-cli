@@ -265,6 +265,19 @@ pub struct ProxyDecision {
     pub elapsed_ms: u64,
     pub usage: Option<Usage>,
     pub created_at: u64,
+    /// Issue #537 headless single seat: whether THIS decision was computed
+    /// for a headless (unattended) launch -- set once, at the tail of
+    /// [`super::decide`], the same place [`super::force_single_seat`] runs.
+    /// [`super::prompt_layer`]'s `clarify:` line reads this to pick between
+    /// the interactive "ask the user" text and the headless "nobody can
+    /// answer, name the assumption instead" text, and `zirv ctx proxy
+    /// --json` exposes it so an external harness (e.g. the benchmark's own
+    /// `build_proxy_layer`) can mirror the same choice without re-deriving
+    /// it from `--headless`/`HEADLESS_ENV` itself. `#[serde(default)]` so a
+    /// decision persisted before this field existed still deserializes, as
+    /// `false` (the historical, interactive-only behaviour).
+    #[serde(default)]
+    pub headless: bool,
 }
 
 // `QuestionKind`/`Criteria`/`Question`/`AnswerValue`/`Answer`/`Answers` --
@@ -609,6 +622,11 @@ pub fn baseline(
         elapsed_ms: 0,
         usage: None,
         created_at: 0,
+        // Placeholder: `decide()` sets the real value, once, at its own
+        // tail (the same place `force_single_seat` runs) -- never derived
+        // here, since `baseline()` has no notion of the launch it will
+        // eventually serve.
+        headless: false,
     };
     apply_security_risk_floor(&mut decision);
     apply_orchestration_request_complexity_floor(&mut decision, request);
@@ -1938,6 +1956,7 @@ mod tests {
             elapsed_ms: 0,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 

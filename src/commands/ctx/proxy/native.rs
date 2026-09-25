@@ -67,6 +67,7 @@ mod tests {
             elapsed_ms: 0,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 

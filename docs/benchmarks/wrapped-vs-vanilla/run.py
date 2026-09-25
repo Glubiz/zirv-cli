@@ -1068,18 +1068,41 @@ def start_workflow(repo_dir, workflow, prompt_text, complexity, risk, env_extra=
     return started, note, elapsed, workflow_id
 
 
+# Mirrors proxy::mod::CLARIFY_THRESHOLD / INTERACTIVE_CLARIFY_LINE /
+# HEADLESS_CLARIFY_LINE (src/commands/ctx/proxy/mod.rs) byte-for-byte --
+# `build_proxy_layer` below needs the literal text, not just the gate.
+CLARIFY_THRESHOLD = 0.5
+INTERACTIVE_CLARIFY_LINE = "clarify: ask the user one precise question before acting"
+HEADLESS_CLARIFY_LINE = (
+    "clarify: nobody can answer in this run -- pick the most reasonable reading "
+    "and name the assumption in your final report"
+)
+
+
 def build_proxy_layer(proxy_obj, model, started_workflow_id=None):
-    """Mirror `proxy::mod::prompt_layer` (src/commands/ctx/proxy/mod.rs,
-    ~438-468) byte-for-byte on the lines this harness can reconstruct from
+    """Mirror `proxy::mod::prompt_layer` (src/commands/ctx/proxy/mod.rs)
+    byte-for-byte on the lines this harness can reconstruct from
     `zirv ctx proxy --json`'s decision object plus `start_workflow`'s own
     result: header, execution/complexity/risk, seat(s), workflow (see
-    below), domains, and the single-seat instruction line.
+    below), domains, the clarify line (see below), and the single-seat
+    instruction line.
 
     `started_workflow_id`: the id `start_workflow` actually started for
     THIS launch (`None` when no workflow was named, the start was skipped,
     or it failed) -- when both a workflow kind and a started id are known,
     the line names the concrete instance and tells the seat to consult it,
     exactly matching `prompt_layer`'s `(Some(kind), Some(id))` arm.
+
+    Clarify line: `prompt_layer` gates it on `needs_clarification >=
+    CLARIFY_THRESHOLD and needs_clarification_decisive`, then picks its
+    wording from `headless` (issue #537 headless follow-up: an unattended
+    launch gets "nobody can answer", not "ask the user"). This needs all
+    three of `needs_clarification`/`needs_clarification_decisive`/
+    `headless` to be PRESENT in `proxy_obj` -- not merely falsy -- to render
+    at all: a `zirv ctx proxy --json` from before one of them existed must
+    never make this harness GUESS which wording (or whether any) applies,
+    so a missing key prints one clear warning to stderr and the layer omits
+    the clarify line entirely rather than risk mismatching `prompt_layer`.
     """
     execution = proxy_obj.get("execution")
     complexity = proxy_obj.get("complexity")
@@ -1106,6 +1129,29 @@ def build_proxy_layer(proxy_obj, model, started_workflow_id=None):
         lines.append("workflow: none")
     if domains:
         lines.append("domains: " + ", ".join(str(d) for d in domains))
+
+    if "needs_clarification" not in proxy_obj or "needs_clarification_decisive" not in proxy_obj:
+        print(
+            "build_proxy_layer: zirv ctx proxy --json did not expose "
+            "needs_clarification/needs_clarification_decisive; omitting the clarify line "
+            "rather than guessing (is zirv-dir pointing at an older build?)",
+            file=sys.stderr,
+        )
+    elif proxy_obj.get("needs_clarification", 0.0) >= CLARIFY_THRESHOLD and proxy_obj.get(
+        "needs_clarification_decisive"
+    ):
+        if "headless" not in proxy_obj:
+            print(
+                "build_proxy_layer: zirv ctx proxy --json did not expose `headless`; "
+                "omitting the clarify line rather than guessing its wording "
+                "(is zirv-dir pointing at an older build?)",
+                file=sys.stderr,
+            )
+        elif proxy_obj.get("headless"):
+            lines.append(HEADLESS_CLARIFY_LINE)
+        else:
+            lines.append(INTERACTIVE_CLARIFY_LINE)
+
     if seat_role == "single":
         lines.append("You are the single seat for this request: do the work here yourself; do not delegate.")
     return "\n".join(lines)
