@@ -53,7 +53,7 @@ use super::journal::{
 };
 use crate::commands::ctx::config::CtxConfig;
 use crate::commands::ctx::output::{self, CompactionScope, StreamingCapture};
-use crate::commands::ctx::state::{self, StateDir};
+use crate::commands::ctx::state::{self, StateDir, now_ms};
 
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_PROCESSES: usize = 16;
@@ -3332,14 +3332,6 @@ fn failed_receipt(
         started_at_ms,
         completed_at_ms: now_ms(),
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
 }
 
 fn definition(

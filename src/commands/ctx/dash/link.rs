@@ -208,21 +208,6 @@ impl RuntimeLink {
         )?)
     }
 
-    /// The operator's literal keystrokes, for a runtime-owned TERMINAL. Only
-    /// the controller may send these, and the runtime is what enforces that.
-    pub fn type_into(&mut self, session_id: &str, bytes: &str) -> CtxResult<()> {
-        self.client.call(
-            Method::SessionSendInput,
-            json!({
-                "session_id": session_id,
-                "client_id": self.client_id,
-                "mode": "raw",
-                "input": bytes,
-            }),
-        )?;
-        Ok(())
-    }
-
     /// A turn for a runtime-owned CONVERSATION. `idempotency` is the
     /// dashboard's own retry identity: a reconnect that resends the same
     /// submission must not start a second turn, and the runtime settles that

@@ -98,15 +98,6 @@ pub struct HarnessUsage {
     pub five_hour_detail: Option<WindowDetail>,
     /// The weekly window's own equivalent of `five_hour_detail`.
     pub seven_day_detail: Option<WindowDetail>,
-    /// Whether this provider is currently metered by credits rather than a
-    /// subscription window (`cfg.pace.use_credits`). Filled every throttled
-    /// tick alongside its siblings, but no production render path has
-    /// consulted it since issue #202 phase 2b -- kept its own narrow
-    /// `#[allow(dead_code)]` (rather than reviving the whole struct's old
-    /// blanket one) so a future credits-aware footer/status surface can
-    /// still read it back without re-deriving the read.
-    #[allow(dead_code)]
-    pub credits: bool,
 }
 
 /// The header's live facts.
@@ -5892,7 +5883,6 @@ mod tests {
                 overage_covered: false,
             }),
             seven_day_detail: None,
-            credits: false,
         };
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
             render_footer_narrow_usage(f, area, Some(&usage), now, utc())
@@ -9420,7 +9410,6 @@ mod tests {
                 seven_day: Some(12.0),
                 five_hour_detail: Some(no_detail()),
                 seven_day_detail: Some(no_detail()),
-                credits: false,
             },
             HarnessUsage {
                 name: "codex",
@@ -9428,7 +9417,6 @@ mod tests {
                 seven_day: Some(58.0),
                 five_hour_detail: None,
                 seven_day_detail: Some(no_detail()),
-                credits: false,
             },
             HarnessUsage {
                 name: "gemini",
@@ -9436,7 +9424,6 @@ mod tests {
                 seven_day: None,
                 five_hour_detail: None,
                 seven_day_detail: None,
-                credits: false,
             },
         ];
         let blocks = limits_blocks_from_usage(&usages);
@@ -9549,7 +9536,6 @@ mod tests {
                 limit_reached: false,
                 overage_covered: false,
             }),
-            credits: false,
         }];
         let blocks = limits_blocks_from_usage(&usages);
         // 2 (title+rule) + 2 blocks * 2 rows each = 6 rows.
@@ -9584,7 +9570,6 @@ mod tests {
             seven_day: None,
             five_hour_detail: Some(no_detail()),
             seven_day_detail: None,
-            credits: false,
         }];
         let blocks = limits_blocks_from_usage(&usages);
         assert!(

@@ -3127,7 +3127,6 @@ impl FactsCache {
                 let windows = window::load_for(state, provider)
                     .map(|w| window::available(&w, now_secs))
                     .unwrap_or_default();
-                let credits = cfg.pace.use_credits.for_provider(provider);
                 let detail_of = |w: &window::Window| ui::WindowDetail {
                     resets_at: w.resets_at,
                     limit_reached: w.limit_reached,
@@ -3139,7 +3138,6 @@ impl FactsCache {
                     seven_day: windows.seven_day.as_ref().map(|w| w.used_percentage),
                     five_hour_detail: windows.five_hour.as_ref().map(detail_of),
                     seven_day_detail: windows.seven_day.as_ref().map(detail_of),
-                    credits,
                 }
             })
             .collect();
@@ -6754,11 +6752,9 @@ fn sanitize_file_dropped_request(mut req: spawnreq::SpawnRequest) -> spawnreq::S
 /// pass `true` (only the dashboard's own in-process Spawn overlay) versus
 /// `false` (everything else, including every file-dropped request).
 ///
-/// Security review round (2026-08-28), issue #160 finding 2: used to push
-/// the env pair itself (`Option<(String, String)>`); now just resolves the
-/// `LaunchMode` and leaves the actual pin-pushing to `build_turn_env`,
-/// which every call site now routes through -- see that function's own doc
-/// comment for why the push moved there.
+/// Resolves the `LaunchMode` only; `build_turn_env` does the actual
+/// pin-pushing (issue #160 finding 2) -- see that function's own doc comment
+/// for why the push lives there.
 fn trusted_launch_mode(trusted_interactive: bool) -> adapters::LaunchMode {
     if trusted_interactive {
         adapters::LaunchMode::Interactive
@@ -19221,7 +19217,6 @@ mod tests {
             .expect("claude is enabled by default");
         assert_eq!(claude.five_hour, Some(55.0));
         assert_eq!(claude.seven_day, None);
-        assert!(!claude.credits, "use_credits is off by default");
 
         let codex = cache
             .disk
@@ -27982,7 +27977,6 @@ mod tests {
             seven_day: Some(18.0),
             five_hour_detail: None,
             seven_day_detail: None,
-            credits: false,
         }];
         let pool = vec![ui::HarnessStrip {
             name: "claude".to_string(),
@@ -34245,7 +34239,6 @@ mod tests {
             seven_day: None,
             five_hour_detail: None,
             seven_day_detail: None,
-            credits: false,
         });
         enrich_sidebar(&mut rows, &disk, 240);
         assert_eq!(rows[0].model.as_deref(), Some("resolved-model"));
