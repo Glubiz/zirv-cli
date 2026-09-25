@@ -869,13 +869,7 @@ fn claim_idle_worktree(
         );
         return None;
     }
-    let reset_ok = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(&path)
+    let reset_ok = worktree::git_command(&path)
         .arg("reset")
         .arg("--hard")
         .arg(base_commit)
@@ -942,13 +936,7 @@ fn allocate_worktree(
     reuse: bool,
     setup: &[String],
 ) -> CtxResult<PathBuf> {
-    let base_commit = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(repo)
+    let base_commit = worktree::git_command(repo)
         .arg("rev-parse")
         .arg("HEAD")
         .output()
@@ -1009,13 +997,7 @@ fn allocate_worktree(
         .map_err(|e| format!("--worktree: could not create {}: {e}", root.display()))?;
     let short = super::sessions::short_id(&SessionId::new_v4().to_string());
     let path = root.join(&short);
-    let output = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(repo)
+    let output = worktree::git_command(repo)
         .arg("worktree")
         .arg("add")
         .arg("-b")
@@ -3039,22 +3021,11 @@ fn sibling_worktree_paths(repo: &Path) -> Vec<PathBuf> {
     let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
         return Vec::new();
     };
-    let Ok(output) = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(&canonical_repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
+    let Ok(stdout) = worktree::run_git(&canonical_repo, &["worktree", "list", "--porcelain"])
     else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    stdout
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .filter_map(|path| std::fs::canonicalize(path).ok())

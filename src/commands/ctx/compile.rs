@@ -2214,7 +2214,7 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         (0, "marker empty: nothing injected per turn")
     } else {
         (
-            super::hook::per_turn_context_text(&cfg.score.marker).len(),
+            super::lifecycle::per_turn_context_text(&cfg.score.marker).len(),
             "paid uncached every user turn",
         )
     };

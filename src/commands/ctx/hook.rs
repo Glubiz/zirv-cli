@@ -3749,15 +3749,6 @@ fn stop_rot_advisory_deferred(
 /// marker. `score.rs`/`rot.rs`'s `marker_miss_rate` only checks for the
 /// marker prefix at the start of a line, never this sentence's wording, so
 /// rewording it here changes no detection logic.
-///
-/// Split out of [`prompt_output`] so `zirv ctx compile --measure` (issue
-/// #225) can report this sentence's own byte cost without re-deriving its
-/// wording a second way -- the measurement and the actual injected text can
-/// never drift apart on what "the hook context" means.
-pub fn per_turn_context_text(marker: &str) -> String {
-    super::lifecycle::per_turn_context_text(marker)
-}
-
 pub fn prompt_output(
     marker: &str,
     adoption_nudge: Option<&str>,
@@ -5380,27 +5371,6 @@ fn skill_pointer_override(
 /// through a dispatched worker instead.
 use super::lifecycle::FILE_MODIFICATION_TOOLS;
 
-/// Resolves `path` lexically: `.` components drop, `..` pops the previous
-/// component (or is kept literally once there is nothing left to pop, so a
-/// relative path that climbs above its own root still reads as "outside").
-/// Deliberately NOT `std::fs::canonicalize`: a `Write` target may not exist
-/// yet, and this must stay a pure path computation, no filesystem access.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    super::lifecycle::normalize_lexically(path)
-}
-
-/// Claude Code's operator-owned configuration directory. An explicit,
-/// non-empty `CLAUDE_CONFIG_DIR` wins; otherwise Claude's default beneath
-/// `HOME` (or Windows' `USERPROFILE`) applies. Environment access stays
-/// injectable so both write guards remain deterministic in tests.
-/// Whether a write target belongs to Claude Code's own configuration tree.
-/// Existing harness homes compare in canonical space so symlinked home/temp
-/// paths agree; a not-yet-created harness home uses a component-aware lexical
-/// comparison on the paths exactly as supplied.
-pub(crate) fn target_is_under_harness_home(target: &Path, env: EnvLookup<'_>) -> bool {
-    super::lifecycle::target_is_under_harness_home(target, env)
-}
-
 /// The absolute, lexically-normalized target `payload` names, or `None` when
 /// the tool is not a [`FILE_MODIFICATION_TOOLS`] entry or the payload names
 /// no target at all (schema drift, not a real write). A relative target is
@@ -5423,35 +5393,7 @@ fn normalized_write_target(payload: &PreToolPayload, cwd: &Path) -> Option<PathB
     } else {
         cwd.join(target)
     };
-    Some(normalize_lexically(&resolved))
-}
-
-/// What the model is told when an orchestrator seat's own guard refuses a
-/// repository write (`OrchestratorWrites::Deny`). Names the exact path so
-/// the model can see why, and the remedy: dispatch a worker rather than
-/// retry the same tool call.
-fn orchestrator_write_deny_reason(target: &Path) -> String {
-    super::lifecycle::orchestrator_write_deny_reason(target)
-}
-
-/// What the model is told, non-blocking, when an orchestrator seat's own
-/// guard lets a repository write through under `OrchestratorWrites::Advise`
-/// (issue #358 T8). Never denies -- the write already proceeded -- only
-/// names the target and the standing guidance to delegate anything larger
-/// than a trivial edit.
-fn orchestrator_write_advise_note(target: &Path) -> String {
-    super::lifecycle::orchestrator_write_advise_note(target)
-}
-
-/// This seat's own repository-write guard posture -- `cfg.supervise.
-/// orchestrator_writes`, already narrowed (repo may only tighten) and
-/// env-overridden by `CtxConfig::load`. One place both `hook::run_pretool`
-/// and `safety::run_check_hook_mode_with_env` resolve it from, so the two
-/// PreToolUse guards (Edit/Write/MultiEdit/NotebookEdit here, Bash/
-/// PowerShell in `safety.rs`) can never read a different posture for the
-/// same session.
-pub(crate) fn orchestrator_write_posture(cfg: &CtxConfig) -> super::config::OrchestratorWrites {
-    super::lifecycle::orchestrator_write_posture(cfg)
+    Some(super::lifecycle::normalize_lexically(&resolved))
 }
 
 /// One orchestrator-write guard decision, resolved against this seat's own
@@ -5518,17 +5460,6 @@ pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: 
     count % ORCHESTRATOR_ADVISORY_RATE == 0
 }
 
-/// The nearest git repository the write TARGET itself sits in, or `None`
-/// when it sits in no git repository at all. Walks from the target's own
-/// PARENT (never the target itself -- a `Write` target may not exist yet)
-/// up through its ancestors for the first one carrying a `.git` entry -- a
-/// directory for an ordinary checkout, a FILE for a linked worktree
-/// (`gitdir: ...`) -- so both shapes resolve to the same repository root.
-/// Pure apart from `Path::exists`.
-fn repo_root_for_target(target: &Path) -> Option<PathBuf> {
-    super::lifecycle::repo_root_for_target(target)
-}
-
 /// The resolved write TARGET when `payload` is an orchestrator seat's own
 /// in-scope repository write, or `None` when it is outside this guard's
 /// scope entirely (and so gets no [`OrchestratorWriteOutcome`] at all --
@@ -5582,12 +5513,12 @@ pub fn orchestrator_write_decision(
     use super::config::OrchestratorWrites;
     let target = orchestrator_write_target(role, payload, cwd, env)?;
     Some(match posture {
-        OrchestratorWrites::Deny => {
-            OrchestratorWriteOutcome::Deny(orchestrator_write_deny_reason(&target))
-        }
-        OrchestratorWrites::Advise => {
-            OrchestratorWriteOutcome::Advise(orchestrator_write_advise_note(&target))
-        }
+        OrchestratorWrites::Deny => OrchestratorWriteOutcome::Deny(
+            super::lifecycle::orchestrator_write_deny_reason(&target),
+        ),
+        OrchestratorWrites::Advise => OrchestratorWriteOutcome::Advise(
+            super::lifecycle::orchestrator_write_advise_note(&target),
+        ),
         OrchestratorWrites::Allow => OrchestratorWriteOutcome::Allow,
     })
 }
@@ -6038,7 +5969,7 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     };
     let role = env(adapters::SEAT_ROLE_ENV);
     let cfg = cfg_or_operator_only_gate(&cwd, env);
-    let posture = orchestrator_write_posture(&cfg);
+    let posture = super::lifecycle::orchestrator_write_posture(&cfg);
     let session = super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
 
     // Issue #406: the reuse probe is independent of the write guard below --
@@ -6136,7 +6067,7 @@ fn reuse_advice(
     session: &str,
 ) -> Option<String> {
     let target = normalized_write_target(payload, cwd)?;
-    let repo = repo_root_for_target(&target)?;
+    let repo = super::lifecycle::repo_root_for_target(&target)?;
     let (action, detail, note) =
         match super::reuse::evaluate(&repo, &target, payload, &cfg.hooks.reuse_exclude) {
             super::reuse::Outcome::Nothing => return None,
@@ -12799,7 +12730,9 @@ capable a model does it actually need?",
             _ => None,
         };
 
-        assert!(target_is_under_harness_home(&target, &env));
+        assert!(super::super::lifecycle::target_is_under_harness_home(
+            &target, &env
+        ));
     }
 
     #[test]
@@ -13177,7 +13110,10 @@ capable a model does it actually need?",
         std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
         // The target itself need not exist -- a `Write` target may not yet.
         let target = repo.join("src").join("deep").join("new_file.rs");
-        assert_eq!(repo_root_for_target(&target), Some(repo));
+        assert_eq!(
+            super::super::lifecycle::repo_root_for_target(&target),
+            Some(repo)
+        );
     }
 
     #[test]
@@ -13191,7 +13127,10 @@ capable a model does it actually need?",
         )
         .expect(".git file");
         let target = worktree.join("src").join("new_file.rs");
-        assert_eq!(repo_root_for_target(&target), Some(worktree));
+        assert_eq!(
+            super::super::lifecycle::repo_root_for_target(&target),
+            Some(worktree)
+        );
     }
 
     #[test]
@@ -13199,7 +13138,7 @@ capable a model does it actually need?",
         let tmp = tempfile::tempdir().expect("tempdir");
         let plain = tmp.path().join("no-git-here");
         let target = plain.join("new_file.rs");
-        assert_eq!(repo_root_for_target(&target), None);
+        assert_eq!(super::super::lifecycle::repo_root_for_target(&target), None);
     }
 
     /// Issue #358 T8: the default posture is `advise`, not `deny` -- this

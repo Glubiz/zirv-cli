@@ -1356,10 +1356,7 @@ impl ClaudeAdapter {
     }
 
     fn home_dir(&self) -> PathBuf {
-        self.home
-            .clone()
-            .or_else(|| crate::utils::home_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+        super::resolve_home_dir(&self.home)
     }
 
     /// Materializes the per-launch safety layer under the operator-owned

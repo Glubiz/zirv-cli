@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -296,18 +297,61 @@ pub struct PermissionPromptRecord {
     pub reason: Option<String>,
 }
 
-/// Reads every parseable line in `permission-prompts.jsonl`, oldest first --
-/// a missing file is an empty list, not an error, and a corrupt line is
-/// skipped rather than fatal, the same best-effort contract `read_
-/// delegations` gives its own file.
-pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> {
-    let path = state.logs().join(PERMISSION_PROMPTS_FILE);
+/// Shared by every best-effort jsonl reader in this module: a missing file
+/// is an empty list, not an error, and a corrupt line is skipped rather than
+/// fatal.
+fn read_jsonl_best_effort<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+/// Shared tail-reading counterpart of [`read_jsonl_best_effort`]: reads at
+/// most the last `tail_bytes` of `path`, for a hot path that must not pay for
+/// materializing a whole, never-rotated log. The read starts at the window
+/// boundary and discards the first, probably-partial line; a file smaller
+/// than the window is read whole. Same best-effort tolerance in every
+/// direction: an unreadable file or an unseekable handle is an empty list, a
+/// corrupt line is skipped.
+fn read_jsonl_tail_best_effort<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    tail_bytes: u64,
+) -> Vec<T> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let from = len.saturating_sub(tail_bytes);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if from > 0 {
+        lines.next();
+    }
+    lines
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Reads every parseable line in `permission-prompts.jsonl`, oldest first --
+/// a missing file is an empty list, not an error, and a corrupt line is
+/// skipped rather than fatal, the same best-effort contract `read_
+/// delegations` gives its own file.
+pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> {
+    read_jsonl_best_effort(&state.logs().join(PERMISSION_PROMPTS_FILE))
 }
 
 /// One tool call an orchestrator seat's own repository-write guard decided
@@ -376,13 +420,7 @@ pub struct OrchestratorBlockRecord {
 /// skipped rather than fatal, the same best-effort contract `read_
 /// permission_prompts` gives its own file.
 pub fn read_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord> {
-    let path = state.logs().join(ORCHESTRATOR_BLOCKS_FILE);
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    read_jsonl_best_effort(&state.logs().join(ORCHESTRATOR_BLOCKS_FILE))
 }
 
 /// The same as [`read_orchestrator_blocks`] but reading at most the last
@@ -394,31 +432,10 @@ pub fn read_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord
 /// Same best-effort tolerance in every direction: an unreadable file or an
 /// unseekable handle is an empty list, a corrupt line is skipped.
 pub fn read_recent_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let path = state.logs().join(ORCHESTRATOR_BLOCKS_FILE);
-    let Ok(mut file) = std::fs::File::open(&path) else {
-        return Vec::new();
-    };
-    let Ok(len) = file.metadata().map(|m| m.len()) else {
-        return Vec::new();
-    };
-    let from = len.saturating_sub(ORCHESTRATOR_BLOCK_TAIL_BYTES);
-    if file.seek(SeekFrom::Start(from)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.lines();
-    if from > 0 {
-        lines.next();
-    }
-    lines
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    read_jsonl_tail_best_effort(
+        &state.logs().join(ORCHESTRATOR_BLOCKS_FILE),
+        ORCHESTRATOR_BLOCK_TAIL_BYTES,
+    )
 }
 
 pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
@@ -534,13 +551,7 @@ pub struct DecisionRecord {
 /// corrupt line is skipped rather than fatal, the same best-effort contract
 /// every other reader in this module gives its own file.
 pub fn read_decisions(state: &StateDir) -> Vec<DecisionRecord> {
-    let path = state.logs().join(LOG_FILE);
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    read_jsonl_best_effort(&state.logs().join(LOG_FILE))
 }
 
 /// The same rows as [`read_decisions`], but reading at most the last
@@ -554,31 +565,7 @@ pub fn read_decisions(state: &StateDir) -> Vec<DecisionRecord> {
 /// best-effort tolerance in every direction: an unreadable file or an
 /// unseekable handle is an empty list, a corrupt line is skipped.
 pub fn read_recent_decisions(state: &StateDir) -> Vec<DecisionRecord> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let path = state.logs().join(LOG_FILE);
-    let Ok(mut file) = std::fs::File::open(&path) else {
-        return Vec::new();
-    };
-    let Ok(len) = file.metadata().map(|m| m.len()) else {
-        return Vec::new();
-    };
-    let from = len.saturating_sub(DECISION_LOG_TAIL_BYTES);
-    if file.seek(SeekFrom::Start(from)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if file.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.lines();
-    if from > 0 {
-        lines.next();
-    }
-    lines
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    read_jsonl_tail_best_effort(&state.logs().join(LOG_FILE), DECISION_LOG_TAIL_BYTES)
 }
 
 pub fn tail(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {

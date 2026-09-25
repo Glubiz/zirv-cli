@@ -103,7 +103,7 @@ fn validate_detector(id: &str, detector: &MaintainDetectorConfig) -> CtxResult<(
     Ok(())
 }
 
-fn command_for_shell(command: &str) -> Command {
+pub(crate) fn command_for_shell(command: &str) -> Command {
     #[cfg(windows)]
     {
         let mut value = Command::new("cmd");

@@ -290,10 +290,7 @@ impl GeminiAdapter {
     }
 
     fn home_dir(&self) -> PathBuf {
-        self.home
-            .clone()
-            .or_else(|| crate::utils::home_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+        super::resolve_home_dir(&self.home)
     }
 
     /// The zirv state root this adapter reads the session registry and its
@@ -302,14 +299,12 @@ impl GeminiAdapter {
     /// contract).
     #[cfg(test)]
     fn state_dir(&self) -> Option<super::super::state::StateDir> {
-        self.forced_state_root
-            .clone()
-            .map(super::super::state::StateDir::from_root)
+        super::resolve_state_dir(&self.forced_state_root)
     }
 
     #[cfg(not(test))]
     fn state_dir(&self) -> Option<super::super::state::StateDir> {
-        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok()
+        super::resolve_state_dir()
     }
 
     /// Where [`Self::read_only_args`] writes [`READ_ONLY_POLICY_TOML`].

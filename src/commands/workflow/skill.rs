@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use super::capability::{self, CapabilityId, CapabilityReport, IntegrationId};
+use super::capability::{self, CapabilityId, CapabilityReport, IntegrationId, valid_id};
 use super::skill_activation::score_skills;
 use super::skill_render;
 use super::skill_tools::{self, SkillLoadSurface};
@@ -216,15 +216,6 @@ impl SkillManifest {
         }
         Ok(())
     }
-}
-
-fn valid_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Issue #539: what kind of bundle-relative file a [`SkillResource`] points

@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use super::adapter::{
     Cancellation, EventSink, FailureClass, FailureScope, FailureScopeKind, ProviderFailure,
     ProviderResponse, ProviderStreamEvent, ProviderTarget,
@@ -232,6 +234,22 @@ pub(crate) fn check_block_accumulator_cap(
         )));
     }
     Ok(())
+}
+
+/// Extracts a required string field, shared by every provider's event
+/// parsing (`anthropic`, `openai`, `google`, `bedrock`) -- error text is
+/// `"{provider} {context} has no string `{field}`"`.
+pub(crate) fn required_string(
+    value: &Value,
+    field: &str,
+    context: &str,
+    provider: &str,
+) -> Result<String, ProviderFailure> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| invalid_stream(format!("{provider} {context} has no string `{field}`")))
 }
 
 pub(crate) struct ResponseLimits {

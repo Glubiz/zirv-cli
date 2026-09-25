@@ -7160,7 +7160,7 @@ fn repo_write_violation(
     if !is_filesystem_absolute {
         return None;
     }
-    if super::hook::target_is_under_harness_home(std::path::Path::new(&resolved), env) {
+    if super::lifecycle::target_is_under_harness_home(std::path::Path::new(&resolved), env) {
         return None;
     }
     let root = repo_root_of(&resolved)?;
@@ -10679,7 +10679,7 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     .and_then(|cwd| {
         orchestrator_repo_write_target(&effective_command, &cwd, &filesystem_repo_root_of, env)
     });
-    let orchestrator_posture = super::hook::orchestrator_write_posture(cfg);
+    let orchestrator_posture = super::lifecycle::orchestrator_write_posture(cfg);
 
     let cwd = if payload.cwd.is_empty() {
         std::env::current_dir().ok()

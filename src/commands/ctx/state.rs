@@ -601,6 +601,55 @@ pub(crate) fn try_acquire_lock(path: &Path) -> CtxResult<FileLock> {
     Ok(FileLock(file))
 }
 
+/// Shared by `mail` and `memory`: claims `<dir>/<base>.md`, falling back to
+/// `<dir>/<base>_NNN.md` on collision. `OpenOptions::create_new` makes the
+/// open itself the atomic claim: it fails with `AlreadyExists` rather than
+/// truncating a winner, so a genuine race is what drives the retry onto the
+/// next suffix, the same guarantee a single process already had. `_NNN` (not
+/// `-N`) is deliberate: `-` (0x2D) sorts *before* `.` (0x2E), which would put
+/// a collision's suffixed file ahead of the unsuffixed one it collided with;
+/// `_` (0x5F) sorts after, so the zero-padded seconds prefix this shares with
+/// every other mail filename keeps sorting messages oldest-first even across
+/// a same-second collision.
+pub(crate) fn claim_and_write(dir: &Path, base: &str, contents: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    let mut n = 0u32;
+    loop {
+        let candidate = if n == 0 {
+            dir.join(format!("{base}.md"))
+        } else {
+            dir.join(format!("{base}_{n:03}.md"))
+        };
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        match opts.open(&candidate) {
+            Ok(mut file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                file.write_all(contents.as_bytes())?;
+                return Ok(candidate);
+            }
+            // Lost the race (or a genuine same-second collision, the single-
+            // process case this always had to handle): try the next suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// A unique temp sibling of `target`, in the *same* directory so the `rename`
 /// in `write_private` is a same-filesystem atomic replace. The pid plus a
 /// process-local counter keeps two concurrent writers -- or two writes from
