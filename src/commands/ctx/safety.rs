@@ -10209,7 +10209,25 @@ fn jev_approve_git_is_read_only(tokens: &[String]) -> bool {
         return rest.iter().any(|token| token == "--list")
             && !rest.iter().any(|token| MUTATING.contains(&token.as_str()));
     }
-    JEV_APPROVE_READ_ONLY_GIT_SUBCOMMANDS.contains(&lower.as_str())
+    let rest = &tokens[2..];
+    match lower.as_str() {
+        // `remote add`/`set-url`/`rename`/`remove` rewrite where pushes go,
+        // and `remote show <name>` contacts the remote.
+        "remote" => {
+            rest.iter()
+                .all(|token| token == "-v" || token == "--verbose")
+                || rest.first().is_some_and(|token| token == "get-url")
+        }
+        // `reflog expire`/`reflog delete` rewrite the reflog.
+        "reflog" => rest
+            .first()
+            .is_none_or(|token| token == "show" || token.starts_with('-')),
+        // `--output=<file>` makes diff/log/show write a file.
+        _ => {
+            JEV_APPROVE_READ_ONLY_GIT_SUBCOMMANDS.contains(&lower.as_str())
+                && !rest.iter().any(|token| token.starts_with("--output"))
+        }
+    }
 }
 
 /// Whether `program`/`tokens` (a single pipe-segment's own program and
@@ -22311,6 +22329,30 @@ mod tests {
         let effects = std::fs::read_to_string(state_dir.path().join("jev-effects.jsonl"))
             .expect("a test runner must still reach Jev, recording a fallback effect row");
         assert!(effects.contains("\"action\":\"fallback\""), "{effects}");
+    }
+
+    #[test]
+    fn git_subcommands_that_write_or_reach_a_remote_are_not_read_only() {
+        let tokens = |command: &str| -> Vec<String> {
+            command.split_whitespace().map(str::to_string).collect()
+        };
+        for command in [
+            "git remote set-url origin https://example.invalid/x.git",
+            "git remote add backup https://example.invalid/y.git",
+            "git remote show origin",
+            "git reflog expire --all",
+            "git diff --output=patch.txt",
+        ] {
+            assert!(!jev_approve_git_is_read_only(&tokens(command)), "{command}");
+        }
+        for command in [
+            "git status",
+            "git remote -v",
+            "git reflog -n 5",
+            "git diff HEAD~1",
+        ] {
+            assert!(jev_approve_git_is_read_only(&tokens(command)), "{command}");
+        }
     }
 
     /// (4) Direction rule for this site: `approve_allow` may only lower an
