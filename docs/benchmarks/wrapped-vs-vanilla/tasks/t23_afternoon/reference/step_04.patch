@@ -1,0 +1,238 @@
+diff --git a/ledgerlite/alias_cli.py b/ledgerlite/alias_cli.py
+new file mode 100644
+index 0000000..a3f2dac
+--- /dev/null
++++ b/ledgerlite/alias_cli.py
+@@ -0,0 +1,53 @@
++"""CLI wiring for `python -m ledgerlite alias ...` (extracted out of
++`cli.py` -- pure refactor, same commands/flags/output/exit codes)."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++
++from . import aliases
++
++
++def add_subparser(sub: "argparse._SubParsersAction", default_store: str) -> None:
++    p_alias = sub.add_parser("alias", help="manage merchant aliases")
++    alias_sub = p_alias.add_subparsers(dest="alias_command", required=True)
++
++    p_alias_add = alias_sub.add_parser("add", help="add a merchant alias")
++    p_alias_add.add_argument("--pattern", required=True)
++    p_alias_add.add_argument("--canonical", required=True)
++    p_alias_add.add_argument(
++        "--store", default=default_store, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++    p_alias_list = alias_sub.add_parser("list", help="list merchant aliases")
++    p_alias_list.add_argument(
++        "--store", default=default_store, help="ledger JSON file to read (default: %(default)s)"
++    )
++
++
++def _cmd_add(args: argparse.Namespace) -> int:
++    existing = aliases.load_aliases(args.store)
++    existing.append((args.pattern, args.canonical))
++    aliases.save_aliases(args.store, existing)
++    print(f"Added alias {args.pattern} -> {args.canonical}")
++    return 0
++
++
++def _cmd_list(args: argparse.Namespace) -> int:
++    existing = aliases.load_aliases(args.store)
++    if not existing:
++        print("No aliases.")
++        return 0
++    for pattern, canonical in existing:
++        print(f"{pattern} -> {canonical}")
++    return 0
++
++
++def handle(args: argparse.Namespace) -> int:
++    if args.alias_command == "add":
++        return _cmd_add(args)
++    if args.alias_command == "list":
++        return _cmd_list(args)
++    print(f"unknown alias subcommand: {args.alias_command}", file=sys.stderr)
++    return 2
+diff --git a/ledgerlite/aliases.py b/ledgerlite/aliases.py
+new file mode 100644
+index 0000000..8c8d6d5
+--- /dev/null
++++ b/ledgerlite/aliases.py
+@@ -0,0 +1,42 @@
++"""Merchant (and, by reuse, category) alias resolution and persistence.
++
++An alias is a `(pattern, canonical)` pair: any raw payee (or category)
++containing `pattern` resolves to `canonical`. Aliases are stored as a plain
++ordered list -- the FIRST matching alias wins, so insertion order is
++significant and preserved by every persistence helper below.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import List, Tuple, Union
++
++from . import store
++
++Alias = Tuple[str, str]
++
++ALIASES_KEY = "aliases"
++
++
++def resolve_alias(name: str, aliases: List[Alias]) -> str:
++    """Return the canonical name for `name` (a payee or category).
++
++    Checks `aliases` in order; the first whose `pattern` is a
++    case-insensitive substring of `name` wins (same case-folding as the
++    "substring" rule kind in `rules.py`). Returns `name` unchanged if no
++    alias matches.
++    """
++    lowered = name.lower()
++    for pattern, canonical in aliases:
++        if pattern.lower() in lowered:
++            return canonical
++    return name
++
++
++def load_aliases(path: Union[str, Path]) -> List[Alias]:
++    raw = store.load_key(path, ALIASES_KEY, default=[])
++    return [(item[0], item[1]) for item in raw]
++
++
++def save_aliases(path: Union[str, Path], aliases: List[Alias]) -> None:
++    store.save_key(path, ALIASES_KEY, [[pattern, canonical] for pattern, canonical in aliases])
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..b752580 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -6,7 +6,7 @@ import argparse
+ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+-from . import report
++from . import alias_cli, aliases, report
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
+@@ -34,6 +34,10 @@ def _build_parser() -> argparse.ArgumentParser:
+     p_list.add_argument(
+         "--page-size", type=int, default=10, dest="page_size", help="rows per page (default: %(default)s)"
+     )
++    p_list.add_argument(
++        "--canonical", action="store_true",
++        help="show each row's canonical merchant name (via saved aliases) instead of the raw payee",
++    )
+ 
+     p_summary = sub.add_parser("summary", help="show per-category totals")
+     p_summary.add_argument(
+@@ -47,6 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    alias_cli.add_subparser(sub, DEFAULT_STORE)
++
+     return parser
+ 
+ 
+@@ -66,11 +72,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
+     if not rows:
+         print("No transactions on this page.")
+         return 0
++    alias_list = aliases.load_aliases(args.store) if args.canonical else []
+     print(f"{'ID':>4}  {'Date':<10}  {'Amount':>10}  {'Payee':<24}  {'Category':<14}  Memo")
+     for txn in rows:
++        display_payee = aliases.resolve_alias(txn.payee, alias_list) if args.canonical else txn.payee
+         print(
+             f"{txn.id:>4}  {txn.date.isoformat():<10}  {txn.amount:>10}  "
+-            f"{txn.payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
++            f"{display_payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
+         )
+     return 0
+ 
+@@ -111,6 +119,7 @@ _HANDLERS = {
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "alias": alias_cli.handle,
+ }
+ 
+ 
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..382e71e 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -1,4 +1,4 @@
+-"""JSON persistence for ledgerlite transactions."""
++"""JSON persistence for ledgerlite transactions (and other top-level keys)."""
+ 
+ from __future__ import annotations
+ 
+@@ -6,7 +6,7 @@ import json
+ from datetime import date
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import List, Union
++from typing import Any, List, Union
+ 
+ from .models import Transaction
+ 
+@@ -33,13 +33,50 @@ def _txn_from_dict(data: dict) -> Transaction:
+     )
+ 
+ 
+-def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
++def _load_raw(path: Union[str, Path]) -> dict:
++    """The whole store file as a dict, or `{}` if it does not exist yet (or
++    does not parse as a JSON object)."""
++    p = Path(path)
++    if not p.exists():
++        return {}
++    try:
++        payload = json.loads(p.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError):
++        return {}
++    return payload if isinstance(payload, dict) else {}
++
++
++def _write_raw(path: Union[str, Path], payload: dict) -> None:
+     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
++def save(path: Union[str, Path], txns: List[Transaction]) -> None:
++    """Write `txns` to `path` as JSON, overwriting any existing file.
++
++    Merges onto whatever else is already stored at `path` (e.g. an
++    `"aliases"` key another part of ledgerlite persists there) instead of
++    clobbering it -- only the `"transactions"` key is replaced.
++    """
++    raw = _load_raw(path)
++    raw["transactions"] = [_txn_to_dict(t) for t in txns]
++    _write_raw(path, raw)
++
++
+ def load(path: Union[str, Path]) -> List[Transaction]:
+     """Read a list of `Transaction` from a JSON file written by `save`."""
+-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+-    return [_txn_from_dict(d) for d in payload.get("transactions", [])]
++    raw = _load_raw(path)
++    return [_txn_from_dict(d) for d in raw.get("transactions", [])]
++
++
++def load_key(path: Union[str, Path], key: str, default: Any = None) -> Any:
++    """Read one top-level key from the store file, `default` if absent."""
++    raw = _load_raw(path)
++    return raw.get(key, [] if default is None else default)
++
++
++def save_key(path: Union[str, Path], key: str, value: Any) -> None:
++    """Write one top-level key into the store file, preserving every other
++    key already there (`"transactions"` included)."""
++    raw = _load_raw(path)
++    raw[key] = value
++    _write_raw(path, raw)

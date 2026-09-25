@@ -1,9 +1,13 @@
 # ledgerlite benchmark tasks
 
-Fifteen tasks against the `ledgerlite` template (see `../template/`, which
+Twenty-two tasks against the `ledgerlite` template (see `../template/`, which
 is FROZEN as of t01-t09 -- t10/t11/t12 were added afterward as harder
-tasks and t13/t14/t15 after that as LARGE tasks (10-25 minutes, 30-80 tool
-calls, several modules touched, for a strong model); all of t10-t15 only
+tasks, t13/t14/t15 after that as LARGE tasks (10-25 minutes, 30-80 tool
+calls, several modules touched, for a strong model), t16-t21 after that
+as XL tasks (10-30+ minutes, many edits across several modules each, for a
+strong model), and t22 after that as the one EPIC task (10 ordered phases,
+30-60+ minutes, 500+ reference-diff lines across 6+ modules -- see
+"Large-task grid" below); all of t10-t22 only
 target behaviour the frozen template already has, or spec new
 features/questions with an exact hidden-test or scoring contract; they
 never modify template/). The
@@ -45,6 +49,40 @@ that doesn't happen to match a current rule.
 | t13_recurring | tests (LARGE) | greenfield feature spanning a new module + persistence + two CLI surfaces: `ledgerlite/recurring.py` (`Recurrence`, `expand()` with exact weekly/monthly/yearly clamping rules and a specified negative-id scheme), persistence under a `"recurring"` store key, `recurring add`/`recurring list`, and `list --include-recurring --since/--until` merging expanded rows sorted by `(date, id)` | hidden: 20 cases -- weekly/monthly/yearly expansion incl. day-31 and leap-day clamping, `until` and range clipping, id determinism/uniqueness, CLI persistence + list formatting, and the merged-list `--include-recurring` behaviour incl. its exit-2 argument-validation path |
 | t14_bugsweep | tests (LARGE) | one multi-issue bug report combining D2 (pagination), D1 (money parsing), D4 (case-sensitive regex rules), and D6 (`categorize` erasing an existing category when no rule matches) -- all reported symptom-first in a single prompt, no file names | hidden: 20 cases -- the full t02/t03/t07 hidden suites (7+6+3) plus 4 new cases for D6; grade.py forces score 0 if `tests/test_rules.py` is touched, same as t07 |
 | t15_reports | tests (LARGE) | reporting feature spanning report.py/cli.py/store.py: `report.monthly_breakdown(txns, year)` (month -> category -> net, gap months omitted) and `report.trend(txns, category, months)` (zero-filled, anchored on the latest transaction overall), plus a `report` CLI command with exactly specified `--year [--format table\|csv]` and `--trend/--months` output shapes | hidden: 17 cases -- both functions (incl. a gap month and empty input), both CLI output formats byte-exact, the empty-year header-only case, and the mutually-exclusive/missing-argument exit-2 paths |
+| t16_tags | tests (XL) | greenfield feature spanning 5 files: `ledgerlite/tagging.py` (`normalize_tags`/`parse_tag_list`), a `tags` field on `Transaction` + store round-trip + optional CSV column, a `list` row-format suffix, a `tag add`/`tag remove`/`tag list` CLI family, and a `--tag` filter on `list` that ignores paging | hidden: 25 cases -- normalization edge cases, CSV column present/blank/absent, store backward-compat (missing `"tags"` key), list-output suffix incl. the D2-pagination-avoidance pattern, tag add/remove incl. unknown-id and all-blank-tags exit-2 paths, tag list counts, and the `--tag` filter incl. its no-match message |
+| t17_schema_migration | tests (XL) | a versioned-store-format upgrade with backwards compatibility: new `ledgerlite/schema.py` (`migrate_payload`, pure), a `source` field on `Transaction` defaulting differently for CSV import vs. a new manual `add` CLI command, transparent in-memory migration on `load()`, and an explicit `migrate` CLI command with an optional `--backup` | hidden: 23 cases -- pure-migration purity/idempotency, store round-trip and backward-compat load, `add`'s id-assignment and empty-store path, `migrate`'s already-current no-op (incl. ignoring `--backup`) vs. actual-migration-with-backup paths, and existing commands still working untouched against an old-format file |
+| t18_ledger_layer | tests (XL) | behaviour-preserving refactor: extracting a `Ledger` service layer (`ledgerlite/ledger.py`: `load`/`save`/`import_csv`/`categorize_all`) out of `cli.py`'s duplicated `import`/`categorize` logic, required to preserve the existing (buggy) D6 category-clearing quirk exactly | hidden: 15 cases split evenly between the new `Ledger` API in isolation and byte-exact CLI-message/regression checks on `import`/`categorize`/`list`/`summary` |
+| t19_goals_saga | tests (XL, longest) | a 7-phase savings/spending-goals feature in one prompt (model -> persistence+add/list -> progress -> milestones -> a sorted report -> an `--overall` total -> validation+`remove`), each phase specified with an exact CLI/format contract so phases can be scored independently | hidden: 26 cases, grouped by phase for partial credit -- `Goal`/`progress()` unit cases, add/list persistence and formatting, `goal progress` incl. unknown-name exit-2, milestone dedup/sort/boundary-exact reached-set, the sorted report incl. the empty-header-only case, `--overall`'s combined total incl. zero-goals, and add's positive-target/duplicate-name rejection plus `goal remove` |
+| t20_audit_log | tests (XL) | a cross-cutting audit trail: new `ledgerlite/audit.py` (sequence-numbered, not wall-clock, entries under an `"audit"` store key), wired into every existing mutating command (`import`, `categorize`), plus a `store.save()` fix so it stops clobbering unrelated top-level keys across saves, and two new `audit log`/`audit summary` CLI commands | hidden: 15 cases -- append/read semantics and persistence-of-other-keys, CLI wiring on both mutating commands (and non-wiring on the read-only ones), cross-command sequence continuity, and both new commands' output/empty-state |
+| t21_search | tests (XL) | an ambiguous-but-specified product request ("a way to search my transactions") pinned down by 12 explicit acceptance criteria in the prompt: a pure `report.search()` filter function (AND-combined payee/amount/category/date criteria) plus a `search` CLI command adding sort/limit/formatting on top | hidden: 20 cases -- the filter function's criteria individually and combined, and the CLI's mutual-exclusion and range-sanity exit-2 paths, three sort orders (incl. case-insensitive payee), `--limit`, the no-match message, and row-format parity with `list` |
+| t22_envelopes | tests (EPIC) | a 10-phase envelope-budgeting subsystem in one prompt (model -> persistence+add/list -> status -> transfers -> a largest-remainder allocation helper -> overspend alerts -> a permanent rollover close-month checkpoint -> CSV export -> CSV import -> validation+remove), spanning 6 new/touched modules (`envelopes.py`, `allocation.py`, `envelope_store.py`, `envelope_cli.py`, plus `cli.py`/`__init__.py` wiring) | hidden: 41 cases, grouped by phase for partial credit -- the rollover balance walk incl. its `closed_through` restart and before-start/before-closed `ValueError`s, persistence/add/list, status incl. its two exit-2 paths, transfers incl. accumulation and same-name rejection, the allocation helper's exact-sum/tie-break/all-zero cases, alerts' sort-and-skip behaviour, close-month's fold+adjustment-pruning+idempotency, CSV export/import round-tripping (incl. import's replace-by-name state reset), and add's validation + remove |
+
+## Large-task grid (t13-t22)
+
+`t16_tags` .. `t21_search` are XL: each is sized for roughly 10-30 minutes of
+work by a strong model (t19_goals_saga, a 7-phase saga, is the longest of
+the XL tasks at ~30+ minutes), spanning several files per task. `t22_envelopes`
+is EPIC: 10 ordered phases, a reference diff of 512 lines across 6 files, and
+41 hidden cases -- sized for 30-60+ minutes. Every one of t16-t22 is
+`kind=tests` (t16-t21: 15-26 hidden cases; t22: 41) with `score =
+passed/total`, ships a `reference.patch` (a verified, from-scratch solution
+scoring 1.0 with `visible_ok: true`, proven against a pristine copy of
+`template/` scoring 0 first), and -- like every other task -- is never
+copied into the agent's own working copy of the repo by
+`run.py`/`regrade.py` (only `template/` is copied into `<run>/repo`;
+graders copy only `hidden/*.py`), so `reference.patch` can't leak into a
+run.
+
+Full large-task grid, combining t13-t15 (LARGE), t16-t21 (XL), and t22
+(EPIC) -- `--timeout-min 60` to give t22 enough room:
+
+```
+python run.py --tasks t13_recurring,t14_bugsweep,t15_reports,t16_tags,t17_schema_migration,t18_ledger_layer,t19_goals_saga,t20_audit_log,t21_search,t22_envelopes \
+  --conds vanilla,zirv,zirv-proxy --reps 3 --model sonnet --parallel 2 --stagger-s 90 --timeout-min 60 \
+  --runs-subdir runs-large \
+  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs-large --out report-large-sonnet.md
+```
 
 ## t09 ground truth: groceries rows in examples/sample.csv
 
@@ -151,3 +189,32 @@ NOT count as dead, even though that one caller is unreachable from the
 CLI. `report.page`, `rules.categorize`, `store.save`/`load`, and all of
 `cli.py`'s `_cmd_*` handlers (referenced via the `_HANDLERS` dict, not a
 direct call site) each have real references and are excluded correctly.
+
+## t23_afternoon: the one long-session chain task
+
+`t23_afternoon` is a different shape entirely (`kind=chain`, see the main
+README's "Long-session chain" section): 9 sequential follow-up prompts sent
+to the SAME agent session, simulating a developer's afternoon of merchant/
+category-alias features built on the `ledgerlite` template. It measures
+session management (rot scoring, compaction, memory across a long
+conversation) that a single 1-3 minute prompt task never exercises, so it is
+not part of the "Large-task grid" table above and is run separately -- see
+README.md for the exact command.
+
+| step | shape | hidden tests | reference score |
+|---|---|---|---|
+| 01 | greenfield: `aliases.py` + `alias add`/`list` | 7 | 1.0 |
+| 02 | feature: `list --canonical` | 4 | 1.0 |
+| 03 | bug report: case-insensitive alias matching | 5 | 1.0 |
+| 04 | refactor: extract `alias_cli.py` (behaviour-preserving) | 5 | 1.0 |
+| 05 | feature: `alias remove` | 2 | 1.0 |
+| 06 | "like you did for X": `category-alias` + unconditional canonical `summary` | 5 | 1.0 |
+| 07 | change of mind: gate step 6's default behind `--canonical-category` | 3 | 1.0 |
+| 08 | feature: `report.top_merchants` + `merchants` CLI | 8 | 1.0 |
+| 09 | wrap-up: README + final-reply summary (judge only, no hidden tests) | - | rubric-graded |
+
+Every reference score above was verified by applying that step's cumulative
+`reference/step_NN.patch` to a fresh, pristine copy of `template/` and
+running that step's own hidden tests against it (score 1.0, `visible_ok`
+true, the template's one known baseline-red visible test excepted); the same
+hidden tests against an unpatched pristine copy score ~0.

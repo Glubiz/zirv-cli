@@ -10,6 +10,8 @@ estimated or "should be roughly" number belongs here.
 This is the third generation of this benchmark; §6 covers what changed and
 why the earlier grids aren't directly comparable to this one.
 
+**Newer (2026-09-24/25):** the benchmark → fix loop on large and long-running tasks (zirv 4.27.0 → 4.28.0 branch builds) found the headline below does not hold on large tasks with fair plugin and hook parity. It is superseded for those tasks by `wrapped-vs-vanilla/results/2026-09-24-fix-loop/README.md`, which has per-round data, reports and the handover.
+
 **Current headline (2026-09-23, zirv 4.21.0 vs. vanilla `claude -p` with the
 obra/superpowers plugin loaded, 15 tasks, both sides given the same
 "finish the task, nobody will answer questions" notice):** on Sonnet, zirv is

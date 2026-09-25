@@ -1,0 +1,60 @@
+I want to be able to add one-off transactions by hand (not just via CSV
+import), and I'd like the ledger file's format to be future-proofed with an
+explicit version number so I can tell old exports apart from new ones. Please
+add both, plus a way to upgrade an old ledger file in place.
+
+1. New module `ledgerlite/schema.py`:
+   - `CURRENT_VERSION = 2`.
+   - `migrate_payload(payload)` -- a pure function (must not mutate its
+     `payload` argument or any of the dicts inside it) that takes the raw
+     dict decoded from a ledger JSON file and returns a new dict in the
+     current schema: `schema_version` set to `CURRENT_VERSION`, and every
+     dict in `transactions` given a `"source"` key of `"import"` if it
+     doesn't already have one (an existing `"source"` value, whatever it
+     is, is left alone). This must work whether the input already has
+     `schema_version: 2` (in which case it's effectively a no-op besides
+     backfilling any missing `"source"`) or has no `schema_version` at all
+     (today's format, treated as the implicit starting point).
+
+2. `Transaction` (`ledgerlite/models.py`) gets a new field `source: str`,
+   defaulting to `"manual"` when a `Transaction` is constructed directly in
+   Python without specifying it.
+
+3. `ledgerlite/store.py`:
+   - `save()` always writes the current schema: a top-level
+     `"schema_version": 2` key alongside `"transactions"`, and every
+     transaction dict includes `"source"`.
+   - `load()` must keep working on a file written by today's format (no
+     `"schema_version"` key, no per-transaction `"source"` key) by running
+     the decoded payload through `schema.migrate_payload` before building
+     `Transaction` objects -- a migrated transaction with no prior
+     `"source"` becomes `source="import"` (matching how every transaction
+     in an old file actually got there: through CSV import). `load()` does
+     **not** rewrite the file on disk by itself; only `save()` (or the new
+     `migrate` command below) does that.
+
+4. `ledgerlite/parse.py::read_csv` sets `source="import"` explicitly on every
+   `Transaction` it produces.
+
+5. A new `add` CLI command: `python -m ledgerlite add --date YYYY-MM-DD
+   --amount AMOUNT --payee NAME [--memo TEXT] [--category CAT] --store
+   PATH`. It loads the existing store (migrating transparently if it's an
+   old file), assigns the new transaction the id `(highest existing id) +
+   1` (or `1` if the store is empty or the file doesn't exist yet), sets
+   `source="manual"`, defaults `--memo` to `""` and `--category` to
+   uncategorized when omitted, appends it, saves (which writes the current
+   schema), and prints `Added transaction <id>`.
+
+6. A new `migrate` CLI command: `python -m ledgerlite migrate --store PATH
+   [--backup]`. If the file at `PATH` already has `"schema_version": 2`,
+   print exactly `Already up to date.` and exit 0 without modifying the
+   file (and without creating a backup, even if `--backup` was passed).
+   Otherwise: if `--backup` was given, first copy the file's current exact
+   contents to `PATH + ".bak"`; then rewrite `PATH` in the current schema
+   (reusing the same migration `load()` already performs, followed by
+   `save()`) and print `Migrated <n> transactions to schema version 2`
+   where `<n>` is the number of transactions in the file.
+
+Existing commands (`list`, `summary`, `categorize`) must keep working
+exactly as before against both an old-format file and a current-format
+file, with no visible change in their behaviour from this change alone.

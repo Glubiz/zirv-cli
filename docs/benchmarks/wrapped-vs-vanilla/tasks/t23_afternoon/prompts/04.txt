@@ -1,0 +1,6 @@
+`cli.py` is getting long. Before I ask for anything else, can you pull all
+the `alias`-related CLI code (the `alias` subcommand's parser setup and its
+`add`/`list` handlers) out into its own new module, `ledgerlite/alias_cli.py`,
+imported from `cli.py`? Behavior must stay identical -- same commands, same
+flags, same output text, same exit codes. This is a pure refactor, no
+functional changes.

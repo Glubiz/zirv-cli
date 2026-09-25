@@ -1,0 +1,22 @@
+The ledger file is getting big (thousands of rows now between all the
+imports and recurring rules), and I noticed `ledger.json` itself has
+gotten disproportionately huge -- I profiled it and it's the undo history:
+every single import/apply stores a full copy of the ENTIRE transactions
+list, every time, even though almost all of those operations only ever
+ADD rows to the end.
+
+Please fix this:
+
+- For an operation that only ADDS rows to the end of the ledger (any
+  `--append` import, `import-ofx --append`, `recurring apply`), undo
+  should only need to remember HOW MANY rows it added, not a full copy of
+  everything -- undoing it just means dropping that many rows off the end.
+- A plain `import` with no `--append` still replaces the WHOLE ledger, so
+  that one genuinely still needs the full prior list to undo -- there's no
+  smaller way to describe "put back everything that got overwritten".
+- Also cap history at the 20 most recent undo-able operations. Once
+  there've been more than 20, silently drop the oldest ones -- older than
+  that just isn't undo-able anymore.
+
+`undo` and `undo --list` themselves should behave exactly like they do
+today from the outside -- this is purely about what's stored underneath.

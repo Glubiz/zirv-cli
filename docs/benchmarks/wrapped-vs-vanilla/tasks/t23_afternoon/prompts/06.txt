@@ -1,0 +1,17 @@
+Merchant aliases have been great. Like you did for merchant payees, I'd
+like the same thing for categories -- sometimes I've categorized things
+slightly differently over time (e.g. "eating out" vs "dining") and I want
+to fold those together too.
+
+- Reuse the same alias matching behaviour (first case-insensitive substring
+  match wins, unchanged name if nothing matches) for categories. Store
+  these under a new top-level `"category_aliases"` key (same shape as
+  `"aliases"`: a list of `[pattern, canonical]` pairs, insertion order).
+- `python -m ledgerlite category-alias add --pattern PATTERN --canonical
+  NAME --store PATH` / `category-alias list --store PATH`, same output
+  conventions as the `alias` family (`Added alias PATTERN -> NAME`, one
+  `PATTERN -> NAME` line per saved entry, `No aliases.` when empty).
+- `summary` should now group by the *canonical* category: resolve each
+  transaction's category (or `"uncategorized"` if none) through the saved
+  category aliases before totalling and printing. Do this automatically,
+  every time -- no flag needed.

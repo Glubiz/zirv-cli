@@ -1,0 +1,12 @@
+I've got thousands of transactions in here now between imports and
+recurring rules, and `list` showing the oldest ones first means I have to
+page through everything to see what I did yesterday. Please make `list`
+show the most recent transactions first by default (sort by date
+descending; when two transactions share a date, keep the one with the
+lower id first). Pagination (`--page`/`--page-size`) works the same as
+always, just over this newly-ordered sequence.
+
+I know some of my own scripts probably depend on the old oldest-first
+order though, so keep it available: add a `--legacy-order` flag to `list`
+that skips the new sorting and shows transactions in the old raw order
+exactly as before.

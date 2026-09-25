@@ -29,8 +29,8 @@ JEV_ABLATION_CONDS = ["zirv-jev-full"] + [f"zirv-jev-{g}" for g in JEV_GATE_KEYS
 # metadata from the same `zirv ctx proxy --json` call run.py makes for them.
 PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
 
-CANONICAL_CONDS = ["vanilla", "zirv", "zirv-proxy", *JEV_ABLATION_CONDS]
-NON_VANILLA_CONDS = ["zirv", "zirv-proxy", *JEV_ABLATION_CONDS]
+CANONICAL_CONDS = ["vanilla", "zirv", "zirv-nojev", "zirv-proxy", *JEV_ABLATION_CONDS]
+NON_VANILLA_CONDS = ["zirv", "zirv-nojev", "zirv-proxy", *JEV_ABLATION_CONDS]
 N_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 0
 

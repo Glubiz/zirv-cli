@@ -1,0 +1,108 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..b0f496c 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -7,9 +7,8 @@ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+ from . import report
+-from .parse import read_csv
+-from .rules import DEFAULT_RULES, categorize
+-from .store import load, save
++from .ledger import Ledger
++from .store import load
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+@@ -51,12 +50,9 @@ def _build_parser() -> argparse.ArgumentParser:
+ 
+ 
+ def _cmd_import(args: argparse.Namespace) -> int:
+-    txns = read_csv(args.csv_path)
+-    for txn in txns:
+-        if txn.category is None:
+-            txn.category = categorize(txn, DEFAULT_RULES)
+-    save(args.store, txns)
+-    print(f"Imported {len(txns)} transactions into {args.store}")
++    ledger = Ledger(args.store)
++    count = ledger.import_csv(args.csv_path)
++    print(f"Imported {count} transactions into {args.store}")
+     return 0
+ 
+ 
+@@ -94,15 +90,10 @@ def _cmd_summary(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_categorize(args: argparse.Namespace) -> int:
+-    txns = load(args.store)
+-    changed = 0
+-    for txn in txns:
+-        new_category = categorize(txn, DEFAULT_RULES)
+-        if new_category != txn.category:
+-            txn.category = new_category
+-            changed += 1
+-    save(args.store, txns)
+-    print(f"Re-categorized {changed} of {len(txns)} transactions")
++    ledger = Ledger(args.store)
++    total = len(ledger.load())
++    changed = ledger.categorize_all()
++    print(f"Re-categorized {changed} of {total} transactions")
+     return 0
+ 
+ 
+diff --git a/ledgerlite/ledger.py b/ledgerlite/ledger.py
+new file mode 100644
+index 0000000..a73b02f
+--- /dev/null
++++ b/ledgerlite/ledger.py
+@@ -0,0 +1,50 @@
++"""A small service layer wrapping a single ledger store file.
++
++Pulls the load/modify/save logic shared by the `import` and `categorize`
++CLI commands into one reusable place.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import List, Union
++
++from .models import Transaction
++from .parse import read_csv
++from .rules import DEFAULT_RULES, categorize
++from .store import load as _store_load
++from .store import save as _store_save
++
++
++class Ledger:
++    """A ledger store at a fixed path, with import/categorize helpers."""
++
++    def __init__(self, path: Union[str, Path]):
++        self.path = path
++
++    def load(self) -> List[Transaction]:
++        return _store_load(self.path)
++
++    def save(self, txns: List[Transaction]) -> None:
++        _store_save(self.path, txns)
++
++    def import_csv(self, csv_path, rules=DEFAULT_RULES) -> int:
++        """Import `csv_path`, categorize uncategorized rows, save, return count."""
++        txns = read_csv(csv_path)
++        for txn in txns:
++            if txn.category is None:
++                txn.category = categorize(txn, rules)
++        self.save(txns)
++        return len(txns)
++
++    def categorize_all(self, rules=DEFAULT_RULES) -> int:
++        """Re-apply `rules` to every stored transaction; return how many changed."""
++        txns = self.load()
++        changed = 0
++        for txn in txns:
++            new_category = categorize(txn, rules)
++            if new_category != txn.category:
++                txn.category = new_category
++                changed += 1
++        self.save(txns)
++        return changed

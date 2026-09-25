@@ -1,0 +1,22 @@
+I want a month-by-month view of money in vs money out, not just the
+per-category summary.
+
+Add `cashflow(txns, from_year, from_month, to_year, to_month)` to
+`ledgerlite/report.py`: returns one row per calendar month in the
+inclusive range, in chronological order, INCLUDING months with no
+transactions at all (all zeros). Each row has that month's `income` (sum
+of positive amounts), `expense` (sum of the absolute value of negative
+amounts, reported as a positive number), and `net` (`income - expense`).
+
+CLI: `python -m ledgerlite report cashflow --from YYYY-MM --to YYYY-MM
+--store PATH` prints:
+
+```
+Month        Income     Expense         Net
+2024-01     2500.00      915.00     1585.00
+```
+
+i.e. header `Month`/`Income`/`Expense`/`Net`, then one row per month in
+range in that order, `Month` left-aligned in a 7-wide field, the three
+money columns right-aligned in 10-wide fields with exactly 2 decimal
+places each.

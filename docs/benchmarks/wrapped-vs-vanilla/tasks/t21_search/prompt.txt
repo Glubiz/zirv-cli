@@ -1,0 +1,41 @@
+I want a way to search my transactions -- I'm not 100% sure what the most
+useful shape for this is, so use your judgement on the details, but
+whatever you build has to satisfy all of these acceptance criteria exactly,
+since that's what I'll be checking:
+
+- AC1: `python -m ledgerlite search --payee-contains TEXT --store PATH`
+  matches transactions whose `payee` contains `TEXT` as a substring,
+  case-insensitively.
+- AC2: `--min-amount AMOUNT` and `--max-amount AMOUNT` filter on the
+  transaction's signed `amount` (not its absolute value), inclusive on both
+  ends; either may be given alone.
+- AC3: `--category CAT` matches transactions whose `category` equals `CAT`
+  exactly (case-sensitive, same as category strings are stored today).
+- AC4: `--uncategorized-only` matches transactions with no category
+  (`category is None`). Passing both `--category` and
+  `--uncategorized-only` together is invalid: print an error to stderr and
+  exit with status 2, printing nothing to stdout.
+- AC5: `--since YYYY-MM-DD` and `--until YYYY-MM-DD` filter on `date`,
+  inclusive on both ends.
+- AC6: Every filter given must match (AND, not OR) for a transaction to be
+  included.
+- AC7: If no filters are given at all, every stored transaction matches.
+- AC8: `--sort {date,amount,payee}` controls display order (default
+  `date`), always ascending, with ties broken by `id` ascending; `payee` is
+  compared case-insensitively.
+- AC9: `--limit N` caps how many matching rows are printed, applied after
+  sorting; omitting it prints every match.
+- AC10: Matching rows are printed with exactly the same header and
+  per-row format the existing `list` command already uses.
+- AC11: If nothing matches, print exactly `No transactions match those
+  criteria.` and exit 0.
+- AC12: If `--min-amount` is greater than `--max-amount` (when both are
+  given), print an error to stderr and exit with status 2, printing
+  nothing to stdout.
+
+Also add `ledgerlite/report.py::search(txns, payee_contains=None,
+min_amount=None, max_amount=None, category=None, uncategorized_only=False,
+date_from=None, date_to=None)` -- a pure function implementing the
+filtering from AC1-AC7 (not the sorting/limit/printing, which are the CLI
+command's job) and returning the matching transactions in their original
+input order.

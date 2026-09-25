@@ -1,0 +1,9 @@
+That's everything I need for now, thank you! Before you go: please update
+`README.md` to document everything we added this session -- the merchant
+alias commands (`alias add/list/remove`), the category alias commands
+(`category-alias add/list`), `list --canonical`, `summary
+--canonical-category`, and the `merchants` leaderboard command -- with a
+short usage example for each. Then, in your final reply (not in the
+README), give me a concise summary of everything we changed this session,
+step by step, including the bug you fixed and the thing I changed my mind
+about.

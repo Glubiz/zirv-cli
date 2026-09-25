@@ -1,0 +1,24 @@
+I'd like to set spending limits per category and see how I'm tracking
+against them.
+
+Add `ledgerlite/budgets.py` storing a monthly limit per category (persisted
+in the store file, obviously not clobbering anything else there).
+
+CLI:
+
+- `python -m ledgerlite budget set --category C --limit N --store PATH`
+  sets (or replaces) C's budget and prints `Set budget for C: N` (N shown
+  with exactly 2 decimal places, e.g. `400.00`).
+- `python -m ledgerlite budget list --store PATH` prints one line per
+  saved budget, sorted alphabetically by category: `C: N` (2 decimals).
+  `No budgets.` when there are none.
+- `summary` gains a `--vs-budget` flag. When passed, replace the normal
+  `Category / Total / Share` table with `Category / Total / Budget /
+  Remaining` instead (same category ordering as today -- alphabetical):
+  `Budget` is that category's limit (2 decimals) or `-` if none is set;
+  `Remaining` is `budget - abs(total)` (2 decimals, so it goes negative
+  once you're over budget) or `-` if there's no budget for that category.
+  Without `--vs-budget`, `summary`'s output is unchanged.
+
+Don't worry about currencies for this one yet -- assume everything's in
+one currency for now, same as `summary` already does today.

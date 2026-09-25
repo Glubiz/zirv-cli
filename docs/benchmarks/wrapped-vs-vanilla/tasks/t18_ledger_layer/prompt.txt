@@ -1,0 +1,37 @@
+The CLI code in `ledgerlite/cli.py` has grown a bit of copy-pasted
+load/modify/save logic between the `import` and `categorize` commands.
+Please pull that into a small reusable service layer, without changing what
+either command actually does or prints.
+
+1. New module `ledgerlite/ledger.py` with a `Ledger` class:
+   - `Ledger(path)` -- constructed with the path to a ledger JSON store
+     file.
+   - `Ledger.load()` -- returns the list of `Transaction`s currently at
+     `path` (the same thing `ledgerlite.store.load(path)` returns).
+   - `Ledger.save(txns)` -- writes `txns` to `path` (the same thing
+     `ledgerlite.store.save(path, txns)` does).
+   - `Ledger.import_csv(csv_path, rules=DEFAULT_RULES)` -- reads `csv_path`
+     with `ledgerlite.parse.read_csv`, applies `rules` via `categorize()`
+     to any row that doesn't already have a category from the CSV itself,
+     saves the resulting list to `path` (replacing whatever was stored
+     there before), and returns how many transactions were imported.
+   - `Ledger.categorize_all(rules=DEFAULT_RULES)` -- loads the transactions
+     at `path`, and for every one of them replaces its `category` with
+     whatever `categorize(txn, rules)` returns -- unconditionally, exactly
+     like the current `categorize` command does today (including its
+     existing quirk of clearing an already-set category to `None` when no
+     rule currently matches -- that quirk is not in scope to fix here and
+     must be preserved exactly). Saves the updated list back to `path` and
+     returns how many transactions had their category actually change.
+
+2. Rewrite `ledgerlite/cli.py`'s `import` and `categorize` command handlers
+   to do their work through a `Ledger` instance instead of calling
+   `read_csv`/`categorize`/`load`/`save` directly, while printing exactly
+   the same messages as today:
+   - `import`: `Imported <n> transactions into <store>`
+   - `categorize`: `Re-categorized <changed> of <total> transactions`
+
+Every other command (`list`, `summary`) and its output must be completely
+unaffected -- this change is purely about `import` and `categorize`'s
+internals plus the new `Ledger` class, not about changing any observable
+behaviour.

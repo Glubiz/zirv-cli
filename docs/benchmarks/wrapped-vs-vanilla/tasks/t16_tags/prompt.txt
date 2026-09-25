@@ -1,0 +1,70 @@
+I'd like to start tagging my transactions with free-form labels (like
+"vacation" or "reimbursable") so I can pull them back out later. Please add
+tagging support:
+
+1. A new `ledgerlite/tagging.py` module with:
+   - `normalize_tags(raw)` -- takes an iterable of strings and returns a
+     normalized list: each tag is stripped of surrounding whitespace and
+     lowercased, blank tags (empty after stripping) are dropped, duplicates
+     are removed, and the result is sorted alphabetically.
+   - `parse_tag_list(text)` -- splits `text` on commas and runs the pieces
+     through `normalize_tags`, returning the same kind of normalized list.
+     `parse_tag_list("")` returns `[]`.
+
+2. `Transaction` (in `ledgerlite/models.py`) gets a new field `tags`: a list
+   of strings, defaulting to an empty list, holding already-normalized tags.
+
+3. `ledgerlite/store.py`'s JSON format gains a `"tags"` field per
+   transaction (a list of strings). Reading a store file written before this
+   change (no `"tags"` key on a transaction) must still work, treating a
+   missing key as `[]`.
+
+4. CSV import (`ledgerlite/parse.py::read_csv`) accepts an optional `tags`
+   column: a comma-separated string parsed with `parse_tag_list`. If the
+   column is absent from the file, or blank for a given row, that
+   transaction's `tags` is `[]`.
+
+5. `list`'s existing per-row output format gets a new optional suffix: if a
+   transaction has any tags, append `"  [tag1,tag2]"` (two spaces, then the
+   sorted tags in a comma-separated bracketed list, no spaces after the
+   commas) to the end of the row exactly as today's row is formatted;
+   transactions with no tags are printed exactly as today, with nothing
+   appended.
+
+6. A new `tag` subcommand family:
+   - `python -m ledgerlite tag add --id ID --tag TAG [--tag TAG ...] --store
+     PATH` -- normalizes the given tag(s), merges them into the transaction
+     with that `id`'s existing tags (deduped, sorted), and saves. Prints
+     `Tagged transaction <id> with <n> tag(s): <comma-separated sorted final
+     tag list>` where `<n>` is how many tags that transaction now has in
+     total. If every given `--tag` value normalizes to blank (e.g. only
+     whitespace), print an error to stderr and exit with status 2 without
+     saving or printing anything else. If `id` doesn't match any stored
+     transaction, print an error to stderr and exit with status 2.
+   - `python -m ledgerlite tag remove --id ID --tag TAG [--tag TAG ...]
+     --store PATH` -- removes the given tag(s) (matched case-insensitively
+     after normalization) from that transaction's tags and saves; a
+     `--tag` that isn't currently present is silently ignored (not an
+     error). Prints `Untagged transaction <id>, remaining tags: <sorted
+     comma-separated list>`, or `Untagged transaction <id>, remaining tags:
+     none` if no tags remain. If `id` doesn't match any stored transaction,
+     print an error to stderr and exit with status 2.
+   - `python -m ledgerlite tag list --store PATH` -- prints every distinct
+     tag used by any stored transaction, alphabetically, one per line, as
+     `<tag>: <count>` where `<count>` is how many stored transactions carry
+     that tag. If no stored transaction has any tag, print exactly `No
+     tags.`.
+
+7. A new `--tag TAG` option on the existing `list` command:
+   `python -m ledgerlite list --store PATH --tag TAG` filters to only
+   transactions carrying that tag (matched case-insensitively), printing
+   them with the same header and row format `list` already uses. When
+   `--tag` is given, ignore `--page`/`--page-size` entirely and print every
+   matching row (this mirrors how `--include-recurring` already ignores
+   paging elsewhere in this codebase). If nothing matches, print exactly
+   `No transactions match that tag.` and exit 0. `--tag` is optional and
+   independent of `--page`/`--page-size`, which keep working as before when
+   `--tag` is not given.
+
+Please implement all of the above; nothing here should change the behaviour
+of any existing command when tags simply aren't used.

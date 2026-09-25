@@ -1,0 +1,167 @@
+diff --git a/ledgerlite/audit.py b/ledgerlite/audit.py
+new file mode 100644
+index 0000000..2c6cfd5
+--- /dev/null
++++ b/ledgerlite/audit.py
+@@ -0,0 +1,44 @@
++"""Append-only audit trail for ledgerlite store files."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Union
++
++
++@dataclass
++class AuditEntry:
++    sequence: int
++    action: str
++    detail: str
++
++
++def _load_raw(path) -> dict:
++    p = Path(path)
++    if not p.exists():
++        return {}
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def _save_raw(path, raw: dict) -> None:
++    Path(path).write_text(json.dumps(raw, indent=2), encoding="utf-8")
++
++
++def append_entry(path: Union[str, Path], action: str, detail: str) -> AuditEntry:
++    """Append a new audit entry to the store at `path`; return it."""
++    raw = _load_raw(path)
++    existing = raw.get("audit", [])
++    entry = AuditEntry(sequence=len(existing) + 1, action=action, detail=detail)
++    existing.append({"sequence": entry.sequence, "action": entry.action, "detail": entry.detail})
++    raw["audit"] = existing
++    _save_raw(path, raw)
++    return entry
++
++
++def read_log(path: Union[str, Path]) -> List[AuditEntry]:
++    """Return every audit entry stored at `path`, oldest first."""
++    raw = _load_raw(path)
++    return [AuditEntry(sequence=e["sequence"], action=e["action"], detail=e["detail"])
++            for e in raw.get("audit", [])]
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..b09c507 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -7,6 +7,7 @@ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+ from . import report
++from .audit import append_entry, read_log
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
+@@ -47,6 +48,19 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_audit = sub.add_parser("audit", help="inspect the audit trail")
++    audit_sub = p_audit.add_subparsers(dest="audit_command", required=True)
++
++    p_audit_log = audit_sub.add_parser("log", help="print the audit trail")
++    p_audit_log.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++
++    p_audit_summary = audit_sub.add_parser("summary", help="print counts per action")
++    p_audit_summary.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++
+     return parser
+ 
+ 
+@@ -56,6 +70,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
+         if txn.category is None:
+             txn.category = categorize(txn, DEFAULT_RULES)
+     save(args.store, txns)
++    append_entry(args.store, "import", f"Imported {len(txns)} transactions from {args.csv_path}")
+     print(f"Imported {len(txns)} transactions into {args.store}")
+     return 0
+ 
+@@ -102,15 +117,48 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+             txn.category = new_category
+             changed += 1
+     save(args.store, txns)
++    append_entry(args.store, "categorize", f"Re-categorized {changed} of {len(txns)} transactions")
+     print(f"Re-categorized {changed} of {len(txns)} transactions")
+     return 0
+ 
+ 
++def _cmd_audit_log(args: argparse.Namespace) -> int:
++    entries = read_log(args.store)
++    if not entries:
++        print("No audit entries.")
++        return 0
++    for entry in entries:
++        print(f"{entry.sequence}. {entry.action}: {entry.detail}")
++    return 0
++
++
++def _cmd_audit_summary(args: argparse.Namespace) -> int:
++    entries = read_log(args.store)
++    if not entries:
++        print("No audit entries.")
++        return 0
++    counts: dict = {}
++    for entry in entries:
++        counts[entry.action] = counts.get(entry.action, 0) + 1
++    for action in sorted(counts):
++        print(f"{action}: {counts[action]}")
++    return 0
++
++
++def _cmd_audit(args: argparse.Namespace) -> int:
++    handler = {
++        "log": _cmd_audit_log,
++        "summary": _cmd_audit_summary,
++    }[args.audit_command]
++    return handler(args)
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "audit": _cmd_audit,
+ }
+ 
+ 
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..44854c0 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -34,9 +34,20 @@ def _txn_from_dict(data: dict) -> Transaction:
+ 
+ 
+ def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
+-    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    """Write `txns` to `path` as JSON.
++
++    Preserves any other top-level keys already in the file (such as an
++    "audit" trail) instead of overwriting the whole file.
++    """
++    p = Path(path)
++    payload: dict = {}
++    if p.exists():
++        try:
++            payload = json.loads(p.read_text(encoding="utf-8"))
++        except (json.JSONDecodeError, OSError):
++            payload = {}
++    payload["transactions"] = [_txn_to_dict(t) for t in txns]
++    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
+ def load(path: Union[str, Path]) -> List[Transaction]:

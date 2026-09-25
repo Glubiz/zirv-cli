@@ -1,0 +1,121 @@
+# Benchmark → fix loop, 2026-09-24/25: results and handover
+
+**Target (operator):** zirv with Jev **off** and zirv with Jev **on** must each be at least **20% cheaper**, at least **20% faster**, and at least **1% better in work quality** than vanilla Claude Code with the superpowers plugin (v6.4.1). Tasks should be large or long-running. Beating the target is welcome.
+
+**Status: not met.** The best fair round (r4) has Jev off at −6% cost, −7% time and +7% judged quality (significant), and Jev on at −5% / −6% / +4%. Round 5 is implemented and not yet benchmarked.
+
+Every round directory here holds one `<task>__<cond>__rN.json` per run (the harness's `result.json`) and a `report.md` regenerated with the current `compare.py`. To recompute a report, copy a round's JSON files back into `<dir>/<name>/result.json` and run `compare.py --runs <dir>`.
+
+## Rounds
+
+Changes are relative to vanilla + superpowers. "sig" means the paired-bootstrap 95% CI over tasks excludes zero; everything else is within noise.
+
+| Round | zirv build | Tasks (runs) | Jev off: cost / time / judge | Jev on: cost / time / judge | Validity |
+|---|---|---|---|---|---|
+| r0 | origin/main 4.27.0 | 15 mostly small (85) | +29% / +15% / – | +18% / +115% / – | **Unfair:** zirv also loaded operator plugins vanilla lacked; no judge yet |
+| r1 | fc59babb | 10 large t13–t22 (60) | −11% / −2% / −9% sig | −7% / +28% / −10% sig | **Unfair:** zirv's user-level hooks were stripped |
+| r2 | f4df7785 | subset t16,t17,t18,t22 (24) | −13% sig / −13% sig / −4% | −13% sig / −9% sig / −2% | **Unfair:** zirv's user-level hooks were stripped |
+| r3 | 1e1add75 | subset + t23 chain (30) | −11% / −4% / +3% | −21% / −11% / −1% | **Invalid:** zirv's user-level hooks were stripped |
+| r3b | 1e1add75, fair harness | subset + t23 (30) | +2% / +6% / **+7% sig** | −19% / −10% / +5% | Valid |
+| r4 | 5ca6b180 + 6414a21c | subset + t23 (30) | **−6% / −7% / +7% sig** | −5% / −6% / +4% | Valid |
+| r4-t24 | same as r4 | t24 22-step pilot (3, 1 rep) | see below | see below | **Broken:** rot-handling bugs; costs undercounted |
+
+About r1–r3: from fc59babb on, the harness ran zirv with `--setting-sources project,local`, which drops `~/.claude/settings.json`, where zirv's own hooks live. Fixed in d256124e. From r3b on, zirv keeps the user layer and vanilla receives the same `enabledPlugins` through `--settings`.
+
+On the t23 chain, a 9-step session, r4 has both zirv conditions at −13 to −15% cost and −14% time. This is the only place zirv wins consistently.
+
+### The t24 long-haul pilot (r4-t24)
+
+t24 is a 22-step session with recall dependencies, built to push context past 150k. Vanilla ran all 22 steps in one conversation, peaking at 209k context with no compaction, and scored 0.92 at $3.26.
+
+Both zirv runs broke at steps 15–16:
+
+1. **Rot fired at about 160k tokens.** The claude adapter assumes a window of about 200k (token floor 0.5 and ceiling 0.8 of it), but Claude Code reports `modelUsage.claude-sonnet-5.contextWindow = 1000000`.
+2. **Headless compaction was killed mid-flight.** Claude's PreCompact hook fired, and zirv logged "compact command timed out" about 20 s later. It then killed the session and restarted with a distilled handoff, and that step still passed.
+3. **The harness kept resuming the old session id.** It did not follow the new conversation, so rot re-fired on every step and the restart breaker tripped: exit 75, and steps 18–22 failed. The harness is fixed in 28993c15.
+
+Before any rot event (steps 1–14) the runs compare as follows:
+
+| Steps 1–14 | Score | Cost | Wall | Turns |
+|---|---:|---:|---:|---:|
+| vanilla | 0.905 | $2.08 | 679 s | 58 |
+| zirv, Jev off | 0.867 | $2.37 (+14%) | 659 s | 86 |
+| zirv, Jev on | 0.819 | $2.29 (+10%) | 661 s | 87 |
+
+## Findings to build on
+
+1. **Short "XL" tasks tie.** t16–t22 take about 1 min and roughly 10 turns on Sonnet 5. All three conditions make 8–9 API calls and end near 41k context. zirv's first-turn prompt is now about 1k tokens *smaller* than vanilla + superpowers (26.4k vs 27.4k). A supervisor cannot find 20% on these tasks without doing less work.
+2. **Wall time is model time.** About 88% of wall time is API time. zirv's own overhead is now around 280 ms per `ctx exec` (was 2,270 ms) and around 24 ms per hook call (was 39 ms).
+3. **zirv's quality lead costs turns.** zirv agents write many more tests (at t24 step 4: 45–52 visible tests vs 30). That is where the judge's +7% comes from, and also the extra turns and cost.
+4. **Scope creep.** At t24 step 4, both zirv agents "fixed" a pagination quirk the prompt said to keep, and failed the step. Vanilla left it alone and passed. zirv's own standard forbids drive-by fixes, so worker prompt discipline is a real lever that also matters outside the benchmark.
+5. **What zirv adds to the context.** No memory bank or vault is injected. Every zirv run composes only `default + adapter + skill pointer`. The one behavioural difference is the intake hook's `INTAKE_DISCIPLINE_TEXT` (hook.rs ~2324), added to each "substantial" first prompt: "Plan ordered, verifiable steps before editing. Write or extend tests first for behaviour changes. … Run the full test suite before declaring done." This is the likely driver of finding 3's extra tests and turns, and a direct lever for the cost/quality trade-off. In r4 the agents almost never ran the suggested `zirv skill load` (0 of 20 runs).
+6. **t16 edge case.** t16's two hidden tests that every condition fails use a stored `"Food"` tag (un-normalized). The prompt says matching is case-insensitive, so this is a fair edge case, not a harness bug.
+7. **Jev latency.** Intake takes about 220 ms. Jev never sees permission requests (metadata-only contract).
+
+## What this branch ships (all rounds)
+
+| Commit | Change | Issue |
+|---|---|---|
+| fc59babb | Code edits never route below the standard seat; workflows start only for substantial work; zirv's skill plugin loads only for orchestrator seats; stop-hook advisory cached | intent a93fc040 |
+| f4df7785 | Browser probe no longer launches Chrome (workflow start 16.5 s → 0.9 s); no pre-created artifacts; headless PreToolUse allow for operator-allowed commands | – |
+| 1e1add75 | Headless missing-tests Stop gate; Stop-hook block decisions actually block | – |
+| 5ca6b180 | One PreToolUse hook with the safety check in-process; 50 ms signal connect; lazy tokio; SubagentStop gate; compact worker standard (3,751 → 2,280 B, orchestrators unchanged); same-error rot weight on; `ctx exec --resume`; exit polled every 20 ms (post-exit wait 2,010 → 35 ms); exec notices on stderr | #769 #770 #771 #774 #772 (worker half) #763 #778 |
+| 6414a21c | Review fixes: migration keeps operator hooks; SubagentStop is keyed per agent_id and scans the subagent's own transcript; tick cadence | – |
+| 3a30825e | A running dash or wrap honours a changed `fallback.auto_orchestrator_rollover` | #780 |
+| 86cffc31 | Incremental transcript usage cache (`ctx usage` 49 s → 0.37 s, byte-identical output); `ctx loop` notices on stderr | #779 |
+| 474052e7 | Headless in-place compaction is no longer killed mid-flight; claude-sonnet-5 window is 1M, and zirv learns observed windows | – |
+| 9c046123 | Review fixes: rollover switch checked on cadence only; usage cache checks mtime and prunes; compaction waits on the hard bound only; learned window bounded to 8,192–10,000,000 and written atomically | – |
+| bench commits | `zirv-nojev` condition, `--stagger-s`, `compare.py`, t16–t24 tasks, chain kind, blind opus quality judge (+ retry), usage-limit pause/retry, chain cost deltas and session-switch following | – |
+
+## Round 5 (implemented, not benchmarked)
+
+The operator stopped before the round-5 benchmark.
+
+Operator decision: compaction should fire when the context actually rots, not at a token count far below the model's window. Let the session gather context until it starts to rot.
+
+- **Real window (474052e7).** The catalogue now gives `sonnet`/`claude-sonnet-5` a 1,000,000-token window, as Claude Code itself reports. `model_window.rs` records `modelUsage.<model>.contextWindow` from each `-p` JSON result in `~/.zirv/model-windows.json`, and the claude adapter prefers that over the catalogue. The operator's `score.model_context_tokens` pin still wins over both. With a 1M window the token gates sit at 500k and 800k, so in t24 (peak ~209k) only real degradation signals can trigger zirv.
+- **What drove t24's compactions.** Both zirv transcripts were rescored under the old 200k assumption. Each verdict was "compact" with a weighted score of only 18–21 (`compact_at` is 60): the token ceiling alone, 160k = 0.8 × 200k, triggered it. Failing test runs are **not** a false rot signal. All 51 failing-test tool results carried `is_error: false`, because Claude's flag tracks whether the tool ran, not whether the tests passed. No weights were changed.
+- **Compaction timeout (474052e7).** `exec::compact_in_place` used to wait on `wrap.inject_timeout_ms` (20 s), a value sized for PTY nudges. It now waits on a `supervise.compact_timeout_ms` hard bound alone (default 10 min, REPO_FORBIDDEN). Transcript growth is not a liveness signal here, because a single compaction turn appends nothing until it completes. That was a review finding, fixed in 9c046123.
+- **Checked, no change.** Session identity was a harness bug (the runner resumed the old id; fixed in 28993c15). The restart-chain breaker only counts real restart boots, so one genuine rot event followed by healthy steps can never trip it.
+- **Also in round 5:**
+  - #779: the usage cache;
+  - `ctx loop` notices on stderr;
+  - #780: live rollover switch;
+  - harness: session-switch following and cost, judge retry.
+
+## Next steps for the next agent
+
+1. **Benchmark round 5 on long sessions.** Run t24 and t23 with 3 conditions × 2 reps (commands below). The questions:
+   - Does zirv now let context grow until real rot?
+   - Does compaction complete when rot does fire?
+   - How do steps 15–22 compare with vanilla?
+2. **Scope discipline without losing tests.** zirv's extra turns come partly from unrequested changes (finding 4). Look at the worker prompt and the gates, keep the "one focused test per behaviour change", and measure the effect on t24 and the subset.
+3. **The intake nudge (finding 5).** A/B the intake-discipline text, especially "run the full test suite" and "tests first", against a lighter variant on the subset and t24. It is the most direct lever on zirv's extra turns.
+4. **Parked by the operator:** Jev-ranked keep/drop instructions for compaction. It is a side quest; do not pursue it unless the operator reopens it.
+5. **Before merge:**
+   - the full four checks (failure-name diff against main);
+   - CI on Linux (covers the cfg(unix) wrap tests touched by #780);
+   - the Docker AI-feature matrix for harness-facing changes;
+   - README reference rows are updated per commit.
+
+## How to run
+
+```sh
+# Bench root: a scratch dir with tasks/ (copy of docs/.../tasks, keep it in
+# sync: t24 was missing once), template/ (git init'ed copy of template/) and
+# the superpowers plugin dir. --zirv-dir puts the zirv under test first on PATH,
+# so hooks run that binary too.
+python -u run.py --bench-root <root> --runs-subdir runs-r5 \
+  --tasks t24_long_haul,t23_afternoon --conds vanilla,zirv-nojev,zirv-jev-full \
+  --reps 2 --parallel 3 --timeout-min 300 --model sonnet --noninteractive \
+  --resume --vanilla-plugin-dir <superpowers> --zirv-dir <dir with zirv.exe>
+python compare.py --runs <root>/runs-r5 --out report-r5.md
+```
+
+Gotchas:
+
+- **Shared subscription.** Benchmark runs share the operator's subscription with the orchestrator session. A 30-run round can exhaust the 5-hour window. The runner pauses and retries on "hit your … limit".
+- **Launch through WMI.** Use `Invoke-CimMethod Win32_Process Create`. A `Start-Process` child lives in the dash pane's process tree and dies on a rollover.
+- **No `--setting-sources project,local` for zirv conditions,** because it strips zirv's hooks.
+- **Chain costs are deltas.** `claude --resume` reports a cumulative `total_cost_usd`, so the runner uses deltas, and after a supervisor session switch it uses the new total plus a transcript-priced estimate.
+- **Small tasks can't show the target.** Iterate on the subset (t16, t17, t18, t22, plus t23). The XL tasks cannot show a 20% gap; long sessions can.

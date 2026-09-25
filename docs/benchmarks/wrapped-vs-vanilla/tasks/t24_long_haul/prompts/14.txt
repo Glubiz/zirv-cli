@@ -1,0 +1,7 @@
+Same problem as the budget comparison, now for the cashflow report: it's
+adding raw amounts across different currencies as if they were the same
+unit. Add a `--usd` flag to `report cashflow`: when passed, convert every
+transaction to its USD equivalent (again, the same conversion rule we
+already have) before bucketing it into that month's income/expense/net.
+Without `--usd` (the default), behavior is exactly what it is today --
+raw amounts, no conversion.

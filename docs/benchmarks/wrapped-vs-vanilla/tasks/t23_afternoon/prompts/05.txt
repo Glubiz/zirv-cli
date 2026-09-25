@@ -1,0 +1,5 @@
+I mistyped an alias earlier and there's no way to get rid of it. Please add
+`python -m ledgerlite alias remove PATTERN --store PATH` that removes the
+alias whose `pattern` exactly equals `PATTERN` and prints `Removed alias
+PATTERN`. If no saved alias has that exact pattern, print an error to
+stderr and exit with status 2, leaving the store unchanged.

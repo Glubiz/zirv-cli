@@ -1,0 +1,7 @@
+That's already useful. Can you make `list` show the canonical merchant name
+in the Payee column, instead of whatever the bank printed, when I pass a
+new `--canonical` flag? Default behaviour (no flag) stays exactly as it is
+today -- raw payee text. With `--canonical`, resolve each row's payee
+through the saved aliases (unmatched payees still show as-is, same as
+`resolve_alias` already does). Everything else about `list`'s output
+(columns, pagination, "No transactions on this page.") stays the same.

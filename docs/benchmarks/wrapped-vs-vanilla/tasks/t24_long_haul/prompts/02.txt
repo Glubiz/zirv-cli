@@ -1,0 +1,29 @@
+Next: I want to import more than one statement into the same ledger.
+Right now `import` always REPLACES the whole ledger with just that one
+file's rows -- if I import a second CSV, my first import's transactions
+are gone.
+
+Add an `--append` flag to `import`:
+
+- With `--append`, load whatever transactions are already in `--store`
+  and ADD the newly imported file's rows after them, instead of
+  replacing. The new rows get ids that continue right after the highest
+  id already in the store (so if the store already has ids 1-3 and I
+  append a 3-row file, the new rows are 4, 5, 6 -- never restarting at 1
+  and never colliding with what's already there). If the store doesn't
+  exist yet, `--append` behaves like a normal first import (new ids start
+  at 1).
+- Without `--append` (today's default), behavior is completely unchanged:
+  replace the whole store with just this import's rows, ids starting at 1.
+- Either way, print `Imported N transactions into PATH` where `N` is the
+  number of rows in the file just imported (not the store's new running
+  total).
+
+Heads up: `store.py`'s `save()` currently overwrites the whole JSON file
+with only `{"transactions": [...]}`. That's fine today, but I'm planning
+to store other things (budgets, recurring rules, etc.) in the same file
+later this session, so please fix `save()`/`load()` now so that saving
+transactions never wipes out any other top-level key that might already
+be in the file, and vice versa -- every feature I ask for after this one
+needs to coexist in the same `--store` file without clobbering each
+other's data.

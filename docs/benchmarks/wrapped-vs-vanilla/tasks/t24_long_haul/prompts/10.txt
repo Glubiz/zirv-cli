@@ -1,0 +1,34 @@
+Found a crash. I imported my Canadian account's OFX export (its <CURDEF>
+is CAD) and then tried to sanity-check a number with `fx convert`:
+
+    > python -m ledgerlite fx convert 100 USD CAD
+    Traceback (most recent call last):
+      File "<frozen runpy>", line 198, in _run_module_as_main
+      File "<frozen runpy>", line 88, in _run_code
+      File "ledgerlite\__main__.py", line 6, in <module>
+        raise SystemExit(main())
+                         ^^^^^^
+      File "ledgerlite\cli.py", line 39, in main
+        return handler(args)
+               ^^^^^^^^^^^^^
+      File "ledgerlite\commands\currency_cli.py", line 23, in _cmd_fx
+        result = currency.convert(amount, args.from_currency, args.to_currency)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      File "ledgerlite\currency.py", line 69, in convert
+        result = usd if to_currency == BASE_CURRENCY else usd / RATES[to_currency]
+                                                                ~~~~~^^^^^^^^^^^^^
+    KeyError: 'CAD'
+
+We only support USD/EUR/GBP right now and CAD legitimately isn't one of
+them, so I don't need you to add CAD support -- I need this to fail
+*nicely* instead of dumping a Python traceback at me.
+
+Add a proper `UnknownCurrencyError` to `ledgerlite/currency.py`, raised by
+`to_usd`, `from_usd`, and `convert` whenever the currency code isn't
+`"USD"` or a key of `RATES` (message: `unknown currency code: 'CAD'`,
+matching the code's repr). Every place in the CLI that calls into currency
+conversion should catch it and print `error: <the message>` to stderr,
+exiting with status 2, instead of letting the traceback through.
+
+Don't touch the rates or the rounding rule for the currencies we DO
+support -- this is purely about the failure mode for the ones we don't.

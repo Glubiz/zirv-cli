@@ -1,0 +1,50 @@
+I share this ledger file with my accountant and I want a record of what
+changed it and when (in terms of "which operation happened, in what order",
+not wall-clock time -- I don't need real timestamps, just an ordered
+history). Please add an audit log.
+
+1. New module `ledgerlite/audit.py`:
+   - An `AuditEntry` type with fields `sequence` (int), `action` (str), and
+     `detail` (str).
+   - `append_entry(path, action, detail)` -- appends a new entry to the
+     audit trail stored under a top-level `"audit"` key in the same JSON
+     store file used by `--store` (a sibling of `"transactions"`, left
+     completely alone by this). The new entry's `sequence` is one more than
+     the number of entries already there (so the very first entry in a
+     file is `1`); entries are never reordered or removed by this
+     function. Returns the `AuditEntry` that was appended.
+   - `read_log(path)` -- returns the list of `AuditEntry` stored at `path`,
+     in the order they were appended (`[]` if the file has no `"audit"`
+     key, or doesn't exist).
+
+2. `ledgerlite/store.py`'s `save()` currently overwrites the whole store
+   file with just `{"transactions": [...]}`. Change it to preserve any
+   other top-level keys already present in the file (such as the new
+   `"audit"` key) instead of discarding them -- otherwise every `import` or
+   `categorize` after the first would wipe out the audit trail written
+   before it.
+
+3. Every existing command that changes the stored transactions must record
+   one audit entry, right after it successfully saves:
+   - `import <csv_path>`: `action="import"`,
+     `detail=f"Imported {n} transactions from {csv_path}"` (`n` is the same
+     count already printed).
+   - `categorize`: `action="categorize"`,
+     `detail=f"Re-categorized {changed} of {total} transactions"` (same
+     numbers already printed).
+   Commands that only read (`list`, `summary`) must not write any audit
+   entry.
+
+4. Two new CLI commands:
+   - `python -m ledgerlite audit log --store PATH` -- prints one line per
+     audit entry, oldest first: `f"{sequence}. {action}: {detail}"`. If
+     there are no entries, print exactly `No audit entries.`.
+   - `python -m ledgerlite audit summary --store PATH` -- prints how many
+     entries there are of each action, alphabetically by action name, one
+     per line, as `<action>: <count>`. If there are no entries, print
+     exactly `No audit entries.`.
+
+Sequence numbers must keep counting up across every command that runs
+against the same store file (e.g. an `import` followed by a `categorize`
+produces entries `1` and `2`, in that order) -- they are never reset or
+renumbered.

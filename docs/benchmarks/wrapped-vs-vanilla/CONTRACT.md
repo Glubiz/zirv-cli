@@ -9,19 +9,29 @@ $BENCH/
   CONTRACT.md
   template/                 # git repo, one commit, clean tree. The Python project "ledgerlite". No CLAUDE.md, no .zirv/.
   tasks/<task_id>/
-     prompt.txt             # exact user prompt given to the agent (may be multi-line)
-     kind.txt               # one of: tests | answer | judge
-     grade.py               # see grading protocol
+     prompt.txt             # exact user prompt given to the agent (may be multi-line) -- omitted for kind=chain
+     kind.txt               # one of: tests | answer | judge | chain
+     grade.py               # see grading protocol -- omitted for kind=chain (graded inline by run.py)
      hidden/                # (kind=tests) unittest files copied into <repo>/tests_hidden/ by grade.py
      rubric.md              # (kind=judge) rubric text handed to a blind judge
+     prompts/01.txt..NN.txt # (kind=chain) ordered follow-up prompts, one agent session
+     hidden/step_NN/*.py    # (kind=chain) per-step hidden tests, same tests_hidden/ convention
+     rubric/step_NN.md      # (kind=chain) per-step judge rubric for a step with no hidden tests
+     reference/step_NN.patch # (kind=chain) cumulative reference diff through step NN, for fairness proof
   run.py                    # runner
   aggregate.py              # aggregator -> markdown tables + results.csv
   runs/<task_id>__<cond>__r<n>/
      repo/                  # fresh copy of template/ for this run (copy the whole dir incl. .git)
-     stdout.json            # the agent's `--output-format json` result object
+     stdout.json            # the agent's `--output-format json` result object -- kind=chain instead writes
+                             # stdout_step_NN.json/result_step_NN.txt/prompt_step_NN.txt per step
      stderr.txt
-     result.json            # metrics, see below
+     result.json            # metrics, see below -- kind=chain adds a "steps": [...] list, see README
 ```
+
+`kind=chain` is documented in full in README.md's "Long-session chain"
+section (task layout, session-continuation mechanism per condition, and the
+grading protocol); it is not repeated in full here to avoid the two drifting
+apart.
 
 ## Grading protocol (`grade.py`)
 
@@ -50,7 +60,8 @@ Invocation: `python grade.py <repo_dir> <result_text_file>` (cwd irrelevant). Pr
  "zirv_cmds": {"workflow": n, "skill": n, "agent": n, "ctx": n, "other": n},   # Bash tool calls in the transcript starting with `zirv ...`
  "tool_calls": int,                                                            # total tool_use blocks in the transcript
  "score": float, "passed": int, "total": int, "visible_ok": bool, "details": str,
- "judge_score": float|null, "judge_reasoning": str|null}
+ "judge_score": float|null, "judge_reasoning": str|null,
+ "quality_score": float|null, "quality_reasoning": str|null}   # kind=tests only; see "Work-quality judge" below
 ```
 
 ## Launch shapes (run.py), cwd = `<run>/repo`
@@ -75,3 +86,19 @@ Prompt on stdin: rubric.md + the task prompt + `git diff HEAD` of the repo (cap 
 result text. It must answer ONLY a JSON object `{"score": 0-10, "reasoning": "..."}`; run.py parses it
 (strip code fences) and stores judge_score/10 as `score`. The judge is never told which condition
 produced the output.
+
+## Work-quality judge (run.py, every kind=tests run)
+
+A second, independent blind judge, run in addition to hidden-test grading
+for every kind=tests run (not just kind=judge): same launch shape as the
+blind judge above but `--model opus` and `quality_rubric.md` (shared across
+every task) instead of a per-task rubric.md. Prompt: quality_rubric.md + the
+task prompt + `git diff HEAD` of the repo, excluding `tests_hidden/` (cap 80
+KB) + the agent's final result text. Same answer contract
+(`{"score": 0-10, "reasoning": "..."}`); run.py stores `score/10` as
+`quality_score` and the reasoning as `quality_reasoning` -- both `null` for
+kind=judge/answer runs, which don't get this second judge. The hidden-test
+`score` is unaffected either way: this is a second, independent metric, not
+a replacement. `regrade.py --rejudge-quality <runs_root> [tasks...]`
+recomputes it for existing runs (re-reading each run's `repo/`/`result.txt`)
+without re-running any agent.

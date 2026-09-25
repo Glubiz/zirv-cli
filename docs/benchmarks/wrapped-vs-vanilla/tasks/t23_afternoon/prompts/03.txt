@@ -1,0 +1,6 @@
+Quick bug: I just noticed none of my aliases are matching half the time.
+Turns out my bank sometimes prints payees in ALL CAPS and sometimes in
+Title Case, and the alias patterns I typed in don't match unless the case
+is exactly right. Please make alias matching case-insensitive (the same
+way the "substring" rule kind in `rules.py` already is) -- "first match in
+order wins" stays the same, just compared case-insensitively now.
