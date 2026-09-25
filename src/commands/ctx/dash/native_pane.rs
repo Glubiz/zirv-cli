@@ -62,7 +62,7 @@ use super::super::runtime::native::{
     self, InteractiveProgress, InteractiveRequest, InteractiveSession,
     SessionState as NativeSessionState, TurnState as NativeTurnState,
 };
-use super::super::state::{StateDir, now_secs};
+use super::super::state::{StateDir, now_ms, now_secs};
 
 // =========================================================================
 // Transcript view model -- pure reduction of `ConversationState`
@@ -682,7 +682,7 @@ pub struct ComposerState {
     /// while editing the live draft.
     pub history_cursor: Option<usize>,
     /// The draft being edited before history browsing started, restored
-    /// when `HistoryDown` walks past the newest history entry.
+    /// when `history_down` walks past the newest history entry.
     history_stash: Option<String>,
     pub queued: Vec<QueuedInput>,
 }
@@ -706,17 +706,6 @@ pub enum ComposerAction {
     MoveDown,
     Home,
     End,
-    /// Explicit history navigation, independent of cursor position.
-    /// `key_to_action`'s own contract never emits these -- `MoveUp`/
-    /// `MoveDown` already decide history-vs-cursor from where the cursor
-    /// is (see their own handling in `apply_composer_action`) -- so no
-    /// caller constructs these today; kept as an explicit action a future
-    /// dedicated key binding (or a non-keyboard UI, e.g. a history picker)
-    /// can reach without duplicating that cursor-position logic.
-    #[allow(dead_code)]
-    HistoryUp,
-    #[allow(dead_code)]
-    HistoryDown,
     Submit,
     ClearLine,
 }
@@ -889,14 +878,6 @@ pub fn apply_composer_action(state: &mut ComposerState, action: ComposerAction) 
             }
             ComposerOutcome::Changed
         }
-        ComposerAction::HistoryUp => {
-            history_up(state);
-            ComposerOutcome::Changed
-        }
-        ComposerAction::HistoryDown => {
-            history_down(state);
-            ComposerOutcome::Changed
-        }
         ComposerAction::ClearLine => {
             leave_history_browsing(state);
             state.draft.clear();
@@ -1024,7 +1005,7 @@ fn move_vertical(state: &mut ComposerState, delta: i32) {
 }
 
 /// Walks one step further back into history (index 0 = most recent),
-/// stashing the live draft the first time browsing starts so `HistoryDown`
+/// stashing the live draft the first time browsing starts so `history_down`
 /// can restore it once the operator walks back past the newest entry.
 fn history_up(state: &mut ComposerState) {
     if state.history.is_empty() {
@@ -1346,11 +1327,6 @@ impl NativePresentation {
             (end, start)
         };
         self.selection = Some((start, end));
-    }
-
-    #[allow(dead_code)] // see `set_selection`'s own doc comment
-    pub fn clear_selection(&mut self) {
-        self.selection = None;
     }
 
     /// Marks the transcript as carrying an unread completed result if the
@@ -2387,13 +2363,6 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     )
 }
 
-/// The plain composer's height, for [`render_plain`]'s own sizing. The
-/// bordered pane composer sizes itself from [`composer_block`].
-#[allow(dead_code)]
-fn composer_height(presentation: &NativePresentation, width: usize) -> u16 {
-    (composer_lines(presentation, width).len() as u16).max(2)
-}
-
 /// How many completion rows the `/`, `@` and `!` entry modes may show.
 /// Issue #541 chunk C bumped this from 6 to 7 alongside `/agent`/`/agents`/
 /// `/team`; issue #538 chunk C bumped it to 9 for `/context`/`/instructions`;
@@ -2668,13 +2637,6 @@ pub fn resolve_billing(route: &RouteIdentity, repo: &Path) -> String {
         Some(BillingClass::Subscription) => "subscription".to_string(),
         None => style::PLACEHOLDER.to_string(),
     }
-}
-
-fn now_ms_u64() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Best-effort checked-out branch for `repo`, read directly from `.git/
@@ -3425,10 +3387,10 @@ impl NativePaneRuntime {
     /// Review finding 6 (PR #544): this pane's own idempotency identity for
     /// [`Self::send_submit`] -- `short-now_ms-seq`, where `seq` is a
     /// monotonic counter that makes two keys minted in the same millisecond
-    /// distinct even though `now_ms_u64()` alone would not.
+    /// distinct even though `now_ms()` alone would not.
     fn next_idempotency_key(&mut self) -> String {
         self.idempotency_seq = self.idempotency_seq.wrapping_add(1);
-        format!("{}-{}-{}", self.short, now_ms_u64(), self.idempotency_seq)
+        format!("{}-{}-{}", self.short, now_ms(), self.idempotency_seq)
     }
 
     // -- issue #490 (N21 item A): what a `dash::pane::Pane` asks a native
@@ -3927,7 +3889,7 @@ impl NativePaneRuntime {
                 self.presentation.composer.queued.push(QueuedInput {
                     text: guidance.to_string(),
                     steering: true,
-                    queued_at_ms: now_ms_u64(),
+                    queued_at_ms: now_ms(),
                 });
             }
         }
@@ -4434,7 +4396,7 @@ impl NativePaneRuntime {
                 self.presentation.composer.queued.push(QueuedInput {
                     text,
                     steering: false,
-                    queued_at_ms: now_ms_u64(),
+                    queued_at_ms: now_ms(),
                 });
             }
         }

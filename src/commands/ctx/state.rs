@@ -19,6 +19,17 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock milliseconds. Only the entry points that have no injected
+/// clock of their own use it -- `NativeLoop` takes one, so every
+/// loop-correctness test stays deterministic.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// Canonicalizes first, then replaces every character outside `[A-Za-z0-9-]`
 /// with `-`, then appends eight hex digits of the canonical display path
 /// SHA-256 so punctuation folding does not alias different repositories.

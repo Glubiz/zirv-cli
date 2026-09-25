@@ -69,6 +69,7 @@ use super::super::provider::adapter::{
     ProviderContent, ProviderFailure, ProviderMessage, ProviderMessageRole, ProviderRequest,
     ProviderStreamEvent, ProviderUsage, journal_blocks, replayed_content,
 };
+use super::super::state::now_ms;
 use super::checkpoint::{self, CheckpointContext};
 use super::compaction::{
     self, CompactionAction, CompactionDecision, CompactionPolicy, CompactionRecord, DistillBudget,
@@ -2937,17 +2938,6 @@ fn native_token_spend(usage: &ProviderUsage) -> u64 {
         .saturating_add(usage.cache_creation_input_tokens)
         .saturating_add(usage.cache_read_input_tokens)
         .saturating_add(usage.output_tokens)
-}
-
-/// Wall-clock milliseconds. Only the entry points that have no injected clock
-/// of their own use it -- [`NativeLoop`] takes one, so every loop-correctness
-/// test stays deterministic.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
 }
 
 /// The ONE durable acknowledgement every entry point uses: [`NativeLoop::
