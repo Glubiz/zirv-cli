@@ -62,6 +62,9 @@ DEFAULT_TIMEOUT_MIN = 20
 JEV_GATE_KEYS = [
     "memory", "supervisor", "dispatch", "review", "gates", "context",
     "intake_savings", "review_reuse", "harvest_screen", "admin_dispatch",
+    # Issues #781-#786 (PR #790).
+    "approve", "approve_allow", "classify", "handoff_select", "inject_screen",
+    "inject", "stop_verify",
 ]
 JEV_FULL_COND = "zirv-jev-full"
 # zirv-nojev launches exactly like zirv but with Jev fully off: every gate
@@ -74,6 +77,16 @@ JEV_ABLATION_CONDS = [JEV_FULL_COND] + JEV_GATE_CONDS
 # zirv-jev-full/zirv-jev-<gate> launch exactly like zirv-proxy: a
 # `zirv ctx proxy --json` call first, then the same `zirv ctx exec` shape.
 JEV_PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
+# The operator's `[headless]` cost levers (issue #788: prompt-cache TTL,
+# effort by intake class, lean launch), set on every zirv condition through
+# their `ZIRV_CTX_HEADLESS_*` env vars so a grid never depends on what the
+# operator's ~/.zirv/ctx.toml happens to hold. vanilla never gets them.
+ZIRV_HEADLESS_LEVERS = {
+    "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL": "5m",
+    "ZIRV_CTX_HEADLESS_LEAN": "true",
+    "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED": "medium",
+    "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL": "medium",
+}
 
 CANONICAL_CONDS = ["vanilla", "zirv", NOJEV_COND, "zirv-proxy", *JEV_ABLATION_CONDS]
 JUDGE_DISALLOWED = "Write,Edit,Bash,NotebookEdit,Read,Glob,Grep,Agent,WebFetch,WebSearch"
@@ -102,22 +115,29 @@ def jev_env_var(gate_key):
     return "ZIRV_CTX_JEV_" + gate_key.upper()
 
 
-def jev_gate_env_for(cond):
-    """The `ZIRV_CTX_JEV_*` env additions a condition's subprocesses need:
-    every gate for `zirv-jev-full`, one gate for `zirv-jev-<gate>`, nothing
-    for every other condition (including plain `zirv-proxy`, which must stay
-    byte-identical to today -- no gate on means every `[jev]`-gated site's
+def cond_env_for(cond):
+    """The env additions a condition's subprocesses need: the headless cost
+    levers for every zirv condition, plus its `ZIRV_CTX_JEV_*` gates --
+    every gate for `zirv-jev-full`, one gate for `zirv-jev-<gate>`, none for
+    plain `zirv`/`zirv-proxy` (no gate on means every `[jev]`-gated site's
     deterministic path runs same as always, see jev.rs::advise_detailed).
     """
+    if not cond.startswith("zirv"):
+        return {}
+    env = dict(ZIRV_HEADLESS_LEVERS)
     if cond == JEV_FULL_COND:
-        return {jev_env_var(g): "true" for g in JEV_GATE_KEYS}
-    if cond == NOJEV_COND:
+        env.update({jev_env_var(g): "true" for g in JEV_GATE_KEYS})
+    elif cond == NOJEV_COND:
         # None = remove the variable from the child environment (child_env).
-        return {**{jev_env_var(g): "false" for g in JEV_GATE_KEYS}, JEV_CREDENTIAL_ENV: None}
-    if cond in JEV_GATE_CONDS:
+        env.update({jev_env_var(g): "false" for g in JEV_GATE_KEYS})
+        env[JEV_CREDENTIAL_ENV] = None
+    elif cond in JEV_GATE_CONDS:
         gate = cond[len("zirv-jev-"):]
-        return {jev_env_var(gate): "true"}
-    return {}
+        env[jev_env_var(gate)] = "true"
+        if gate == "approve_allow":
+            # approve_allow is inert unless approve is on too (config.rs).
+            env[jev_env_var("approve")] = "true"
+    return env
 
 # The launching shell's PATH can be mangled (mixed `:`/`;` separators); give every
 # child -- and therefore both conditions equally -- one clean Windows PATH.
@@ -314,7 +334,7 @@ def build_argv(cond, model, prompt_text, resume_session_id=None):
         # zirv-proxy and every zirv-jev-* condition launch exactly like zirv:
         # same shape, different (proxy-decided) model and a prompt with the
         # proxy layer prepended. Which `[jev]` gates are on is carried by the
-        # subprocess environment (see jev_gate_env_for), never argv.
+        # subprocess environment (see cond_env_for), never argv.
         #
         # Fairness (probe, 2026-09-24): zirv runs keep the operator's user
         # settings layer, because that is where `zirv setup` installs zirv's
@@ -393,8 +413,8 @@ def kill_tree(pid):
 def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path, env_extra=None,
            resume_session_id=None):
     argv = build_argv(cond, model, prompt_text, resume_session_id=resume_session_id)
-    # env_extra carries the ZIRV_CTX_JEV_* gate vars for a zirv-jev-* run
-    # (jev_gate_env_for); {} for every other condition, so the child
+    # env_extra carries the headless levers and ZIRV_CTX_JEV_* gate vars for
+    # a zirv run (cond_env_for); {} for vanilla, so the child
     # inherits this process's own environment unchanged, same as before
     # issue #758. Built per-call, never via os.environ mutation: do_one_run
     # runs inside a thread pool with interleaved conditions, and mutating
@@ -1080,11 +1100,10 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
     model_used = model
     prompt_for_launch = prompt_text
     remaining_budget = timeout_s
-    # Issue #758: zirv-jev-full/zirv-jev-<gate> set these on top of the
-    # already-empty {} every other condition gets; threaded through the
-    # proxy call, the workflow start, and the final launch below so a gate
-    # is on for the whole run, not just part of it.
-    env_extra = jev_gate_env_for(cond)
+    # Threaded through the proxy call, the workflow start, and the final
+    # launch below so a lever or gate is on for the whole run, not just part
+    # of it.
+    env_extra = cond_env_for(cond)
 
     if cond in JEV_PROXY_LIKE_CONDS:
         proxy_obj, proxy_elapsed, proxy_err, _raw = call_proxy(
@@ -1341,7 +1360,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
         "model_used": model, "steps": [], "session_switches": [],
     }
 
-    env_extra = jev_gate_env_for(cond)
+    env_extra = cond_env_for(cond)
     session_id = None
     model_used = model
     remaining_budget = timeout_s
@@ -1754,7 +1773,7 @@ def main():
                     print(f"\nFirst {cond} argv:")
                     argv = build_argv(cond, args.model, prompt_text)
                 print("  " + " ".join(repr(a) for a in argv))
-                env_extra = jev_gate_env_for(cond)
+                env_extra = cond_env_for(cond)
                 if env_extra:
                     print("  env additions: " + ", ".join(f"{k}={'<removed>' if v is None else v}" for k, v in sorted(env_extra.items())))
                 shown.add(cond)
