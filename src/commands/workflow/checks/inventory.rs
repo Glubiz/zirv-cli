@@ -570,16 +570,18 @@ mod tests {
     fn removing_a_real_runtime_entry_point_row_fails_inventory() {
         let repo = tempfile::tempdir().expect("tempdir");
         super::super::write_manifest(repo.path(), "zirv");
-        let runtime = repo.path().join("src/commands/ctx/runtime");
-        std::fs::create_dir_all(&runtime).expect("mkdir runtime");
+        // `stream_once` lives in `native/turn.rs` since issue split/native
+        // turned `native.rs` into a directory module.
+        let native_dir = repo.path().join("src/commands/ctx/runtime/native");
+        std::fs::create_dir_all(&native_dir).expect("mkdir native");
         std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/ctx/runtime/native.rs"),
-            runtime.join("native.rs"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/ctx/runtime/native/turn.rs"),
+            native_dir.join("turn.rs"),
         )
         .expect("copy real native runtime");
 
-        let row = "| Native agent loop | `src/commands/ctx/runtime/native.rs` | `stream_once` | \
-                   N09 (#478) |  |";
+        let row = "| Native agent loop | `src/commands/ctx/runtime/native/turn.rs` | \
+                   `stream_once` | N09 (#478) |  |";
         let complete = passing_doc(repo.path()).replace(
             "|---|---|---|---|---|",
             &format!("|---|---|---|---|---|\n{row}"),
