@@ -554,12 +554,33 @@ the seat gets its own optional `~/.zirv/system-prompt.single.md`
 keeps today's orchestrator seat and every one of its existing conventions
 unchanged.
 
-**`zirv ctx proxy [--json] [REQUEST]`** decides and prints without launching
-anything. `REQUEST` is read from stdin when omitted and stdin is not a tty;
-human output is the announce line plus one line per field with its source
-and confidence, then reasons and fallbacks; `--json` prints the full
-decision. `zirv ctx chat --proxy` / `--no-proxy` overrides `cfg.proxy.enabled`
-for one launch; `--resume` and `--simple` always skip the proxy.
+**`zirv ctx proxy [--json] [--headless] [REQUEST]`** decides and prints
+without launching anything. `REQUEST` is read from stdin when omitted and
+stdin is not a tty; human output is the announce line plus one line per
+field with its source and confidence, then reasons and fallbacks; `--json`
+prints the full decision. `zirv ctx chat --proxy` / `--no-proxy` overrides
+`cfg.proxy.enabled` for one launch; `--resume` and `--simple` always skip the
+proxy.
+
+**Headless single seat.** A headless launch works unattended — nobody is
+watching the seat, so it must never be told it is an orchestrator: zirv's own
+rule for a worker is "runs unattended and must not delegate further". Pass
+`--headless`, or leave it unset and let `zirv ctx proxy` fall back to reading
+`ZIRV_CTX_HEADLESS=1` (`adapters::HEADLESS_ENV`, the same marker zirv itself
+sets on a headless launch's own process environment) from the calling
+process's environment — either is enough. Either one forces `execution`/
+`seat_role` to their single-seat equivalents (`Orchestrated`/`Orchestrator`
+downgrades to `Bounded`/`Single`; a decision already `Direct`/`Bounded` is a
+no-op) for BOTH the deterministic decider and a Jev/helper-assisted decision
+alike — applied last, after everything else has run. `complexity`, `risk`,
+`seat_tier`, `worker_tier`, and `workflow` are left exactly as the rest of
+the pipeline decided; only which seat executes the request changes. The
+rendered `[zirv proxy]` prompt layer then carries the same "You are the
+single seat for this request: do the work here yourself; do not delegate."
+line an interactive single-seat decision already gets. An interactive launch
+(`zirv chat`, a dashboard pane) never passes this and is unaffected. An
+external harness that launches zirv headlessly (a benchmark, CI, or any
+caller outside a session) should always pass `--headless`.
 
 Disabled by default:
 

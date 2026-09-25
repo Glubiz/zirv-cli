@@ -1267,6 +1267,42 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
 }
 
+/// Issue #537 (headless single seat): a headless launch works unattended --
+/// there is nobody to run a spawned team past, and zirv's own rule for a
+/// worker is "runs unattended and must not delegate further" -- so it must
+/// never be told `seat_role: Orchestrator`, no matter what the deterministic
+/// baseline or a Jev/helper merge decided. Called by [`super::decide`] AFTER
+/// [`finalize_derived_fields`] has already run (both inside [`baseline`] and,
+/// when a model decider won, inside [`merge`]), so it always sees the FINAL
+/// execution/seat_role pair, from either path.
+///
+/// Downgrades `Orchestrated` to `Bounded` -- NOT `Direct`: `Direct` carries
+/// its own invariant ([`apply_direct_execution_workflow_rule`], "a `Direct`
+/// execution never coexists with a `workflow`"), and this function runs after
+/// that rule already had its say, so forcing `Direct` here would silently
+/// violate it on any decision that named a workflow. `Bounded` is the
+/// highest execution rank that still maps to `SeatRole::Single`
+/// ([`SeatRole::from_execution`]), so it downgrades the seat without
+/// disturbing that invariant.
+///
+/// Deliberately narrow: only `execution`/`seat_role` change. `complexity`,
+/// `risk`, `seat_tier`, `worker_tier`, and `workflow` are left exactly as the
+/// rest of the pipeline decided -- this changes which seat executes the
+/// request, not how hard the request is judged to be or what it should
+/// still be told to do. A no-op when `execution` is already
+/// `Direct`/`Bounded` (already single-seat).
+pub fn force_single_seat(decision: &mut ProxyDecision) {
+    if decision.execution == ExecutionMode::Orchestrated {
+        decision.execution = ExecutionMode::Bounded;
+        decision.seat_role = SeatRole::Single;
+        decision.reasons.push(
+            "execution: forced to bounded because this is a headless launch -- a worker runs \
+             unattended and must not delegate further"
+                .to_string(),
+        );
+    }
+}
+
 /// Builds the Jev `state`/`questions()` input: the request (truncated to
 /// `cfg.proxy.request_max_bytes`), the repository's own name, the registered
 /// workflow ids/descriptions, and whether the native runtime is available.
@@ -2421,6 +2457,59 @@ mod tests {
             SeatRole::from_execution(ExecutionMode::Orchestrated),
             SeatRole::Orchestrator
         );
+    }
+
+    /// Issue #537 (headless single seat): a headless launch (unattended,
+    /// nobody watching the seat work) must never fan out into a delegated
+    /// team, so `force_single_seat` downgrades an `Orchestrated`/
+    /// `Orchestrator` decision to `Bounded`/`Single` -- and, per this
+    /// function's own doc comment, touches ONLY those two fields.
+    /// `complexity`/`risk`/`seat_tier`/`worker_tier`/`workflow` all stay
+    /// exactly as the rest of the pipeline decided.
+    #[test]
+    fn force_single_seat_downgrades_orchestrated_to_bounded_single_seat() {
+        let mut decision = sample_decision();
+        decision.complexity = Complexity::Substantial;
+        decision.risk = RiskBand::Medium;
+        decision.execution = ExecutionMode::Orchestrated;
+        decision.seat_role = SeatRole::Orchestrator;
+        decision.seat_tier = SeatTier::Frontier;
+        decision.worker_tier = Tier::Standard;
+        decision.workflow = Some("feature".to_string());
+
+        force_single_seat(&mut decision);
+
+        assert_eq!(decision.execution, ExecutionMode::Bounded);
+        assert_eq!(decision.seat_role, SeatRole::Single);
+        // Untouched by design -- see this test's own doc comment.
+        assert_eq!(decision.complexity, Complexity::Substantial);
+        assert_eq!(decision.risk, RiskBand::Medium);
+        assert_eq!(decision.seat_tier, SeatTier::Frontier);
+        assert_eq!(decision.worker_tier, Tier::Standard);
+        assert_eq!(decision.workflow.as_deref(), Some("feature"));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("headless")),
+            "{:?}",
+            decision.reasons
+        );
+    }
+
+    /// A decision that is already single-seat (`Direct`/`Bounded`) is left
+    /// byte-identical -- `force_single_seat` never fires a reason or touches
+    /// a field it has nothing to downgrade.
+    #[test]
+    fn force_single_seat_is_a_noop_for_an_already_single_seat_decision() {
+        for execution in [ExecutionMode::Direct, ExecutionMode::Bounded] {
+            let mut decision = sample_decision();
+            decision.execution = execution;
+            decision.seat_role = SeatRole::Single;
+            let before = decision.clone();
+            force_single_seat(&mut decision);
+            assert_eq!(decision, before, "{execution:?}");
+        }
     }
 
     /// Issue #537: a `direct` execution answer must never coexist with a
