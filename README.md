@@ -4072,7 +4072,7 @@ intake_savings = false # clarification category and optional planner; ZIRV_CTX_J
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
-approve = false     # safety-hook risk check: sends local facts only (program/subcommand class, write/delete/network/privilege flags, path-scope class, pipe/redirect/substitution/secret-placeholder counts), may only escalate a deterministic allow to ask; ZIRV_CTX_JEV_APPROVE (#781)
+approve = false     # safety-hook risk check: sends local facts only (program/subcommand class, write/delete/network/privilege flags, path-scope class, pipe/redirect/substitution/secret-placeholder counts), may only escalate a deterministic allow to ask; makes no call at all for a read-only, worktree/scratchpad-confined command (grep/cat/head/git status/..., pipes between them); ZIRV_CTX_JEV_APPROVE (#781)
 approve_allow = false # opt-in auto-approve, effective only when `approve` is also true: may lower a SIMPLE unmatched-default ask to allow (single segment, no pipe/redirect/substitution/env-prefix/code-bearing argument, program not a shell/eval/wrapper/refused-destructive program, not destructive/network/privilege) on a high-confidence/margin answer, with every check ALSO re-run on each token suffix to defeat launcher prefixes (nohup, timeout N, nice, ...); never a hard deny, and never a matched deny/ask rule (rm -rf, force-push, credential paths, ...) -- see "Command safety policy" below for the full structural rule; ZIRV_CTX_JEV_APPROVE_ALLOW (#781)
 classify = false    # intent refinement for `zirv workflow start`/`classify` (classify also adds domain tags); ZIRV_CTX_JEV_CLASSIFY (#782)
 handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_JEV_HANDOFF_SELECT (#783)
@@ -6338,7 +6338,15 @@ makes a call under `dontAsk` (every headless launch): the hook emits nothing
 there for `allow` or a non-operator `ask`, so the answer could not change the
 decision. `approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
 answer; widening what may be escalated is always safe, so this direction has
-no further restriction. `approve_allow` (effective only when `approve` is
+no further restriction — except one operator-decided carve-out: `approve`
+makes no Jev call at all for a command that is read-only and confined to the
+worktree/scratchpad (a fixed allowlist of inspection programs/subcommands —
+`grep`/`rg`/`cat`/`head`/`tail`/`wc`/`ls`/`find` without `-exec`/`-delete`/
+`-ok`, read-only `git` subcommands including `branch --list`, `pwd`, `echo`,
+and pipes ONLY between such programs — with no writes/deletes/network/
+privilege flags, no eval/shell wrapper, no code-bearing argument, no command
+substitution, and no redirection to a file; anything it cannot positively
+confirm still reaches Jev). `approve_allow` (effective only when `approve` is
 also on) may only LOWER an `ask` to `allow`, on a decisive `safe` answer
 clearing a HIGH margin and confidence floor (2026-09-18 probe: 8/10 correct,
 both misses cautious, n=10 — too small to gate on at a normal bar), and only

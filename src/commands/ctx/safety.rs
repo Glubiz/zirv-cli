@@ -10124,6 +10124,196 @@ fn jev_approve_facts(command: &str, scratchpad_roots: &[String]) -> Vec<u32> {
     ]
 }
 
+/// Issue #781 follow-up (operator decision, benchmark evidence): the fixed,
+/// narrow table of read-only inspection programs eligible to skip the Jev
+/// escalate call entirely -- see [`jev_approve_is_read_only_local`]'s own
+/// doc comment. Deliberately excludes test runners and interpreters
+/// (`pytest`, `python`, `cargo`, `npm`, `node`, ...): those execute code and
+/// must keep asking Jev. `git` and `find` are handled by their own
+/// subcommand/flag-aware predicates below rather than a bare name match.
+const JEV_APPROVE_READ_ONLY_PROGRAMS: &[&str] = &[
+    "grep", "rg", "cat", "head", "tail", "wc", "ls", "pwd", "echo", "less", "more", "file", "stat",
+    "basename", "dirname", "which", "where", "type", "tree", "diff", "printf", "realpath",
+];
+
+/// `git` subcommands that only inspect repository state -- `branch` is
+/// handled separately in [`jev_approve_git_is_read_only`] since it is only
+/// read-only with `--list` and no mutating flag.
+const JEV_APPROVE_READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "remote",
+    "describe",
+    "rev-parse",
+    "ls-files",
+    "blame",
+    "shortlog",
+    "reflog",
+];
+
+/// `find` is read-only unless it carries a flag that runs a command or
+/// deletes a match -- the same action-flag family the issue names
+/// (`-exec`/`-delete`/`-ok`), plus their siblings (`-execdir`/`-okdir`) and
+/// the `-f*` family that writes to a file.
+fn jev_approve_find_is_read_only(tokens: &[String]) -> bool {
+    !tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-delete"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-fls"
+        )
+    })
+}
+
+/// `git branch` is read-only only with `--list` and no rename/delete/copy/
+/// upstream-changing flag alongside it; every other `git` subcommand is
+/// read-only exactly when it is in [`JEV_APPROVE_READ_ONLY_GIT_SUBCOMMANDS`].
+/// A missing or flag-shaped subcommand (`git -C x status`) is conservatively
+/// NOT read-only -- this predicate only looks at `tokens[1]`, deliberately
+/// narrower than the launcher-aware suffix walk `jev_approve_lower_is_
+/// simple_enough` uses, since an uncertain read here just keeps calling Jev
+/// rather than silently widening what may be lowered.
+fn jev_approve_git_is_read_only(tokens: &[String]) -> bool {
+    let Some(second) = tokens.get(1) else {
+        return false;
+    };
+    if second.starts_with('-') {
+        return false;
+    }
+    let lower = second.to_ascii_lowercase();
+    if lower == "branch" {
+        const MUTATING: &[&str] = &[
+            "-d",
+            "-D",
+            "--delete",
+            "-m",
+            "-M",
+            "--move",
+            "-c",
+            "-C",
+            "--copy",
+            "-u",
+            "--set-upstream-to",
+            "--unset-upstream",
+        ];
+        let rest = &tokens[2..];
+        return rest.iter().any(|token| token == "--list")
+            && !rest.iter().any(|token| MUTATING.contains(&token.as_str()));
+    }
+    JEV_APPROVE_READ_ONLY_GIT_SUBCOMMANDS.contains(&lower.as_str())
+}
+
+/// Whether `program`/`tokens` (a single pipe-segment's own program and
+/// tokens) name a known read-only inspection command -- the fixed,
+/// conservative allowlist [`jev_approve_is_read_only_local`] folds over
+/// every segment.
+fn jev_approve_program_is_read_only(program: &str, tokens: &[String]) -> bool {
+    match program {
+        "find" => jev_approve_find_is_read_only(tokens),
+        "git" => jev_approve_git_is_read_only(tokens),
+        _ => JEV_APPROVE_READ_ONLY_PROGRAMS.contains(&program),
+    }
+}
+
+/// Issue #781 follow-up (operator decision, benchmark evidence): `[jev]
+/// approve` made a synchronous Jev call on every deterministically-ALLOWED
+/// Bash command, including plain read-only inspection -- in a benchmark
+/// round every one of 23 escalations was a false positive on a command like
+/// `grep -n ... | head -5`. This predicate is consulted BEFORE
+/// [`jev_approve_escalate`] ever builds a facts row or calls Jev: when it
+/// returns `true` the deterministic `Allow` is returned unchanged, with no
+/// Jev call and no recorded effect -- see [`apply_jev_approve_outcome`]'s
+/// own match guard.
+///
+/// Conservative by construction, reusing this module's own tokenizer/
+/// segmenter/classifiers rather than a parallel one: [`command_substitution_
+/// spans`] (no substitution), a literal scan for heredoc/process-substitution
+/// syntax, [`split_segments_with_pipe_marker`] (segmentation -- every
+/// non-leading segment MUST be pipe-joined; a `;`/`&&`/`||`/newline/
+/// background `&` join can smuggle in an unrelated later command, so any of
+/// those disqualifies the whole command), [`segment_redirect_targets`] (no
+/// redirection to a file on any segment), [`sql_tokens`]/[`sql_program_
+/// name`] (tokenizing), [`is_shell_identifier_assignment`] (no env-prefix
+/// assignment), [`jev_approve_is_eval_or_shell_wrapper`]/[`jev_approve_has_
+/// code_bearing_argument`] (the #781 wrapper/code-argument checks),
+/// [`command_is_destructive`]/[`is_network_program`] (the existing delete/
+/// network classifiers), and [`jev_approve_path_scope`] (the #781 path-scope
+/// bucket -- required to be exactly 0, i.e. no credential path, no root-wide
+/// or whole-home reference, and no write target at all) on every segment.
+/// Only after every one of those checks passes is the segment's own program
+/// checked against [`jev_approve_program_is_read_only`]'s fixed allowlist.
+///
+/// Anything this predicate cannot positively confirm falls through to
+/// `false`, which keeps calling Jev -- the issue's own "anything uncertain
+/// is NOT read-only" rule.
+fn jev_approve_is_read_only_local(command: &str, scratchpad_roots: &[String]) -> bool {
+    if command.contains(['\\', '$', '`', '\n']) {
+        return false;
+    }
+    if !command_substitution_spans(command).is_empty() {
+        return false;
+    }
+    if command.contains("<(") || command.contains(">(") || command.contains("<<") {
+        return false;
+    }
+    let segments = split_segments_with_pipe_marker(command);
+    if segments.is_empty() {
+        return false;
+    }
+    for (index, (segment, preceded_by_pipe)) in segments.iter().enumerate() {
+        if index > 0 && !preceded_by_pipe {
+            return false;
+        }
+        if segment.trim().is_empty() {
+            return false;
+        }
+        let Some(redirect_targets) = segment_redirect_targets(segment) else {
+            return false;
+        };
+        if !redirect_targets.is_empty() {
+            return false;
+        }
+        let Some(tokens) = sql_tokens(&collapse_whitespace(segment)) else {
+            return false;
+        };
+        let Some(first) = tokens.first() else {
+            return false;
+        };
+        if is_shell_identifier_assignment(first) {
+            return false;
+        }
+        let program = sql_program_name(first);
+        if jev_approve_is_eval_or_shell_wrapper(&program, &tokens)
+            || jev_approve_has_code_bearing_argument(&tokens)
+        {
+            return false;
+        }
+        if command_is_destructive(segment, scratchpad_roots)
+            || is_network_program(&program)
+            || matches!(program.as_str(), "sudo" | "doas" | "su")
+        {
+            return false;
+        }
+        let writes = write_targets_confined(segment, scratchpad_roots);
+        if jev_approve_path_scope(segment, &tokens, writes) != 0 {
+            return false;
+        }
+        if !jev_approve_program_is_read_only(&program, &tokens) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Issue #781 direction 1 (`[jev] approve`): may only ESCALATE. Called only
 /// when `outcome.verdict == Allow` and `cfg.jev.approve` is on -- see
 /// [`apply_jev_approve_outcome`]'s own doc comment.
@@ -10325,7 +10515,12 @@ fn jev_approve_lower(
 /// verdict` makes -- so Jev only ever sees (and can only ever adjust) the
 /// FINAL deterministic verdict, never one a later guard (the identical-
 /// failing-command breaker, the orchestrator-write posture) might still go
-/// on to override. `approve` may only ESCALATE `Allow` to `Ask`;
+/// on to override. Follow-up (operator decision, benchmark evidence): a
+/// deterministic `Allow` that [`jev_approve_is_read_only_local`] confirms is
+/// read-only and confined to the worktree/scratchpad is returned unchanged
+/// with NO Jev call at all -- `approve` never asks Jev about a `grep`/`cat`/
+/// `git status`-shaped command in the first place. Otherwise, `approve` may
+/// only ESCALATE `Allow` to `Ask`;
 /// `approve_allow` (effective only when `approve` is ALSO on) may only
 /// LOWER an unmatched-default, SIMPLE `Ask` to `Allow` -- never a hard
 /// `Deny`, never an `Ask` that carries any matched rule at all, and never a
@@ -10348,6 +10543,11 @@ fn apply_jev_approve_outcome(
     outcome: Outcome,
 ) -> Outcome {
     match outcome.verdict {
+        Verdict::Allow
+            if cfg.jev.approve && jev_approve_is_read_only_local(command, scratchpad_roots) =>
+        {
+            outcome
+        }
         Verdict::Allow if cfg.jev.approve => {
             jev_approve_escalate(cfg, state, command, scratchpad_roots, outcome)
         }
@@ -21949,7 +22149,11 @@ mod tests {
         let cfg = jev_approve_test_cfg(url, credential_env);
         let state_dir = tempfile::tempdir().expect("state");
 
-        let verdict = run_jev_approve_hook(&cfg, "git status", "default", state_dir.path());
+        // `cargo build` (not `git status`): must be deterministically Allow
+        // AND non-read-only, so it still reaches Jev -- `git status` became
+        // read-only-local after the follow-up below and would now skip the
+        // Jev call entirely, defeating this test's own purpose.
+        let verdict = run_jev_approve_hook(&cfg, "cargo build", "default", state_dir.path());
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -22021,7 +22225,9 @@ mod tests {
         let cfg = jev_approve_test_cfg(url, credential_env);
         let state_dir = tempfile::tempdir().expect("state");
 
-        let verdict = run_jev_approve_hook(&cfg, "git status", "default", state_dir.path());
+        // `cargo build`, not `git status` -- see the escalate test above for
+        // why: a read-only-local command now skips the Jev call entirely.
+        let verdict = run_jev_approve_hook(&cfg, "cargo build", "default", state_dir.path());
 
         unsafe {
             std::env::remove_var(credential_env);
@@ -22035,6 +22241,75 @@ mod tests {
         );
         let effects = std::fs::read_to_string(state_dir.path().join("jev-effects.jsonl"))
             .expect("a fallback effect row must be recorded");
+        assert!(effects.contains("\"action\":\"fallback\""), "{effects}");
+    }
+
+    /// Follow-up (operator decision, benchmark evidence): a read-only,
+    /// worktree-local pipeline (`grep` piped to `head`, both shipped
+    /// read-only allow families) never calls Jev at all -- no
+    /// `jev-effects.jsonl`/`jev-decisions.jsonl` file is created, even
+    /// though the endpoint is unreachable and would otherwise record a
+    /// `fallback` effect. Proven live to fail without `jev_approve_is_
+    /// read_only_local`'s early return (see this worker's own report).
+    #[test]
+    fn approve_makes_no_jev_call_for_a_read_only_local_pipeline() {
+        let credential_env = "SAFETY_TEST_JEV_APPROVE_READ_ONLY_LOCAL";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_approve_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("state");
+
+        let verdict = run_jev_approve_hook(
+            &cfg,
+            "grep -n foo src/lib.rs | head -5",
+            "default",
+            state_dir.path(),
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+
+        assert_eq!(
+            verdict,
+            Some(Verdict::Allow),
+            "a read-only local pipeline must stay Allow with no Jev round trip"
+        );
+        assert!(
+            !state_dir.path().join("jev-effects.jsonl").exists(),
+            "a read-only local command must skip the Jev call entirely, not merely fall back"
+        );
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
+    }
+
+    /// Follow-up counterpart: a deterministically-ALLOWED command that
+    /// EXECUTES code (a test runner) is not read-only, so it must still
+    /// reach Jev -- here an unreachable endpoint records a `fallback`
+    /// effect, proving the call was actually attempted.
+    #[test]
+    fn approve_still_calls_jev_for_a_non_read_only_allowed_command() {
+        let credential_env = "SAFETY_TEST_JEV_APPROVE_NON_READ_ONLY_STILL_CALLS";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = jev_approve_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
+        let state_dir = tempfile::tempdir().expect("state");
+
+        let verdict =
+            run_jev_approve_hook(&cfg, "python -m pytest -q", "default", state_dir.path());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+
+        assert_eq!(
+            verdict,
+            Some(Verdict::Allow),
+            "an unreachable endpoint must fall back to the deterministic Allow"
+        );
+        let effects = std::fs::read_to_string(state_dir.path().join("jev-effects.jsonl"))
+            .expect("a test runner must still reach Jev, recording a fallback effect row");
         assert!(effects.contains("\"action\":\"fallback\""), "{effects}");
     }
 
