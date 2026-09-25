@@ -336,24 +336,6 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub const POLICY_FINGERPRINT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_SHA256";
 pub const POLICY_SNAPSHOT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_FILE";
 
-// Issue #168: no longer called (self-heal replaced its use in
-// evaluate_with_attestation_evidence) -- kept as the documented pre-#168
-// shape referenced by nearby doc comments.
-#[allow(dead_code)]
-fn attestation_failure(mode: super::adapters::LaunchMode) -> Outcome {
-    Outcome {
-        verdict: if mode.is_interactive() {
-            Verdict::Ask
-        } else {
-            Verdict::Deny
-        },
-        matched: Some(Rule {
-            pattern: "<attestation: invalid launch policy snapshot>".to_string(),
-            origin: Origin::BuiltIn,
-        }),
-    }
-}
-
 /// Issue #139: whether the launch-time policy snapshot's verdict for one
 /// command diverges from the currently-resolved policy's own verdict for
 /// the SAME command, and in which direction. `evaluate_with_attestation_

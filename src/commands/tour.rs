@@ -281,7 +281,6 @@ fn run_noninteractive_tour() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Offer the tour after first-run setup. Prints the offer, reads the answer, and runs
 /// the tour on yes. Silent no-op when not a TTY.
-#[allow(dead_code)]
 pub fn offer_after_first_run() {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return;

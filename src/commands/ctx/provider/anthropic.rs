@@ -4,8 +4,6 @@
 //! construction, stream accumulation, cancellation, typed failures, and the
 //! opaque thinking blocks required for safe continuation.
 
-#![allow(dead_code)] // N09 wires direct providers into the persistent runtime loop.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};

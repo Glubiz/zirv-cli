@@ -11,8 +11,6 @@
 //! deliberately unused -- it only continues a provider-stored response, so
 //! it could never be the durable state, and Zirv keeps no route where it is.
 
-#![allow(dead_code)] // N09 wires direct providers into the persistent runtime loop.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 

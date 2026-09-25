@@ -13,8 +13,6 @@
 //! run a native session against is not the same thing as test-only scaffolding.
 //! Nothing here reads a clock, an environment variable or a network.
 
-#![allow(dead_code)] // Consumed by this module's own tests and by later roadmap steps.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};

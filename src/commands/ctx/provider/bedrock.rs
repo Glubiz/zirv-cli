@@ -21,8 +21,6 @@
 //! both surfaces immediately as a JSON decode failure -- a typed
 //! `InvalidStream`, never a silently accepted turn.
 
-#![allow(dead_code)] // Route selection reaches this adapter through native.rs.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read};
 

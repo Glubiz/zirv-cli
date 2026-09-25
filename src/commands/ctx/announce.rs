@@ -205,7 +205,7 @@ pub enum Event {
     /// test below -- `#[allow(dead_code)]` documents that as deliberate
     /// rather than an oversight, the same way `poll.rs`'s own macOS-only
     /// items are marked.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MacosKeychainPromptExpected,
     /// The shipped-default "sandboxed, no prompts" launch posture
     /// (2026-08-22, `adapters::policy_launch_args`/`AgentAdapter::default_

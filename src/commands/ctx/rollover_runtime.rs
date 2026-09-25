@@ -592,7 +592,6 @@ fn continuation_for(direction: Direction, plan: &ContinuationPlan) -> Option<Con
 /// `wrap.rs` and `dash/mod.rs`, which this task deliberately does not touch
 /// -- see the design note. The decision and its durable effects are real and
 /// tested here so that wiring is a call, not a redesign.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "disposition", rename_all = "kebab-case")]
 pub enum Disposition {
@@ -621,7 +620,6 @@ impl Disposition {
 
 /// The pure half of item 6: what SHOULD happen to `record` at this boundary.
 /// See [`Disposition`] for why this has no in-tree caller yet.
-#[allow(dead_code)]
 pub fn disposition(record: &delegation::Record, drain: Drain, owner: &str) -> Disposition {
     if record.phase.is_terminal() {
         return Disposition::Finished {

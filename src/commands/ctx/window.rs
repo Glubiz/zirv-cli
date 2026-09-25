@@ -1121,7 +1121,6 @@ pub fn estimate_windows(
 /// Parses an RFC 3339 timestamp ("2026-08-16T20:49:59.785342+00:00", trailing
 /// "Z" or "+/-HH:MM", fraction ignored) to unix seconds. None on anything
 /// malformed or pre-epoch. Used by the codex collector and the rollout parser.
-#[allow(dead_code)]
 pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
     let (date, rest) = s.split_once('T')?;
     let mut dp = date.split('-');
@@ -1195,7 +1194,6 @@ fn window_slot(window_secs: u64) -> Option<bool /* true = five_hour */> {
 /// non-null `rate_limit_reached_type` is the vendor reporting it actually
 /// refused -- and every other payload shape leaves `overage_covered` false, so
 /// an absent `credits` node can never soften a real refusal.
-#[allow(dead_code)]
 pub fn windows_from_rate_limits(
     limits: &serde_json::Value,
     observed_at: u64,
@@ -1307,7 +1305,6 @@ pub enum RolloutRecord {
 /// Parses one rollout line into the record shapes above. `None` for garbage
 /// JSON, a non-`event_msg` top-level type, or a `payload.type` this codebase
 /// has no verified mapping for.
-#[allow(dead_code)]
 pub fn parse_rollout_record(line: &str) -> Option<RolloutRecord> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
     if v.get("type")?.as_str()? != "event_msg" {
@@ -1354,7 +1351,6 @@ pub fn parse_rollout_record(line: &str) -> Option<RolloutRecord> {
 
 /// One codex session-rollout JSONL line -> usage windows, if it is a
 /// token_count event carrying rate limits and a parseable timestamp.
-#[allow(dead_code)]
 pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
     match parse_rollout_record(line)? {
         RolloutRecord::TokenCount { windows, .. } => windows,
@@ -1363,7 +1359,6 @@ pub fn parse_rollout_line(line: &str) -> Option<UsageWindows> {
 }
 
 /// The account the codex provider's usage is attributed to.
-#[allow(dead_code)]
 pub const CODEX_USAGE_PROVIDER: &str = "openai";
 
 /// Floor between codex rollout-tree scan *attempts*, shared by
@@ -1374,12 +1369,9 @@ pub const CODEX_USAGE_PROVIDER: &str = "openai";
 pub(crate) const CODEX_SCAN_FLOOR_SECS: u64 = 60;
 
 /// Rollout files grow large; only the tail can hold the newest snapshot.
-#[allow(dead_code)]
 const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
-#[allow(dead_code)]
 pub(crate) const ROLLOUT_SCAN_FILES: usize = 3;
 
-#[allow(dead_code)]
 fn collect_jsonl(
     dir: &Path,
     depth: u8,
@@ -1404,7 +1396,6 @@ fn collect_jsonl(
     }
 }
 
-#[allow(dead_code)]
 fn last_snapshot_in(path: &Path, now: u64) -> Option<UsageWindows> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -1423,7 +1414,6 @@ fn last_snapshot_in(path: &Path, now: u64) -> Option<UsageWindows> {
 }
 
 /// Newest rate-limit snapshot across the most recently modified rollout files.
-#[allow(dead_code)]
 pub fn scan_codex_rollouts(
     sessions_dir: &Path,
     max_files: usize,
@@ -1439,7 +1429,6 @@ pub fn scan_codex_rollouts(
         .max_by_key(newest_observation)
 }
 
-#[allow(dead_code)]
 pub(crate) fn newest_observation(windows: &UsageWindows) -> u64 {
     windows
         .five_hour
@@ -1489,7 +1478,6 @@ pub(crate) fn freshest_available_observation(windows: &UsageWindows, now: u64) -
 /// Opportunistic passive refresh for codex: scan its session rollouts only
 /// when the stored reading is stale. Best-effort by design — every failure
 /// leaves the stored state exactly as it was.
-#[allow(dead_code)]
 pub fn refresh_codex_usage(
     state: &StateDir,
     sessions_dir: Option<&Path>,

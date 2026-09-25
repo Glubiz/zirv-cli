@@ -37,7 +37,6 @@ const MAX_BUNDLE_DESCRIPTION_CHARS: usize = 1024;
 /// characters.
 // #[allow(dead_code)]: only `bundle_compatibility` reads this today; its
 // caller (the CLI/tool-registry export surface) is a later #539 chunk.
-#[allow(dead_code)]
 const MAX_COMPATIBILITY_CHARS: usize = 500;
 /// A resource body read on demand through [`SkillRegistry::read_resource`]
 /// is truncated to this many bytes -- progressive disclosure only helps if
@@ -50,7 +49,7 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
 /// activation deterministically in Rust rather than asking a model to pick a
 /// skill from a rendered catalogue the way a host that delegates that choice
 /// would need to.
-// #[allow(dead_code)]: `ensure_discovery_budget` has no caller yet; the CLI
+// `ensure_discovery_budget` has no caller yet; the CLI
 // and activation surfaces that enforce it are a later #539 chunk.
 #[allow(dead_code)]
 pub const MAX_DISCOVERY_BUDGET_BYTES: usize = 32 * 1024;
@@ -345,7 +344,7 @@ pub struct SkillDigest<'a> {
 impl SkillDigest<'_> {
     /// One compact, tab-separated intake line: enough to decide relevance
     /// and admissibility without reading the full digest struct.
-    // #[allow(dead_code)]: only `discovery_bytes` calls this today, and it
+    // only `discovery_bytes` calls this today, and it
     // has no caller outside tests either; see the note there.
     #[allow(dead_code)]
     pub fn render_line(&self) -> String {
@@ -528,7 +527,8 @@ impl SkillRegistry {
 
     /// Total bytes the whole discovery listing would cost, one
     /// [`SkillDigest::render_line`] per registered skill.
-    #[allow(dead_code)] // see `digests`'s note
+    // see `digests`'s note
+    #[allow(dead_code)]
     pub fn discovery_bytes(&self) -> usize {
         self.digests()
             .iter()
@@ -539,7 +539,8 @@ impl SkillRegistry {
     /// Refuses when the discovery listing does not fit [`MAX_DISCOVERY_BUDGET_BYTES`].
     /// A registry too large to summarize compactly needs to shrink -- this
     /// never silently truncates the listing and hides a skill from view.
-    #[allow(dead_code)] // see `digests`'s note
+    // see `digests`'s note
+    #[allow(dead_code)]
     pub fn ensure_discovery_budget(&self) -> CtxResult<()> {
         let bytes = self.discovery_bytes();
         if bytes > MAX_DISCOVERY_BUDGET_BYTES {
@@ -1294,7 +1295,6 @@ fn parse_enum_csv<T>(
 /// portable fields still gets an honest prerequisite instead of silence.
 /// `None` when the skill needs nothing beyond the host itself.
 // #[allow(dead_code)]: only `export_bundle` calls this today; see its note.
-#[allow(dead_code)]
 fn bundle_compatibility(manifest: &SkillManifest) -> Option<String> {
     if manifest.required_integrations.is_empty() && manifest.required_capabilities.is_empty() {
         return None;
@@ -1339,7 +1339,6 @@ fn bundle_compatibility(manifest: &SkillManifest) -> Option<String> {
 /// written out, matching what an absent key already means on parse.
 // #[allow(dead_code)]: this chunk (issue #539) only defines the library
 // function; the CLI subcommand that calls it is a later chunk's job.
-#[allow(dead_code)]
 pub fn export_bundle(skill: &RegisteredSkill, out_dir: &Path) -> CtxResult<PathBuf> {
     ensure_bundle_description_len(&skill.manifest.description, &skill.manifest.id)?;
     let bundle_dir = out_dir.join(&skill.manifest.id);

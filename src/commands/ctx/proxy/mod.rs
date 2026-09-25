@@ -518,7 +518,6 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 /// every one of those keeps today's plain `workflow: <kind or none>` line.
 // T2 is the first caller (folds this into `compile.rs`'s composed context);
 // exercised here only by this module's own tests in the meantime.
-#[allow(dead_code)]
 pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>) -> String {
     let mut lines = vec!["[zirv proxy]".to_string()];
     lines.push(format!(

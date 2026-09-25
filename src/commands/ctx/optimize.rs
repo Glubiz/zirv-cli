@@ -243,8 +243,7 @@ impl Surface {
     /// conversion would not blindly repeat the mistake. `self.layer.scope()`
     /// is still consulted, but only to choose which repo-owned refinement
     /// (`into_nested`/`into_local_private`) to apply, never to decide `Global`.
-    // No production caller yet -- Tasks 10-16's handoff API (issue #39).
-    #[allow(dead_code)]
+    // `compile.rs`'s context compiler (issue #44) is the production caller.
     pub fn context_surface(&self, repo: &Path, home: Option<&Path>) -> surface::ContextSurface {
         let generic = surface::ContextSurface::for_path(
             self.layer.provider(),

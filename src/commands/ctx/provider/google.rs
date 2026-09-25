@@ -26,8 +26,6 @@
 //! `docs/design/2026-09-13-native-google-provider.md` for which shapes are
 //! fixture-verified here versus assumed from current primary docs.
 
-#![allow(dead_code)] // N09 wires direct providers into the persistent runtime loop.
-
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 

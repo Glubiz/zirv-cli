@@ -17,8 +17,6 @@
 //! vendor implements them. Anything a request asks for that the profile does
 //! not declare is refused with a typed failure rather than dropped.
 
-#![allow(dead_code)] // Route selection reaches this adapter through native.rs.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 
@@ -229,10 +227,6 @@ impl OpenAiChatAdapter {
             endpoint,
             extensions,
         })
-    }
-
-    pub fn profile(&self) -> &'static RouteProfile {
-        self.profile
     }
 
     fn request_url(&self) -> String {

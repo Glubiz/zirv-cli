@@ -24,7 +24,6 @@
 // The registry is data: individual rows, lookups and extension types are
 // consumed by the transports, the inventory and this module's own tests, so
 // "nothing in the default build calls this one" is not a signal here.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
@@ -141,10 +140,23 @@ pub struct ExtensionSpec {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ExtensionType {
     Bool,
-    Integer { min: i64, max: i64 },
-    Number { min: f64, max: f64 },
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Number {
+        min: f64,
+        max: f64,
+    },
+    // Not yet declared by any profile in the registry; validated
+    // exhaustively below for when one does, and exercised by this module's
+    // own tests.
+    #[allow(dead_code)]
     String,
-    Enum { values: &'static [&'static str] },
+    #[allow(dead_code)]
+    Enum {
+        values: &'static [&'static str],
+    },
 }
 
 /// One route profile: everything a configured route needs beyond its
@@ -772,6 +784,7 @@ pub static PROFILES: &[RouteProfile] = &[
 /// the Nova family has no separate direct API. `typesafe` binds to a
 /// legacy-only profile because it is a decision-only vendor for the harness
 /// proxy, never a coding-session route.
+#[allow(dead_code)] // read only by `vendor_profile`, itself exercised by this module's own tests
 const VENDOR_ROUTES: &[(&str, &str)] = &[
     ("anthropic", "anthropic-messages"),
     ("openai", "openai-responses"),
@@ -792,6 +805,7 @@ const VENDOR_ROUTES: &[(&str, &str)] = &[
 ];
 
 /// The documented direct route for a catalogue vendor.
+#[allow(dead_code)] // no production caller yet; exercised by this module's own catalogue-completeness test
 pub fn vendor_profile(slug: &str) -> Option<&'static RouteProfile> {
     VENDOR_ROUTES
         .iter()

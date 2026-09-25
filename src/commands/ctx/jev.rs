@@ -173,7 +173,6 @@ impl Question {
     /// caller-composed catch-all or an optional description, build
     /// [`Criteria::Choice`] directly instead -- this constructor is for the
     /// common case where every option has one.
-    #[allow(dead_code)]
     pub(crate) fn choice(id: &str, instructions: &str, options: &[(&str, &str)]) -> Self {
         Question {
             id: id.to_string(),
@@ -192,7 +191,8 @@ impl Question {
     }
 
     /// A score question from an ordered list of level descriptions (index 0
-    /// first).
+    /// first). Only `metadata_score` (test-only) calls this directly today;
+    /// production code builds `Score` questions as struct literals.
     #[allow(dead_code)]
     pub(crate) fn score(id: &str, instructions: &str, levels: &[&str]) -> Self {
         Question {
@@ -280,7 +280,6 @@ pub struct Answer {
 
 impl Answer {
     /// `Some(choice)` for a `Choice` answer, `None` for any other kind.
-    #[allow(dead_code)]
     pub(crate) fn as_choice(&self) -> Option<&str> {
         match &self.value {
             AnswerValue::Choice(value) => Some(value.as_str()),
@@ -288,17 +287,7 @@ impl Answer {
         }
     }
 
-    /// `Some(index)` for a `Score` answer, `None` for any other kind.
-    #[allow(dead_code)]
-    pub(crate) fn as_score(&self) -> Option<f64> {
-        match self.value {
-            AnswerValue::Score(value) => Some(value),
-            AnswerValue::Choice(_) | AnswerValue::Noul(_) => None,
-        }
-    }
-
     /// `Some(probability)` for a `Noul` answer, `None` for any other kind.
-    #[allow(dead_code)]
     pub(crate) fn as_noul(&self) -> Option<f64> {
         match self.value {
             AnswerValue::Noul(value) => Some(value),
@@ -496,7 +485,9 @@ enum SystemOneAnswer {
 #[derive(Debug, Deserialize)]
 struct SystemOneResponse {
     // Kept for parity with the documented response shape and asserted on in
-    // this module's own tests; `ask` reads `answers`/`usage` only.
+    // this module's own tests; `ask` reads `answers`/`usage` only. The
+    // assertion lives inside `assert_eq!` in a `#[cfg(test)]` fn, which the
+    // dead_code lint does not see through.
     #[allow(dead_code)]
     model: String,
     answers: BTreeMap<String, SystemOneAnswer>,
@@ -1092,14 +1083,12 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
         || cfg.missing_tests
 }
 
-#[allow(dead_code)]
 const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` prices the spend row
 /// on -- see `catalogue.rs`'s `typesafe` vendor. Every `[jev]`-gated site
 /// spends through the same vendor as the harness proxy, regardless of which
 /// site asked.
-#[allow(dead_code)]
 const JEV_SPEND_AGENT: &str = "typesafe";
 
 /// This process's own `(session, principal)` -- `ZIRV_CTX_SESSION`/
@@ -1641,7 +1630,6 @@ pub(crate) enum AdvisoryStatus {
 /// an empty answer set carrying the error's `Display` as the one fallback
 /// reason. Never panics, never propagates -- same posture as every other
 /// best-effort seam in this crate.
-#[allow(dead_code)]
 pub(crate) fn advise(
     cfg: &CtxConfig,
     state_dir: &StateDir,
@@ -1722,7 +1710,6 @@ pub(crate) fn advise_detailed(
 /// Returns the environment variable name currently configured for the Jev
 /// credential, as set in `cfg.proxy.typesafe.credential_env`. Exposed so
 /// the setup wizard can tell the operator exactly which variable to export.
-#[allow(dead_code)]
 pub fn credential_env_name(cfg: &CtxConfig) -> String {
     cfg.proxy.typesafe.credential_env.clone()
 }
@@ -1730,7 +1717,6 @@ pub fn credential_env_name(cfg: &CtxConfig) -> String {
 /// Whether the configured credential environment variable is set and
 /// non-empty, without ever returning or logging its value. Exposed so
 /// the setup wizard can distinguish "credential missing" from "gate off".
-#[allow(dead_code)]
 pub fn credential_present(cfg: &CtxConfig) -> bool {
     available(&cfg.proxy.typesafe)
 }

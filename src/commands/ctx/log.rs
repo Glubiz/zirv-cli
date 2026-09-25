@@ -192,7 +192,6 @@ pub struct DelegationRow {
     /// creation order, not by delegation time), the same
     /// kept-for-parity-not-yet-read pattern `SafetyDecisionRecord::mode`
     /// already uses.
-    #[allow(dead_code)]
     pub ts: u64,
     pub session: String,
     /// Who delegated this row. `status::spend_status_line` and the
@@ -282,15 +281,18 @@ pub struct PermissionPromptRecord {
     /// Kept for parity; `permissions.rs`'s own audit groups Bash/PowerShell
     /// prompts by event only (never by directory), so it does not read the
     /// command hash today.
-    #[allow(dead_code)]
     #[serde(default)]
+    #[allow(dead_code)]
     pub command_sha256: Option<String>,
+    /// Kept for parity with `PermissionPromptRow`; not read by any auditor
+    /// yet, the same kept-for-parity-not-yet-read pattern this struct's
+    /// other fields already use.
     #[allow(dead_code)]
     pub cwd: String,
     #[allow(dead_code)]
     pub permission_mode: String,
-    #[allow(dead_code)]
     #[serde(default)]
+    #[allow(dead_code)]
     pub reason: Option<String>,
 }
 
@@ -514,6 +516,10 @@ pub struct DecisionRecord {
     pub session: String,
     pub verb: String,
     pub verdict: String,
+    /// Kept for parity with `Decision`; not read by `zirv ctx hook audit` or
+    /// the per-session hook-health line yet, the same
+    /// kept-for-parity-not-yet-read pattern `SafetyDecisionRecord::mode`
+    /// already uses.
     #[allow(dead_code)]
     pub score: u32,
     pub action: String,

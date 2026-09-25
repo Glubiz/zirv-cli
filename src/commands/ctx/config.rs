@@ -2955,12 +2955,8 @@ impl FallbackConfig {
     /// the explicit override when set, otherwise the same threshold new
     /// background delegation already steers on.
     ///
-    /// Issue #358, task 1 of a multi-task rollout: this configuration
-    /// accessor lands ahead of the scheduler code (a later task) that reads
-    /// it, so it is only exercised by this module's own tests today.
-    /// `#[allow(dead_code)]` documents that as deliberate, the same way
-    /// `announce.rs`'s platform-gated variant is marked.
-    #[allow(dead_code)]
+    /// Issue #358: `seat.rs`'s rollover eligibility check and `rollover.rs`
+    /// now read this.
     pub fn rollover_headroom_pct(&self) -> f64 {
         self.orchestrator_rollover_headroom_pct
             .unwrap_or(self.predictive_headroom_pct)
@@ -2973,7 +2969,6 @@ impl FallbackConfig {
     /// meaning "use the global limits" -- when `name` has no entry.
     ///
     /// Same issue #358 task-ordering note as `rollover_headroom_pct` above.
-    #[allow(dead_code)]
     pub fn harness_limits(&self, name: &str) -> HarnessLimits {
         self.harness
             .iter()
@@ -2987,7 +2982,6 @@ impl FallbackConfig {
     /// every candidate is already held to.
     ///
     /// Same issue #358 task-ordering note as `rollover_headroom_pct` above.
-    #[allow(dead_code)]
     pub fn reserve_headroom_pct(&self, name: &str) -> f64 {
         self.harness_limits(name)
             .reserve_headroom_pct

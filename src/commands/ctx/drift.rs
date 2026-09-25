@@ -128,12 +128,8 @@ fn shares_provider_or_canonical(surfaces: &[Surface], a: &Instruction, b: &Instr
 /// Every finding this module can produce, over already-collected surfaces.
 /// `surfaces` is normally `optimize::collect_surfaces`'s own output --
 /// canonical and native surfaces mixed, exactly as issue #42 asks for.
-// No production caller yet -- issue #42 (this task) is report-only findings
-// production; Task 16 (`zirv context status`, issue #46) is the first real
-// consumer, for duplicate/conflict counts. Same dormancy pattern as
-// `optimize.rs`'s own `Layer::trust`/`Surface::context_surface`; this
-// module's own tests exercise every path in the meantime.
-#[allow(dead_code)]
+// `zirv context status` (issue #46, `context_status.rs`) is the production
+// consumer, for duplicate/conflict counts.
 pub fn analyze(surfaces: &[Surface]) -> Vec<Finding> {
     let mut findings = duplicate_findings(surfaces);
     findings.extend(near_duplicate_and_contradiction_findings(surfaces));

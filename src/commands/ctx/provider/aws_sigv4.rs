@@ -12,12 +12,11 @@
 //! is twenty lines; an SDK would add a large async runtime surface for one
 //! header.
 
-#![allow(dead_code)] // The Bedrock transport is this module's only consumer.
-
 use sha2::{Digest, Sha256};
 
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// The SHA-256 of the empty string, which a bodyless request hashes to.
+#[allow(dead_code)] // used only by this module's own AWS test-vector assertions today
 pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
