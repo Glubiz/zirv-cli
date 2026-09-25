@@ -18,6 +18,17 @@ use crate::commands::ctx::policy::{Capability as PolicyCapability, EffectivePoli
 /// provide.
 pub const NATIVE_ADAPTER: &str = "native";
 
+/// Shared id shape for workflow definitions, agent roles and skills: an
+/// ASCII-lowercase/digit start, then lowercase/digit/`.`/`_`/`-`.
+pub(crate) fn valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CapabilityId {
     #[serde(rename = "shell.exec")]

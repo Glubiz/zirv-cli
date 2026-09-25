@@ -1115,11 +1115,7 @@ fn block_index(value: &Value) -> Result<usize, ProviderFailure> {
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, ProviderFailure> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| invalid_stream(format!("Bedrock event has no string `{field}`")))
+    super::transport::required_string(value, field, "event", "Bedrock")
 }
 
 // -- failure normalization -----------------------------------------------

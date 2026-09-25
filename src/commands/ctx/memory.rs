@@ -17,7 +17,7 @@ use super::CtxResult;
 use super::adapters::AGENT_ENV;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::jev;
-use super::state::{FileLock, StateDir, now_secs, repo_slug};
+use super::state::{FileLock, StateDir, claim_and_write, now_secs, repo_slug};
 
 /// Reserved state-directory slug for the operator-owned machine-wide bank.
 /// Repository slugs contain only ASCII alphanumerics and hyphens, so the
@@ -309,44 +309,7 @@ pub fn parse_markdown(md: &str) -> Entry {
     entry
 }
 
-/// Same atomic-claim idiom as `mail::claim_and_write`: opens with
-/// `create_new` so the open itself is the collision check, retrying the next
-/// `_NNN` suffix on `AlreadyExists` rather than racing a separate
-/// `.exists()` probe against a concurrent writer.
-fn claim_and_write(dir: &Path, base: &str, contents: &str) -> std::io::Result<PathBuf> {
-    let mut n = 0u32;
-    loop {
-        let candidate = if n == 0 {
-            dir.join(format!("{base}.md"))
-        } else {
-            dir.join(format!("{base}_{n:03}.md"))
-        };
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        match opts.open(&candidate) {
-            Ok(mut file) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                file.write_all(contents.as_bytes())?;
-                return Ok(candidate);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                n += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+// `claim_and_write` now lives in `state.rs`, shared with `mail.rs`.
 
 /// Replaces every character outside `[A-Za-z0-9-]` with `-` and lowercases,
 /// the same rule `state::repo_slug` uses, capped short so filenames stay

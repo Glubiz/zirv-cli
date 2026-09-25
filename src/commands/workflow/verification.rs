@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use super::maintain::command_for_shell;
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::event::input_hash;
 use crate::commands::ctx::state::{
@@ -1730,21 +1731,6 @@ fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option
              --prune`)"
         )
     })
-}
-
-fn command_for_shell(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut value = Command::new("cmd");
-        value.args(["/D", "/S", "/C", command]);
-        value
-    }
-    #[cfg(not(windows))]
-    {
-        let mut value = Command::new("sh");
-        value.args(["-c", command]);
-        value
-    }
 }
 
 /// Compacts consecutive identical Git line-ending warnings before capping

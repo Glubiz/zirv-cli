@@ -15,7 +15,7 @@ use super::adapters::{AGENT_ENV, SESSION_ENV};
 use super::config::{CtxConfig, EnvLookup, MailConfig, env_from_process};
 use super::result_schema;
 use super::sessions;
-use super::state::{self, StateDir, now_secs, repo_slug};
+use super::state::{self, StateDir, claim_and_write, now_secs, repo_slug};
 
 /// One mail message: a free-form markdown note plus who sent it, who it is
 /// addressed to, and when.
@@ -954,65 +954,7 @@ pub fn parse_markdown(md: &str) -> Message {
     msg
 }
 
-/// Atomically claims the first collision-free path for `<dir>/<base>.md`
-/// (`<base>.md` itself if nothing is there yet, else `<base>_001.md`,
-/// `<base>_002.md`, ...) and writes `contents` into it as part of the same
-/// open, returning the path it landed at.
-///
-/// Item 4 (TOCTOU fix): the previous version (`next_available_mail_path`)
-/// checked `.exists()` in a loop and then handed the winning path to
-/// `state::write_private`, which opens with plain `create(true)` -- an
-/// unconditional overwrite. Two zirv processes racing to store mail in the
-/// same wall-clock second (`now_secs()` has one-second granularity, and two
-/// real sends this close together is common, not a rare edge case) could
-/// both observe the same candidate as free between the check and the write,
-/// and the second writer would silently clobber the first message rather
-/// than fall through to the next suffix. `OpenOptions::create_new` makes the
-/// open itself the atomic claim: it fails with `AlreadyExists` rather than
-/// truncating a winner, so a genuine race is what drives the retry onto the
-/// next suffix, the same guarantee a single process already had.
-///
-/// `_NNN` (not `-N`) is deliberate: `-` (0x2D) sorts *before* `.` (0x2E),
-/// which would put a collision's suffixed file ahead of the unsuffixed one
-/// it collided with; `_` (0x5F) sorts after, so the zero-padded seconds
-/// prefix this shares with every other mail filename keeps sorting messages
-/// oldest-first even across a same-second collision.
-fn claim_and_write(dir: &Path, base: &str, contents: &str) -> std::io::Result<PathBuf> {
-    let mut n = 0u32;
-    loop {
-        let candidate = if n == 0 {
-            dir.join(format!("{base}.md"))
-        } else {
-            dir.join(format!("{base}_{n:03}.md"))
-        };
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        match opts.open(&candidate) {
-            Ok(mut file) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                file.write_all(contents.as_bytes())?;
-                return Ok(candidate);
-            }
-            // Lost the race (or a genuine same-second collision, the single-
-            // process case this always had to handle): try the next suffix.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                n += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+// `claim_and_write` now lives in `state.rs`, shared with `memory.rs`.
 
 /// M2: which `(keep, max_message_bytes)` a store may apply to the mailbox
 /// owned by `dest_slug`, on behalf of a sender configured in `sender_slug`.

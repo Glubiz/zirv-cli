@@ -267,10 +267,7 @@ impl DroidAdapter {
     }
 
     fn home_dir(&self) -> PathBuf {
-        self.home
-            .clone()
-            .or_else(|| crate::utils::home_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+        super::resolve_home_dir(&self.home)
     }
 
     /// `~/.factory/sessions` -- see this module's own doc comment ("Session
@@ -287,14 +284,12 @@ impl DroidAdapter {
 
     #[cfg(test)]
     fn state_dir(&self) -> Option<super::super::state::StateDir> {
-        self.forced_state_root
-            .clone()
-            .map(super::super::state::StateDir::from_root)
+        super::resolve_state_dir(&self.forced_state_root)
     }
 
     #[cfg(not(test))]
     fn state_dir(&self) -> Option<super::super::state::StateDir> {
-        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok()
+        super::resolve_state_dir()
     }
 
     /// Resolution 2/3 of [`AgentAdapter::transcript_path`], mirroring

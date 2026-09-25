@@ -320,20 +320,17 @@ impl OpenCodeAdapter {
     }
 
     fn home_dir(&self) -> PathBuf {
-        self.home
-            .clone()
-            .or_else(|| crate::utils::home_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+        super::resolve_home_dir(&self.home)
     }
 
     #[cfg(test)]
     fn state_dir(&self) -> Option<StateDir> {
-        self.forced_state_root.clone().map(StateDir::from_root)
+        super::resolve_state_dir(&self.forced_state_root)
     }
 
     #[cfg(not(test))]
     fn state_dir(&self) -> Option<StateDir> {
-        StateDir::resolve(&super::super::config::env_from_process()).ok()
+        super::resolve_state_dir()
     }
 
     /// `Global.Path.data` (`packages/core/src/global.ts`, verified above):

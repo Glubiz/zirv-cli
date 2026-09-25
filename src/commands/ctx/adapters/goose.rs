@@ -75,10 +75,7 @@ impl GooseAdapter {
     }
 
     fn home_dir(&self) -> PathBuf {
-        self.home
-            .clone()
-            .or_else(|| crate::utils::home_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
+        super::resolve_home_dir(&self.home)
     }
 
     /// Issue #393's own verified path pair: `~/.local/share/goose/sessions/

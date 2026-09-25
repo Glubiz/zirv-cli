@@ -1206,11 +1206,7 @@ fn required_index(value: &Value) -> Result<usize, ProviderFailure> {
 }
 
 fn required_string(value: &Value, field: &str, context: &str) -> Result<String, ProviderFailure> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| invalid_stream(format!("Anthropic {context} has no string `{field}`")))
+    super::transport::required_string(value, field, context, "Anthropic")
 }
 
 fn check_block_accumulator_cap(

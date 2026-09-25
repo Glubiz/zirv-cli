@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use super::capability::{CapabilityId, CapabilityReport};
+use super::capability::{CapabilityId, CapabilityReport, valid_id};
 use super::skill::SkillRegistry;
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::runtime::RuntimeKind;
@@ -224,15 +224,6 @@ pub fn team_role_for(manifest: &AgentManifest) -> TeamRole {
     } else {
         TeamRole::Implementer
     })
-}
-
-fn valid_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

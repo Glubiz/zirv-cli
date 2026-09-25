@@ -216,19 +216,28 @@ pub fn decide(probes: &Probes) -> PruneDecision {
     PruneDecision::Remove
 }
 
+/// A `git` [`std::process::Command`] scoped to `repo` via `-C`, with every
+/// ambient `GIT_*` variable cleared so a caller's own worktree/index cannot
+/// leak into a command meant to run against `repo` -- shared by [`run_git`]
+/// and every other module that shells out to git against a specific repo.
+pub(crate) fn git_command(repo: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .arg("-C")
+        .arg(repo);
+    cmd
+}
+
 /// Runs one git subcommand inside `path`, scrubbed of the ambient
 /// `GIT_*`/worktree env vars the same way every other worktree-touching git
 /// invocation in `agent.rs` already is, so a caller's own inherited
 /// repository context (if this process happens to be running inside one)
 /// never leaks into a probe aimed at a different tree.
-fn run_git(path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .arg("-C")
-        .arg(path)
+pub(crate) fn run_git(path: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_command(path)
         .args(args)
         .output()
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;

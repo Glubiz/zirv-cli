@@ -22,10 +22,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use super::capability::CapabilityId;
-use super::engine::{ArtifactStage, StepCondition};
+use super::capability::{CapabilityId, valid_id};
+use super::engine::{ArtifactStage, StepCondition, hash_bytes};
 use super::skill::WorkflowPhase;
 use crate::commands::ctx::CtxResult;
 
@@ -34,25 +33,6 @@ use crate::commands::ctx::CtxResult;
 pub const DEFINITION_SCHEMA_VERSION: u32 = 1;
 const MAX_DEFINITION_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_ATTEMPTS: u8 = 3;
-
-fn valid_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
 
 fn default_condition() -> StepCondition {
     StepCondition::Always

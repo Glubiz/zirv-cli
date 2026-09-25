@@ -1582,7 +1582,7 @@ fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
     Ok(())
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
