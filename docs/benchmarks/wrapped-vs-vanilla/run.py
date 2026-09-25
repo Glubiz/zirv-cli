@@ -124,7 +124,9 @@ def cond_env_for(cond):
     """
     if not cond.startswith("zirv"):
         return {}
-    env = dict(ZIRV_HEADLESS_LEVERS)
+    # No cross-harness handover on a usage limit: vanilla has no other
+    # harness to finish on (wait_run ends a parked zirv run instead).
+    env = {**ZIRV_HEADLESS_LEVERS, "ZIRV_CTX_FALLBACK": "false"}
     if cond == JEV_FULL_COND:
         env.update({jev_env_var(g): "true" for g in JEV_GATE_KEYS})
     elif cond == NOJEV_COND:
@@ -229,11 +231,12 @@ def read_text(path):
 
 
 def parse_last_json(text):
-    """Return the last top-level JSON value found in text, or None.
+    """Return the last top-level JSON object found in text, or None.
 
     Handles a stray leading non-JSON line (or several) by scanning forward
     and retrying, and handles multiple JSON objects concatenated by lines
-    by keeping the last successfully parsed one.
+    by keeping the last successfully parsed one. Bare values (a number in
+    trailing prose) are skipped, never returned.
     """
     if not text:
         return None
@@ -248,7 +251,8 @@ def parse_last_json(text):
             break
         try:
             obj, end = dec.raw_decode(text, i)
-            results.append(obj)
+            if isinstance(obj, dict):
+                results.append(obj)
             i = end
         except json.JSONDecodeError:
             i += 1
@@ -408,6 +412,31 @@ def rmtree_robust(path):
 def kill_tree(pid):
     subprocess.run([TASKKILL_EXE, "/T", "/F", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# On a usage limit vanilla's run just ends, while `zirv ctx exec` (fallback
+# off) parks in-process until the window resets. End a parked zirv run the
+# same way, so both get dispatch_with_usage_retry's pause and fresh retry.
+ZIRV_LIMIT_PARK_MARKER = b"zirv ctx exec: agent reported a usage limit"
+
+
+def wait_run(proc, timeout_s, stderr_path):
+    """proc.wait(timeout_s), except a run that parks on a usage limit is
+    killed as soon as it says so."""
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            return proc.wait(timeout=max(0.0, min(5.0, deadline - time.time())))
+        except subprocess.TimeoutExpired:
+            if time.time() >= deadline:
+                raise
+            try:
+                parked = ZIRV_LIMIT_PARK_MARKER in Path(stderr_path).read_bytes()
+            except OSError:
+                parked = False
+            if parked:
+                kill_tree(proc.pid)
+                return proc.wait(timeout=15)
 
 
 def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path, env_extra=None,
@@ -1183,7 +1212,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
             cond, model_used, prompt_for_launch, prompt_path, repo_dir, stdout_path, stderr_path,
             env_extra=env_extra)
         try:
-            exit_code = proc.wait(timeout=remaining_budget)
+            exit_code = wait_run(proc, remaining_budget, stderr_path)
         except subprocess.TimeoutExpired:
             timed_out = True
             kill_tree(proc.pid)
@@ -1475,7 +1504,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
                 cond, model_used, prompt_for_launch, step_prompt_path, repo_dir,
                 stdout_path, stderr_path, env_extra=env_extra, resume_session_id=resume_session_id)
             try:
-                exit_code = proc.wait(timeout=remaining_budget)
+                exit_code = wait_run(proc, remaining_budget, stderr_path)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 kill_tree(proc.pid)
