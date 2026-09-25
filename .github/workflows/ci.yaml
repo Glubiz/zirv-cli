@@ -23,7 +23,7 @@ jobs:
       # ancestor with main actually present in history, which a depth-1
       # checkout of just the PR ref would not have.
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
@@ -52,7 +52,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo Registry
-        uses: actions/cache@v4
+        uses: actions/cache@v4.3.0
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -60,7 +60,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache Cargo Build
-        uses: actions/cache@v4
+        uses: actions/cache@v4.3.0
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
@@ -99,7 +99,7 @@ jobs:
         run: ./target/debug/zirv verify --builtin --json
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.87.20
         with:
           tool: cargo-nextest@0.9.143
 
@@ -152,58 +152,12 @@ jobs:
       checks: write
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Audit Dependencies
-        uses: rustsec/audit-check@v2
+        uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-  # No ubuntu leg in the three native-*-platforms matrices: the `test` job
-  # already runs every one of these tests on ubuntu-latest via nextest.
-  native-enforcement-platforms:
-    name: Native Enforcement (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set Up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # The broker suite uses real filesystem roots and a real linked git
-      # worktree. Platform detection may honestly report unavailable, but an
-      # unavailable sandbox must remain a typed refusal rather than a plain
-      # subprocess launch.
-      - name: Verify Native Enforcement Contract
-        run: cargo test --bin zirv runtime::enforcement::tests -- --test-threads=1
-
-  native-tools-platforms:
-    name: Native Tools (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set Up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # Exercises the closed registry, Unicode/line-ending-safe file tools,
-      # bounded raw-byte output capture and process lifecycle contracts. Tests
-      # that spawn a POSIX shell are cfg(unix); Windows still compiles every
-      # process path and runs its path/argv/junction regressions.
-      - name: Verify Native Coding Tool Contract
-        run: 'cargo test --bin zirv runtime::tools:: -- --test-threads=1'
 
   # Issue #491 (roadmap N22): the installation acceptance criterion. A fresh
   # machine on each supported OS must be able to configure native operation
@@ -211,6 +165,13 @@ jobs:
   # installed. GitHub runners ship none, and the first step asserts that
   # rather than assuming it, so the job would fail loudly if an image ever
   # started shipping one.
+  #
+  # This job also carries the native enforcement and native tools contract
+  # checks (formerly separate `native-enforcement-platforms` and
+  # `native-tools-platforms` jobs): same matrix, so merging them avoids three
+  # separate cold, uncached checkouts and toolchain installs per PR. They run
+  # last under `!cancelled()`, so one failure never hides the others. No ubuntu
+  # leg: the `test` job already runs these tests on ubuntu-latest via nextest.
   native-install-platforms:
     name: Native Install (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -221,10 +182,26 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Set Up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4.3.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo Build
+        uses: actions/cache@v4.3.0
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
 
       # Issue #609 (roadmap N22, review of #493): every name
       # `ctx::adapters::ADAPTERS` registers, not the `claude`/`codex` pair
@@ -347,6 +324,22 @@ jobs:
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter matched no tests" >&2; exit 1; }
 
+      # The broker suite uses real filesystem roots and a real linked git
+      # worktree. Platform detection may honestly report unavailable, but an
+      # unavailable sandbox must remain a typed refusal rather than a plain
+      # subprocess launch.
+      - name: Verify Native Enforcement Contract
+        if: ${{ !cancelled() }}
+        run: cargo test --bin zirv runtime::enforcement::tests -- --test-threads=1
+
+      # Exercises the closed registry, Unicode/line-ending-safe file tools,
+      # bounded raw-byte output capture and process lifecycle contracts. Tests
+      # that spawn a POSIX shell are cfg(unix); Windows still compiles every
+      # process path and runs its path/argv/junction regressions.
+      - name: Verify Native Coding Tool Contract
+        if: ${{ !cancelled() }}
+        run: 'cargo test --bin zirv runtime::tools:: -- --test-threads=1'
+
   # PRs into `release/**` integration branches share one pinned release
   # version, so they are exempt. This check still guards every PR into main,
   # where CD is idempotent on an already-published version and a bump is what
@@ -366,7 +359,7 @@ jobs:
       # gives two disconnected single commits with no common ancestor, so
       # the three-dot form can't resolve a merge base at all.
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
@@ -436,7 +429,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
@@ -465,11 +458,26 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
+      # Same path filter as the `version-bump` job above: only a diff that
+      # touches src/, Cargo.toml, Cargo.lock or build.rs can move build cost,
+      # so a README/docs/CI-only PR skips the scan below.
+      - name: Check whether shipped-code paths changed
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only --no-renames "origin/${{ github.base_ref }}...HEAD")
+          if echo "$CHANGED" | grep -qE '^src/|^Cargo\.toml$|^Cargo\.lock$|^build\.rs$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no shipped-code paths changed since ${{ github.base_ref }} -- build-cost scan skipped"
+          fi
+
       - name: Run advisory build-cost scan
+        if: steps.changed.outputs.changed == 'true'
         env:
           ZIRV_BENCH_SKIP_RELEASE: "1"
         run: |

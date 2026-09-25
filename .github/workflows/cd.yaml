@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Get version
         id: get_version
@@ -119,7 +119,7 @@ jobs:
           sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: zirv-${{ matrix.suffix }}
           path: |
@@ -140,7 +140,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
@@ -220,25 +220,25 @@ jobs:
           fi
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-windows
           path: artifacts
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-linux
           path: artifacts
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-macos
           path: artifacts
 
       - name: Attest Release Assets
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v2.4.0
         with:
           subject-path: artifacts/zirv-${{ needs.build.outputs.version }}-*
 
@@ -282,18 +282,18 @@ jobs:
     environment:
       name: homebrew-release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
       - name: Download macOS Artifact for Homebrew
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-macos
           path: artifacts
 
       - name: Download Linux Artifact for Homebrew
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-linux
           path: artifacts
@@ -327,7 +327,7 @@ jobs:
       name: chocolatey-release
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           fetch-depth: 0
 
@@ -341,7 +341,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download Windows Artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: zirv-windows
           path: artifacts
