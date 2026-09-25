@@ -146,17 +146,43 @@ fn protected_model_intake(
     Ok((intake, questions))
 }
 
+/// A word that looks like it names a file or path -- shared with the
+/// workflow module's own metadata-only classify refinement (issue #782,
+/// `workflow::profile::refine_via_jev`) so the two never carry diverging
+/// path-like-token predicates for the same signal.
+pub(crate) fn is_path_like_token(word: &str) -> bool {
+    word.contains('/') || word.contains('\\') || word.ends_with(".rs") || word.ends_with(".md")
+}
+
+/// Whether lowercased text names a stated outcome ("should", "expected",
+/// "return", "display", "show", "produce"). Shared the same way as
+/// [`is_path_like_token`].
+pub(crate) fn text_has_outcome_terms(lower: &str) -> bool {
+    ["should", "expected", "return", "display", "show", "produce"]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+/// Whether lowercased text names a stated constraint ("without",
+/// "compatible", "preserve", "only", "must", "don't"). Shared the same way
+/// as [`is_path_like_token`].
+pub(crate) fn text_has_constraint_terms(lower: &str) -> bool {
+    ["without", "compatible", "preserve", "only", "must", "don't"]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+/// Buckets a word count into `0..=4` (one bucket per 8 words, capped).
+/// Shared the same way as [`is_path_like_token`].
+pub(crate) fn word_count_bucket(word_count: usize) -> u64 {
+    word_count.div_ceil(8).min(4) as u64
+}
+
 fn safe_intake_metadata(request: &str, baseline: &ProxyDecision) -> serde_json::Value {
     let lower = request.to_ascii_lowercase();
-    let has_target = request.split_whitespace().any(|word| {
-        word.contains('/') || word.contains('\\') || word.ends_with(".rs") || word.ends_with(".md")
-    });
-    let has_outcome = ["should", "expected", "return", "display", "show", "produce"]
-        .iter()
-        .any(|term| lower.contains(term));
-    let has_constraint = ["without", "compatible", "preserve", "only", "must", "don't"]
-        .iter()
-        .any(|term| lower.contains(term));
+    let has_target = request.split_whitespace().any(is_path_like_token);
+    let has_outcome = text_has_outcome_terms(&lower);
+    let has_constraint = text_has_constraint_terms(&lower);
     serde_json::json!({
         "_zirv_metadata_only": true,
         // [site=2, intent, complexity, risk, word-count bucket, named
@@ -167,7 +193,7 @@ fn safe_intake_metadata(request: &str, baseline: &ProxyDecision) -> serde_json::
             baseline.intent as u8,
             baseline.complexity as u8,
             baseline.risk as u8,
-            request.split_whitespace().count().div_ceil(8).min(4),
+            word_count_bucket(request.split_whitespace().count()),
             has_target as u8,
             has_outcome as u8,
             has_constraint as u8,

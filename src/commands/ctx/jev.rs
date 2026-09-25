@@ -600,7 +600,7 @@ fn encoded_request(
     Ok((payload, cache_key))
 }
 
-pub(super) fn safe_metadata_request(
+pub(crate) fn safe_metadata_request(
     state: &serde_json::Value,
     questions: &[Question],
     model: &str,
@@ -1419,6 +1419,13 @@ fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serd
         ("review_reuse", cfg.jev.review_reuse),
         ("harvest_screen", cfg.jev.harvest_screen),
         ("admin_dispatch", cfg.jev.admin_dispatch),
+        ("approve", cfg.jev.approve),
+        ("approve_allow", cfg.jev.approve_allow),
+        ("classify", cfg.jev.classify),
+        ("handoff_select", cfg.jev.handoff_select),
+        ("inject_screen", cfg.jev.inject_screen),
+        ("inject", cfg.jev.inject),
+        ("stop_verify", cfg.jev.stop_verify),
     ];
     let any_gate_on = gates.iter().any(|(_, on)| *on);
     let cred_present = available(&cfg.proxy.typesafe);
@@ -1446,6 +1453,13 @@ fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serd
             "review_reuse": cfg.jev.review_reuse,
             "harvest_screen": cfg.jev.harvest_screen,
             "admin_dispatch": cfg.jev.admin_dispatch,
+            "approve": cfg.jev.approve,
+            "approve_allow": cfg.jev.approve_allow,
+            "classify": cfg.jev.classify,
+            "handoff_select": cfg.jev.handoff_select,
+            "inject_screen": cfg.jev.inject_screen,
+            "inject": cfg.jev.inject,
+            "stop_verify": cfg.jev.stop_verify,
         },
         "credential_env": cred_env,
         "credential_present": cred_present,
@@ -1487,6 +1501,13 @@ pub fn status(
         ("review_reuse", cfg.jev.review_reuse),
         ("harvest_screen", cfg.jev.harvest_screen),
         ("admin_dispatch", cfg.jev.admin_dispatch),
+        ("approve", cfg.jev.approve),
+        ("approve_allow", cfg.jev.approve_allow),
+        ("classify", cfg.jev.classify),
+        ("handoff_select", cfg.jev.handoff_select),
+        ("inject_screen", cfg.jev.inject_screen),
+        ("inject", cfg.jev.inject),
+        ("stop_verify", cfg.jev.stop_verify),
     ];
     let any_gate_on = gates.iter().any(|(_, on)| *on);
 

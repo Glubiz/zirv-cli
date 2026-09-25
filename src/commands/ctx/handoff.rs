@@ -8,6 +8,7 @@ use super::adapters::AgentAdapter;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{StructuralContext, VerificationOutcome, VerificationStatus};
 use super::jev;
+use super::memory;
 use super::sessions::InFlight;
 use super::state::{StateDir, now_secs, repo_slug};
 use super::{adapters, log};
@@ -1600,13 +1601,306 @@ pub fn distill_or_structural_with_jev(
         chrome_events_enabled,
         previous,
     );
-    if source != "distilled" || !jev_handoff_is_thin(cfg, state, &handoff) {
-        return (handoff, source);
-    }
+    let (handoff, source) = if source != "distilled" || !jev_handoff_is_thin(cfg, state, &handoff) {
+        (handoff, source)
+    } else {
+        (
+            carry_forward_undistillable(structural(ctx), previous),
+            "structural",
+        )
+    };
     (
-        carry_forward_undistillable(structural(ctx), previous),
-        "structural",
+        jev_select_optional_handoff_items(cfg, state, ctx, handoff),
+        source,
     )
+}
+
+/// Issue #783 (`[jev] handoff_select`): one candidate this off-by-default
+/// keep/drop pass may consider -- an entry from an OPTIONAL handoff section
+/// only. `task`/`constraints`/`remaining`/`blocked`/`verification`/`next_
+/// step` are never candidates: the restart path depends on all six, and
+/// [`optional_candidates`] never yields one for them.
+#[derive(Debug, Clone, Copy)]
+enum OptionalItemKind {
+    Done,
+    KeyDecision,
+    FileRead,
+    FileModified,
+    Gotcha,
+}
+
+impl OptionalItemKind {
+    /// The `item type` fact cell -- see [`HANDOFF_SELECT_INSTRUCTIONS`].
+    fn type_id(self) -> u32 {
+        match self {
+            OptionalItemKind::Done => 0,
+            OptionalItemKind::KeyDecision => 1,
+            OptionalItemKind::FileRead => 2,
+            OptionalItemKind::FileModified => 3,
+            OptionalItemKind::Gotcha => 4,
+        }
+    }
+}
+
+struct OptionalCandidate<'a> {
+    kind: OptionalItemKind,
+    /// 0-based position within its own section, in `Handoff`'s own order.
+    position: usize,
+    /// How many items its own section carries -- used only to derive
+    /// `age_in_turns` in [`handoff_select_facts_row`]; never itself sent.
+    section_len: usize,
+    text: &'a str,
+}
+
+/// Every optional-section item in `handoff`, in section order (`done`, `key_
+/// decisions`, `files_read`, `files_modified`, `gotchas`), each section in
+/// its own original item order. A required field never appears here.
+fn optional_candidates(handoff: &Handoff) -> Vec<OptionalCandidate<'_>> {
+    let sections: [(OptionalItemKind, &[String]); 5] = [
+        (OptionalItemKind::Done, &handoff.done),
+        (OptionalItemKind::KeyDecision, &handoff.key_decisions),
+        (OptionalItemKind::FileRead, &handoff.files_read),
+        (OptionalItemKind::FileModified, &handoff.files_modified),
+        (OptionalItemKind::Gotcha, &handoff.gotchas),
+    ];
+    sections
+        .into_iter()
+        .flat_map(|(kind, items)| {
+            let section_len = items.len();
+            items
+                .iter()
+                .enumerate()
+                .map(move |(position, text)| OptionalCandidate {
+                    kind,
+                    position,
+                    section_len,
+                    text,
+                })
+        })
+        .collect()
+}
+
+/// Lowercased, punctuation-trimmed words of at least 3 characters -- used
+/// only to COUNT local term overlap between an optional item and the current
+/// session's own transcript excerpts; no word ever leaves this process, only
+/// the resulting counts do ([`handoff_select_facts_row`]). The same coarse
+/// normalization `compile.rs`'s own (unrelated) `normalized_terms` already
+/// applies for its own metadata-only overlap count.
+fn handoff_select_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Buckets a byte count the same coarse way `memory.rs`'s own (unrelated)
+/// `harvest_screen_size_bucket` already buckets candidate sizes for its own
+/// metadata-only Jev call.
+fn handoff_select_size_bucket(bytes: usize) -> u32 {
+    match bytes {
+        0..=63 => 0,
+        64..=255 => 1,
+        256..=1023 => 2,
+        1024..=4095 => 3,
+        _ => 4,
+    }
+}
+
+/// At most this many optional items are ever SENT to Jev in one
+/// [`jev_select_optional_handoff_items`] call -- `jev::safe_metadata_
+/// request`'s own 32-row ceiling, the same cap `compile.rs`'s `MEMORY_
+/// ADVISE_MAX_CANDIDATES` mirrors for memory candidates. Any candidate
+/// beyond this cap is never sent, and therefore never dropped.
+const HANDOFF_SELECT_MAX_CANDIDATES: usize = 32;
+
+/// Reused from `memory::MEMORY_RELEVANCE_FLOOR`: validated by the
+/// 2026-09-18 memory-relevance probe (24/24 candidates cleanly separated at
+/// 0.3); same keep/drop-noul shape, no dedicated handoff-select probe yet.
+const HANDOFF_SELECT_DROP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+
+/// Static instructions naming the facts row order -- see
+/// [`OptionalItemKind::type_id`] for the item-type cell, and
+/// [`handoff_select_facts_row`] for every other one.
+const HANDOFF_SELECT_INSTRUCTIONS: &str = "Facts row N (id cN) is [type: 0 done, 1 key \
+    decision, 2 file read, 3 file modified, 4 gotcha; age in turns (0 = newest in its section); \
+    byte size bucket 0-4; count of other transcript excerpts mentioning it again; count of \
+    open-work files it overlaps; 1 if adjacent to a tool failure else 0; position in its \
+    section]. One OPTIONAL item from a handoff that may need to shrink for a byte-limited \
+    restart; required items are never sent. Keep it?";
+
+/// One [`jev_select_optional_handoff_items`] fact row for `candidate` -- see
+/// [`HANDOFF_SELECT_INSTRUCTIONS`] for the field order Jev is told. Every
+/// cell is a locally computed, bounded, non-negative integer; `candidate`'s
+/// own text and `ctx`'s own transcript excerpts are read here only to derive
+/// counts, never serialized.
+fn handoff_select_facts_row(
+    candidate: &OptionalCandidate<'_>,
+    ctx: &StructuralContext,
+) -> Vec<u32> {
+    let age_in_turns = (candidate.section_len - 1 - candidate.position) as u32;
+    let terms = handoff_select_terms(candidate.text);
+    let referenced_again = ctx
+        .assistant_texts
+        .iter()
+        .chain(ctx.user_messages.iter())
+        .filter(|text| !handoff_select_terms(text).is_disjoint(&terms))
+        .count()
+        .min(31) as u32;
+    let files_touched_overlap = ctx
+        .files_modified
+        .iter()
+        .filter(|path| !path.is_empty() && candidate.text.contains(path.as_str()))
+        .count()
+        .min(31) as u32;
+    let tool_failure_adjacent = u32::from(
+        ctx.tool_errors
+            .iter()
+            .any(|error| !handoff_select_terms(error).is_disjoint(&terms)),
+    );
+    vec![
+        candidate.kind.type_id(),
+        age_in_turns,
+        handoff_select_size_bucket(candidate.text.len()),
+        referenced_again,
+        files_touched_overlap,
+        tool_failure_adjacent,
+        candidate.position as u32,
+    ]
+}
+
+/// Bounded numeric-only metadata state (`jev::safe_metadata_request`'s own
+/// egress boundary): one fact row per optional item sent, in [`optional_
+/// candidates`]'s own order. Never the item's own text.
+#[derive(Debug, serde::Serialize)]
+struct HandoffSelectState {
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// Builds the exact `(state, questions)` pair [`jev_select_optional_handoff_
+/// items`] sends to `jev::advise` -- factored out so a test can assert
+/// directly that this pair passes `jev::safe_metadata_request`, the same way
+/// [`handoff_quality_request`]'s own test does for the `[jev] supervisor`
+/// site.
+fn handoff_select_request(
+    ids: &[String],
+    candidates: &[OptionalCandidate<'_>],
+    ctx: &StructuralContext,
+) -> (HandoffSelectState, Vec<jev::Question>) {
+    let facts: Vec<Vec<u32>> = candidates
+        .iter()
+        .map(|candidate| handoff_select_facts_row(candidate, ctx))
+        .collect();
+    let questions: Vec<jev::Question> = ids
+        .iter()
+        .map(|id| {
+            jev::Question::metadata_noul(
+                id,
+                HANDOFF_SELECT_INSTRUCTIONS,
+                "keep this item",
+                "drop this item",
+            )
+        })
+        .collect();
+    (
+        HandoffSelectState {
+            _zirv_metadata_only: true,
+            facts,
+        },
+        questions,
+    )
+}
+
+/// Issue #783: an off-by-default (`[jev] handoff_select`) keep/drop pass
+/// over a handoff's OPTIONAL items only -- `done`/`key_decisions`/`files_
+/// read`/`files_modified`/`gotchas`. Mirrors `compile::rerank_memory_
+/// candidates`/`memory::apply_jev_harvest_gate`'s own per-candidate noul
+/// shape exactly (one batched call, one noul question per candidate, only a
+/// margin-gated decisive rejection ever prunes), but never reorders: this is
+/// keep/drop only, so a surviving item keeps its original relative position
+/// within its own section.
+///
+/// Never touches `task`/`constraints`/`remaining`/`blocked`/`verification`/
+/// `next_step` -- [`optional_candidates`] never yields one of those, so this
+/// pass has no way to drop or reorder any of them. Best-effort like every
+/// other `[jev]`-gated site: the gate being off, no credential set, or any
+/// transport/parse error all surface as `jev::advise` returning `None`,
+/// which leaves `handoff` completely untouched -- the only case today's
+/// default config (`cfg.jev.handoff_select` defaults `false`) ever takes.
+///
+/// At most [`HANDOFF_SELECT_MAX_CANDIDATES`] optional items are ever sent to
+/// Jev; any item beyond that cap is always kept, never dropped by omission.
+/// Records one `"handoff_select"`/`"items_pruned"` [`jev::JevEffect`]
+/// (baseline/actual item counts and the dropped items' own byte size)
+/// whenever the call succeeds AND actually drops something.
+fn jev_select_optional_handoff_items(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    ctx: &StructuralContext,
+    mut handoff: Handoff,
+) -> Handoff {
+    let candidates = optional_candidates(&handoff);
+    if candidates.is_empty() {
+        return handoff;
+    }
+    let sent_len = candidates.len().min(HANDOFF_SELECT_MAX_CANDIDATES);
+    let sent = &candidates[..sent_len];
+    let ids: Vec<String> = (0..sent_len).map(|i| format!("c{i}")).collect();
+    let (advise_state, questions) = handoff_select_request(&ids, sent, ctx);
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "handoff_select",
+        cfg.jev.handoff_select,
+        &advise_state,
+        &questions,
+    ) else {
+        return handoff;
+    };
+
+    let mut dropped: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
+    let mut removed_bytes = 0u64;
+    for (candidate, id) in sent.iter().zip(ids.iter()) {
+        // Jev determinism fix, matching every other keep/drop noul in this
+        // crate: a non-decisive (margin below `jev::DEFAULT_MIN_MARGIN`) or
+        // missing/unparseable answer is treated exactly like "keep" -- only
+        // a decisive, below-floor verdict may drop an item.
+        let Some(answer) = answers.get(id) else {
+            continue;
+        };
+        if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+            continue;
+        }
+        if matches!(answer.as_noul(), Some(value) if value < HANDOFF_SELECT_DROP_FLOOR) {
+            dropped.insert((candidate.kind.type_id(), candidate.position));
+            removed_bytes += candidate.text.len() as u64;
+        }
+    }
+    if dropped.is_empty() {
+        return handoff;
+    }
+
+    let drop_from = |kind: OptionalItemKind, items: &mut Vec<String>| {
+        let mut position = 0usize;
+        items.retain(|_| {
+            let keep = !dropped.contains(&(kind.type_id(), position));
+            position += 1;
+            keep
+        });
+    };
+    drop_from(OptionalItemKind::Done, &mut handoff.done);
+    drop_from(OptionalItemKind::KeyDecision, &mut handoff.key_decisions);
+    drop_from(OptionalItemKind::FileRead, &mut handoff.files_read);
+    drop_from(OptionalItemKind::FileModified, &mut handoff.files_modified);
+    drop_from(OptionalItemKind::Gotcha, &mut handoff.gotchas);
+
+    let mut effect = jev::JevEffect::new("handoff_select", "items_pruned");
+    effect.baseline_count = u32::try_from(sent_len).ok();
+    effect.actual_count = u32::try_from(sent_len - dropped.len()).ok();
+    effect.removed_bytes = Some(removed_bytes);
+    jev::record_effect(cfg, state, cfg.jev.handoff_select, &effect);
+
+    handoff
 }
 
 #[derive(Debug, clap::Args)]
@@ -2307,6 +2601,227 @@ mod tests {
 
         assert_eq!(source, "distilled");
         assert_eq!(handoff.task, "Ship the webhook");
+    }
+
+    // -- jev_select_optional_handoff_items (issue #783) -----------------------
+
+    fn handoff_select_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.handoff_select = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// Two optional sections populated (`done`: 1 item -> `c0`; `gotchas`: 2
+    /// items -> `c1`/`c2`), so a mock answer can target one specific item
+    /// for drop while the rest must survive untouched.
+    fn handoff_select_sample() -> Handoff {
+        Handoff {
+            task: "Wire the payments webhook".to_string(),
+            next_step: "Add a failing test for an invalid signature".to_string(),
+            constraints: vec!["Must stay backwards compatible with v1 clients".to_string()],
+            remaining: vec!["Add integration coverage".to_string()],
+            blocked: vec!["Waiting on provider sandbox credentials".to_string()],
+            verification: "cargo test: passed".to_string(),
+            done: vec!["Wrote the route handler".to_string()],
+            gotchas: vec![
+                "keep this gotcha".to_string(),
+                "drop this gotcha".to_string(),
+            ],
+            ..Handoff::default()
+        }
+    }
+
+    /// The gate off must never even attempt a call, despite a credential
+    /// that looks available -- `handoff` returned byte-identical to what was
+    /// passed in, and no decision/effect file created.
+    #[test]
+    fn jev_select_optional_handoff_items_is_a_pass_through_when_the_gate_is_off() {
+        let handoff = handoff_select_sample();
+        let credential_env = "HANDOFF_TEST_JEV_SELECT_783_GATE_OFF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.handoff_select, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result =
+            jev_select_optional_handoff_items(&cfg, &state, &ctx_sample(), handoff.clone());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(result, handoff);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// A decisive drop verdict on exactly one candidate (`c2`, "drop this
+    /// gotcha") prunes only that item; every other optional item, and every
+    /// required field, survives -- and the prune is recorded as an effect.
+    #[test]
+    fn jev_select_optional_handoff_items_enabled_prunes_a_decisive_drop_and_records_an_effect() {
+        let handoff = handoff_select_sample();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "c0": {"type": "noul", "noul": 0.9},
+            "c1": {"type": "noul", "noul": 0.9},
+            "c2": {"type": "noul", "noul": 0.05}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_SELECT_783_ENABLED";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = handoff_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = jev_select_optional_handoff_items(&cfg, &state, &ctx_sample(), handoff);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result.done, vec!["Wrote the route handler".to_string()]);
+        assert_eq!(result.gotchas, vec!["keep this gotcha".to_string()]);
+
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("jev-effects.jsonl must exist after a successful prune");
+        let line = effects.lines().next().expect("one effect line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse effect line");
+        assert_eq!(value["site"], "handoff_select");
+        assert_eq!(value["action"], "items_pruned");
+        assert_eq!(value["baseline_count"].as_u64(), Some(3));
+        assert_eq!(value["actual_count"].as_u64(), Some(2));
+        assert_eq!(
+            value["removed_bytes"].as_u64(),
+            Some("drop this gotcha".len() as u64)
+        );
+    }
+
+    /// A failed call (5xx) must leave `handoff` completely untouched, same
+    /// as every other `[jev]`-gated site's own fallback -- and record no
+    /// effect, since nothing was ever pruned.
+    #[test]
+    fn jev_select_optional_handoff_items_falls_back_to_the_deterministic_handoff_on_a_500() {
+        let handoff = handoff_select_sample();
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "HANDOFF_TEST_JEV_SELECT_783_500";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = handoff_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result =
+            jev_select_optional_handoff_items(&cfg, &state, &ctx_sample(), handoff.clone());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result, handoff);
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// Direction rule: a uniformly decisive KEEP verdict must never widen or
+    /// reorder anything -- this pass can only ever narrow the deterministic
+    /// selection, never add to it or shuffle it.
+    #[test]
+    fn jev_select_optional_handoff_items_never_drops_on_a_decisive_keep_answer() {
+        let handoff = handoff_select_sample();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "c0": {"type": "noul", "noul": 0.95},
+            "c1": {"type": "noul", "noul": 0.95},
+            "c2": {"type": "noul", "noul": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_SELECT_783_KEEP";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = handoff_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result =
+            jev_select_optional_handoff_items(&cfg, &state, &ctx_sample(), handoff.clone());
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            result, handoff,
+            "a uniformly decisive keep verdict must never widen or reorder anything"
+        );
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// Even a uniformly decisive DROP verdict across every optional item
+    /// must never touch a required field -- `optional_candidates` never
+    /// yields one, so this pass has no way to drop or reorder any of them.
+    #[test]
+    fn jev_select_optional_handoff_items_never_touches_required_fields() {
+        let handoff = handoff_select_sample();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "c0": {"type": "noul", "noul": 0.01},
+            "c1": {"type": "noul", "noul": 0.01},
+            "c2": {"type": "noul", "noul": 0.01}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_SELECT_783_REQUIRED";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = handoff_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let original = handoff.clone();
+
+        let result = jev_select_optional_handoff_items(&cfg, &state, &ctx_sample(), handoff);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result.task, original.task);
+        assert_eq!(result.next_step, original.next_step);
+        assert_eq!(result.constraints, original.constraints);
+        assert_eq!(result.remaining, original.remaining);
+        assert_eq!(result.blocked, original.blocked);
+        assert_eq!(result.verification, original.verification);
+    }
+
+    /// Direct proof that the exact `(state, questions)` pair
+    /// [`jev_select_optional_handoff_items`] sends via [`handoff_select_
+    /// request`] passes `jev::safe_metadata_request` -- the egress boundary
+    /// issue #746 established for every `[jev]`-gated site, the same way
+    /// [`handoff_quality_request_passes_safe_metadata_request`] proves it for
+    /// the `[jev] supervisor` site.
+    #[test]
+    fn handoff_select_request_passes_safe_metadata_request() {
+        let handoff = handoff_select_sample();
+        let candidates = optional_candidates(&handoff);
+        let ids: Vec<String> = (0..candidates.len()).map(|i| format!("c{i}")).collect();
+        let (state, questions) = handoff_select_request(&ids, &candidates, &ctx_sample());
+        let value = serde_json::to_value(&state).expect("HandoffSelectState always serializes");
+        let model = CtxConfig::default().proxy.typesafe.model;
+        assert!(
+            crate::commands::ctx::jev::safe_metadata_request(&value, &questions, &model),
+            "got state {value}"
+        );
     }
 
     /// Issue #280: the structural (mechanical) fallback can never

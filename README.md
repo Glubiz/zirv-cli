@@ -4041,6 +4041,13 @@ intake_savings = false # clarification category and optional planner; ZIRV_CTX_J
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
+approve = false     # safety-hook risk check: sends local facts only (program/subcommand class, write/delete/network/privilege flags, path-scope class, pipe/redirect/substitution/secret-placeholder counts), may only escalate a deterministic allow to ask; ZIRV_CTX_JEV_APPROVE (#781)
+approve_allow = false # opt-in auto-approve, effective only when `approve` is also true: may lower a SIMPLE unmatched-default ask to allow (single segment, no pipe/redirect/substitution/env-prefix/code-bearing argument, program not a shell/eval/wrapper/refused-destructive program, not destructive/network/privilege) on a high-confidence/margin answer, with every check ALSO re-run on each token suffix to defeat launcher prefixes (nohup, timeout N, nice, ...); never a hard deny, and never a matched deny/ask rule (rm -rf, force-push, credential paths, ...) -- see "Command safety policy" below for the full structural rule; ZIRV_CTX_JEV_APPROVE_ALLOW (#781)
+classify = false    # intent refinement for `zirv workflow start`/`classify` (classify also adds domain tags); ZIRV_CTX_JEV_CLASSIFY (#782)
+handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_JEV_HANDOFF_SELECT (#783)
+inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
+inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
+stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
@@ -4130,6 +4137,26 @@ only. A match records one `admin_dispatch`/`llm_turn_avoided` effect row
 (never a decision or cache row); the rendered output is truncated to 8 KiB
 and prefixed with a line naming the operation. A renderer failure falls back
 to today's path; the hook never fails a prompt.
+
+`jev.classify` (issue [#782](https://github.com/Glubiz/zirv-cli/issues/782))
+refines `zirv workflow classify`'s output, and `zirv workflow start`'s pack
+selection, with one batched Jev call, sending only local facts derived from
+the request text and the deterministic classifier's own output: intent/
+complexity/risk as ids, a word-count bucket, a path-like token count,
+stated-outcome/stated-constraint flags, and per-domain keyword hit counts for
+the same six domains the harness proxy already asks about (security, data,
+docs, dev-ops, architecture, frontend) -- never the request text itself. It
+asks the same intent options the proxy's own intake asks, plus (for
+`classify`, which has an `ExecutionProfile` to add a tag to) one yes/no
+question per domain; `start` classifies before an `ExecutionProfile` exists,
+so it asks and applies intent only. Never asks about complexity (a
+2026-09-18 replay found complexity answers stable-but-wrong at that margin,
+routing 1.7-2.2x more spend through Substantial with no accuracy gain). A
+decisive answer may replace `intent` outright, or (for `classify`) ADD a
+domain tag (`security` also raises `independent_review`/`security_review`)
+-- it never removes a tag the keyword path already found and never touches
+`risk`. A disabled gate, a missing credential, or a failed/uncertain call
+leaves the deterministic output byte-identical to today.
 
 Handoffs, sockets, logs and scoring checkpoints live in the platform state
 directory under `zirv/ctx/`, never in the repo. Override with
@@ -4457,6 +4484,13 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.review_reuse` | `ZIRV_CTX_JEV_REVIEW_REUSE` |
 | `jev.harvest_screen` | `ZIRV_CTX_JEV_HARVEST_SCREEN` |
 | `jev.admin_dispatch` | `ZIRV_CTX_JEV_ADMIN_DISPATCH` |
+| `jev.approve` | `ZIRV_CTX_JEV_APPROVE` |
+| `jev.approve_allow` | `ZIRV_CTX_JEV_APPROVE_ALLOW` |
+| `jev.classify` | `ZIRV_CTX_JEV_CLASSIFY` |
+| `jev.handoff_select` | `ZIRV_CTX_JEV_HANDOFF_SELECT` |
+| `jev.inject_screen` | `ZIRV_CTX_JEV_INJECT_SCREEN` |
+| `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
+| `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
@@ -6151,6 +6185,85 @@ apply` wires into claude's `PreToolUse` hook for `Bash` and `PowerShell` calls,
 so the same
 evaluator zirv's own CLI uses is what claude consults before running a
 command — see [Context Management](#context-management-zirv-ctx).
+
+`[jev] approve`/`approve_allow` (issue #781, both operator-only and off by
+default) add an optional Jev risk check on top of this deterministic policy,
+strictly after every other rule above has already produced its verdict. The
+request sends bounded local facts only — program class, subcommand class,
+write/delete/network/privilege-escalation flags (folded over every
+executable candidate `normalize_segments` finds, not just the command's own
+leading token), a path-scope class (worktree/repo/home-or-root-wide/
+credential path), pipe/redirect/command-substitution counts, a
+secret-placeholder count from the same detector `[obfuscate]` uses (issue
+#466), and a shell/eval/inline-interpreter wrapper flag — never the command
+text, paths, arguments, env values, or file contents; the request must pass
+`jev::safe_metadata_request` like every other `[jev]`-gated site.
+`approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
+answer; widening what may be escalated is always safe, so this direction has
+no further restriction. `approve_allow` (effective only when `approve` is
+also on) may only LOWER an `ask` to `allow`, on a decisive `safe` answer
+clearing a HIGH margin and confidence floor (2026-09-18 probe: 8/10 correct,
+both misses cautious, n=10 — too small to gate on at a normal bar), and only
+for a **simple** unmatched-default `ask` that clears every one of these
+checks:
+
+- No matched rule at all; exactly one segment; no pipe/redirect/command-or-
+  process-substitution/backtick/heredoc; no leading `VAR=value` prefix.
+- The command's own program is not a shell/`eval`/`exec`/`xargs`/`env`/
+  `sudo`/`doas`/dot-source, an interpreter given inline code (`-c`/`-e`), a
+  fixed list of always-opaque wrappers (`builtin`, PowerShell's own
+  `iex`/`Invoke-Expression`/`Start-Process`/`Invoke-Command`, `trap`,
+  `alias`, remote/relay execution `ssh`/`scp`/`nc`/`ncat`/`socat`/`telnet`,
+  or `osascript`/`lua`/`deno`/`bun`/`php`/`tclsh`/`awk`/`gawk`/`expect`), or
+  a fixed list of destructive/service-altering programs zirv's own
+  deterministic policy does not otherwise classify (`shred`, `srm`,
+  `truncate`, `diskutil`, `crontab`, `launchctl`, `systemctl`, `wipefs`,
+  `cipher`, `schtasks`, `kill`, `mkfs*`, `rsync` with a `--delete*` flag,
+  `reg delete`).
+- No argument token is code-bearing: none contains whitespace (a quoted
+  multi-word string, already dequoted), `(`, `)`, `{`, `}`, or `@`, and none
+  is itself `-e`/`-c`/`/c` immediately followed by another token.
+- Computed over the command itself: not destructive, not a network program,
+  not privilege-escalating, with a path-scope no wider than the repo.
+- **Structural launcher check**: for every `i` in `1..tokens.len()` (the
+  full, unbounded remainder — an earlier bounded window still missed a real
+  program past its cap), the SAME deterministic path the hook itself uses
+  (`evaluate`, no Jev) is re-run on the suffix `tokens[i..]`, and every
+  check above (matched rule, `deny`, destructive/network/privilege-
+  escalating, the refused-program list, a code-bearing argument) is
+  re-applied to that suffix too. A launcher prefix (`nohup`, `timeout N`,
+  `nice`/`nice -n N`, `command`, `time`, `stdbuf ...`, `setsid`, or any
+  other launcher this module does not name) shifts the real program past
+  every check that looks at the command's own leading token alone; this
+  re-evaluates every plausible starting position instead of naming
+  launchers, so it generalizes to one this list does not yet know about.
+- The RAW command may not contain `\`, `?`, `*`, `[`, `]`, `$`, `'`, `"`,
+  `~`, `` ` ``, or a newline, checked before any other test runs: every
+  check above reasons about dequoted tokens, and a backslash-split program
+  name, a glob standing in for it, or an unexpanded `$IFS` standing in for
+  whitespace all compare unequal to the plain-string program/argument names
+  those checks look for while a real shell still executes them identically.
+
+A matched-rule check on the WHOLE command is not enough by itself: the
+deterministic fold (`evaluate_candidates`) keeps the FIRST candidate at a
+tied verdict rank, so a compound like `foo-unknown; rm -rf ~` reports `ask`
+with **no** matched rule at all even though its second segment is the
+shipped `rm -rf *` ask family. The simple-command restriction above,
+including the structural launcher check, is what actually keeps `rm -rf`,
+force-push, `sh -c "..."`, `eval "$(...)"`, `nohup rm -rf ...`,
+`timeout 5 git reset --hard`, and every other `SHIPPED_POSTURE_DENY`/
+`SHIPPED_POSTURE_ASK` family, dangerous wrapper, or launcher-prefixed
+dangerous shape out of reach — not any single check by itself, and this is
+necessarily a bounded, reviewed list rather than a claim of catching every
+possible obfuscation. An unmatched, simple, single-program command the
+deterministic policy simply has no opinion on at all — e.g.
+`chmod 000 /Users/x/keep`, `ln -sf /dev/null /Users/x/.zshrc`,
+`./script.sh`, `certutil -urlcache` — clears every check above and so
+relies on Jev's own confidence/margin floors alone, a documented trade-off
+of this off-by-default opt-in rather than an oversight. Any Jev error,
+timeout, or an answer that misses either floor
+falls back to the deterministic verdict unchanged. Decisions are recorded
+on site `approve` with outcome `escalated`/`lowered`/`unchanged`/`fallback`.
 
 ### Permission auditing and safe-list proposals (issue #178)
 

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::commands::ctx::{
-    adapters, agent, delegation, envelope, mail, result_schema, safety, task,
+    adapters, agent, delegation, envelope, inject_screen, mail, result_schema, safety, task,
 };
 use sha2::{Digest, Sha256};
 
@@ -115,6 +115,12 @@ pub(super) struct WorkerResult {
 #[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct ResultPage {
     id: String,
+    // Issue #784: `[jev] inject_screen`'s own warning, ahead of `text` in
+    // both field order and (skip-if-none) JSON output -- never folded into
+    // `text` itself, which stays an exact, `format`-typed slice of the
+    // underlying report so pagination/`revision` math is never disturbed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screening: Option<&'static str>,
     text: String,
     offset: usize,
     next_offset: Option<usize>,
@@ -131,6 +137,11 @@ struct InboxMessage {
     from_agent: String,
     to_session: Option<String>,
     sent: u64,
+    // Issue #784: `[jev] inject_screen`'s own warning, ahead of `body` in
+    // both field order and (skip-if-none) JSON output -- never folded into
+    // `body` itself, which stays exactly what `mail::list` returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screening: Option<&'static str>,
     body: String,
     body_truncated: bool,
     body_bytes: usize,
@@ -494,7 +505,7 @@ impl Scope {
         })
     }
 
-    pub(super) fn result_read(&self, args: ResultArgs) -> CtxResult<Value> {
+    pub(super) fn result_read(&self, args: ResultArgs, cfg: &CtxConfig) -> CtxResult<Value> {
         validate_id(&args.id)?;
         let bytes = bounded(args.max_bytes, 8192, 4, 8192, "max_bytes")?;
         let records = self.scoped_delegations()?;
@@ -515,8 +526,26 @@ impl Scope {
         }
         let page = text_prefix(&text[args.offset..], bytes);
         let end = args.offset + page.len();
+        // Issue #784: `[jev] inject_screen` screens the whole underlying
+        // report once, on its first page only -- never re-screened per
+        // pagination call. Surfaced through the dedicated `screening` field
+        // (see `ResultPage`'s own doc comment), never folded into `text`
+        // itself, which stays an exact, `format`-typed slice of the report
+        // so pagination/`revision` math is never disturbed and a JSON-
+        // parsing caller never sees corrupted content.
+        let screening = if args.offset == 0 {
+            inject_screen::screen_for_injection(
+                cfg,
+                &self.state,
+                inject_screen::InjectSource::WorkerResult,
+                &text,
+            )
+        } else {
+            None
+        };
         self.response(ResultPage {
             id: args.id,
+            screening,
             text: page.into(),
             offset: args.offset,
             next_offset: (end < text.len()).then_some(end),
@@ -579,12 +608,23 @@ impl Scope {
                 &msg.body,
                 bytes.min(cfg.mail.max_delivered_bytes.saturating_sub(delivered_bytes)),
             );
+            // Issue #784: `[jev] inject_screen` screens the delivered
+            // preview -- the same text this reader actually receives --
+            // and surfaces any warning through the dedicated `screening`
+            // field, never folded into `body` itself.
+            let screening = inject_screen::screen_for_injection(
+                cfg,
+                &self.state,
+                inject_screen::InjectSource::Mail,
+                body,
+            );
             let message = InboxMessage {
                 id,
                 from_session: msg.from_session,
                 from_agent: msg.from_agent,
                 to_session: msg.to_session,
                 sent: msg.sent,
+                screening,
                 body: body.into(),
                 body_truncated: body.len() < msg.body.len(),
                 body_bytes: msg.body.len(),

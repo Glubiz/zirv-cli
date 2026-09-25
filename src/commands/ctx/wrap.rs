@@ -3503,6 +3503,9 @@ fn pump(
     // T13: the live mail wake-up. See `mail_polling_enabled` for the gates: a
     // session that cannot receive mail at all never reads the mailbox once.
     let mut mail_watch = MailWatch::default();
+    // Issue #785: the `[jev] inject` gate's pump-local state; off => every
+    // `check` proceeds at once and the paths below run as before.
+    let mut inject_gate = super::inject_gate::AsyncGate::default();
     // Finding #7: `handover::take_request`'s own polling cadence, tracked
     // independently of `mail_watch` -- see the check site's own doc comment.
     let mut last_handover_poll: Option<Instant> = None;
@@ -4000,7 +4003,32 @@ fn pump(
         // the no-op-when-unchanged check; this call is cheap otherwise.
         redraw_bar_if_due(bar, supervision, state_dir, repo, Instant::now());
 
-        match action_for(supervision, Instant::now(), debounce) {
+        let action = match action_for(supervision, Instant::now(), debounce) {
+            action @ (Action::Compact | Action::Restart) => {
+                let now = Instant::now();
+                let kind = match action {
+                    Action::Compact => super::inject_gate::InjectKind::Compact,
+                    _ => super::inject_gate::InjectKind::Restart,
+                };
+                let facts = super::inject_gate::InjectFacts {
+                    rot_score: Some(supervision.score),
+                    restart_at: cfg.score.restart_at,
+                    output_idle_ms: Some(
+                        now.saturating_duration_since(supervision.last_output)
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    ),
+                    ..Default::default()
+                };
+                match inject_gate.check(cfg, state_dir, kind, supervision.signals_seen, facts, now)
+                {
+                    super::inject_gate::Gate::Proceed => action,
+                    super::inject_gate::Gate::Hold => Action::None,
+                }
+            }
+            action => action,
+        };
+        match action {
             Action::None => {}
             Action::Advise => {
                 announcer.emit(&Event::RotAdvisory {
@@ -4011,6 +4039,10 @@ fn pump(
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
             Action::Compact => {
+                inject_gate.injected(
+                    super::inject_gate::InjectKind::Compact,
+                    supervision.signals_seen,
+                );
                 let defer = adapter.capabilities().defer_injection_submit;
                 let injected = writer
                     .lock()
@@ -4078,6 +4110,10 @@ fn pump(
             }
             Action::Restart => 'restart: {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
+                inject_gate.injected(
+                    super::inject_gate::InjectKind::Restart,
+                    supervision.signals_seen,
+                );
 
                 // Before anything is torn down: a restart chain that has
                 // already tripped means this session is in a loop that
@@ -4367,7 +4403,48 @@ fn pump(
                     debounce,
                     Duration::from_millis(cfg.dash.idle_quiet_ms),
                 );
-                match mail_watch.decide(&facts, ready) {
+                let mut action = mail_watch.decide(&facts, ready);
+                if matches!(action, MailAction::Inject { .. }) {
+                    let now_secs = super::state::now_secs();
+                    let gate_facts = super::inject_gate::InjectFacts {
+                        unread: Some(unread.len() as u64),
+                        oldest_unread_age_secs: unread
+                            .iter()
+                            .map(|(_, message)| now_secs.saturating_sub(message.sent))
+                            .max(),
+                        sender: facts
+                            .iter()
+                            .map(|fact| {
+                                super::inject_gate::sender_class(
+                                    &fact.from_agent,
+                                    &fact.from_short,
+                                    parent_short,
+                                )
+                            })
+                            .max()
+                            .unwrap_or_default(),
+                        output_idle_ms: Some(
+                            now.saturating_duration_since(supervision.last_output)
+                                .as_millis()
+                                .min(u128::from(u64::MAX)) as u64,
+                        ),
+                        ..Default::default()
+                    };
+                    // Held exactly as an unready child would be: announced
+                    // on the `zirv ▸` channel, injection still owed.
+                    if inject_gate.check(
+                        cfg,
+                        state_dir,
+                        super::inject_gate::InjectKind::MailPty,
+                        supervision.signals_seen,
+                        gate_facts,
+                        now,
+                    ) == super::inject_gate::Gate::Hold
+                    {
+                        action = mail_watch.decide(&facts, false);
+                    }
+                }
+                match action {
                     MailAction::None => {}
                     MailAction::Announce { count, ids } => {
                         // R5: `try_emit`, not `emit` -- an advisory the
@@ -4408,6 +4485,10 @@ fn pump(
                         );
                         if wrote {
                             mail_watch.commit_injected(&ids);
+                            inject_gate.injected(
+                                super::inject_gate::InjectKind::MailPty,
+                                supervision.signals_seen,
+                            );
                         } else {
                             // Same R5 rule on the degrade path: a poisoned
                             // writer plus a swallowed announcement must leave

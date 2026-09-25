@@ -47,13 +47,53 @@ const CLASSIFY_TASK_MAX_BYTES: usize = 4000;
 /// add to [`ProxyDecision::domains`] -- also the exact question ids
 /// [`questions`] asks and [`merge`] reads back, so the two can never drift
 /// out of sync with each other.
-const DOMAIN_QUESTION_IDS: [&str; 6] = [
+pub(crate) const DOMAIN_QUESTION_IDS: [&str; 6] = [
     "security",
     "data",
     "docs_only",
     "devops",
     "architecture",
     "frontend",
+];
+
+/// The six domain Noul questions themselves ([`DOMAIN_QUESTION_IDS`]'s own
+/// `(instructions, when_true, when_false)`, in the same order), promoted out
+/// of [`questions`] so the workflow module's own metadata-only classify
+/// refinement (issue #782, `workflow::profile::refine_via_jev`) can ask the
+/// identical six questions instead of writing a second copy.
+pub(crate) const DOMAIN_NOUL_QUESTIONS: [(&str, &str, &str); 6] = [
+    (
+        "Does this request touch authentication, credentials, permissions, or a trust \
+         boundary?",
+        "yes, a security-sensitive surface",
+        "no security-sensitive surface",
+    ),
+    (
+        "Does this request touch a data schema, a migration, or stored data?",
+        "yes, a data surface",
+        "no data surface",
+    ),
+    (
+        "Does this request change only documentation or comments, with no other code \
+         change?",
+        "yes, documentation/comments only",
+        "no, it changes other code too",
+    ),
+    (
+        "Does this request touch CI, deployment, packaging, or infrastructure?",
+        "yes, a deployment/operations surface",
+        "no deployment/operations surface",
+    ),
+    (
+        "Does this request involve cross-module design or a new subsystem?",
+        "yes, cross-module design or a new subsystem",
+        "no, contained to one place",
+    ),
+    (
+        "Does this request touch UI, rendering, or visual behavior?",
+        "yes, a UI/visual surface",
+        "no UI/visual surface",
+    ),
 ];
 
 /// The orchestrator seat a decision names: a harness registry name
@@ -1465,41 +1505,8 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
     // `security`'s own confident `true` answer floors risk/execution the
     // same way the keyword trigger already does (see `merge`); the other
     // five are informational only.
-    let domain_questions: [(&str, &str, &str); 6] = [
-        (
-            "Does this request touch authentication, credentials, permissions, or a trust \
-             boundary?",
-            "yes, a security-sensitive surface",
-            "no security-sensitive surface",
-        ),
-        (
-            "Does this request touch a data schema, a migration, or stored data?",
-            "yes, a data surface",
-            "no data surface",
-        ),
-        (
-            "Does this request change only documentation or comments, with no other code \
-             change?",
-            "yes, documentation/comments only",
-            "no, it changes other code too",
-        ),
-        (
-            "Does this request touch CI, deployment, packaging, or infrastructure?",
-            "yes, a deployment/operations surface",
-            "no deployment/operations surface",
-        ),
-        (
-            "Does this request involve cross-module design or a new subsystem?",
-            "yes, cross-module design or a new subsystem",
-            "no, contained to one place",
-        ),
-        (
-            "Does this request touch UI, rendering, or visual behavior?",
-            "yes, a UI/visual surface",
-            "no UI/visual surface",
-        ),
-    ];
-    for (id, (what, when_true, when_false)) in DOMAIN_QUESTION_IDS.into_iter().zip(domain_questions)
+    for (id, (what, when_true, when_false)) in
+        DOMAIN_QUESTION_IDS.into_iter().zip(DOMAIN_NOUL_QUESTIONS)
     {
         out.push(Question::noul(id, what, when_true, when_false));
     }

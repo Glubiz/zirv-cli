@@ -602,6 +602,7 @@ impl RuntimeHost {
                 super::super::dash::sweep_one_pane(
                     &mut injector,
                     &id,
+                    cfg,
                     &self.state,
                     &slug,
                     &agent,
