@@ -287,9 +287,13 @@ pub struct Receipt {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
-    #[serde(default)]
+    /// `run.py`'s own `make_receipt` emits Anthropic's own field spelling,
+    /// `cache_creation_input_tokens`/`cache_read_input_tokens` -- accepted
+    /// here as aliases so a receipt line it writes never silently parses
+    /// with these at 0 (issue-review finding R6).
+    #[serde(default, alias = "cache_creation_input_tokens")]
     pub cache_creation_tokens: u64,
-    #[serde(default)]
+    #[serde(default, alias = "cache_read_input_tokens")]
     pub cache_read_tokens: u64,
     /// A cached Jev hit: a real call was skipped, so this receipt counts as
     /// a call with zero provider spend, never as unpriced/unknown usage.
@@ -922,6 +926,53 @@ mod tests {
             billing: Billing::Metered,
             attribution: Attribution::default(),
         }
+    }
+
+    /// Regression for issue-review finding R6: `run.py`'s own `make_receipt`
+    /// (docs/benchmarks/wrapped-vs-vanilla/run.py) emits Anthropic's own
+    /// field spelling, `cache_creation_input_tokens`/
+    /// `cache_read_input_tokens`, not `Receipt`'s `cache_creation_tokens`/
+    /// `cache_read_tokens` -- so a receipt line it writes must still
+    /// populate those fields via `#[serde(alias = ...)]`, not silently
+    /// parse them as 0. This is `make_receipt`'s exact key set and value
+    /// shape, byte-for-byte (a JSON object with precisely its keys, in its
+    /// order, none added or dropped) -- not a synthetic shorthand.
+    #[test]
+    fn a_receipt_line_shaped_exactly_like_run_pys_make_receipt_parses_its_cache_tokens() {
+        let line = serde_json::json!({
+            "source": "judge",
+            "session": "sess-1",
+            "receipt_id": "r-1",
+            "cumulative": false,
+            "reported_usd": 0.0123,
+            "model": "claude-x",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 7,
+            "cache_read_input_tokens": 13,
+            "cached": false,
+            "billing": "metered",
+        })
+        .to_string();
+        let receipt: Receipt = serde_json::from_str(&line).unwrap();
+        assert_eq!(receipt.source, Source::Judge);
+        assert_eq!(receipt.session.as_deref(), Some("sess-1"));
+        assert_eq!(receipt.receipt_id.as_deref(), Some("r-1"));
+        assert!(!receipt.cumulative);
+        assert_eq!(receipt.reported_usd, Some(0.0123));
+        assert_eq!(receipt.model.as_deref(), Some("claude-x"));
+        assert_eq!(receipt.input_tokens, 100);
+        assert_eq!(receipt.output_tokens, 20);
+        assert_eq!(
+            receipt.cache_creation_tokens, 7,
+            "cache_creation_input_tokens must alias into cache_creation_tokens"
+        );
+        assert_eq!(
+            receipt.cache_read_tokens, 13,
+            "cache_read_input_tokens must alias into cache_read_tokens"
+        );
+        assert!(!receipt.cached);
+        assert_eq!(receipt.billing, Billing::Metered);
     }
 
     // -- Attribution -----------------------------------------------------
