@@ -27,6 +27,7 @@ pub mod maintain;
 pub mod outcomes;
 pub mod profile;
 pub mod registry;
+pub mod research;
 pub mod review;
 pub mod selection;
 pub mod skill;
