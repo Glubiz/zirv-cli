@@ -19,6 +19,7 @@ use super::promote::CohortDecision;
 use super::reconcile::reconstruct_tracker;
 use super::run::{Stage, stage_records_from_ledger};
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::state::display_path;
 
 /// One candidate/stage's full result, parsed back from that `StageDecision`
 /// event's own `detail` -- `screen`'s detail is `{reason, points,
@@ -385,9 +386,9 @@ fn write_provenance(
 ) -> CtxResult<()> {
     writeln!(file, "## Provenance")?;
     writeln!(file, "- zirv version: {}", summary.zirv_version)?;
-    writeln!(file, "- manifest: `{}`", lock.manifest_path.display())?;
+    writeln!(file, "- manifest: `{}`", display_path(&lock.manifest_path))?;
     writeln!(file, "- manifest sha256: {}", lock.manifest_sha256)?;
-    writeln!(file, "- repo: `{}`", lock.repo.display())?;
+    writeln!(file, "- repo: `{}`", display_path(&lock.repo))?;
     writeln!(file, "- baseline commit: {}", summary.baseline_sha)?;
     writeln!(file, "- corpus: `{}`", lock.manifest.corpus.file.display())?;
     writeln!(file, "- corpus version: {}", lock.corpus_version)?;
@@ -572,7 +573,7 @@ fn write_coverage(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
     Ok(())
 }
 
-fn write_reproduction(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
+fn write_reproduction(file: &mut std::fs::File, lock: &Lock, campaign_dir: &Path) -> CtxResult<()> {
     writeln!(file, "## Reproduction")?;
     writeln!(
         file,
@@ -581,8 +582,8 @@ fn write_reproduction(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
     writeln!(file, "```")?;
     writeln!(
         file,
-        "git -C {} checkout {}",
-        lock.repo.display(),
+        "git -C \"{}\" checkout {}",
+        display_path(&lock.repo),
         lock.baseline_sha
     )?;
     writeln!(file, "```")?;
@@ -593,9 +594,10 @@ fn write_reproduction(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
     writeln!(file, "```")?;
     writeln!(
         file,
-        "zirv workflow research run {} --repo {} --resume",
-        lock.manifest_path.display(),
-        lock.repo.display()
+        "zirv workflow research run \"{}\" --repo \"{}\" --dir \"{}\" --resume",
+        display_path(&lock.manifest_path),
+        display_path(&lock.repo),
+        display_path(campaign_dir)
     )?;
     writeln!(file, "```")?;
     Ok(())
@@ -671,10 +673,6 @@ fn write_candidates(
                     writeln!(file, "  - {reason}: {count}{}", plural(reason))?;
                 }
             }
-            writeln!(
-                file,
-                "  - tampered: 0 (evaluator drift stops the whole campaign immediately -- see [`R1`] -- it never marks individual observations)"
-            )?;
             for cohort in &row.cohorts {
                 writeln!(file, "- cohort `{}`:", cohort.cohort)?;
                 writeln!(
@@ -712,18 +710,18 @@ fn write_candidates(
                     interval(cohort.rel_wall.as_ref()),
                 )?;
             }
-            let retries_used = retries.get(&candidate.id).copied().unwrap_or(0);
-            writeln!(file, "- retries: {retries_used}")?;
-            if candidate
-                .strategy
-                .as_ref()
-                .is_some_and(|s| s.kind == "escalate")
-            {
-                writeln!(
-                    file,
-                    "- escalation frequency: not recorded (per-trial details are not persisted to the ledger)"
-                )?;
-            }
+        }
+        let retries_used = retries.get(&candidate.id).copied().unwrap_or(0);
+        writeln!(file, "- retries: {retries_used} (across all stages)")?;
+        if candidate
+            .strategy
+            .as_ref()
+            .is_some_and(|s| s.kind == "escalate")
+        {
+            writeln!(
+                file,
+                "- escalation frequency: not recorded (per-trial details are not persisted to the ledger)"
+            )?;
         }
         writeln!(file)?;
     }
@@ -786,7 +784,7 @@ fn write_report_md(
     write_coverage(&mut file, lock)?;
     let retries = retries_by_candidate(events);
     write_candidates(&mut file, summary, lock, &retries)?;
-    write_reproduction(&mut file, lock)?;
+    write_reproduction(&mut file, lock, path.parent().unwrap_or(Path::new(".")))?;
     Ok(())
 }
 
@@ -922,13 +920,9 @@ fn write_overlay(path: &Path, candidate: &Candidate) -> CtxResult<Vec<Vec<&'stat
     writeln!(file, "#")?;
     writeln!(
         file,
-        "# Merge these keys into ~/.zirv/ctx.toml (or the repo's committed"
+        "# Merge these keys into ~/.zirv/ctx.toml to adopt this candidate."
     )?;
-    writeln!(
-        file,
-        "# .zirv/ctx.toml) to adopt this candidate. Each source env var is"
-    )?;
-    writeln!(file, "# noted as a comment next to its key.")?;
+    writeln!(file, "# Each source env var is noted next to its key.")?;
     for env_key in candidate.env.keys() {
         if let Some(key_path) = crate::commands::ctx::config::toml_path_for_env(env_key) {
             writeln!(file, "# {env_key} -> {}", key_path.join("."))?;
