@@ -105,3 +105,111 @@ kind=judge/answer runs, which don't get this second judge. The hidden-test
 a replacement. `regrade.py --rejudge-quality <runs_root> [tasks...]`
 recomputes it for existing runs (re-reading each run's `repo/`/`result.txt`)
 without re-running any agent.
+
+## Autoresearch trial mode (`--trial`/`--out`, issues #800-#805)
+
+`run.py --trial <spec.json> --out <dir> [--cond <cond, default zirv-proxy>]`
+runs exactly the one `(task, rep)` the spec names -- reusing the SAME
+`do_one_run`/`do_one_chain_run` pipeline the grid above uses (proxy call,
+workflow start, judges, chain stepping), not a second implementation -- into
+`<dir>` instead of the grid's own `<bench_root>/runs/<task>__<cond>__r<rep>`
+naming. `--tasks/--conds/--reps/--model` and `--trial/--out` are mutually
+exclusive CLI modes; every grid invocation documented earlier in this file
+is unaffected by this addition.
+
+`spec.json`'s fields the trial reads: `task` (a task id from `corpus.toml`),
+`rep`, `route.model` (falls back to `"sonnet"` if absent), `env` (a
+candidate's overlay, merged LAST over the condition's own env --
+`merge_spec_env`, so an overlay key always wins, including a `null` value
+removing that variable), `timeout_secs`, `zirv_dir` (prepended to `PATH`,
+identical to `--zirv-dir`), `state_dir` (sets `ZIRV_CTX_STATE_DIR` on this
+process, inherited by every subprocess it launches, including judge calls),
+and `strategy` (only `{"kind": "escalate", "to_model": ...}` is implemented;
+absent means the plain single/chain path).
+
+**Escalate strategy** (issue #804, non-chain tasks only): attempt 1 runs on
+`route.model`; if it errors, OR the repo's VISIBLE test suite (`tests/`,
+never a hidden one) has any failure beyond the template's one known
+baseline (`test_rules.py::test_regex_rule_case_insensitive`), attempt 2
+reruns in the SAME repo (no fresh template copy) on `strategy.to_model`
+with a fixed continuation prompt naming what's still wrong. Both attempts
+are agent receipts; `result.json`'s (and the trial's) cost includes the
+full failed first attempt. `escalated`/`escalate_reason` (`"error"` or
+`"visible_regression"`) land in `result.json` when it fires.
+
+**Leakage fix** (issue #801): `tests_hidden/` is removed from the trial
+repo immediately after grading, for every kind -- previously a `tests`/
+`answer` task's own per-task `grade.py` copied hidden tests in to run them
+but left the directory behind for the rest of the run (a chain task's
+`grade_step_tests` already cleaned up between steps; single-shot tasks did
+not, until now).
+
+**Receipts** (`<out>/receipts.jsonl`, one JSON object per line, CONTRACT's
+`SpendReport` receipt shape): one `"agent"` receipt per agent invocation
+(one per chain step, one or two for an escalated trial), and one `"judge"`
+receipt per judge/quality-judge call, INCLUDING a retried call (a judge
+reply with no usable score is retried once; both attempts get a receipt so
+a retry's cost is never dropped -- previously not captured at all).
+`cumulative` is always `false`: a resumed chain step's raw `total_cost_usd`
+is the WHOLE session's cost so far (verified from this file's own
+pre-existing chain-stepping code -- `do_one_chain_run`'s comment: "`claude
+--resume` reports total_cost_usd for the whole session so far, so a step's
+own cost is the delta from the previous step"), and run.py already
+subtracts the previous step's total before a receipt is ever built, so the
+number reaching `receipts.jsonl` is already an increment, not a running
+total.
+
+**Spend**: `zirv workflow spend --state-dir <state_dir> --receipts
+<out>/receipts.jsonl --campaign <c> --trial <t> --json` is tried first (the
+one reconciler, folding in whatever intake/Jev/delegation spend the state
+dir's own records hold); if that command is missing or fails, a fallback
+`SpendReport` is built from `receipts.jsonl` alone, `completeness:
+"partial"`, and `execution.unknown_count >= 1` ALWAYS (this process only
+ever sees its own agent+judge calls, never intake/Jev spend, so "the full
+execution cost is known" is never a claim the fallback makes).
+
+**trial.json** score mapping: `tests` -> `(score, quality_score)`
+(`quality_score` already 0..1); `answer` -> `(score, null)`; `judge` ->
+`(judge_score / 10, null)` (`judge_score` is stored 0..10 in `result.json`,
+unlike `quality_score`); `chain` -> `(the mean-of-steps score already in
+result.json's "score", the one end-of-chain quality-judge score)` -- a
+chain's work-quality judge runs ONCE over the whole session, never per
+step, so there is no per-step quality figure to average.
+
+**`--check-graders [--tasks t1,t2,...]`** (issue #801, no provider call):
+for every task shipping a reference solution -- `reference.patch` for a
+non-chain `tests`-kind task (t16-t22 today; t02-t15 have none checked in),
+`reference/step_NN.patch` per `tests`-kind step of a chain task (t23, t24,
+t24b, t25) -- applies it to a pristine template copy and grades it (must
+score full marks), then grades an UNCHANGED pristine copy (must score below
+full). Prints a table and exits 1 on any failure; never weakens a grader to
+make this pass. `answer`/`judge`-kind tasks have no reference patch to
+check this way and are skipped, not failed.
+
+## Task corpus and splits (`corpus.toml`, issue #801)
+
+Every directory under `tasks/` appears exactly once in `corpus.toml`'s
+`[[task]]` list, with `family` (`"ledgerlite"` today -- reports flag
+`single_family` per the design spec's non-goals), `class` (`mechanical|
+bounded|bug|feature|architecture|ambiguous|sensitive|long_session`), `split`
+(`dev|validation|holdout`), and `kind` (mirrors each task's own `kind.txt`).
+Loaded/validated by `run.py`'s `load_corpus_toml`/`validate_corpus`
+(stdlib `tomllib`).
+
+Splits are assigned by TASK GROUP, not individually, so near-duplicates
+never straddle a split boundary: `t24_long_haul` and `t24b_long_haul` are
+byte-identical except for two step prompts (see `tasks/README.md`), so
+using one for iterative screening and the other as the "unseen" holdout
+would leak almost the whole task into candidate selection -- both sit in
+`holdout` together. `dev` (12 tasks: t01-t12) is the cheap, small-task
+screening set; `validation` (t13-t19, t23, t25) and `holdout` (t20-t22,
+t24, t24b) each cover several `class` values and at least one
+`long_session` chain task.
+
+The protected evaluator set a campaign hash-pins at start and re-verifies
+before every trial and before promotion (design spec #801) is, for this
+harness: `run.py`, `corpus.toml`, every task's `grade.py`/`hidden/`/
+`rubric*`/`reference*`, and `quality_rubric.md` -- a manifest's own
+`[evaluator].protected` list names these paths for the campaign runner;
+this file and `run.py`'s own leakage fix are what keep a live trial repo
+from ever holding a hidden test past its own grading.

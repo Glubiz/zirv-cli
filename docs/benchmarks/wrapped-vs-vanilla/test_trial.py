@@ -9,6 +9,7 @@ repo root. No test here calls a model provider, `claude`, `zirv ctx proxy`,
 or any other billed command -- every function under test is pure, or
 touches only a throwaway tempdir.
 """
+import json
 import shutil
 import subprocess
 import sys
@@ -455,6 +456,114 @@ class CheckGradersSyntheticTaskTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertFalse(ok)
         self.assertIn("expected full", rows[0]["note"])
+
+
+class FakeCompletedProc:
+    """Stands in for the `subprocess.Popen` object `launch()` normally
+    returns -- `wait_run` only ever calls `.wait(timeout=...)` and reads
+    `.pid` on a timeout path, both satisfied here without spawning
+    anything."""
+    pid = 999999
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class RunSingleTrialIntegrationTests(unittest.TestCase):
+    """Exercises `do_one_run` through the real `--trial` code path
+    (`run_dir_override`/`spec_env`, receipts_from_result, map_result_to_trial)
+    with ONLY `launch` (the one function that would otherwise spawn `claude`)
+    replaced by a fake that writes a canned `-p --output-format json` result
+    -- everything else (template copy, `git status`, the task's own
+    `grade.py`) runs for real, exactly as `--check-graders` already does.
+    Uses `t01_tiebreak` (kind=answer) and `cond="zirv"` specifically because
+    neither path calls a judge, so nothing here can reach a provider.
+    """
+
+    def setUp(self):
+        self._orig_launch = run_module.launch
+
+    def tearDown(self):
+        run_module.launch = self._orig_launch
+
+    def _fake_launch(self, cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path,
+                      env_extra=None, resume_session_id=None):
+        canned = {
+            "session_id": "sess-fake-1",
+            "total_cost_usd": 0.1234,
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+            "result": (
+                "The tie-break happens in rules.py's categorize function, decided by "
+                "priority: the earliest rule in list order wins."
+            ),
+            "is_error": False,
+            "duration_ms": 1000,
+            "duration_api_ms": 800,
+            "num_turns": 3,
+        }
+        Path(stdout_path).write_text(json.dumps(canned), encoding="utf-8")
+        Path(stderr_path).write_text("", encoding="utf-8")
+        self.last_env_extra = env_extra
+        return FakeCompletedProc(), ["fake", "argv"], None, None, None
+
+    def test_trial_mode_end_to_end_with_launch_faked(self):
+        run_module.launch = self._fake_launch
+        real_bench_root = Path(run_module.__file__).resolve().parent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # do_one_run refuses to copy a dirty `template/` (git status
+            # --porcelain) -- this checked-in `template/` has no `.git` of
+            # its own (see CONTRACT.md: the real deployment copies this
+            # whole directory tree out and `git init`s template/ there), so
+            # `git -C template status` would otherwise resolve to this
+            # OUTER repo's own (often dirty, mid-PR) status. Build a fake
+            # bench_root with its own freshly-committed template/ copy,
+            # exactly what an operator does before ever running run.py.
+            bench_root = Path(tmp) / "bench_root"
+            shutil.copytree(real_bench_root / "tasks" / "t01_tiebreak",
+                             bench_root / "tasks" / "t01_tiebreak")
+            shutil.copytree(real_bench_root / "template", bench_root / "template")
+            subprocess.run([run_module.GIT_EXE, "init", "-q"], cwd=str(bench_root / "template"), check=True)
+            subprocess.run([run_module.GIT_EXE, "config", "user.email", "t@example.com"],
+                            cwd=str(bench_root / "template"), check=True)
+            subprocess.run([run_module.GIT_EXE, "config", "user.name", "t"],
+                            cwd=str(bench_root / "template"), check=True)
+            subprocess.run([run_module.GIT_EXE, "add", "-A"], cwd=str(bench_root / "template"), check=True)
+            subprocess.run([run_module.GIT_EXE, "commit", "-q", "-m", "init"],
+                            cwd=str(bench_root / "template"), check=True)
+
+            out_dir = Path(tmp) / "trial-out"
+            spec_env = {"ZIRV_CTX_JEV_MEMORY": "true"}
+            result = run_module.do_one_run(
+                bench_root, "t01_tiebreak", "zirv", 1, "sonnet", 1200.0,
+                resume=False, k=1, total=1, run_dir_override=out_dir, spec_env=spec_env)
+
+            self.assertFalse(result["is_error"])
+            self.assertEqual(result["session_id"], "sess-fake-1")
+            self.assertEqual(result["agent_cost_usd"], 0.1234)
+            self.assertGreater(result["score"], 0.0)
+            # spec_env reached cond_env_for's merge (zirv cond always sets
+            # the headless levers too, so this just checks our key is IN
+            # there, not that it's the only one).
+            self.assertEqual(self.last_env_extra.get("ZIRV_CTX_JEV_MEMORY"), "true")
+            # run_dir_override was honoured: trial output landed at out_dir,
+            # not the grid's own runs/<task>__<cond>__r<rep> naming.
+            self.assertTrue((out_dir / "result.json").exists())
+            self.assertTrue((out_dir / "repo").is_dir())
+
+            receipts = run_module.receipts_from_result(result)
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["source"], "agent")
+            self.assertEqual(receipts[0]["reported_usd"], 0.1234)
+
+            spend = run_module.fallback_spend_report(receipts)
+            self.assertEqual(spend["completeness"], "partial")
+
+            trial = run_module.map_result_to_trial(
+                result, "answer", "trial-1", "ok", spend,
+                {"harness": "claude", "model": "sonnet"}, "0" * 16)
+            self.assertEqual(trial["correctness"], result["score"])
+            self.assertIsNone(trial["quality"])
 
 
 if __name__ == "__main__":
