@@ -1823,6 +1823,12 @@ zirv workflow stats                               # local bounded telemetry: per
 zirv workflow calibrate [--json] [--min-samples N] # read-only: outcome buckets and routing proposals (issue #757)
 zirv workflow spend --state-dir <dir> [--receipts <file.jsonl>] [--campaign <id>] [--candidate <id>] [--trial <id>] [--task <id>] [--json]
                                                     # read-only: reconciles delegations.jsonl/jev-decisions.jsonl/jev-effects.jsonl/proxy-decisions.jsonl into one SpendReport (issue #800)
+zirv workflow research plan <manifest> [--repo <path>] [--dir <path>] [--json]
+                                                    # validate + resolve a campaign manifest; zero backend/provider calls; exit 0 valid / 2 refused (issue #802)
+zirv workflow research run <manifest> [--repo <path>] [--dir <path>] [--resume] [--json]
+                                                    # baseline -> per-candidate screen -> validate -> one holdout confirmation, inside explicit budgets
+zirv workflow research status <id|dir> [--json]    # stage, trial counts, spend used vs caps for an in-progress or finished campaign
+zirv workflow research report <id|dir> [--json]    # regenerate report.md/report.json/results.tsv/proposal/* from the ledger alone
 ```
 
 ### Outcome calibration
@@ -1875,6 +1881,42 @@ unpriced usage is never reported as free. Filtering by `--campaign`/
 `--candidate`/`--trial`/`--task` means two campaigns sharing one state
 directory can never cross-attribute. Exits `0` even when the report is
 incomplete; a filter or missing price table is not an error.
+
+### Autoresearch campaigns (issue #802)
+
+`zirv workflow research plan|run|status|report` runs a bounded, resumable,
+budgeted search over small policy changes (Jev gate floors, model/effort
+routing, context/compaction/handoff knobs, or an operator-declared,
+path-scoped source patch) against a baseline, and reports accept / reject /
+inconclusive / tradeoff / unmeasured with evidence -- see
+[`docs/benchmarks/autoresearch/README.md`](docs/benchmarks/autoresearch/README.md)
+for the full manifest reference, worked examples, and the design this
+implements.
+
+- **Manifest**: a TOML file (`schema = 1`, `deny_unknown_fields` throughout)
+  the operator points `plan`/`run` at -- anywhere on disk, most naturally
+  under `docs/benchmarks/<project>/campaigns/`. It names a baseline commit,
+  a protected evaluator set, a corpus split, a backend (a real `command` or
+  a scripted `fixture`), route, `[budgets]`, per-stage repetitions, the
+  promotion `[criteria]`, and a `[candidate_space]` bounding what a
+  `[[candidates]]` entry may actually vary.
+- **Campaign directory**: `<ctx state dir>/research/<id>/` by default (or
+  `--dir`) -- an immutable `lock.json` (resolved manifest + hash, baseline
+  sha, evaluator file hashes, zirv version) written once, an append-only
+  `ledger.jsonl` (every dispatch, finish, retry, stage decision, and stop
+  reason), and per-trial `spec.json`/`trial.json` under `trials/`.
+- **Budgets**: `max_spend_usd`, `max_wall_secs`, `max_calls`, `max_trials`,
+  `max_retries`, `concurrency` are hard caps -- each trial's declared cost
+  ceiling is reserved before it is dispatched (so in-flight work always
+  counts against the cap), and scheduling stops the instant a reservation
+  would exceed one, letting in-flight trials finish. `--resume` replays the
+  ledger and never re-dispatches an already-finished trial.
+- **Nothing is applied automatically.** A finished campaign writes
+  `report.md`, `report.json`, `results.tsv`, and (for the single simplest
+  accepted candidate) `proposal/overlay.toml` or `proposal/candidate.patch`
+  plus `proposal/ROLLBACK.md` -- reviewable evidence and a proposal, never
+  merged, applied, pushed, or turned into a pull request by the runner
+  itself; that stays an explicit, separate, operator-taken action.
 
 ### Workflow definitions v2 (issue #542)
 
@@ -4470,6 +4512,7 @@ keep only your own.
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
+| Autoresearch campaign manifest (`zirv workflow research plan\|run`) and every file it references (corpus, fixture, evaluator, candidate patch) | operator input, like a script | a `[[candidates]]` env overlay may only use a key that is in BOTH the manifest's own `[candidate_space] allow_env` AND a compiled-in allowlist (non-safety Jev gates/floors, `ZIRV_CTX_PROXY_MIN_CONFIDENCE`/`MIN_MARGIN`, the handover ladder, `[headless]` effort, `[score]` token ratios); anything permission/sandbox/safety/credential/base_url-shaped, and the fixed Jev safety gates (approve/approve_allow/inject_screen/stop_verify/missing_tests/review/gates/admin_dispatch), are always refused regardless of what the manifest declares; repo-owned `.zirv/` files cannot widen either list, and a `requires_receipts` entry outside the compiled prefixes is refused at `plan` time |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
 (root, `.zirv/` fallback, or nested), `AGENTS.md`, `CLAUDE.md`, and the
