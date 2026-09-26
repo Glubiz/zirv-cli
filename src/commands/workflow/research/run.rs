@@ -1056,11 +1056,12 @@ fn build_candidate_runtimes(
     manifest_dir: &Path,
     baseline_sha: &str,
     manifest: &Manifest,
+    candidates: &[Candidate],
     protected: &[PathBuf],
 ) -> CtxResult<BTreeMap<String, CandidateRuntime>> {
     let mut map = BTreeMap::new();
     map.insert("baseline".to_string(), CandidateRuntime::default());
-    for candidate in &manifest.candidates {
+    for candidate in candidates {
         let runtime = if candidate.patch.is_some() {
             let source_patch = manifest
                 .candidate_space
@@ -1258,12 +1259,11 @@ fn cleanup_worktrees(repo: &Path, campaign_dir: &Path) {
 }
 
 fn candidate_complexity(
-    manifest: &Manifest,
+    all_candidates: &[Candidate],
     candidates: &BTreeMap<String, CandidateRuntime>,
     candidate_id: &str,
 ) -> usize {
-    let env_len = manifest
-        .candidates
+    let env_len = all_candidates
         .iter()
         .find(|c| c.id == candidate_id)
         .map(|c| c.env.len())
@@ -1273,6 +1273,248 @@ fn candidate_complexity(
         .map(|r| r.patch_lines)
         .unwrap_or(0);
     env_len + patch_lines
+}
+
+#[derive(Debug, Deserialize)]
+struct ProposedCandidateJson {
+    id: String,
+    hypothesis: String,
+    #[serde(default)]
+    mechanism: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+fn candidate_space_schema_text(manifest: &Manifest) -> String {
+    let keys: Vec<String> = manifest
+        .candidate_space
+        .allow_env
+        .iter()
+        .map(|key| match guard::classify_env_key(key) {
+            Ok(kind) => format!("{key} ({kind:?})"),
+            Err(_) => format!("{key} (refused)"),
+        })
+        .collect();
+    format!(
+        "allowed env keys: [{}]\nallowed models: {:?}",
+        keys.join(", "),
+        manifest.candidate_space.allowed_models
+    )
+}
+
+/// Dev-split baseline aggregate metrics only -- no per-task breakdown, so
+/// this alone cannot leak which specific dev task drove a number.
+fn dev_aggregate_summary(records: &[TrialRecord]) -> String {
+    let n = records.len();
+    if n == 0 {
+        return "no dev-split baseline trials yet".to_string();
+    }
+    let ok = records
+        .iter()
+        .filter(|r| r.status == backend::TrialStatus::Ok)
+        .count();
+    let correctness_vals: Vec<f64> = records.iter().filter_map(|r| r.correctness).collect();
+    let correctness_mean = if correctness_vals.is_empty() {
+        0.0
+    } else {
+        correctness_vals.iter().sum::<f64>() / correctness_vals.len() as f64
+    };
+    let cost_vals: Vec<f64> = records.iter().filter_map(|r| r.cost_usd).collect();
+    let cost_mean = if cost_vals.is_empty() {
+        0.0
+    } else {
+        cost_vals.iter().sum::<f64>() / cost_vals.len() as f64
+    };
+    let wall_mean = records.iter().map(|r| r.wall_ms).sum::<u64>() as f64 / n as f64;
+    format!(
+        "n={n} success_rate={:.3} correctness_mean={correctness_mean:.3} cost_mean_usd={cost_mean:.4} wall_mean_ms={wall_mean:.0}",
+        ok as f64 / n as f64
+    )
+}
+
+/// The proposer's ENTIRE prompt: the candidate-space schema and dev-split
+/// aggregate metrics only -- deliberately never a per-task result, a
+/// validation/holdout task id, or any other campaign detail, so a proposer
+/// round can never see the evidence its own proposal will later be judged
+/// against.
+fn proposer_prompt(manifest: &Manifest, dev_summary: &str) -> String {
+    format!(
+        "Propose ONE bounded environment-overlay candidate for campaign '{}'.\n\n\
+         Candidate space:\n{}\n\n\
+         Dev-split baseline aggregate metrics (no per-task detail):\n{}\n\n\
+         Respond with exactly one JSON object on its own line, as the LAST line of output:\n\
+         {{\"id\": \"...\", \"hypothesis\": \"...\", \"mechanism\": \"...\", \"env\": {{...}}}}\n\
+         A proposal may not set a \"patch\" field or any key outside the candidate space above.",
+        manifest.id,
+        candidate_space_schema_text(manifest),
+        dev_summary,
+    )
+}
+
+/// The production spawn argv: `current_exe agent <harness> "<prompt>" --
+/// --model <model>` (unchanged from the design). Tests substitute an
+/// entirely different argv (e.g. a stub `python -c "print(...)"`) directly
+/// into `spawn_and_validate_proposal` instead of calling this.
+fn production_proposer_argv(harness: &str, model: &str, prompt: &str) -> Vec<String> {
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "zirv".to_string());
+    vec![
+        exe,
+        "agent".to_string(),
+        harness.to_string(),
+        prompt.to_string(),
+        "--".to_string(),
+        "--model".to_string(),
+        model.to_string(),
+    ]
+}
+
+/// The last valid single-line JSON object among `stdout`'s trailing lines
+/// (checked over at most the last 50 lines, most recent first) -- a
+/// well-behaved proposer prints its answer as the final line of output.
+fn parse_last_json_object(stdout: &str) -> Option<serde_json::Value> {
+    stdout
+        .lines()
+        .rev()
+        .take(50)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+}
+
+/// Spawns `argv` (production: [`production_proposer_argv`]; tests
+/// substitute their own stub command) with `cwd`/`extra_env`, and validates
+/// the parsed candidate exactly like a declared one: its env must be in
+/// both `allow_env` and the compiled allowlist, and it may not carry a
+/// `patch` (source-patch candidates are only ever operator-declared).
+/// `Ok(None)` when the process ran but printed nothing parseable as a
+/// candidate -- a proposer round proposing nothing is a normal outcome, not
+/// an error.
+fn spawn_and_validate_proposal(
+    argv: &[String],
+    cwd: &Path,
+    extra_env: &[(String, String)],
+    manifest: &Manifest,
+) -> Result<Option<Candidate>, String> {
+    let [program, args @ ..] = argv else {
+        return Err("proposer argv is empty".to_string());
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    command.current_dir(cwd);
+    command.stdin(std::process::Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("could not run the proposer command: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(value) = parse_last_json_object(&stdout) else {
+        return Ok(None);
+    };
+    let proposed: ProposedCandidateJson = serde_json::from_value(value)
+        .map_err(|err| format!("proposer output did not parse as a candidate: {err}"))?;
+    if proposed.patch.is_some() {
+        return Err("a proposed candidate may not carry a patch".to_string());
+    }
+    guard::validate_candidate_env(
+        &proposed.env,
+        &manifest.candidate_space.allow_env,
+        &manifest.candidate_space.allowed_models,
+    )?;
+    Ok(Some(Candidate {
+        id: proposed.id,
+        hypothesis: proposed.hypothesis,
+        mechanism: proposed.mechanism,
+        env: proposed.env,
+        patch: None,
+        requires_receipts: Vec::new(),
+        strategy: None,
+    }))
+}
+
+/// One full proposer round: builds the prompt and production argv, gives
+/// the proposer its own empty cwd and its own `<campaign>/proposer/<round>/
+/// state` state dir (attributed `candidate = "proposer"`, so its own spend
+/// counts as overhead, never a candidate's execution cost), then validates
+/// whatever it proposed.
+fn run_proposer_round(
+    campaign_dir: &Path,
+    manifest: &Manifest,
+    proposer_cfg: &manifest::Proposer,
+    dev_summary: &str,
+    round: u32,
+) -> Result<Option<Candidate>, String> {
+    let prompt = proposer_prompt(manifest, dev_summary);
+    let argv = production_proposer_argv(&proposer_cfg.harness, &proposer_cfg.model, &prompt);
+    let round_dir = campaign_dir.join("proposer").join(round.to_string());
+    let cwd = round_dir.join("cwd");
+    let state_dir = round_dir.join("state");
+    create_private_dir_all(&cwd)
+        .map_err(|err| format!("could not create the proposer's own cwd: {err}"))?;
+    let extra_env = vec![
+        (
+            "ZIRV_CTX_STATE_DIR".to_string(),
+            state_dir.to_string_lossy().to_string(),
+        ),
+        ("ZIRV_ATTR_CAMPAIGN".to_string(), manifest.id.clone()),
+        ("ZIRV_ATTR_CANDIDATE".to_string(), "proposer".to_string()),
+    ];
+    spawn_and_validate_proposal(&argv, &cwd, &extra_env, manifest)
+}
+
+/// Folds one proposer round's outcome into the campaign's live candidate
+/// set: a validated proposal is appended to `all_candidates` and given a
+/// `CandidateRuntime` in `candidates_map` -- from this point on it is
+/// "scheduled" exactly like a declared candidate, screened and (if it
+/// survives) validated in the very next loop -- plus a `candidate_proposed`
+/// ledger event. `Ok(None)` (nothing parseable) is silently a no-op, same as
+/// a declared candidate list simply not growing; a validation failure is
+/// recorded as `candidate_rejected` under a synthetic `proposal-<round>` id
+/// rather than aborting the campaign over one bad proposal.
+fn apply_proposal_outcome(
+    outcome: Result<Option<Candidate>, String>,
+    round: u32,
+    ledger: &mut Ledger,
+    candidates_map: &mut BTreeMap<String, CandidateRuntime>,
+    all_candidates: &mut Vec<Candidate>,
+) -> CtxResult<()> {
+    match outcome {
+        Ok(Some(candidate)) => {
+            let seq = ledger.next_seq();
+            ledger.append(&LedgerEvent::CandidateProposed {
+                seq,
+                ts: now_secs(),
+                candidate: candidate.id.clone(),
+                hypothesis: candidate.hypothesis.clone(),
+            })?;
+            candidates_map.insert(
+                candidate.id.clone(),
+                CandidateRuntime {
+                    env: candidate.env.clone(),
+                    zirv_dir: None,
+                    strategy: candidate.strategy.as_ref().map(strategy_json),
+                    patch_lines: 0,
+                },
+            );
+            all_candidates.push(candidate);
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            let seq = ledger.next_seq();
+            ledger.append(&LedgerEvent::CandidateRejected {
+                seq,
+                ts: now_secs(),
+                candidate: format!("proposal-{round}"),
+                reason,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn holdout_uses_path(state_dir: &StateDir) -> PathBuf {
@@ -1406,12 +1648,13 @@ pub fn execute(
     ensure_no_drift(&repo, &lock, &mut research_ledger)?;
 
     let protected = resolve_protected_paths(&repo, &manifest)?;
-    let candidates_map = build_candidate_runtimes(
+    let mut candidates_map = build_candidate_runtimes(
         &repo,
         &campaign_dir,
         &manifest_dir,
         &lock.baseline_sha,
         &manifest,
+        &manifest.candidates,
         &protected,
     )?;
 
@@ -1454,6 +1697,28 @@ pub fn execute(
         stop_reason = dispatch_batch(&mut state, &candidates_map, baseline_screen)?;
     }
 
+    let mut all_candidates = manifest.candidates.clone();
+    if stop_reason.is_none()
+        && !resume
+        && let Some(proposer_cfg) = &manifest.proposer
+    {
+        let events_now = ledger::replay(&Ledger::path(&campaign_dir))?;
+        let baseline_screen_records =
+            stage_records_from_ledger(&events_now, Stage::Screen, "baseline");
+        let dev_summary = dev_aggregate_summary(&baseline_screen_records);
+        for round in 0..proposer_cfg.max_proposals {
+            let outcome =
+                run_proposer_round(&campaign_dir, &manifest, proposer_cfg, &dev_summary, round);
+            apply_proposal_outcome(
+                outcome,
+                round,
+                &mut state.ledger,
+                &mut candidates_map,
+                &mut all_candidates,
+            )?;
+        }
+    }
+
     let mut survivors: Vec<String> = Vec::new();
     if stop_reason.is_none() {
         let events_now = ledger::replay(&Ledger::path(&campaign_dir))?;
@@ -1462,7 +1727,7 @@ pub fn execute(
         let seed = seed_for(&manifest.id, "baseline", "screen");
         let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
 
-        for candidate in &manifest.candidates {
+        for candidate in &all_candidates {
             if stop_reason.is_some() {
                 break;
             }
@@ -1543,11 +1808,10 @@ pub fn execute(
                 if stop_reason.is_some() {
                     break;
                 }
-                let candidate = manifest
-                    .candidates
+                let candidate = all_candidates
                     .iter()
                     .find(|c| &c.id == candidate_id)
-                    .expect("a survivor always came from manifest.candidates");
+                    .expect("a survivor always came from all_candidates");
                 let pending = trials_for(
                     candidate_id,
                     Arm::Candidate,
@@ -1593,7 +1857,7 @@ pub fn execute(
         .map(|(id, d)| {
             (
                 id.as_str(),
-                candidate_complexity(&manifest, &candidates_map, id),
+                candidate_complexity(&all_candidates, &candidates_map, id),
                 d,
             )
         })
@@ -1650,11 +1914,10 @@ pub fn execute(
                         uses: 0,
                     })?;
 
-                    let candidate = manifest
-                        .candidates
+                    let candidate = all_candidates
                         .iter()
                         .find(|c| &c.id == winner_id)
-                        .expect("winner came from manifest.candidates");
+                        .expect("winner came from all_candidates");
                     let events_now = ledger::replay(&Ledger::path(&campaign_dir))?;
                     let baseline_holdout_records =
                         stage_records_from_ledger(&events_now, Stage::Holdout, "baseline");
@@ -2549,5 +2812,225 @@ crash_first = 5
             1,
             "stratify = none must keep a single cohort: {plain_cohorts:?}"
         );
+    }
+
+    // -- proposer -------------------------------------------------------
+
+    fn manifest_with_candidate_space(allow_env: &[&str], allowed_models: &[&str]) -> Manifest {
+        let text = format!(
+            r#"
+schema = 1
+id = "proposer-demo"
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "subscription"
+
+[baseline]
+commit = "HEAD"
+
+[corpus]
+file = "corpus.toml"
+
+[backend]
+kind = "fixture"
+file = "fixture.toml"
+per_trial_ceiling_usd = 1.0
+calls_per_trial = 1
+timeout_secs = 30
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 10.0
+max_wall_secs = 600
+max_calls = 10
+max_trials = 10
+max_retries = 0
+concurrency = 1
+
+[stages.screen]
+split = "dev"
+reps = 1
+
+[stages.validate]
+split = "validation"
+reps = 1
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[candidate_space]
+allow_env = {allow_env:?}
+allowed_models = {allowed_models:?}
+"#
+        );
+        Manifest::parse(&text).unwrap()
+    }
+
+    fn python_stub_argv(json_body: &str) -> Vec<String> {
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            format!("print('{json_body}')"),
+        ]
+    }
+
+    #[test]
+    fn spawn_and_validate_proposal_accepts_a_valid_stub_proposal() {
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
+        let dir = tempfile::tempdir().unwrap();
+        let argv = python_stub_argv(
+            r#"{"id": "cand-x", "hypothesis": "h", "mechanism": "m", "env": {"ZIRV_CTX_JEV_MEMORY": "true"}}"#,
+        );
+        let candidate = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
+            .expect("a valid proposal must not error")
+            .expect("a valid proposal must be returned");
+        assert_eq!(candidate.id, "cand-x");
+        assert_eq!(
+            candidate.env.get("ZIRV_CTX_JEV_MEMORY").map(String::as_str),
+            Some("true")
+        );
+        assert!(candidate.patch.is_none());
+    }
+
+    #[test]
+    fn spawn_and_validate_proposal_rejects_a_fixed_safety_key() {
+        // Declared in allow_env deliberately, so this exercises the compiled
+        // fixed-safety refusal specifically, not the allow_env membership
+        // check.
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_APPROVE"], &["sonnet"]);
+        let dir = tempfile::tempdir().unwrap();
+        let argv = python_stub_argv(
+            r#"{"id": "cand-x", "hypothesis": "h", "env": {"ZIRV_CTX_JEV_APPROVE": "false"}}"#,
+        );
+        let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
+            .expect_err("a fixed safety gate must be refused");
+        assert!(err.contains("fixed safety"), "got: {err}");
+    }
+
+    #[test]
+    fn spawn_and_validate_proposal_rejects_a_patch_field() {
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
+        let dir = tempfile::tempdir().unwrap();
+        let argv = python_stub_argv(
+            r#"{"id": "cand-x", "hypothesis": "h", "env": {}, "patch": "x.patch"}"#,
+        );
+        let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
+            .expect_err("a patch field must be refused");
+        assert!(err.contains("patch"), "got: {err}");
+    }
+
+    #[test]
+    fn proposer_prompt_never_contains_validation_or_holdout_task_ids() {
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
+        let corpus = Corpus::parse(
+            r#"
+schema = 1
+version = "1"
+
+[[task]]
+id = "dev-task-visible"
+family = "f"
+class = "bounded"
+split = "dev"
+
+[[task]]
+id = "validation-task-secret"
+family = "f"
+class = "bounded"
+split = "validation"
+
+[[task]]
+id = "holdout-task-secret"
+family = "f"
+class = "bounded"
+split = "holdout"
+"#,
+        )
+        .unwrap();
+        let dev_records = vec![TrialRecord {
+            task: "dev-task-visible".to_string(),
+            rep: 0,
+            arm: Arm::Baseline,
+            status: backend::TrialStatus::Ok,
+            correctness: Some(1.0),
+            quality: Some(1.0),
+            cost_usd: Some(1.0),
+            cost_complete: true,
+            wall_ms: 10,
+            env_fingerprint: None,
+            receipts: BTreeMap::new(),
+        }];
+        let summary = dev_aggregate_summary(&dev_records);
+        let prompt = proposer_prompt(&manifest, &summary);
+
+        for task in &corpus.tasks {
+            if task.split != Split::Dev {
+                assert!(
+                    !prompt.contains(&task.id),
+                    "prompt must never mention the {:?}-split task '{}'",
+                    task.split,
+                    task.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_proposal_outcome_schedules_a_valid_proposal_and_records_a_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::open(dir.path()).unwrap();
+        let mut candidates_map: BTreeMap<String, CandidateRuntime> = BTreeMap::new();
+        let mut all_candidates: Vec<Candidate> = Vec::new();
+
+        let candidate = Candidate {
+            id: "cand-x".to_string(),
+            hypothesis: "h".to_string(),
+            mechanism: None,
+            env: BTreeMap::new(),
+            patch: None,
+            requires_receipts: Vec::new(),
+            strategy: None,
+        };
+        apply_proposal_outcome(
+            Ok(Some(candidate.clone())),
+            0,
+            &mut ledger,
+            &mut candidates_map,
+            &mut all_candidates,
+        )
+        .unwrap();
+        assert!(
+            candidates_map.contains_key("cand-x"),
+            "must be scheduled with a runtime"
+        );
+        assert!(
+            all_candidates.iter().any(|c| c.id == "cand-x"),
+            "must be scheduled into the candidate list"
+        );
+
+        apply_proposal_outcome(
+            Err("a forbidden key".to_string()),
+            1,
+            &mut ledger,
+            &mut candidates_map,
+            &mut all_candidates,
+        )
+        .unwrap();
+
+        let events = ledger::replay(&Ledger::path(dir.path())).unwrap();
+        assert!(events.iter().any(
+            |e| matches!(e, LedgerEvent::CandidateProposed { candidate, .. } if candidate == "cand-x")
+        ));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LedgerEvent::CandidateRejected { candidate, reason, .. }
+                if candidate == "proposal-1" && reason == "a forbidden key"
+        )));
     }
 }
