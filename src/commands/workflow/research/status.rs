@@ -184,8 +184,12 @@ max_uses = 1
         let dir = tempfile::tempdir().unwrap();
         let lock = super::super::ledger::Lock {
             manifest: minimal_manifest(),
+            manifest_path: "manifest.toml".into(),
+            repo: "repo".into(),
             manifest_sha256: "x".into(),
             baseline_sha: "y".into(),
+            corpus_version: "1".into(),
+            corpus_families: vec!["f".into()],
             evaluator_version: None,
             evaluator_files: Default::default(),
             evaluator_fingerprint: "fp".into(),

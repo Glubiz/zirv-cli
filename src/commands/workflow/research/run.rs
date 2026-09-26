@@ -25,7 +25,7 @@ use super::corpus::Corpus;
 use super::guard;
 use super::ledger::{self, Ledger, LedgerEvent, Lock, manifest_sha256};
 use super::manifest::{self, Candidate, Manifest, SourcePatch, Split};
-use super::promote::{self, Decision, ScreenVerdict, Verdict};
+use super::promote::{self, Decision, Observation, ScreenVerdict, Verdict};
 use super::proposer::{apply_proposal_outcome, dev_aggregate_summary, run_proposer_round};
 use super::reconcile::{
     ensure_no_drift, load_or_create_lock, reconcile_unfinished, reconstruct_tracker,
@@ -382,6 +382,31 @@ fn candidate_complexity(
     env_len + patch_lines
 }
 
+/// A validate/holdout `StageDecision`'s persisted `detail`: the `Decision`
+/// itself (verdict/reasons/cohorts/confidence), plus two things it does not
+/// carry on its own -- the per-reason exclusion breakdown (`Decision`'s own
+/// `CohortDecision.excluded` is only ever a total count) and the bootstrap
+/// seed actually used, so `report::generate` (which works purely from the
+/// ledger, never re-deriving `obs` from the corpus) can show both without
+/// guessing. `Decision` has no `#[serde(deny_unknown_fields)]`, so merging
+/// extra keys alongside its own here does not break deserializing this same
+/// value back into a `Decision`.
+fn decision_detail(
+    decision: &Decision,
+    obs: &[Observation],
+    seed: u64,
+) -> CtxResult<serde_json::Value> {
+    let mut detail = serde_json::to_value(decision)?;
+    if let serde_json::Value::Object(map) = &mut detail {
+        map.insert(
+            "excluded_by_reason".to_string(),
+            serde_json::to_value(promote::excluded_by_reason(obs))?,
+        );
+        map.insert("seed".to_string(), serde_json::json!(seed));
+    }
+    Ok(detail)
+}
+
 fn holdout_uses_path(state_dir: &StateDir) -> PathBuf {
     state_dir.root().join(HOLDOUT_USES_FILE)
 }
@@ -494,7 +519,7 @@ pub fn execute(
         ));
     }
 
-    let lock = load_or_create_lock(&repo, &manifest, &campaign_dir, &sha, resume)?;
+    let lock = load_or_create_lock(&repo, &manifest, manifest_path, &campaign_dir, &sha, resume)?;
 
     let (mut research_ledger, mut events) = Ledger::open(&campaign_dir)?;
     let tracker = reconstruct_tracker(lock.started_at, &events);
@@ -663,6 +688,8 @@ pub fn execute(
                 &candidate.requires_receipts,
             );
             let verdict = promote::screen(&obs, &manifest.criteria);
+            let points = promote::screen_points(&obs);
+            let excluded = promote::excluded_by_reason(&obs);
             let (verdict_str, reason) = match &verdict {
                 ScreenVerdict::Survive => ("survive".to_string(), None),
                 ScreenVerdict::Discard { reason } => ("discard".to_string(), Some(reason.clone())),
@@ -674,7 +701,11 @@ pub fn execute(
                 candidate: candidate.id.clone(),
                 stage: "screen".to_string(),
                 verdict: verdict_str,
-                detail: serde_json::json!({ "reason": reason }),
+                detail: serde_json::json!({
+                    "reason": reason,
+                    "points": points,
+                    "excluded_by_reason": excluded,
+                }),
             })?;
             match verdict {
                 ScreenVerdict::Survive => survivors.push(candidate.id.clone()),
@@ -759,7 +790,7 @@ pub fn execute(
                     candidate: candidate_id.clone(),
                     stage: "validate".to_string(),
                     verdict: format!("{:?}", decision.verdict).to_lowercase(),
-                    detail: serde_json::to_value(&decision)?,
+                    detail: decision_detail(&decision, &obs, seed)?,
                 })?;
                 decisions.push((candidate_id.clone(), decision));
                 ensure_no_drift(&repo, &lock, &mut state.ledger)?;
@@ -872,7 +903,7 @@ pub fn execute(
                         candidate: winner_id.clone(),
                         stage: "holdout".to_string(),
                         verdict: format!("{:?}", decision.verdict).to_lowercase(),
-                        detail: serde_json::to_value(&decision)?,
+                        detail: decision_detail(&decision, &obs, seed)?,
                     })?;
                     final_verdict = decision.verdict;
                     if decision.verdict == Verdict::Accept {
@@ -1749,8 +1780,15 @@ crash_first = 5
 
         let campaign_dir = tempfile::tempdir().unwrap();
         let sha = manifest_sha256(&manifest_text);
-        let lock =
-            load_or_create_lock(repo.path(), &manifest, campaign_dir.path(), &sha, false).unwrap();
+        let lock = load_or_create_lock(
+            repo.path(),
+            &manifest,
+            &manifest_path,
+            campaign_dir.path(),
+            &sha,
+            false,
+        )
+        .unwrap();
 
         // Tamper with the protected corpus file AFTER the lock hashed it --
         // simulating drift that happened between two stage-boundary checks,
@@ -1952,6 +1990,153 @@ crash_first = 5
         assert!(
             report_md.contains("completeness:"),
             "report.md must state data completeness"
+        );
+
+        // Report-completeness round: results.tsv must never leave
+        // rel_cost/rel_wall/d_correctness blank -- a number (from the
+        // Decision's own intervals at validate/holdout, or screen's point
+        // estimates) or an explicit "-", never an empty cell.
+        let results_tsv = std::fs::read_to_string(dir.join("results.tsv")).unwrap();
+        let mut data_lines = results_tsv.lines();
+        let header = data_lines.next().unwrap();
+        assert_eq!(
+            header,
+            "candidate\tstage\tverdict\trel_cost\trel_wall\td_correctness\thypothesis"
+        );
+        let mut saw_a_row = false;
+        for line in data_lines {
+            if line.is_empty() {
+                continue;
+            }
+            saw_a_row = true;
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields.len(), 7, "row must have all 7 columns: {line}");
+            for (name, value) in ["rel_cost", "rel_wall", "d_correctness"]
+                .iter()
+                .zip(&fields[3..6])
+            {
+                assert!(
+                    !value.is_empty(),
+                    "{name} must never be blank (use '-' when unusable): {line}"
+                );
+            }
+        }
+        assert!(saw_a_row, "results.tsv must have at least one data row");
+
+        // report.md: verdict reasons, per-cohort arm summaries and delta
+        // CIs with the confidence used, exclusions, retries, budgets vs
+        // used, promotion criteria + seed, extended provenance, coverage,
+        // and a concrete reproduction command.
+        assert!(
+            report_md.contains("- reasons:"),
+            "report.md must print each stage decision's own verdict reasons"
+        );
+        assert!(
+            report_md.contains("cost_per_success_usd=") && report_md.contains("wall_median_ms="),
+            "report.md must print per-cohort arm summaries"
+        );
+        assert!(
+            report_md.contains("(point [lo, hi])"),
+            "report.md must print delta CIs as point [lo, hi]"
+        );
+        assert!(
+            report_md.contains("confidence used:"),
+            "report.md must state the confidence level used per decision"
+        );
+        assert!(
+            report_md.contains("- exclusions:") || report_md.contains("exclusions: none"),
+            "report.md must report exclusions per candidate/stage"
+        );
+        assert!(
+            report_md.contains("untriggered"),
+            "untriggered-gate's exclusions must be visible in the report"
+        );
+        assert!(
+            report_md.contains("- retries:"),
+            "report.md must report retries (cheaper-equal's scripted crash) per candidate"
+        );
+        assert!(
+            report_md.contains("## Budgets")
+                && report_md.contains("| spend (total) |")
+                && report_md.contains("| trials |"),
+            "report.md must have a budgets-vs-used table"
+        );
+        assert!(
+            report_md.contains("## Promotion criteria") && report_md.contains("min_pairs"),
+            "report.md must list the manifest's own criteria values"
+        );
+        assert!(
+            report_md.contains("bootstrap seed:"),
+            "report.md must report the bootstrap seed used per decision"
+        );
+        assert!(
+            report_md.contains("manifest:") && report_md.contains("fixture-demo.toml"),
+            "report.md provenance must name the manifest path"
+        );
+        assert!(
+            report_md.contains("manifest sha256:"),
+            "report.md provenance must include the manifest sha256"
+        );
+        assert!(
+            report_md.contains("corpus:") && report_md.contains("corpus version:"),
+            "report.md provenance must name the corpus file and version"
+        );
+        assert!(
+            report_md.contains("billing:") && report_md.contains("route:"),
+            "report.md provenance must include billing posture and route"
+        );
+        assert!(
+            report_md.contains("cache mode:")
+                && report_md.contains("pressure:")
+                && report_md.contains("stratify:"),
+            "report.md provenance must include cache mode, pressure and stratify"
+        );
+        assert!(
+            report_md.contains("UTC"),
+            "report.md provenance must include human-readable UTC timestamps"
+        );
+        assert!(
+            report_md.contains("single project family: `ledgerlite`"),
+            "report.md coverage must note the corpus's single project family"
+        );
+        assert!(
+            !report_md.contains("no paid campaign evidence"),
+            "report.md must never carry that internal process phrase as a product statement"
+        );
+        assert!(
+            report_md.contains("zirv workflow research run")
+                && report_md.contains("--repo")
+                && report_md.contains("--resume")
+                && report_md.contains("fixture-demo.toml"),
+            "report.md reproduction must give the exact manifest path, --repo and --resume"
+        );
+        let lock = Lock::read(dir).unwrap();
+        let baseline_checkout_line = format!("checkout {}", lock.baseline_sha);
+        assert!(
+            report_md.contains(&baseline_checkout_line),
+            "report.md reproduction must name the exact baseline commit to check out: {report_md}"
+        );
+
+        // overlay.toml: cheaper-equal's env ZIRV_CTX_JEV_MEMORY=true must
+        // render as the REAL ctx.toml key, not just an env-var comment.
+        let overlay = std::fs::read_to_string(dir.join("proposal/overlay.toml")).unwrap();
+        assert!(
+            overlay.contains("[jev]") && overlay.contains("memory = true"),
+            "overlay.toml must render the real ctx.toml key: {overlay}"
+        );
+        assert!(
+            overlay.contains("ZIRV_CTX_JEV_MEMORY"),
+            "overlay.toml must still note the source env var: {overlay}"
+        );
+
+        let rollback = std::fs::read_to_string(dir.join("proposal/ROLLBACK.md")).unwrap();
+        assert!(
+            rollback.contains("jev.memory"),
+            "ROLLBACK.md must name the exact key to remove: {rollback}"
+        );
+        assert!(
+            rollback.contains("report.json") && rollback.contains("ledger.jsonl"),
+            "ROLLBACK.md must name the evidence files to keep: {rollback}"
         );
     }
 

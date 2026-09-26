@@ -9,6 +9,7 @@ use std::process::Command;
 
 use super::backend::TrialResult;
 use super::budget::Tracker;
+use super::corpus::Corpus;
 use super::guard;
 use super::ledger::{self, Ledger, LedgerEvent, Lock};
 use super::manifest::{self, Manifest, Split};
@@ -99,6 +100,7 @@ pub(crate) fn ensure_no_drift(repo: &Path, lock: &Lock, ledger: &mut Ledger) -> 
 pub(crate) fn load_or_create_lock(
     repo: &Path,
     manifest: &Manifest,
+    manifest_path: &Path,
     campaign_dir: &Path,
     sha: &str,
     resume: bool,
@@ -126,10 +128,20 @@ pub(crate) fn load_or_create_lock(
         run_self_check(repo, manifest)?;
         let protected = resolve_protected_paths(repo, manifest)?;
         let (hashes, fingerprint) = guard::hash_protected_files(repo, &protected)?;
+        let corpus = Corpus::load(&repo.join(&manifest.corpus.file))?;
+        let corpus_version = corpus.version;
+        let mut corpus_families: Vec<String> =
+            corpus.tasks.iter().map(|t| t.family.clone()).collect();
+        corpus_families.sort();
+        corpus_families.dedup();
         let lock = Lock {
             manifest: manifest.clone(),
+            manifest_path: manifest_path.to_path_buf(),
+            repo: repo.to_path_buf(),
             manifest_sha256: sha.to_string(),
             baseline_sha,
+            corpus_version,
+            corpus_families,
             evaluator_version: manifest.evaluator.version.clone(),
             evaluator_files: hashes,
             evaluator_fingerprint: fingerprint,

@@ -4487,6 +4487,20 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
 ];
 
+/// The `ctx.toml` key path (e.g. `["jev", "memory"]`) a compiled env var
+/// overrides, or `None` when `name` has no `ENV_MAP` entry. `ENV_MAP` itself
+/// stays module-private (it also carries each key's `EnvKind`, which is not
+/// this crate's business outside `config.rs`'s own load/merge/audit code) --
+/// this is the one narrow, read-only accessor a caller outside this module
+/// needs to render a real config-key path for an env var it already knows
+/// about (e.g. an autoresearch candidate's own `env` overlay).
+pub(crate) fn toml_path_for_env(name: &str) -> Option<&'static [&'static str]> {
+    ENV_MAP
+        .iter()
+        .find(|(var, _, _)| *var == name)
+        .map(|(_, path, _)| *path)
+}
+
 /// Parsed `ctx.toml` surfaces that do not have scalar environment overrides
 /// and therefore cannot be discovered through `ENV_MAP`. Kept as an explicit
 /// table so ZCHK-FORBIDDEN-WIDENING audits them instead of silently missing a
