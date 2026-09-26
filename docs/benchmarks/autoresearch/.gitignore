@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+campaigns/*/state/
+campaigns/*/runs/
