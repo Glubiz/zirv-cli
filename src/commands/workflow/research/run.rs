@@ -2084,19 +2084,35 @@ allowed_models = {allowed_models:?}
         Manifest::parse(&text).unwrap()
     }
 
-    fn python_stub_argv(json_body: &str) -> Vec<String> {
-        vec![
-            "python".to_string(),
-            "-c".to_string(),
-            format!("print('{json_body}')"),
-        ]
+    /// A portable stand-in for a proposer subprocess that just echoes fixed
+    /// stdout, in place of shelling out to `python -c`: only `python3` ships
+    /// on many Linux/macOS CI images (ubuntu/macos runners), so `python`
+    /// alone is an ENOENT there ("could not run the proposer command: No
+    /// such file or directory") -- no Rust test may depend on Python at
+    /// all. `stdout` is written to a file inside `dir` and echoed back with
+    /// a small platform-native command instead.
+    fn stub_argv(dir: &Path, stdout: &str) -> Vec<String> {
+        let file = dir.join("stub-stdout.txt");
+        std::fs::write(&file, stdout).unwrap();
+        let file = file.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "type".to_string(),
+                file,
+            ]
+        } else {
+            vec!["cat".to_string(), file]
+        }
     }
 
     #[test]
     fn spawn_and_validate_proposal_accepts_a_valid_stub_proposal() {
         let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
         let dir = tempfile::tempdir().unwrap();
-        let argv = python_stub_argv(
+        let argv = stub_argv(
+            dir.path(),
             r#"{"id": "cand-x", "hypothesis": "h", "mechanism": "m", "env": {"ZIRV_CTX_JEV_MEMORY": "true"}}"#,
         );
         let candidate = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
@@ -2117,7 +2133,8 @@ allowed_models = {allowed_models:?}
         // check.
         let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_APPROVE"], &["sonnet"]);
         let dir = tempfile::tempdir().unwrap();
-        let argv = python_stub_argv(
+        let argv = stub_argv(
+            dir.path(),
             r#"{"id": "cand-x", "hypothesis": "h", "env": {"ZIRV_CTX_JEV_APPROVE": "false"}}"#,
         );
         let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
@@ -2129,7 +2146,8 @@ allowed_models = {allowed_models:?}
     fn spawn_and_validate_proposal_rejects_a_patch_field() {
         let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
         let dir = tempfile::tempdir().unwrap();
-        let argv = python_stub_argv(
+        let argv = stub_argv(
+            dir.path(),
             r#"{"id": "cand-x", "hypothesis": "h", "env": {}, "patch": "x.patch"}"#,
         );
         let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
