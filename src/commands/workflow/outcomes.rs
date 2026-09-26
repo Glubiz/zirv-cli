@@ -23,10 +23,15 @@ use super::classify::{Complexity, RiskBand};
 use super::engine::{WorkflowProfile, WorkflowState, WorkflowStatus};
 use super::skill::WorkflowPhase;
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::attribution::{self, Attribution};
 use crate::commands::ctx::proxy::decision::SeatTier;
 use crate::commands::ctx::state::{StateDir, create_private_dir_all, now_secs};
 
-pub const OUTCOME_SCHEMA_VERSION: u32 = 1;
+/// Issue #800: bumped 1 -> 2 to add `kind`/`session`/`attribution`/
+/// `harness`/`model`/`effort`/`policy` -- every one `#[serde(default)]` so a
+/// v1 row (which never wrote them) still deserializes, as the empty/`None`
+/// values that are the only honest reading for a row that predates them.
+pub const OUTCOME_SCHEMA_VERSION: u32 = 2;
 /// `<state>/logs/workflow-outcomes/{day:010}.jsonl`, the same daily-bucket
 /// layout (and pruner) the safety-decision log uses.
 pub const OUTCOMES_DIR: &str = "workflow-outcomes";
@@ -46,28 +51,118 @@ pub const LIGHTER_FIRST_PASS_AT_LEAST: f64 = 0.95;
 /// ...AND the mean review rounds is AT MOST this.
 pub const LIGHTER_MEAN_REVIEW_ROUNDS_AT_MOST: f64 = 0.2;
 
-/// One terminal workflow, metadata only.
+/// Issue #800: whether this row is a completed/failed/closed WORKFLOW, or a
+/// headless `zirv ctx exec` session that ran no workflow at all (a "direct"
+/// task). `#[default]` is `Workflow` -- the only kind a v1 row (which never
+/// wrote this field) could have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutcomeKind {
+    #[default]
+    Workflow,
+    Direct,
+}
+
+/// One terminal workflow, or (issue #800) one direct headless session,
+/// metadata only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeRow {
     pub schema_version: u32,
     pub ts: u64,
+    /// Empty for a `Direct` row -- there is no workflow id to carry.
     pub workflow_id: String,
     /// The pinned definition pack id, or the legacy kind id without one.
+    /// Empty for a `Direct` row.
     pub pack: String,
     pub profile: WorkflowProfile,
     pub complexity: Complexity,
     pub risk: RiskBand,
-    /// The proxy's seat tier when the workflow knows it. Workflow state does
-    /// not carry it today, so this is `None` until it does.
+    /// The proxy's ACTUAL seat tier when known -- see [`resolve_seat_tier`].
+    /// `None` when neither `ZIRV_ROUTE_TIER` nor the handover ladder (from
+    /// `harness`/`model`) can place it.
     pub seat_tier: Option<SeatTier>,
     /// The highest review round any recorded review run reached (0 = none).
+    /// Always 0 for a `Direct` row.
     pub review_rounds: u8,
-    /// `None` when no Test/Verify step was ever attempted.
+    /// `None` when no Test/Verify step was ever attempted. Always `None` for
+    /// a `Direct` row (there is no workflow step to have attempted one).
     pub verification_first_attempt: Option<bool>,
     pub verification_passed: Option<bool>,
     /// `completed`, `failed`, or `closed` (the latter two are "abandoned").
+    /// A `Direct` row is always `Completed` -- it exists purely to record
+    /// that the session ran, never a workflow verdict.
     pub terminal: WorkflowStatus,
     pub duration_secs: u64,
+    /// Issue #800.
+    #[serde(default)]
+    pub kind: OutcomeKind,
+    /// Issue #800: `ZIRV_CTX_SESSION`, when this row's own process had one --
+    /// lets `zirv ctx exec`'s own direct-row append at exit check "did THIS
+    /// session already write a workflow row" before adding a redundant one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Issue #800: this process's own campaign/candidate/trial/task ids.
+    #[serde(default, skip_serializing_if = "Attribution::is_empty")]
+    pub attribution: Attribution,
+    /// Issue #800: the actual harness this session ran (`ZIRV_CTX_AGENT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Issue #800: the actual configured model (`ZIRV_ROUTE_MODEL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Issue #800: the actual headless effort level (`ZIRV_ROUTE_EFFORT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Issue #800: `attribution::policy_fingerprint`'s own output, so two
+    /// outcomes can be compared knowing whether the SAME policy produced
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+}
+
+/// `ZIRV_ROUTE_TIER`'s own labels (`SeatTier::label`), parsed back.
+fn parse_seat_tier(label: &str) -> Option<SeatTier> {
+    match label {
+        "cheap" => Some(SeatTier::Cheap),
+        "standard" => Some(SeatTier::Standard),
+        "deep" => Some(SeatTier::Deep),
+        "frontier" => Some(SeatTier::Frontier),
+        _ => None,
+    }
+}
+
+/// Issue #800: this session's ACTUAL seat tier -- `ZIRV_ROUTE_TIER` when the
+/// launch seam already resolved one, else derived from `harness`/`model`
+/// through the handover ladder (`handover::tier_for_model`), else `None`.
+/// Best-effort throughout: a config load failure or an unplaceable model is
+/// `None`, never a guess.
+fn resolve_seat_tier(cfg: Option<&crate::commands::ctx::config::CtxConfig>) -> Option<SeatTier> {
+    if let Ok(raw) = std::env::var(attribution::ROUTE_TIER_ENV)
+        && let Some(tier) = parse_seat_tier(raw.trim())
+    {
+        return Some(tier);
+    }
+    let cfg = cfg?;
+    let harness = std::env::var(crate::commands::ctx::adapters::AGENT_ENV).ok()?;
+    let model = std::env::var(attribution::ROUTE_MODEL_ENV).ok()?;
+    let label = crate::commands::ctx::handover::tier_for_model(&harness, &model, cfg)?;
+    parse_seat_tier(label)
+}
+
+/// Best-effort: loads the live `CtxConfig` for the current repository, for
+/// [`resolve_seat_tier`]'s handover-ladder fallback and the policy
+/// fingerprint. `None` on any load failure -- recording an outcome must
+/// never fail a transition over a bad config layer elsewhere.
+fn load_cfg_best_effort() -> Option<crate::commands::ctx::config::CtxConfig> {
+    let repo = std::env::current_dir().ok()?;
+    crate::commands::ctx::config::CtxConfig::load_for_launch(&repo, &|key| std::env::var(key).ok())
+        .ok()
+}
+
+fn current_session() -> Option<String> {
+    std::env::var(crate::commands::ctx::adapters::SESSION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 impl OutcomeRow {
@@ -78,6 +173,7 @@ impl OutcomeRow {
             .map(|definition| definition.id.clone())
             .unwrap_or_else(|| state.kind.as_str().to_string());
         let (verification_first_attempt, verification_passed) = verification_outcome(state);
+        let cfg = load_cfg_best_effort();
         Self {
             schema_version: OUTCOME_SCHEMA_VERSION,
             ts: now_secs(),
@@ -86,7 +182,7 @@ impl OutcomeRow {
             profile: state.profile,
             complexity: state.classification.complexity,
             risk: state.classification.risk,
-            seat_tier: None,
+            seat_tier: resolve_seat_tier(cfg.as_ref()),
             review_rounds: state
                 .review_evidence
                 .iter()
@@ -97,6 +193,56 @@ impl OutcomeRow {
             verification_passed,
             terminal: state.status,
             duration_secs: state.updated_at.saturating_sub(state.created_at),
+            kind: OutcomeKind::Workflow,
+            session: current_session(),
+            attribution: Attribution::from_env(),
+            harness: std::env::var(crate::commands::ctx::adapters::AGENT_ENV).ok(),
+            model: std::env::var(attribution::ROUTE_MODEL_ENV).ok(),
+            effort: std::env::var(attribution::ROUTE_EFFORT_ENV).ok(),
+            policy: cfg.as_ref().map(attribution::policy_fingerprint),
+        }
+    }
+
+    /// Issue #800: a `Direct` row for a headless session that ran no
+    /// workflow at all -- `zirv ctx exec`'s own best-effort append at exit.
+    /// `harness`/`model` are the actual values the launch resolved (from its
+    /// own [`super::super::ctx::exec::ExecutionReport`] segment), not
+    /// re-derived from env, since a supervised run's own env may already have
+    /// moved on to a later turn by the time this is called.
+    pub fn direct(session: &str, harness: Option<&str>, model: Option<&str>) -> Self {
+        let cfg = load_cfg_best_effort();
+        let seat_tier = std::env::var(attribution::ROUTE_TIER_ENV)
+            .ok()
+            .and_then(|raw| parse_seat_tier(raw.trim()))
+            .or_else(|| {
+                let cfg = cfg.as_ref()?;
+                let harness = harness?;
+                let model = model?;
+                parse_seat_tier(crate::commands::ctx::handover::tier_for_model(
+                    harness, model, cfg,
+                )?)
+            });
+        Self {
+            schema_version: OUTCOME_SCHEMA_VERSION,
+            ts: now_secs(),
+            workflow_id: String::new(),
+            pack: String::new(),
+            profile: WorkflowProfile::default(),
+            complexity: Complexity::Trivial,
+            risk: RiskBand::Low,
+            seat_tier,
+            review_rounds: 0,
+            verification_first_attempt: None,
+            verification_passed: None,
+            terminal: WorkflowStatus::Completed,
+            duration_secs: 0,
+            kind: OutcomeKind::Direct,
+            session: Some(session.to_string()),
+            attribution: Attribution::from_env(),
+            harness: harness.map(str::to_string),
+            model: model.map(str::to_string),
+            effort: std::env::var(attribution::ROUTE_EFFORT_ENV).ok(),
+            policy: cfg.as_ref().map(attribution::policy_fingerprint),
         }
     }
 }
@@ -156,8 +302,10 @@ pub fn record_terminal(state_dir: &StateDir, state: &WorkflowState) -> CtxResult
     append(state_dir, &OutcomeRow::from_state(state))
 }
 
-/// Every parseable current-schema row, oldest bucket first. A corrupt line or
-/// an unreadable bucket is skipped, never fatal.
+/// Every parseable row at schema 1 or 2, oldest bucket first -- issue #800
+/// bumped the schema to 2, but every new field is `#[serde(default)]`, so a
+/// v1 row still deserializes cleanly and is kept, not dropped. A corrupt line
+/// or an unreadable bucket is skipped, never fatal.
 pub fn read_all(state: &StateDir) -> Vec<OutcomeRow> {
     let Ok(entries) = std::fs::read_dir(outcomes_dir(state)) else {
         return Vec::new();
@@ -174,10 +322,20 @@ pub fn read_all(state: &StateDir) -> Vec<OutcomeRow> {
         .flat_map(|text| {
             text.lines()
                 .filter_map(|line| serde_json::from_str::<OutcomeRow>(line).ok())
-                .filter(|row| row.schema_version == OUTCOME_SCHEMA_VERSION)
+                .filter(|row| matches!(row.schema_version, 1 | 2))
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Whether `read_all` already holds a `Workflow` row for `session` -- `zirv
+/// ctx exec`'s own best-effort exit check for whether to append a `Direct`
+/// row (issue #800): a session that already ran a workflow to completion
+/// must never also get a redundant direct row.
+pub fn has_workflow_row_for_session(state: &StateDir, session: &str) -> bool {
+    read_all(state)
+        .iter()
+        .any(|row| row.kind == OutcomeKind::Workflow && row.session.as_deref() == Some(session))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -355,7 +513,16 @@ pub fn propose(
 pub fn calibrate(rows: &[OutcomeRow], min_samples: usize) -> CalibrationReport {
     type Key = (Complexity, String, String);
     let mut groups: BTreeMap<Key, Vec<&OutcomeRow>> = BTreeMap::new();
-    for row in rows {
+    // Issue #800: a `Direct` row carries no workflow complexity/profile/tier
+    // routing decision to calibrate against -- only ever a placeholder
+    // (`Complexity::Trivial`/`WorkflowProfile::default()`), so folding it in
+    // here would silently contaminate the `trivial`/`standard` bucket with
+    // rows this proposal table was never meant to see.
+    let rows: Vec<&OutcomeRow> = rows
+        .iter()
+        .filter(|row| row.kind == OutcomeKind::Workflow)
+        .collect();
+    for row in rows.iter().copied() {
         let tier = row.seat_tier.map(|tier| {
             SEAT_TIERS
                 .iter()
@@ -509,6 +676,13 @@ mod tests {
             verification_passed: first_pass.map(|_| true),
             terminal: WorkflowStatus::Completed,
             duration_secs: 60,
+            kind: OutcomeKind::Workflow,
+            session: None,
+            attribution: Attribution::default(),
+            harness: None,
+            model: None,
+            effort: None,
+            policy: None,
         }
     }
 
@@ -688,5 +862,79 @@ mod tests {
         append(&state, &first).unwrap();
         std::fs::write(outcomes_dir(&state).join("0000000001.jsonl"), "not json\n").unwrap();
         assert_eq!(read_all(&state), vec![first]);
+    }
+
+    /// Issue #800: a v1 row (written before `kind`/`session`/`attribution`/
+    /// `harness`/`model`/`effort`/`policy` existed) must still deserialize --
+    /// every new field is `#[serde(default)]`.
+    #[test]
+    fn a_v1_json_line_still_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let v1_line = r#"{"schema_version":1,"ts":1700000000,"workflow_id":"wf","pack":"feature","profile":"standard","complexity":"bounded","risk":"low","seat_tier":null,"review_rounds":1,"verification_first_attempt":true,"verification_passed":true,"terminal":"completed","duration_secs":60}"#;
+        std::fs::create_dir_all(outcomes_dir(&state)).unwrap();
+        std::fs::write(
+            outcomes_dir(&state).join("0000000001.jsonl"),
+            format!("{v1_line}\n"),
+        )
+        .unwrap();
+        let rows = read_all(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, OutcomeKind::Workflow);
+        assert_eq!(rows[0].session, None);
+        assert!(rows[0].attribution.is_empty());
+        assert_eq!(rows[0].harness, None);
+        assert_eq!(rows[0].policy, None);
+    }
+
+    /// Issue #800: a v2 row with every new field populated round-trips
+    /// through JSON exactly.
+    #[test]
+    fn a_v2_row_round_trips() {
+        let mut r = row(Complexity::Bounded, Some(true), 1);
+        r.kind = OutcomeKind::Workflow;
+        r.session = Some("sess-1".to_string());
+        r.attribution = Attribution {
+            campaign: Some("camp-1".to_string()),
+            ..Attribution::default()
+        };
+        r.harness = Some("claude".to_string());
+        r.model = Some("sonnet".to_string());
+        r.effort = Some("high".to_string());
+        r.policy = Some("deadbeefcafef00d".to_string());
+        let json = serde_json::to_string(&r).unwrap();
+        let back: OutcomeRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    /// Issue #800: `OutcomeRow::direct` produces a `Direct` row, and
+    /// `has_workflow_row_for_session` never mistakes it for a `Workflow` one.
+    #[test]
+    fn direct_row_is_written_and_never_counted_as_a_workflow_row() {
+        let root = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let direct = OutcomeRow::direct("sess-direct", Some("claude"), Some("sonnet"));
+        assert_eq!(direct.kind, OutcomeKind::Direct);
+        assert_eq!(direct.session.as_deref(), Some("sess-direct"));
+        append(&state, &direct).unwrap();
+        assert!(!has_workflow_row_for_session(&state, "sess-direct"));
+
+        let workflow_row = {
+            let mut r = row(Complexity::Bounded, Some(true), 0);
+            r.session = Some("sess-workflow".to_string());
+            r
+        };
+        append(&state, &workflow_row).unwrap();
+        assert!(has_workflow_row_for_session(&state, "sess-workflow"));
+    }
+
+    /// Issue #800: a `Direct` row must never pollute a workflow calibration
+    /// bucket -- `calibrate` only ever sees `Workflow` rows.
+    #[test]
+    fn calibrate_excludes_direct_rows() {
+        let direct = OutcomeRow::direct("sess-direct", None, None);
+        let report = calibrate(&[direct], 1);
+        assert_eq!(report.total_samples, 0);
+        assert!(report.buckets.is_empty());
     }
 }
