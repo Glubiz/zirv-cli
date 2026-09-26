@@ -1,11 +1,26 @@
 # context-compaction: candidates over compaction_select, handoff_select,
 # review_reuse, memory, context gates + floors, and [score] token ratios --
 # the knobs #762 owns the calibration ALGORITHM for; this campaign only
-# evaluates them, never re-implements calibration. Runs on the long-session
-# split (validation: t23_afternoon, t25_sticky_notes -- see
-# ../wrapped-vs-vanilla/corpus.toml) because a short single-prompt task
-# never exercises compaction/handoff/review-reuse at all.
+# evaluates them, never re-implements calibration. `classes =
+# ["long_session"]` on every stage narrows to the one long_session task each
+# split carries (screen: dev's t23_afternoon; validate: validation's
+# t25_sticky_notes; holdout: holdout's t24_long_haul + t24b_long_haul -- see
+# ../../wrapped-vs-vanilla/corpus.toml) because a short single-prompt task
+# never exercises compaction/handoff/review-reuse at all, and #801 split
+# discipline refuses screen/validate sharing a split.
 #
+# Pair counts: validate = 1 task * 6 reps = 6 pairs, holdout = 2 tasks * 3
+# reps = 6 pairs, both >= criteria.min_pairs = 4 (`plan` refuses a stage
+# that could never reach min_pairs -- issue #802/#804).
+#
+# Budgets: baseline (screen 1*2 + validate 1*6 + holdout 2*3 = 14 trials)
+# plus screening all 5 candidates once (5 * 1*2 = 10 trials) = 24 trials *
+# $8.00 = $192.00 worst case for "baseline fits, room to screen everyone";
+# max_spend_usd/max_trials below give headroom past that for survivors to
+# reach validate/holdout too (`zirv workflow research plan` prints the full
+# worst-case-every-candidate-through-holdout number, which this comment
+# does not chase exactly since not every candidate is expected to survive
+# screen).
 # `requires_receipts` uses the EXACT `JevEffect::new(site, action)` site
 # strings from the current source (checked against src/commands/ctx/
 # handoff.rs and src/commands/workflow/review.rs, not guessed): compaction_
@@ -58,25 +73,28 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 120.00
+max_spend_usd = 250.00
 max_wall_secs = 86400
 max_calls = 200
-max_trials = 60
+max_trials = 100
 max_retries = 1
 concurrency = 2
 
 [stages.screen]
-split = "validation"
+split = "dev"
 reps = 2
+classes = ["long_session"]
 
 [stages.validate]
 split = "validation"
-reps = 3
+reps = 6
+classes = ["long_session"]
 
 [stages.holdout]
 split = "holdout"
-reps = 1
+reps = 3
 max_uses = 1
+classes = ["long_session"]
 
 [criteria]
 min_pairs = 4

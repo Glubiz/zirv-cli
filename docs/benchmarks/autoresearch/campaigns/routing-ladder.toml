@@ -18,6 +18,29 @@
 # leaving direct-vs-team/fan-out choices to the (not-yet-existing)
 # orchestration suite.
 #
+# `classes` on every stage excludes `long_session` (dev's t23_afternoon,
+# validation's t25_sticky_notes, holdout's t24_long_haul/t24b_long_haul --
+# see ../../wrapped-vs-vanilla/corpus.toml): routing/effort candidates are
+# evaluated over the stratified short-task classes this file's own
+# stratification note describes, not the most expensive chain-task class.
+# dev keeps mechanical/bounded/bug/feature/architecture (12 tasks),
+# validation keeps feature/bug/architecture (7 tasks), holdout keeps
+# architecture/ambiguous (3 tasks).
+#
+# Pair counts: validate = 7 tasks * 2 reps = 14 pairs, holdout = 3 tasks *
+# 2 reps = 6 pairs, both >= criteria.min_pairs = 6.
+#
+# per_trial_ceiling_usd is $6.00, not $3.00: the escalate candidate can run
+# TWO full agent invocations per trial (cheap-first attempt, then a full
+# opus escalation), so a single $3.00 ceiling could under-reserve its own
+# trial before either call even finishes.
+#
+# Budgets: baseline (screen 12*2 + validate 7*2 + holdout 3*2 = 44 trials)
+# plus screening all 3 candidates once (3 * 12*2 = 72 trials) = 116 trials
+# * $6.00 = $696.00 worst case for "baseline fits, room to screen
+# everyone"; max_spend_usd/max_trials/max_calls below give headroom past
+# that for survivors to reach validate/holdout too.
+#
 # Backend is run.py; costs real money (every trial is a live agent run,
 # and the escalate candidate can run TWO agent invocations per trial); never
 # run in CI.
@@ -44,7 +67,7 @@ file = "docs/benchmarks/wrapped-vs-vanilla/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
-per_trial_ceiling_usd = 3.00
+per_trial_ceiling_usd = 6.00
 calls_per_trial = 2
 timeout_secs = 1800
 
@@ -53,25 +76,28 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 60.00
+max_spend_usd = 750.00
 max_wall_secs = 28800
-max_calls = 300
-max_trials = 120
+max_calls = 350
+max_trials = 200
 max_retries = 1
 concurrency = 2
 
 [stages.screen]
 split = "dev"
 reps = 2
+classes = ["mechanical", "bounded", "bug", "feature", "architecture"]
 
 [stages.validate]
 split = "validation"
 reps = 2
+classes = ["feature", "bug", "architecture"]
 
 [stages.holdout]
 split = "holdout"
-reps = 1
+reps = 2
 max_uses = 1
+classes = ["architecture", "ambiguous"]
 
 [criteria]
 min_pairs = 6

@@ -1,6 +1,6 @@
 # context-compaction-forced: the FORCED-pressure cohort variant of
-# context-compaction.toml -- same candidate set, same long-session split,
-# but `[cohort] pressure = "forced"` with `ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO`
+# context-compaction.toml -- same long-session split classes, but
+# `[cohort] pressure = "forced"` with `ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO`
 # lowered for BOTH arms (baseline and every candidate alike, via `[cohort]
 # env`, applied on top of whatever a candidate's own env sets -- never a
 # candidate-only advantage). Design spec #805: "Forced pressure (pressure =
@@ -12,7 +12,20 @@
 # Same reasoning applies here as in context-compaction.toml for
 # requires_receipts naming (compaction_select/handoff_select site strings
 # are underscored in the real code; workflow-review-reuse is already
-# hyphenated there) -- see that file's header comment for the source lines.
+# hyphenated there), the `classes = ["long_session"]` stage filter (dev:
+# t23_afternoon; validation: t25_sticky_notes; holdout: t24_long_haul +
+# t24b_long_haul), and the #801 split-discipline rule (screen and validate
+# must not share a split) -- see that file's header comment for the source
+# lines.
+#
+# Pair counts: validate = 1 task * 6 reps = 6 pairs, holdout = 2 tasks * 3
+# reps = 6 pairs, both >= criteria.min_pairs = 4.
+#
+# Budgets: baseline (screen 1*2 + validate 1*6 + holdout 2*3 = 14 trials)
+# plus screening all 3 candidates once (3 * 1*2 = 6 trials) = 20 trials *
+# $8.00 = $160.00 worst case for "baseline fits, room to screen everyone";
+# max_spend_usd/max_trials below give headroom past that for survivors to
+# reach validate/holdout too.
 #
 # Backend is run.py; costs real money; never run in CI.
 
@@ -47,25 +60,28 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 120.00
+max_spend_usd = 200.00
 max_wall_secs = 86400
 max_calls = 200
-max_trials = 60
+max_trials = 80
 max_retries = 1
 concurrency = 2
 
 [stages.screen]
-split = "validation"
+split = "dev"
 reps = 2
+classes = ["long_session"]
 
 [stages.validate]
 split = "validation"
-reps = 3
+reps = 6
+classes = ["long_session"]
 
 [stages.holdout]
 split = "holdout"
-reps = 1
+reps = 3
 max_uses = 1
+classes = ["long_session"]
 
 [criteria]
 min_pairs = 4
