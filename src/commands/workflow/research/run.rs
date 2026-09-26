@@ -53,6 +53,13 @@ pub enum Stage {
     Screen,
     Validate,
     Holdout,
+    /// Cache-mode `warm` only: one uncounted trial per arm, dispatched once
+    /// before any of that arm's real trials, sharing the same persistent
+    /// state dir they will reuse. Charged for real (a real dispatch, real
+    /// spend) but never fed into `promote::Observation` -- `stage_records_
+    /// from_ledger` is always called with `Stage::Screen/Validate/Holdout`,
+    /// so a `"warmup"`-staged trial is structurally excluded already.
+    Warmup,
 }
 
 impl Stage {
@@ -61,6 +68,7 @@ impl Stage {
             Stage::Screen => "screen",
             Stage::Validate => "validate",
             Stage::Holdout => "holdout",
+            Stage::Warmup => "warmup",
         }
     }
 }
@@ -208,6 +216,24 @@ fn trials_for(
         }
     }
     out
+}
+
+/// One uncounted `Stage::Warmup` trial for `(candidate, arm)`, dispatched
+/// once before any of that arm's real trials under `cache_mode = "warm"`.
+/// `rep = 0` and `attempt = 0` like any other first attempt; its trial id
+/// is stable across a campaign (and resume), so it is dispatched exactly
+/// once per campaign, same as every other trial id.
+fn warmup_trial(candidate: &str, arm: Arm, task: &str, split: Split) -> PendingTrial {
+    PendingTrial {
+        trial_id: sanitize(&format!("warmup-{candidate}-{}", arm.as_str())),
+        candidate: candidate.to_string(),
+        arm,
+        stage: Stage::Warmup,
+        task: task.to_string(),
+        rep: 0,
+        split,
+        attempt: 0,
+    }
 }
 
 /// The base cohort key, plus (issue #804) the observation's own corpus task
@@ -1036,6 +1062,7 @@ fn reconcile_unfinished(
                         stage: match outstanding.stage.as_str() {
                             "screen" => Stage::Screen,
                             "validate" => Stage::Validate,
+                            "warmup" => Stage::Warmup,
                             _ => Stage::Holdout,
                         },
                         task: outstanding.task,
@@ -1683,6 +1710,28 @@ pub fn execute(
     let corpus = Corpus::load(&repo.join(&manifest.corpus.file))?;
     let task_classes = build_task_classes(&corpus);
 
+    if stop_reason.is_none() && matches!(manifest.cache_mode, manifest::CacheMode::Warm) {
+        let seed = seed_for(&manifest.id, "baseline", "screen");
+        let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
+        if let Some(task) = screen_tasks.first() {
+            let mut warmups = vec![warmup_trial(
+                "baseline",
+                Arm::Baseline,
+                task,
+                manifest.stages.screen.split,
+            )];
+            for candidate in &manifest.candidates {
+                warmups.push(warmup_trial(
+                    &candidate.id,
+                    Arm::Candidate,
+                    task,
+                    manifest.stages.screen.split,
+                ));
+            }
+            stop_reason = dispatch_batch(&mut state, &candidates_map, warmups)?;
+        }
+    }
+
     if stop_reason.is_none() {
         let seed = seed_for(&manifest.id, "baseline", "screen");
         let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
@@ -2196,6 +2245,89 @@ wall_ms = 10
             events
                 .iter()
                 .any(|e| matches!(e, LedgerEvent::TrialFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn warm_cache_mode_dispatches_one_uncounted_charged_warmup_trial_per_arm() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        write_corpus(&repo.path().join("corpus.toml"));
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let fixture_path = manifest_dir.path().join("fixture.toml");
+        write_fixture(
+            &fixture_path,
+            r#"
+[[result]]
+arm = "cand-a"
+task = "*"
+status = "ok"
+correctness = 1.0
+quality = 1.0
+cost_usd = 0.02
+wall_ms = 10
+"#,
+        );
+        let manifest_path = manifest_dir.path().join("manifest.toml");
+        let cold_toml = manifest_toml(
+            "warm-demo",
+            "corpus.toml",
+            "fixture.toml",
+            1,
+            0,
+            100.0,
+            1,
+            ONE_CANDIDATE,
+        );
+        let warm_toml = cold_toml.replacen("cache_mode = \"cold\"", "cache_mode = \"warm\"", 1);
+        assert!(
+            warm_toml.contains("cache_mode = \"warm\""),
+            "the replace must actually apply"
+        );
+        std::fs::write(&manifest_path, &warm_toml).unwrap();
+
+        let state_root = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
+
+        let summary = execute(&manifest_path, repo.path(), None, false, &state_dir).unwrap();
+        assert!(summary.stopped_reason.is_none());
+
+        let events = ledger::replay(&Ledger::path(&summary.campaign_dir)).unwrap();
+        let warmup_finished: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                LedgerEvent::TrialFinished {
+                    trial_id, cost_usd, ..
+                } if trial_id.starts_with("warmup-") => {
+                    assert!(
+                        cost_usd.is_some_and(|c| c > 0.0),
+                        "the warmup trial's spend must be a real, nonzero charge"
+                    );
+                    Some(trial_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            warmup_finished.len(),
+            2,
+            "one warmup trial per arm (baseline + cand-a): {warmup_finished:?}"
+        );
+
+        // Screen's own observation-building must never see the warmup
+        // trial: with 1 dev task * 1 rep, exactly one real screen trial per
+        // arm, not two.
+        let baseline_screen = stage_records_from_ledger(&events, Stage::Screen, "baseline");
+        let candidate_screen = stage_records_from_ledger(&events, Stage::Screen, "cand-a");
+        assert_eq!(
+            baseline_screen.len(),
+            1,
+            "the warmup trial must not appear in screen observations"
+        );
+        assert_eq!(
+            candidate_screen.len(),
+            1,
+            "the warmup trial must not appear in screen observations"
         );
     }
 
