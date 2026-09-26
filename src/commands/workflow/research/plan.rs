@@ -546,17 +546,16 @@ min_pairs = 0
         );
     }
 
-    /// Every manifest under `docs/benchmarks/autoresearch/campaigns/` (Lane
-    /// C's real, hand-authored campaigns plus the fixture demo), planned
-    /// against this actual worktree -- never a synthetic repo -- so
+    /// Every manifest under `docs/benchmarks/autoresearch/campaigns/` (the
+    /// real, hand-authored campaigns plus the fixture demo), planned against
+    /// this actual worktree -- never a synthetic repo -- so
     /// `corpus.file`/`evaluator.protected`/`backend.command` really resolve
     /// or really fail exactly as a real `zirv workflow research plan` run
     /// would see them. Every committed manifest must be genuinely runnable:
-    /// `plan` must not skip one silently, and none may be refused --
-    /// phase-3 retuned the four real campaigns' stage splits/classes/reps/
-    /// budgets so each one's baseline fits with room to screen every
-    /// candidate, and every validate/holdout stage clears
-    /// `criteria.min_pairs`.
+    /// `plan` must not skip one silently, and none may be refused -- each
+    /// real campaign's stage splits/classes/reps/budgets are tuned so its
+    /// baseline fits with room to screen every candidate, and every
+    /// validate/holdout stage clears `criteria.min_pairs`.
     #[test]
     fn plan_covers_every_committed_campaign_manifest_without_dispatching() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
