@@ -32,6 +32,69 @@ pub struct ReportSummary {
     pub verdict: String,
     pub rows: Vec<CandidateReportRow>,
     pub stopped_reason: Option<String>,
+    pub spend: SpendSummary,
+}
+
+/// Execution spend (what a trial's own arm cost) kept strictly separate
+/// from experiment overhead (judges, a proposer's own calls -- never
+/// counted toward a candidate's own cost axis, but still real campaign
+/// spend). `completeness` is `"complete"` only when every finished trial's
+/// own cost was fully known; a crash/timeout charged at its declared
+/// ceiling, or any trial reporting `cost_complete = false`, makes it
+/// `"partial"`; `"unknown"` when no trial finished at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpendSummary {
+    pub execution_usd: f64,
+    pub overhead_usd: f64,
+    pub completeness: String,
+}
+
+fn spend_summary(events: &[LedgerEvent]) -> SpendSummary {
+    let mut execution_usd = 0.0;
+    let mut overhead_usd = 0.0;
+    let mut saw_a_trial = false;
+    let mut all_complete = true;
+
+    for event in events {
+        match event {
+            LedgerEvent::TrialFinished {
+                cost_usd,
+                cost_complete,
+                overhead_usd: overhead,
+                ..
+            } => {
+                saw_a_trial = true;
+                execution_usd += cost_usd.unwrap_or(0.0);
+                overhead_usd += overhead;
+                if !cost_complete {
+                    all_complete = false;
+                }
+            }
+            LedgerEvent::TrialFailed { charged_usd, .. } => {
+                // A crash/timeout's actual spend is unknown; `charged_usd`
+                // is the declared ceiling substituted for budget accounting,
+                // not a known real cost, so it also marks the total partial.
+                saw_a_trial = true;
+                execution_usd += charged_usd;
+                all_complete = false;
+            }
+            _ => {}
+        }
+    }
+
+    let completeness = if !saw_a_trial {
+        "unknown"
+    } else if all_complete {
+        "complete"
+    } else {
+        "partial"
+    };
+
+    SpendSummary {
+        execution_usd,
+        overhead_usd,
+        completeness: completeness.to_string(),
+    }
 }
 
 fn campaign_verdict(events: &[LedgerEvent]) -> (Option<String>, String, Option<String>) {
@@ -121,6 +184,23 @@ fn write_report_md(path: &Path, summary: &ReportSummary, lock: &Lock) -> CtxResu
     }
     writeln!(file, "- started at: {}", summary.started_at)?;
     writeln!(file)?;
+    writeln!(file, "## Spend")?;
+    writeln!(
+        file,
+        "- execution: ${:.4} (what the trials' own arms cost -- what a candidate's cost axis is judged on)",
+        summary.spend.execution_usd
+    )?;
+    writeln!(
+        file,
+        "- overhead: ${:.4} (judges, proposer -- counted against the campaign budget, never against a candidate's own cost)",
+        summary.spend.overhead_usd
+    )?;
+    writeln!(
+        file,
+        "- completeness: {} (a crash/timeout charged at its declared ceiling, or any trial with an unknown cost, makes this `partial`)",
+        summary.spend.completeness
+    )?;
+    writeln!(file)?;
     writeln!(file, "## Coverage and limitations")?;
     writeln!(
         file,
@@ -205,6 +285,7 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
     let events = ledger::replay(&Ledger::path(campaign_dir))?;
     let (promoted, verdict, stopped_reason) = campaign_verdict(&events);
     let rows = candidate_rows(&events, &lock.manifest.candidates);
+    let spend = spend_summary(&events);
 
     let summary = ReportSummary {
         campaign_id: lock.manifest.id.clone(),
@@ -215,6 +296,7 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
         verdict,
         rows,
         stopped_reason,
+        spend,
     };
 
     write_report_md(&campaign_dir.join("report.md"), &summary, &lock)?;

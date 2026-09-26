@@ -251,18 +251,23 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
         }
     }
 
-    let baseline_trials = splits.dev * manifest.stages.screen.reps as usize
-        + splits.validation * manifest.stages.validate.reps as usize
-        + splits.holdout * manifest.stages.holdout.reps as usize;
-    let candidate_worst_case = manifest
-        .candidates
-        .iter()
-        .map(|_| {
-            splits.dev * manifest.stages.screen.reps as usize
-                + splits.validation * manifest.stages.validate.reps as usize
-        })
-        .sum::<usize>()
-        + splits.holdout * manifest.stages.holdout.reps as usize; // at most one candidate reaches holdout
+    let split_count = |split: manifest::Split| match split {
+        manifest::Split::Dev => splits.dev,
+        manifest::Split::Validation => splits.validation,
+        manifest::Split::Holdout => splits.holdout,
+    };
+    let screen_trials =
+        split_count(manifest.stages.screen.split) * manifest.stages.screen.reps as usize;
+    let validate_trials =
+        split_count(manifest.stages.validate.split) * manifest.stages.validate.reps as usize;
+    let holdout_trials =
+        split_count(manifest.stages.holdout.split) * manifest.stages.holdout.reps as usize;
+    let baseline_trials = screen_trials + validate_trials + holdout_trials;
+    // Every declared candidate runs its own screen + validate trials paired
+    // against the shared baseline; at most one (the winner) also reaches
+    // holdout, so the holdout term is added once, not per candidate.
+    let candidate_worst_case =
+        manifest.candidates.len() * (screen_trials + validate_trials) + holdout_trials;
     let worst_case_trials = baseline_trials + candidate_worst_case;
     let worst_case_spend_usd = worst_case_trials as f64 * manifest.backend.per_trial_ceiling_usd;
     let worst_case_calls = worst_case_trials as u64 * manifest.backend.calls_per_trial as u64;
@@ -444,5 +449,71 @@ max_uses = 1
         let report = plan(&manifest_path, repo.path()).unwrap();
         assert!(!report.valid);
         assert!(report.errors.iter().any(|e| e.contains("baseline")));
+    }
+
+    /// Every manifest under `docs/benchmarks/autoresearch/campaigns/` (Lane
+    /// C's real, hand-authored campaigns plus the fixture demo), planned
+    /// against this actual worktree -- never a synthetic repo -- so
+    /// `corpus.file`/`evaluator.protected`/`backend.command` really resolve
+    /// or really fail exactly as a real `zirv workflow research plan` run
+    /// would see them. `plan` must not skip one silently: every manifest is
+    /// asserted either valid, or refused with a specific, expected reason
+    /// (the four real, expensive campaigns here were authored with
+    /// deliberately conservative dollar caps that their own declared
+    /// screen+validate+holdout repetition counts do not fit -- `plan`
+    /// catching that before any provider call is the whole point of this
+    /// check, not a bug to paper over).
+    #[test]
+    fn plan_covers_every_committed_campaign_manifest_without_dispatching() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let campaigns_dir = repo.join("docs/benchmarks/autoresearch/campaigns");
+        let mut manifests: Vec<PathBuf> = std::fs::read_dir(&campaigns_dir)
+            .expect("campaigns dir must exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+        manifests.sort();
+
+        let expected_valid: &[&str] = &["fixture-demo.toml", "jev-intake-floors.toml"];
+        let expected_refused_baseline: &[&str] = &[
+            "context-compaction.toml",
+            "context-compaction-forced.toml",
+            "jev-gates-e2e.toml",
+            "routing-ladder.toml",
+        ];
+        assert_eq!(
+            manifests.len(),
+            expected_valid.len() + expected_refused_baseline.len(),
+            "a new/removed campaign manifest must update this test's expectations, not be skipped: {manifests:?}"
+        );
+
+        super::super::backend::reset_fixture_dispatch_count();
+        for manifest_path in &manifests {
+            let name = manifest_path.file_name().unwrap().to_str().unwrap();
+            let report = plan(manifest_path, repo)
+                .unwrap_or_else(|err| panic!("plan({name}) must not error outright: {err}"));
+            if expected_valid.contains(&name) {
+                assert!(
+                    report.valid,
+                    "{name} was expected valid; errors: {:?}",
+                    report.errors
+                );
+            } else if expected_refused_baseline.contains(&name) {
+                assert!(!report.valid, "{name} was expected refused");
+                assert!(
+                    report.errors.iter().any(|e| e.contains("baseline")),
+                    "{name}: expected a baseline-budget refusal reason, got {:?}",
+                    report.errors
+                );
+            } else {
+                panic!("{name}: not in either expectation list -- update this test, don't skip it");
+            }
+        }
+        assert_eq!(
+            super::super::backend::fixture_dispatch_count(),
+            0,
+            "plan must never run a trial, including fixture-demo.toml's fixture backend"
+        );
     }
 }

@@ -4,12 +4,6 @@
 //! caller supplies the observations, the criteria, the (already
 //! multiple-comparisons-adjusted) confidence level, and a seed.
 
-// Lane B2 (#801) only; nothing outside this module calls these yet -- a
-// later lane wires the runner (#802) to `evaluate`/`screen`/`simplest`.
-// Suppressed for non-test builds only, so the inline tests below still
-// catch an item that becomes truly unreachable.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 
 use super::stats::{self, Interval};

@@ -55,15 +55,17 @@ cost_usd = 0.55
 wall_ms = 40000
 receipts = {}
 
-# --- no-clear-win: correctness/quality/cost all within noise of baseline,
-# no axis clears min_effect -> Inconclusive. ---
+# --- no-clear-win: correctness/quality hold, and cost is enough cheaper
+# (9%) to clear screen's coarse half-min_effect pre-filter (>5%) but NOT
+# validate's full min_effect bar (10%) -> survives screen, Inconclusive at
+# validate. Wall time is flat (not a win on that axis either). ---
 [[result]]
 arm = "no-clear-win"
 task = "*"
 status = "ok"
 correctness = 0.98
 quality = 0.79
-cost_usd = 0.97
+cost_usd = 0.91
 wall_ms = 59000
 receipts = {}
 

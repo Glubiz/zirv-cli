@@ -4,12 +4,6 @@
 //! clock, env or network: identical inputs (including the seed) always give
 //! identical outputs.
 
-// Lane B2 (#801) only; nothing outside this module calls these yet -- a
-// later lane wires `research::promote::evaluate` and friends into the
-// runner. Suppressed for non-test builds only, so the inline tests below
-// still catch an item that becomes truly unreachable.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 
 /// SplitMix64, seeded by a single `u64`. Chosen over the platform RNG
@@ -62,7 +56,10 @@ pub fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
 }
 
-/// The median of `xs` (the 50th nearest-rank percentile).
+/// The median of `xs` (the 50th nearest-rank percentile). Unused in
+/// production today (`promote.rs` calls `percentile` directly for its own
+/// median needs); kept as public API and exercised by its own test below.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn median(xs: &[f64]) -> f64 {
     percentile(xs, 50.0)
 }
