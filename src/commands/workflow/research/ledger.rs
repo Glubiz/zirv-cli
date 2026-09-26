@@ -20,8 +20,29 @@ pub const LEDGER_FILE: &str = "ledger.jsonl";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lock {
     pub manifest: Manifest,
+    /// The exact path `zirv workflow research run` was given for this
+    /// manifest, frozen at campaign start -- report generation (issue
+    /// #802) needs it for provenance and the reproduction command, and
+    /// `report::generate` works purely from this lock plus the ledger, with
+    /// no `--repo`/manifest-path argument of its own.
+    #[serde(default)]
+    pub manifest_path: std::path::PathBuf,
+    /// The `--repo` this campaign actually ran against, frozen at campaign
+    /// start -- same reasoning as `manifest_path`.
+    #[serde(default)]
+    pub repo: std::path::PathBuf,
     pub manifest_sha256: String,
     pub baseline_sha: String,
+    /// The corpus file's own `version` field, read once at campaign start --
+    /// same reasoning as `manifest_path`: report generation has no repo
+    /// access to re-read the corpus file itself.
+    #[serde(default)]
+    pub corpus_version: String,
+    /// Every distinct `task.family` in the corpus, sorted and deduped --
+    /// same reasoning as `corpus_version`. Lets the report note "single
+    /// project family" coverage without a repo-dependent re-read.
+    #[serde(default)]
+    pub corpus_families: Vec<String>,
     pub evaluator_version: Option<String>,
     pub evaluator_files: BTreeMap<String, String>,
     pub evaluator_fingerprint: String,

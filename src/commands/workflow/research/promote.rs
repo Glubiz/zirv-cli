@@ -4,6 +4,8 @@
 //! caller supplies the observations, the criteria, the (already
 //! multiple-comparisons-adjusted) confidence level, and a seed.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::stats::{self, Interval};
@@ -800,6 +802,77 @@ pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
     ScreenVerdict::Survive
 }
 
+/// Point-only estimates (no confidence interval -- screen never bootstraps)
+/// for the same paired baseline/candidate observations `screen` itself
+/// judged, recorded alongside a screen `StageDecision` so a report generated
+/// later (purely from the ledger) can show a number instead of leaving the
+/// screen row's rel_cost/rel_wall/d_correctness columns blank. Reuses
+/// exactly the same pairing and cost-usability rule `screen` uses, so the
+/// numbers shown are the ones the gate actually looked at, not a
+/// re-derivation that could disagree with it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScreenPoints {
+    pub d_correctness: Option<f64>,
+    pub rel_cost: Option<f64>,
+    pub rel_wall: Option<f64>,
+}
+
+pub fn screen_points(obs: &[Observation]) -> ScreenPoints {
+    let all_refs: Vec<&Observation> = obs.iter().collect();
+    let pairs = build_pairs(&all_refs);
+    if pairs.is_empty() {
+        return ScreenPoints::default();
+    }
+
+    let cost_usable = pairs
+        .iter()
+        .all(|(b, c)| pair_cost_complete(b) && pair_cost_complete(c));
+    let rel_cost = if cost_usable {
+        let cost_pairs: Vec<(f64, f64)> = pairs
+            .iter()
+            .map(|(b, c)| (b.cost_usd.unwrap_or(0.0), c.cost_usd.unwrap_or(0.0)))
+            .collect();
+        stats::relative_diff(&cost_pairs)
+    } else {
+        None
+    };
+    let wall_pairs: Vec<(f64, f64)> = pairs
+        .iter()
+        .map(|(b, c)| (b.wall_ms as f64, c.wall_ms as f64))
+        .collect();
+    let rel_wall = stats::relative_diff(&wall_pairs);
+
+    let d_correctness_pairs: Vec<f64> = pairs
+        .iter()
+        .map(|(b, c)| trial_correctness(c) - trial_correctness(b))
+        .collect();
+    let d_correctness = if d_correctness_pairs.is_empty() {
+        None
+    } else {
+        Some(stats::mean(&d_correctness_pairs))
+    };
+
+    ScreenPoints {
+        d_correctness,
+        rel_cost,
+        rel_wall,
+    }
+}
+
+/// Every observation's own exclusion reason (`untriggered`, `env_mismatch`,
+/// ...), counted -- report generation (issue #802) needs this breakdown per
+/// candidate/stage, and `CohortDecision.excluded` is only ever a total
+/// count, not broken down by reason.
+pub fn excluded_by_reason(obs: &[Observation]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for o in obs {
+        if let Some(reason) = &o.excluded {
+            *counts.entry(reason.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 /// The representative benefit axis and interval for a Decision, used by
 /// [`simplest`]: the first cohort with a usable `rel_cost`, else the first
 /// cohort with a usable `rel_wall`. A `Decision` in practice represents one
@@ -1144,6 +1217,63 @@ mod tests {
         let observations = matched_pairs("cohort-a", 6, 0.9, 0.9, 1.0, 0.2, 1000, 1000);
         let verdict = screen(&observations, &Criteria::default());
         assert_eq!(verdict, ScreenVerdict::Survive);
+    }
+
+    /// Regression for report-completeness item 1: a screen `StageDecision`
+    /// used to record only its verdict/reason, leaving a report's
+    /// rel_cost/rel_wall/d_correctness columns blank for every screen row.
+    /// `screen_points` must report the same point estimates `screen` itself
+    /// judged (an 80% cheaper candidate with a correctness deficit).
+    #[test]
+    fn screen_points_reports_the_same_point_estimates_screen_itself_used() {
+        let observations = matched_pairs("cohort-a", 6, 0.9, 0.8, 1.0, 0.2, 1000, 1100);
+        let points = screen_points(&observations);
+        assert!(
+            (points.d_correctness.unwrap() - (-0.1)).abs() < 1e-9,
+            "got {:?}",
+            points.d_correctness
+        );
+        assert!(
+            (points.rel_cost.unwrap() - (-0.8)).abs() < 1e-9,
+            "got {:?}",
+            points.rel_cost
+        );
+        assert!(
+            (points.rel_wall.unwrap() - 0.1).abs() < 1e-9,
+            "got {:?}",
+            points.rel_wall
+        );
+    }
+
+    /// An incomplete cost on any pair must leave `rel_cost` unset, the same
+    /// "cost incomplete" rule `screen` itself enforces before ever calling
+    /// it a cost-based improvement.
+    #[test]
+    fn screen_points_leaves_rel_cost_unset_when_any_pair_cost_is_incomplete() {
+        let mut observations = matched_pairs("cohort-a", 6, 0.9, 0.9, 1.0, 0.2, 1000, 1000);
+        let victim = observations
+            .iter_mut()
+            .find(|o| o.arm == Arm::Candidate && o.task == "task-0")
+            .unwrap();
+        victim.cost_usd = None;
+        victim.cost_complete = false;
+
+        let points = screen_points(&observations);
+        assert!(points.rel_cost.is_none());
+        assert!(points.rel_wall.is_some());
+    }
+
+    #[test]
+    fn excluded_by_reason_counts_each_reason_separately() {
+        let mut observations = matched_pairs("cohort-a", 3, 0.9, 0.9, 1.0, 0.9, 1000, 1000);
+        observations[0].excluded = Some("untriggered".to_string());
+        observations[1].excluded = Some("env_mismatch".to_string());
+        observations[3].excluded = Some("untriggered".to_string());
+
+        let counts = excluded_by_reason(&observations);
+        assert_eq!(counts.get("untriggered"), Some(&2));
+        assert_eq!(counts.get("env_mismatch"), Some(&1));
+        assert_eq!(counts.len(), 2);
     }
 
     fn accept_decision(rel_cost_point: f64) -> Decision {

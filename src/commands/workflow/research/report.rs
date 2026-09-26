@@ -1,9 +1,13 @@
 //! Regenerates `report.md`, `report.json`, `results.tsv`, and (for a
-//! promoted candidate) `proposal/{overlay.toml,ROLLBACK.md}` purely from
-//! `lock.json` + `ledger.jsonl` -- `run` calls this once at the end of a
-//! campaign, and `zirv workflow research report` calls it again any time,
-//! independent of whether the process that ran the campaign is still alive.
+//! promoted candidate) `proposal/{overlay.toml|candidate.patch,ROLLBACK.md}`
+//! purely from `lock.json` + `ledger.jsonl` -- `run` calls this once at the
+//! end of a campaign, and `zirv workflow research report` calls it again any
+//! time, independent of whether the process that ran the campaign is still
+//! alive. `Lock` carries everything a repo-independent regeneration needs
+//! (the manifest path/repo it ran against, the corpus version/families) so
+//! this module never re-reads the corpus or the manifest file itself.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -11,15 +15,40 @@ use serde::Serialize;
 
 use super::ledger::{self, Ledger, LedgerEvent, Lock};
 use super::manifest::Candidate;
+use super::promote::CohortDecision;
+use super::reconcile::reconstruct_tracker;
 use super::run::{Stage, stage_records_from_ledger};
 use crate::commands::ctx::CtxResult;
 
+/// One candidate/stage's full result, parsed back from that `StageDecision`
+/// event's own `detail` -- `screen`'s detail is `{reason, points,
+/// excluded_by_reason}` (point estimates only, no cohorts, no bootstrap);
+/// `validate`/`holdout`'s detail is a `promote::Decision` (verdict/reasons/
+/// cohorts/confidence) plus `excluded_by_reason` and `seed` merged in
+/// alongside it.
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateReportRow {
     pub candidate: String,
     pub stage: String,
     pub verdict: String,
     pub hypothesis: String,
+    /// Empty when unusable (e.g. no pairs at all); one entry per cohort
+    /// otherwise -- cohorts are never pooled into one number.
+    pub d_correctness: Vec<f64>,
+    pub rel_cost: Vec<f64>,
+    pub rel_wall: Vec<f64>,
+    pub reasons: Vec<String>,
+    /// The confidence level actually applied (Bonferroni-adjusted at
+    /// validate, the manifest's own `criteria.confidence` at holdout);
+    /// `None` for screen, which never bootstraps.
+    pub confidence: Option<f64>,
+    /// The bootstrap seed actually used; `None` for screen.
+    pub seed: Option<u64>,
+    pub excluded_by_reason: BTreeMap<String, usize>,
+    /// Full per-cohort arm summaries and delta intervals, for `report.md`'s
+    /// detailed breakdown; empty for screen (which has no cohort concept of
+    /// its own -- see `promote::screen`'s own doc comment).
+    pub cohorts: Vec<CohortDecision>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +57,7 @@ pub struct ReportSummary {
     pub zirv_version: String,
     pub baseline_sha: String,
     pub started_at: u64,
+    pub finished_at: Option<u64>,
     pub promoted: Option<String>,
     pub verdict: String,
     pub rows: Vec<CandidateReportRow>,
@@ -117,23 +147,182 @@ fn campaign_verdict(events: &[LedgerEvent]) -> (Option<String>, String, Option<S
     (None, "unmeasured".to_string(), None)
 }
 
+/// The `ts` of the campaign's own closing event (`campaign_finished` or
+/// `campaign_stopped`), or `None` while it is still in progress.
+fn finished_at(events: &[LedgerEvent]) -> Option<u64> {
+    events.iter().rev().find_map(|event| match event {
+        LedgerEvent::CampaignFinished { ts, .. } | LedgerEvent::CampaignStopped { ts, .. } => {
+            Some(*ts)
+        }
+        _ => None,
+    })
+}
+
+/// The latest `ts` seen anywhere in the ledger, or `started_at` when the
+/// ledger is empty -- used for "wall used" even on an in-progress campaign
+/// that has not (yet) written a closing event.
+fn last_event_ts(events: &[LedgerEvent], started_at: u64) -> u64 {
+    let last = match events {
+        [.., last] => match last {
+            LedgerEvent::CampaignStarted { ts, .. }
+            | LedgerEvent::TrialScheduled { ts, .. }
+            | LedgerEvent::TrialFinished { ts, .. }
+            | LedgerEvent::TrialFailed { ts, .. }
+            | LedgerEvent::CandidateProposed { ts, .. }
+            | LedgerEvent::CandidateRejected { ts, .. }
+            | LedgerEvent::StageDecision { ts, .. }
+            | LedgerEvent::HoldoutUsed { ts, .. }
+            | LedgerEvent::CampaignStopped { ts, .. }
+            | LedgerEvent::CampaignFinished { ts, .. } => *ts,
+        },
+        [] => started_at,
+    };
+    last.max(started_at)
+}
+
+fn parse_screen_detail(
+    candidate: &Candidate,
+    verdict: &str,
+    detail: &serde_json::Value,
+) -> CandidateReportRow {
+    let reason = detail
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let points = detail.get("points");
+    let metric = |key: &str| -> Vec<f64> {
+        points
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_f64())
+            .into_iter()
+            .collect()
+    };
+    let excluded_by_reason = detail
+        .get("excluded_by_reason")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    CandidateReportRow {
+        candidate: candidate.id.clone(),
+        stage: "screen".to_string(),
+        verdict: verdict.to_string(),
+        hypothesis: candidate.hypothesis.clone(),
+        d_correctness: metric("d_correctness"),
+        rel_cost: metric("rel_cost"),
+        rel_wall: metric("rel_wall"),
+        reasons: reason.into_iter().collect(),
+        confidence: None,
+        seed: None,
+        excluded_by_reason,
+        cohorts: Vec::new(),
+    }
+}
+
+fn parse_decision_detail(
+    candidate: &Candidate,
+    stage: &str,
+    verdict: &str,
+    detail: &serde_json::Value,
+) -> Option<CandidateReportRow> {
+    let decision: super::promote::Decision = serde_json::from_value(detail.clone()).ok()?;
+    let seed = detail.get("seed").and_then(|v| v.as_u64());
+    let excluded_by_reason = detail
+        .get("excluded_by_reason")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let d_correctness = decision
+        .cohorts
+        .iter()
+        .filter_map(|c| c.d_correctness.as_ref())
+        .map(|iv| iv.point)
+        .collect();
+    let rel_cost = decision
+        .cohorts
+        .iter()
+        .filter_map(|c| c.rel_cost.as_ref())
+        .map(|iv| iv.point)
+        .collect();
+    let rel_wall = decision
+        .cohorts
+        .iter()
+        .filter_map(|c| c.rel_wall.as_ref())
+        .map(|iv| iv.point)
+        .collect();
+
+    Some(CandidateReportRow {
+        candidate: candidate.id.clone(),
+        stage: stage.to_string(),
+        verdict: verdict.to_string(),
+        hypothesis: candidate.hypothesis.clone(),
+        d_correctness,
+        rel_cost,
+        rel_wall,
+        reasons: decision.reasons.clone(),
+        confidence: Some(decision.confidence),
+        seed,
+        excluded_by_reason,
+        cohorts: decision.cohorts,
+    })
+}
+
 fn candidate_rows(events: &[LedgerEvent], candidates: &[Candidate]) -> Vec<CandidateReportRow> {
     let mut rows = Vec::new();
     for candidate in candidates {
         for stage in ["screen", "validate", "holdout"] {
-            if let Some(LedgerEvent::StageDecision { verdict, .. }) =
-                events.iter().rev().find(|e| matches!(e, LedgerEvent::StageDecision { candidate: c, stage: s, .. } if c == &candidate.id && s == stage))
-            {
-                rows.push(CandidateReportRow {
-                    candidate: candidate.id.clone(),
-                    stage: stage.to_string(),
-                    verdict: verdict.clone(),
-                    hypothesis: candidate.hypothesis.clone(),
-                });
+            let found = events.iter().rev().find_map(|e| match e {
+                LedgerEvent::StageDecision {
+                    candidate: c,
+                    stage: s,
+                    verdict,
+                    detail,
+                    ..
+                } if c == &candidate.id && s == stage => Some((verdict.as_str(), detail)),
+                _ => None,
+            });
+            let Some((verdict, detail)) = found else {
+                continue;
+            };
+            let row = if stage == "screen" {
+                Some(parse_screen_detail(candidate, verdict, detail))
+            } else {
+                parse_decision_detail(candidate, stage, verdict, detail)
+            };
+            if let Some(row) = row {
+                rows.push(row);
             }
         }
     }
     rows
+}
+
+/// One retry (an attempt beyond the first) dispatched, per candidate --
+/// `trial_scheduled.attempt > 0` is the only place a retry shows up in the
+/// ledger; `trial_failed.retryable` says a retry is OWED, not that one
+/// actually ran.
+fn retries_by_candidate(events: &[LedgerEvent]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for event in events {
+        if let LedgerEvent::TrialScheduled {
+            candidate, attempt, ..
+        } = event
+            && *attempt > 0
+        {
+            *counts.entry(candidate.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn format_metric(values: &[f64]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 }
 
 fn write_results_tsv(path: &Path, rows: &[CandidateReportRow]) -> CtxResult<()> {
@@ -145,28 +334,80 @@ fn write_results_tsv(path: &Path, rows: &[CandidateReportRow]) -> CtxResult<()> 
     for row in rows {
         writeln!(
             file,
-            "{}\t{}\t{}\t\t\t\t{}",
-            row.candidate, row.stage, row.verdict, row.hypothesis
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.candidate,
+            row.stage,
+            row.verdict,
+            format_metric(&row.rel_cost),
+            format_metric(&row.rel_wall),
+            format_metric(&row.d_correctness),
+            row.hypothesis
         )?;
     }
     Ok(())
 }
 
-fn write_report_md(path: &Path, summary: &ReportSummary, lock: &Lock) -> CtxResult<()> {
-    let mut file = std::fs::File::create(path)?;
-    writeln!(file, "# Autoresearch campaign: {}", summary.campaign_id)?;
-    writeln!(file)?;
-    match &summary.promoted {
-        Some(id) => writeln!(file, "**Verdict:** promoted candidate `{id}`")?,
-        None => writeln!(file, "**Verdict:** no improvement (nothing promoted)")?,
-    }
-    if let Some(reason) = &summary.stopped_reason {
-        writeln!(file, "**Stopped:** {reason}")?;
-    }
-    writeln!(file)?;
+/// `YYYY-MM-DD HH:MM:SS UTC` from a unix timestamp, using pure civil-
+/// calendar arithmetic (Howard Hinnant's well-known `civil_from_days`) --
+/// the same "no timezone-crate dependency just to print a clock" approach
+/// `ctx::attention::utc_hhmm` already uses for a bare `HH:MM`, extended to a
+/// full date since a report's provenance needs more than a clock face.
+fn format_utc(ts: u64) -> String {
+    let days = (ts / 86_400) as i64;
+    let secs_of_day = ts % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60
+    )
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn write_provenance(
+    file: &mut std::fs::File,
+    summary: &ReportSummary,
+    lock: &Lock,
+) -> CtxResult<()> {
     writeln!(file, "## Provenance")?;
     writeln!(file, "- zirv version: {}", summary.zirv_version)?;
+    writeln!(file, "- manifest: `{}`", lock.manifest_path.display())?;
+    writeln!(file, "- manifest sha256: {}", lock.manifest_sha256)?;
+    writeln!(file, "- repo: `{}`", lock.repo.display())?;
     writeln!(file, "- baseline commit: {}", summary.baseline_sha)?;
+    writeln!(file, "- corpus: `{}`", lock.manifest.corpus.file.display())?;
+    writeln!(file, "- corpus version: {}", lock.corpus_version)?;
+    writeln!(file, "- billing: `{:?}`", lock.manifest.billing)?;
+    writeln!(
+        file,
+        "- route: harness `{}`, model `{}`",
+        lock.manifest.route.harness, lock.manifest.route.model
+    )?;
+    writeln!(
+        file,
+        "- cache mode: `{}`",
+        lock.manifest.cache_mode.as_str()
+    )?;
+    writeln!(
+        file,
+        "- pressure: `{}`",
+        lock.manifest.cohort.pressure.as_str()
+    )?;
+    writeln!(file, "- stratify: `{:?}`", lock.manifest.stratify)?;
     writeln!(
         file,
         "- evaluator version: {}",
@@ -182,8 +423,349 @@ fn write_report_md(path: &Path, summary: &ReportSummary, lock: &Lock) -> CtxResu
     if let Some(price_as_of) = &lock.price_as_of {
         writeln!(file, "- price table as_of: {price_as_of}")?;
     }
-    writeln!(file, "- started at: {}", summary.started_at)?;
+    writeln!(
+        file,
+        "- started at: {} ({})",
+        summary.started_at,
+        format_utc(summary.started_at)
+    )?;
+    match summary.finished_at {
+        Some(ts) => writeln!(file, "- finished at: {} ({})", ts, format_utc(ts))?,
+        None => writeln!(file, "- finished at: (still in progress)")?,
+    }
     writeln!(file)?;
+    Ok(())
+}
+
+fn write_criteria(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
+    let c = &lock.manifest.criteria;
+    writeln!(file, "## Promotion criteria")?;
+    writeln!(
+        file,
+        "Values actually used, from this manifest's own `[criteria]` table (never a hardcoded default once a manifest sets one):"
+    )?;
+    writeln!(file, "| key | value |")?;
+    writeln!(file, "|---|---|")?;
+    writeln!(file, "| min_pairs | {} |", c.min_pairs)?;
+    writeln!(file, "| correctness_floor | {:.3} |", c.correctness_floor)?;
+    writeln!(
+        file,
+        "| quality_floor | {} |",
+        c.quality_floor
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "(none)".to_string())
+    )?;
+    writeln!(
+        file,
+        "| max_correctness_regression | {:.3} |",
+        c.max_correctness_regression
+    )?;
+    writeln!(
+        file,
+        "| max_quality_regression | {:.3} |",
+        c.max_quality_regression
+    )?;
+    writeln!(file, "| min_effect | {:.3} |", c.min_effect)?;
+    writeln!(file, "| confidence (base) | {:.3} |", c.confidence)?;
+    writeln!(file, "| bootstrap_resamples | {} |", c.bootstrap_resamples)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+fn write_budgets(
+    file: &mut std::fs::File,
+    lock: &Lock,
+    events: &[LedgerEvent],
+    summary: &ReportSummary,
+) -> CtxResult<()> {
+    let budgets = lock.manifest.budgets;
+    let tracker = reconstruct_tracker(lock.started_at, events);
+    let wall_used = last_event_ts(events, lock.started_at).saturating_sub(lock.started_at);
+    let max_attempt = events
+        .iter()
+        .filter_map(|e| match e {
+            LedgerEvent::TrialScheduled { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let total_retries: usize = retries_by_candidate(events).values().sum();
+
+    writeln!(file, "## Budgets")?;
+    writeln!(file, "| cap | limit | used |")?;
+    writeln!(file, "|---|---|---|")?;
+    writeln!(
+        file,
+        "| spend (execution) | (part of total spend, below) | ${:.4} |",
+        summary.spend.execution_usd
+    )?;
+    writeln!(
+        file,
+        "| spend (overhead) | (part of total spend, below) | ${:.4} |",
+        summary.spend.overhead_usd
+    )?;
+    writeln!(
+        file,
+        "| spend (total) | ${:.2} | ${:.4} |",
+        budgets.max_spend_usd,
+        summary.spend.execution_usd + summary.spend.overhead_usd
+    )?;
+    writeln!(
+        file,
+        "| calls | {} | {} |",
+        budgets.max_calls, tracker.calls_used
+    )?;
+    writeln!(
+        file,
+        "| trials | {} | {} |",
+        budgets.max_trials, tracker.trials_dispatched
+    )?;
+    writeln!(
+        file,
+        "| retries (per-trial cap: {}) | max attempt seen: {} | {} retry dispatches total |",
+        budgets.max_retries, max_attempt, total_retries
+    )?;
+    writeln!(
+        file,
+        "| wall | {}s | {}s |",
+        budgets.max_wall_secs, wall_used
+    )?;
+    writeln!(file)?;
+    if let Some(reason) = &summary.stopped_reason {
+        writeln!(file, "**Stopped early:** `{reason}`")?;
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
+fn write_coverage(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
+    writeln!(file, "## Coverage and limitations")?;
+    writeln!(
+        file,
+        "- seat_mode = `{:?}`: single-seat results are not orchestration evidence.",
+        lock.manifest.seat_mode
+    )?;
+    writeln!(file, "- runtime = `{:?}`.", lock.manifest.runtime)?;
+    if matches!(lock.manifest.runtime, super::manifest::Runtime::Native) {
+        writeln!(
+            file,
+            "- native runtime: unmeasured -- `zirv native` is release-gated (issue #802)."
+        )?;
+    }
+    if matches!(
+        lock.manifest.seat_mode,
+        super::manifest::SeatMode::Orchestration
+    ) {
+        writeln!(
+            file,
+            "- orchestration: unmeasured -- no orchestration suite exists yet."
+        )?;
+    }
+    if lock.corpus_families.len() == 1 {
+        writeln!(
+            file,
+            "- single project family: `{}` -- this result does not generalize across project families.",
+            lock.corpus_families[0]
+        )?;
+    }
+    writeln!(file)?;
+    Ok(())
+}
+
+fn write_reproduction(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
+    writeln!(file, "## Reproduction")?;
+    writeln!(
+        file,
+        "1. Check out the exact baseline this campaign ran against:"
+    )?;
+    writeln!(file, "```")?;
+    writeln!(
+        file,
+        "git -C {} checkout {}",
+        lock.repo.display(),
+        lock.baseline_sha
+    )?;
+    writeln!(file, "```")?;
+    writeln!(
+        file,
+        "2. Run the same manifest, resuming this campaign directory if it stopped early (a fresh run without `--resume` starts a new campaign instead):"
+    )?;
+    writeln!(file, "```")?;
+    writeln!(
+        file,
+        "zirv workflow research run {} --repo {} --resume",
+        lock.manifest_path.display(),
+        lock.repo.display()
+    )?;
+    writeln!(file, "```")?;
+    Ok(())
+}
+
+fn plural(reason: &str) -> &'static str {
+    match reason {
+        "untriggered" => " (a required receipt never fired)",
+        "env_mismatch" => {
+            " (the candidate's env fingerprint did not match the paired baseline trial)"
+        }
+        _ => "",
+    }
+}
+
+fn write_candidates(
+    file: &mut std::fs::File,
+    summary: &ReportSummary,
+    lock: &Lock,
+    retries: &BTreeMap<String, usize>,
+) -> CtxResult<()> {
+    writeln!(file, "## Candidates")?;
+    writeln!(
+        file,
+        "| candidate | stage | verdict | rel_cost | rel_wall | d_correctness |"
+    )?;
+    writeln!(file, "|---|---|---|---|---|---|")?;
+    for row in &summary.rows {
+        writeln!(
+            file,
+            "| {} | {} | {} | {} | {} | {} |",
+            row.candidate,
+            row.stage,
+            row.verdict,
+            format_metric(&row.rel_cost),
+            format_metric(&row.rel_wall),
+            format_metric(&row.d_correctness)
+        )?;
+    }
+    writeln!(file)?;
+
+    for candidate in &lock.manifest.candidates {
+        let rows: Vec<&CandidateReportRow> = summary
+            .rows
+            .iter()
+            .filter(|r| r.candidate == candidate.id)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(file, "### `{}`", candidate.id)?;
+        writeln!(file, "{}", candidate.hypothesis)?;
+        writeln!(file)?;
+        for row in &rows {
+            writeln!(file, "**{}**: {}", row.stage, row.verdict)?;
+            if let Some(confidence) = row.confidence {
+                writeln!(file, "- confidence used: {confidence:.4}")?;
+            }
+            if let Some(seed) = row.seed {
+                writeln!(file, "- bootstrap seed: {seed}")?;
+            }
+            if !row.reasons.is_empty() {
+                writeln!(file, "- reasons:")?;
+                for reason in &row.reasons {
+                    writeln!(file, "  - {reason}")?;
+                }
+            }
+            if row.excluded_by_reason.is_empty() {
+                writeln!(file, "- exclusions: none")?;
+            } else {
+                writeln!(file, "- exclusions:")?;
+                for (reason, count) in &row.excluded_by_reason {
+                    writeln!(file, "  - {reason}: {count}{}", plural(reason))?;
+                }
+            }
+            writeln!(
+                file,
+                "  - tampered: 0 (evaluator drift stops the whole campaign immediately -- see [`R1`] -- it never marks individual observations)"
+            )?;
+            for cohort in &row.cohorts {
+                writeln!(file, "- cohort `{}`:", cohort.cohort)?;
+                writeln!(
+                    file,
+                    "  - baseline: n={}, success_rate={:.3}, timeout_rate={:.3}, error_rate={:.3}, correctness_mean={}, quality_mean={}, cost_per_success_usd={}, wall_median_ms={}, wall_p90_ms={}",
+                    cohort.baseline.n,
+                    cohort.baseline.success_rate,
+                    cohort.baseline.timeout_rate,
+                    cohort.baseline.error_rate,
+                    opt(cohort.baseline.correctness_mean),
+                    opt(cohort.baseline.quality_mean),
+                    opt(cohort.baseline.cost_per_success_usd),
+                    opt_u64(cohort.baseline.wall_median_ms),
+                    opt_u64(cohort.baseline.wall_p90_ms),
+                )?;
+                writeln!(
+                    file,
+                    "  - candidate: n={}, success_rate={:.3}, timeout_rate={:.3}, error_rate={:.3}, correctness_mean={}, quality_mean={}, cost_per_success_usd={}, wall_median_ms={}, wall_p90_ms={}",
+                    cohort.candidate.n,
+                    cohort.candidate.success_rate,
+                    cohort.candidate.timeout_rate,
+                    cohort.candidate.error_rate,
+                    opt(cohort.candidate.correctness_mean),
+                    opt(cohort.candidate.quality_mean),
+                    opt(cohort.candidate.cost_per_success_usd),
+                    opt_u64(cohort.candidate.wall_median_ms),
+                    opt_u64(cohort.candidate.wall_p90_ms),
+                )?;
+                writeln!(
+                    file,
+                    "  - d_correctness: {}, d_quality: {}, rel_cost: {}, rel_wall: {} (point [lo, hi])",
+                    interval(cohort.d_correctness.as_ref()),
+                    interval(cohort.d_quality.as_ref()),
+                    interval(cohort.rel_cost.as_ref()),
+                    interval(cohort.rel_wall.as_ref()),
+                )?;
+            }
+            let retries_used = retries.get(&candidate.id).copied().unwrap_or(0);
+            writeln!(file, "- retries: {retries_used}")?;
+            if candidate
+                .strategy
+                .as_ref()
+                .is_some_and(|s| s.kind == "escalate")
+            {
+                writeln!(
+                    file,
+                    "- escalation frequency: not recorded (per-trial details are not persisted to the ledger)"
+                )?;
+            }
+        }
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
+fn opt(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.3}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn opt_u64(v: Option<u64>) -> String {
+    v.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+fn interval(iv: Option<&super::stats::Interval>) -> String {
+    match iv {
+        Some(iv) => format!("{:.4} [{:.4}, {:.4}]", iv.point, iv.lo, iv.hi),
+        None => "-".to_string(),
+    }
+}
+
+fn write_report_md(
+    path: &Path,
+    summary: &ReportSummary,
+    lock: &Lock,
+    events: &[LedgerEvent],
+) -> CtxResult<()> {
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "# Autoresearch campaign: {}", summary.campaign_id)?;
+    writeln!(file)?;
+    match &summary.promoted {
+        Some(id) => writeln!(file, "**Verdict:** promoted candidate `{id}`")?,
+        None => writeln!(file, "**Verdict:** no improvement (nothing promoted)")?,
+    }
+    if let Some(reason) = &summary.stopped_reason {
+        writeln!(file, "**Stopped:** {reason}")?;
+    }
+    writeln!(file)?;
+    write_provenance(&mut file, summary, lock)?;
+    write_criteria(&mut file, lock)?;
+    write_budgets(&mut file, lock, events, summary)?;
     writeln!(file, "## Spend")?;
     writeln!(
         file,
@@ -201,35 +783,21 @@ fn write_report_md(path: &Path, summary: &ReportSummary, lock: &Lock) -> CtxResu
         summary.spend.completeness
     )?;
     writeln!(file)?;
-    writeln!(file, "## Coverage and limitations")?;
-    writeln!(
-        file,
-        "- seat_mode = `{:?}`: single-seat results are not orchestration evidence.",
-        lock.manifest.seat_mode
-    )?;
-    writeln!(file, "- runtime = `{:?}`.", lock.manifest.runtime)?;
-    writeln!(file)?;
-    writeln!(file, "## Candidates")?;
-    writeln!(file, "| candidate | stage | verdict |")?;
-    writeln!(file, "|---|---|---|")?;
-    for row in &summary.rows {
-        writeln!(
-            file,
-            "| {} | {} | {} |",
-            row.candidate, row.stage, row.verdict
-        )?;
-    }
-    writeln!(file)?;
-    writeln!(file, "## Reproduction")?;
-    writeln!(file, "```")?;
-    writeln!(file, "zirv workflow research run <manifest> --resume")?;
-    writeln!(file, "```")?;
+    write_coverage(&mut file, lock)?;
+    let retries = retries_by_candidate(events);
+    write_candidates(&mut file, summary, lock, &retries)?;
+    write_reproduction(&mut file, lock)?;
     Ok(())
 }
 
-fn write_rollback(path: &Path, candidate_id: &str) -> CtxResult<()> {
+fn write_rollback(
+    path: &Path,
+    candidate: &Candidate,
+    keys: &[Vec<&'static str>],
+    has_patch: bool,
+) -> CtxResult<()> {
     let mut file = std::fs::File::create(path)?;
-    writeln!(file, "# Rollback: {candidate_id}")?;
+    writeln!(file, "# Rollback: {}", candidate.id)?;
     writeln!(file)?;
     writeln!(
         file,
@@ -239,19 +807,112 @@ fn write_rollback(path: &Path, candidate_id: &str) -> CtxResult<()> {
         file,
         "repository or the operator's own `~/.zirv/ctx.toml` was changed by this"
     )?;
+    writeln!(file, "campaign.")?;
+    writeln!(file)?;
+    if has_patch {
+        writeln!(
+            file,
+            "To adopt it: apply `proposal/candidate.patch` in the repo."
+        )?;
+        writeln!(file, "To roll back after adopting it:")?;
+        writeln!(file, "```")?;
+        writeln!(file, "git apply -R proposal/candidate.patch")?;
+        writeln!(file, "```")?;
+    } else if keys.is_empty() {
+        writeln!(
+            file,
+            "To adopt it: apply the environment variables in `proposal/overlay.toml`'s comments."
+        )?;
+        writeln!(file, "To roll back: unset those environment variables.")?;
+    } else {
+        writeln!(
+            file,
+            "To adopt it: merge `proposal/overlay.toml` into `~/.zirv/ctx.toml`."
+        )?;
+        writeln!(
+            file,
+            "To roll back after adopting it, remove exactly these keys:"
+        )?;
+        for key in keys {
+            writeln!(file, "- `{}`", key.join("."))?;
+        }
+    }
+    writeln!(file)?;
     writeln!(
         file,
-        "campaign. To adopt it, apply `proposal/overlay.toml` or"
+        "Keep `report.json` and `ledger.jsonl` from this campaign directory as the"
     )?;
     writeln!(
         file,
-        "`proposal/candidate.patch` yourself; to roll back after adopting it,"
+        "evidence record for this change, whichever way you decide."
     )?;
-    writeln!(file, "remove those keys (or revert the patch).")?;
     Ok(())
 }
 
-fn write_overlay(path: &Path, candidate: &Candidate) -> CtxResult<()> {
+/// `raw` typed as a TOML scalar: `"true"`/`"false"` as a boolean, an
+/// integer- or float-parseable string as a number, anything else as a
+/// string. A best-effort rendering from the candidate's own `env` string
+/// map -- `ctx::config`'s real `EnvKind` (which would type this exactly) is
+/// private to that module; `toml_path_for_env` exposes only the key path.
+fn typed_toml_value(raw: &str) -> toml::Value {
+    if raw == "true" {
+        return toml::Value::Boolean(true);
+    }
+    if raw == "false" {
+        return toml::Value::Boolean(false);
+    }
+    if let Ok(i) = raw.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+    if let Ok(f) = raw.parse::<f64>() {
+        return toml::Value::Float(f);
+    }
+    toml::Value::String(raw.to_string())
+}
+
+fn insert_nested(table: &mut toml::value::Table, path: &[&str], value: toml::Value) {
+    let Some((head, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        table.insert((*head).to_string(), value);
+        return;
+    }
+    let entry = table
+        .entry((*head).to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::value::Table::new());
+    }
+    if let Some(child) = entry.as_table_mut() {
+        insert_nested(child, rest, value);
+    }
+}
+
+/// Renders the candidate's env overlay as real `~/.zirv/ctx.toml` keys
+/// (`ctx::config::toml_path_for_env`), with the source env var kept as a
+/// comment next to each key -- an env var with no known mapping falls back
+/// to a top-level key named after itself, clearly marked unmapped. Returns
+/// the resolved key paths too, so `ROLLBACK.md` can name exactly what to
+/// remove.
+fn write_overlay(path: &Path, candidate: &Candidate) -> CtxResult<Vec<Vec<&'static str>>> {
+    let mut root = toml::value::Table::new();
+    let mut resolved: Vec<Vec<&'static str>> = Vec::new();
+    let mut unmapped: Vec<&str> = Vec::new();
+    for (env_key, raw_value) in &candidate.env {
+        let value = typed_toml_value(raw_value);
+        match crate::commands::ctx::config::toml_path_for_env(env_key) {
+            Some(key_path) => {
+                insert_nested(&mut root, key_path, value);
+                resolved.push(key_path.to_vec());
+            }
+            None => {
+                root.insert(env_key.clone(), value);
+                unmapped.push(env_key.as_str());
+            }
+        }
+    }
+
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
@@ -261,21 +922,40 @@ fn write_overlay(path: &Path, candidate: &Candidate) -> CtxResult<()> {
     writeln!(file, "#")?;
     writeln!(
         file,
-        "# No `ctx.toml` key mapping is available from this lane (the reverse"
+        "# Merge these keys into ~/.zirv/ctx.toml (or the repo's committed"
     )?;
     writeln!(
         file,
-        "# env -> config-key table is private to `src/commands/ctx/config.rs`,"
+        "# .zirv/ctx.toml) to adopt this candidate. Each source env var is"
     )?;
-    writeln!(
-        file,
-        "# which this lane does not modify) -- apply these as environment"
-    )?;
-    writeln!(file, "# variables instead:")?;
-    for (key, value) in &candidate.env {
-        writeln!(file, "# export {key}={value}")?;
+    writeln!(file, "# noted as a comment next to its key.")?;
+    for env_key in candidate.env.keys() {
+        if let Some(key_path) = crate::commands::ctx::config::toml_path_for_env(env_key) {
+            writeln!(file, "# {env_key} -> {}", key_path.join("."))?;
+        }
     }
-    Ok(())
+    if !unmapped.is_empty() {
+        writeln!(file, "#")?;
+        writeln!(
+            file,
+            "# No ctx.toml key mapping is known for: {}. Set these as environment",
+            unmapped.join(", ")
+        )?;
+        writeln!(file, "# variables instead:")?;
+        for env_key in &unmapped {
+            writeln!(file, "# export {env_key}={}", candidate.env[*env_key])?;
+        }
+    }
+    writeln!(file)?;
+    if !root.is_empty() {
+        write!(
+            file,
+            "{}",
+            toml::to_string_pretty(&toml::Value::Table(root))
+                .map_err(|err| format!("could not render overlay.toml: {err}"))?
+        )?;
+    }
+    Ok(resolved)
 }
 
 /// Regenerates every report artifact for `campaign_dir` from its
@@ -292,6 +972,7 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
         zirv_version: lock.zirv_version.clone(),
         baseline_sha: lock.baseline_sha.clone(),
         started_at: lock.started_at,
+        finished_at: finished_at(&events),
         promoted: promoted.clone(),
         verdict,
         rows,
@@ -299,7 +980,7 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
         spend,
     };
 
-    write_report_md(&campaign_dir.join("report.md"), &summary, &lock)?;
+    write_report_md(&campaign_dir.join("report.md"), &summary, &lock, &events)?;
     std::fs::write(
         campaign_dir.join("report.json"),
         serde_json::to_string_pretty(&summary)?,
@@ -315,25 +996,22 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
             .iter()
             .find(|c| &c.id == candidate_id)
         {
-            if candidate.patch.is_some() {
-                let source = lock
-                    .manifest
-                    .candidate_space
-                    .source_patch
-                    .as_ref()
-                    .map(|_| candidate.patch.clone().unwrap_or_default())
-                    .unwrap_or_default();
-                let _ = source; // The patch file itself lives beside the manifest; nothing to copy here.
-                let mut note = std::fs::File::create(proposal_dir.join("candidate.patch.txt"))?;
-                writeln!(
-                    note,
-                    "See the candidate's own `patch` file next to the manifest: {source}"
-                )?;
+            if let Some(patch_rel) = &candidate.patch {
+                let manifest_dir = lock
+                    .manifest_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| Path::new(".").to_path_buf());
+                let source = manifest_dir.join(patch_rel);
+                if source.is_file() {
+                    std::fs::copy(&source, proposal_dir.join("candidate.patch"))?;
+                }
+                write_rollback(&proposal_dir.join("ROLLBACK.md"), candidate, &[], true)?;
             } else {
-                write_overlay(&proposal_dir.join("overlay.toml"), candidate)?;
+                let keys = write_overlay(&proposal_dir.join("overlay.toml"), candidate)?;
+                write_rollback(&proposal_dir.join("ROLLBACK.md"), candidate, &keys, false)?;
             }
         }
-        write_rollback(&proposal_dir.join("ROLLBACK.md"), candidate_id)?;
     }
 
     Ok(summary)
@@ -351,7 +1029,6 @@ pub fn stage_summary(campaign_dir: &Path, stage: Stage, candidate: &str) -> CtxR
 mod tests {
     use super::*;
     use crate::commands::workflow::research::manifest::Manifest;
-    use std::collections::BTreeMap;
 
     fn write_minimal_lock(campaign_dir: &Path, candidate_id: &str, patch: bool) {
         let candidates_toml = if patch {
@@ -429,8 +1106,12 @@ allow_env = ["ZIRV_CTX_JEV_MEMORY"]
         let manifest = Manifest::parse(&manifest_text).unwrap();
         let lock = Lock {
             manifest,
+            manifest_path: campaign_dir.join("manifest.toml"),
+            repo: campaign_dir.join("repo"),
             manifest_sha256: "abc".to_string(),
             baseline_sha: "deadbeef".to_string(),
+            corpus_version: "1".to_string(),
+            corpus_families: vec!["ledgerlite".to_string()],
             evaluator_version: Some("v1".to_string()),
             evaluator_files: BTreeMap::new(),
             evaluator_fingerprint: "fp".to_string(),
@@ -482,5 +1163,22 @@ allow_env = ["ZIRV_CTX_JEV_MEMORY"]
         assert_eq!(summary.verdict, "accept");
         assert!(dir.path().join("proposal/overlay.toml").is_file());
         assert!(dir.path().join("proposal/ROLLBACK.md").is_file());
+        let overlay = std::fs::read_to_string(dir.path().join("proposal/overlay.toml")).unwrap();
+        assert!(
+            overlay.contains("[jev]") && overlay.contains("memory = true"),
+            "must render the real ctx.toml key, not just an env-var comment: {overlay}"
+        );
+        let rollback = std::fs::read_to_string(dir.path().join("proposal/ROLLBACK.md")).unwrap();
+        assert!(
+            rollback.contains("jev.memory"),
+            "must name the exact key to remove: {rollback}"
+        );
+    }
+
+    #[test]
+    fn format_utc_matches_known_epoch_values() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
+        // The "Unix billennium" -- a well-known round-number timestamp.
+        assert_eq!(format_utc(1_000_000_000), "2001-09-09 01:46:40 UTC");
     }
 }
