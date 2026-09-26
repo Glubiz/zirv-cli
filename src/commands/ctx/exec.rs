@@ -2658,7 +2658,7 @@ fn run_with_clock_inner<W: Write>(
                 .chain(user_extra.iter().cloned())
                 .chain(prompt_args.iter().cloned())
                 .collect();
-            // Issue #789 (`[jev] compaction_select`): best-effort, off by
+            // Issue #798 (`[jev] compaction_select`): best-effort, off by
             // default -- `compaction_focus_for_transcript` checks the gate
             // and credential BEFORE touching the transcript at all (review
             // of 6bdd7675, defect #1), so this costs nothing observable on

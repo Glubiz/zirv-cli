@@ -4128,7 +4128,7 @@ fn pump(
                     supervision.signals_seen,
                 );
                 let defer = adapter.capabilities().defer_injection_submit;
-                // Issue #789 (`[jev] compaction_select`): best-effort, off by
+                // Issue #798 (`[jev] compaction_select`): best-effort, off by
                 // default -- `compaction_focus_for_transcript` checks the
                 // gate and credential BEFORE touching the transcript at all
                 // (review of 6bdd7675, defect #1), so with the gate off

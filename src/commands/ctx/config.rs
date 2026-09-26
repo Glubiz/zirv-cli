@@ -2036,7 +2036,7 @@ pub struct JevConfig {
     pub classify: bool,
     /// Issue #783: Jev keep/drop scoring of handoff candidate items.
     pub handoff_select: bool,
-    /// Issue #789: Jev-ranked keep list appended to a compaction's own focus
+    /// Issue #798: Jev-ranked keep list appended to a compaction's own focus
     /// text.
     pub compaction_select: bool,
     /// Issue #784: Jev prompt-injection screening of untrusted inputs.

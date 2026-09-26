@@ -1903,9 +1903,9 @@ fn jev_select_optional_handoff_items(
     handoff
 }
 
-// -- compaction_select (issue #789) -----------------------------------------
+// -- compaction_select (issue #798) -----------------------------------------
 
-/// Issue #789 (`[jev] compaction_select`): one candidate this off-by-default
+/// Issue #798 (`[jev] compaction_select`): one candidate this off-by-default
 /// pass may feature by name in a compaction's own focus text -- extracted
 /// directly and deterministically from a `StructuralContext`, never from a
 /// distilled `Handoff`: compaction must stay cheap (one bounded [`jev::
@@ -1953,7 +1953,7 @@ struct CompactionCandidate {
     text: String,
 }
 
-/// Per-item render cap (issue #789): applied BEFORE the keep list's own
+/// Per-item render cap (issue #798): applied BEFORE the keep list's own
 /// overall [`COMPACTION_KEEP_LIST_MAX_CHARS`] budget, so one very long
 /// candidate can never crowd out every other one on its own.
 const COMPACTION_ITEM_CHAR_CAP: usize = 120;
@@ -2090,7 +2090,7 @@ const COMPACTION_SELECT_KEEP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
 /// [`CompactionItemKind::type_id`] for the item-type cell, and
 /// [`compaction_select_facts_row`] for every other one. Kept at or under
 /// `jev::safe_metadata_request`'s own 512-byte instructions ceiling (issue
-/// #789 regression: an earlier, wordier draft of this string ran over that
+/// #798 regression: an earlier, wordier draft of this string ran over that
 /// ceiling, which made every real call silently fail closed as
 /// `JevError::UnsafeState` -- caught by
 /// [`tests::compaction_select_request_passes_safe_metadata_request`]).
@@ -2185,7 +2185,7 @@ const COMPACTION_KEEP_LIST_MAX_ITEMS: usize = 8;
 /// `base_focus` itself.
 const COMPACTION_KEEP_LIST_MAX_CHARS: usize = 600;
 
-/// Issue #789 (`[jev] compaction_select`): appends a short, Jev-chosen keep
+/// Issue #798 (`[jev] compaction_select`): appends a short, Jev-chosen keep
 /// list to `base_focus` (`supervise::COMPACT_FOCUS` at every call site
 /// today) when the gate is on, Jev is available, and at least one candidate
 /// clears a decisive keep verdict. Gate off, no credential, no candidates,
@@ -2290,7 +2290,7 @@ const COMPACTION_SELECT_TIMEOUT_SECS: u64 = 2;
 /// with `[jev] compaction_select` off (the default) or no credential
 /// available, this returns `base_focus` completely untouched, with zero
 /// filesystem access and zero allocation beyond the one `to_string()` --
-/// byte-identical and zero-cost versus before issue #789, exactly like every
+/// byte-identical and zero-cost versus before issue #798, exactly like every
 /// other `[jev]`-gated site's own off-by-default contract. Only once the
 /// gate and credential both check out does this read `transcript`, parse it
 /// into a [`StructuralContext`], and hand off to [`compaction_focus_text`]
@@ -3243,7 +3243,7 @@ mod tests {
         );
     }
 
-    // -- compaction_focus_text / compaction_candidates (issue #789) ---------
+    // -- compaction_focus_text / compaction_candidates (issue #798) ---------
 
     const COMPACTION_TEST_BASE_FOCUS: &str = "BASE FOCUS TEXT";
 
@@ -3520,7 +3520,7 @@ mod tests {
         );
     }
 
-    /// Candidate extraction (issue #789): an edited file and a failing
+    /// Candidate extraction (issue #798): an edited file and a failing
     /// verification with no later success both become candidates; a plain
     /// `tool_errors` entry that predates a LATER successful verification run
     /// must not resurrect a failing-test candidate -- `last_verification`

@@ -774,7 +774,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
 
             if super::exec::should_attempt_compact(compact_requested, limit_hit) {
-                // Issue #789 (`[jev] compaction_select`): same best-effort,
+                // Issue #798 (`[jev] compaction_select`): same best-effort,
                 // off-by-default seam as `exec.rs`'s own `zirv ctx exec`
                 // compaction -- `zirv ctx loop` composes the identical
                 // `compact_in_place` call, so it gets the identical
