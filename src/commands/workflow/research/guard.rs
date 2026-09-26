@@ -236,6 +236,33 @@ pub fn validate_cohort_env(
     Ok(())
 }
 
+/// Prefixes a `[[candidates]] requires_receipts` entry may start with --
+/// see `crate::commands::ctx::attribution::load_receipt_counts` for what
+/// each one actually counts. `proxy:decision` is deliberately still
+/// accepted (a manifest may legitimately want "some intake decision ran at
+/// all", even though it cannot alone prove the Jev path specifically did --
+/// see `proxy:decider:<decider>` for that).
+const KNOWN_RECEIPT_PREFIXES: &[&str] = &["jev:", "effect:", "proxy:decision", "proxy:decider:"];
+
+/// A candidate's `requires_receipts` entry must start with a known receipt
+/// prefix -- an unrecognized one almost certainly means the manifest author
+/// mistyped or guessed a key that will never appear in any trial's
+/// receipts, silently marking every trial for that candidate `untriggered`
+/// forever rather than failing loudly at plan/load time.
+pub fn validate_requires_receipts(entries: &[String]) -> Result<(), String> {
+    for entry in entries {
+        if !KNOWN_RECEIPT_PREFIXES
+            .iter()
+            .any(|prefix| entry.starts_with(prefix))
+        {
+            return Err(format!(
+                "requires_receipts entry '{entry}' has an unrecognized prefix (expected one of {KNOWN_RECEIPT_PREFIXES:?})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Paths a source patch may never touch, whatever `allowed_paths` says.
 pub const HARD_DENY_PATCH_PATTERNS: &[&str] = &[
     ".github/**",
@@ -463,6 +490,22 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requires_receipts_accepts_known_prefixes_and_refuses_others() {
+        assert!(
+            validate_requires_receipts(&[
+                "jev:memory".to_string(),
+                "effect:compaction_select".to_string(),
+                "proxy:decision".to_string(),
+                "proxy:decider:typesafe".to_string(),
+            ])
+            .is_ok()
+        );
+        let err = validate_requires_receipts(&["jev_memory".to_string()])
+            .expect_err("a prefix without the colon must be refused");
+        assert!(err.contains("jev_memory"), "got: {err}");
+    }
 
     #[test]
     fn a_declared_bool_gate_accepts_true_and_false() {

@@ -6,13 +6,16 @@
 # --headless` path -- this campaign spends real money (every trial is one
 # live intake decision call) and is NEVER run in CI.
 #
-# `requires_receipts = ["proxy:decision"]`: the SpendReport shape in
-# docs/superpowers/specs/2026-09-26-autoresearch-design.md's #800 section
-# names `proxy:decision` as the receipt key for a proxy/intake decision
-# (its own worked example: `"receipts":{"jev:<site>":N,"effect:<name>":N,
-# "proxy:decision":N}`) -- a trial missing that receipt did not actually run
-# the production intake path (issue #803's "Candidate measurements prove
-# the intended production Jev path actually ran"), so it is `untriggered`,
+# `requires_receipts = ["proxy:decider:typesafe"]`: `proxy:decision` alone
+# (the design spec's original worked example) is written even when Jev
+# never ran at all -- the deterministic decider appends a `proxy-
+# decisions.jsonl` row too, so it cannot prove the production Jev/helper
+# intake path actually fired (issue #803's "Candidate measurements prove
+# the intended production Jev path actually ran"). `proxy:decider:typesafe`
+# is counted from that same row's own `decider` field (src/commands/ctx/
+# attribution.rs::load_receipt_counts) and is only present when the
+# typesafe Jev decider itself produced the decision -- a trial missing it
+# did not exercise the floors these candidates vary, so it is `untriggered`,
 # not silently counted.
 #
 # Corresponds to design spec #803 ("Build independent labelled decision
@@ -95,7 +98,7 @@ id = "floors-default"
 hypothesis = "Restating today's compiled-in floors changes nothing (sanity candidate)."
 mechanism = "No-op: same confidence/margin the deterministic path already uses."
 env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.6", ZIRV_CTX_PROXY_MIN_MARGIN = "0.15" }
-requires_receipts = ["proxy:decision"]
+requires_receipts = ["proxy:decider:typesafe"]
 
 # Looser floors: more decisions trust a lower-confidence Jev/helper answer
 # instead of falling back to the deterministic decider -- tests whether
@@ -106,7 +109,7 @@ id = "looser-floors"
 hypothesis = "A lower confidence/margin bar resolves more ambiguous/insufficient_facts cases decisively without under-tiering costly_error cases."
 mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN lowered -- more Jev/helper answers clear the bar."
 env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.5", ZIRV_CTX_PROXY_MIN_MARGIN = "0.10" }
-requires_receipts = ["proxy:decision"]
+requires_receipts = ["proxy:decider:typesafe"]
 
 # Tighter floors: fewer decisions trust Jev/helper, more fall back to the
 # deterministic decider -- tests whether that costs unnecessary
@@ -116,4 +119,4 @@ id = "tighter-floors"
 hypothesis = "A higher confidence/margin bar mainly costs abstention/coverage, not safety."
 mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN raised -- fewer Jev/helper answers clear the bar."
 env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.75", ZIRV_CTX_PROXY_MIN_MARGIN = "0.25" }
-requires_receipts = ["proxy:decision"]
+requires_receipts = ["proxy:decider:typesafe"]
