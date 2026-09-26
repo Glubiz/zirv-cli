@@ -335,38 +335,68 @@ pub(crate) fn stage_records_from_ledger(
             );
         }
     }
+    // The highest attempt ever actually scheduled for each trial id -- used
+    // below to tell a genuinely exhausted/terminal failure (`retryable:
+    // false`) apart from a *retryable* failure whose promised retry was
+    // never dispatched (a budget stop right after the crash orphaned it in
+    // the scheduler's in-memory queue; see `reconcile_unfinished`'s own
+    // fix). Both must count as a terminal crash here, or the trial silently
+    // vanishes from every downstream pair count instead of being charged
+    // and recorded.
+    let mut max_scheduled_attempt: BTreeMap<String, u32> = BTreeMap::new();
+    for event in events {
+        if let LedgerEvent::TrialScheduled {
+            trial_id, attempt, ..
+        } = event
+        {
+            let entry = max_scheduled_attempt
+                .entry(trial_id.clone())
+                .or_insert(*attempt);
+            if *attempt > *entry {
+                *entry = *attempt;
+            }
+        }
+    }
     for event in events {
         if let LedgerEvent::TrialFailed {
             trial_id,
             retryable,
+            attempt,
             ..
         } = event
-            && !*retryable
             && !records.contains_key(trial_id)
             && let Some(m) = meta.get(trial_id)
             && m.stage == stage.as_str()
             && m.candidate == candidate
         {
-            records.insert(
-                trial_id.clone(),
-                TrialRecord {
-                    task: m.task.clone(),
-                    rep: m.rep,
-                    arm: if m.arm == "baseline" {
-                        Arm::Baseline
-                    } else {
-                        Arm::Candidate
+            // Orphaned iff this failed attempt is the last one ever
+            // scheduled for the trial id -- nothing came after it to
+            // supersede it (a later, higher-attempt schedule means this
+            // older failure was already retried for real, and that newer
+            // attempt's own outcome is what should count instead).
+            let orphaned_retry = *retryable && max_scheduled_attempt.get(trial_id) == Some(attempt);
+            if !*retryable || orphaned_retry {
+                records.insert(
+                    trial_id.clone(),
+                    TrialRecord {
+                        task: m.task.clone(),
+                        rep: m.rep,
+                        arm: if m.arm == "baseline" {
+                            Arm::Baseline
+                        } else {
+                            Arm::Candidate
+                        },
+                        status: backend::TrialStatus::Crash,
+                        correctness: Some(0.0),
+                        quality: Some(0.0),
+                        cost_usd: None,
+                        cost_complete: false,
+                        wall_ms: 0,
+                        env_fingerprint: None,
+                        receipts: BTreeMap::new(),
                     },
-                    status: backend::TrialStatus::Crash,
-                    correctness: Some(0.0),
-                    quality: Some(0.0),
-                    cost_usd: None,
-                    cost_complete: false,
-                    wall_ms: 0,
-                    env_fingerprint: None,
-                    receipts: BTreeMap::new(),
-                },
-            );
+                );
+            }
         }
     }
     records.into_values().collect()

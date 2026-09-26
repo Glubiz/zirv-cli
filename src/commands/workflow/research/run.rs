@@ -1440,6 +1440,113 @@ wall_ms = 10
         );
     }
 
+    /// Regression for issue-review finding R3: a crash recorded as
+    /// `trial_failed { retryable: true }` whose promised retry never
+    /// actually got dispatched (a budget stop hit right after the crash, in
+    /// the same `dispatch_batch` call, orphaning the retry that was only
+    /// ever queued in memory) must not silently disappear. It must (a)
+    /// still be counted in this stage's denominators as a terminal crash,
+    /// and (b) still be requeued for a real retry on resume, rather than
+    /// `reconcile_unfinished` treating the lone `trial_scheduled` +
+    /// `trial_failed` pair as already resolved.
+    #[test]
+    fn an_orphaned_retryable_failure_counts_toward_denominators_and_is_requeued_on_resume() {
+        let campaign_dir = tempfile::tempdir().unwrap();
+        let (mut research_ledger, _) = Ledger::open(campaign_dir.path()).unwrap();
+
+        let seq = research_ledger.next_seq();
+        research_ledger
+            .append(&LedgerEvent::TrialScheduled {
+                seq,
+                ts: 1,
+                trial_id: "trial-c".to_string(),
+                candidate: "baseline".to_string(),
+                arm: "baseline".to_string(),
+                stage: "screen".to_string(),
+                task: "t1".to_string(),
+                rep: 0,
+                split: "dev".to_string(),
+                attempt: 0,
+                reserved_spend_usd: 1.0,
+                reserved_calls: 2,
+            })
+            .unwrap();
+        let seq = research_ledger.next_seq();
+        research_ledger
+            .append(&LedgerEvent::TrialFailed {
+                seq,
+                ts: 1,
+                trial_id: "trial-c".to_string(),
+                reason: "crashed".to_string(),
+                charged_usd: 1.0,
+                attempt: 0,
+                retryable: true,
+            })
+            .unwrap();
+
+        // Nothing else was ever appended for trial-c: the retry that
+        // `dispatch_batch` queued in memory never actually redispatched.
+
+        let events = ledger::replay(&Ledger::path(campaign_dir.path())).unwrap();
+
+        // (a) Without a real resolution, the stage's own records must still
+        // carry a terminal crash for trial-c instead of it vanishing.
+        let records = stage_records_from_ledger(&events, Stage::Screen, "baseline");
+        assert_eq!(
+            records.len(),
+            1,
+            "the orphaned retryable failure must still count toward this stage's denominators"
+        );
+        assert_eq!(records[0].status, backend::TrialStatus::Crash);
+        assert_eq!(records[0].task, "t1");
+
+        // (b) On resume, it must be requeued for a real attempt (attempt 1),
+        // not treated as already resolved.
+        let budgets = manifest::Budgets {
+            max_spend_usd: 100.0,
+            max_wall_secs: 1000,
+            max_calls: 100,
+            max_trials: 100,
+            max_retries: 2,
+            concurrency: 1,
+        };
+        let mut tracker = reconstruct_tracker(0, &events);
+        let retries = reconcile_unfinished(
+            campaign_dir.path(),
+            budgets,
+            &events,
+            &mut research_ledger,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(
+            retries.len(),
+            1,
+            "the orphaned retry must be requeued for a fresh dispatch on resume"
+        );
+        assert_eq!(retries[0].trial_id, "trial-c");
+        assert_eq!(retries[0].attempt, 1);
+
+        // Requeueing for redispatch must not fabricate a second ledger
+        // event for this trial: no `trial.json`-probe fallback ran, and no
+        // charge was recorded twice.
+        let events_after = ledger::replay(&Ledger::path(campaign_dir.path())).unwrap();
+        let trial_c_events: Vec<&LedgerEvent> = events_after
+            .iter()
+            .filter(|e| match e {
+                LedgerEvent::TrialScheduled { trial_id, .. }
+                | LedgerEvent::TrialFinished { trial_id, .. }
+                | LedgerEvent::TrialFailed { trial_id, .. } => trial_id == "trial-c",
+                _ => false,
+            })
+            .collect();
+        assert_eq!(
+            trial_c_events.len(),
+            2,
+            "reconcile must not append a duplicate event for a trial it only requeued in memory: {trial_c_events:?}"
+        );
+    }
+
     #[test]
     fn concurrency_never_exceeds_the_configured_cap() {
         let repo = tempfile::tempdir().unwrap();
