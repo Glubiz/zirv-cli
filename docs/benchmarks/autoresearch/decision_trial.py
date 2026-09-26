@@ -91,17 +91,53 @@ def parse_last_json(text):
     return results[-1] if results else None
 
 
-def call_proxy_decision(prompt, zirv_bin, state_dir, env_extra, timeout_s=DEFAULT_TIMEOUT_S):
-    """Runs `zirv ctx proxy --json --headless <prompt>`. Returns (decision
-    dict or None, elapsed_ms, raw_stdout, error_note or None)."""
-    argv = [zirv_bin, "ctx", "proxy", "--json", "--headless", prompt]
+def build_child_env(state_dir, attribution, env_extra):
+    """The full child environment for a `zirv` subprocess call, built
+    explicitly from `os.environ` -- never by mutating the parent process's
+    own environment (issue: a prior version set `ZIRV_ATTR_*`/
+    `ZIRV_CTX_STATE_DIR` via `os.environ[...] = ...` in `run_trial` and
+    never cleared an unset key, so a later trial in the same process could
+    inherit a PREVIOUS trial's attribution). `attribution` is a plain
+    `{env_var: value_or_None}` dict (see `attribution_env_for`); `env_extra`
+    (a candidate's overlay) is applied LAST and wins on conflict, same
+    null-removes-the-key convention `run.py`'s `child_env`/`merge_spec_env`
+    already use."""
     env = dict(os.environ)
     if state_dir:
         env["ZIRV_CTX_STATE_DIR"] = str(state_dir)
-    env.update({k: v for k, v in (env_extra or {}).items() if v is not None})
+    for k, v in (attribution or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     for k, v in (env_extra or {}).items():
         if v is None:
             env.pop(k, None)
+        else:
+            env[k] = v
+    return env
+
+
+def attribution_env_for(spec):
+    """`{"ZIRV_ATTR_CAMPAIGN": ..., ...}` from `spec`'s own campaign/
+    candidate/trial_id/task fields, `None` for any field `spec` doesn't
+    carry (so `build_child_env` removes rather than inherits a stale key)."""
+    return {
+        "ZIRV_ATTR_CAMPAIGN": spec.get("campaign"),
+        "ZIRV_ATTR_CANDIDATE": spec.get("candidate"),
+        "ZIRV_ATTR_TRIAL": spec.get("trial_id"),
+        "ZIRV_ATTR_TASK": spec.get("task"),
+    }
+
+
+def call_proxy_decision(prompt, zirv_bin, state_dir, env_extra, timeout_s=DEFAULT_TIMEOUT_S,
+                         attribution=None):
+    """Runs `zirv ctx proxy --json --headless <prompt>`. Returns (decision
+    dict or None, elapsed_ms, raw_stdout, error_note or None). The child's
+    environment is built explicitly by `build_child_env` -- this function
+    never reads or writes `os.environ` directly beyond that one call."""
+    argv = [zirv_bin, "ctx", "proxy", "--json", "--headless", prompt]
+    env = build_child_env(state_dir, attribution, env_extra)
     t0 = time.time()
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout_s, env=env)
@@ -215,6 +251,60 @@ def grade_decision(decision, label):
     return correctness, details
 
 
+def read_proxy_decisions(state_dir):
+    """Every row of `<state_dir>/proxy-decisions.jsonl` -- the production
+    receipt file `zirv ctx proxy` itself appends to for every decision it
+    computes (`src/commands/ctx/proxy/mod.rs`'s `PROXY_DECISIONS_FILE`,
+    each row the flattened `ProxyDecision` struct), in file order. Tolerant
+    of a missing file or a malformed line (skipped, never raises) -- an
+    older build or a proxy call that failed before persisting anything
+    yields an empty list, not an error."""
+    if not state_dir:
+        return []
+    path = Path(state_dir) / "proxy-decisions.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def jev_ran_from_proxy_decisions(rows):
+    """Whether the production intake path actually invoked Jev/helper
+    decisively for THIS trial, per the persisted `proxy-decisions.jsonl`
+    receipt (the last row, since a trial's state dir is per-trial and
+    isolated -- see the design spec's `ZIRV_CTX_STATE_DIR=<trial>/state`)
+    -- ground truth independent of whatever this process parsed from the
+    subprocess's own stdout (`decision_abstained` above answers a related
+    but different question from the live decision object; this one answers
+    it from the receipt).
+
+    `False` for an empty list: a missing Jev credential or an off gate
+    means the production path never even attempted the call, which must
+    never be read as the SAME thing as "attempted but not decisive"
+    (`decision_abstained`'s `True`) -- this is exactly the distinction the
+    review that added this function asked for. This is a plain boolean
+    signal, not a promotion decision: a `False` here does not null
+    `correctness` (a deterministic-only arm is a legitimate #803 baseline)
+    -- the campaign runner separately excludes a trial missing a required
+    `proxy:decider:typesafe`-style receipt via its own `requires_receipts`
+    gate, which is the actual promotion-relevant exclusion mechanism.
+    """
+    if not rows:
+        return False
+    return rows[-1].get("decider") in ("typesafe", "helper")
+
+
 def find_receipts_file(state_dir):
     """A trial's state dir MAY carry a receipts file the runner already
     knows how to read (mirrors run.py's own `receipts.jsonl` convention);
@@ -267,15 +357,7 @@ def run_trial(spec_path, out_dir, zirv_bin=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     state_dir = spec.get("state_dir")
-    if state_dir:
-        os.environ["ZIRV_CTX_STATE_DIR"] = str(state_dir)
-    for env_key, spec_key in (
-        ("ZIRV_ATTR_CAMPAIGN", "campaign"), ("ZIRV_ATTR_CANDIDATE", "candidate"),
-        ("ZIRV_ATTR_TRIAL", "trial_id"), ("ZIRV_ATTR_TASK", "task"),
-    ):
-        val = spec.get(spec_key)
-        if val:
-            os.environ[env_key] = str(val)
+    attribution = attribution_env_for(spec)
 
     case_id = spec["task"]
     input_row, label_row = load_case(case_id)
@@ -290,10 +372,17 @@ def run_trial(spec_path, out_dir, zirv_bin=None):
     env_extra = spec.get("env") or {}
 
     decision, elapsed_ms, _raw, error_note = call_proxy_decision(
-        input_row["prompt"], zirv_bin, state_dir, env_extra, timeout_s=timeout_s)
+        input_row["prompt"], zirv_bin, state_dir, env_extra, timeout_s=timeout_s,
+        attribution=attribution)
 
     correctness, details = grade_decision(decision, label_row)
     details["latency_ms"] = elapsed_ms
+    # issue #803 review: distinguish "Jev abstained" (`details["abstained"]`,
+    # from the live decision object) from "Jev never ran" (missing
+    # credential / gate off) using the production's OWN persisted receipt --
+    # never nulls `correctness` (a deterministic-only arm is a legitimate
+    # baseline); see `jev_ran_from_proxy_decisions`'s docstring.
+    details["jev_ran"] = jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir))
     if error_note:
         details["error"] = error_note
     (out_dir / "details.json").write_text(json.dumps(details, indent=2), encoding="utf-8")

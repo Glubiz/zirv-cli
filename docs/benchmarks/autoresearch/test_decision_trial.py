@@ -7,6 +7,7 @@ via `python -m unittest discover -s docs/benchmarks -p "test_*.py"` from
 the repo root.
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -221,7 +222,7 @@ class RunTrialStubbedTests(unittest.TestCase):
 
     def test_run_trial_writes_trial_json_from_stubbed_decision(self):
         decision_trial.call_proxy_decision = (
-            lambda prompt, zirv_bin, state_dir, env_extra, timeout_s=120: (
+            lambda prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None: (
                 decision(seat_tier="standard", needs_clarification=0.9, decisive=True),
                 42, "", None,
             )
@@ -260,6 +261,192 @@ class RunTrialStubbedTests(unittest.TestCase):
             spec_path.write_text(json.dumps(spec), encoding="utf-8")
             with self.assertRaises(ValueError):
                 decision_trial.run_trial(str(spec_path), str(Path(tmp) / "out"))
+
+    def test_run_trial_never_mutates_os_environ_for_attribution(self):
+        # Review finding (P4): run_trial used to set os.environ["ZIRV_ATTR_*"]
+        # directly and never cleared it -- a later trial in the same process
+        # (or this test suite's own later tests) could inherit a previous
+        # trial's attribution. Assert the keys are absent from os.environ
+        # both before and after run_trial, proving they were never set there
+        # at all (build_child_env carries them into the subprocess call
+        # instead).
+        attr_keys = ["ZIRV_ATTR_CAMPAIGN", "ZIRV_ATTR_CANDIDATE", "ZIRV_ATTR_TRIAL", "ZIRV_ATTR_TASK"]
+        for k in attr_keys:
+            self.assertNotIn(k, os.environ, f"{k} leaked into os.environ before this test even ran")
+
+        captured = {}
+
+        def fake_call_proxy_decision(prompt, zirv_bin, state_dir, env_extra, timeout_s=120,
+                                      attribution=None):
+            captured["attribution"] = attribution
+            captured["os_environ_snapshot"] = {k: os.environ.get(k) for k in attr_keys}
+            return decision(seat_tier="standard"), 1, "", None
+
+        decision_trial.call_proxy_decision = fake_call_proxy_decision
+        decision_trial.call_spend_command = lambda *a, **k: None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp) / "spec.json"
+            spec = {
+                "campaign": "c1", "candidate": "cand-x", "trial_id": "t-attr-1", "task": "ic001",
+                "state_dir": str(Path(tmp) / "state"),
+            }
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            decision_trial.run_trial(str(spec_path), str(Path(tmp) / "out"))
+
+        # The subprocess call DID receive the attribution values...
+        self.assertEqual(captured["attribution"]["ZIRV_ATTR_TRIAL"], "t-attr-1")
+        self.assertEqual(captured["attribution"]["ZIRV_ATTR_CAMPAIGN"], "c1")
+        # ...but the parent process's own os.environ was never touched to
+        # deliver them (both during the call and after run_trial returns).
+        for k in attr_keys:
+            self.assertIsNone(captured["os_environ_snapshot"][k])
+            self.assertNotIn(k, os.environ)
+
+    def test_build_child_env_removes_none_and_applies_env_extra_last(self):
+        os.environ["ZIRV_ATTR_TASK_TEST_PROBE_UNSET"] = "should-be-removed"
+        try:
+            env = decision_trial.build_child_env(
+                state_dir="/tmp/some-state",
+                attribution={"ZIRV_ATTR_TASK_TEST_PROBE_UNSET": None, "ZIRV_ATTR_TRIAL": "t1"},
+                env_extra={"ZIRV_ATTR_TRIAL": "overridden-by-candidate-env"},
+            )
+        finally:
+            os.environ.pop("ZIRV_ATTR_TASK_TEST_PROBE_UNSET", None)
+        self.assertNotIn("ZIRV_ATTR_TASK_TEST_PROBE_UNSET", env)
+        self.assertEqual(env["ZIRV_ATTR_TRIAL"], "overridden-by-candidate-env")
+        self.assertEqual(env["ZIRV_CTX_STATE_DIR"], "/tmp/some-state")
+        # The real os.environ is untouched by build_child_env itself.
+        self.assertNotIn("ZIRV_ATTR_TASK_TEST_PROBE_UNSET", os.environ)
+
+    def test_attribution_env_for_maps_spec_fields(self):
+        spec = {"campaign": "c1", "candidate": "cand-1", "trial_id": "t1", "task": "ic001"}
+        attribution = decision_trial.attribution_env_for(spec)
+        self.assertEqual(attribution, {
+            "ZIRV_ATTR_CAMPAIGN": "c1", "ZIRV_ATTR_CANDIDATE": "cand-1",
+            "ZIRV_ATTR_TRIAL": "t1", "ZIRV_ATTR_TASK": "ic001",
+        })
+
+    def test_attribution_env_for_missing_fields_are_none(self):
+        attribution = decision_trial.attribution_env_for({})
+        self.assertEqual(attribution, {
+            "ZIRV_ATTR_CAMPAIGN": None, "ZIRV_ATTR_CANDIDATE": None,
+            "ZIRV_ATTR_TRIAL": None, "ZIRV_ATTR_TASK": None,
+        })
+
+
+class JevRanFromProxyDecisionsTests(unittest.TestCase):
+    """Issue #803 review (P3): `jev_ran` must come from the production's own
+    persisted `proxy-decisions.jsonl` receipt, distinguishing "Jev never ran"
+    (missing credential / gate off -- an empty file) from "Jev ran but
+    abstained" (a row present, `decider: "deterministic"`)."""
+
+    def test_true_for_typesafe(self):
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(
+            [{"decider": "typesafe"}]))
+
+    def test_true_for_helper(self):
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(
+            [{"decider": "helper"}]))
+
+    def test_false_for_deterministic_only(self):
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(
+            [{"decider": "deterministic"}]))
+
+    def test_false_when_no_rows_at_all(self):
+        # This is the "Jev never ran" case the review specifically called
+        # out -- no receipt at all, not merely a deterministic one.
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions([]))
+
+    def test_uses_the_last_row(self):
+        rows = [{"decider": "deterministic"}, {"decider": "typesafe"}]
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(rows))
+        rows2 = [{"decider": "typesafe"}, {"decider": "deterministic"}]
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(rows2))
+
+
+class ReadProxyDecisionsTests(unittest.TestCase):
+    def test_missing_file_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(decision_trial.read_proxy_decisions(tmp), [])
+
+    def test_missing_state_dir_returns_empty_list(self):
+        self.assertEqual(decision_trial.read_proxy_decisions(None), [])
+
+    def test_reads_jsonl_rows_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proxy-decisions.jsonl"
+            path.write_text(
+                '{"decider": "deterministic"}\n\n{"decider": "typesafe"}\n',
+                encoding="utf-8",
+            )
+            rows = decision_trial.read_proxy_decisions(tmp)
+            self.assertEqual([r["decider"] for r in rows], ["deterministic", "typesafe"])
+
+    def test_malformed_line_is_skipped_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proxy-decisions.jsonl"
+            path.write_text('{"decider": "typesafe"}\nnot json\n', encoding="utf-8")
+            rows = decision_trial.read_proxy_decisions(tmp)
+            self.assertEqual(len(rows), 1)
+
+
+class RunTrialJevRanIntegrationTests(unittest.TestCase):
+    """`run_trial` end to end (proxy call stubbed) with a REAL
+    `proxy-decisions.jsonl` file on disk under the trial's state dir --
+    proves `details.json["jev_ran"]` is read from that file, not from the
+    stubbed decision object, and that a deterministic-only (or missing)
+    receipt never nulls `correctness`."""
+
+    def setUp(self):
+        self._orig_call_proxy = decision_trial.call_proxy_decision
+        self._orig_spend = decision_trial.call_spend_command
+        decision_trial.call_spend_command = lambda *a, **k: None
+
+    def tearDown(self):
+        decision_trial.call_proxy_decision = self._orig_call_proxy
+        decision_trial.call_spend_command = self._orig_spend
+
+    def _run(self, tmp, proxy_decisions_lines):
+        state_dir = Path(tmp) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        if proxy_decisions_lines is not None:
+            (state_dir / "proxy-decisions.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in proxy_decisions_lines) + "\n",
+                encoding="utf-8",
+            )
+        decision_trial.call_proxy_decision = (
+            lambda prompt, zirv_bin, sd, env_extra, timeout_s=120, attribution=None: (
+                decision(seat_tier="standard", needs_clarification=0.9, decisive=True),
+                10, "", None,
+            )
+        )
+        spec_path = Path(tmp) / "spec.json"
+        spec = {"campaign": "c1", "candidate": "cand-1", "trial_id": "t1", "task": "ic001",
+                "state_dir": str(state_dir)}
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        out_dir = Path(tmp) / "out"
+        trial = decision_trial.run_trial(str(spec_path), str(out_dir))
+        details = json.loads((out_dir / "details.json").read_text(encoding="utf-8"))
+        return trial, details
+
+    def test_jev_ran_true_when_receipt_says_typesafe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial, details = self._run(tmp, [{"decider": "typesafe"}])
+        self.assertTrue(details["jev_ran"])
+        self.assertIsNotNone(trial["correctness"])
+
+    def test_jev_ran_false_and_correctness_not_nulled_when_no_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial, details = self._run(tmp, None)  # no proxy-decisions.jsonl at all
+        self.assertFalse(details["jev_ran"])
+        self.assertIsNotNone(trial["correctness"])
+
+    def test_jev_ran_false_and_correctness_not_nulled_when_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trial, details = self._run(tmp, [{"decider": "deterministic"}])
+        self.assertFalse(details["jev_ran"])
+        self.assertIsNotNone(trial["correctness"])
 
 
 if __name__ == "__main__":
