@@ -165,6 +165,15 @@ pub(crate) fn spawn_and_validate_proposal(
     if proposed.patch.is_some() {
         return Err("a proposed candidate may not carry a patch".to_string());
     }
+    if !manifest::is_valid_id(&proposed.id) {
+        return Err(format!(
+            "proposed candidate id '{}' must match [A-Za-z0-9._-]{{1,48}}",
+            proposed.id
+        ));
+    }
+    if proposed.id == "baseline" {
+        return Err("a proposed candidate may not use the reserved id 'baseline'".to_string());
+    }
     guard::validate_candidate_env(
         &proposed.env,
         &manifest.candidate_space.allow_env,
@@ -229,6 +238,26 @@ pub(crate) fn apply_proposal_outcome(
 ) -> CtxResult<()> {
     match outcome {
         Ok(Some(candidate)) => {
+            // `candidates_map` already holds "baseline" and every declared
+            // candidate before the first proposer round ever runs, and
+            // accumulates each accepted proposal as rounds proceed -- so a
+            // membership check here alone catches a proposal that would
+            // overwrite the baseline runtime, or any other candidate
+            // (declared or already-proposed) sharing its id, before it
+            // clobbers that entry in the map below.
+            if candidates_map.contains_key(&candidate.id) {
+                let seq = ledger.next_seq();
+                ledger.append(&LedgerEvent::CandidateRejected {
+                    seq,
+                    ts: now_secs(),
+                    candidate: candidate.id.clone(),
+                    reason: format!(
+                        "proposed id '{}' collides with an existing candidate",
+                        candidate.id
+                    ),
+                })?;
+                return Ok(());
+            }
             let seq = ledger.next_seq();
             ledger.append(&LedgerEvent::CandidateProposed {
                 seq,
