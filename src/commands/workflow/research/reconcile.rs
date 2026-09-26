@@ -3,7 +3,7 @@
 //! scheduled-but-unfinished trial -- issue #802's resume seam, split out of
 //! `run.rs`. No behaviour change from the code that used to live here.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -253,6 +253,17 @@ pub(crate) fn reconcile_unfinished(
         calls: u64,
     }
     let mut queues: BTreeMap<String, VecDeque<Outstanding>> = BTreeMap::new();
+    // Trial ids whose *most recent* event is a retryable `trial_failed` with
+    // nothing scheduled after it: the scheduler queued a retry in memory
+    // (`dispatch_batch`'s own `queue.push_back`) but a budget stop -- or
+    // this whole process dying -- meant it was never actually redispatched,
+    // so no `trial_scheduled` for the next attempt ever reached the ledger.
+    // Left alone, the ordinary schedule/resolve accounting below would see
+    // the original `trial_scheduled` matched by this `trial_failed` and
+    // treat the trial as fully resolved, silently dropping the retry it is
+    // still owed. These are queued for a real redispatch below instead of
+    // being probed for a `trial.json` that was never written.
+    let mut needs_redispatch: BTreeSet<String> = BTreeSet::new();
     for event in events {
         match event {
             LedgerEvent::TrialScheduled {
@@ -286,11 +297,36 @@ pub(crate) fn reconcile_unfinished(
                         ceiling: *reserved_spend_usd,
                         calls: *reserved_calls,
                     });
+                needs_redispatch.remove(trial_id);
             }
-            LedgerEvent::TrialFinished { trial_id, .. }
-            | LedgerEvent::TrialFailed { trial_id, .. } => {
+            LedgerEvent::TrialFinished { trial_id, .. } => {
                 if let Some(queue) = queues.get_mut(trial_id) {
                     queue.pop_front();
+                }
+                needs_redispatch.remove(trial_id);
+            }
+            LedgerEvent::TrialFailed {
+                trial_id,
+                retryable: false,
+                ..
+            } => {
+                if let Some(queue) = queues.get_mut(trial_id) {
+                    queue.pop_front();
+                }
+                needs_redispatch.remove(trial_id);
+            }
+            LedgerEvent::TrialFailed {
+                trial_id,
+                retryable: true,
+                ..
+            } => {
+                // Bump the still-queued schedule entry to the attempt it is
+                // now owed, and mark it as already known (from the ledger)
+                // to need a real redispatch -- not a `trial.json` check, one
+                // was never written for an attempt that never ran.
+                if let Some(entry) = queues.get_mut(trial_id).and_then(VecDeque::back_mut) {
+                    entry.attempt += 1;
+                    needs_redispatch.insert(trial_id.clone());
                 }
             }
             _ => {}
@@ -299,6 +335,30 @@ pub(crate) fn reconcile_unfinished(
 
     let mut retries = Vec::new();
     for (trial_id, mut queue) in queues {
+        if needs_redispatch.contains(&trial_id) {
+            while let Some(outstanding) = queue.pop_front() {
+                retries.push(PendingTrial {
+                    trial_id: trial_id.clone(),
+                    candidate: outstanding.candidate,
+                    arm: if outstanding.arm == "baseline" {
+                        Arm::Baseline
+                    } else {
+                        Arm::Candidate
+                    },
+                    stage: match outstanding.stage.as_str() {
+                        "screen" => Stage::Screen,
+                        "validate" => Stage::Validate,
+                        "warmup" => Stage::Warmup,
+                        _ => Stage::Holdout,
+                    },
+                    task: outstanding.task,
+                    rep: outstanding.rep,
+                    split: outstanding.split,
+                    attempt: outstanding.attempt,
+                });
+            }
+            continue;
+        }
         while let Some(outstanding) = queue.pop_front() {
             let trial_dir = trial_dir_for(campaign_dir, &trial_id, outstanding.attempt);
             if let Some(result) = TrialResult::read(&trial_dir) {
