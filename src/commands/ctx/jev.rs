@@ -1302,6 +1302,32 @@ struct EffectRollupRow {
     removed_bytes: Option<u64>,
 }
 
+/// The single most recent `jev-decisions.jsonl` row in the rollup window,
+/// across every site -- [`JevRollup::last_call`]'s own payload. Dash refresh
+/// PR2's JEV sidebar section `last` line.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JevLastCall {
+    pub site: String,
+    pub ts: u64,
+}
+
+/// [`usage_rollup`]'s full result: the per-site fold plus two "most recent
+/// row in the window" facts that only make sense taken across every site at
+/// once, gathered in the SAME read pass rather than a second scan of
+/// `jev-decisions.jsonl` (dash refresh PR2's JEV sidebar section needs both
+/// its `last` line and its `errors` line's latest reason, and the dashboard
+/// reads this on a throttled cadence, never per frame).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct JevRollup {
+    pub sites: BTreeMap<String, JevSiteUsage>,
+    /// `None` when no decision row fell inside the window at all.
+    pub last_call: Option<JevLastCall>,
+    /// The latest window row that carried a non-empty `fallbacks` list, its
+    /// own fallbacks joined into one plain-words reason. `None` when nothing
+    /// in the window errored.
+    pub latest_error_reason: Option<String>,
+}
+
 /// One site's folded usage over the rollup window: call volume, cache-hit
 /// rate and latency from `jev-decisions.jsonl` (every site that went
 /// through the shared [`ask`] client), plus observed-effect volume and
@@ -1367,18 +1393,26 @@ fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
 }
 
 /// Folds `<state>/jev-decisions.jsonl` and `<state>/jev-effects.jsonl` into
-/// a per-site [`JevSiteUsage`] map over [`ROLLUP_WINDOW_SECS`]. Read-only
-/// and best-effort: a missing file contributes nothing -- never an error --
-/// and a line that isn't valid JSON or doesn't match the expected shape is
-/// skipped rather than aborting the fold, since both logs are appended to
-/// by several call sites with no cross-process locking (see [`record`]/
-/// [`record_effect`]'s own doc comments), so a torn last line is expected,
-/// not exceptional. Must stay fast: `zirv ctx jev status` is a read-only
-/// diagnostic and this is the only I/O it does beyond loading config.
-pub(crate) fn usage_rollup(state: &StateDir) -> BTreeMap<String, JevSiteUsage> {
+/// a per-site [`JevSiteUsage`] map, plus the window's single most recent call
+/// and latest error reason (see [`JevRollup`]), over `window_secs` looking
+/// back from now. `window_secs` is a parameter (dash refresh PR2's JEV
+/// sidebar section narrows to 24h; `zirv ctx jev status` keeps
+/// [`ROLLUP_WINDOW_SECS`], 7 days) rather than the constant itself, so one
+/// fold serves both windows. Read-only and best-effort: a missing file
+/// contributes nothing -- never an error -- and a line that isn't valid JSON
+/// or doesn't match the expected shape is skipped rather than aborting the
+/// fold, since both logs are appended to by several call sites with no
+/// cross-process locking (see [`record`]/[`record_effect`]'s own doc
+/// comments), so a torn last line is expected, not exceptional. Must stay
+/// fast: `zirv ctx jev status` is a read-only diagnostic and the dashboard
+/// reads this on its own throttled cadence, never per frame -- either way,
+/// this is the only I/O beyond loading config.
+pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
     let now = state::now_secs();
-    let cutoff = now.saturating_sub(ROLLUP_WINDOW_SECS);
+    let cutoff = now.saturating_sub(window_secs);
     let mut builders: BTreeMap<String, JevSiteUsageBuilder> = BTreeMap::new();
+    let mut last_call: Option<JevLastCall> = None;
+    let mut latest_error: Option<(u64, String)> = None;
 
     if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_DECISIONS_FILE)) {
         for line in text.lines() {
@@ -1391,6 +1425,17 @@ pub(crate) fn usage_rollup(state: &StateDir) -> BTreeMap<String, JevSiteUsage> {
             };
             if row.ts < cutoff {
                 continue;
+            }
+            if last_call.as_ref().is_none_or(|last| row.ts >= last.ts) {
+                last_call = Some(JevLastCall {
+                    site: row.site.clone(),
+                    ts: row.ts,
+                });
+            }
+            if !row.fallbacks.is_empty()
+                && latest_error.as_ref().is_none_or(|(ts, _)| row.ts >= *ts)
+            {
+                latest_error = Some((row.ts, row.fallbacks.join(", ")));
             }
             let entry = builders.entry(row.site).or_default();
             entry.calls += 1;
@@ -1422,10 +1467,14 @@ pub(crate) fn usage_rollup(state: &StateDir) -> BTreeMap<String, JevSiteUsage> {
         }
     }
 
-    builders
-        .into_iter()
-        .map(|(site, builder)| (site, builder.finish()))
-        .collect()
+    JevRollup {
+        sites: builders
+            .into_iter()
+            .map(|(site, builder)| (site, builder.finish()))
+            .collect(),
+        last_call,
+        latest_error_reason: latest_error.map(|(_, reason)| reason),
+    }
 }
 
 fn fmt_rate(rate: Option<f64>) -> String {
@@ -1552,6 +1601,33 @@ pub fn credential_present(cfg: &CtxConfig) -> bool {
     available(&cfg.proxy.typesafe)
 }
 
+/// Every `[jev]` gate name and whether it is on, the same list `status`/
+/// `status_json` each built inline -- factored out so a third reader (the
+/// dashboard's JEV sidebar section, dash refresh PR2: hidden entirely with
+/// every gate off, via the existing [`any_gate_enabled`]) does not hand-
+/// maintain its own copy that could drift from theirs.
+fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 17] {
+    [
+        ("memory", cfg.jev.memory),
+        ("supervisor", cfg.jev.supervisor),
+        ("dispatch", cfg.jev.dispatch),
+        ("review", cfg.jev.review),
+        ("gates", cfg.jev.gates),
+        ("context", cfg.jev.context),
+        ("intake_savings", cfg.jev.intake_savings),
+        ("review_reuse", cfg.jev.review_reuse),
+        ("harvest_screen", cfg.jev.harvest_screen),
+        ("admin_dispatch", cfg.jev.admin_dispatch),
+        ("approve", cfg.jev.approve),
+        ("approve_allow", cfg.jev.approve_allow),
+        ("classify", cfg.jev.classify),
+        ("handoff_select", cfg.jev.handoff_select),
+        ("inject_screen", cfg.jev.inject_screen),
+        ("inject", cfg.jev.inject),
+        ("stop_verify", cfg.jev.stop_verify),
+    ]
+}
+
 use clap::{Args, Subcommand};
 
 /// Subcommands for `zirv ctx jev`.
@@ -1587,8 +1663,8 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
             let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
 
             if *json {
-                let rollup = usage_rollup(&state);
-                let json_output = status_json(&cfg, &rollup);
+                let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+                let json_output = status_json(&cfg, &rollup.sites);
                 writeln!(writer, "{}", serde_json::to_string_pretty(&json_output)?)?;
                 Ok(0)
             } else {
@@ -1605,26 +1681,7 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
 /// out of `run_jev` so a test can assert its shape without going through
 /// `CtxConfig::load`/`StateDir::resolve`'s real filesystem and env lookups.
 fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serde_json::Value {
-    let gates = [
-        ("memory", cfg.jev.memory),
-        ("supervisor", cfg.jev.supervisor),
-        ("dispatch", cfg.jev.dispatch),
-        ("review", cfg.jev.review),
-        ("gates", cfg.jev.gates),
-        ("context", cfg.jev.context),
-        ("intake_savings", cfg.jev.intake_savings),
-        ("review_reuse", cfg.jev.review_reuse),
-        ("harvest_screen", cfg.jev.harvest_screen),
-        ("admin_dispatch", cfg.jev.admin_dispatch),
-        ("approve", cfg.jev.approve),
-        ("approve_allow", cfg.jev.approve_allow),
-        ("classify", cfg.jev.classify),
-        ("handoff_select", cfg.jev.handoff_select),
-        ("inject_screen", cfg.jev.inject_screen),
-        ("inject", cfg.jev.inject),
-        ("stop_verify", cfg.jev.stop_verify),
-    ];
-    let any_gate_on = gates.iter().any(|(_, on)| *on);
+    let any_gate_on = any_gate_enabled(&cfg.jev);
     let cred_present = available(&cfg.proxy.typesafe);
     let cred_env = &cfg.proxy.typesafe.credential_env;
 
@@ -1687,26 +1744,8 @@ pub fn status(
     use std::fmt::Write as FmtWrite;
 
     // Determine if any gate is on
-    let gates = [
-        ("memory", cfg.jev.memory),
-        ("supervisor", cfg.jev.supervisor),
-        ("dispatch", cfg.jev.dispatch),
-        ("review", cfg.jev.review),
-        ("gates", cfg.jev.gates),
-        ("context", cfg.jev.context),
-        ("intake_savings", cfg.jev.intake_savings),
-        ("review_reuse", cfg.jev.review_reuse),
-        ("harvest_screen", cfg.jev.harvest_screen),
-        ("admin_dispatch", cfg.jev.admin_dispatch),
-        ("approve", cfg.jev.approve),
-        ("approve_allow", cfg.jev.approve_allow),
-        ("classify", cfg.jev.classify),
-        ("handoff_select", cfg.jev.handoff_select),
-        ("inject_screen", cfg.jev.inject_screen),
-        ("inject", cfg.jev.inject),
-        ("stop_verify", cfg.jev.stop_verify),
-    ];
-    let any_gate_on = gates.iter().any(|(_, on)| *on);
+    let gates = gate_list(cfg);
+    let any_gate_on = any_gate_enabled(&cfg.jev);
 
     // Check credential
     let cred_env = &cfg.proxy.typesafe.credential_env;
@@ -1773,14 +1812,14 @@ pub fn status(
     }
 
     // Print the usage rollup
-    let rollup = usage_rollup(state);
+    let rollup = usage_rollup(state, ROLLUP_WINDOW_SECS);
     let window_days = ROLLUP_WINDOW_SECS / 86_400;
     writeln!(writer)?;
     writeln!(writer, "usage (last {window_days}d)")?;
-    if rollup.is_empty() {
+    if rollup.sites.is_empty() {
         writeln!(writer, "  (no calls or effects recorded)")?;
     } else {
-        for (site, usage) in &rollup {
+        for (site, usage) in &rollup.sites {
             writeln!(
                 writer,
                 "  {:<30} calls={:<5} cache_hit={:<6} wall_p50={:<8} wall_p95={:<8} errors={:<4} effects={:<5} removed_bytes={}",
@@ -3155,8 +3194,8 @@ pub(crate) mod tests {
         );
         std::fs::write(state.root().join("jev-effects.jsonl"), effects).expect("write effects");
 
-        let rollup = usage_rollup(&state);
-        let usage = rollup.get("memory").expect("memory site present");
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let usage = rollup.sites.get("memory").expect("memory site present");
         assert_eq!(usage.calls, 3);
         assert_eq!(
             usage.errors, 1,
@@ -3171,6 +3210,55 @@ pub(crate) mod tests {
             (cache_hit_rate - (1.0 / 3.0)).abs() < 1e-9,
             "expected 1/3 cache hit rate, got {cache_hit_rate}"
         );
+        assert_eq!(
+            rollup.last_call,
+            Some(JevLastCall {
+                site: "memory".to_string(),
+                ts: now
+            }),
+            "the last (highest-ts, latest-in-file) decision row wins"
+        );
+        assert_eq!(
+            rollup.latest_error_reason,
+            Some("boom".to_string()),
+            "the one row with a fallback names it as the latest error"
+        );
+    }
+
+    /// Dash refresh PR2: `last_call`/`latest_error_reason` are keyed across
+    /// EVERY site, not per-site -- the most recent row overall wins even
+    /// when it belongs to a different site than the busiest one, and the
+    /// latest ERROR is tracked independently of the latest call.
+    #[test]
+    fn usage_rollup_last_call_and_latest_error_span_every_site() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+
+        let decisions = format!(
+            "{{\"site\":\"memory\",\"ts\":{t0},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[\"rate limited\"]}}\n\
+             {{\"site\":\"approve\",\"ts\":{t1},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[]}}\n",
+            t0 = now - 20,
+            t1 = now - 5,
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        assert_eq!(
+            rollup.last_call,
+            Some(JevLastCall {
+                site: "approve".to_string(),
+                ts: now - 5,
+            }),
+            "approve's row is the most recent even though memory's row errored"
+        );
+        assert_eq!(
+            rollup.latest_error_reason,
+            Some("rate limited".to_string()),
+            "memory's older row is still the only (and therefore latest) error"
+        );
     }
 
     /// Issue #758: a state dir with neither log file must roll up to empty,
@@ -3179,11 +3267,13 @@ pub(crate) mod tests {
     fn usage_rollup_with_no_log_files_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_path(dir.path().to_path_buf());
-        let rollup = usage_rollup(&state);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
         assert!(
-            rollup.is_empty(),
+            rollup.sites.is_empty(),
             "no log files should yield an empty rollup: {rollup:?}"
         );
+        assert_eq!(rollup.last_call, None);
+        assert_eq!(rollup.latest_error_reason, None);
     }
 
     /// Issue #758: both logs are appended by several call sites with no
@@ -3201,11 +3291,45 @@ pub(crate) mod tests {
         std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
             .expect("write decisions");
 
-        let rollup = usage_rollup(&state);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
         let usage = rollup
+            .sites
             .get("dispatch")
             .expect("dispatch site present despite the corrupt line above it");
         assert_eq!(usage.calls, 1);
+    }
+
+    /// Dash refresh PR2: the window is a parameter now -- a row just outside
+    /// a NARROW window (the dashboard's 24h JEV section) must not count,
+    /// even though the same row is well inside the wide 7-day window `zirv
+    /// ctx jev status` keeps.
+    #[test]
+    fn usage_rollup_window_is_a_parameter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+        let two_days_secs = 2 * 24 * 60 * 60;
+        let decisions = format!(
+            "{{\"site\":\"memory\",\"ts\":{ts},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[]}}\n",
+            ts = now.saturating_sub(two_days_secs)
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let one_day_secs = 24 * 60 * 60;
+        let narrow = usage_rollup(&state, one_day_secs);
+        assert!(
+            narrow.sites.is_empty(),
+            "a 2-day-old row must not count in a 1-day window: {narrow:?}"
+        );
+
+        let wide = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        assert_eq!(
+            wide.sites.get("memory").map(|u| u.calls),
+            Some(1),
+            "the same row counts in the wider 7-day window"
+        );
     }
 
     /// Issue #758: the `--json` payload carries a `usage` object with the
