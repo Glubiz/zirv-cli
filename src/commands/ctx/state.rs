@@ -124,7 +124,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
             "commands/ctx/runtime/tools/mod.rs",
             "commands/ctx/context_status.rs",
             "commands/ctx/status.rs",
-            "commands/ctx/chat.rs",
+            "commands/ctx/chat/mod.rs",
             "commands/ctx/handover.rs",
             "commands/ctx/wrap.rs",
             "commands/workflow/review.rs",

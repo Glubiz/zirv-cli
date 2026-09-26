@@ -402,6 +402,23 @@ impl Roster {
             .as_ref()
             .is_some_and(|registry| registry.get(id).is_ok())
     }
+
+    /// PR3 (#799): the plan card's own `Workflow <kind> \u{b7} N steps,
+    /// starting at <first step>` line reads this rather than the registry
+    /// directly -- how many steps `id` has and the first one's title, from
+    /// the RAW (unmaterialized) definition. This is a display-only
+    /// approximation: a step's domain overrides/conditions can change what
+    /// actually runs first once the workflow starts, but the plan card is
+    /// shown before that happens, so the raw definition is the best answer
+    /// available at the time. `None` when the registry never loaded or `id`
+    /// is not one of its entries.
+    pub fn workflow_step_summary(&self, id: &str) -> Option<(usize, String)> {
+        let registry = self.registry.as_ref()?;
+        let entry = registry.get(id).ok()?;
+        let steps = &entry.definition.steps;
+        let first = steps.first()?.title.clone();
+        Some((steps.len(), first))
+    }
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -548,6 +565,80 @@ fn baseline_seat(cfg: &CtxConfig, seat_tier: SeatTier) -> Seat {
             model: cfg.chat.model.clone().unwrap_or_default(),
         },
     }
+}
+
+/// Operator follow-up (2026-09-26, round 2): "available" for plan-card
+/// choice 2 must mean enabled AND actually on this machine -- every harness
+/// defaults to enabled (`AgentGate::is_enabled`'s own permissive default), so
+/// gating on that alone offered harnesses like `copilot`/`gemini`/`muse` that
+/// simply are not installed here. This is the SAME readiness [`Roster::
+/// gather`] already computes for `decide`/`validate` (`RosterHarness.ready =
+/// is_enabled && adapter.ready().is_ok()`) -- "the harness roster" in this
+/// crate's own vocabulary -- reused rather than re-derived, so choice 2 can
+/// never disagree with what the proxy itself would actually accept as this
+/// decision's own harness.
+///
+/// `adapter.ready()` touches disk/PATH, so this is deliberately NOT called
+/// from the render path: `intake.rs` computes it once per intake, off the
+/// UI thread, alongside `decide()` itself, and passes the resulting name
+/// list in here as `ready_harnesses`.
+pub(crate) fn ready_harness_names(cfg: &CtxConfig, repo: &Path) -> Vec<String> {
+    Roster::gather(cfg, repo)
+        .harnesses
+        .into_iter()
+        .filter(|harness| harness.ready)
+        .map(|harness| harness.name)
+        .collect()
+}
+
+/// PR3 (#799) plus the operator's own follow-up: every model any harness
+/// named in `ready_harnesses` (see [`ready_harness_names`]) own tier ladder
+/// resolves, `Cheap` through `Frontier` -- not only the decided harness's own
+/// ladder, so plan-card choice 2 ("Start with a different model") can
+/// genuinely offer a different harness too, not just a different tier of the
+/// same one. `current` (`decision.orchestrator`, the already-planned seat) is
+/// excluded: offering to "switch to what you already have" is not a choice.
+/// Deduplicated by `(harness, model)` in registry order, then tier order.
+pub(crate) fn model_choices(
+    cfg: &CtxConfig,
+    current: &Seat,
+    ready_harnesses: &[String],
+) -> Vec<Seat> {
+    let mut seen = std::collections::BTreeSet::new();
+    adapters::ADAPTERS
+        .iter()
+        .filter(|(name, _)| ready_harnesses.iter().any(|ready| ready == name))
+        .flat_map(|(name, _)| {
+            [
+                SeatTier::Cheap,
+                SeatTier::Standard,
+                SeatTier::Deep,
+                SeatTier::Frontier,
+            ]
+            .into_iter()
+            .map(|tier| Seat {
+                harness: (*name).to_string(),
+                model: model_for_tier(cfg, name, tier),
+            })
+        })
+        .filter(|seat| !seat.model.is_empty() && seat != current)
+        .filter(|seat| seen.insert((seat.harness.clone(), seat.model.clone())))
+        .collect()
+}
+
+/// The plan card's "Helpers" line (orchestrated decisions): the concrete
+/// model `decision.worker_tier` resolves to on `harness`, through the same
+/// `handover::resolve_model` ladder [`model_for_tier`] uses for the
+/// cheap/standard/deep tiers, falling back to [`top_rung_alias`] on the same
+/// "no ladder for this adapter" error `model_for_tier` degrades on -- never
+/// fails.
+pub(crate) fn worker_model(cfg: &CtxConfig, harness: &str, tier: Tier) -> String {
+    let label = match tier {
+        Tier::Cheap => "cheap",
+        Tier::Standard => "standard",
+        Tier::Deep => "deep",
+    };
+    handover::resolve_model(harness, label, cfg).unwrap_or_else(|_| top_rung_alias(harness))
 }
 
 fn top_rung_alias(harness: &str) -> String {
@@ -2591,6 +2682,84 @@ mod tests {
             model_for_tier(&with_chat_model, "claude", SeatTier::Frontier),
             "mythos"
         );
+    }
+
+    /// PR3 (#799): the plan card's choice-2 model list is every tier's
+    /// resolved model, cheap to frontier, in that order -- exactly what
+    /// `model_for_tier` itself would resolve for each rung on the same
+    /// harness, so the operator picks from something real, never an
+    /// invented name.
+    #[test]
+    fn model_choices_lists_every_tier_cheap_to_frontier_across_every_ready_harness() {
+        let cfg = CtxConfig::default();
+        let current = Seat {
+            harness: "claude".to_string(),
+            model: "claude-sonnet-5".to_string(),
+        };
+        let ready = vec!["claude".to_string(), "codex".to_string()];
+        let choices = model_choices(&cfg, &current, &ready);
+        // Every ready harness's own ladder is offered, not only claude's.
+        assert!(
+            choices
+                .iter()
+                .any(|s| s.harness == "claude" && s.model == "haiku"),
+            "{choices:?}"
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|s| s.harness == "codex" && s.model == "gpt-5.6-luna"),
+            "{choices:?}"
+        );
+        // The already-planned seat itself is excluded.
+        assert!(
+            !choices
+                .iter()
+                .any(|s| s.harness == current.harness && s.model == current.model),
+            "{choices:?}"
+        );
+    }
+
+    /// Operator follow-up (2026-09-26, round 2): "available" means enabled
+    /// AND actually on this machine -- a harness this run of `model_choices`
+    /// was NOT told is ready (whatever the reason: disabled, or enabled but
+    /// not installed) contributes no models at all, even though its own tier
+    /// ladder would otherwise resolve fine. `ready_harnesses` is injected
+    /// directly here rather than routed through a real `AgentGate`/`Roster::
+    /// gather` probe, so this proves `model_choices`'s OWN filtering without
+    /// depending on which adapters happen to be installed on the machine
+    /// running the test.
+    #[test]
+    fn model_choices_excludes_a_harness_not_named_ready() {
+        let cfg = CtxConfig::default();
+        let current = Seat {
+            harness: "claude".to_string(),
+            model: "claude-sonnet-5".to_string(),
+        };
+        // codex is deliberately left out of `ready` -- standing in for
+        // either a disabled harness or one that is enabled but not
+        // installed (`RosterHarness.ready` folds both into one bool).
+        let ready = vec!["claude".to_string()];
+        let choices = model_choices(&cfg, &current, &ready);
+        assert!(
+            !choices.iter().any(|s| s.harness == "codex"),
+            "a harness absent from `ready` must contribute no models at all: {choices:?}"
+        );
+        assert!(
+            choices.iter().any(|s| s.harness == "claude"),
+            "a harness present in `ready` stays offered: {choices:?}"
+        );
+    }
+
+    /// PR3 (#799): the "Helpers" line's model resolves through the same
+    /// `handover` ladder `model_for_tier` uses for its own cheap/standard/
+    /// deep tiers.
+    #[test]
+    fn worker_model_resolves_through_the_handover_ladder() {
+        let cfg = CtxConfig::default();
+        assert_eq!(worker_model(&cfg, "claude", Tier::Cheap), "haiku");
+        assert_eq!(worker_model(&cfg, "claude", Tier::Standard), "sonnet");
+        assert_eq!(worker_model(&cfg, "claude", Tier::Deep), "opus");
     }
 
     /// Issue #537, revised by the wrapper-overhead benchmark (frontier gate)
