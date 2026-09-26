@@ -3812,6 +3812,10 @@ pub enum WorkflowSubcommand {
     /// `jev-effects.jsonl`/`proxy-decisions.jsonl` under `--state-dir` into
     /// one attributable `SpendReport` (issue #800). Never a new ledger.
     Spend(crate::commands::ctx::attribution::SpendArgs),
+    /// Plan, run, inspect, and report a bounded, resumable autoresearch
+    /// campaign (issue #802): baseline first, paired screen/validate/
+    /// holdout stages, explicit budgets, never auto-applied.
+    Research(super::research::ResearchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -5331,6 +5335,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Spend(args) => {
             return crate::commands::ctx::attribution::run_spend(args, writer);
+        }
+        WorkflowSubcommand::Research(args) => {
+            return super::research::run(args, writer);
         }
     }
     Ok(0)
