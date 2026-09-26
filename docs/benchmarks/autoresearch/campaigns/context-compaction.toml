@@ -1,0 +1,138 @@
+# context-compaction: candidates over compaction_select, handoff_select,
+# review_reuse, memory, context gates + floors, and [score] token ratios --
+# the knobs #762 owns the calibration ALGORITHM for; this campaign only
+# evaluates them, never re-implements calibration. Runs on the long-session
+# split (validation: t23_afternoon, t25_sticky_notes -- see
+# ../wrapped-vs-vanilla/corpus.toml) because a short single-prompt task
+# never exercises compaction/handoff/review-reuse at all.
+#
+# `requires_receipts` uses the EXACT `JevEffect::new(site, action)` site
+# strings from the current source (checked against src/commands/ctx/
+# handoff.rs and src/commands/workflow/review.rs, not guessed): compaction_
+# select's own site is `"compaction_select"` (handoff.rs:2268),
+# handoff_select's is `"handoff_select"` (handoff.rs:1897), and review_reuse's
+# is `"workflow-review-reuse"` (review.rs:3372, already hyphenated in the
+# real code -- note this differs from the design spec's informal
+# `effect:handoff-select`/`effect:compaction-select` prose, which used
+# hyphens where the actual `site` strings use underscores). A trial whose
+# state dir carries no matching effect receipt did not actually exercise
+# that mechanism (design spec #805: "A long session that never compacts
+# provides no evidence for compaction improvements"), so it is
+# `untriggered`, not silently counted as a no-op win.
+#
+# This is the NATURAL-pressure cohort. See context-compaction-forced.toml
+# for the forced-pressure variant of the same candidate set (design spec:
+# "Forced pressure... is its own cohort" -- reported separately, never
+# pooled with this file's natural-pressure trials). Backend is run.py;
+# costs real money (long-session chain trials are the most expensive kind
+# this harness runs); never run in CI.
+
+schema = 1
+id = "context-compaction"
+description = "compaction_select/handoff_select/review_reuse/memory/context candidates on the long-session split, natural pressure. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["run.py", "corpus.toml", "quality_rubric.md"]
+self_check = ["python", "run.py", "--check-graders"]
+
+[corpus]
+file = "../wrapped-vs-vanilla/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "../wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+per_trial_ceiling_usd = 8.00
+calls_per_trial = 6
+timeout_secs = 7200
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 120.00
+max_wall_secs = 86400
+max_calls = 200
+max_trials = 60
+max_retries = 1
+concurrency = 2
+
+[stages.screen]
+split = "validation"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 3
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+min_pairs = 4
+correctness_floor = 0.6
+quality_floor = 0.5
+max_correctness_regression = 0.05
+max_quality_regression = 0.1
+min_effect = 0.1
+confidence = 0.85
+bootstrap_resamples = 1000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = [
+  "ZIRV_CTX_JEV_COMPACTION_SELECT", "ZIRV_CTX_JEV_HANDOFF_SELECT", "ZIRV_CTX_JEV_REVIEW_REUSE",
+  "ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT",
+  "ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_CONFIDENCE",
+  "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE",
+  "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO", "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "compaction-select-on"
+hypothesis = "The compaction_select gate keeps required context through a compaction without costing more than it saves."
+mechanism = "ZIRV_CTX_JEV_COMPACTION_SELECT=true; requires an effect:compaction_select receipt to count."
+env = { ZIRV_CTX_JEV_COMPACTION_SELECT = "true" }
+requires_receipts = ["effect:compaction_select"]
+
+[[candidates]]
+id = "handoff-select-on"
+hypothesis = "The handoff_select gate carries forward earlier decisions and unresolved failures across a handoff."
+mechanism = "ZIRV_CTX_JEV_HANDOFF_SELECT=true; requires an effect:handoff_select receipt to count."
+env = { ZIRV_CTX_JEV_HANDOFF_SELECT = "true" }
+requires_receipts = ["effect:handoff_select"]
+
+[[candidates]]
+id = "review-reuse-on"
+hypothesis = "Review-finding reuse avoids re-litigating already-resolved review findings without missing new defects."
+mechanism = "ZIRV_CTX_JEV_REVIEW_REUSE=true; requires an effect:workflow-review-reuse receipt to count."
+env = { ZIRV_CTX_JEV_REVIEW_REUSE = "true" }
+requires_receipts = ["effect:workflow-review-reuse"]
+
+[[candidates]]
+id = "memory-context-combo"
+hypothesis = "Memory ranking + context selection together retain the step-1 constraint and the deferred-fix arc better than either alone."
+mechanism = "ZIRV_CTX_JEV_MEMORY=true, ZIRV_CTX_JEV_CONTEXT=true together."
+env = { ZIRV_CTX_JEV_MEMORY = "true", ZIRV_CTX_JEV_CONTEXT = "true" }
+requires_receipts = ["jev:memory", "jev:context"]
+
+[[candidates]]
+id = "compaction-select-looser-floor"
+hypothesis = "A looser compaction_select confidence floor keeps more of what later steps need."
+mechanism = "ZIRV_CTX_JEV_COMPACTION_SELECT=true plus a lowered ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_CONFIDENCE."
+env = { ZIRV_CTX_JEV_COMPACTION_SELECT = "true", ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_CONFIDENCE = "0.5" }
+requires_receipts = ["effect:compaction_select"]

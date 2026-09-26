@@ -1,0 +1,166 @@
+# jev-gates-e2e: per-gate end-to-end ablations over the wrapped-vs-vanilla
+# corpus, reusing run.py's existing zirv-nojev baseline shape (headless
+# proxy call, every [jev] gate forced off) with ONE non-safety gate turned
+# back on per candidate via the manifest's env overlay -- the same
+# ZIRV_CTX_JEV_<GATE>=true mechanism run.py's own `zirv-jev-<gate>`
+# conditions already use (see ../../wrapped-vs-vanilla/run.py's
+# `JEV_GATE_KEYS`/`cond_env_for`), just driven through the runner's
+# candidate env instead of a hardcoded condition name. Backend is run.py
+# itself (`--cond zirv-proxy`, the fixed arm both baseline and candidate
+# share; `--trial`'s spec.env carries the ZIRV_CTX_JEV_* overlay). Costs
+# real money (every trial is a live agent run); never run in CI.
+#
+# Always-refused gates (approve/approve_allow/inject_screen/stop_verify/
+# missing_tests/review/gates -- anything permission/sandbox/safety/
+# credential/base_url/budget related) are never candidates here, per
+# #802's compiled-in env allowlist.
+#
+# Corresponds to design spec #803's "Per-gate e2e campaigns reuse run.py's
+# per-gate conditions via overlays."
+
+schema = 1
+id = "jev-gates-e2e"
+description = "Per-gate [jev] ablations (memory/context/harvest_screen/handoff_select/compaction_select/dispatch/launch_effort/classify/inject) plus one floor candidate, over the dev/validation corpus. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["run.py", "corpus.toml", "quality_rubric.md"]
+self_check = ["python", "run.py", "--check-graders"]
+
+[corpus]
+file = "../wrapped-vs-vanilla/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "../wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+per_trial_ceiling_usd = 1.50
+calls_per_trial = 3
+timeout_secs = 1200
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 40.00
+max_wall_secs = 21600
+max_calls = 400
+max_trials = 160
+max_retries = 1
+concurrency = 2
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+min_pairs = 6
+correctness_floor = 0.7
+quality_floor = 0.5
+max_correctness_regression = 0.05
+max_quality_regression = 0.1
+min_effect = 0.05
+confidence = 0.9
+bootstrap_resamples = 1000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = [
+  "ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT", "ZIRV_CTX_JEV_HARVEST_SCREEN",
+  "ZIRV_CTX_JEV_HANDOFF_SELECT", "ZIRV_CTX_JEV_COMPACTION_SELECT", "ZIRV_CTX_JEV_DISPATCH",
+  "ZIRV_CTX_JEV_LAUNCH_EFFORT", "ZIRV_CTX_JEV_CLASSIFY", "ZIRV_CTX_JEV_INJECT",
+  "ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE", "ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_MARGIN",
+]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "gate-memory"
+hypothesis = "The memory gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_MEMORY=true, every other gate off."
+env = { ZIRV_CTX_JEV_MEMORY = "true" }
+requires_receipts = ["jev:memory"]
+
+[[candidates]]
+id = "gate-context"
+hypothesis = "The context gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_CONTEXT=true, every other gate off."
+env = { ZIRV_CTX_JEV_CONTEXT = "true" }
+requires_receipts = ["jev:context"]
+
+[[candidates]]
+id = "gate-harvest-screen"
+hypothesis = "The harvest_screen gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_HARVEST_SCREEN=true, every other gate off."
+env = { ZIRV_CTX_JEV_HARVEST_SCREEN = "true" }
+requires_receipts = ["jev:harvest_screen"]
+
+[[candidates]]
+id = "gate-handoff-select"
+hypothesis = "The handoff_select gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_HANDOFF_SELECT=true, every other gate off."
+env = { ZIRV_CTX_JEV_HANDOFF_SELECT = "true" }
+requires_receipts = ["effect:handoff_select"]
+
+[[candidates]]
+id = "gate-compaction-select"
+hypothesis = "The compaction_select gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_COMPACTION_SELECT=true, every other gate off."
+env = { ZIRV_CTX_JEV_COMPACTION_SELECT = "true" }
+requires_receipts = ["effect:compaction_select"]
+
+[[candidates]]
+id = "gate-dispatch"
+hypothesis = "The dispatch gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_DISPATCH=true, every other gate off."
+env = { ZIRV_CTX_JEV_DISPATCH = "true" }
+requires_receipts = ["jev:dispatch"]
+
+[[candidates]]
+id = "gate-launch-effort"
+hypothesis = "The launch_effort gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_LAUNCH_EFFORT=true, every other gate off."
+env = { ZIRV_CTX_JEV_LAUNCH_EFFORT = "true" }
+requires_receipts = ["jev:launch_effort"]
+
+[[candidates]]
+id = "gate-classify"
+hypothesis = "The classify gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_CLASSIFY=true, every other gate off."
+env = { ZIRV_CTX_JEV_CLASSIFY = "true" }
+requires_receipts = ["jev:classify"]
+
+[[candidates]]
+id = "gate-inject"
+hypothesis = "The inject gate alone earns default-on status."
+mechanism = "ZIRV_CTX_JEV_INJECT=true, every other gate off."
+env = { ZIRV_CTX_JEV_INJECT = "true" }
+requires_receipts = ["jev:inject"]
+
+# Floor candidate: memory gate on, with a looser per-site confidence floor
+# than the compiled-in default -- isolates whether the memory gate's own
+# floor (not just on/off) is worth tuning.
+[[candidates]]
+id = "gate-memory-looser-floor"
+hypothesis = "A lower memory-site confidence floor recovers useful trims the default floor was discarding."
+mechanism = "ZIRV_CTX_JEV_MEMORY=true plus a lowered ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE."
+env = { ZIRV_CTX_JEV_MEMORY = "true", ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE = "0.5" }
+requires_receipts = ["jev:memory"]

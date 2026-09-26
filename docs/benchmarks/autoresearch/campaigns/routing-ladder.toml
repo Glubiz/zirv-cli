@@ -1,0 +1,128 @@
+# routing-ladder: candidates over the handover ladder
+# (ZIRV_CTX_HANDOVER_CLAUDE_{CHEAP,STANDARD,DEEP}), headless effort
+# (ZIRV_CTX_HEADLESS_EFFORT_{TRIVIAL,BOUNDED,SUBSTANTIAL}), and one
+# `escalate` strategy candidate (run.py's #804 addition: cheap-first, with a
+# fixed continuation prompt on a failed/visibly-regressed attempt, full
+# failed-attempt cost included). `apply_security_risk_floor` and the
+# frontier floor are compiled-in and NOT candidates -- #804 requires the
+# measured security/risk/verification floors to stay fixed.
+#
+# Stratification note (design spec #804: "Stratify mechanical edits,
+# bounded work, bugs, features, architecture, ambiguous requests and
+# sensitive tasks"): the wrapped-vs-vanilla corpus's `class` column already
+# carries this stratification (see ../wrapped-vs-vanilla/corpus.toml); this
+# campaign's dev/validation/holdout splits each cover several classes (see
+# that file's header comment), so a per-class report can be built from the
+# same trial set without a second corpus. `seat_mode = "single"` throughout
+# -- #804 explicitly scopes routing candidates to single-seat evidence only,
+# leaving direct-vs-team/fan-out choices to the (not-yet-existing)
+# orchestration suite.
+#
+# Backend is run.py; costs real money (every trial is a live agent run,
+# and the escalate candidate can run TWO agent invocations per trial); never
+# run in CI.
+
+schema = 1
+id = "routing-ladder"
+description = "Handover ladder, headless effort, and one escalate-strategy candidate over the stratified corpus. Single-seat only. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["run.py", "corpus.toml", "quality_rubric.md"]
+self_check = ["python", "run.py", "--check-graders"]
+
+[corpus]
+file = "../wrapped-vs-vanilla/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "../wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+per_trial_ceiling_usd = 3.00
+calls_per_trial = 2
+timeout_secs = 1800
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 60.00
+max_wall_secs = 28800
+max_calls = 300
+max_trials = 120
+max_retries = 1
+concurrency = 2
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+min_pairs = 6
+correctness_floor = 0.7
+quality_floor = 0.5
+max_correctness_regression = 0.05
+max_quality_regression = 0.1
+min_effect = 0.1
+confidence = 0.9
+bootstrap_resamples = 1000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = [
+  "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP", "ZIRV_CTX_HANDOVER_CLAUDE_STANDARD",
+  "ZIRV_CTX_HANDOVER_CLAUDE_DEEP",
+  "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED",
+  "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
+]
+allowed_models = ["haiku", "sonnet", "opus"]
+
+# Cheaper standard-tier model on the ladder: does routing "standard" work to
+# a cheaper model than today's default lose correctness?
+[[candidates]]
+id = "cheaper-standard-rung"
+hypothesis = "A cheaper model on the standard rung holds correctness on bounded/mechanical work."
+mechanism = "ZIRV_CTX_HANDOVER_CLAUDE_STANDARD points at a cheaper model than the compiled default."
+env = { ZIRV_CTX_HANDOVER_CLAUDE_STANDARD = "sonnet" }
+requires_receipts = []
+
+# Lower headless effort for bounded tasks: does spending less per-call
+# effort still finish bounded work correctly?
+[[candidates]]
+id = "lean-bounded-effort"
+hypothesis = "Bounded-class tasks finish correctly at a lower headless effort level."
+mechanism = "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED lowered from the operator default."
+env = { ZIRV_CTX_HEADLESS_EFFORT_BOUNDED = "low" }
+requires_receipts = []
+
+# Escalate strategy (#804): start cheap, escalate to a stronger model only
+# on a failed/visibly-regressed first attempt, full failed-attempt cost
+# included. Compared against direct use of the stronger model on the same
+# tasks (paired with the "cheaper-standard-rung" candidate's own baseline
+# pairing, not a separate manifest).
+[[candidates]]
+id = "escalate-sonnet-to-opus"
+hypothesis = "Cheap-first-with-escalation beats direct opus on cost, at no correctness cost, once failed-attempt cost is counted."
+mechanism = "run.py's escalate strategy: attempt 1 on sonnet, escalate to opus only if attempt 1 errors or the visible suite regresses beyond baseline."
+env = {}
+strategy = { kind = "escalate", to_model = "opus" }
+requires_receipts = []
