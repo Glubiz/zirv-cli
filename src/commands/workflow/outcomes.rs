@@ -328,14 +328,17 @@ pub fn read_all(state: &StateDir) -> Vec<OutcomeRow> {
         .collect()
 }
 
-/// Whether `read_all` already holds a `Workflow` row for `session` -- `zirv
-/// ctx exec`'s own best-effort exit check for whether to append a `Direct`
-/// row (issue #800): a session that already ran a workflow to completion
-/// must never also get a redundant direct row.
-pub fn has_workflow_row_for_session(state: &StateDir, session: &str) -> bool {
+/// Whether `read_all` already holds ANY row (`Workflow` or `Direct`) for
+/// `session` -- `zirv ctx exec`'s own best-effort exit check for whether to
+/// append a `Direct` row (issue #800). A session that already ran a workflow
+/// to completion must never also get a redundant direct row, and (issue-
+/// review finding R5) a resumed headless session that already recorded its
+/// own `Direct` row on a prior attempt must not get a second one appended
+/// when it resumes and exits again.
+pub fn has_any_row_for_session(state: &StateDir, session: &str) -> bool {
     read_all(state)
         .iter()
-        .any(|row| row.kind == OutcomeKind::Workflow && row.session.as_deref() == Some(session))
+        .any(|row| row.session.as_deref() == Some(session))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -907,17 +910,26 @@ mod tests {
         assert_eq!(back, r);
     }
 
-    /// Issue #800: `OutcomeRow::direct` produces a `Direct` row, and
-    /// `has_workflow_row_for_session` never mistakes it for a `Workflow` one.
+    /// Issue #800: `OutcomeRow::direct` produces a `Direct` row, distinct
+    /// from a `Workflow` row's `kind` -- but (issue-review finding R5)
+    /// `has_any_row_for_session` must count either kind as "already
+    /// recorded", not just `Workflow`: a resumed headless session that
+    /// already wrote its own `Direct` row on a prior attempt must not get a
+    /// second one appended when `record_direct_outcome_if_needed` runs
+    /// again on exit.
     #[test]
-    fn direct_row_is_written_and_never_counted_as_a_workflow_row() {
+    fn direct_row_is_written_and_counted_by_has_any_row_for_session() {
         let root = tempfile::tempdir().unwrap();
         let state = StateDir::from_root(root.path().to_path_buf());
         let direct = OutcomeRow::direct("sess-direct", Some("claude"), Some("sonnet"));
         assert_eq!(direct.kind, OutcomeKind::Direct);
         assert_eq!(direct.session.as_deref(), Some("sess-direct"));
+        assert!(!has_any_row_for_session(&state, "sess-direct"));
         append(&state, &direct).unwrap();
-        assert!(!has_workflow_row_for_session(&state, "sess-direct"));
+        assert!(
+            has_any_row_for_session(&state, "sess-direct"),
+            "an existing Direct row must itself block a second Direct row for the same session"
+        );
 
         let workflow_row = {
             let mut r = row(Complexity::Bounded, Some(true), 0);
@@ -925,7 +937,11 @@ mod tests {
             r
         };
         append(&state, &workflow_row).unwrap();
-        assert!(has_workflow_row_for_session(&state, "sess-workflow"));
+        assert!(has_any_row_for_session(&state, "sess-workflow"));
+        assert!(
+            !has_any_row_for_session(&state, "sess-unrelated"),
+            "an unrelated session must not be reported as already recorded"
+        );
     }
 
     /// Issue #800: a `Direct` row must never pollute a workflow calibration
