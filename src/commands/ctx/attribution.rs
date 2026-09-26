@@ -303,13 +303,18 @@ pub struct Receipt {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Money {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `null` (never omitted -- other lanes depend on this key always being
+    /// present) when no receipt in this bucket carried a harness-reported
+    /// cost.
+    #[serde(default)]
     pub reported_usd: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `null` (never omitted) when nothing in this bucket was priced.
+    #[serde(default)]
     pub estimated_usd: Option<f64>,
     #[serde(default)]
     pub unknown_count: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `null` (never omitted) when nothing in this bucket was priced.
+    #[serde(default)]
     pub price_as_of: Option<String>,
     #[serde(default)]
     pub calls: u64,
