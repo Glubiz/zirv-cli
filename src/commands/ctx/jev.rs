@@ -3080,6 +3080,42 @@ pub(crate) mod tests {
         );
     }
 
+    // -- issue #803: jev::floor -----------------------------------------
+
+    #[test]
+    fn floor_unset_returns_exactly_the_callers_own_defaults() {
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            floor(&cfg, FloorSite::Memory, 0.0, DEFAULT_MIN_MARGIN),
+            (0.0, DEFAULT_MIN_MARGIN)
+        );
+        assert_eq!(
+            floor(&cfg, FloorSite::Dispatch, 0.6, DEFAULT_MIN_MARGIN),
+            (0.6, DEFAULT_MIN_MARGIN)
+        );
+    }
+
+    #[test]
+    fn floor_configured_overrides_only_the_set_field() {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.floors.dispatch.min_confidence = Some(0.9);
+        assert_eq!(
+            floor(&cfg, FloorSite::Dispatch, 0.6, DEFAULT_MIN_MARGIN),
+            (0.9, DEFAULT_MIN_MARGIN),
+            "min_margin must still fall back to the caller's own default"
+        );
+        cfg.jev.floors.dispatch.min_margin = Some(0.35);
+        assert_eq!(
+            floor(&cfg, FloorSite::Dispatch, 0.6, DEFAULT_MIN_MARGIN),
+            (0.9, 0.35)
+        );
+        // A different site's floor is untouched.
+        assert_eq!(
+            floor(&cfg, FloorSite::Memory, 0.0, DEFAULT_MIN_MARGIN),
+            (0.0, DEFAULT_MIN_MARGIN)
+        );
+    }
+
     #[test]
     fn credential_env_name_returns_the_configured_variable_name() {
         let cfg = config("http://127.0.0.1:0".to_string(), "CUSTOM_ENV_VAR", 5);
