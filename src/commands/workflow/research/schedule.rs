@@ -14,7 +14,7 @@ use super::corpus::Corpus;
 use super::ledger::LedgerEvent;
 use super::manifest::{self, Manifest, Split};
 use super::promote::{self, Observation};
-use super::reconcile::terminal_trial_ids;
+use super::reconcile::{ensure_no_drift, terminal_trial_ids};
 use super::run::{Arm, CandidateRuntime, PendingTrial, RunState, Stage, TRIALS_DIR, TrialRecord};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::state::now_secs;
@@ -423,6 +423,20 @@ pub(crate) fn dispatch_batch(
                 let Some(pending_trial) = queue.pop_front() else {
                     break;
                 };
+                // Re-hash protected files before every single trial dispatch
+                // (issue-review finding R1), not just at stage boundaries:
+                // a concurrent batch's trials can run for a long time, and
+                // tampering mid-stage must be caught before the *next*
+                // trial goes out, not only after the whole stage finishes
+                // and a verdict has already been computed. On drift this
+                // appends `campaign_stopped { evaluator_tampered }` and
+                // returns `Err`, which aborts this batch (and, via `?` at
+                // every call site, the whole campaign) before this trial --
+                // or any trial after it -- is ever spawned.
+                if let Err(err) = ensure_no_drift(&repo, &state.lock, &mut state.ledger) {
+                    dispatch_err = Some(err);
+                    break 'outer;
+                }
                 let now = now_secs();
                 match state.tracker.check_reservation(
                     &budgets,

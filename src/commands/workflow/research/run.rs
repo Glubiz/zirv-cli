@@ -23,7 +23,7 @@ use super::backend;
 use super::budget::Tracker;
 use super::corpus::Corpus;
 use super::guard;
-use super::ledger::{self, Ledger, LedgerEvent, manifest_sha256};
+use super::ledger::{self, Ledger, LedgerEvent, Lock, manifest_sha256};
 use super::manifest::{self, Candidate, Manifest, SourcePatch, Split};
 use super::promote::{self, Decision, ScreenVerdict, Verdict};
 use super::proposer::{apply_proposal_outcome, dev_aggregate_summary, run_proposer_round};
@@ -138,6 +138,15 @@ pub struct RunState {
     pub(crate) campaign_dir: PathBuf,
     pub(crate) ledger: Ledger,
     pub(crate) tracker: Tracker,
+    /// Carried alongside `ledger` so `dispatch_batch` can re-hash protected
+    /// files against it right before every trial spawn (issue-review
+    /// finding R1): evaluator drift used to be checked only at campaign
+    /// start and at each candidate's screen/validate stage decision, so
+    /// tampering that happened mid-stage -- while a concurrent batch of
+    /// trials was still running -- was not caught until the next stage
+    /// boundary, by which point a verdict had already been computed from
+    /// (potentially) tainted results.
+    pub(crate) lock: Lock,
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +530,7 @@ pub fn execute(
         campaign_dir: campaign_dir.clone(),
         ledger: research_ledger,
         tracker,
+        lock: lock.clone(),
     };
 
     let retry_queue = reconcile_unfinished(
@@ -847,6 +857,14 @@ pub fn execute(
                         manifest.criteria.confidence,
                         seed,
                     );
+                    // One last re-hash immediately before a verdict is
+                    // recorded and, if it accepts, a candidate is promoted:
+                    // closes the gap between holdout's last trial finishing
+                    // and this decision being finalized. On drift this
+                    // propagates `Err`, so neither the holdout
+                    // `StageDecision` nor `promoted` is ever written from
+                    // results that may now be tainted.
+                    ensure_no_drift(&repo, &lock, &mut state.ledger)?;
                     let seq = state.ledger.next_seq();
                     state.ledger.append(&LedgerEvent::StageDecision {
                         seq,
@@ -1589,6 +1607,100 @@ crash_first = 5
         assert!(err.contains("refresh holdout"));
         // A different corpus version is unaffected.
         assert!(check_holdout_uses(&state_dir, corpus_file, "2", 1).is_ok());
+    }
+
+    /// Regression for issue-review finding R1: evaluator drift used to be
+    /// checked only at campaign start and after each candidate's
+    /// screen/validate stage decision -- so tampering that happened between
+    /// two stage-boundary checks (e.g. right before a fresh `dispatch_batch`
+    /// call for the next candidate) was not caught until that whole batch
+    /// had already dispatched every one of its trials. `dispatch_batch`
+    /// must now re-hash before every single trial, so not even the first
+    /// trial in an already-drifted batch is ever dispatched.
+    #[test]
+    fn dispatch_batch_checks_evaluator_drift_before_every_trial_not_just_at_stage_boundaries() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        write_corpus(&repo.path().join("corpus.toml"));
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let fixture_path = manifest_dir.path().join("fixture.toml");
+        write_fixture(&fixture_path, "");
+        let manifest_path = manifest_dir.path().join("manifest.toml");
+        let text = manifest_toml(
+            "drift-demo",
+            "corpus.toml",
+            "fixture.toml",
+            1,
+            0,
+            100.0,
+            1,
+            ONE_CANDIDATE,
+        );
+        std::fs::write(&manifest_path, &text).unwrap();
+        let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
+        let manifest = Manifest::parse(&manifest_text).unwrap();
+
+        let campaign_dir = tempfile::tempdir().unwrap();
+        let sha = manifest_sha256(&manifest_text);
+        let lock =
+            load_or_create_lock(repo.path(), &manifest, campaign_dir.path(), &sha, false).unwrap();
+
+        // Tamper with the protected corpus file AFTER the lock hashed it --
+        // simulating drift that happened between two stage-boundary checks,
+        // before this (freshly started) batch has dispatched anything.
+        std::fs::write(
+            repo.path().join("corpus.toml"),
+            "schema = 1\nversion = \"2\"\n",
+        )
+        .unwrap();
+
+        let (research_ledger, _) = Ledger::open(campaign_dir.path()).unwrap();
+        let tracker = reconstruct_tracker(lock.started_at, &[]);
+        let mut state = RunState {
+            manifest: manifest.clone(),
+            repo: repo.path().to_path_buf(),
+            manifest_dir: manifest_dir.path().to_path_buf(),
+            campaign_dir: campaign_dir.path().to_path_buf(),
+            ledger: research_ledger,
+            tracker,
+            lock,
+        };
+        let candidates_map = build_candidate_runtimes(
+            repo.path(),
+            campaign_dir.path(),
+            manifest_dir.path(),
+            &state.lock.baseline_sha,
+            &manifest,
+            &manifest.candidates,
+            &[],
+        )
+        .unwrap();
+
+        let pending = trials_for(
+            "baseline",
+            Arm::Baseline,
+            Stage::Screen,
+            Split::Dev,
+            &["t1".to_string()],
+            1,
+        );
+        let err = dispatch_batch(&mut state, &candidates_map, pending)
+            .expect_err("drift must abort dispatch before any trial in the batch runs");
+        assert!(err.to_string().contains("evaluator_tampered"), "got: {err}");
+
+        let events = ledger::replay(&Ledger::path(campaign_dir.path())).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, LedgerEvent::TrialScheduled { .. })),
+            "not even the first trial in an already-drifted batch may be dispatched"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, LedgerEvent::CampaignStopped { reason, .. } if reason == "evaluator_tampered")
+            ),
+            "drift must record campaign_stopped{{evaluator_tampered}}"
+        );
     }
 
     /// The committed `docs/benchmarks/autoresearch/campaigns/fixture-demo.toml`
