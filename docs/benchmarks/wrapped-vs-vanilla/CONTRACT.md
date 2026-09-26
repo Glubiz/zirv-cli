@@ -201,10 +201,12 @@ never straddle a split boundary: `t24_long_haul` and `t24b_long_haul` are
 byte-identical except for two step prompts (see `tasks/README.md`), so
 using one for iterative screening and the other as the "unseen" holdout
 would leak almost the whole task into candidate selection -- both sit in
-`holdout` together. `dev` (12 tasks: t01-t12) is the cheap, small-task
-screening set; `validation` (t13-t19, t23, t25) and `holdout` (t20-t22,
-t24, t24b) each cover several `class` values and at least one
-`long_session` chain task.
+`holdout` together. `dev` (13 tasks: t01-t12, t23) is the cheap, small-task
+screening set; `validation` (t13-t19, t25) and `holdout` (t20-t22, t24,
+t24b) each cover several `class` values -- and `dev`/`validation`/`holdout`
+each carry at least one `long_session` chain task (t23, t25, and t24/t24b
+respectively) so a manifest's `[stages.*] classes = ["long_session"]`
+filter has something to screen/validate/holdout against on every stage.
 
 The protected evaluator set a campaign hash-pins at start and re-verifies
 before every trial and before promotion (design spec #801) is, for this
