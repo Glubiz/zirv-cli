@@ -3183,9 +3183,10 @@ checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 
 [[package]]
 name = "zirv"
-version = "4.30.0"
+version = "4.32.0"
 dependencies = [
  "cap-std",
+ "chrono",
  "clap",
  "console",
  "crossterm",

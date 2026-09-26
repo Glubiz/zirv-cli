@@ -1147,7 +1147,16 @@ fn run_dash_branch(
                 env(key)
             }
         };
-        dash::run_dashboard(cfg, repo, &proxied, state, pane, None, force_pace)
+        dash::run_dashboard(
+            cfg,
+            repo,
+            &proxied,
+            state,
+            pane,
+            None,
+            force_pace,
+            started_workflow_id.map(str::to_string),
+        )
     })
 }
 
@@ -1355,6 +1364,9 @@ fn run_native_chat<E: Write>(
         pane_spec,
         Some(native_spec),
         args.force_pace,
+        // The native runtime launch never runs the harness proxy intake, so
+        // it never has a `started_workflow_id` to bind.
+        None,
     )
 }
 
