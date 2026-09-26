@@ -272,7 +272,7 @@ impl FixtureFile {
                 (row, specificity)
             })
             .collect();
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|(_, specificity)| std::cmp::Reverse(*specificity));
         matches.into_iter().map(|(row, _)| row).collect()
     }
 }
