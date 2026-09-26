@@ -2016,6 +2016,22 @@ fn run_with_clock_inner<W: Write>(
             })
             .unwrap_or_default();
         turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+        // Issue #800: the actual, resolved route this launch took, so a
+        // later reconciliation (`zirv workflow spend`, `OutcomeRow::direct`)
+        // never has to re-derive it from argv/config itself. `tier` is
+        // derived through the same handover ladder `handover::resolve_model`
+        // itself uses; `effort` is left unset here (`CLAUDE_CODE_EFFORT_
+        // LEVEL` is set directly on the child `Command`, further down this
+        // same function, not on this env vec).
+        let route_tier = execution_model
+            .as_deref()
+            .and_then(|model| super::handover::tier_for_model(adapter.name(), model, &cfg));
+        turn_env.extend(super::attribution::route_env(
+            Some(adapter.name()),
+            execution_model.as_deref(),
+            route_tier,
+            None,
+        ));
         // Security review round 2 (Finding 3): the work-group binding travels
         // by lineage. `dash::fulfill_spawn_request` already pushed this exact
         // pair into a pane's own `turn_env`; the headless launch pushed
@@ -4647,20 +4663,63 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     // `run_with`/`run_with_clock` directly.
     match choice.kind {
         super::runtime::RuntimeKind::Native => run_native(&args, w, &repo, &env),
-        super::runtime::RuntimeKind::Harness => run_with_clock(
-            &args,
-            &mut std::io::stderr(),
-            &repo,
-            &env,
-            &super::state::now_secs,
-            &|d: Duration| std::thread::sleep(d),
-        ),
+        super::runtime::RuntimeKind::Harness => {
+            // Issue #800: `run_with_clock` itself discards its own
+            // `ExecutionReport` (every OTHER caller of this arm's own
+            // underlying `run_with_clock_and_presence` never needed the
+            // segments it collects) -- this is the one call site that does,
+            // to learn the actual session/harness/model a `Direct` outcome
+            // row (below) would otherwise have to re-derive from env.
+            let mut report = ExecutionReport::default();
+            let code = run_with_clock_inner(
+                &args,
+                &mut std::io::stderr(),
+                &repo,
+                &env,
+                &super::state::now_secs,
+                &|d: Duration| std::thread::sleep(d),
+                None,
+                true,
+                &mut report,
+                &adapters::liveness_probe,
+            );
+            record_direct_outcome_if_needed(&repo, &env, &report);
+            code
+        }
         super::runtime::RuntimeKind::Unknown => Err(format!(
             "--runtime '{}': expected `harness` or `native`",
             args.runtime
         )
         .into()),
     }
+}
+
+/// Issue #800: best-effort `Direct`-outcome recording for a headless launch
+/// that never ran a workflow -- gated by the SAME `[workflow]
+/// telemetry_enabled` switch `outcomes::record_terminal` itself checks, and
+/// never makes a provider call (`OutcomeRow::direct` only reads local config/
+/// env). `let _ =`/early-return throughout: this must never affect the
+/// launch's own exit code or block on a missing state directory/telemetry
+/// opt-out.
+fn record_direct_outcome_if_needed(repo: &Path, env: EnvLookup<'_>, report: &ExecutionReport) {
+    let Some(segment) = report.segments.last() else {
+        return;
+    };
+    if !crate::commands::workflow::telemetry::TelemetryConfig::for_repo(repo).enabled {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    if crate::commands::workflow::outcomes::has_workflow_row_for_session(&state, &segment.session) {
+        return;
+    }
+    let row = crate::commands::workflow::outcomes::OutcomeRow::direct(
+        &segment.session,
+        Some(segment.agent.as_str()),
+        segment.model.as_deref(),
+    );
+    let _ = crate::commands::workflow::outcomes::append(&state, &row);
 }
 
 /// Issue #491: the `[runtime]` resolution `run` applies before anything

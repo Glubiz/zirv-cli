@@ -301,24 +301,6 @@ pub struct Receipt {
     pub attribution: Attribution,
 }
 
-impl Receipt {
-    fn usage(&self) -> super::event::TranscriptUsage {
-        super::event::TranscriptUsage {
-            input_tokens: self.input_tokens,
-            cache_creation_input_tokens: self.cache_creation_tokens,
-            cache_read_input_tokens: self.cache_read_tokens,
-            output_tokens: self.output_tokens,
-        }
-    }
-
-    fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_creation_tokens)
-            .saturating_add(self.cache_read_tokens)
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Money {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,7 +388,7 @@ fn filter_receipts<'a>(receipts: &'a [Receipt], filter: &Attribution) -> Vec<&'a
 /// a retried write, a re-read log tail, or a caller that supplied the same
 /// external receipt more than once). A `None` id is never deduped against
 /// anything -- only a shared, non-empty id counts as the same event.
-fn dedupe_by_receipt_id<'a>(receipts: Vec<&'a Receipt>) -> (Vec<&'a Receipt>, u64) {
+fn dedupe_by_receipt_id(receipts: Vec<&Receipt>) -> (Vec<&Receipt>, u64) {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(receipts.len());
     let mut dropped = 0u64;
@@ -1029,11 +1011,11 @@ mod tests {
         // with the other worker rows: 200+50+30+30+20=330 input.
         assert_eq!(
             report.tokens.input,
-            100 + 10 + 10 + 0 + 20 + 200 + 50 + 30 + 30 + 20
+            100 + 10 + 10 + 20 + 200 + 50 + 30 + 30 + 20
         );
         assert_eq!(
             report.tokens.output,
-            50 + 5 + 5 + 0 + 10 + 100 + 25 + 15 + 15 + 10
+            50 + 5 + 5 + 10 + 100 + 25 + 15 + 15 + 10
         );
         assert_eq!(report.completeness, Completeness::Complete);
         assert!(report.execution.calls > 0);
