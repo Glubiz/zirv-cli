@@ -74,6 +74,9 @@ pub enum ActionId {
     Memory,
     Errors,
     Zoom,
+    /// Dash refresh PR1: forces the session column back on below the
+    /// narrow-terminal floor, or hides it again above it.
+    ToggleSidebar,
     Palette,
     Help,
     Quit,
@@ -598,6 +601,16 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         checks: &[(ch('z'), DashAction::Zoom)],
     },
     ActionDescriptor {
+        id: ActionId::ToggleSidebar,
+        chord: "^A b",
+        label: "sidebar",
+        description: "show/hide the session column",
+        section: ActionSection::Dashboard,
+        availability: always,
+        menu: None,
+        checks: &[(ch('b'), DashAction::ToggleSidebar)],
+    },
+    ActionDescriptor {
         id: ActionId::Palette,
         chord: "^A p",
         label: "palette",
@@ -953,6 +966,7 @@ mod tests {
         handover: bool,
         show_errors: bool,
         zoom: bool,
+        toggle_sidebar: bool,
         quit: bool,
         scroll_page_up: bool,
         scroll_page_down: bool,
@@ -994,6 +1008,7 @@ mod tests {
                     DashAction::Handover => cov.handover = true,
                     DashAction::ShowErrors => cov.show_errors = true,
                     DashAction::Zoom => cov.zoom = true,
+                    DashAction::ToggleSidebar => cov.toggle_sidebar = true,
                     DashAction::Quit => cov.quit = true,
                     DashAction::ScrollPageUp => cov.scroll_page_up = true,
                     DashAction::ScrollPageDown => cov.scroll_page_down = true,
@@ -1019,6 +1034,7 @@ mod tests {
                 && cov.handover
                 && cov.show_errors
                 && cov.zoom
+                && cov.toggle_sidebar
                 && cov.quit
                 && cov.scroll_page_up
                 && cov.scroll_page_down

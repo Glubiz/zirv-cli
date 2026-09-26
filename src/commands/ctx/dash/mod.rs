@@ -116,6 +116,9 @@ pub enum DashAction {
     /// (`push_error`'s own buffer, newest first).
     ShowErrors,
     Zoom,
+    /// `Ctrl+A b` (dash refresh PR1) -- forces the session column back on
+    /// below the narrow-terminal floor, or hides it again above it.
+    ToggleSidebar,
     Quit,
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
     /// binding below.
@@ -412,19 +415,29 @@ fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
                 *value = value.replacen(style::PLACEHOLDER, &group.scope, 1);
             }
         }
-        // Issue #354 phase 2: `reason` is the composed status's own explanation
-        // rather than phase 1's `none · <state>`. A row with no status (or one
-        // that projects `Unknown`, which is what a missing file reads back as)
-        // keeps the phase 1 text -- never a fabricated reason.
-        if let Some(status) = row.status.as_ref()
-            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "reason")
-            && let Some(text) = disclosure_reason(status)
-        {
-            *value = text;
+        // Dash refresh PR1: the fact block's own state word -- the composed
+        // projection's own word (`working`, `needs approval`, ...) once a
+        // status exists. `Unknown` (what a missing/never-written status file
+        // reads back as) keeps whatever phase-1 `RowState` word `assemble_
+        // sidebar` already set -- never a fabricated word.
+        if let Some(status) = row.status.as_ref() {
+            let projection = super::attention::project(status);
+            if projection != super::attention::Projection::Unknown {
+                row.fact_state = projection_word(projection);
+            }
         }
-        // A retained ended row's `since` is already final (`exited <age> ·
-        // exit <code>`, built by `assemble_sidebar` from facts frozen at the
-        // reap); nothing cached may overwrite it.
+        // This row's own bound workflow and unread mail, from the same
+        // throttled per-session reads `FactsCache::refresh_if_due` already
+        // did this tick -- never a fallback to the repo-wide pointer.
+        row.workflow = disk.workflow_by_session.get(&row.short).cloned();
+        row.unread_mail = disk
+            .mail_by_session
+            .get(&row.short)
+            .map(|(broadcast, direct)| broadcast + direct)
+            .unwrap_or(0);
+        // A retained ended row's `since`/fact are already final (`exited
+        // <age> · exit <code>`, built by `assemble_sidebar` from facts
+        // frozen at the reap); nothing cached may overwrite them.
         if row.exit_code.is_some() {
             continue;
         }
@@ -442,16 +455,17 @@ fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
                     .get(&row.short)
                     .map(|(_, at)| (row_state_label(row.state), *at))
             });
-        if let Some((word, at)) = transition
-            && let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "since")
-        {
-            *value = format!(
-                "{word} {} \u{b7} started {} ago",
-                style::format_age(now.saturating_sub(at)),
-                row.age_secs
-                    .map(style::format_age)
-                    .unwrap_or_else(|| style::PLACEHOLDER.into())
-            );
+        if let Some((word, at)) = transition {
+            row.fact_since_secs = Some(now.saturating_sub(at));
+            if let Some((_, value)) = row.disclosure.iter_mut().find(|(key, _)| key == "since") {
+                *value = format!(
+                    "{word} {} \u{b7} started {} ago",
+                    style::format_age(now.saturating_sub(at)),
+                    row.age_secs
+                        .map(style::format_age)
+                        .unwrap_or_else(|| style::PLACEHOLDER.into())
+                );
+            }
         }
         if let Some(usage) = disk
             .usage
@@ -551,6 +565,10 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         // action-descriptor table. `p` was unbound before.
         KeyCode::Char('p') => Some(DashAction::Palette),
         KeyCode::Char('z') => Some(DashAction::Zoom),
+        // Dash refresh PR1: below 100 columns the session column hides
+        // itself; this forces it back (or hides it again) regardless of
+        // width. `b` was unbound before.
+        KeyCode::Char('b') => Some(DashAction::ToggleSidebar),
         KeyCode::Char('q') => Some(DashAction::Quit),
         KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
@@ -1437,6 +1455,15 @@ fn assemble_sidebar(
         selected: false,
         focused: false,
         supervised: p.supervised,
+        // Phase 1 placeholders; `enrich_sidebar` refines `fact_state`/
+        // `fact_since_secs` from the cached attention status and fills
+        // `workflow`/`unread_mail` from this same throttled tick's disk
+        // reads. A retained ended row's own fact is final already -- frozen
+        // at the reap, the same way its `since` disclosure line is.
+        fact_state: row_state_label(p.state).to_string(),
+        fact_since_secs: p.ended.map(|e| now_secs.saturating_sub(e.exited_at)),
+        workflow: None,
+        unread_mail: 0,
     };
     let mut rows: Vec<ui::SidebarRow> = live_panes.iter().copied().map(row_of).collect();
 
@@ -1478,6 +1505,10 @@ fn assemble_sidebar(
             // No `Pane` to ask, and never `focused` -- see `SidebarRow::
             // supervised`'s own doc comment.
             supervised: true,
+            fact_state: row_state_label(ui::RowState::Unknown).to_string(),
+            fact_since_secs: None,
+            workflow: None,
+            unread_mail: 0,
         });
     }
 
@@ -1494,8 +1525,23 @@ fn assemble_sidebar(
         // would put a subprocess on the render path.
         let pane = panes.iter().find(|p| p.short == row.short);
         let state = row_state_label(row.state);
+        // Dash refresh PR1: the fact block's own line 1 -- phase 1's plain
+        // `RowState` word and elapsed time, the same facts the old `reason`/
+        // `since` disclosure lines led with before `enrich_sidebar` composes
+        // a richer word from the cached attention status a moment later. A
+        // retained ended row's fact is already final: frozen at the reap,
+        // exactly like its old `since` disclosure line was.
+        match pane.and_then(|p| p.ended) {
+            Some(ended) => {
+                row.fact_state = "ended".to_string();
+                row.fact_since_secs = Some(now_secs.saturating_sub(ended.exited_at));
+            }
+            None => {
+                row.fact_state = state.to_string();
+                row.fact_since_secs = row.age_secs;
+            }
+        }
         row.disclosure = vec![
-            ("reason".into(), format!("none · {state}")),
             (
                 "group".into(),
                 format!(
@@ -1506,14 +1552,6 @@ fn assemble_sidebar(
                         .unwrap_or(style::PLACEHOLDER),
                     pane.and_then(|p| p.parent.as_deref())
                         .unwrap_or(style::PLACEHOLDER)
-                ),
-            ),
-            (
-                "model".into(),
-                format!(
-                    "{} {}",
-                    row.harness,
-                    row.model.as_deref().unwrap_or(style::PLACEHOLDER)
                 ),
             ),
             (
@@ -1575,6 +1613,20 @@ fn display_role(role: &str) -> &str {
     }
 }
 
+/// Pure: `cwd`, `~`-shortened against `home` when `cwd` starts with it --
+/// the pane header's own convention for its own `cwd` segment
+/// (` {harness} ▸ {role} · {model} · {cwd}`). Passes `cwd` through
+/// untouched when `home` is `None` or does not prefix it (a checkout
+/// outside the operator's home, or a build that could not resolve one).
+fn shorten_home(cwd: &str, home: Option<&str>) -> String {
+    match home {
+        Some(home) if !home.is_empty() && cwd.starts_with(home) => {
+            format!("~{}", &cwd[home.len()..])
+        }
+        _ => cwd.to_string(),
+    }
+}
+
 /// Pure: the word a disclosure line uses for a row's state when the composed
 /// attention model has nothing to say about it. Phase 2's [`lifecycle_word`]
 /// is the richer answer whenever a `SessionStatus` exists; this stays the
@@ -1630,37 +1682,74 @@ fn spaced_lowercase(camel: &str) -> String {
     out
 }
 
-/// Pure: the `reason` disclosure line for `status` -- `approval · workflow
-/// gate`: the projection's own word, then whatever evidence the winning
-/// authority recorded, capped at the 30 display columns the disclosure
-/// contract allows.
+/// Dash refresh PR1: resolves ONE session's own bound workflow (`workflow_
+/// id`) into the fact the sidebar/pane-header renders, replacing the old
+/// repo-wide `active_workflow_summary` pointer every pane used to share.
 ///
-/// `None` for a status that projects `Unknown`, which is exactly what a
-/// missing or never-written attention file loads back as: the caller then
-/// keeps phase 1's `none · <state>` rather than printing a reason nobody
-/// recorded.
-fn disclosure_reason(status: &super::attention::SessionStatus) -> Option<String> {
-    let projection = super::attention::project(status);
-    if projection == super::attention::Projection::Unknown {
-        return None;
+/// Three outcomes, matching the bug this replaces (`WorkflowState::current()`
+/// returns `None` once `current_step` is out of range -- previously papered
+/// over as an empty step string):
+/// - `Completed`: the fact reads `done` for 10 minutes after the run's own
+///   state file was last written (`engine::state_mtime_secs`), then `None`.
+///   Round 2 coordinator review, CONFIRMED: a state file this build could
+///   not stat (`state_mtime_secs` returns `None`) is treated as NOT fresh
+///   -- `None` right away -- never as "just written" (an `unwrap_or(now)`
+///   would make `now.saturating_sub(now) == 0`, always inside the 10-minute
+///   window, so a completed workflow's own "done" could never expire).
+/// - Any other status with a valid current step (`WorkflowState::current()`
+///   is `Some`): the step, its 1-based position, and whether the run is
+///   `AwaitingApproval`.
+/// - Anything else -- `current_step` out of range for a non-`Completed`
+///   status, or the run could not be loaded at all (purged, malformed,
+///   unknown id) -- `None`. Never a guessed or empty step.
+fn resolve_session_workflow(
+    state: &StateDir,
+    repo: &Path,
+    workflow_id: &str,
+    now: u64,
+) -> Option<ui::SessionWorkflowFact> {
+    let wf = workflow::engine::load(state, repo, workflow_id).ok()?;
+    let total = wf.steps.len();
+    if wf.status == workflow::engine::WorkflowStatus::Completed {
+        let mtime = workflow::engine::state_mtime_secs(state, repo, workflow_id);
+        if !completed_workflow_is_fresh(mtime, now) {
+            return None;
+        }
+        return Some(ui::SessionWorkflowFact {
+            kind: wf.kind.as_str().to_string(),
+            step: "done".to_string(),
+            index: total,
+            total,
+            awaiting_approval: false,
+            completed: true,
+        });
     }
-    let word = projection_word(projection);
-    // `attention::reason` is the one place the "prefer recorded evidence,
-    // else a generic sentence" rule lives; this only re-shapes its answer for
-    // a 30-column field. Its `Attention: evidence` prefix is dropped because
-    // `word` already carries that half.
-    let detail = super::attention::reason(status);
-    let prefix = format!("{:?}: ", status.attention);
-    let detail = detail
-        .strip_prefix(&prefix)
-        .map(str::to_string)
-        .unwrap_or(detail);
-    let text = if detail.is_empty() || detail.eq_ignore_ascii_case(&word) {
-        word
-    } else {
-        format!("{word} \u{b7} {detail}")
-    };
-    Some(style::truncate_display(&text, 30).into_owned())
+    let step = wf.current()?;
+    Some(ui::SessionWorkflowFact {
+        kind: wf.kind.as_str().to_string(),
+        step: step.id.clone(),
+        index: wf.current_step + 1,
+        total,
+        awaiting_approval: wf.status == workflow::engine::WorkflowStatus::AwaitingApproval,
+        completed: false,
+    })
+}
+
+/// Pure: whether a `Completed` run's own "done" fact is still fresh, given
+/// its state file's own last-write time (`engine::state_mtime_secs`) and
+/// `now`.
+///
+/// Round 2 coordinator review, CONFIRMED: `None` (no state file, or one
+/// this build could not stat) must NEVER be fresh. The bug this replaces
+/// was `mtime.unwrap_or(now)`, which made `now.saturating_sub(now) == 0` --
+/// always inside the 10-minute window -- so a completed workflow whose
+/// state file had since been purged, or was simply unreadable, showed
+/// "done" forever instead of fading like every other completed run.
+fn completed_workflow_is_fresh(mtime: Option<u64>, now: u64) -> bool {
+    match mtime {
+        Some(mtime) => now.saturating_sub(mtime) <= 600,
+        None => false,
+    }
 }
 
 /// Pure: one navigation action's effect on the `(selected, focused)` pair.
@@ -1749,18 +1838,18 @@ const fn follow_focus(selected: usize, focused: usize, pane_count: usize) -> usi
 /// never both at once -- is exercised without a state dir. Mirrors `ui`'s own
 /// `HeaderFacts` field order.
 fn assemble_header_facts(
-    harness: String,
-    live: usize,
-    total: usize,
+    sessions: usize,
+    working: usize,
+    needs_you: usize,
     error_count: usize,
     latest_error: Option<String>,
     notice: Option<String>,
 ) -> ui::HeaderFacts {
     ui::HeaderFacts {
         hints: ui::HintContext::default(),
-        harness,
-        live,
-        total,
+        sessions,
+        working,
+        needs_you,
         error_count,
         latest_error,
         notice,
@@ -1799,8 +1888,10 @@ fn assemble_header_facts(
 /// question (see `MailMap`'s own doc comment).
 fn assemble_footer_facts(
     focused_row: Option<&ui::SidebarRow>,
-    usage: &[ui::HarnessUsage],
     mail: Option<(usize, usize)>,
+    // Dash refresh PR1: only the DEAD-pane variant still carries a workflow
+    // segment (the alive footer's own workflow segment moved to the pane
+    // header, which has nowhere to draw for a pane that no longer exists).
     workflow: Option<&workflow::ActiveWorkflowSummary>,
     last_exited: Option<(&str, Option<u64>)>,
     // Issue #310: whether the focused pane's stall latch is currently armed
@@ -1837,11 +1928,6 @@ fn assemble_footer_facts(
         });
     }
 
-    let (five_hour, seven_day) = usage
-        .iter()
-        .find(|u| u.name == row.harness.as_str())
-        .map(|u| (u.five_hour, u.seven_day))
-        .unwrap_or((None, None));
     // N7's own broadcast/direct split collapses into one total here: the
     // mock's footer shows a single unlabeled number, unlike the wrap bar's
     // own richer `+`-suffixed segment (`chrome::status_bar`'s own `mail`).
@@ -1850,12 +1936,8 @@ fn assemble_footer_facts(
         .unwrap_or(0);
 
     ui::FooterFacts::Alive(ui::FooterAliveFacts {
-        harness: row.harness.clone(),
         score: row.score,
-        usage_five_hour: five_hour,
-        usage_seven_day: seven_day,
         unread_mail,
-        workflow: footer_workflow,
         // Issue #209/v3 codex review finding 5: `Pane::reachable()`, via
         // `SidebarRow::supervised` -- a pane whose turn-signal socket
         // failed to bind at spawn runs genuinely unsupervised, and the
@@ -2076,6 +2158,12 @@ struct DiskFacts {
     /// once-cleared-on-progress contract; there is no separate "unknown"
     /// state to represent here.
     stalled: HashSet<String>,
+    /// Dash refresh PR1: each pane's own bound workflow, resolved by id from
+    /// its own session record -- see `resolve_session_workflow`'s own doc
+    /// comment. Read on the same throttled tick and populated the same way
+    /// as `mail_by_session`/`stalled` right above; absence means "no bound
+    /// workflow, or its run could not be resolved," never a guess.
+    workflow_by_session: HashMap<String, ui::SessionWorkflowFact>,
     /// Issue #264: the aggregate row's own `failed`/`cost` cells, read once
     /// per throttled tick alongside `usage`/`mail` above -- `delegations.
     /// jsonl` is a plain file read, the same no-scan/no-network discipline
@@ -2612,10 +2700,17 @@ impl FactsCache {
                     .map(|w| window::available(&w, now_secs))
                     .unwrap_or_default();
                 let credits = cfg.pace.use_credits.for_provider(provider);
+                let detail_of = |w: &window::Window| ui::WindowDetail {
+                    resets_at: w.resets_at,
+                    limit_reached: w.limit_reached,
+                    overage_covered: w.overage_covered,
+                };
                 ui::HarnessUsage {
                     name,
-                    five_hour: windows.five_hour.map(|w| w.used_percentage),
-                    seven_day: windows.seven_day.map(|w| w.used_percentage),
+                    five_hour: windows.five_hour.as_ref().map(|w| w.used_percentage),
+                    seven_day: windows.seven_day.as_ref().map(|w| w.used_percentage),
+                    five_hour_detail: windows.five_hour.as_ref().map(detail_of),
+                    seven_day_detail: windows.seven_day.as_ref().map(detail_of),
                     credits,
                 }
             })
@@ -2731,6 +2826,41 @@ impl FactsCache {
             }
             if sessions::stall_marker(state, &record.short).is_some() {
                 self.disk.stalled.insert(record.short.clone());
+            }
+        }
+
+        // Dash refresh PR1: each pane's OWN bound workflow, resolved from its
+        // own session record by id -- mirroring `mail_by_session`/`stalled`
+        // right above, the same throttled per-session disk read. Never the
+        // repo-wide `active_workflow_summary` pointer above: that pointer
+        // moves on any `zirv workflow start` anywhere in the repo and can
+        // point at a completed run's now out-of-range step, which is exactly
+        // the bug this per-session resolution replaces (see
+        // `resolve_session_workflow`'s own doc comment).
+        let now = super::state::now_secs();
+        self.disk.workflow_by_session.clear();
+        for pane in panes {
+            if let Some(fact) = sessions::workflow_id_for(state, pane.short())
+                .and_then(|id| resolve_session_workflow(state, repo, &id, now))
+            {
+                self.disk
+                    .workflow_by_session
+                    .insert(pane.short().to_string(), fact);
+            }
+        }
+        for (record, liveness) in &self.registry {
+            if *liveness != sessions::Liveness::Live
+                || self.disk.workflow_by_session.contains_key(&record.short)
+                || record.owner_pid != Some(std::process::id())
+            {
+                continue;
+            }
+            if let Some(fact) = sessions::workflow_id_for(state, &record.short)
+                .and_then(|id| resolve_session_workflow(state, repo, &id, now))
+            {
+                self.disk
+                    .workflow_by_session
+                    .insert(record.short.clone(), fact);
             }
         }
         true
@@ -5408,6 +5538,21 @@ fn restore_panic_hook(previous: &Arc<PanicHook>) {
     let _ = std::panic::take_hook();
     let previous = Arc::clone(previous);
     std::panic::set_hook(Box::new(move |info| previous(info)));
+}
+
+/// Dash refresh PR1: THE one effective-width value for `dash.sidebar_cols`
+/// -- `0` (hidden) below 100 total columns unless `forced_visible`, else
+/// the operator's own configured width. Every call site that used to read
+/// `cfg.dash.sidebar_cols` directly for a geometry decision (pty resize,
+/// `ui::layout`, `effective_main`) goes through this instead, so a narrow
+/// terminal and a forced-visible toggle can never disagree about how wide
+/// the sidebar actually is this frame.
+fn effective_sidebar_cols(cfg: &CtxConfig, frame_width: u16, forced_visible: bool) -> u16 {
+    if ui::sidebar_hidden(frame_width, forced_visible) {
+        0
+    } else {
+        cfg.dash.sidebar_cols
+    }
 }
 
 /// The area a pane's grid actually renders into this frame: the full
@@ -11284,6 +11429,7 @@ fn sync_quiet_heuristic_attention(
 /// and none of them change between two consecutive 150 ms frames.
 const NATIVE_RECORD_REFRESH_SECS: u64 = 2;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     cfg: &CtxConfig,
     repo: &Path,
@@ -11292,8 +11438,19 @@ pub fn run_dashboard(
     first: PaneSpec,
     first_native: Option<native_pane::NativeDashboardSpec>,
     force_pace: bool,
+    first_workflow_id: Option<String>,
 ) -> CtxResult<i32> {
-    run_dashboard_inner(cfg, repo, env, state, first, first_native, force_pace, None)
+    run_dashboard_inner(
+        cfg,
+        repo,
+        env,
+        state,
+        first,
+        first_native,
+        force_pace,
+        None,
+        first_workflow_id,
+    )
 }
 
 /// Takes over an already-live successor pane after another terminal host has
@@ -11327,6 +11484,8 @@ pub(crate) fn run_dashboard_with_first_pane(
         None,
         force_pace,
         Some(first_pane),
+        // A rollover successor takeover, never a fresh workflow start.
+        None,
     )
 }
 
@@ -11340,6 +11499,7 @@ fn run_dashboard_inner(
     first_native: Option<native_pane::NativeDashboardSpec>,
     force_pace: bool,
     first_prebuilt: Option<Pane>,
+    first_workflow_id: Option<String>,
 ) -> CtxResult<i32> {
     let mut errors = ErrorLog::default();
     // Issue #354 phase 5: what the dashboard-level inspector reports as
@@ -11358,7 +11518,16 @@ fn run_dashboard_inner(
     // startup would restore panes to the terminal's *launch* geometry after
     // any resize rather than to what it is now.
     let (mut term_cols, mut term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let sidebar_cols = cfg.dash.sidebar_cols;
+    // Dash refresh PR1: below 100 total columns the session column hides
+    // (`ui::sidebar_hidden`) -- `^A b` forces it back regardless of width.
+    // `sidebar_cols` is THE one effective-width value every geometry read
+    // below (pty resize, `ui::layout`, `effective_main`, the inspector's own
+    // display line) goes through; kept current at every point the real
+    // terminal width can change (the `Event::Resize` arm, and the top-of-
+    // loop reconciliation against a resize crossterm coalesced or dropped),
+    // never read stale from a keystroke that only toggled the config value.
+    let mut sidebar_forced_visible = false;
+    let mut sidebar_cols = effective_sidebar_cols(cfg, term_cols, sidebar_forced_visible);
     let mut full = Rect::new(0, 0, term_cols, term_rows);
     let main = effective_main(full, sidebar_cols, false);
 
@@ -11603,6 +11772,16 @@ fn run_dashboard_inner(
             return Err(e);
         }
     };
+    // Dash refresh PR1: binds the proxy's already-started workflow onto this
+    // fresh orchestrator pane's own just-registered record, so the dashboard
+    // resolves ITS workflow step from this pane's session rather than the
+    // one repo-wide `engine::load_active` pointer. Best-effort, and only
+    // ever `Some` for a freshly spawned (non-native, non-prebuilt) pane --
+    // `chat.rs`'s only caller that ever has a `started_workflow_id` is the
+    // wrapped-launch proxy intake, which always takes this exact branch.
+    if let Some(workflow_id) = &first_workflow_id {
+        sessions::bind_workflow_id(state, first_pane.short(), workflow_id);
+    }
     let mut panes = vec![first_pane];
     // Task 9: one FIFO nudge queue per pane, kept the same length as `panes`.
     // Nothing in this task's scope ever grows `panes` after this point (a
@@ -11890,6 +12069,12 @@ fn run_dashboard_inner(
     // drawn frame, not on a clock of its own -- the dashboard already
     // redraws every frame, so this is the only "polling" the spinner needs.
     let mut render_tick: usize = 0;
+    // Dash refresh PR1: the pane header's own `cwd` field is `~`-shortened
+    // against the operator's home directory, resolved once here (an env
+    // lookup, not a per-frame read) rather than inside the render loop.
+    let home_dir_display = crate::utils::home_dir()
+        .ok()
+        .map(|p| p.display().to_string());
     // Issue #330: which unfocused pane the shared drain budget starts on,
     // advanced once per tick -- see `drain_shared_budget`.
     let mut drain_rotation: usize = 0;
@@ -13849,6 +14034,18 @@ fn run_dashboard_inner(
                                             }
                                         }
                                     }
+                                    InputVerdict::Dash(DashAction::ToggleSidebar) => {
+                                        // Dash refresh PR1: flips whether the
+                                        // narrow-terminal hide is overridden.
+                                        // `sidebar_cols` itself is recomputed
+                                        // (and every pane resized to match)
+                                        // at the top of the next iteration --
+                                        // see the loop's own reconciliation,
+                                        // which fires on a sidebar-only
+                                        // change exactly as it does on a real
+                                        // terminal resize.
+                                        sidebar_forced_visible = !sidebar_forced_visible;
+                                    }
                                     InputVerdict::Dash(DashAction::Quit) => {
                                         let working: Vec<String> = panes
                                             .iter()
@@ -14006,6 +14203,14 @@ fn run_dashboard_inner(
                             // call below read these, so leaving them at the startup
                             // geometry made un-zooming after a resize restore panes
                             // to the size the terminal had at launch.
+                            // Recomputed from THIS event's own incoming width,
+                            // never the stale value the previous iteration
+                            // left behind -- a resize that crosses the
+                            // narrow-terminal floor must resize every pane
+                            // to the right geometry on this same event, not
+                            // one iteration late.
+                            sidebar_cols =
+                                effective_sidebar_cols(cfg, cols, sidebar_forced_visible);
                             apply_terminal_resize(
                                 cols,
                                 term_h,
@@ -14448,10 +14653,20 @@ fn run_dashboard_inner(
         }
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+        // Dash refresh PR1: recomputed every iteration, from THIS frame's
+        // real width -- never held over from whatever a previous keystroke
+        // last saw.
+        let next_sidebar_cols = effective_sidebar_cols(cfg, term_size.0, sidebar_forced_visible);
         // M6: reconcile a resize crossterm coalesced or dropped -- if the real
         // terminal is not the size the ptys were last set to, apply it now so a
         // missed SIGWINCH does not leave every pane pinned at the old geometry.
-        if term_size != (term_cols, term_rows) {
+        // Dash refresh PR1: also reconciles on a sidebar-only change (`^A b`
+        // toggling `sidebar_forced_visible` with no terminal resize at all)
+        // -- the effective main rect changed just as surely as if the
+        // terminal itself had, and every pane's pty must follow it on this
+        // exact frame, not whenever the terminal happens to resize next.
+        if term_size != (term_cols, term_rows) || next_sidebar_cols != sidebar_cols {
+            sidebar_cols = next_sidebar_cols;
             apply_terminal_resize(
                 term_size.0,
                 term_size.1,
@@ -14464,6 +14679,8 @@ fn run_dashboard_inner(
                 &mut errors,
                 &mut selection,
             );
+        } else {
+            sidebar_cols = next_sidebar_cols;
         }
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let layout = ui::layout(frame_area, sidebar_cols);
@@ -14501,10 +14718,22 @@ fn run_dashboard_inner(
             .iter()
             .filter(|r| r.state != ui::RowState::Dead)
             .count();
+        // Dash refresh PR1 round 2: the header's own count cluster --
+        // `working` and `needs_you` are subsets of `total_live` ("sessions"
+        // in the drawn text), read off the same tick's own rows so the
+        // header can never disagree with the sidebar it sits above.
+        let header_working = rows
+            .iter()
+            .filter(|r| r.state == ui::RowState::Working)
+            .count();
+        let header_needs_you = rows
+            .iter()
+            .filter(|r| ui::glyph_for(r) == ui::Glyph::NeedsAction)
+            .count();
         let mut facts = assemble_header_facts(
-            harness_label.clone(),
             total_live,
-            rows.len(),
+            header_working,
+            header_needs_you,
             errors.sticky_count(),
             errors.sticky_line(),
             live_notice(&notices, Instant::now()).map(str::to_string),
@@ -14556,7 +14785,6 @@ fn run_dashboard_inner(
             focused_row.is_some_and(|row| facts_cache.disk.stalled.contains(&row.short));
         let footer_facts = assemble_footer_facts(
             focused_row,
-            &facts_cache.disk.usage,
             focused_mail,
             facts_cache.disk.workflow.as_ref(),
             last_exited.as_ref().map(|info| {
@@ -14572,38 +14800,6 @@ fn run_dashboard_inner(
             focused_stalled,
         );
 
-        // Issue #264: the aggregate row's own facts. `workers_running` is
-        // cheap in-memory state (`total_live`), recomputed fresh every frame
-        // like `HeaderFacts::live` itself; `workers_failed`/`spend_micros`
-        // and `five_hour_pct` all come from this tick's throttled disk read
-        // (`FactsCache::refresh_if_due`), so their own age is how long ago
-        // that read happened -- never claimed fresher than it is.
-        let facts_age = Instant::now().saturating_duration_since(facts_cache.last_refresh);
-        let aggregate_facts = ui::AggregateFacts {
-            workers_running: Some((total_live as u64, ui::Source::Live, Duration::ZERO)),
-            workers_failed: facts_cache
-                .disk
-                .spend
-                .map(|s| (s.failed, ui::Source::Live, facts_age)),
-            spend_micros: facts_cache
-                .disk
-                .spend
-                .map(|s| (s.cost_micros, ui::Source::Live, facts_age)),
-            five_hour_pct: facts_cache
-                .disk
-                .usage
-                .first()
-                .and_then(|u| u.five_hour)
-                .map(|pct| (pct, ui::Source::Live, facts_age)),
-            // Issue #358 (task T6a): the pool strip and seat label, same
-            // throttled tick as every other cell above.
-            harnesses: facts_cache.disk.pool_harnesses.clone(),
-            seat: facts_cache.disk.pool_seat.clone(),
-        };
-
-        let summary = ui::SidebarSummary {
-            aggregate: aggregate_facts,
-        };
         let bands = (cfg.score.advise_at, cfg.score.compact_at);
         // Issue #354: the roster owns its own viewport now -- the wheel
         // scrolls it without moving the cursor -- so the offset is re-pinned
@@ -14623,12 +14819,15 @@ fn run_dashboard_inner(
             tick: render_tick,
             bands,
         };
-        let mut roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+        let mut roster = ui::roster_frame(layout.sidebar, &rows, &view);
         // The viewport's index space is `roster.row_ids` (tree entries), not
         // `rows` (sessions): a group header takes a line of its own and a
-        // collapsed group swallows its children's. One row of the sidebar is
-        // the summary line, which never scrolls.
-        let capacity = layout.sidebar.height.saturating_sub(1) as usize;
+        // collapsed group swallows its children's. Dash refresh PR1: the
+        // title line that used to cost the roster its own top row is drawn
+        // from a separate rect now (`DashLayout::sidebar_title`), so the
+        // roster's own capacity is `layout.sidebar.height` outright -- no
+        // `-1` reservation left to make here.
+        let capacity = layout.sidebar.height as usize;
         let reveal_index = reveal_sidebar
             .then(|| {
                 chrome_selection.clone().or_else(|| {
@@ -14650,7 +14849,7 @@ fn run_dashboard_inner(
         if next_offset != sidebar_offset {
             sidebar_offset = next_offset;
             view.offset = sidebar_offset;
-            roster = ui::roster_frame(layout.sidebar, &rows, &summary, &view);
+            roster = ui::roster_frame(layout.sidebar, &rows, &view);
         }
         let next_snapshot = ui::frame_snapshot(
             frame_area,
@@ -14665,30 +14864,125 @@ fn run_dashboard_inner(
         // same `&overlay` it was built from -- see `overlay_route_is_current`.
         let next_snapshot_overlay_ident = overlay_identity(&overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
+        // Dash refresh PR1: the focused pane's own header row -- left
+        // identity, right workflow/state -- replaces `render_focus_rule`'s
+        // old text-in-the-rule treatment. `None` (nothing focused, an empty
+        // dashboard) draws nothing.
+        let pane_header_facts = focused_row.map(|row| ui::PaneHeaderFacts {
+            harness: row.harness.clone(),
+            role: row.role.clone(),
+            model: row.model.clone(),
+            cwd: focus_cwd
+                .as_deref()
+                .map(|cwd| shorten_home(cwd, home_dir_display.as_deref()))
+                .unwrap_or_else(|| style::PLACEHOLDER.into()),
+            workflow: row.workflow.clone(),
+            glyph: ui::glyph_for(row),
+            state_word: row.fact_state.clone(),
+            age_secs: row.fact_since_secs,
+        });
+        // Dash refresh PR1: the LIMITS block, pinned to the bottom of the
+        // session column -- session rows win the space (`roster.lines` is
+        // never shortened for it), so this only ever draws into whatever
+        // `layout.sidebar` the roster left blank, dropping whole windows
+        // from the bottom (never a half block) when even that is not
+        // enough room. `disk.usage` is already filtered to enabled
+        // harnesses (`FactsCache::refresh_if_due`'s own `cfg.agents.
+        // is_enabled` gate), so a disabled harness never reaches here.
+        let limits_blocks = ui::limits_blocks_from_usage(&facts_cache.disk.usage);
+        let limits_available_rows = layout
+            .sidebar
+            .height
+            .saturating_sub(roster.drawn_rows() as u16);
+        let limits_shown = ui::limits_blocks_fitting(limits_blocks.len(), limits_available_rows);
+        let limits_height = ui::limits_rows_for(limits_shown);
+        let limits_area = Rect {
+            y: layout.sidebar.y + layout.sidebar.height - limits_height,
+            height: limits_height,
+            ..layout.sidebar
+        };
+        // Dash refresh PR1: below the narrow-terminal floor `layout.sidebar`
+        // is 0-wide (`sidebar_cols` is 0), and the two rules must draw a
+        // plain line with no `┬`/`┼`/`┴` junction at all -- there is no
+        // divider column to meet. `u16::MAX` never satisfies either rule's
+        // own `divider_col < area.width` check, so it degrades to a bare
+        // rule exactly like a frame with no separator column already does.
+        let sidebar_hidden_now = layout.sidebar.width == 0;
+        // Dash refresh PR1 round 2: LIMITS reset times read as the
+        // operator's own local wall clock, not UTC -- the one clock read in
+        // this whole draw closure, so every pure formatter below takes the
+        // offset as a plain argument instead of reaching for `Local` itself.
+        let local_offset = *chrono::Local::now().offset();
+        let rule_divider_col = if sidebar_hidden_now {
+            u16::MAX
+        } else {
+            layout.sidebar.width
+        };
         let mut native_approval_rendered = false;
         let draw = terminal.draw(|f| {
             if !zoomed {
-                ui::render_header(f, layout.header, &facts);
-                ui::render_focus_rule(
-                    f,
-                    layout.rule_top,
-                    layout.sidebar.width,
-                    focused_row,
-                    focus_cwd.as_deref(),
-                );
-                ui::render_roster(f, layout.sidebar, &roster);
-                // Straight from the snapshot the click will be tested
-                // against, so the drawn divider and `Hit::Divider` can never
-                // describe different columns.
-                ui::render_sidebar_divider(f, next_snapshot.divider);
-                ui::render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
-                ui::render_footer_spend(
-                    f,
-                    layout.footer,
-                    &footer_facts,
-                    (cfg.score.advise_at, cfg.score.compact_at),
-                    &summary,
-                );
+                if sidebar_hidden_now {
+                    ui::render_header_tabs(f, layout.header, &facts, &rows, render_tick);
+                } else {
+                    ui::render_header(f, layout.header, &facts);
+                }
+                ui::render_rule(f, layout.rule_top, rule_divider_col, true);
+                if !sidebar_hidden_now {
+                    ui::render_sidebar_title(f, layout.sidebar_title, rows.len());
+                }
+                if let Some(pane_header_facts) = &pane_header_facts {
+                    ui::render_pane_header(f, layout.pane_header, pane_header_facts, render_tick);
+                }
+                ui::render_mid_rule(f, layout.mid_rule, rule_divider_col);
+                if !sidebar_hidden_now {
+                    ui::render_roster(f, layout.sidebar, &roster);
+                    if limits_height > 0 {
+                        ui::render_limits(
+                            f,
+                            limits_area,
+                            &limits_blocks[..limits_shown],
+                            super::state::now_secs(),
+                            local_offset,
+                        );
+                    }
+                    // Straight from the snapshot the click will be tested
+                    // against, so the drawn divider and `Hit::Divider` can
+                    // never describe different columns.
+                    ui::render_sidebar_divider(
+                        f,
+                        Rect {
+                            y: layout.sidebar_title.y,
+                            height: 1,
+                            ..next_snapshot.divider
+                        },
+                    );
+                    ui::render_sidebar_divider(f, next_snapshot.divider);
+                }
+                ui::render_rule(f, layout.rule_bottom, rule_divider_col, false);
+                if sidebar_hidden_now {
+                    let focused_usage = focused_row.and_then(|row| {
+                        facts_cache
+                            .disk
+                            .usage
+                            .iter()
+                            .find(|u| u.name == row.harness)
+                    });
+                    ui::render_footer_narrow_usage(
+                        f,
+                        layout.footer,
+                        focused_usage,
+                        super::state::now_secs(),
+                        local_offset,
+                    );
+                } else {
+                    ui::render_footer(
+                        f,
+                        layout.footer,
+                        &footer_facts,
+                        cfg.score.advise_at,
+                        cfg.score.compact_at,
+                    );
+                }
             }
             if let Some(pane) = panes.get(focused) {
                 // A selection only ever names the pane it started on
@@ -15480,17 +15774,18 @@ mod tests {
     #[test]
     fn a_forwarded_wheel_lands_in_the_childs_own_coordinate_space() {
         // The real geometry: an 80x24 frame, one header row, one rule row
-        // (issue #209/v3 §A4/§D), a 24-column sidebar and its separator --
-        // so the pane starts at column 25, row 2.
+        // (issue #209/v3 §A4/§D), a 24-column sidebar and its separator,
+        // then dash refresh PR1's own pane-header row and its rule below it
+        // -- so the pane starts at column 25, row 4.
         let main = ui::layout(Rect::new(0, 0, 80, 24), 24).main;
-        assert_eq!((main.x, main.y), (25, 2), "sanity: the pane is inset");
+        assert_eq!((main.x, main.y), (25, 4), "sanity: the pane is inset");
 
         assert_eq!(
-            pane_local_mouse(main, 25, 2),
+            pane_local_mouse(main, main.x, main.y),
             (1, 1),
             "the pane's own top-left cell is its (1, 1), not the frame's"
         );
-        assert_eq!(pane_local_mouse(main, 31, 6), (7, 5));
+        assert_eq!(pane_local_mouse(main, 31, 8), (7, 5));
         // Bottom-right corner of the pane, and nothing past it.
         assert_eq!(
             pane_local_mouse(main, main.x + main.width - 1, main.y + main.height - 1),
@@ -16707,38 +17002,6 @@ mod tests {
         }
     }
 
-    /// The `reason` line is the projection's own word plus the winning
-    /// authority's evidence -- `approval · workflow gate` -- capped at the 30
-    /// display columns the disclosure contract allows.
-    #[test]
-    fn the_reason_line_names_the_attention_and_its_evidence() {
-        assert_eq!(
-            disclosure_reason(&blocked_status(1)).as_deref(),
-            Some("approval \u{b7} workflow gate")
-        );
-        // A camel-cased attention variant reads as words.
-        let mut gate = blocked_status(1);
-        gate.attention = super::super::attention::Attention::WorkflowGate;
-        gate.evidence = "verify step 3".into();
-        assert_eq!(
-            disclosure_reason(&gate).as_deref(),
-            Some("workflow gate \u{b7} verify step 3")
-        );
-        // No evidence recorded: the word alone, never a duplicated sentence.
-        let mut bare = blocked_status(1);
-        bare.evidence.clear();
-        assert_eq!(disclosure_reason(&bare).as_deref(), Some("approval"));
-        // Never wider than the 30-column disclosure field.
-        let mut long = blocked_status(1);
-        long.evidence = "a".repeat(200);
-        assert_eq!(style::display_width(&disclosure_reason(&long).unwrap()), 30);
-        // And a status nobody has ever written keeps phase 1's own text.
-        assert_eq!(
-            disclosure_reason(&super::super::attention::SessionStatus::default()),
-            None
-        );
-    }
-
     #[test]
     fn the_lifecycle_word_is_the_axis_the_since_line_counts_from() {
         use super::super::attention::Lifecycle;
@@ -16751,8 +17014,11 @@ mod tests {
     }
 
     /// `enrich_sidebar` folds the cached status onto the row: the glyph's own
-    /// source, the `reason` line and the `since` line's `<lifecycle word>
-    /// <age since last_transition> · started <age>` shape.
+    /// source, the fact block's own state word (dash refresh PR1 -- the
+    /// composed projection's word, replacing the old `reason` disclosure
+    /// line) and the `since` disclosure line's `<lifecycle word> <age since
+    /// last_transition> · started <age>` shape (kept for the `^A i`
+    /// inspector).
     #[test]
     fn enrich_sidebar_folds_the_cached_attention_status_onto_the_row() {
         let panes = vec![pane_row("aaa11111", "claude")];
@@ -16766,6 +17032,8 @@ mod tests {
         enrich_sidebar(&mut rows, &disk, 740);
 
         assert_eq!(ui::glyph_for(&rows[0]), ui::Glyph::NeedsAction);
+        assert_eq!(rows[0].fact_state, "approval");
+        assert_eq!(rows[0].fact_since_secs, Some(740 - 200));
         let value = |key: &str| {
             rows[0]
                 .disclosure
@@ -16774,7 +17042,6 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap()
         };
-        assert_eq!(value("reason"), "approval \u{b7} workflow gate");
         // 740 - 200 = 9m in state; 740 - 100 = 10m since it started.
         assert_eq!(value("since"), "waiting 9m \u{b7} started 10m ago");
     }
@@ -17389,37 +17656,31 @@ mod tests {
     }
 
     #[test]
-    fn assemble_header_facts_carries_live_and_total_through() {
-        let facts = assemble_header_facts("claude".to_string(), 2, 5, 0, None, None);
-        assert_eq!(facts.live, 2);
-        assert_eq!(facts.total, 5);
+    fn assemble_header_facts_carries_the_session_counts_through() {
+        let facts = assemble_header_facts(5, 2, 1, 0, None, None);
+        assert_eq!(facts.sessions, 5);
+        assert_eq!(facts.working, 2);
+        assert_eq!(facts.needs_you, 1);
         assert_eq!(facts.error_count, 0);
         assert_eq!(facts.latest_error, None);
         assert_eq!(facts.notice, None);
 
-        let facts = assemble_header_facts(
-            "claude".to_string(),
-            1,
-            1,
-            3,
-            Some("mail send: disk full".to_string()),
-            None,
-        );
+        let facts =
+            assemble_header_facts(1, 0, 0, 3, Some("mail send: disk full".to_string()), None);
         assert_eq!(facts.error_count, 3);
         assert_eq!(facts.latest_error.as_deref(), Some("mail send: disk full"));
     }
 
     #[test]
-    fn assemble_header_facts_carries_the_harness_and_notice_through() {
+    fn assemble_header_facts_carries_the_notice_through() {
         let facts = assemble_header_facts(
-            "claude (opus)".to_string(),
             1,
-            1,
+            0,
+            0,
             0,
             None,
             Some("spawned claude as wrk-2".to_string()),
         );
-        assert_eq!(facts.harness, "claude (opus)");
         assert_eq!(facts.notice.as_deref(), Some("spawned claude as wrk-2"));
     }
 
@@ -17447,12 +17708,16 @@ mod tests {
             selected: false,
             focused: true,
             supervised,
+            fact_state: "idle".into(),
+            fact_since_secs: Some(90),
+            workflow: None,
+            unread_mail: 0,
         }
     }
 
     #[test]
     fn assemble_footer_facts_is_none_with_nothing_focused_and_no_exit_to_report() {
-        let facts = assemble_footer_facts(None, &[], None, None, None, false);
+        let facts = assemble_footer_facts(None, None, None, None, false);
         assert!(matches!(facts, ui::FooterFacts::None));
     }
 
@@ -17461,7 +17726,7 @@ mod tests {
     /// the dead-pane variant instead of drawing nothing.
     #[test]
     fn assemble_footer_facts_is_dead_when_nothing_is_focused_but_something_just_exited() {
-        let facts = assemble_footer_facts(None, &[], None, None, Some(("codex", Some(720))), false);
+        let facts = assemble_footer_facts(None, None, None, Some(("codex", Some(720))), false);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "codex");
@@ -17471,25 +17736,18 @@ mod tests {
         }
     }
 
+    /// Dash refresh PR1: the alive footer carries only the score/mail/
+    /// supervision facts now -- harness, usage and workflow all moved
+    /// elsewhere (the pane header, or PR2's forecast track).
     #[test]
-    fn assemble_footer_facts_carries_score_usage_and_mail_for_the_focused_row() {
+    fn assemble_footer_facts_carries_score_and_mail_for_the_focused_row() {
         let row = focused_alive_row(Some(47));
-        let usage = vec![ui::HarnessUsage {
-            name: "claude",
-            five_hour: Some(61.0),
-            seven_day: Some(18.0),
-            credits: false,
-        }];
-        let facts = assemble_footer_facts(Some(&row), &usage, Some((2, 1)), None, None, false);
+        let facts = assemble_footer_facts(Some(&row), Some((2, 1)), None, None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => {
-                assert_eq!(alive.harness, "claude");
                 assert_eq!(alive.score, Some(47));
-                assert_eq!(alive.usage_five_hour, Some(61.0));
-                assert_eq!(alive.usage_seven_day, Some(18.0));
                 // N7's broadcast/direct split collapses into one total.
                 assert_eq!(alive.unread_mail, 3);
-                assert!(matches!(alive.workflow, ui::FooterWorkflow::None));
                 assert!(alive.supervised);
                 assert!(!alive.stalled);
             }
@@ -17502,7 +17760,7 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_unsupervised_through() {
         let row = focused_alive_row_supervised(None, false);
-        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, false);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, false);
         match facts {
             ui::FooterFacts::Alive(alive) => assert!(!alive.supervised),
             _ => panic!("expected FooterFacts::Alive"),
@@ -17515,7 +17773,7 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_stalled_through() {
         let row = focused_alive_row(Some(47));
-        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, true);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, true);
         match facts {
             ui::FooterFacts::Alive(alive) => assert!(alive.stalled),
             _ => panic!("expected FooterFacts::Alive"),
@@ -17523,13 +17781,13 @@ mod tests {
     }
 
     /// A dead focused row produces `FooterFacts::Dead`, never `Alive` --
-    /// there is no verdict/usage/mail to show for an exited pane.
+    /// there is no verdict/mail to show for an exited pane.
     #[test]
     fn assemble_footer_facts_is_dead_for_a_dead_focused_row() {
         let mut row = focused_alive_row(Some(12));
         row.state = ui::RowState::Dead;
         row.age_secs = Some(720);
-        let facts = assemble_footer_facts(Some(&row), &[], None, None, None, false);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, false);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "claude");
@@ -17539,43 +17797,203 @@ mod tests {
         }
     }
 
+    fn wf_test_classification() -> crate::commands::workflow::classify::Classification {
+        crate::commands::workflow::classify::Classification {
+            intent: crate::commands::workflow::classify::Intent::Feature,
+            complexity: crate::commands::workflow::classify::Complexity::Bounded,
+            risk: crate::commands::workflow::classify::RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 10,
+            changed_paths: Vec::new(),
+            declared_scope: true,
+            work_domain: crate::commands::workflow::classify::DomainClassification::default(),
+            risk_measurement: crate::commands::workflow::classify::RiskMeasurement::default(),
+            reasons: Vec::new(),
+        }
+    }
+
+    /// Dash refresh PR1: a running workflow resolves to its own current step
+    /// and 1-based position, never the repo-wide pointer.
     #[test]
-    fn assemble_footer_facts_carries_the_active_workflow_summary_through() {
+    fn resolve_session_workflow_reports_the_current_step() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let wf = workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            wf_test_classification(),
+        );
+        workflow::engine::save(&state, &wf, true).expect("save workflow");
+
+        let fact =
+            resolve_session_workflow(&state, repo.path(), &wf.id, super::super::state::now_secs())
+                .expect("a saved, running workflow resolves");
+        assert_eq!(fact.kind, "feature");
+        assert_eq!(fact.step, wf.current().unwrap().id);
+        assert_eq!(fact.index, 1);
+        assert_eq!(
+            fact.awaiting_approval,
+            wf.status == workflow::engine::WorkflowStatus::AwaitingApproval
+        );
+        assert!(!fact.completed);
+    }
+
+    /// A completed run reads `done` immediately after finishing.
+    #[test]
+    fn resolve_session_workflow_reports_done_right_after_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let mut wf = workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            wf_test_classification(),
+        );
+        wf.status = workflow::engine::WorkflowStatus::Completed;
+        workflow::engine::save(&state, &wf, true).expect("save workflow");
+
+        let fact =
+            resolve_session_workflow(&state, repo.path(), &wf.id, super::super::state::now_secs())
+                .expect("a just-completed workflow still resolves");
+        assert_eq!(fact.step, "done");
+        assert!(fact.completed);
+    }
+
+    /// The same completed run stops resolving at all once its own state
+    /// file's last write is more than 10 minutes in the past -- the fact
+    /// block's own "10 minutes, then nothing" rule.
+    #[test]
+    fn resolve_session_workflow_hides_a_completed_run_after_ten_minutes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let mut wf = workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            wf_test_classification(),
+        );
+        wf.status = workflow::engine::WorkflowStatus::Completed;
+        workflow::engine::save(&state, &wf, true).expect("save workflow");
+
+        let far_future = super::super::state::now_secs() + 700;
+        assert_eq!(
+            resolve_session_workflow(&state, repo.path(), &wf.id, far_future),
+            None,
+            "a completed run more than 10 minutes stale must render nothing"
+        );
+    }
+
+    /// The bug this replaces: `current_step` past the end of `steps` (with a
+    /// non-`Completed` status) must resolve to `None`, never an empty step.
+    #[test]
+    fn resolve_session_workflow_is_none_when_the_current_step_is_out_of_range() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let mut wf = workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            wf_test_classification(),
+        );
+        wf.current_step = wf.steps.len() + 5;
+        workflow::engine::save(&state, &wf, true).expect("save workflow");
+
+        assert_eq!(
+            resolve_session_workflow(&state, repo.path(), &wf.id, super::super::state::now_secs()),
+            None
+        );
+    }
+
+    /// Round 2 coordinator review, CONFIRMED: a missing/unreadable state
+    /// file (`state_mtime_secs` -> `None`) must never be treated as fresh --
+    /// the old `unwrap_or(now)` made `done` never expire for exactly this
+    /// case.
+    #[test]
+    fn completed_workflow_is_fresh_treats_a_missing_mtime_as_not_fresh() {
+        assert!(!completed_workflow_is_fresh(None, 1_000));
+        assert!(!completed_workflow_is_fresh(None, 0));
+    }
+
+    #[test]
+    fn completed_workflow_is_fresh_is_the_ten_minute_window_on_a_real_mtime() {
+        assert!(completed_workflow_is_fresh(Some(1_000), 1_000));
+        assert!(completed_workflow_is_fresh(Some(1_000), 1_000 + 600));
+        assert!(!completed_workflow_is_fresh(Some(1_000), 1_000 + 601));
+    }
+
+    /// No such id on disk at all (never bound, or purged) resolves to `None`.
+    #[test]
+    fn resolve_session_workflow_is_none_for_an_unknown_id() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state = StateDir::from_root(root.path().to_path_buf());
+        assert_eq!(
+            resolve_session_workflow(
+                &state,
+                repo.path(),
+                "w-doesnotexist",
+                super::super::state::now_secs()
+            ),
+            None
+        );
+    }
+
+    /// Dash refresh PR1: the workflow segment moved to the pane header --
+    /// an alive row's own footer facts carry no workflow field at all any
+    /// more, whatever the repo-wide summary says.
+    #[test]
+    fn assemble_footer_facts_alive_variant_has_no_workflow_field() {
         let row = focused_alive_row(None);
         let summary = workflow::ActiveWorkflowSummary {
             kind: "feature",
             step: "design".to_string(),
             awaiting_approval: false,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None, false);
+        let facts = assemble_footer_facts(Some(&row), None, Some(&summary), None, false);
         match facts {
-            ui::FooterFacts::Alive(alive) => match alive.workflow {
-                ui::FooterWorkflow::Active { kind, step, gated } => {
-                    assert_eq!(kind, "feature");
-                    assert_eq!(step, "design");
-                    assert!(!gated);
-                }
-                ui::FooterWorkflow::None => panic!("expected an active workflow segment"),
-            },
+            ui::FooterFacts::Alive(_) => {}
             _ => panic!("expected FooterFacts::Alive"),
         }
     }
 
+    /// The dead-pane variant is the one exception (dash refresh PR1): it
+    /// still carries the workflow summary, since a pane that no longer
+    /// exists has no pane header left to show it in.
     #[test]
-    fn assemble_footer_facts_marks_an_awaiting_approval_workflow_as_gated() {
-        let row = focused_alive_row(None);
+    fn assemble_footer_facts_dead_variant_still_carries_the_workflow_summary() {
+        let mut row = focused_alive_row(None);
+        row.state = ui::RowState::Dead;
+        row.age_secs = Some(720);
         let summary = workflow::ActiveWorkflowSummary {
             kind: "feature",
             step: "spec".to_string(),
             awaiting_approval: true,
         };
-        let facts = assemble_footer_facts(Some(&row), &[], None, Some(&summary), None, false);
+        let facts = assemble_footer_facts(Some(&row), None, Some(&summary), None, false);
         match facts {
-            ui::FooterFacts::Alive(alive) => match alive.workflow {
-                ui::FooterWorkflow::Active { gated, .. } => assert!(gated),
+            ui::FooterFacts::Dead(dead) => match dead.workflow {
+                ui::FooterWorkflow::Active { kind, step, gated } => {
+                    assert_eq!(kind, "feature");
+                    assert_eq!(step, "spec");
+                    assert!(gated);
+                }
                 ui::FooterWorkflow::None => panic!("expected an active workflow segment"),
             },
-            _ => panic!("expected FooterFacts::Alive"),
+            _ => panic!("expected FooterFacts::Dead"),
         }
     }
 
@@ -17634,6 +18052,78 @@ mod tests {
         assert_eq!(
             codex.five_hour, None,
             "nothing was ever stored for codex's own provider"
+        );
+        // Dash refresh PR1: the LIMITS block's own reset/limit/overage facts
+        // (`window::Window`'s fields beyond `used_percentage`) ride along
+        // too, not just the bare percentage.
+        assert_eq!(
+            claude.five_hour_detail,
+            Some(ui::WindowDetail {
+                resets_at: 0,
+                limit_reached: false,
+                overage_covered: false,
+            })
+        );
+    }
+
+    /// Coordinator scope addition: a harness the operator (or repo) has
+    /// disabled -- `crate::settings::AgentGate::is_enabled` false -- must
+    /// never reach `disk.usage` at all, even with a stale usage file still
+    /// sitting on disk for it from before it was disabled. The LIMITS
+    /// block (`ui::limits_blocks_from_usage`) only ever sees `disk.usage`,
+    /// so this is also what keeps a disabled harness out of LIMITS.
+    #[test]
+    fn refresh_if_due_hides_a_disabled_harnesss_usage_even_with_a_stale_file_on_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let now = Instant::now();
+
+        // Codex's own stale usage file, written as if from before the
+        // operator disabled it -- it must not resurrect once disabled.
+        super::super::window::store_for(
+            &state,
+            "chatgpt",
+            &super::super::window::UsageWindows {
+                five_hour: Some(super::super::window::Window {
+                    used_percentage: 92.0,
+                    resets_at: 0,
+                    observed_at: super::super::state::now_secs(),
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex's stale reading");
+
+        let env = HashMap::from([("ZIRV_AGENT_CODEX_ENABLED".to_string(), "false".to_string())]);
+        let cfg = CtxConfig::load(&repo, &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.agents.is_enabled("codex"),
+            "sanity: the env override actually disabled codex"
+        );
+
+        let mut cache = FactsCache::new(now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            Some(FactsSnapshot::default())
+        });
+
+        assert!(
+            cache.disk.usage.iter().all(|u| u.name != "codex"),
+            "a disabled harness's usage must not appear at all, stale file or not: {:?}",
+            cache.disk.usage.iter().map(|u| u.name).collect::<Vec<_>>()
+        );
+        assert!(
+            cache.disk.usage.iter().any(|u| u.name == "claude"),
+            "an enabled harness is unaffected"
+        );
+        assert!(
+            ui::limits_blocks_from_usage(&cache.disk.usage)
+                .iter()
+                .all(|b| b.harness != "codex"),
+            "and therefore never reaches a LIMITS block either"
         );
     }
 
@@ -26242,6 +26732,8 @@ mod tests {
             name: "claude",
             five_hour: Some(61.0),
             seven_day: Some(18.0),
+            five_hour_detail: None,
+            seven_day_detail: None,
             credits: false,
         }];
         let pool = vec![ui::HarnessStrip {
@@ -31759,8 +32251,9 @@ mod tests {
         let mut full = Rect::new(0, 0, 80, 24);
         let mut errors = ErrorLog::default();
         // sidebar 20, not zoomed: main width = 100 - 20 - 1 = 79, height =
-        // 40 - 4 (issue #209/v3 §A4/§D: one header row, one top rule, one
-        // bottom rule, one footer row -- `ui::chrome_rows`).
+        // 40 - 6 (issue #209/v3 §A4/§D: one header row, one top rule, one
+        // bottom rule, one footer row -- `ui::chrome_rows` -- plus dash
+        // refresh PR1's own pane-header row and the rule below it).
         apply_terminal_resize(
             100,
             40,
@@ -31778,7 +32271,7 @@ mod tests {
         // vt100 `size()` returns (rows, cols).
         assert_eq!(
             panes[0].screen().size(),
-            (36, 79),
+            (34, 79),
             "the pane's screen was resized to the new inner geometry"
         );
 
@@ -31786,6 +32279,91 @@ mod tests {
         // `a_nudge_aimed_at_a_reaped_pane_is_reported_and_delivered_nowhere`.
         for pane in panes.iter_mut() {
             let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Dash refresh PR1: the grid rect (`ui::layout`'s own `main`) and the
+    /// pty size `apply_terminal_resize` actually applies must agree in
+    /// every one of the three regimes `effective_sidebar_cols` decides
+    /// between -- hidden below the narrow-terminal floor, forced back on
+    /// below it, and shown outright at/above it. All three go through the
+    /// SAME `sidebar_cols` value here, exactly as the real render loop's
+    /// own `effective_sidebar_cols` call feeds both `ui::layout` and
+    /// `apply_terminal_resize` from one place.
+    #[test]
+    fn pane_geometry_matches_layouts_main_rect_hidden_forced_and_shown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+        assert_eq!(
+            cfg.dash.sidebar_cols, 28,
+            "sanity: the default this test exercises"
+        );
+
+        for (width, height, forced_visible, expect_hidden) in [
+            (80u16, 24u16, false, true),
+            (80u16, 24u16, true, false),
+            (120u16, 40u16, false, false),
+        ] {
+            let spec = PaneSpec {
+                agent_name: "test-agent".to_string(),
+                argv: super::pane::tests::long_lived_argv(),
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: "bbbbbbbb-2222-4333-8444-555555555555".to_string(),
+                title: "wrk resize".to_string(),
+            };
+            let mut panes = vec![
+                Pane::spawn(
+                    spec,
+                    &state,
+                    &repo,
+                    &repo,
+                    (80, 24),
+                    &[],
+                    true,
+                    pane::DEFAULT_IDLE_QUIET,
+                )
+                .expect("spawn"),
+            ];
+            let mut term_cols = 80u16;
+            let mut term_rows = 24u16;
+            let mut full = Rect::new(0, 0, 80, 24);
+            let mut errors = ErrorLog::default();
+
+            let sidebar_cols = effective_sidebar_cols(&cfg, width, forced_visible);
+            assert_eq!(
+                sidebar_cols == 0,
+                expect_hidden,
+                "sanity: hidden decision at {width}x{height} forced={forced_visible}"
+            );
+
+            apply_terminal_resize(
+                width,
+                height,
+                sidebar_cols,
+                false,
+                &mut term_cols,
+                &mut term_rows,
+                &mut full,
+                &mut panes,
+                &mut errors,
+                &mut None,
+            );
+
+            let expected_main = ui::layout(Rect::new(0, 0, width, height), sidebar_cols).main;
+            assert_eq!(
+                panes[0].screen().size(),
+                (expected_main.height.max(1), expected_main.width.max(1)),
+                "pty size must match ui::layout's own main rect at {width}x{height} \
+                 forced={forced_visible} (sidebar_cols={sidebar_cols})"
+            );
+
+            for pane in panes.iter_mut() {
+                let _ = pane.finish_shutdown();
+            }
         }
     }
 
@@ -32373,11 +32951,18 @@ mod tests {
             name: "codex",
             five_hour: Some(61.0),
             seven_day: None,
+            five_hour_detail: None,
+            seven_day_detail: None,
             credits: false,
         });
         enrich_sidebar(&mut rows, &disk, 240);
         assert_eq!(rows[0].model.as_deref(), Some("resolved-model"));
-        assert_eq!(rows[0].disclosure.len(), 8);
+        // Dash refresh PR1: "model" and "reason" dropped from this vec --
+        // they only ever fed the old 8-line sidebar disclosure block, which
+        // the 2-line fact block replaced (see `SidebarRow::disclosure`'s own
+        // doc comment). "group"/"budget"/"branch"/"writer"/"since"/"signal"
+        // remain: the `^A i` per-row inspector still reads them.
+        assert_eq!(rows[0].disclosure.len(), 6);
         assert!(
             rows[0]
                 .disclosure

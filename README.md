@@ -354,7 +354,9 @@ switch panes, `Tab`/arrows navigate, `s`/`n`/`m` open spawn/nudge/mail
 overlays, `o` opens the handover picker (swap the focused pane's model or
 harness in place — see [Cross-harness fallback and
 handover](#cross-harness-fallback-and-handover) below), `z` zooms the focused
-pane, `e` shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
+pane, `b` shows/hides the session column (it hides itself below 100 total
+columns; `b` forces it back regardless of width, or hides it again), `e`
+shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
 dashboard writes a restore roster so a next launch can offer to reopen the
 same panes.
 
@@ -388,7 +390,7 @@ must not raise for itself, so a repository may set it:
 ```toml
 [dash]
 enabled = true               # ZIRV_CTX_DASH
-sidebar_cols = 44            # ZIRV_CTX_DASH_SIDEBAR_COLS
+sidebar_cols = 28            # ZIRV_CTX_DASH_SIDEBAR_COLS
 roster_max_age_secs = 604800 # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
 max_panes = 9                 # ZIRV_CTX_DASH_MAX_PANES
 mouse = true                  # ZIRV_CTX_DASH_MOUSE

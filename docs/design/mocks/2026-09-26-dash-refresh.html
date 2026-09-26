@@ -1,0 +1,495 @@
+<title>Zirv Dash Refresh</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0c0e11; --panel:#11151a; --bar:#161b21; --line:#27303a;
+  --text:#d8dde3; --muted:#7c8795; --dim:#4a5461; --head:#eef2f6;
+  --cyan:#4fd7e0; --cyan-b:#7ae6ec; --green:#5fcf8c; --yellow:#e4c35e; --red:#e76b62; --magenta:#c985e3;
+  --sel:#1b2430; --tab:#1d2733;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{background:var(--bg);color:var(--text);margin:0;font:15px/1.6 "IBM Plex Sans",system-ui,sans-serif;padding-block:28px 80px;padding-inline:max(16px,4vw)}
+main{max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font:600 30px/1.2 "IBM Plex Sans",system-ui,sans-serif;color:var(--head);margin:0;text-wrap:balance;letter-spacing:-.01em}
+h1 b{color:var(--cyan);font-weight:600}
+h2{font:600 20px/1.3 "IBM Plex Sans",system-ui,sans-serif;color:var(--head);margin:36px 0 0;padding-top:22px;border-top:1px solid var(--line);text-wrap:balance}
+h2 .n{font:500 12px/1 "IBM Plex Mono",monospace;color:var(--cyan);letter-spacing:.08em;display:block;margin-bottom:8px}
+h3{font:600 12px/1.4 "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:14px 0 0}
+p{margin:0;max-width:78ch;color:var(--text)}
+p.lede{color:var(--muted);font-size:16px}
+ul.req{margin:0;padding-left:1.1em;max-width:90ch;display:grid;gap:4px}
+ul.req li::marker{color:var(--cyan)}
+code{font:13px "IBM Plex Mono",monospace;color:var(--cyan-b)}
+.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,640px),1fr));gap:18px;align-items:start}
+figure.term{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+figure.term figcaption{display:flex;justify-content:space-between;gap:12px;background:var(--bar);border-bottom:1px solid var(--line);padding:6px 12px;font:11px "IBM Plex Mono",monospace;color:var(--muted);letter-spacing:.04em}
+figure.term .scroll{overflow-x:auto}
+figure.term pre{margin:0;padding:8px 10px;white-space:pre;line-height:1.32;
+  font-family:"Cascadia Mono","Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace;
+  font-size:clamp(7px, calc((min(100vw, 1500px) - 8vw - 40px) / (var(--cols) * 0.61)), 13px)}
+.pair figure.term pre{font-size:clamp(6px, calc(((min(100vw, 1500px) - 8vw - 60px) / 2) / (var(--cols) * 0.61)), 13px)}
+@media (max-width:1340px){.pair figure.term pre{font-size:clamp(7px, calc((100vw - 8vw - 40px) / (var(--cols) * 0.61)), 13px)}}
+.d{color:var(--dim)} .mu{color:var(--muted)} .b{color:var(--head);font-weight:700} .h{color:var(--muted);font-weight:700;letter-spacing:.06em}
+.c{color:var(--cyan)} .cd{color:#2f8f96} .g{color:var(--green)} .dg{color:var(--green)} .y{color:var(--yellow)} .yb{color:var(--yellow);font-weight:700}
+.r{color:var(--red);font-weight:700} .rb{color:var(--red);font-weight:700} .m{color:var(--magenta)} .acc{color:var(--cyan)}
+.ty{color:#8a7a3c} .tr{color:#8a4540}
+.chip{background:var(--cyan);color:#061014;font-weight:700}
+.sel{background:var(--sel)} .rev{background:#c9d0d8;color:#0c0e11} .tab{background:var(--tab)}
+.cur{background:var(--text)}
+.toast{color:var(--green)}
+.flash{animation:flash 900ms ease-out}
+@keyframes flash{0%{background:#3a3050}100%{background:transparent}}
+.pulse{animation:breathe 1.6s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.45}}
+.shim{color:var(--cyan)} .shim.hi{color:#d9fbfd;text-shadow:0 0 6px rgba(122,230,236,.5)} .shim.mid{color:var(--cyan-b)}
+.states{display:grid;gap:10px}
+.state{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr);gap:6px 18px;align-items:start}
+.state .lbl{font:600 13px/1.4 "IBM Plex Sans",sans-serif;color:var(--head)}
+.state .lbl small{display:block;font-weight:400;color:var(--muted);font-size:13px;margin-top:2px}
+@media (max-width:760px){.state{grid-template-columns:1fr}}
+.limits{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
+.limits .lbl{font:600 13px/1.4 "IBM Plex Sans",sans-serif;color:var(--head);margin-bottom:6px}
+.limits .lbl small{display:block;font-weight:400;color:var(--muted)}
+.limits figure.term pre{font-size:13px}
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr));gap:18px;align-items:start}
+.flow figure.term pre{font-size:clamp(7px, calc(((min(100vw, 1500px) - 8vw - 60px) / 2) / (var(--cols) * 0.61)), 12px)}
+@media (max-width:1240px){.flow figure.term pre{font-size:clamp(7px, calc((100vw - 8vw - 40px) / (var(--cols) * 0.61)), 12px)}}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font:13px "IBM Plex Mono",monospace;color:var(--muted)}
+button{font:600 13px "IBM Plex Mono",monospace;background:var(--tab);color:var(--head);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--cyan)} button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+.tw{overflow-x:auto;max-width:100%}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 12px "IBM Plex Mono",monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+td:first-child{color:var(--head);font-weight:600;white-space:nowrap}
+.ask{border:1px solid var(--line);border-left:3px solid var(--yellow);border-radius:6px;padding:14px 18px;background:var(--panel);display:grid;gap:8px}
+.ask ol{margin:0;padding-left:1.3em;display:grid;gap:6px}
+@media (prefers-reduced-motion:reduce){.pulse,.flash{animation:none}}
+</style>
+<main>
+<h1><b>zirv</b> dash refresh: wrapped sessions, limits, motion and intake</h1>
+<p class="lede">Proposed changes to the wrapped-session dashboard, its motion, and the prompt proxy that runs before a session starts. The current frame is rebuilt from <code>dash/ui.rs</code>; every proposed value maps to data zirv already has or a small, named addition. Nothing is implemented yet.</p>
+<h2><span class="n">01 · DASHBOARD</span>Narrower session column, pane header, limits in the dead space</h2>
+<ul class="req"><li>Session column goes from 44 to 28 columns. Rows keep the group tree, state glyph, rot score, and gain a mail or approval badge.</li><li>The 8-line fact block becomes 2 lines: state with time, and workflow step. Group, model, budget, branch and signal are gone; the model moves to the pane header.</li><li>A pane header row, like the native pane: harness, role, model, folder, workflow step, and a working indicator.</li><li>The column's empty lower half shows usage limits with exact reset times.</li><li>The footer shows the rot track and, on the orchestrator, the distance to rollover. Cost is removed from the footer and the sidebar; <code>zirv ctx status</code> keeps it.</li><li>"● supervised" and "socket bound" disappear while healthy; only a problem (unsupervised, stalled) is shown.</li></ul>
+<div class="pair">
+<figure class="term" style="--cols:120"><figcaption><span>CURRENT · 120 × 40</span><span>reconstructed from ui.rs</span></figcaption><div class="scroll"><pre><span class="chip"> zirv </span> <span class="b">claude-opus-5.5</span><span class="mu"> · 3/3 live</span>                                                   <span class="d">^A ?</span> help  <span class="d">^A ␣</span> palette  <span class="d">^A n</span> nudge 
+<span class="d">────────────────────────────────────────────┬───────────────────────────────────────────────────────────────────────────</span>
+  <span class="mu">3 live</span>                          <span class="c">⠋1</span>  <span class="g">●2</span>    <span class="d">│</span>                                                                           
+<span class="rev">  ● a1c93f02 ✻41 42m orch     opus-5.5      </span><span class="d">│</span> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step            
+    reason    working                       <span class="d">│</span>                                                                           
+    group     <span class="d">–</span>                             <span class="d">│</span> <span class="b">⏺</span> I'll trace how the footer resolves the workflow first.                  
+    model     claude opus-5.5               <span class="d">│</span>                                                                           
+    budget    <span class="d">– / –</span>                         <span class="d">│</span> <span class="g">⏺</span> <span class="b">Search</span>(pattern: "active_workflow_summary", path: "src")                 
+    branch    <span class="d">–</span>                             <span class="d">│</span>   <span class="mu">⎿  Found 4 files (ctrl+r to expand)</span>                                     
+    writer    held · ~/zirv-dynamic-cli     <span class="d">│</span>                                                                           
+    since     working 3m · started 42m      <span class="d">│</span> <span class="g">⏺</span> <span class="b">Read</span>(src/commands/workflow/mod.rs)                                      
+    signal    socket bound                  <span class="d">│</span>   <span class="mu">⎿  Read 212 lines (ctrl+r to expand)</span>                                    
+▾ zirv-482 · f7e21a90 · 1 workers    <span class="c">⠋1</span>     <span class="d">│</span>                                                                           
+├ <span class="c">⠋</span> f7e21a90 <span class="y">✻55</span>  3m worker   sonnet-5      <span class="d">│</span> <span class="b">⏺</span> The footer reads one repo-wide pointer, so every pane shows whichever   
+└ <span class="g">●</span> 9c02be44 <span class="d">✻ –</span>  9m worker   gpt-5.6-terra <span class="d">│</span>   workflow started last. I'll key it on the session instead.              
+  <span class="mu">spend</span> $4.20 · 3 sessions                  <span class="d">│</span>                                                                           
+                                            <span class="d">│</span> <span class="g">⏺</span> <span class="b">Update</span>(src/commands/ctx/sessions.rs)                                    
+                                            <span class="d">│</span>   <span class="mu">⎿  Updated src/commands/ctx/sessions.rs with 2 additions</span>                
+                                            <span class="d">│</span>      <span class="mu">312</span>    pub struct Record {                                           
+                                            <span class="d">│</span>      <span class="mu">313</span> <span class="dg">+      /// Workflow this session started, if any.</span>                
+                                            <span class="d">│</span>      <span class="mu">314</span> <span class="dg">+      pub workflow_id: Option&lt;String&gt;,</span>                          
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span> <span class="c">✻ Wrangling…</span><span class="mu"> (esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                  
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span>                                                                           
+                                            <span class="d">│</span> <span class="d">╭───────────────────────────────────────────────────────────────────────╮</span> 
+                                            <span class="d">│</span> <span class="d">│</span> &gt;                                                                    <span class="d">│</span>  
+                                            <span class="d">│</span> <span class="d">╰───────────────────────────────────────────────────────────────────────╯</span> 
+                                            <span class="d">│</span>   <span class="mu">? for shortcuts</span>                                                         
+<span class="d">────────────────────────────────────────────┴───────────────────────────────────────────────────────────────────────────</span>
+claude   <span class="y">✻ warming</span>   <span class="mu">✉</span> <span class="y">1</span>   <span class="mu">▸ implement · T2</span>   <span class="g">● supervised</span>                                           <span class="mu">$4.20 this session</span> </pre></div></figure>
+<figure class="term" style="--cols:120"><figcaption><span>PROPOSED · 120 × 40</span><span>orchestrator focused</span></figcaption><div class="scroll"><pre><span class="acc">▌</span><span class="b">zirv</span><span class="mu"> · 3 sessions · </span><span class="c">1 working</span><span class="mu"> · </span><span class="y">1 needs you</span>                                                    <span class="d">^A ?</span> help  <span class="d">^A ␣</span> palette 
+<span class="d">────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="h">SESSIONS</span>                 <span class="mu">3</span> <span class="d">│</span> <span class="c">claude</span><span class="mu"> ▸ </span>orchestrator<span class="mu"> · opus-5.5 · ~/zirv-dynamic-cli</span>  <span class="mu">▸ </span>bugfix<span class="mu"> › </span><span class="b">debug</span><span class="mu"> 3/7</span>  <span class="c">⠋ Working</span><span class="mu"> 3m </span>
+<span class="d">────────────────────────────</span><span class="d">┼</span><span class="d">───────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="sel"> <span class="c">⠋</span> orch       <span class="mu">claude</span> <span class="y">✻41</span> <span class="y">✉1</span> </span><span class="d">│</span>                                                                                           
+   <span class="mu">working · 3m</span>             <span class="d">│</span> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                            
+   <span class="mu">▸ bugfix › debug 3/7</span>     <span class="d">│</span>                                                                                           
+<span class="mu">▾</span> zirv-482           <span class="y">▲1</span> <span class="g">●1</span>  <span class="d">│</span> <span class="b">⏺</span> I'll trace how the footer resolves the workflow first.                                  
+<span class="mu">├</span><span class="y">▲</span> f7e21a90   <span class="mu">claude</span> <span class="y">✻55</span> <span class="y">⚑ </span> <span class="d">│</span>                                                                                           
+<span class="mu">└</span><span class="g">●</span> 9c02be44   <span class="mu">codex </span> <span class="d">✻ –</span>    <span class="d">│</span> <span class="g">⏺</span> <span class="b">Search</span>(pattern: "active_workflow_summary", path: "src")                                 
+                            <span class="d">│</span>   <span class="mu">⎿  Found 4 files (ctrl+r to expand)</span>                                                     
+                            <span class="d">│</span>                                                                                           
+                            <span class="d">│</span> <span class="g">⏺</span> <span class="b">Read</span>(src/commands/workflow/mod.rs)                                                      
+                            <span class="d">│</span>   <span class="mu">⎿  Read 212 lines (ctrl+r to expand)</span>                                                    
+                            <span class="d">│</span>                                                                                           
+                            <span class="d">│</span> <span class="b">⏺</span> The footer reads one repo-wide pointer, so every pane shows whichever                   
+                            <span class="d">│</span>   workflow started last. I'll key it on the session instead.                              
+                            <span class="d">│</span>                                                                                           
+ <span class="h">JEV</span>               <span class="mu">24h · </span><span class="g">on</span> <span class="d">│</span> <span class="g">⏺</span> <span class="b">Update</span>(src/commands/ctx/sessions.rs)                                                    
+<span class="d">────────────────────────────</span><span class="d">│</span>   <span class="mu">⎿  Updated src/commands/ctx/sessions.rs with 2 additions</span>                                
+ <span class="mu">calls   </span>739<span class="mu"> · 82% cached</span>   <span class="d">│</span>      <span class="mu">312</span>    pub struct Record {                                                           
+ <span class="mu">wait    </span>p95 670 ms         <span class="d">│</span>      <span class="mu">313</span> <span class="dg">+      /// Workflow this session started, if any.</span>                                
+ <span class="mu">errors  </span>0                  <span class="d">│</span>      <span class="mu">314</span> <span class="dg">+      pub workflow_id: Option&lt;String&gt;,</span>                                          
+ <span class="mu">last    </span>approve · 2s ago   <span class="d">│</span>                                                                                           
+ <span class="mu">memory   </span> 417 <span class="c">▰▰▰▰▰▰</span><span class="d"></span>       <span class="d">│</span> <span class="c">✻ Wrangling…</span><span class="mu"> (esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                                  
+ <span class="mu">approve  </span> 240 <span class="c">▰▰▰</span><span class="d">▱▱▱</span>       <span class="d">│</span>                                                                                           
+ <span class="mu">classify </span>  38 <span class="c">▰</span><span class="d">▱▱▱▱▱</span>       <span class="d">│</span>                                                                                           
+                            <span class="d">│</span>                                                                                           
+ <span class="h">LIMITS</span>                     <span class="d">│</span>                                                                                           
+<span class="d">────────────────────────────</span><span class="d">│</span>                                                                                           
+ claude <span class="mu">5h</span> <span class="c">▰▰</span><span class="d">▱▱▱▱</span>  41%      <span class="d">│</span>                                                                                           
+   <span class="mu">resets 16:20 · in 2h13m</span>  <span class="d">│</span>                                                                                           
+        <span class="mu">wk</span> <span class="c">▰</span><span class="d">▱▱▱▱▱</span>  12%      <span class="d">│</span>                                                                                           
+   <span class="mu">resets Thu 09:00</span>         <span class="d">│</span>                                                                                           
+ codex  <span class="mu">5h</span> <span class="c"></span><span class="d">▱▱▱▱▱▱</span>   8%      <span class="d">│</span> <span class="d">╭───────────────────────────────────────────────────────────────────────────────────────╮</span> 
+   <span class="mu">resets 18:05 · in 4h02m</span>  <span class="d">│</span> <span class="d">│</span> &gt;                                                                                    <span class="d">│</span>  
+        <span class="mu">wk</span> <span class="c">▰▰▰</span><span class="d">▱▱▱</span>  58%      <span class="d">│</span> <span class="d">╰───────────────────────────────────────────────────────────────────────────────────────╯</span> 
+   <span class="mu">resets ~Mon 02:00</span>        <span class="d">│</span>   <span class="mu">? for shortcuts</span>                                                                         
+<span class="d">────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="y">✻ 41 warming</span> <span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                             <span class="mu">⤓ rollover at 20% left · now 59%</span>   <span class="mu">✉</span> <span class="y">1</span> </pre></div></figure>
+</div>
+<figure class="term" style="--cols:200"><figcaption><span>PROPOSED · 200 × 50</span><span>worker focused, waiting on an approval, compaction soon</span></figcaption><div class="scroll"><pre><span class="acc">▌</span><span class="b">zirv</span><span class="mu"> · 3 sessions · </span><span class="c">1 working</span><span class="mu"> · </span><span class="y">1 needs you</span>                                                                                                             <span class="d">^A ?</span> help  <span class="d">^A ␣</span> palette  <span class="d">^A n</span> nudge  <span class="d">^A m</span> mail 
+<span class="d">────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="h">SESSIONS</span>                 <span class="mu">3</span> <span class="d">│</span> <span class="c">claude</span><span class="mu"> ▸ </span>worker<span class="mu"> · sonnet-5 · ~/zirv-482</span>                                                                       <span class="mu">▸ </span>feature<span class="mu"> › </span><span class="b">review</span><span class="mu"> 6/8</span>  <span class="y">⚑ needs approval</span>   <span class="y">▲ waiting on you </span>
+<span class="d">────────────────────────────</span><span class="d">┼</span><span class="d">───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="c">⠋</span> orch       <span class="mu">claude</span> <span class="y">✻41</span> <span class="y">✉1</span> <span class="d">│</span>                                                                                                                                                                           
+<span class="mu">▾</span> zirv-482           <span class="y">▲1</span> <span class="g">●1</span>  <span class="d">│</span> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                                                                                                            
+<span class="sel"><span class="mu">├</span><span class="y">▲</span> f7e21a90   <span class="mu">claude</span> <span class="y">✻55</span> <span class="y">⚑ </span> </span><span class="d">│</span>                                                                                                                                                                           
+<span class="mu">│</span>  <span class="mu">needs approval · 1m</span>      <span class="d">│</span> <span class="b">⏺</span> I'll trace how the footer resolves the workflow first.                                                                                                                  
+<span class="mu">│</span>  <span class="mu">▸ feature › review 6/8</span>   <span class="d">│</span>                                                                                                                                                                           
+<span class="mu">└</span><span class="g">●</span> 9c02be44   <span class="mu">codex </span> <span class="d">✻ –</span>    <span class="d">│</span> <span class="g">⏺</span> <span class="b">Search</span>(pattern: "active_workflow_summary", path: "src")                                                                                                                 
+                            <span class="d">│</span>   <span class="mu">⎿  Found 4 files (ctrl+r to expand)</span>                                                                                                                                     
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span> <span class="g">⏺</span> <span class="b">Read</span>(src/commands/workflow/mod.rs)                                                                                                                                      
+                            <span class="d">│</span>   <span class="mu">⎿  Read 212 lines (ctrl+r to expand)</span>                                                                                                                                    
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span> <span class="b">⏺</span> The footer reads one repo-wide pointer, so every pane shows whichever                                                                                                   
+                            <span class="d">│</span>   workflow started last. I'll key it on the session instead.                                                                                                              
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span> <span class="g">⏺</span> <span class="b">Update</span>(src/commands/ctx/sessions.rs)                                                                                                                                    
+                            <span class="d">│</span>   <span class="mu">⎿  Updated src/commands/ctx/sessions.rs with 2 additions</span>                                                                                                                
+                            <span class="d">│</span>      <span class="mu">312</span>    pub struct Record {                                                                                                                                           
+                            <span class="d">│</span>      <span class="mu">313</span> <span class="dg">+      /// Workflow this session started, if any.</span>                                                                                                                
+                            <span class="d">│</span>      <span class="mu">314</span> <span class="dg">+      pub workflow_id: Option&lt;String&gt;,</span>                                                                                                                          
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span> <span class="c">✻ Wrangling…</span><span class="mu"> (esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                                                                                                                  
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span>                                                                                                                                                                           
+ <span class="h">JEV</span>               <span class="mu">24h · </span><span class="g">on</span> <span class="d">│</span>                                                                                                                                                                           
+<span class="d">────────────────────────────</span><span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">calls   </span>739<span class="mu"> · 82% cached</span>   <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">wait    </span>p95 670 ms         <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">errors  </span>0                  <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">last    </span>approve · 2s ago   <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">memory   </span> 417 <span class="c">▰▰▰▰▰▰</span><span class="d"></span>       <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">approve  </span> 240 <span class="c">▰▰▰</span><span class="d">▱▱▱</span>       <span class="d">│</span>                                                                                                                                                                           
+ <span class="mu">classify </span>  38 <span class="c">▰</span><span class="d">▱▱▱▱▱</span>       <span class="d">│</span>                                                                                                                                                                           
+                            <span class="d">│</span>                                                                                                                                                                           
+ <span class="h">LIMITS</span>                     <span class="d">│</span>                                                                                                                                                                           
+<span class="d">────────────────────────────</span><span class="d">│</span>                                                                                                                                                                           
+ claude <span class="mu">5h</span> <span class="c">▰▰</span><span class="d">▱▱▱▱</span>  41%      <span class="d">│</span>                                                                                                                                                                           
+   <span class="mu">resets 16:20 · in 2h13m</span>  <span class="d">│</span>                                                                                                                                                                           
+        <span class="mu">wk</span> <span class="c">▰</span><span class="d">▱▱▱▱▱</span>  12%      <span class="d">│</span>                                                                                                                                                                           
+   <span class="mu">resets Thu 09:00</span>         <span class="d">│</span>                                                                                                                                                                           
+ codex  <span class="mu">5h</span> <span class="c"></span><span class="d">▱▱▱▱▱▱</span>   8%      <span class="d">│</span> <span class="d">╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮</span> 
+   <span class="mu">resets 18:05 · in 4h02m</span>  <span class="d">│</span> <span class="d">│</span> &gt;                                                                                                                                                                    <span class="d">│</span>  
+        <span class="mu">wk</span> <span class="c">▰▰▰</span><span class="d">▱▱▱</span>  58%      <span class="d">│</span> <span class="d">╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</span> 
+   <span class="mu">resets ~Mon 02:00</span>        <span class="d">│</span>   <span class="mu">? for shortcuts</span>                                                                                                                                                         
+<span class="d">────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="r">✻ 64 rotting</span> <span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="ty">┊</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>  <span class="y">/compact recommended</span>                                                                                                                                          <span class="mu">✉ –</span> </pre></div></figure>
+<p>Under 100 columns the session column hides and sessions become tabs in the header, the way the native pane already behaves. <code>^A b</code> brings the column back.</p>
+<figure class="term" style="--cols:80"><figcaption><span>PROPOSED · 80 × 24</span><span>no session column</span></figcaption><div class="scroll"><pre><span class="acc">▌</span><span class="b">zirv</span>  <span class="tab"> <span class="c">⠋</span> orch ✉1 </span>  <span class="y">▲</span> f7e2  <span class="g">●</span> 9c02                                    <span class="d">^A ?</span> help 
+<span class="d">────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="c">claude</span><span class="mu"> ▸ orchestrator · opus-5.5</span>                    <span class="mu">▸ </span>bugfix<span class="mu"> › </span><span class="b">debug</span><span class="mu"> 3/7</span>  <span class="c">⠋ 3m </span>
+<span class="d">────────────────────────────────────────────────────────────────────────────────</span>
+                                                                                
+ <span class="g">⏺</span> <span class="b">Read</span>(src/commands/workflow/mod.rs)                                           
+   <span class="mu">⎿  Read 212 lines (ctrl+r to expand)</span>                                         
+                                                                                
+ <span class="b">⏺</span> The footer reads one repo-wide pointer, so every pane shows whichever        
+   workflow started last. I'll key it on the session instead.                   
+                                                                                
+ <span class="g">⏺</span> <span class="b">Update</span>(src/commands/ctx/sessions.rs)                                         
+   <span class="mu">⎿  Updated src/commands/ctx/sessions.rs with 2 additions</span>                     
+      <span class="mu">312</span>    pub struct Record {                                                
+      <span class="mu">313</span> <span class="dg">+      /// Workflow this session started, if any.</span>                     
+      <span class="mu">314</span> <span class="dg">+      pub workflow_id: Option&lt;String&gt;,</span>                               
+                                                                                
+ <span class="c">✻ Wrangling…</span><span class="mu"> (esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                       
+                                                                                
+ <span class="d">╭────────────────────────────────────────────────────────────────────────────╮</span> 
+ <span class="d">│</span> &gt;                                                                         <span class="d">│</span>  
+ <span class="d">╰────────────────────────────────────────────────────────────────────────────╯</span> 
+   <span class="mu">? for shortcuts</span>                                                              
+ <span class="y">✻ 41 warming</span>                                       <span class="mu">5h 41% · resets 16:20</span>   <span class="mu">✉</span> <span class="y">1</span> </pre></div></figure>
+<h2><span class="n">02 · ROT AND ROLLOVER</span>How rotten the session is, and how close the orchestrator is to rolling over</h2>
+<p>zirv does not compact or restart dashboard sessions; only rollover is automatic. The rot score you already like becomes a track with its colour bands marked: <span class="y">┊</span> warming at 40 and <span class="r">┊</span> rotting at 60 (your <code>score.advise_at</code> and <code>score.compact_at</code>). From 60 the footer recommends what to do. Rollover is an orchestrator-only segment on the right; the sidebar row carries ⤓ or ⏸ while it is pending or parked.</p>
+<div class="states">
+<div class="state"><div class="lbl">Fresh<small>Below 40. Nothing to do.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="g">✻ 22 fresh</span> <span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                                                                  <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Warming<small>40 to 59, between your score.advise_at and score.compact_at.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="y">✻ 47 warming</span> <span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="ty">┊</span><span class="y">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                                                                <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Rotting<small>60 and up. zirv does not compact dashboard sessions, so it tells you.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="r">✻ 64 rotting</span> <span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="ty">┊</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>  <span class="y">/compact recommended</span>                                                          <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Very rotten<small>80 and up (score.restart_at).</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="r">✻ 83 rotting</span> <span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="ty">┊</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="tr">┊</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="r">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>  <span class="r">fresh session recommended</span>                                                     <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Rollover distance<small>Orchestrator only. Headroom left against the 20% rollover floor.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="g">✻ 22 fresh</span> <span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                               <span class="mu">⤓ rollover at 20% left · now 59%</span>   <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Rollover soon<small>Within 10 points of the floor.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="g">✻ 22 fresh</span> <span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                            <span class="y">⤓ rollover soon · 24% left (at 20%)</span>   <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Rollover pending<small>The seat is marked pending and swaps when the session is idle. The chip breathes.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="g">✻ 22 fresh</span> <span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                                 <span class="yb pulse">⤓ switching to codex when idle</span>   <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Parked<small>No fallback had headroom, so the seat waits for the reset.</small></div><figure class="term" style="--cols:120"><figcaption><span>FOOTER · 120</span><span></span></figcaption><div class="scroll"><pre> <span class="g">✻ 22 fresh</span> <span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="g">▰</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span>                                    <span class="m">⏸ parked until claude resets at 16:20 · 12m</span>   <span class="mu">✉ –</span> </pre></div></figure></div>
+<div class="state"><div class="lbl">Rolled over<small>A toast in the pane header for 5 s after the swap.</small></div><figure class="term" style="--cols:91"><figcaption><span>PANE HEADER · 91</span><span></span></figcaption><div class="scroll"><pre> <span class="c">codex</span><span class="mu"> ▸ orchestrator · gpt-5.6-terra</span>   <span class="g">⏺ ⤓ rolled over from claude · gen 2</span>   <span class="c">⠋ Working</span><span class="mu"> 4s </span></pre></div></figure></div>
+</div>
+<h2><span class="n">03 · LIMITS</span>Exact reset times for the 5-hour and weekly windows</h2>
+<p>zirv already stores the vendor's <code>resets_at</code> for both windows (Claude's statusline, Codex's rate-limit events); the dashboard drops it today. Resets today show the clock time and a countdown; later resets show the weekday. A <code>~</code> marks zirv's own estimate when no vendor reading exists yet. Only enabled, available harnesses appear: a disabled Codex or Claude gets no block, even with old usage files on disk.</p>
+<div class="limits">
+<div><div class="lbl">Exact<small>Vendor reported the reset time (Claude statusline, Codex rate-limit events).</small></div><figure class="term" style="--cols:28"><figcaption><span>LIMITS</span><span></span></figcaption><div class="scroll"><pre> claude <span class="mu">5h</span> <span class="c">▰▰</span><span class="d">▱▱▱▱</span>  41%      
+   <span class="mu">resets 16:20 · 2h13m</span>     
+        <span class="mu">wk</span> <span class="c">▰</span><span class="d">▱▱▱▱▱</span>  12%      
+   <span class="mu">resets Thu 09:00</span>         </pre></div></figure></div>
+<div><div class="lbl">Estimated<small>No vendor reading yet. The time is zirv&#x27;s estimate, marked with ~.</small></div><figure class="term" style="--cols:28"><figcaption><span>LIMITS</span><span></span></figcaption><div class="scroll"><pre> claude <span class="mu">5h</span> <span class="c">▰▰</span><span class="d">▱▱▱▱</span>  37%      
+   <span class="mu">resets ~16:40 · ~2h</span>      
+        <span class="mu">wk</span> <span class="c">▰</span><span class="d">▱▱▱▱▱</span>  12%      
+   <span class="mu">resets ~Thu 09:00</span>        </pre></div></figure></div>
+<div><div class="lbl">Close<small>80% and above turns yellow; the countdown is the part to watch.</small></div><figure class="term" style="--cols:28"><figcaption><span>LIMITS</span><span></span></figcaption><div class="scroll"><pre> claude <span class="mu">5h</span> <span class="y">▰▰▰▰▰</span><span class="d">▱</span> <span class="y"> 86%</span>      
+   <span class="y">resets 16:20 · 38m</span>       
+        <span class="mu">wk</span> <span class="c">▰▰▰▰</span><span class="d">▱▱</span>  64%      
+   <span class="mu">resets Thu 09:00</span>         </pre></div></figure></div>
+<div><div class="lbl">Hit<small>Limit reached: red, with the exact time it comes back.</small></div><figure class="term" style="--cols:28"><figcaption><span>LIMITS</span><span></span></figcaption><div class="scroll"><pre> claude <span class="mu">5h</span> <span class="r">▰▰▰▰▰▰</span><span class="d"></span> <span class="r">100%</span>      
+   <span class="r">back at 16:20 · 12m</span>      
+        <span class="mu">wk</span> <span class="c">▰▰▰▰</span><span class="d">▱▱</span>  71%      
+   <span class="mu">resets Thu 09:00</span>         </pre></div></figure></div>
+<div><div class="lbl">On credits<small>Codex served past the limit from paid credits.</small></div><figure class="term" style="--cols:28"><figcaption><span>LIMITS</span><span></span></figcaption><div class="scroll"><pre> codex  <span class="mu">5h</span> <span class="m">▰▰▰▰▰▰</span><span class="d"></span> <span class="m">100%</span>      
+   <span class="m">credits until 16:05</span>      
+        <span class="mu">wk</span> <span class="c">▰▰▰</span><span class="d">▱▱▱</span>  58%      
+   <span class="mu">resets Mon 02:00</span>         </pre></div></figure></div>
+</div>
+<h2><span class="n">03 · JEV</span>What Jev did in the last 24 hours</h2>
+<p>A section between sessions and limits, from the same <code>jev-decisions.jsonl</code> and <code>jev-effects.jsonl</code> that <code>zirv ctx jev status</code> rolls up, narrowed to 24 hours: calls and cache hits, p95 wait, errors, the latest call, and the three busiest gates. Jev records carry no session id, so the numbers are machine-wide. The last line flashes when a new call lands. Spend stays out, like the rest of the dash. With every Jev gate off the section is not shown at all.</p>
+<div class="limits">
+<div><div class="lbl">On<small>Normal: gates enabled, key present.</small></div><figure class="term" style="--cols:28"><figcaption><span>JEV</span><span></span></figcaption><div class="scroll"><pre> <span class="h">JEV</span>               <span class="mu">24h · </span><span class="g">on</span> 
+<span class="d">────────────────────────────</span>
+ <span class="mu">calls   </span>739<span class="mu"> · 82% cached</span>   
+ <span class="mu">wait    </span>p95 670 ms         
+ <span class="mu">errors  </span>0                  
+ <span class="mu">last    </span>approve · 2s ago   
+ <span class="mu">memory   </span> 417 <span class="c">▰▰▰▰▰▰</span><span class="d"></span>       
+ <span class="mu">approve  </span> 240 <span class="c">▰▰▰</span><span class="d">▱▱▱</span>       
+ <span class="mu">classify </span>  38 <span class="c">▰</span><span class="d">▱▱▱▱▱</span>       </pre></div></figure></div>
+<div><div class="lbl">Errors<small>Errors in the window turn red with the latest reason.</small></div><figure class="term" style="--cols:28"><figcaption><span>JEV</span><span></span></figcaption><div class="scroll"><pre> <span class="h">JEV</span>               <span class="mu">24h · </span><span class="g">on</span> 
+<span class="d">────────────────────────────</span>
+ <span class="mu">calls   </span>739<span class="mu"> · 82% cached</span>   
+ <span class="mu">wait    </span>p95 670 ms         
+ <span class="mu">errors  </span><span class="r">3 · rate limited</span>   
+ <span class="mu">last    </span>approve · 2s ago   
+ <span class="mu">memory   </span> 417 <span class="c">▰▰▰▰▰▰</span><span class="d"></span>       
+ <span class="mu">approve  </span> 240 <span class="c">▰▰▰</span><span class="d">▱▱▱</span>       
+ <span class="mu">classify </span>  38 <span class="c">▰</span><span class="d">▱▱▱▱▱</span>       </pre></div></figure></div>
+<div><div class="lbl">No key<small>Gates enabled but the credential is missing.</small></div><figure class="term" style="--cols:28"><figcaption><span>JEV</span><span></span></figcaption><div class="scroll"><pre> <span class="h">JEV</span>                 <span class="y">no key</span> 
+<span class="d">────────────────────────────</span>
+ <span class="mu">set TYPESAFE_API_KEY</span>       </pre></div></figure></div>
+</div>
+<h2><span class="n">05 · WORKFLOW STEP</span>Each pane shows its own workflow, not the repo&#x27;s newest</h2>
+<p>Why it is wrong today: the dashboard reads one "active workflow" pointer per repo and shows it on every pane. Any <code>zirv workflow start</code> in the repo moves that pointer, and a finished run can leave it pointing at a step that no longer exists, which renders as an empty step. The fix records the workflow id a session started on its session record and resolves each pane from that.</p>
+<div class="states">
+<div class="state"><div class="lbl">Running<small>The workflow this session started, with its current step and position.</small></div><figure class="term" style="--cols:91"><figcaption><span>PANE HEADER · 91</span><span></span></figcaption><div class="scroll"><pre> <span class="c">claude</span><span class="mu"> ▸ worker · sonnet-5 · ~/zirv-482</span>               <span class="mu">▸ </span>bugfix<span class="mu"> › </span><span class="b">debug</span><span class="mu"> 3/7</span>   <span class="c">⠋ Working</span><span class="mu"> 3m </span></pre></div></figure></div>
+<div class="state"><div class="lbl">Needs you<small>An approval gate is waiting.</small></div><figure class="term" style="--cols:91"><figcaption><span>PANE HEADER · 91</span><span></span></figcaption><div class="scroll"><pre> <span class="c">claude</span><span class="mu"> ▸ worker · sonnet-5 · ~/zirv-482</span>          <span class="mu">▸ </span>feature<span class="mu"> › </span><span class="b">review</span><span class="mu"> 6/8</span>  <span class="y">⚑ needs approval </span></pre></div></figure></div>
+<div class="state"><div class="lbl">Finished<small>The run completed. It stays for 10 minutes, then the segment goes.</small></div><figure class="term" style="--cols:91"><figcaption><span>PANE HEADER · 91</span><span></span></figcaption><div class="scroll"><pre> <span class="c">claude</span><span class="mu"> ▸ worker · sonnet-5 · ~/zirv-482</span>                     <span class="mu">▸ </span>bugfix<span class="mu"> › </span><span class="g">✓ done</span>   <span class="g">●</span><span class="mu"> idle 2m </span></pre></div></figure></div>
+<div class="state"><div class="lbl">None<small>This session started no workflow. Nothing is shown; no guessing from the repo.</small></div><figure class="term" style="--cols:91"><figcaption><span>PANE HEADER · 91</span><span></span></figcaption><div class="scroll"><pre> <span class="c">claude</span><span class="mu"> ▸ worker · sonnet-5 · ~/zirv-482</span>                                         <span class="g">●</span><span class="mu"> idle 2m </span></pre></div></figure></div>
+</div>
+<h2><span class="n">06 · MOTION</span>Calmer, clock-driven motion with a few deliberate moments</h2>
+<ul class="req"><li>Spinners run on a clock. Today they advance once per redraw, so they speed up to ~100 fps while you type and slow to 20 fps when idle.</li><li>The working verb in the pane header gets the Claude Code shimmer.</li><li>Gauges ease to new values over about 300 ms instead of jumping once a second.</li><li>A pending rollover breathes until it happens. New mail or a finished worker flashes its row once.</li><li>Toasts appear in the pane header and fade after 5 s.</li><li>One setting, <code>dash.motion = "full" | "reduced"</code>, default full. Reduced keeps state changes and drops the rest.</li></ul>
+<div class="controls"><button id="play" type="button">Pause</button><span id="clock" aria-live="off"></span><span>A 20 s loop: the score climbs, headroom drains, the rollover goes pending and happens, then mail arrives on the codex row.</span></div>
+<figure class="term" style="--cols:120" data-live="1"><figcaption><span>LIVE · 120 × 40</span><span>animated</span></figcaption><div class="scroll"><pre><span class="acc">▌</span><span class="b">zirv</span><span class="mu"> · 3 sessions · </span><span class="c">1 working</span><span class="mu"> · </span><span class="y">1 needs you</span>                                                    <span class="d">^A ?</span> help  <span class="d">^A ␣</span> palette 
+<span class="d">────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span class="h">SESSIONS</span>                 <span class="mu">3</span> <span class="d">│</span> <span class="c">claude</span><span class="mu"> ▸ </span>orchestrator<span class="mu"> · opus-5.5</span><span id="live-toast" class="mu"> · ~/zirv-dynamic-cli</span>  <span class="mu">▸ </span>bugfix<span class="mu"> › </span><span class="b">debug</span><span class="mu"> 3/7</span>  <span id="live-spin2" class="c">⠋</span> <span id="live-verb" class="c">Working</span><span class="mu"> 3m </span>
+<span class="d">────────────────────────────</span><span class="d">┼</span><span class="d">───────────────────────────────────────────────────────────────────────────────────────────</span>
+<span class="sel"> <span id="live-spin1" class="c">⠋</span> orch       <span class="mu">claude</span> <span id="live-orot" class="y">✻41</span> <span class="y">✉1</span> </span><span class="d">│</span>                                                                                           
+   <span class="mu">working · 3m</span>             <span class="d">│</span> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                            
+   <span class="mu">▸ bugfix › debug 3/7</span>     <span class="d">│</span>                                                                                           
+<span class="mu">▾</span> zirv-482           <span class="y">▲1</span> <span class="g">●1</span>  <span class="d">│</span> <span class="b">⏺</span> I'll trace how the footer resolves the workflow first.                                  
+<span class="mu">├</span><span class="y">▲</span> f7e21a90   <span class="mu">claude</span> <span class="y">✻55</span> <span class="y">⚑ </span> <span class="d">│</span>                                                                                           
+<span id="live-codex" class=""><span class="mu">└</span><span class="g">●</span> 9c02be44   <span class="mu">codex </span> <span class="d">✻ –</span>    </span><span class="d">│</span> <span class="g">⏺</span> <span class="b">Search</span>(pattern: "active_workflow_summary", path: "src")                                 
+                            <span class="d">│</span>   <span class="mu">⎿  Found 4 files (ctrl+r to expand)</span>                                                     
+                            <span class="d">│</span>                                                                                           
+                            <span class="d">│</span> <span class="g">⏺</span> <span class="b">Read</span>(src/commands/workflow/mod.rs)                                                      
+                            <span class="d">│</span>   <span class="mu">⎿  Read 212 lines (ctrl+r to expand)</span>                                                    
+                            <span class="d">│</span>                                                                                           
+                            <span class="d">│</span> <span class="b">⏺</span> The footer reads one repo-wide pointer, so every pane shows whichever                   
+                            <span class="d">│</span>   workflow started last. I'll key it on the session instead.                              
+                            <span class="d">│</span>                                                                                           
+ <span class="h">JEV</span>               <span class="mu">24h · </span><span class="g">on</span> <span class="d">│</span> <span class="g">⏺</span> <span class="b">Update</span>(src/commands/ctx/sessions.rs)                                                    
+<span class="d">────────────────────────────</span><span class="d">│</span>   <span class="mu">⎿  Updated src/commands/ctx/sessions.rs with 2 additions</span>                                
+ <span class="mu">calls   </span><span id="live-jcalls" class="">739</span><span class="mu"> · 82% cached</span>   <span class="d">│</span>      <span class="mu">312</span>    pub struct Record {                                                           
+ <span class="mu">wait    </span>p95 670 ms         <span class="d">│</span>      <span class="mu">313</span> <span class="dg">+      /// Workflow this session started, if any.</span>                                
+ <span class="mu">errors  </span>0                  <span class="d">│</span>      <span class="mu">314</span> <span class="dg">+      pub workflow_id: Option&lt;String&gt;,</span>                                          
+ <span class="mu">last    </span><span id="live-jlast" class="">approve · 2s ago </span>  <span class="d">│</span>                                                                                           
+ <span class="mu">memory   </span> 417 <span class="c">▰▰▰▰▰▰</span><span class="d"></span>       <span class="d">│</span> <span id="live-ccspin" class="c">✻</span> <span class="c">Wrangling…</span><span class="mu"> (esc to interrupt · 1m 12s · ↓ 3.4k tokens)</span>                                  
+ <span class="mu">approve  </span> 240 <span class="c">▰▰▰</span><span class="d">▱▱▱</span>       <span class="d">│</span>                                                                                           
+ <span class="mu">classify </span>  38 <span class="c">▰</span><span class="d">▱▱▱▱▱</span>       <span class="d">│</span>                                                                                           
+                            <span class="d">│</span>                                                                                           
+ <span class="h">LIMITS</span>                     <span class="d">│</span>                                                                                           
+<span class="d">────────────────────────────</span><span class="d">│</span>                                                                                           
+ claude <span class="mu">5h</span> <span class="c">▰▰</span><span class="d">▱▱▱▱</span>  41%      <span class="d">│</span>                                                                                           
+   <span class="mu">resets 16:20 · in 2h13m</span>  <span class="d">│</span>                                                                                           
+        <span class="mu">wk</span> <span class="c">▰</span><span class="d">▱▱▱▱▱</span>  12%      <span class="d">│</span>                                                                                           
+   <span class="mu">resets Thu 09:00</span>         <span class="d">│</span>                                                                                           
+ codex  <span class="mu">5h</span> <span class="c"></span><span class="d">▱▱▱▱▱▱</span>   8%      <span class="d">│</span> <span class="d">╭───────────────────────────────────────────────────────────────────────────────────────╮</span> 
+   <span class="mu">resets 18:05 · in 4h02m</span>  <span class="d">│</span> <span class="d">│</span> &gt;                                                                                    <span class="d">│</span>  
+        <span class="mu">wk</span> <span class="c">▰▰▰</span><span class="d">▱▱▱</span>  58%      <span class="d">│</span> <span class="d">╰───────────────────────────────────────────────────────────────────────────────────────╯</span> 
+   <span class="mu">resets ~Mon 02:00</span>        <span class="d">│</span>   <span class="mu">? for shortcuts</span>                                                                         
+<span class="d">────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────</span>
+ <span id="live-frot" class="y">✻ 41 warming</span> <span id="live-gauge" class="gauge"><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="y">▰</span><span class="ty">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="tr">┊</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span><span class="d">▱</span></span>  <span id="live-next" class="y">                          </span>             <span id="live-roll" class="mu">⤓ rollover at 20% left · now 31%    </span>   <span class="mu">✉</span> <span class="y">1</span> </pre></div></figure>
+<h2><span class="n">07 · STARTING A SESSION</span>The prompt proxy becomes a short, visible plan step</h2>
+<ul class="req"><li>A boxed prompt like Claude Code's, with the keys written under it. Esc starts the harness without planning at any point.</li><li>A spinner with elapsed time while zirv sizes the task, instead of up to 20 s of silence.</li><li>A plan card in plain words (model, helpers, workflow, why) with numbered choices. Every plan waits for Enter.</li><li>If Typesafe fails or times out, you are told, and the local-rules plan is labelled as such.</li><li>It runs in an inline region of the normal terminal, so it survives the harness's full-screen start (#701). One summary line is left in scrollback.</li><li>No seat tiers, decider names, domain scores or confidence floats on screen. <code>zirv ctx proxy --json</code> still has them.</li></ul>
+<figure class="term" style="--cols:100"><figcaption><span>CURRENT · 100 cols</span><span>plain stderr lines</span></figcaption><div class="scroll"><pre><span class="mu">PS D:\GitHub\zirv-dynamic-cli&gt;</span> zirv chat                                                            
+<span class="c">zirv ▸</span> proxy: describe the task (empty line to send)                                                
+fix the dash footer so each pane shows its own workflow step                                        
+                                                                                                    
+<span class="mu">[14:32:07]</span> <span class="c">zirv ▸</span> proxy: asking typesafe (jev-1.13.0)…                                              
+                                                                                                    
+<span class="d">                      (nothing for up to 20 s — no spinner, no way to skip)</span>                         
+                                                                                                    
+<span class="mu">[14:32:11]</span> <span class="c">zirv ▸</span> proxy: orchestrated · orchestrator claude/claude-opus-5.5 (deep) ·                
+workers standard · workflow bugfix (bounded/medium) · typesafe · domains: tui 0.81                  
+                                                                                                    
+<span class="d">                      (Claude Code starts immediately — nothing to confirm or change)</span>               </pre></div></figure>
+<div class="flow">
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · 1 · describe the task</span><span></span></figcaption><div class="scroll"><pre> <span class="acc">▌</span><span class="b">zirv</span><span class="mu">  new session in ~/zirv-dynamic-cli (main)</span>                                                    
+                                                                                                    
+ <span class="d">╭──────────────────────────────────────────────────────────────────────────────────────────────╮</span>   
+ <span class="d">│</span> &gt; fix the dash footer so each pane shows its own workflow step<span class="cur"> </span>                              <span class="d">│</span>   
+ <span class="d">╰──────────────────────────────────────────────────────────────────────────────────────────────╯</span>   
+   <span class="mu">⏎ plan and start · shift+⏎ new line · esc start without a plan</span>                                   </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · 2 · sizing (typically 1–4 s)</span><span></span></figcaption><div class="scroll"><pre> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                                     
+                                                                                                    
+ <span class="c">✻</span> <span class="c">Sizing the task…</span><span class="mu"> 2s · esc to start without a plan</span>                                                </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · 3 · plan, single seat</span><span></span></figcaption><div class="scroll"><pre> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                                     
+                                                                                                    
+ <span class="c">╭─ Plan ───────────────────────────────────────────────────────────────╮</span>                           
+ <span class="c">│</span> <span class="b">A bounded bug fix in the dashboard.</span>                                  <span class="c">│</span>                           
+ <span class="c">│</span>                                                                      <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Model     </span>Sonnet 5, working alone                                  <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Workflow  </span>bugfix · 7 steps, starting at reproduce                  <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Why       </span>one area (dashboard), low risk                           <span class="c">│</span>                           
+ <span class="c">│</span>                                                                      <span class="c">│</span>                           
+ <span class="c">│</span> <span class="c">❯ 1. Start</span>                                                           <span class="c">│</span>                           
+ <span class="c">│</span>   2. Start with a different model                                    <span class="c">│</span>                           
+ <span class="c">│</span>   3. Start without a workflow                                        <span class="c">│</span>                           
+ <span class="c">│</span>   4. Edit the task                                                   <span class="c">│</span>                           
+ <span class="c">╰──────────────────────────────────────────────────────────────────────╯</span>                           
+   <span class="mu">↑↓ choose · ⏎ confirm · esc start without a plan</span>                                                 </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · 3 · plan, multi-agent</span><span></span></figcaption><div class="scroll"><pre> <span class="c">╭─ Plan ───────────────────────────────────────────────────────────────╮</span>                           
+ <span class="c">│</span> <span class="b">A substantial feature across the dashboard and the session store.</span>    <span class="c">│</span>                           
+ <span class="c">│</span>                                                                      <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Lead      </span>Opus 5.5 coordinates and reviews                         <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Helpers   </span>Sonnet 5 workers write code and tests                    <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Workflow  </span>feature · 9 steps, starting at intent                    <span class="c">│</span>                           
+ <span class="c">│</span>   <span class="mu">Why       </span>several areas, design choices, medium risk               <span class="c">│</span>                           
+ <span class="c">│</span>                                                                      <span class="c">│</span>                           
+ <span class="c">│</span> <span class="c">❯ 1. Start</span>                                                           <span class="c">│</span>                           
+ <span class="c">│</span>   2. Start with a different model                                    <span class="c">│</span>                           
+ <span class="c">│</span>   3. Start without a workflow                                        <span class="c">│</span>                           
+ <span class="c">│</span>   4. Edit the task                                                   <span class="c">│</span>                           
+ <span class="c">╰──────────────────────────────────────────────────────────────────────╯</span>                           
+   <span class="mu">↑↓ choose · ⏎ confirm · esc start without a plan</span>                                                 </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · only when the request is ambiguous</span><span></span></figcaption><div class="scroll"><pre> <span class="y">╭─ One question ───────────────────────────────────────────────────────╮</span>                           
+ <span class="y">│</span> Which part should change? Name a file, a module or a screen.         <span class="y">│</span>                           
+ <span class="y">│</span> &gt; the footer, and the sidebar rows too<span class="cur"> </span>                              <span class="y">│</span>                           
+ <span class="y">╰──────────────────────────────────────────────────────────────────────╯</span>                           
+   <span class="mu">⏎ answer · tab skip and plan anyway</span>                                                              </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · planner unavailable</span><span></span></figcaption><div class="scroll"><pre> <span class="y">⚠</span> Typesafe did not answer within 10s. The plan below uses local rules.                             
+ <span class="mu">  Details: zirv ctx proxy --json · turn the planner off: zirv ctx config set proxy.enabled false</span>   </pre></div></figure>
+<figure class="term" style="--cols:100"><figcaption><span>PROPOSED · what stays in scrollback</span><span></span></figcaption><div class="scroll"><pre> <span class="mu">&gt;</span> fix the dash footer so each pane shows its own workflow step                                     
+ <span class="c">✻</span><span class="mu"> zirv planned in 3s · Sonnet 5 alone · bugfix workflow w-3f2a</span>                                     
+                                                                                                    
+<span class="d"> ╭─── Claude Code ──────────────────────────────────╮</span>                                               
+<span class="d"> │ ✻ Welcome back!                                  │</span>                                               </pre></div></figure>
+</div>
+<h2><span class="n">08 · WHAT IT TAKES</span>Data that exists, and the three additions</h2>
+<div class="tw"><table><thead><tr><th>Change</th><th>How</th><th>Kind</th></tr></thead><tbody>
+<tr><td>Session column</td><td>Row and fact-block rewrite in <code>ui.rs</code> / <code>mod.rs</code>; <code>dash.sidebar_cols</code> default 44 → 28.</td><td>Rendering only</td></tr>
+<tr><td>Cost removal</td><td>Drop the footer spend segment and the aggregate spend row. <code>zirv ctx status</code> and the <code>^A i</code> inspector keep spend.</td><td>Deletion</td></tr>
+<tr><td>Limits</td><td><code>window::Window.resets_at</code> is already stored per provider; carry it into <code>ui::HarnessUsage</code> with an estimated flag.</td><td>Plumbing</td></tr>
+<tr><td>Workflow per pane</td><td>Persist the started workflow id on the session record (it is only in the prompt text today); the pane reads its own; empty step becomes ✓ done.</td><td>Small addition</td></tr>
+<tr><td>Rot and rollover</td><td>Rot track from the score the dash already reads. Rollover distance from the headroom it already computes; pending and parked from <code>&lt;short&gt;.seat.json</code> and <code>&lt;short&gt;.rollover.json</code>, read per pane; the toast from the settlement change.</td><td>Plumbing</td></tr>
+<tr><td>Jev</td><td>A 24-hour variant of <code>jev::usage_rollup</code> read on a 10 s throttle (both logs are low-volume); top three sites by calls; no network.</td><td>Plumbing</td></tr>
+<tr><td>Motion</td><td>Clock-based frames, easing, flash and toast fade in the dash render path; <code>dash.motion</code> setting.</td><td>Rendering only</td></tr>
+<tr><td>Intake</td><td>Inline ratatui region before launch in <code>chat.rs</code>; the plan card reads the existing decision; fallback reasons are already in <code>decision.fallbacks</code>.</td><td>Rewrite of one screen</td></tr>
+</tbody></table></div>
+<p>Delivery would be three PRs: dashboard layout, limits and workflow binding; then the rot track, rollover indicator and motion; then intake.</p>
+<div class="ask"><b>Decided 2026-09-26</b><ol><li>Session column is 28 columns.</li><li>Every plan waits for Enter; no countdown.</li><li>Motion is fully on by default.</li><li>Dashboard sessions are not compacted or restarted automatically; the footer recommends instead.</li></ol></div>
+</main>
+<script>
+(() => {
+  const P = 'live';
+  const $ = id => document.getElementById(P + '-' + id);
+  const SPIN = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let playing = !reduce, t0 = performance.now(), paused = 0, shown = -1, gaugeNow = 41;
+  const btn = document.getElementById('play');
+  const lbl = document.getElementById('clock');
+  function band(s){return s<40?'g':(s<60?'y':'r')}
+  function bandWord(s){return s<40?'fresh':(s<60?'warming':'rotting')}
+  function renderGauge(v){
+    const el=$('gauge'); if(!el) return;
+    const f=Math.round(v/5), c=band(v); let h='';
+    for(let i=0;i<20;i++){ if(i===12)h+='<span class="ty">┊</span>'; if(i===16)h+='<span class="tr">┊</span>';
+      h+= i<f?`<span class="${c}">▰</span>`:'<span class="d">▱</span>'; }
+    el.innerHTML=h;
+  }
+  function pad(s,n){ return s.length>=n?s.slice(0,n):s+' '.repeat(n-s.length) }
+  const SCRIPT = [ // [t, score, hint, hint class, rollover text, rollover class, toast]
+    [0,   41, '', 'y', '⤓ rollover at 20% left · now 31%', 'mu', ''],
+    [2.5, 49, '', 'y', '⤓ rollover at 20% left · now 28%', 'mu', ''],
+    [5,   58, '', 'y', '⤓ rollover soon · 24% left (at 20%)', 'y', ''],
+    [7.5, 63, '/compact recommended', 'y', '⤓ rollover soon · 21% left (at 20%)', 'y', ''],
+    [9.5, 63, '/compact recommended', 'y', '⤓ switching to codex when idle', 'yb pulse', ''],
+    [13,   6, '', 'y', '⤓ rollover at 20% left · now 88%', 'mu', ' ⤓ rolled over: codex'],
+    [17,   6, '', 'y', '⤓ rollover at 20% left · now 88%', 'mu', ' ✉ 9c02 sent a result'],
+  ];
+  const LOOP = 20;
+  function tick(now){
+    const el = (now - t0)/1000;
+    const t = playing ? el % LOOP : paused;
+    if(playing) paused = t;
+    // spinners on a clock (80 ms), not on redraws
+    const fr = reduce ? 0 : Math.floor(now/80) % SPIN.length;
+    ['spin1','spin2'].forEach(id => { const e=$(id); if(e) e.textContent = SPIN[fr]; });
+    const cc=$('ccspin'); if(cc) cc.textContent = reduce ? '✻' : ['✻','✳','✢','·','✢','✳'][Math.floor(now/140)%6];
+    // shimmer across the working verb
+    const v=$('verb');
+    if(v){ const word='Working'; const pos = reduce ? -9 : Math.floor(now/90)%(word.length+6)-3; let h='';
+      for(let i=0;i<word.length;i++){ const d=Math.abs(i-pos); h+=`<span class="shim ${d===0?'hi':(d===1?'mid':'')}">${word[i]}</span>`; }
+      v.innerHTML=h; }
+    // scripted lifecycle
+    let k=0; for(let i=0;i<SCRIPT.length;i++){ if(t>=SCRIPT[i][0]) k=i; }
+    const [ts,score,text,cls,roll,rollCls,toast] = SCRIPT[k];
+    if(k!==shown){
+      shown=k;
+      const nx=$('next'); nx.className=cls; nx.textContent=pad(text,26);
+      const rl=$('roll'); rl.className=rollCls; rl.textContent=pad(roll,36);
+      const fr_=$('frot'); fr_.className=band(score); fr_.textContent=`✻ ${String(score).padStart(2,' ')} ${bandWord(score)}`;
+      const or_=$('orot'); or_.className=band(score); or_.textContent=`✻${String(score).padStart(2,' ')}`;
+      $('toast').textContent = pad(toast || ' · ~/zirv-dynamic-cli', 21); $('toast').className = toast ? 'toast' : 'mu';
+      const jc=$('jcalls'), jl=$('jlast');
+      if(jc && jl && k>0){ jc.textContent=String(739+k*3); jl.textContent=pad(['memory','approve','classify','memory','approve','memory'][k%6]+' · just now',17);
+        jl.classList.remove('flash'); void jl.offsetWidth; jl.classList.add('flash'); }
+      if(k===6){ const c=$('codex'); c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); }
+    }
+    // gauge eases toward the score instead of jumping
+    const target = score; gaugeNow += (target-gaugeNow) * (reduce?1:0.12); if(Math.abs(target-gaugeNow)<0.5) gaugeNow=target;
+    renderGauge(gaugeNow);
+    if(lbl) lbl.textContent = `${t.toFixed(1).padStart(4,' ')}s / ${LOOP}s`;
+    requestAnimationFrame(tick);
+  }
+  if(btn){
+    btn.textContent = playing ? 'Pause' : 'Play';
+    btn.addEventListener('click', () => { playing=!playing; if(playing){ t0 = performance.now() - paused*1000; } btn.textContent = playing?'Pause':'Play'; });
+  }
+  requestAnimationFrame(tick);
+})();
+</script>

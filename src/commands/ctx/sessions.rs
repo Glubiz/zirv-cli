@@ -864,6 +864,10 @@ impl SessionGuard {
         // supervisor's own leftover is still cleaned up by `list()`'s own
         // `sweep_orphaned_screening_summaries`.
         let _ = std::fs::remove_file(screening_path(&self.state, &self.record.short));
+        // The bound-workflow sibling file (`workflow_path`) goes with the
+        // record the same way -- best-effort, and swept up by `list()`'s own
+        // `sweep_orphaned_workflow_markers` for a crashed supervisor's leftover.
+        let _ = std::fs::remove_file(workflow_path(&self.state, &self.record.short));
         // Issue #295: a session-tier memory entry must never outlive the
         // session it belongs to -- best-effort, like every other cleanup
         // here; a failed removal leaves an orphaned directory, never data
@@ -1136,6 +1140,63 @@ pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
         .and_then(|contents| serde_json::from_str::<Record>(&contents).ok())
 }
 
+/// `short`'s own bound-workflow sibling file, next to `record_path` -- the
+/// same `screening_path` pattern, and for the same reason (read its own doc
+/// comment). Round 2 coordinator review: `bind_workflow_id` used to be a
+/// read-modify-write of the WHOLE `Record`, and a wrap-supervised session's
+/// `SessionGuard` holds its OWN cached `Record` (captured at `register`)
+/// that it rewrites whole on every turn (`stamp_in_flight`/`refresh_session`,
+/// both `write_record(&self.state, &self.record)`) -- so a workflow bound by
+/// the separate `zirv workflow start` process was silently reverted to
+/// `None`/stale the moment that guard's next turn landed. A dedicated
+/// sibling file makes that impossible by construction: nothing in
+/// `bind_workflow_id`/`workflow_id_for` ever opens `record_path`, and no
+/// in-memory `Record` anywhere carries this field to go stale.
+fn workflow_path(state: &StateDir, short: &str) -> PathBuf {
+    state.sessions().join(format!("{short}.workflow"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkflowBinding {
+    workflow_id: String,
+}
+
+/// Dash refresh PR1: stamps `short`'s own bound workflow id into its sibling
+/// file (`workflow_path`), best-effort, atomically -- the identical
+/// `write_private` primitive `write_record`/`set_last_screening` already
+/// use. `zirv workflow start` calls this onto whatever `ZIRV_CTX_SESSION`
+/// names once the workflow it just started already has an id; `chat.rs`
+/// calls it for a session it launches with a proxy-decided workflow already
+/// running. Only patches an ALREADY-REGISTERED session (mirrors the old
+/// read-modify-write's own contract) -- a short id with no live record gets
+/// no marker file at all, matching `bind_workflow_id_is_a_quiet_no_op_with_
+/// no_registered_record`.
+pub fn bind_workflow_id(state: &StateDir, short: &str, workflow_id: &str) {
+    if load_record(state, short).is_none() {
+        return;
+    }
+    let path = workflow_path(state, short);
+    let _ = super::state::create_private_dir_all(&state.sessions());
+    if let Ok(json) = serde_json::to_string(&WorkflowBinding {
+        workflow_id: workflow_id.to_string(),
+    }) {
+        let _ = super::state::write_private(&path, &json);
+    }
+}
+
+/// The workflow id `bind_workflow_id` last stored for `short`, if any -- the
+/// dashboard's own per-pane workflow resolution reads this instead of a
+/// `Record` field (removed; see `bind_workflow_id`'s own doc comment for
+/// why a field on the record could never be made safe against the guard's
+/// own whole-record rewrites). `None` for a session with no bound workflow,
+/// or one this build could not parse back.
+pub fn workflow_id_for(state: &StateDir, short: &str) -> Option<String> {
+    let text = std::fs::read_to_string(workflow_path(state, short)).ok()?;
+    serde_json::from_str::<WorkflowBinding>(&text)
+        .ok()
+        .map(|b| b.workflow_id)
+}
+
 /// Issue #281: the crash-interruption witness lookup a resumed session's
 /// injection reads (`handoff::render_crash_witness`, called from
 /// `resume::resume_prompt` and `hook::run_session_start`). Scans every
@@ -1293,6 +1354,7 @@ pub fn list_with_retention(state: &StateDir, retention_secs: u64) -> Vec<(Record
     sweep_orphan_endpoints(state, &found);
     sweep_orphan_socket_paths(state, &found);
     sweep_orphaned_screening_summaries(state, &found);
+    sweep_orphaned_workflow_markers(state, &found);
     found
 }
 
@@ -1440,6 +1502,30 @@ fn sweep_orphaned_screening_summaries(state: &StateDir, found: &[(Record, Livene
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("screening") {
+            continue;
+        }
+        let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let has_live_record = found
+            .iter()
+            .any(|(record, liveness)| *liveness == Liveness::Live && record.short == short);
+        if !has_live_record {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The same orphan sweep as [`sweep_orphaned_screening_summaries`], for the
+/// `.workflow` sibling files [`bind_workflow_id`] writes: a crashed
+/// supervisor's own leftover is cleaned up here rather than living forever.
+fn sweep_orphaned_workflow_markers(state: &StateDir, found: &[(Record, Liveness)]) {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("workflow") {
             continue;
         }
         let Some(short) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -2546,6 +2632,77 @@ mod tests {
         let json = serde_json::to_string(&record).expect("serialize");
         let round_tripped: Record = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped.runtime, RuntimeKind::Harness);
+    }
+
+    /// Dash refresh PR1: a fresh session starts with no bound workflow, and
+    /// an already-registered one picks one up through `bind_workflow_id`'s
+    /// own sibling file.
+    #[test]
+    fn bind_workflow_id_patches_an_existing_sessions_own_sibling_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let record = record_for(
+            "22222222-3333-4444-8888-555555555555",
+            Path::new("/repo"),
+            Verb::Wrap,
+        );
+        let short = record.short.clone();
+        let _guard = SessionGuard::register(&state, record);
+        assert_eq!(workflow_id_for(&state, &short), None);
+
+        bind_workflow_id(&state, &short, "w-9c02");
+        assert_eq!(workflow_id_for(&state, &short).as_deref(), Some("w-9c02"));
+    }
+
+    /// `bind_workflow_id` against a short id with no registered record at all
+    /// is a quiet no-op, never a panic -- the same best-effort posture every
+    /// other write in this module holds to.
+    #[test]
+    fn bind_workflow_id_is_a_quiet_no_op_with_no_registered_record() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        bind_workflow_id(&state, "ghost0001", "w-0000");
+        assert!(load_record(&state, "ghost0001").is_none());
+        assert_eq!(workflow_id_for(&state, "ghost0001"), None);
+    }
+
+    /// Round 2 coordinator review, CONFIRMED severe: a wrap-supervised
+    /// session's `SessionGuard` holds its OWN cached `Record` from
+    /// `register` time, and rewrites it whole on every turn
+    /// (`stamp_in_flight`, `write_record(&self.state, &self.record)`).
+    /// When `bind_workflow_id` used to patch that same `record_path` file,
+    /// the very next `stamp_in_flight` call reverted the binding to
+    /// whatever the guard's own in-memory copy still held (`None`, since it
+    /// predates the bind) -- silently, with no error anywhere. Pins the
+    /// fix: the binding lives in its own sibling file, which nothing the
+    /// guard writes ever touches, so it survives every turn.
+    #[test]
+    fn bind_workflow_id_survives_the_guards_own_whole_record_rewrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let record = record_for(
+            "33333333-4444-4555-8666-777777777777",
+            Path::new("/repo"),
+            Verb::Wrap,
+        );
+        let short = record.short.clone();
+        let mut guard = SessionGuard::register(&state, record);
+
+        // The bind happens from the SEPARATE `zirv workflow start` process,
+        // after the guard already registered -- exactly the ordering that
+        // exposed the bug.
+        bind_workflow_id(&state, &short, "w-9c02");
+        assert_eq!(workflow_id_for(&state, &short).as_deref(), Some("w-9c02"));
+
+        // The guard's own next turn rewrites its whole cached `Record` --
+        // the write that used to clobber a record-field binding.
+        guard.stamp_in_flight("wrap", 1);
+
+        assert_eq!(
+            workflow_id_for(&state, &short).as_deref(),
+            Some("w-9c02"),
+            "the binding must survive the guard's own whole-record rewrite"
+        );
     }
 
     /// Issue #243 (review round, F1): the whole point of the sibling file --

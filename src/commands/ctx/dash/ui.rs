@@ -20,8 +20,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
+use chrono::{DateTime, FixedOffset, TimeZone};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -31,12 +31,32 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use crate::style;
 
-use super::super::attention::{Projection, SessionStatus, Visibility};
+use super::super::attention::{Attention, Projection, SessionStatus, Visibility};
 use super::super::mail::Message;
-use super::super::price;
 use super::actions::{self, ActionContext, ActionId, PaletteRow};
 use super::hit::{FrameSnapshot, HintId, Hit};
 use super::pane::PaneState;
+
+/// Dash refresh PR1: one session's own bound workflow, resolved by
+/// `dash::mod::resolve_session_workflow` from its `sessions::Record::
+/// workflow_id`, never from the repo-wide `active_workflow_summary` pointer.
+/// Shared by the sidebar's own 2-line fact block (line 2) and the pane
+/// header's right segment -- the same fact, rendered twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorkflowFact {
+    /// `WorkflowKind::as_str()` -- e.g. `"bugfix"`.
+    pub kind: String,
+    /// The current step's id, or `"done"` once `completed` is set.
+    pub step: String,
+    /// 1-based position among `total` steps. `0`/`total` once `completed`.
+    pub index: usize,
+    pub total: usize,
+    pub awaiting_approval: bool,
+    /// The run finished (`WorkflowStatus::Completed`) within the last 10
+    /// minutes -- `resolve_session_workflow` itself is what stops returning
+    /// `Some` once that window has passed.
+    pub completed: bool,
+}
 
 /// One enabled harness's cached subscription usage snapshot. No longer read
 /// by the header itself (issue #202 phase 2b dropped the header's own usage
@@ -49,11 +69,35 @@ use super::pane::PaneState;
 /// `assemble_footer_facts`; issue #358 (task T6a) drops the blanket
 /// `#[allow(dead_code)]` this struct used to carry now that it is no longer
 /// landed ahead of every one of its fields' own call sites.
+/// Dash refresh PR1: `window::Window`'s own fields, minus `used_percentage`
+/// (already `HarnessUsage::five_hour`/`seven_day`) and `observed_at` (the
+/// LIMITS block has no use for it). `resets_at` is epoch seconds,
+/// vendor-reported (Claude's statusline, Codex's rate-limit events) -- there
+/// is no cheap, scan-free way for the dashboard's own throttled tick to tell
+/// a vendor reading apart from zirv's own estimate (`window::estimate_
+/// windows`, only reachable through `pace::current_windows`, which sums
+/// transcripts and is exactly the scan/poll this tick must never do), so
+/// this build never marks one `~`-estimated; see `render_limits`'s own doc
+/// comment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowDetail {
+    pub resets_at: u64,
+    pub limit_reached: bool,
+    pub overage_covered: bool,
+}
+
 #[derive(Clone)]
 pub struct HarnessUsage {
     pub name: &'static str,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
+    /// Dash refresh PR1: the rest of the 5h window's own `window::Window`
+    /// (`resets_at`/`limit_reached`/`overage_covered`) that `five_hour`
+    /// alone drops -- the LIMITS block's own reset line needs all three.
+    /// `None` exactly when `five_hour` is `None`.
+    pub five_hour_detail: Option<WindowDetail>,
+    /// The weekly window's own equivalent of `five_hour_detail`.
+    pub seven_day_detail: Option<WindowDetail>,
     /// Whether this provider is currently metered by credits rather than a
     /// subscription window (`cfg.pace.use_credits`). Filled every throttled
     /// tick alongside its siblings, but no production render path has
@@ -67,16 +111,15 @@ pub struct HarnessUsage {
 
 /// The header's live facts.
 ///
-/// `harness` is the dashboard's own launch identity -- the agent plus any
-/// `chat.model` disclosure (`chat.model` is repo-settable on the strength of
-/// the choice staying visible; the dashboard's header is the one surface
-/// that stays on screen for the whole session). It renders as the header's
-/// one bold segment, standing in for the generic app label the rest of this
-/// module's design otherwise uses.
-///
-/// `live`/`total` replace the old flat `sessions` count: `total` is every row
-/// the sidebar draws (attached panes plus view-only registry rows this
-/// dashboard owns), `live` is how many of those are not `Ended`/exited.
+/// Dash refresh PR1 round 2: the left side no longer names the dashboard's
+/// own launch identity (`chat.model` moved to the pane header, which stays
+/// on screen for whichever pane is focused rather than the one fixed
+/// identity the whole session launched with) -- it is `zirv`'s own brand
+/// mark plus three session counts: `sessions` (every row the sidebar draws
+/// that is not `Ended`/exited), `working` (`RowState::Working`) and
+/// `needs_you` (`Glyph::NeedsAction`). A zero count omits its whole segment
+/// (never "0 working"), so the row only ever names what is actually true
+/// right now.
 ///
 /// `error_count`/`latest_error` are the sticky `⚠` channel (`push_error`'s own
 /// buffer); `notice` is the transient, auto-expiring informational channel
@@ -84,9 +127,9 @@ pub struct HarnessUsage {
 /// while it is fresh, exactly as it did before this phase.
 pub struct HeaderFacts {
     pub hints: HintContext,
-    pub harness: String,
-    pub live: usize,
-    pub total: usize,
+    pub sessions: usize,
+    pub working: usize,
+    pub needs_you: usize,
     pub error_count: usize,
     pub latest_error: Option<String>,
     pub notice: Option<String>,
@@ -218,26 +261,6 @@ pub fn header_hint_regions(area: Rect, facts: &HeaderFacts) -> Vec<(Rect, HintId
     header_layout(facts, area).1
 }
 
-/// Issue #264: where an aggregate-row cell's value came from -- currently
-/// only ever `Live` (read fresh this frame, or fresh as of the last
-/// throttled `delegations.jsonl` read). Kept as an explicit enum rather than
-/// folding straight into a bare `Option<T>` so a future cached/stale
-/// distinction (mirroring `price::PriceTable::is_stale`) has somewhere to go
-/// without changing every call site's shape again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Live,
-}
-
-/// One aggregate-row cell: `Some((value, source, age))` when a live source
-/// produced it, `None` when none exists yet. [`render_aggregate_row`] renders
-/// a `None` cell as `--`, never a default number -- Ruflo's own `statusline/
-/// index.ts:517` hard-codes `patternsLearned: 156` as a literal, and this
-/// shape is what makes the equivalent bug impossible to write here: there is
-/// no code path that can hand a bare value to the renderer with no source
-/// behind it.
-pub type AggregateCell<T> = Option<(T, Source, Duration)>;
-
 /// Issue #358 (task T6a): one harness's condensed pool status for the
 /// aggregate row's own strip -- `allocator::HarnessState::as_str()`'s own
 /// vocabulary (`"ready"`/`"draining"`/`"hard-blocked"`/`"unknown"`/
@@ -250,73 +273,6 @@ pub struct HarnessStrip {
     pub name: String,
     pub state: String,
     pub headroom_pct: Option<f64>,
-}
-
-/// The dashboard's own aggregate row, drawn above the roster
-/// (`dash::mod::run_dashboard`'s own draw closure carves one row off the top
-/// of the sidebar for it, issue #264). `workers_running` is cheap in-memory
-/// state (`total_live`) recomputed fresh every frame, the same discipline
-/// `HeaderFacts::live` already holds; `workers_failed`/`spend_micros` come
-/// from a throttled `delegations.jsonl` read (`dash::mod::DiskFacts::spend`)
-/// and are `None` until at least one delegation has ever completed;
-/// `five_hour_pct` reuses the same per-harness usage snapshot the header/
-/// footer already read (`DiskFacts::usage`).
-///
-/// `harnesses`/`seat` (issue #358, task T6a) are the pool strip: one
-/// [`HarnessStrip`] per harness `fallback::capacity_snapshot` names (empty
-/// when the dashboard's own repo has none configured, never a placeholder
-/// row) and this dashboard's own orchestrator seat's `"gen N"` label, `None`
-/// until a seat is registered for it. Both are throttled disk reads, the
-/// same cadence `DiskFacts::usage` already uses.
-pub struct AggregateFacts {
-    pub workers_running: AggregateCell<u64>,
-    pub workers_failed: AggregateCell<u64>,
-    pub spend_micros: AggregateCell<u64>,
-    pub five_hour_pct: AggregateCell<f64>,
-    pub harnesses: Vec<HarnessStrip>,
-    pub seat: Option<String>,
-}
-
-fn aggregate_cell_text<T: Copy>(cell: &AggregateCell<T>, render: impl Fn(T) -> String) -> String {
-    match cell {
-        Some((value, _, _)) => render(*value),
-        None => "--".to_string(),
-    }
-}
-
-/// Pure: the aggregate row's own text. A cell with no live source renders
-/// `--` in its place -- never a guessed or default number (see
-/// [`AggregateCell`]'s own doc comment for why that is structurally, not
-/// just conventionally, true).
-///
-/// Issue #358 (task T6a): the harness pool strip and seat label append after
-/// the four original cells, each behind its own `\u{b7}` separator, and only
-/// when there is something to show -- an empty `harnesses` list or a `None`
-/// seat contributes nothing at all, so a dashboard with no configured
-/// fallback order (or no registered seat) renders the identical row this
-/// function always has.
-pub fn render_aggregate_row(facts: &AggregateFacts) -> String {
-    let mut text = format!(
-        "workers {} running \u{b7} {} failed \u{b7} {} \u{b7} five_hour {}",
-        aggregate_cell_text(&facts.workers_running, |v: u64| v.to_string()),
-        aggregate_cell_text(&facts.workers_failed, |v: u64| v.to_string()),
-        aggregate_cell_text(&facts.spend_micros, |v: u64| price::format_usd(v, false)),
-        aggregate_cell_text(&facts.five_hour_pct, |v: f64| format!("{v:.0}%")),
-    );
-    for strip in &facts.harnesses {
-        let headroom = strip
-            .headroom_pct
-            .map(|v| format!("{v:.0}%"))
-            .unwrap_or_else(|| "--".to_string());
-        text.push_str(&format!(
-            " \u{b7} {} {} {headroom}",
-            strip.name, strip.state
-        ));
-    }
-    if let Some(seat) = &facts.seat {
-        text.push_str(&format!(" \u{b7} seat {seat}"));
-    }
-    text
 }
 
 /// The sidebar/grid state a row's leading glyph column renders: [`render_
@@ -502,15 +458,45 @@ pub struct SidebarRow {
     /// Where the row sits in the tree; set by [`roster_frame`] as it lays the
     /// group out, not by whoever built the row.
     pub tree: TreePos,
-    /// Ordered `(key, value)` facts drawn under this row while it is
-    /// selected. Filled only for the selected row, and only from values
-    /// already cached -- a disclosure line never costs a read.
+    /// Ordered `(key, value)` facts the `^A i` per-row inspector reads back
+    /// by key (`group`, `branch`, `since`, `budget`, `writer`, `signal`).
+    /// Dash refresh PR1 replaced the sidebar's own 8-line rendering of this
+    /// same vec with the 2-line fact block below (`fact_state`/
+    /// `fact_since_secs`/`workflow`) -- kept here, unrendered by the sidebar
+    /// now, purely because the inspector still has a live use for it; a key
+    /// that fed ONLY the old sidebar block (`model`, `reason`) was dropped
+    /// from this vec entirely rather than kept unused. Filled only for the
+    /// selected row, and only from values already cached -- a disclosure
+    /// line never costs a read.
     pub disclosure: Vec<(String, String)>,
     pub short: String,
     pub harness: String,
     pub age_secs: Option<u64>,
     pub score: Option<u32>,
     pub state: RowState,
+    /// Dash refresh PR1: the fact block's own line 1, `{fact_state} ·
+    /// {age}`. The state word -- the composed projection's own word
+    /// (`working`, `needs approval`, ...) when a status exists, else the
+    /// plain `RowState` word (`working`/`idle`/`ended`/`unknown`). Set for
+    /// every row (not only the selected one): the pane header's own right
+    /// segment reads it off the FOCUSED row, which need not be the row the
+    /// sidebar cursor is currently on.
+    pub fact_state: String,
+    /// The fact block/pane-header's own elapsed clock: seconds since the
+    /// state word's own last transition (or, with no status, since the row
+    /// was first observed in this `RowState`). `None` when nothing has ever
+    /// been recorded yet.
+    pub fact_since_secs: Option<u64>,
+    /// This row's OWN bound workflow (`sessions::Record::workflow_id`,
+    /// resolved by `dash::mod::resolve_session_workflow`), never the
+    /// repo-wide pointer. `None` when this session started no workflow, or
+    /// its run could not be resolved. Read by both the fact block's line 2
+    /// and the pane header's workflow segment.
+    pub workflow: Option<SessionWorkflowFact>,
+    /// Total unread mail (broadcast + direct) for this session, the badge
+    /// column's second-priority glyph (`✉N`, `✉+` above 9) -- a workflow
+    /// gate awaiting approval (`⚑`) always wins when both are true.
+    pub unread_mail: usize,
     /// Issue #354 phase 2: this session's composed attention status as of the
     /// last `FactsCache` refresh (`attention::load`), never a per-frame read.
     /// `None` means this row was built before the first refresh; a status that
@@ -562,12 +548,13 @@ pub enum TreePos {
 }
 
 impl TreePos {
-    /// The row's own two-column tree prefix.
+    /// The row's own ONE-column tree prefix (dash refresh PR1 narrowed this
+    /// from two columns to one, part of the 44 -> 28 column row contract).
     fn prefix(self) -> &'static str {
         match self {
-            Self::Flat => "  ",
-            Self::Child => "\u{251c} ",
-            Self::LastChild => "\u{2514} ",
+            Self::Flat => " ",
+            Self::Child => "\u{251c}",
+            Self::LastChild => "\u{2514}",
         }
     }
 }
@@ -1139,20 +1126,52 @@ pub(crate) fn chrome_rows(area_height: u16) -> (u16, u16, u16, u16) {
 /// `rule_top`/`rule_bottom` are the full-width flat rules that replace the
 /// sidebar's old box border (issue #209/v3 §A4), each zero-height on a frame
 /// too short to afford it (see [`chrome_rows`]).
+///
+/// Dash refresh PR1 adds `sidebar_title`/`pane_header` (one shared row: the
+/// sidebar's own ` SESSIONS N` title beside the focused pane's own header)
+/// and `mid_rule` (the `─...┼...─` rule right below them, aligned with the
+/// sidebar/main divider) -- `sidebar`/`main` themselves now start BELOW
+/// those two rows, so a pane's child pty is sized to the grid it actually
+/// gets, never the two rows above it. All three are zero-height on a frame
+/// too short to afford them, the identical `1.min(remaining)` degrade every
+/// other chrome row already uses.
 pub struct DashLayout {
     pub header: Rect,
     pub rule_top: Rect,
+    /// The sidebar's own title row (` SESSIONS N`), same width as `sidebar`.
+    pub sidebar_title: Rect,
+    /// The focused pane's own header row, same width as `main`.
+    pub pane_header: Rect,
+    /// Full-width rule directly below `sidebar_title`/`pane_header`, with a
+    /// `┼` junction at the sidebar/main divider column.
+    pub mid_rule: Rect,
     pub sidebar: Rect,
     pub main: Rect,
     pub rule_bottom: Rect,
     pub footer: Rect,
 }
 
+/// Dash refresh PR1: below 100 total columns the session column hides
+/// outright (the header shows sessions as tabs instead, `render_header_
+/// tabs`) -- unless the operator has toggled it back on (`^A b`,
+/// `DashAction::ToggleSidebar`), which holds regardless of width until
+/// toggled again. Pure: `dash::mod`'s own `effective_sidebar_cols` is the
+/// ONE place this feeds `sidebar_cols` for every geometry read (`layout`,
+/// `effective_main`, pty resize) from, recomputed at every point the real
+/// terminal width can change and on the toggle itself, so a narrow
+/// terminal and a forced-visible toggle can never disagree about how wide
+/// the sidebar actually is this frame.
+pub fn sidebar_hidden(frame_width: u16, forced_visible: bool) -> bool {
+    frame_width < 100 && !forced_visible
+}
+
 /// Splits `area` into every chrome rect a v3 frame draws: one header row, a
 /// full-width top rule, a `sidebar_cols`-wide sidebar with a one-column
 /// divider before the grid, a bottom rule mirroring the top one, and one
 /// footer row (§D) -- see [`DashLayout`] and [`chrome_rows`] for how each
-/// piece's height is decided.
+/// piece's height is decided. Dash refresh PR1: the body's own top two rows
+/// go to the title/pane-header row and the rule below it (see
+/// [`DashLayout`]'s own doc comment) before `sidebar`/`main` get the rest.
 pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     let (header_h, rule_top_h, rule_bottom_h, footer_h) = chrome_rows(area.height);
     let header = Rect {
@@ -1170,35 +1189,75 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     };
 
     let body_y = area.y + header_h + rule_top_h;
-    let body_h = area
+    let body_h_total = area
         .height
         .saturating_sub(header_h + rule_top_h + rule_bottom_h + footer_h);
     let sidebar_w = sidebar_cols.min(area.width);
-    let sidebar = Rect {
+    // No sidebar at all (dash refresh PR1's own narrow-terminal hide,
+    // `sidebar_cols` config'd to 0) means no separator column either --
+    // `main` gets the whole frame, not `frame width - 1` for a divider with
+    // nothing to divide.
+    let separator = if sidebar_w > 0 && area.width > sidebar_w {
+        1
+    } else {
+        0
+    };
+    let main_x = area.x + sidebar_w + separator;
+    let main_w = area.width.saturating_sub(sidebar_w + separator);
+
+    // Reserved in the same priority order every other chrome row already
+    // follows: the title/pane-header row first, the rule below it second --
+    // a terminal too short for both loses the rule before it loses the row
+    // that actually carries information.
+    let title_h = 1.min(body_h_total);
+    let remaining = body_h_total.saturating_sub(title_h);
+    let mid_rule_h = 1.min(remaining);
+    let body_h = body_h_total.saturating_sub(title_h + mid_rule_h);
+    let body_y_below_title = body_y + title_h + mid_rule_h;
+
+    let sidebar_title = Rect {
         x: area.x,
         y: body_y,
+        width: sidebar_w,
+        height: title_h,
+    };
+    let pane_header = Rect {
+        x: main_x,
+        y: body_y,
+        width: main_w,
+        height: title_h,
+    };
+    let mid_rule = Rect {
+        x: area.x,
+        y: body_y + title_h,
+        width: area.width,
+        height: mid_rule_h,
+    };
+
+    let sidebar = Rect {
+        x: area.x,
+        y: body_y_below_title,
         width: sidebar_w,
         height: body_h,
     };
 
-    let separator = if area.width > sidebar_w { 1 } else { 0 };
     let main = Rect {
-        x: area.x + sidebar_w + separator,
-        y: body_y,
-        width: area.width.saturating_sub(sidebar_w + separator),
+        x: main_x,
+        y: body_y_below_title,
+        width: main_w,
         height: body_h,
     };
 
     let rule_bottom = Rect {
         x: area.x,
-        y: body_y + body_h,
+        y: body_y + body_h_total,
         width: area.width,
         height: rule_bottom_h,
     };
 
     let footer = Rect {
         x: area.x,
-        y: body_y + body_h + rule_bottom_h,
+        y: body_y + body_h_total + rule_bottom_h,
         width: area.width,
         height: footer_h,
     };
@@ -1206,6 +1265,9 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     DashLayout {
         header,
         rule_top,
+        sidebar_title,
+        pane_header,
+        mid_rule,
         sidebar,
         main,
         rule_bottom,
@@ -1231,6 +1293,30 @@ pub fn render_rule(f: &mut Frame, area: Rect, divider_col: u16, top: bool) {
     for col in 0..cols {
         line.push(if col == junction_at && divider_col < area.width {
             junction
+        } else {
+            '\u{2500}'
+        });
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, style::tui::muted()))),
+        area,
+    );
+}
+
+/// Dash refresh PR1: the rule directly below the sidebar's title row and the
+/// focused pane's own header row (`DashLayout::mid_rule`) -- a `┼` junction
+/// at the sidebar/main divider column rather than [`render_rule`]'s own
+/// `┬`/`┴`, since both sides have a row above AND below this one.
+pub fn render_mid_rule(f: &mut Frame, area: Rect, divider_col: u16) {
+    if area.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let junction_at = (divider_col as usize).min(cols.saturating_sub(1));
+    let mut line = String::with_capacity(cols);
+    for col in 0..cols {
+        line.push(if col == junction_at && divider_col < area.width {
+            '\u{253c}'
         } else {
             '\u{2500}'
         });
@@ -1300,18 +1386,6 @@ fn map_color(c: vt100::Color) -> Color {
 fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(Rect, HintId)>) {
     let cols = area.width as usize;
 
-    let chip_text = " zirv ".to_string();
-    let harness_text = format!(" {}", facts.harness);
-    let live_text = format!(" \u{b7} {}/{} live", facts.live, facts.total);
-
-    // The chip and the hint cluster always show, and the live count is
-    // short and fixed-shape; the harness/model label is the one
-    // variable-length piece of the left side, so it is the one that gives
-    // up room when the row is narrow. Ellipsis-truncate it to whatever is
-    // left after those fixed pieces, rather than drawing it at full length:
-    // a long-but-valid label would otherwise consume the row and push the
-    // hint cluster past the Paragraph's own right edge, where ratatui clips
-    // it off-screen with no ellipsis and no warning.
     let hints = header_hints(&facts.hints);
     let hints_w = hints
         .iter()
@@ -1319,17 +1393,36 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
         .sum::<usize>()
         + hints.len().saturating_sub(1) * 2;
     let gap_before_hints = 2usize;
-    let chip_w = style::display_width(&chip_text);
-    let live_w = style::display_width(&live_text);
-    let fixed_w = chip_w + live_w;
-    let harness_budget = cols.saturating_sub(fixed_w + hints_w + gap_before_hints);
-    let harness_text = style::truncate_display_ellipsis(&harness_text, harness_budget).into_owned();
 
-    let left: Vec<(String, Style)> = vec![
-        (chip_text, style::tui::chip()),
-        (harness_text, style::tui::title()),
-        (live_text, style::tui::muted()),
+    // `▌zirv` is the brand mark; the counts after it are `sessions` (always
+    // shown) then `working`/`needs_you`, each only when nonzero -- a zero
+    // count omits its whole segment (never "0 working"), so the row only
+    // ever names what is actually true right now. Every segment is short
+    // and digit-bounded (unlike the old free-text harness/model label this
+    // replaces), so unlike that label this cluster is never itself
+    // ellipsis-truncated; only the flexible middle slot gives up room.
+    let mut left: Vec<(String, Style)> = vec![
+        ("\u{258c}".to_string(), Style::default().fg(Color::Cyan)),
+        ("zirv".to_string(), style::tui::title()),
     ];
+    let mut counts: Vec<(String, Style)> =
+        vec![(format!("{} sessions", facts.sessions), style::tui::muted())];
+    if facts.working > 0 {
+        counts.push((
+            format!("{} working", facts.working),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if facts.needs_you > 0 {
+        counts.push((
+            format!("{} needs you", facts.needs_you),
+            style::tui::warning(),
+        ));
+    }
+    for (text, style) in counts {
+        left.push((" \u{b7} ".to_string(), style::tui::muted()));
+        left.push((text, style));
+    }
     let left_w: usize = left.iter().map(|(t, _)| style::display_width(t)).sum();
 
     let reserved = left_w + hints_w + gap_before_hints;
@@ -1407,6 +1500,482 @@ pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
     );
 }
 
+/// Dash refresh PR1: below the narrow-terminal floor the session column
+/// hides and its own header shows every session as a tab instead --
+/// ` {glyph} {name} {badge} `, the focused tab on the selected row's own
+/// `Color::Indexed(236)` background (dash refresh PR1's own selection
+/// tint, reused here rather than invented again). Same chip and hint
+/// cluster as [`render_header`]; the error/notice middle segment is
+/// dropped in this shape -- there is no room left for it once the tabs and
+/// the hints are both on the row.
+pub fn render_header_tabs(
+    f: &mut Frame,
+    area: Rect,
+    facts: &HeaderFacts,
+    rows: &[SidebarRow],
+    tick: usize,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let chip_text = " zirv ".to_string();
+    let hints = header_hints(&facts.hints);
+    let hints_w = hints
+        .iter()
+        .map(|(k, l)| k.len() + l.len() + 1)
+        .sum::<usize>()
+        + hints.len().saturating_sub(1) * 2;
+    let gap_before_hints = 2usize;
+    let chip_w = style::display_width(&chip_text);
+
+    let mut tab_spans: Vec<Span<'static>> = Vec::new();
+    let mut tabs_w = 0usize;
+    let tabs_budget = cols.saturating_sub(chip_w + hints_w + gap_before_hints);
+    for row in rows {
+        let name = if row.role == "orch" {
+            "orch".to_string()
+        } else {
+            style::truncate_display(&row.short, 4).into_owned()
+        };
+        let base = if row.focused {
+            Style::default().bg(Color::Indexed(236))
+        } else {
+            Style::default()
+        };
+        let (badge_text, badge_style) = badge_for(row).unwrap_or_else(|| (String::new(), base));
+        let mut piece = vec![
+            (" ".to_string(), base),
+            (
+                glyph_char_for(glyph_for(row), tick).to_string(),
+                glyph_style_for(glyph_for(row)).patch(base),
+            ),
+            (format!(" {name}"), style::tui::muted().patch(base)),
+        ];
+        if !badge_text.is_empty() {
+            piece.push((format!(" {badge_text}"), badge_style.patch(base)));
+        }
+        piece.push((" ".to_string(), base));
+        let piece_w: usize = piece.iter().map(|(t, _)| style::display_width(t)).sum();
+        if tabs_w + piece_w > tabs_budget {
+            break;
+        }
+        tabs_w += piece_w;
+        tab_spans.extend(piece.into_iter().map(|(t, s)| Span::styled(t, s)));
+    }
+
+    let mut spans = vec![Span::styled(chip_text, style::tui::chip())];
+    spans.extend(tab_spans);
+    let used = chip_w + tabs_w;
+    let pad = cols.saturating_sub(used + hints_w);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    for (i, (key, label)) in hints.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(key, style::tui::hint()));
+        spans.push(Span::raw(format!(" {label}")));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { height: 1, ..area },
+    );
+}
+
+/// Dash refresh PR1: the sidebar's own title row (`DashLayout::sidebar_
+/// title`) -- ` SESSIONS` left, the row count right-aligned. Replaces the
+/// old summary line's `N live` plus rollup cluster; the per-glyph counts
+/// still live in each group header's own rollup.
+pub fn render_sidebar_title(f: &mut Frame, area: Rect, count: usize) {
+    if area.is_empty() {
+        return;
+    }
+    let text = aligned_rollup(" SESSIONS", &count.to_string(), area.width);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, style::tui::title()))),
+        area,
+    );
+}
+
+/// Pure: the pane header's own workflow segment text and style -- `▸ {kind}
+/// › {step} {i}/{n}`, or `▸ {kind} › ✓ done` once `completed`; bold yellow
+/// while `awaiting_approval`, muted otherwise. Shared with nothing else:
+/// unlike the old footer segment this replaces, there is exactly one reader.
+fn pane_header_workflow_span(fact: &SessionWorkflowFact) -> (String, Style) {
+    let text = if fact.completed {
+        format!("\u{25b8} {} \u{203a} \u{2713} done", fact.kind)
+    } else {
+        format!(
+            "\u{25b8} {} \u{203a} {} {}/{}",
+            fact.kind, fact.step, fact.index, fact.total
+        )
+    };
+    let style = if fact.awaiting_approval {
+        style::tui::warning().add_modifier(Modifier::BOLD)
+    } else {
+        style::tui::muted()
+    };
+    (text, style)
+}
+
+/// Pure: `word`'s first character upper-cased, the rest untouched -- the
+/// pane header's own `{State word}` segment (`working` -> `Working`); the
+/// sidebar's fact block keeps the plain lowercase word.
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Everything [`render_pane_header`] needs for the focused pane's own header
+/// row -- one row plus the `mid_rule` below it (see [`DashLayout`]).
+pub struct PaneHeaderFacts {
+    pub harness: String,
+    /// `display_role`'s own short spelling (`orch`, `sub-orch`, `worker`).
+    pub role: String,
+    pub model: Option<String>,
+    /// Already `~`-shortened by the caller (`dash::mod`'s existing cwd
+    /// display convention) -- this renderer does no path math of its own.
+    pub cwd: String,
+    /// This pane's OWN bound workflow (never the repo-wide pointer).
+    pub workflow: Option<SessionWorkflowFact>,
+    pub glyph: Glyph,
+    /// The fact block's own state word (`working`, `needs approval`, ...),
+    /// capitalized here (`capitalize_first`) -- the sidebar keeps it plain.
+    pub state_word: String,
+    pub age_secs: Option<u64>,
+}
+
+/// Dash refresh PR1: the focused pane's own header row (`DashLayout::
+/// pane_header`) -- left ` {harness} ▸ {role} · {model} · {cwd}`, right
+/// `▸ {workflow} › {step} {i}/{n}  {glyph} {State word} {age}` (the workflow
+/// segment absent without a bound workflow). Truncates the left side before
+/// ever touching the right, since the right is the part naming what is
+/// actually happening right now.
+pub fn render_pane_header(f: &mut Frame, area: Rect, facts: &PaneHeaderFacts, tick: usize) {
+    if area.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let left: Vec<(String, Style)> = vec![
+        (format!(" {}", facts.harness), style::tui::accent()),
+        (" \u{25b8} ".to_string(), style::tui::muted()),
+        (facts.role.clone(), style::tui::muted()),
+        (
+            format!(
+                " \u{b7} {}",
+                facts.model.as_deref().unwrap_or(style::PLACEHOLDER)
+            ),
+            style::tui::muted(),
+        ),
+        (format!(" \u{b7} {}", facts.cwd), style::tui::muted()),
+    ];
+
+    let mut right: Vec<(String, Style)> = Vec::new();
+    if let Some(workflow) = &facts.workflow {
+        let (text, style) = pane_header_workflow_span(workflow);
+        right.push((format!("{text}  "), style));
+    }
+    let glyph_style = glyph_style_for(facts.glyph);
+    right.push((
+        format!("{} ", glyph_char_for(facts.glyph, tick)),
+        glyph_style,
+    ));
+    right.push((
+        format!("{} ", capitalize_first(&facts.state_word)),
+        glyph_style,
+    ));
+    if let Some(age) = facts.age_secs {
+        right.push((style::format_age(age), style::tui::muted()));
+    }
+    let right_w: usize = right.iter().map(|(t, _)| style::display_width(t)).sum();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut remaining = cols.saturating_sub(right_w);
+    let mut used = 0usize;
+    for (text, style) in left {
+        let text = style::truncate_display(&text, remaining).into_owned();
+        let w = style::display_width(&text);
+        remaining = remaining.saturating_sub(w);
+        used += w;
+        spans.push(Span::styled(text, style));
+    }
+    let pad = cols.saturating_sub(used + right_w);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    for (text, style) in right {
+        spans.push(Span::styled(text, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ---------------------------------------------------------------------
+// Dash refresh PR1: the LIMITS block pinned to the bottom of the session
+// column -- per harness with usage data, two rows per window (5h, wk).
+// ---------------------------------------------------------------------
+
+/// Converts a unix timestamp to this offset's own wall-clock time. A
+/// `FixedOffset` covers every whole-minute UTC offset there is, so
+/// `timestamp_opt` is always `Single` -- the fallback only guards a type
+/// that cannot actually fail, never a real "ambiguous local time" case (that
+/// belongs to `TimeZone`s with DST, which `FixedOffset` is not).
+fn to_local(offset: FixedOffset, ts: u64) -> DateTime<FixedOffset> {
+    offset
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .unwrap_or_else(|| offset.timestamp_opt(0, 0).single().unwrap_or_default())
+}
+
+/// `HH:MM` at `offset` from a unix timestamp -- the LIMITS block's own
+/// "exactly when it resets, on the operator's own clock" reading. Distinct
+/// from `attention::utc_hhmm`, which is a different feature and stays UTC.
+fn limits_hhmm(offset: FixedOffset, ts: u64) -> String {
+    to_local(offset, ts).format("%H:%M").to_string()
+}
+
+/// Pure: the reset line's own `{time}` half -- today's bare `HH:MM`, `Ddd
+/// HH:MM` within the next 7 days, else `D Mon`, all read at `offset` so a
+/// reset that lands after local midnight (but before UTC midnight, or vice
+/// versa) still reports the day the operator's own clock sees.
+fn limits_reset_time(offset: FixedOffset, resets_at: u64, now: u64) -> String {
+    let reset_local = to_local(offset, resets_at);
+    let today = to_local(offset, now).date_naive();
+    let reset_day = reset_local.date_naive();
+    let hhmm = reset_local.format("%H:%M").to_string();
+    let delta = (reset_day - today).num_days();
+    if delta <= 0 {
+        hhmm
+    } else if delta < 7 {
+        format!("{} {hhmm}", reset_local.format("%a"))
+    } else {
+        format!("{}", reset_local.format("%-d %b"))
+    }
+}
+
+/// Pure: a duration in `resets_at - now` seconds, spelled `XhYYm` at an hour
+/// or more and `Nm` (never `0m`) under one.
+fn limits_countdown(resets_at: u64, now: u64) -> String {
+    let remaining = resets_at.saturating_sub(now);
+    if remaining < 3600 {
+        format!("{}m", (remaining / 60).max(1))
+    } else {
+        format!("{}h{:02}m", remaining / 3600, (remaining % 3600) / 60)
+    }
+}
+
+/// One harness window's own LIMITS row pair. Built by
+/// [`limits_blocks_from_usage`]; `show_harness` is `true` only for the
+/// first block of each harness (its 5h window), so the second row's own
+/// harness column stays blank, matching the mock.
+#[derive(Clone)]
+pub struct LimitsBlock {
+    pub harness: &'static str,
+    pub show_harness: bool,
+    pub window_label: &'static str,
+    pub pct: f64,
+    pub detail: WindowDetail,
+}
+
+/// Pure: every LIMITS block worth drawing, one per window that has usage
+/// data at all -- a harness with no vendor reading for a window (`None` on
+/// `HarnessUsage`) contributes nothing for it, and one with neither window
+/// contributes nothing at all. `usages`' own order is kept, 5h before wk
+/// within a harness.
+pub fn limits_blocks_from_usage(usages: &[HarnessUsage]) -> Vec<LimitsBlock> {
+    let mut blocks = Vec::new();
+    for usage in usages {
+        let mut show_harness = true;
+        if let (Some(pct), Some(detail)) = (usage.five_hour, usage.five_hour_detail) {
+            blocks.push(LimitsBlock {
+                harness: usage.name,
+                show_harness,
+                window_label: "5h",
+                pct,
+                detail,
+            });
+            show_harness = false;
+        }
+        if let (Some(pct), Some(detail)) = (usage.seven_day, usage.seven_day_detail) {
+            blocks.push(LimitsBlock {
+                harness: usage.name,
+                show_harness,
+                window_label: "wk",
+                pct,
+                detail,
+            });
+        }
+    }
+    blocks
+}
+
+/// Pure: how many whole blocks (2 rows each, behind a 2-row title+rule)
+/// fit in `rows` -- "session rows win vertical space: when rows would
+/// collide, drop the limits block from the bottom a whole window at a
+/// time" (never a half-drawn block). `0` when there is not even room for
+/// the title and rule.
+pub fn limits_blocks_fitting(block_count: usize, rows: u16) -> usize {
+    if rows < 2 {
+        return 0;
+    }
+    let available = ((rows - 2) / 2) as usize;
+    block_count.min(available)
+}
+
+/// Pure: the total rows [`render_limits`] draws for `shown` blocks --
+/// `0` when `shown` is `0` (no title/rule with nothing to show under it
+/// either), else `2 + 2 * shown`.
+pub fn limits_rows_for(shown: usize) -> u16 {
+    if shown == 0 { 0 } else { 2 + 2 * shown as u16 }
+}
+
+/// Pure: the bar+percentage row's own tone -- red when the limit is hit,
+/// magenta when overage is covered by credits, yellow at 80% or more,
+/// else cyan. The unfilled bar cells are always dim, regardless.
+fn limits_tone(pct: f64, detail: &WindowDetail) -> Style {
+    if detail.limit_reached {
+        style::tui::error()
+    } else if detail.overage_covered {
+        Style::default().fg(Color::Magenta)
+    } else if pct >= 80.0 {
+        style::tui::warning()
+    } else {
+        style::tui::accent()
+    }
+}
+
+/// Pure: the reset line's own text and tone -- `back at HH:MM · Nm` (red)
+/// when the limit is hit, `credits until HH:MM` (magenta) when overage is
+/// covered, `reset at HH:MM · stale` (muted) when `resets_at` is already in
+/// the past (a stale vendor reading, round 2 coordinator review), else
+/// `resets {time}` with `· in {countdown}` appended only for a reset later
+/// today (yellow at 80% or more, else muted).
+fn limits_reset_line(
+    offset: FixedOffset,
+    pct: f64,
+    detail: &WindowDetail,
+    now: u64,
+) -> (String, Style) {
+    if detail.limit_reached {
+        let countdown = limits_countdown(detail.resets_at, now);
+        (
+            format!(
+                "back at {} \u{b7} {countdown}",
+                limits_hhmm(offset, detail.resets_at)
+            ),
+            style::tui::error(),
+        )
+    } else if detail.overage_covered {
+        (
+            format!("credits until {}", limits_hhmm(offset, detail.resets_at)),
+            Style::default().fg(Color::Magenta),
+        )
+    } else if detail.resets_at < now {
+        // Round 2 coordinator review, CONFIRMED: a `resets_at` already in
+        // the past is a stale vendor reading (the window rolled over but a
+        // fresh one has not been reported yet), never a future time to
+        // render as an ordinary `resets HH:MM` -- that reads as if the
+        // reset is still ahead. Always muted, regardless of `pct`: this is
+        // "the number is old", not a percentage-driven state. Kept to
+        // `reset at HH:MM \u{b7} stale` (well under the 28-col sidebar
+        // width, with its own 3-column indent) rather than the longer
+        // `waiting for update` phrasing, which does not fit that row at
+        // all -- `render_limits`'s own `truncate_display` is a last-resort
+        // safety net, never the intended way this line gets short enough.
+        (
+            format!(
+                "reset at {} \u{b7} stale",
+                limits_hhmm(offset, detail.resets_at)
+            ),
+            style::tui::muted(),
+        )
+    } else {
+        let time = limits_reset_time(offset, detail.resets_at, now);
+        let style = if pct >= 80.0 {
+            style::tui::warning()
+        } else {
+            style::tui::muted()
+        };
+        let today =
+            to_local(offset, now).date_naive() == to_local(offset, detail.resets_at).date_naive();
+        if today {
+            let countdown = limits_countdown(detail.resets_at, now);
+            (format!("resets {time} \u{b7} in {countdown}"), style)
+        } else {
+            (format!("resets {time}"), style)
+        }
+    }
+}
+
+/// Dash refresh PR1: draws the LIMITS block -- ` LIMITS` title, a rule,
+/// then as many `blocks` as `limits_blocks_fitting` said would fit (the
+/// caller is the one that drops blocks under height pressure; this draws
+/// whatever it is handed and nothing more, even if more rows were left
+/// over -- never guesses at the cut itself).
+///
+/// No `~` estimate marker anywhere: the only estimator source
+/// (`window::estimate_windows`, via `pace::current_windows`) sums
+/// transcripts, which is exactly the scan/poll the dashboard's own
+/// throttled tick must never do (see `WindowDetail`'s own doc comment) --
+/// so every value shown here is vendor-reported, never zirv's own guess,
+/// and the `~` prefix the design calls for never has anything to attach to
+/// in this build.
+pub fn render_limits(
+    f: &mut Frame,
+    area: Rect,
+    blocks: &[LimitsBlock],
+    now: u64,
+    offset: FixedOffset,
+) {
+    if area.is_empty() || blocks.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(" LIMITS", style::tui::title())));
+    // Confined to the sidebar's own width -- the vertical divider against
+    // the grid is a separate draw (`render_sidebar_divider`) spanning the
+    // whole body height already, so this rule needs no junction of its own.
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(cols),
+        style::tui::muted(),
+    )));
+    for block in blocks {
+        let tone = limits_tone(block.pct, &block.detail);
+        let harness = if block.show_harness {
+            block.harness.to_string()
+        } else {
+            String::new()
+        };
+        let bar_filled = ((block.pct / 100.0) * 6.0).round().clamp(0.0, 6.0) as usize;
+        let bar_filled_text = "\u{25b0}".repeat(bar_filled);
+        let bar_empty_text = "\u{25b1}".repeat(6 - bar_filled);
+        let pct_text = format!("{:>3.0}%", block.pct.round());
+        let bar_row = Line::from(vec![
+            Span::styled(
+                style::truncate_display(&format!(" {harness:<6} {:>2} ", block.window_label), cols)
+                    .into_owned(),
+                style::tui::muted(),
+            ),
+            Span::styled(bar_filled_text, tone),
+            Span::styled(bar_empty_text, style::tui::muted()),
+            Span::styled(format!(" {pct_text}"), tone),
+        ]);
+        lines.push(bar_row);
+        let (reset_text, reset_style) = limits_reset_line(offset, block.pct, &block.detail, now);
+        lines.push(Line::from(Span::styled(
+            style::truncate_display(&format!("   {reset_text}"), cols).into_owned(),
+            reset_style,
+        )));
+    }
+    let height = lines.len().min(area.height as usize) as u16;
+    f.render_widget(Paragraph::new(Text::from(lines)), Rect { height, ..area });
+}
+
 /// Issue #209/v3 §D: the focused session's active `zirv workflow` position,
 /// as much as the footer needs -- the rest of `workflow::ActiveWorkflowSummary`
 /// (attempts, artifacts, review evidence, ...) has no footer segment.
@@ -1436,19 +2005,21 @@ pub enum FooterFacts {
 
 /// The healthy/attention footer shapes (mock §04's first two examples) --
 /// they differ only in *values*, not in which fields exist.
+///
+/// Dash refresh PR1 dropped `harness`, `usage_five_hour`/`usage_seven_day`
+/// and `workflow` from this struct: the harness/model/workflow facts moved
+/// to the pane header (`ui::PaneHeaderFacts`), and PR2 replaces the usage
+/// pair with the next-action forecast track. The footer keeps only the rot
+/// verdict, mail and supervision now.
 pub struct FooterAliveFacts {
-    pub harness: String,
     /// `None` when no cached score exists yet for this session -- renders
     /// the same `✻ –` unknown placeholder the wrap bar's own `BarState`
     /// uses for the identical case.
     pub score: Option<u32>,
-    pub usage_five_hour: Option<f64>,
-    pub usage_seven_day: Option<f64>,
     /// Total unread mail (broadcast + direct) for this session. The mock's
     /// footer shows one unlabeled number, unlike the wrap bar's own
     /// broadcast/direct `+`-split -- `0` renders the dim placeholder.
     pub unread_mail: usize,
-    pub workflow: FooterWorkflow,
     /// `Pane::reachable()` for the focused pane (issue #209/v3 codex review
     /// finding 5): whether its own turn-signal socket bound successfully at
     /// spawn time. `false` is the same "degrades to unsupervised" case
@@ -1522,12 +2093,15 @@ fn footer_workflow_spans(workflow: &FooterWorkflow) -> (FooterSeg, FooterSeg) {
 /// grammar verbatim (minus the chip, per the mock's own note).
 const FOOTER_SEGMENT_GAP: &str = "   ";
 
-/// Pure: the alive-pane footer's spans, width-budgeted to `cols`, applying
-/// §D's own drop order: usage first, then the verdict's score number, then
-/// the workflow segment compresses (full form to `step!`), then the
-/// harness label drops, then -- last resort -- the now-harness-less
-/// workflow segment drops too. Verdict word/glyph, mail and supervision are
-/// never dropped.
+/// Pure: the alive-pane footer's spans, width-budgeted to `cols`. Dash
+/// refresh PR1 dropped the harness/usage/workflow segments entirely (the
+/// first two moved to the pane header; PR2 replaces usage with the
+/// next-action forecast) -- what is left is the rot verdict (`✻ NN {band}`),
+/// mail, and supervision, which shrinks to nothing at all while the pane is
+/// healthy and reachable (`Remove the healthy ● supervised segment`) and
+/// only ever shows `▲ unsupervised` or `◆ stalled`. Only the verdict's own
+/// score number is ever dropped, under real width pressure -- the word,
+/// mail and supervision are never dropped.
 fn footer_alive_spans(
     facts: &FooterAliveFacts,
     advise_at: u32,
@@ -1535,8 +2109,6 @@ fn footer_alive_spans(
     cols: u16,
 ) -> Vec<Span<'static>> {
     let cols = cols as usize;
-
-    let harness: FooterSeg = vec![(facts.harness.clone(), Style::default())];
 
     let (verdict_full, verdict_reduced): (FooterSeg, FooterSeg) = match facts.score {
         Some(score) => {
@@ -1547,10 +2119,7 @@ fn footer_alive_spans(
                 RotBand::Rotting => "rotting",
             };
             let style = footer_rot_style(band);
-            let full = vec![
-                (format!("{ROT_GLYPH} {word}"), style),
-                (format!(" {score}"), style::tui::muted()),
-            ];
+            let full = vec![(format!("{ROT_GLYPH} {score} {word}"), style)];
             let reduced = vec![(format!("{ROT_GLYPH} {word}"), style)];
             (full, reduced)
         }
@@ -1563,18 +2132,6 @@ fn footer_alive_spans(
         }
     };
 
-    let usage: FooterSeg = {
-        let five = facts
-            .usage_five_hour
-            .map(style::format_pct)
-            .unwrap_or_else(|| style::PLACEHOLDER.to_string());
-        let seven = facts
-            .usage_seven_day
-            .map(style::format_pct)
-            .unwrap_or_else(|| style::PLACEHOLDER.to_string());
-        vec![(format!("\u{25d4} {five}\u{b7}{seven}"), style::tui::muted())]
-    };
-
     let mail: FooterSeg = if facts.unread_mail == 0 {
         vec![(
             format!("\u{2709} {}", style::PLACEHOLDER),
@@ -1585,73 +2142,36 @@ fn footer_alive_spans(
         vec![(format!("\u{2709} {}", facts.unread_mail), style)]
     };
 
-    let (workflow_full, workflow_compressed) = footer_workflow_spans(&facts.workflow);
-
     // Issue #310: a stalled latch takes priority over the ordinary
-    // supervised/unsupervised segment -- see `FooterAliveFacts::stalled`'s
-    // own doc comment.
+    // unsupervised segment -- see `FooterAliveFacts::stalled`'s own doc
+    // comment. Healthy and reachable renders NOTHING at all now (dash
+    // refresh PR1): only a problem is worth a segment.
     let supervision: FooterSeg = if facts.stalled {
         vec![(
             "\u{25c6} stalled".to_string(),
             style::tui::warning().add_modifier(Modifier::BOLD),
         )]
-    } else if facts.supervised {
-        vec![
-            ("\u{25cf} ".to_string(), style::tui::ok()),
-            ("supervised".to_string(), Style::default()),
-        ]
-    } else {
+    } else if !facts.supervised {
         vec![("\u{25b2} unsupervised".to_string(), style::tui::error())]
+    } else {
+        Vec::new()
     };
 
-    // §D's own drop order, most to least generous -- usage, then the
-    // verdict's score number, then the workflow segment compresses (long
-    // form to `step!`), then the harness label drops (the mock's own
-    // 44-column example: `▸ spec!` survives with no harness at all), and
-    // only as the very last resort before the irreducible core does the
-    // now-harness-less workflow segment drop too. The verdict word/glyph,
-    // mail and supervision segments are never dropped. Issue #209/v3 codex
-    // review finding 4: harness must drop *before* the workflow segment is
-    // removed outright, not after -- the original tier order dropped
-    // workflow to nothing while still holding onto the harness, which
-    // never matches the mock at 44 columns. Mirrors `chrome::status_bar`'s
-    // own tiered-candidate shape.
     let tiers = [
-        join_footer_segments(&[
-            &harness,
-            &verdict_full,
-            &usage,
-            &mail,
-            &workflow_full,
-            &supervision,
-        ]),
-        join_footer_segments(&[&harness, &verdict_full, &mail, &workflow_full, &supervision]),
-        join_footer_segments(&[
-            &harness,
-            &verdict_reduced,
-            &mail,
-            &workflow_full,
-            &supervision,
-        ]),
-        join_footer_segments(&[
-            &harness,
-            &verdict_reduced,
-            &mail,
-            &workflow_compressed,
-            &supervision,
-        ]),
-        join_footer_segments(&[&verdict_reduced, &mail, &workflow_compressed, &supervision]),
+        join_footer_segments(&[&verdict_full, &mail, &supervision]),
         join_footer_segments(&[&verdict_reduced, &mail, &supervision]),
     ];
     choose_footer_tier(&tiers, cols)
 }
 
 /// Pure: joins `segments` with [`FOOTER_SEGMENT_GAP`] between each one
-/// present, in order.
+/// present, in order -- an empty segment (dash refresh PR1's healthy-and-
+/// reachable supervision, which is nothing at all) contributes neither text
+/// nor a gap of its own.
 fn join_footer_segments(segments: &[&FooterSeg]) -> FooterSeg {
     let mut out = FooterSeg::new();
-    for (i, seg) in segments.iter().enumerate() {
-        if i > 0 {
+    for seg in segments.iter().filter(|seg| !seg.is_empty()) {
+        if !out.is_empty() {
             out.push((FOOTER_SEGMENT_GAP.to_string(), Style::default()));
         }
         out.extend(seg.iter().cloned());
@@ -1755,6 +2275,42 @@ pub fn render_footer(
     };
     f.render_widget(
         Paragraph::new(Line::from(spans)),
+        Rect { height: 1, ..area },
+    );
+}
+
+/// Dash refresh PR1: below the narrow-terminal floor the footer shows the
+/// FOCUSED pane's own harness usage instead of the ordinary verdict/mail/
+/// supervision row -- `5h {pct}% · resets {time}`, since the LIMITS block
+/// that would otherwise carry this is gone along with the rest of the
+/// sidebar. `None` (nothing focused, or that harness has no 5h reading at
+/// all yet) draws nothing, same as [`render_footer`]'s own `FooterFacts::
+/// None`.
+pub fn render_footer_narrow_usage(
+    f: &mut Frame,
+    area: Rect,
+    usage: Option<&HarnessUsage>,
+    now: u64,
+    offset: FixedOffset,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let Some(usage) = usage else {
+        return;
+    };
+    let Some(pct) = usage.five_hour else {
+        return;
+    };
+    let text = match usage.five_hour_detail {
+        Some(detail) => format!(
+            "5h {pct:.0}% \u{b7} resets {}",
+            limits_reset_time(offset, detail.resets_at, now)
+        ),
+        None => format!("5h {pct:.0}%"),
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(text, style::tui::muted())),
         Rect { height: 1, ..area },
     );
 }
@@ -1891,11 +2447,11 @@ const ROT_GLYPH: &str = "\u{273b}";
 /// regardless of what happens to still be cached for it.
 fn rot_text(row: &SidebarRow) -> String {
     if row.state == RowState::Dead {
-        return style::PLACEHOLDER.to_string();
+        return format!("{ROT_GLYPH} {}", style::PLACEHOLDER);
     }
     match row.score {
         Some(score) => format!("{ROT_GLYPH}{score}"),
-        None => style::PLACEHOLDER.to_string(),
+        None => format!("{ROT_GLYPH} {}", style::PLACEHOLDER),
     }
 }
 
@@ -1914,18 +2470,48 @@ fn column(text: &str, width: usize, right: bool) -> String {
     }
 }
 
-/// The approved 44-column row contract's fixed prefix, in display columns:
-/// `tree(2) glyph(1) sp short(8) sp rot(3) sp age(3) sp role(8) sp` =
-/// 30. The model column takes whatever is left (14 at the default
-/// `sidebar_cols` of 44), so a row always fills `cols` exactly and a
-/// selected row's REVERSED background reaches the divider.
-const SIDEBAR_FIXED_COLS: usize = 30;
+/// The dash refresh (PR1) 28-column row contract's fixed prefix, in display
+/// columns: `tree(1) glyph(1) sp name(N) sp harness(6) sp rot(3) sp badge(2)
+/// sp` = 18 + N. `name` takes whatever is left (10 at the default
+/// `sidebar_cols` of 28), so a row always fills `cols` exactly and a
+/// selected row's own background reaches the divider.
+const SIDEBAR_FIXED_COLS: usize = 18;
 
-/// Pure: one sidebar row's styled spans under the fixed-column contract
-/// above. Colours follow #209 §B: a selected row is uniformly REVERSED and
-/// every glyph (state and rot alike) drops its own colour so the reversal
-/// reads as one band; keyboard focus adds BOLD; a view-only (unattached)
-/// row is DIM.
+/// Pure: the badge column's own text and style, highest priority first -- a
+/// workflow gate awaiting approval (`⚑ `) outranks unread mail (`✉N`, `✉+`
+/// above 9, matching the wrap bar's own convention for an unbounded count).
+/// `None` (rendered as two blank columns) when neither applies. PR2 adds the
+/// lifecycle badges (`⟳ ⇢ ⤓ ⏸`) above mail in this same priority order.
+fn badge_for(row: &SidebarRow) -> Option<(String, Style)> {
+    if row
+        .status
+        .as_ref()
+        .is_some_and(|s| s.attention == Attention::WorkflowGate)
+    {
+        return Some((
+            "\u{2691} ".to_string(),
+            style::tui::warning().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if row.unread_mail > 0 {
+        let count = if row.unread_mail > 9 {
+            "+".to_string()
+        } else {
+            row.unread_mail.to_string()
+        };
+        return Some((
+            format!("\u{2709}{count}"),
+            style::tui::warning().add_modifier(Modifier::BOLD),
+        ));
+    }
+    None
+}
+
+/// Pure: one sidebar row's styled spans under the 28-column contract above.
+/// Colours follow the dash refresh's replacement for #209 §B: a selected
+/// row gets a subtle `Color::Indexed(236)` background rather than REVERSED,
+/// so every glyph (state, rot and badge alike) keeps its own colour under
+/// the tint; keyboard focus adds BOLD; a view-only (unattached) row is DIM.
 fn sidebar_row_parts(
     row: &SidebarRow,
     tick: usize,
@@ -1941,52 +2527,33 @@ fn sidebar_row_parts(
         base = base.add_modifier(Modifier::BOLD);
     }
     if row.selected {
-        base = base.add_modifier(Modifier::REVERSED);
+        base = base.bg(Color::Indexed(236));
     }
-    let muted = if row.selected {
-        base
+    let muted = style::tui::muted().patch(base);
+    let glyph = glyph_style_for(glyph_for(row)).patch(base);
+    let rot = row
+        .score
+        .filter(|_| row.state != RowState::Dead)
+        .map(|score| sidebar_rot_style(rot_band_for(score, advise_at, compact_at)))
+        .unwrap_or_else(style::tui::muted)
+        .patch(base);
+    // `name` is `orch` for the orchestrator (`display_role` already shortens
+    // its role to that exact string), otherwise the 8-char short id.
+    let name = if row.role == "orch" {
+        "orch".to_string()
     } else {
-        style::tui::muted().patch(base)
+        row.short.clone()
     };
-    let glyph = if row.selected {
-        base
-    } else {
-        glyph_style_for(glyph_for(row)).patch(base)
-    };
-    let rot = if row.selected {
-        base
-    } else {
-        row.score
-            .filter(|_| row.state != RowState::Dead)
-            .map(|score| sidebar_rot_style(rot_band_for(score, advise_at, compact_at)))
-            .unwrap_or_else(style::tui::muted)
-            .patch(base)
-    };
-    let age = row
-        .age_secs
-        .map(style::format_age)
-        .unwrap_or_else(|| style::PLACEHOLDER.into());
+    let name_width = (cols as usize).saturating_sub(SIDEBAR_FIXED_COLS);
+    let (badge_text, badge_style) = badge_for(row).unwrap_or_else(|| (String::new(), muted));
     let parts = [
         (row.tree.prefix().to_string(), muted),
         (glyph_char_for(glyph_for(row), tick).to_string(), glyph),
-        (format!(" {} ", column(&row.short, 8, false)), base),
-        (column(&rot_text(row), 3, false), rot),
-        (
-            format!(
-                " {} {} ",
-                column(&age, 3, true),
-                column(&row.role, 8, false)
-            ),
-            muted,
-        ),
-        (
-            column(
-                row.model.as_deref().unwrap_or(style::PLACEHOLDER),
-                (cols as usize).saturating_sub(SIDEBAR_FIXED_COLS),
-                false,
-            ),
-            base,
-        ),
+        (format!(" {} ", column(&name, name_width, false)), base),
+        (column(&row.harness, 6, false), muted),
+        (format!(" {} ", column(&rot_text(row), 3, false)), rot),
+        (column(&badge_text, 2, false), badge_style.patch(base)),
+        (" ".to_string(), base),
     ];
     let mut remaining = cols as usize;
     parts
@@ -2065,14 +2632,6 @@ pub fn render_sidebar(
     }
 }
 
-/// The aggregate facts the sidebar's summary line stands for. Kept as its own
-/// struct (rather than folded into [`RosterFrame`]) so issue #354's later
-/// phases can grow the summary's own disclosure without the roster's geometry
-/// having to know about spend, pools or delegation counts.
-pub struct SidebarSummary {
-    pub aggregate: AggregateFacts,
-}
-
 /// One drawn roster: its lines, and the pointer geometry of exactly those
 /// lines. Produced together by [`roster_frame`] so a click can never address
 /// a row that height pressure or a collapsed group kept off the screen.
@@ -2142,9 +2701,12 @@ pub struct RosterView<'a> {
     pub bands: (u32, u32),
 }
 
-/// Pure: lays the whole roster out -- summary line, group tree, session rows
-/// and the selected row's disclosure -- and returns the lines together with
-/// the pointer geometry of exactly those lines.
+/// Pure: lays the whole roster out -- group tree, session rows and the
+/// selected row's 2-line fact block -- and returns the lines together with
+/// the pointer geometry of exactly those lines. `area` is the session-rows
+/// area alone (`DashLayout::sidebar`): the title row lives in its own rect
+/// now (`DashLayout::sidebar_title`, drawn by `render_sidebar_title`), not
+/// as this function's own row 0.
 ///
 /// Session order is spawn order, never re-sorted; a work group takes one
 /// header at the position of its first member, with the lead (its
@@ -2153,14 +2715,9 @@ pub struct RosterView<'a> {
 /// from the drawing is how a click ends up addressing a row that a collapsed
 /// group or height pressure kept off the screen.
 ///
-/// Under height pressure disclosure lines drop before any session row, and
-/// the summary line and group headers never drop at all.
-pub fn roster_frame(
-    area: Rect,
-    rows: &[SidebarRow],
-    summary: &SidebarSummary,
-    view: &RosterView<'_>,
-) -> RosterFrame {
+/// Under height pressure fact-block lines drop before any session row, and
+/// group headers never drop at all.
+pub fn roster_frame(area: Rect, rows: &[SidebarRow], view: &RosterView<'_>) -> RosterFrame {
     let RosterView {
         collapsed,
         chrome_selection,
@@ -2168,7 +2725,6 @@ pub fn roster_frame(
         tick,
         bands,
     } = *view;
-    let all: Vec<_> = rows.iter().collect();
     let mut entries: Vec<(Hit, Line<'static>, Vec<Line<'static>>)> = Vec::new();
     let mut seen = HashSet::new();
     for row in rows {
@@ -2186,13 +2742,15 @@ pub fn roster_frame(
             }
             let closed = collapsed.contains(&group.id);
             let id = Hit::GroupToggle(group.id.clone());
+            // Dash refresh PR1: `▾ {scope}` alone -- the lead/worker-count
+            // text the 44-column contract used to spell out is gone; the
+            // rollup cluster (right-aligned to the row's own badge column)
+            // already says how many members and what state they are in.
             let text = aligned_rollup(
                 &format!(
-                    "{} {} · {} · {} workers ",
-                    if closed { "▸" } else { "▾" },
-                    group.scope,
-                    group.lead_short,
-                    members.len()
+                    "{} {}",
+                    if closed { "\u{25b8}" } else { "\u{25be}" },
+                    group.scope
                 ),
                 &rollup(&members, tick),
                 area.width,
@@ -2240,31 +2798,16 @@ pub fn roster_frame(
     if area.is_empty() {
         return result;
     }
-    let live = rows.iter().filter(|r| r.state != RowState::Dead).count();
-    let summary_text = aligned_rollup(&format!("  {live} live"), &rollup(&all, tick), area.width);
-    let tone = if chrome_selection == Some(&Hit::SidebarSummary) {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        style::tui::muted()
-    };
-    result
-        .lines
-        .push(Line::from(Span::styled(summary_text, tone)));
-    result
-        .hits
-        .push((Rect { height: 1, ..area }, Hit::SidebarSummary));
-    let capacity = area.height.saturating_sub(1) as usize;
+    // Dash refresh PR1: the old summary line (`N live` plus its own rollup)
+    // is gone -- `DashLayout::sidebar_title` now carries the row count
+    // (`render_sidebar_title`, drawn from a separate rect above `area`, one
+    // row up), and `Hit::SidebarSummary`'s own click target is added
+    // straight onto that rect by `frame_snapshot` rather than through this
+    // frame's own `hits`. `area` is therefore ALL session rows now -- no
+    // row reserved for a title this function no longer draws.
+    let capacity = area.height as usize;
     let offset = offset.min(entries.len().saturating_sub(capacity));
     let mut detail_room = capacity.saturating_sub(entries.len());
-    if chrome_selection == Some(&Hit::SidebarSummary) && detail_room > 0 {
-        let text = render_aggregate_row(&summary.aggregate);
-        result.lines.push(Line::from(Span::styled(
-            style::truncate_display(&text, area.width as usize).into_owned(),
-            style::tui::muted(),
-        )));
-        result.hits[0].0.height += 1;
-        detail_room -= 1;
-    }
     for (id, line, disclosure) in entries.into_iter().skip(offset).take(capacity) {
         if result.lines.len() >= area.height as usize {
             break;
@@ -2289,14 +2832,17 @@ pub fn roster_frame(
 }
 
 /// Pure: one session row as a roster entry -- its hit id, its own line, and
-/// the disclosure lines that belong under it.
+/// the fact-block lines that belong under it.
 ///
-/// Disclosure hangs off the tree's own `│` for a row that has more siblings
-/// below it and off plain indentation otherwise, so the group's vertical line
-/// is never broken by a fact. `selected_session` is false while the cursor is
-/// parked on the summary or a group header: the roster shows one cursor, so a
-/// session row must drop its REVERSED band (and its disclosure with it) while
-/// something else owns it.
+/// Dash refresh PR1: at most 2 lines (replacing the old 8-line disclosure
+/// dump) -- `{fact_state} · {age}`, then `▸ {workflow} › {step} {i}/{n}`
+/// only when this session has a bound workflow. Both hang off the tree's own
+/// `│` for a row that has more siblings below it and off plain indentation
+/// otherwise, so the group's vertical line is never broken by a fact.
+/// `selected_session` is false while the cursor is parked on the summary or
+/// a group header: the roster shows one cursor, so a session row must drop
+/// its selected band (and its fact block with it) while something else owns
+/// it.
 fn roster_entry(
     row: &SidebarRow,
     width: u16,
@@ -2308,30 +2854,33 @@ fn roster_entry(
     row.selected &= selected_session;
     let line = Line::from(sidebar_row_parts(&row, tick, width, bands.0, bands.1));
     let prefix = if row.tree == TreePos::Child {
-        "│   "
+        "\u{2502}  "
     } else {
-        "    "
+        "   "
     };
-    let disclosure = if row.selected {
-        row.disclosure
-            .iter()
-            .map(|(key, value)| {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{prefix}{}", column(key, 10, false)),
-                        style::tui::muted(),
-                    ),
-                    Span::raw(
-                        style::truncate_display(value, 30.min((width as usize).saturating_sub(14)))
-                            .into_owned(),
-                    ),
-                ])
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    (Hit::SidebarRow(row.short), line, disclosure)
+    let mut fact_lines = Vec::new();
+    if row.selected {
+        let age = row
+            .fact_since_secs
+            .map(style::format_age)
+            .unwrap_or_else(|| style::PLACEHOLDER.into());
+        fact_lines.push(Line::from(Span::styled(
+            style::truncate_display(
+                &format!("{prefix}{} \u{b7} {age}", row.fact_state),
+                width as usize,
+            )
+            .into_owned(),
+            style::tui::muted(),
+        )));
+        if let Some(workflow) = &row.workflow {
+            let (text, style) = pane_header_workflow_span(workflow);
+            fact_lines.push(Line::from(Span::styled(
+                style::truncate_display(&format!("{prefix}{text}"), width as usize).into_owned(),
+                style,
+            )));
+        }
+    }
+    (Hit::SidebarRow(row.short), line, fact_lines)
 }
 
 /// Draws a [`roster_frame`] result. The lines were already fitted to `area`
@@ -2340,6 +2889,16 @@ fn roster_entry(
 /// be tested against.
 pub fn render_roster(f: &mut Frame, area: Rect, roster: &RosterFrame) {
     f.render_widget(Paragraph::new(Text::from(roster.lines.clone())), area);
+}
+
+impl RosterFrame {
+    /// How many rows this frame actually drew -- dash refresh PR1's own
+    /// LIMITS block reads this to find out how much of the sidebar's own
+    /// height the roster left blank (session rows always win the space; the
+    /// caller never shortens `roster.lines` to make room for LIMITS).
+    pub fn drawn_rows(&self) -> usize {
+        self.lines.len()
+    }
 }
 
 /// Pure: the geometry of the frame about to be drawn, in the shape
@@ -2387,7 +2946,17 @@ pub fn frame_snapshot(
             )
         },
         grid: if zoomed { frame } else { layout.main },
-        rows: roster.hits.clone(),
+        // Dash refresh PR1: the sidebar's title row is drawn from its own
+        // rect now (`render_sidebar_title`, not part of `roster.lines`), so
+        // its `Hit::SidebarSummary` click target is added here rather than
+        // coming from `roster.hits` itself.
+        rows: if zoomed {
+            roster.hits.clone()
+        } else {
+            let mut hits = vec![(layout.sidebar_title, Hit::SidebarSummary)];
+            hits.extend(roster.hits.clone());
+            hits
+        },
         roster: roster.row_ids.clone(),
         // Straight from the same layout pass `render_header` draws from, so
         // the click rects and the drawn chords can never describe different
@@ -2410,113 +2979,6 @@ pub fn frame_snapshot(
         overlay_capacity: overlay_geom
             .map(|(_, _, _, capacity)| capacity)
             .unwrap_or_default(),
-    }
-}
-
-/// Issue #354: the top rule names the pane that actually has the keyboard --
-/// `short · harness model · role [in scope]` on the left, its checkout on the
-/// right, dim, with the rule's own line filling between them. `render_rule`
-/// still draws the `┬` at the divider column first, so the sidebar's vertical
-/// line runs through it unbroken.
-pub fn render_focus_rule(
-    f: &mut Frame,
-    area: Rect,
-    divider: u16,
-    row: Option<&SidebarRow>,
-    cwd: Option<&str>,
-) {
-    render_rule(f, area, divider, true);
-    let Some(row) = row else {
-        return;
-    };
-    let start = divider.saturating_add(2).min(area.width);
-    let width = area.width.saturating_sub(start);
-    if width == 0 || area.is_empty() {
-        return;
-    }
-    let group = row
-        .group
-        .as_ref()
-        .map(|g| format!(" in {}", g.scope))
-        .unwrap_or_default();
-    let left = format!(
-        " {} · {} {} · {}{group} ",
-        row.short,
-        row.harness,
-        row.model.as_deref().unwrap_or(style::PLACEHOLDER),
-        row.role
-    );
-    let right = format!(" {} ─", cwd.unwrap_or(style::PLACEHOLDER));
-    let right = style::truncate_display(&right, (width as usize) / 2);
-    let left = style::truncate_display(
-        &left,
-        (width as usize).saturating_sub(style::display_width(&right)),
-    );
-    let fill =
-        (width as usize).saturating_sub(style::display_width(&left) + style::display_width(&right));
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("{left}{}{right}", "─".repeat(fill)),
-            style::tui::muted(),
-        )),
-        Rect::new(area.x + start, area.y, width, 1),
-    );
-}
-
-/// Draws [`render_footer`]'s existing grammar, then issue #354's dim
-/// right-aligned `$<spend> this session · pool <harness> <headroom>%…`
-/// segment over the space the footer left unused.
-///
-/// It is the first thing to go under width pressure: it is only drawn when
-/// the whole of the footer's own text plus a two-column gap plus this
-/// segment fit, so a narrow terminal keeps the verdict, usage and workflow
-/// state and simply loses the spend line. Both halves come from
-/// `AggregateFacts`, which the `FactsCache` already refreshes on its own
-/// throttled tick.
-pub fn render_footer_spend(
-    f: &mut Frame,
-    area: Rect,
-    facts: &FooterFacts,
-    bands: (u32, u32),
-    summary: &SidebarSummary,
-) {
-    let spend = aggregate_cell_text(&summary.aggregate.spend_micros, |v| {
-        price::format_usd(v, false)
-    });
-    let mut text = format!("{spend} this session");
-    for (i, pool) in summary.aggregate.harnesses.iter().enumerate() {
-        text.push_str(&format!(
-            " · {}{} {}",
-            if i == 0 { "pool " } else { "" },
-            pool.name,
-            pool.headroom_pct
-                .map(|v| format!("{v:.0}%"))
-                .unwrap_or_else(|| style::PLACEHOLDER.into())
-        ));
-    }
-    // A3-4: measured at the width the footer is actually DRAWN at, not at
-    // `u16::MAX`. `render_footer` below sheds segments as the terminal
-    // narrows; measuring the full-width footer instead made the spend
-    // segment look too wide to fit next to a tier that had already dropped
-    // half of itself, so it vanished while there was plenty of room.
-    let base = match facts {
-        FooterFacts::None => Vec::new(),
-        // A3-4: measured at the width the footer is actually DRAWN at, not
-        // at `u16::MAX`. `render_footer` below sheds segments as the
-        // terminal narrows; measuring the full-width footer instead made the
-        // spend segment look too wide to fit beside a tier that had already
-        // dropped half of itself, so it vanished with room to spare.
-        FooterFacts::Alive(v) => footer_alive_spans(v, bands.0, bands.1, area.width),
-        FooterFacts::Dead(v) => footer_dead_spans(v, area.width),
-    };
-    let base_width: usize = base.iter().map(|s| style::display_width(&s.content)).sum();
-    render_footer(f, area, facts, bands.0, bands.1);
-    let width = style::display_width(&text);
-    if !area.is_empty() && base_width + 2 + width <= area.width as usize {
-        f.render_widget(
-            Paragraph::new(Span::styled(text, style::tui::muted())),
-            Rect::new(area.right() - width as u16, area.y, width as u16, 1),
-        );
     }
 }
 
@@ -3845,6 +4307,10 @@ mod tests {
                         selected: i == 0,
                         focused: i == 0,
                         supervised: true,
+                        fact_state: "working".into(),
+                        fact_since_secs: Some(90 + i * 60),
+                        workflow: None,
+                        unread_mail: 0,
                     })
                     .collect();
                 if scenario == "nine-panes" {
@@ -3853,22 +4319,13 @@ mod tests {
                     rows.push(external);
                 }
                 let mut header = base_facts();
-                header.harness = "claude (opus)".to_string();
                 header.hints.alive = !empty;
-                header.total = rows.len();
-                header.live = rows.iter().filter(|r| r.state != RowState::Dead).count();
-                let aggregate = AggregateFacts {
-                    workers_running: Some((header.live as u64, Source::Live, Duration::ZERO)),
-                    workers_failed: Some((1, Source::Live, Duration::ZERO)),
-                    spend_micros: Some((2_340_000, Source::Live, Duration::ZERO)),
-                    five_hour_pct: Some((61.0, Source::Live, Duration::ZERO)),
-                    harnesses: vec![HarnessStrip {
-                        name: "claude".to_string(),
-                        state: "ready".to_string(),
-                        headroom_pct: Some(39.0),
-                    }],
-                    seat: Some("gen 2".to_string()),
-                };
+                header.sessions = rows.iter().filter(|r| r.state != RowState::Dead).count();
+                header.working = rows.iter().filter(|r| r.state == RowState::Working).count();
+                header.needs_you = rows
+                    .iter()
+                    .filter(|r| glyph_for(r) == Glyph::NeedsAction)
+                    .count();
                 let footer = if scenario == "dead-footer" {
                     FooterFacts::Dead(FooterDeadFacts {
                         harness: "claude".to_string(),
@@ -3902,20 +4359,17 @@ mod tests {
                 };
                 let mut parser = vt100::Parser::new(main.height, main.width, 100);
                 parser.process(b"Harness terminal (synthetic audit fixture)\r\n\r\nTask: review dashboard interaction\r\nReading source files...\r\n\r\n> ");
-                let summary = SidebarSummary { aggregate };
                 let nothing_collapsed = HashSet::new();
-                let roster = roster_frame(
-                    layout.sidebar,
-                    &rows,
-                    &summary,
-                    &test_roster_view(&nothing_collapsed),
-                );
+                let roster =
+                    roster_frame(layout.sidebar, &rows, &test_roster_view(&nothing_collapsed));
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|f| {
                         if !zoomed {
                             render_header(f, layout.header, &header);
                             render_rule(f, layout.rule_top, layout.sidebar.width, true);
+                            render_sidebar_title(f, layout.sidebar_title, rows.len());
+                            render_mid_rule(f, layout.mid_rule, layout.sidebar.width);
                             render_roster(f, layout.sidebar, &roster);
                             render_sidebar_divider(
                                 f,
@@ -3926,7 +4380,7 @@ mod tests {
                                 },
                             );
                             render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
-                            render_footer_spend(f, layout.footer, &footer, (40, 70), &summary);
+                            render_footer(f, layout.footer, &footer, 40, 70);
                         }
                         if !empty {
                             render_grid(f, main, parser.screen(), None);
@@ -3996,17 +4450,6 @@ mod tests {
         std::fs::write(output, captures).unwrap();
     }
 
-    fn no_live_source() -> AggregateFacts {
-        AggregateFacts {
-            workers_running: None,
-            workers_failed: None,
-            spend_micros: None,
-            five_hour_pct: None,
-            harnesses: Vec::new(),
-            seat: None,
-        }
-    }
-
     #[test]
     fn phase_one_render_matrix_and_exact_group_columns() {
         for (width, height) in [(80, 20), (120, 40), (200, 50)] {
@@ -4029,13 +4472,8 @@ mod tests {
                         row.focused = i == 1;
                         if i == 1 {
                             row.role = "sub-orch".into();
-                            row.disclosure = [
-                                "reason", "group", "model", "budget", "branch", "writer", "since",
-                                "signal",
-                            ]
-                            .into_iter()
-                            .map(|key| (key.into(), format!("{key} value")))
-                            .collect();
+                            row.fact_state = "working".into();
+                            row.fact_since_secs = Some(540);
                         }
                         row
                     })
@@ -4055,26 +4493,23 @@ mod tests {
                         });
                     }
                 }
-                let summary = SidebarSummary {
-                    aggregate: no_live_source(),
-                };
                 let area = Rect::new(0, 0, width, height);
-                let layout = layout(area, 44);
+                let layout = layout(area, 28);
+                // Height pressure: 4 rows exactly fill a 4-tall roster (the
+                // group header plus its 3 members), leaving no room at all
+                // for the selected member's own fact-block line -- it must
+                // drop before any session row does.
                 let roster_area = if scenario == "pressure" {
                     Rect {
-                        height: 5,
+                        height: 4,
                         ..layout.sidebar
                     }
                 } else {
                     layout.sidebar
                 };
                 let nothing_collapsed = HashSet::new();
-                let roster = roster_frame(
-                    roster_area,
-                    &rows,
-                    &summary,
-                    &test_roster_view(&nothing_collapsed),
-                );
+                let roster =
+                    roster_frame(roster_area, &rows, &test_roster_view(&nothing_collapsed));
                 let zoomed = scenario == "zoom";
                 let mut header = base_facts();
                 header.hints.alive = true;
@@ -4085,22 +4520,18 @@ mod tests {
                     .draw(|f| {
                         if !zoomed {
                             render_header(f, layout.header, &header);
-                            render_focus_rule(
-                                f,
-                                layout.rule_top,
-                                44,
-                                rows.get(1),
-                                Some("D:/GitHub/zirv-ux"),
-                            );
+                            render_rule(f, layout.rule_top, layout.sidebar.width, true);
+                            render_sidebar_title(f, layout.sidebar_title, rows.len());
+                            render_mid_rule(f, layout.mid_rule, layout.sidebar.width);
                             render_roster(f, roster_area, &roster);
                             render_sidebar_divider(f, snapshot.divider);
-                            render_rule(f, layout.rule_bottom, 44, false);
-                            render_footer_spend(
+                            render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
+                            render_footer(
                                 f,
                                 layout.footer,
                                 &FooterFacts::Alive(alive_footer_facts()),
-                                (40, 70),
-                                &summary,
+                                40,
+                                70,
                             );
                         }
                     })
@@ -4119,55 +4550,77 @@ mod tests {
                     rows.len()
                 );
                 if scenario == "pressure" {
-                    assert_eq!(roster.lines.len(), 5);
+                    // 4 entries (1 group header + 3 members), no room left
+                    // for the selected member's own fact line.
+                    assert_eq!(roster.lines.len(), 4);
                     assert!(
                         !roster
                             .lines
                             .iter()
-                            .any(|line| line.to_string().contains("reason"))
+                            .any(|line| line.to_string().contains("working \u{b7}"))
                     );
                 }
                 if scenario == "group" {
-                    assert_eq!(roster.hits[2].1, Hit::SidebarRow("a0000001".into()));
-                    assert_eq!(roster.hits[2].0.height, 9);
+                    // Entry 0 is the group header; entry 1 is the lead
+                    // (`a0000001`, reordered to the front) -- the old
+                    // `SidebarSummary` title-line hit that used to sit in
+                    // front of both is gone (dash refresh PR1 moved it to
+                    // its own rect, see `frame_snapshot`).
+                    assert_eq!(roster.hits[1].1, Hit::SidebarRow("a0000001".into()));
+                    // 1 row + 1 fact-block line (state+since; no bound
+                    // workflow, so line 2 never appears).
+                    assert_eq!(roster.hits[1].0.height, 2);
                     if width == 200 {
-                        // Built from the approved column contract itself --
-                        // `tree(2) glyph(1) sp short(8) sp rot(3) sp age(3,
-                        // right) sp role(8) sp model(rest)` -- not copied out
-                        // of the mock, so a drifted renderer cannot be made
-                        // to pass by editing a literal to match it.
-                        let model_cols = 44 - SIDEBAR_FIXED_COLS;
+                        // Built from the 28-column row contract itself --
+                        // `tree(1) glyph(1) sp name(10) sp harness(6) sp
+                        // rot(3) sp badge(2) sp` -- not copied out of the
+                        // mock, so a drifted renderer cannot be made to pass
+                        // by editing a literal to match it.
+                        let name_cols = 28 - SIDEBAR_FIXED_COLS;
                         let expected = format!(
-                            "{tree}{glyph} {short:<8} {rot:<3} {age:>3} {role:<8} {model:<model_cols$}",
-                            tree = "\u{251c} ",
+                            "{tree}{glyph} {name:<name_cols$} {harness:<6} {rot:<3}    ",
+                            tree = "\u{251c}",
                             glyph = style::tui::SPINNER_FRAMES[0],
-                            short = "a0000001",
+                            name = "a0000001",
+                            harness = "codex",
                             rot = format!("{ROT_GLYPH}21"),
-                            age = "9m",
-                            role = "sub-orch",
-                            model = "gpt-6-astra",
                         );
-                        assert_eq!(style::display_width(&expected), 44, "got {expected:?}");
+                        assert_eq!(style::display_width(&expected), 28, "got {expected:?}");
                         let buffer = terminal.backend().buffer();
-                        let line: String = (0..44).map(|x| buffer[(x, 4)].symbol()).collect();
+                        let sidebar_x0 = layout.sidebar.x;
+                        // Entry 0 is the group header; the lead row is entry 1.
+                        let row_y = layout.sidebar.y + 1;
+                        let line: String = (0..28)
+                            .map(|x| buffer[(sidebar_x0 + x, row_y)].symbol())
+                            .collect();
                         assert_eq!(line, expected);
-                        // Disclosure hangs off the tree's own `│`, key padded
-                        // to 10, value capped at 30 display columns.
-                        let detail: String = (0..44).map(|x| buffer[(x, 5)].symbol()).collect();
-                        assert_eq!(
-                            detail,
-                            format!("\u{2502}   {:<10}{:<30}", "reason", "reason value")
-                        );
-                        // #209 §B: one uniformly REVERSED band the full width
-                        // of the sidebar, no glyph keeping a colour of its own.
-                        for x in 0..44 {
-                            assert_eq!(buffer[(x, 4)].fg, Color::Reset);
-                            assert!(
-                                buffer[(x, 4)]
-                                    .modifier
-                                    .contains(Modifier::REVERSED | Modifier::BOLD)
+                        // The fact block, one line below: `{state} · {age}`,
+                        // indented under the tree's own continuation.
+                        let fact: String = (0..28)
+                            .map(|x| buffer[(sidebar_x0 + x, row_y + 1)].symbol())
+                            .collect();
+                        assert!(fact.contains("working \u{b7} 9m"), "got {fact:?}");
+                        // Dash refresh PR1 (§B replacement): a subtle
+                        // background rather than REVERSED, so the glyph
+                        // keeps its own colour under the selected band.
+                        for x in 0..28 {
+                            assert_eq!(
+                                buffer[(sidebar_x0 + x, row_y)].bg,
+                                Color::Indexed(236),
+                                "col {x}"
                             );
                         }
+                        assert_eq!(
+                            buffer[(sidebar_x0 + 1, row_y)].fg,
+                            Color::Cyan,
+                            "the working glyph keeps its own colour"
+                        );
+                        assert!(
+                            buffer[(sidebar_x0, row_y)]
+                                .modifier
+                                .contains(Modifier::BOLD),
+                            "the focused+selected row is still bold"
+                        );
                     }
                 }
             }
@@ -4187,15 +4640,11 @@ mod tests {
                 lead_short: "a0000000".into(),
             });
         }
-        let summary = SidebarSummary {
-            aggregate: no_live_source(),
-        };
         let collapsed = HashSet::from(["g".into()]);
         let on_header = Hit::GroupToggle("g".into());
         let roster = roster_frame(
             Rect::new(0, 2, 44, 6),
             &rows,
-            &summary,
             &RosterView {
                 collapsed: &collapsed,
                 chrome_selection: Some(&on_header),
@@ -4203,22 +4652,24 @@ mod tests {
             },
         );
         // A folded group keeps its own header, its rollup and its place in
-        // spawn order; its 3 members collapse into that one entry.
-        assert!(roster.lines[1].to_string().starts_with("▸ audit"));
-        assert!(roster.lines[1].to_string().contains("⠋3"));
+        // spawn order; its 3 members collapse into that one entry. Dash
+        // refresh PR1: this is now the roster's own line 0 -- the title
+        // line that used to sit in front of it lives in a separate rect
+        // now (`DashLayout::sidebar_title`), not as part of `roster.lines`.
+        assert!(roster.lines[0].to_string().starts_with("\u{25b8} audit"));
+        assert!(roster.lines[0].to_string().contains("⠋3"));
         assert_eq!(roster.row_ids.len(), 18);
         // The wheel moves the viewport only: the selection is still row 0,
         // which the scrolled frame simply does not draw.
         let scrolled = roster_frame(
             Rect::new(0, 2, 44, 6),
             &rows,
-            &summary,
             &RosterView {
                 offset: 4,
                 ..test_roster_view(&collapsed)
             },
         );
-        assert_eq!(scrolled.hits[1].1, Hit::SidebarRow("a0000006".into()));
+        assert_eq!(scrolled.hits[0].1, Hit::SidebarRow("a0000006".into()));
         assert!(rows[0].selected);
     }
 
@@ -4248,74 +4699,6 @@ mod tests {
                     .contains(Modifier::DIM)
             );
         }
-    }
-
-    #[test]
-    fn footer_spend_drops_before_focused_signal_segments() {
-        let mut aggregate = no_live_source();
-        aggregate.spend_micros = Some((420_000, Source::Live, Duration::ZERO));
-        aggregate.harnesses = vec![HarnessStrip {
-            name: "claude".into(),
-            state: "ready".into(),
-            headroom_pct: Some(64.0),
-        }];
-        let summary = SidebarSummary { aggregate };
-        for width in [80, 200] {
-            let text = render_and_capture_text(Rect::new(0, 0, width, 1), |f, area| {
-                render_footer_spend(
-                    f,
-                    area,
-                    &FooterFacts::Alive(alive_footer_facts()),
-                    (40, 70),
-                    &summary,
-                )
-            });
-            assert_eq!(text.contains("$0.42 this session"), width == 200);
-            assert!(text.contains("supervised"));
-        }
-    }
-
-    /// A3-4: the spend segment is measured against the footer that is
-    /// actually DRAWN, not against a hypothetical `u16::MAX`-wide one. Once
-    /// the footer has shed a tier there is room beside it, and the spend
-    /// segment must take it.
-    #[test]
-    fn the_footer_spend_segment_is_measured_against_the_width_it_is_drawn_at() {
-        // Long enough that dropping the harness label is a big tier step --
-        // exactly the drop the fixed measurement can see.
-        let facts = || FooterAliveFacts {
-            harness: "claude-sonnet-4-5-2026".to_string(),
-            ..alive_footer_facts()
-        };
-        let alive = facts();
-        let mut aggregate = no_live_source();
-        aggregate.spend_micros = Some((420_000, Source::Live, Duration::ZERO));
-        let summary = SidebarSummary { aggregate };
-        let spend = "$0.42 this session";
-        let spend_w = style::display_width(spend);
-        let measure =
-            |cols: u16| -> usize { footer_seg_width_of(&footer_alive_spans(&alive, 40, 70, cols)) };
-
-        let width = (30u16..=200)
-            .find(|w| measure(*w) + 2 + spend_w <= *w as usize)
-            .expect("some width leaves room beside the drawn footer");
-        assert!(
-            measure(u16::MAX) + 2 + spend_w > width as usize,
-            "sanity: at {width} cols the spend segment only fits because the footer shed a tier"
-        );
-
-        let drawn = FooterFacts::Alive(facts());
-        let text = render_and_capture_text(Rect::new(0, 0, width, 1), |f, area| {
-            render_footer_spend(f, area, &drawn, (40, 70), &summary)
-        });
-        assert!(
-            text.contains(spend),
-            "{width} cols: the spend segment fits beside the drawn footer, got {text:?}"
-        );
-    }
-
-    fn footer_seg_width_of(spans: &[Span<'static>]) -> usize {
-        spans.iter().map(|s| style::display_width(&s.content)).sum()
     }
 
     /// A3-3: at a one-row interior [`list_dialog_layout`] puts the hint row
@@ -4352,117 +4735,6 @@ mod tests {
             "the row the layout hit-tests as a hint must be the row the renderer draws hints \
              on, got {drawn:?}"
         );
-    }
-
-    /// Issue #264, the render-path contract: with no live source at all, the
-    /// aggregate row must contain no digit whatsoever -- proof there is no
-    /// hard-coded metric literal anywhere in `render_aggregate_row` (Ruflo's
-    /// own `statusline/index.ts:517` hard-codes `patternsLearned: 156`,
-    /// exactly the bug class this rules out). A digit could only reach the
-    /// output through a `Some` cell, and every cell here is `None`.
-    #[test]
-    fn render_aggregate_row_with_no_live_source_contains_no_digit_literal() {
-        let text = render_aggregate_row(&no_live_source());
-        assert!(
-            !text.chars().any(|c| c.is_ascii_digit()),
-            "no live source means no cell may render a number at all: {text}"
-        );
-        assert!(text.contains("--"), "got {text}");
-    }
-
-    /// Every cell backed by a live source renders its real value, in the
-    /// design's own worked shape: `workers N running · M failed · $x ·
-    /// five_hour P%`.
-    #[test]
-    fn render_aggregate_row_renders_every_live_cell() {
-        let facts = AggregateFacts {
-            workers_running: Some((3, Source::Live, Duration::ZERO)),
-            workers_failed: Some((1, Source::Live, Duration::ZERO)),
-            spend_micros: Some((4_200_000, Source::Live, Duration::ZERO)),
-            five_hour_pct: Some((41.0, Source::Live, Duration::ZERO)),
-            harnesses: Vec::new(),
-            seat: None,
-        };
-        let text = render_aggregate_row(&facts);
-        assert_eq!(
-            text,
-            "workers 3 running \u{b7} 1 failed \u{b7} $4.20 \u{b7} five_hour 41%"
-        );
-    }
-
-    /// A mix of live and absent cells renders each independently -- `--`
-    /// never leaks into a cell that DOES have a live source, and vice versa.
-    #[test]
-    fn render_aggregate_row_mixes_live_and_absent_cells_independently() {
-        let facts = AggregateFacts {
-            workers_running: Some((2, Source::Live, Duration::ZERO)),
-            workers_failed: None,
-            spend_micros: None,
-            five_hour_pct: Some((10.0, Source::Live, Duration::ZERO)),
-            harnesses: Vec::new(),
-            seat: None,
-        };
-        let text = render_aggregate_row(&facts);
-        assert!(text.contains("workers 2 running"), "got {text}");
-        assert!(text.contains("-- failed"), "got {text}");
-        assert!(text.contains("\u{b7} -- \u{b7}"), "got {text}");
-        assert!(text.contains("five_hour 10%"), "got {text}");
-    }
-
-    /// Issue #358 (task T6a): the pool strip and seat label append to the
-    /// aggregate row, each behind its own `\u{b7}` separator, in the design's
-    /// own worked shape (`claude ready 62% \u{b7} codex draining 8% \u{b7}
-    /// seat gen 3`) -- and neither one leaks into the row when both are
-    /// empty/`None` (already covered by `render_aggregate_row_renders_every_
-    /// live_cell` above, which asserts the row's exact text with an empty
-    /// `harnesses` and a `None` seat).
-    #[test]
-    fn render_aggregate_row_renders_the_harness_strip_and_seat() {
-        let facts = AggregateFacts {
-            workers_running: Some((3, Source::Live, Duration::ZERO)),
-            workers_failed: Some((1, Source::Live, Duration::ZERO)),
-            spend_micros: Some((4_200_000, Source::Live, Duration::ZERO)),
-            five_hour_pct: Some((41.0, Source::Live, Duration::ZERO)),
-            harnesses: vec![
-                HarnessStrip {
-                    name: "claude".to_string(),
-                    state: "ready".to_string(),
-                    headroom_pct: Some(62.0),
-                },
-                HarnessStrip {
-                    name: "codex".to_string(),
-                    state: "draining".to_string(),
-                    headroom_pct: Some(8.0),
-                },
-            ],
-            seat: Some("gen 3".to_string()),
-        };
-        let text = render_aggregate_row(&facts);
-        assert_eq!(
-            text,
-            "workers 3 running \u{b7} 1 failed \u{b7} $4.20 \u{b7} five_hour 41% \u{b7} claude \
-             ready 62% \u{b7} codex draining 8% \u{b7} seat gen 3"
-        );
-    }
-
-    /// A harness with no binding window (no measured/assumed headroom yet)
-    /// renders `--` in the strip, never a fabricated percentage.
-    #[test]
-    fn render_aggregate_row_harness_strip_with_no_headroom_renders_a_placeholder() {
-        let facts = AggregateFacts {
-            workers_running: None,
-            workers_failed: None,
-            spend_micros: None,
-            five_hour_pct: None,
-            harnesses: vec![HarnessStrip {
-                name: "gemini".to_string(),
-                state: "unknown".to_string(),
-                headroom_pct: None,
-            }],
-            seat: None,
-        };
-        let text = render_aggregate_row(&facts);
-        assert!(text.contains("gemini unknown --"), "got {text}");
     }
 
     /// A dialog must be opaque. `Block` paints only its border and
@@ -4773,9 +5045,15 @@ mod tests {
         assert_eq!(l.rule_top.height, 1);
         assert_eq!(l.rule_bottom.height, 1);
         assert_eq!(l.footer.height, 1);
+        // Dash refresh PR1: the title/pane-header row and the rule below it
+        // (`sidebar_title`/`pane_header`/`mid_rule`) are each one more row
+        // `sidebar`/`main` no longer include.
+        assert_eq!(l.sidebar_title.height, 1);
+        assert_eq!(l.pane_header.height, 1);
+        assert_eq!(l.mid_rule.height, 1);
         assert_eq!(l.sidebar.width, 24);
         assert_eq!(l.main.width, 100 - 24 - 1);
-        assert_eq!(l.sidebar.height, 30 - 1 - 1 - 1 - 1);
+        assert_eq!(l.sidebar.height, 30 - 1 - 1 - 1 - 1 - 1 - 1);
         assert_eq!(l.main.height, l.sidebar.height);
     }
 
@@ -4792,6 +5070,127 @@ mod tests {
         assert_eq!(l.sidebar.width, 10);
         assert_eq!(l.main.width, 0);
         assert_eq!(l.main.height, 0);
+    }
+
+    /// Dash refresh PR1: below 100 columns the session column hides, unless
+    /// the operator has forced it back on -- and forcing it holds regardless
+    /// of width until toggled again.
+    #[test]
+    fn sidebar_hides_under_100_cols_unless_forced_visible() {
+        assert!(sidebar_hidden(99, false));
+        assert!(!sidebar_hidden(100, false), "100 is the floor, not hidden");
+        assert!(
+            !sidebar_hidden(80, true),
+            "forced visible holds at any width"
+        );
+        assert!(!sidebar_hidden(200, false));
+    }
+
+    /// `layout(area, 0)` -- what the caller passes once `sidebar_hidden`
+    /// says to -- gives `main` the WHOLE frame: no sidebar width and no
+    /// separator column wasted on a divider with nothing to divide.
+    #[test]
+    fn layout_with_no_sidebar_gives_main_the_whole_frame() {
+        let l = layout(Rect::new(0, 0, 80, 24), 0);
+        assert_eq!(l.sidebar.width, 0);
+        assert_eq!(l.main.x, 0);
+        assert_eq!(l.main.width, 80, "no separator column wasted");
+    }
+
+    /// Dash refresh PR1: below the narrow-terminal floor the header shows
+    /// every session as a tab -- the focused one tinted with the same
+    /// `Color::Indexed(236)` background the selected sidebar row uses, an
+    /// unread-mail badge included, and the chip/hint cluster unchanged.
+    #[test]
+    fn render_header_tabs_shows_every_session_and_tints_the_focused_one() {
+        let mut orch = sidebar_row("orch0001", "claude", RowState::Working);
+        orch.role = "orch".into();
+        orch.focused = true;
+        let mut worker = sidebar_row("f7e21a90", "claude", RowState::Idle);
+        worker.unread_mail = 1;
+        let rows = vec![orch, worker];
+        let mut facts = base_facts();
+        facts.hints.alive = true;
+        let backend = TestBackend::new(80, 1);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_header_tabs(f, f.area(), &facts, &rows, 0))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let text: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(text.contains("zirv"), "got {text:?}");
+        assert!(text.contains("orch"), "got {text:?}");
+        assert!(text.contains("f7e2"), "truncated to 4 chars: got {text:?}");
+        assert!(
+            text.contains("\u{2709}1"),
+            "the unread-mail badge: got {text:?}"
+        );
+        assert!(
+            text.contains("help"),
+            "the hint cluster survives: got {text:?}"
+        );
+        // The focused tab's own glyph cell carries the selected-row tint.
+        let orch_glyph_x = text
+            .find('\u{280b}')
+            .map(|byte_idx| text[..byte_idx].chars().count() as u16);
+        if let Some(x) = orch_glyph_x {
+            assert_eq!(buf[(x, 0)].bg, Color::Indexed(236));
+        }
+    }
+
+    /// A very narrow area still never overflows its own column budget --
+    /// tabs are dropped whole, never half-drawn, once the hints/chip alone
+    /// do not leave room for one.
+    #[test]
+    fn render_header_tabs_never_overflows_a_narrow_area() {
+        let rows: Vec<SidebarRow> = (0..8)
+            .map(|i| sidebar_row(&format!("a{i:07}"), "claude", RowState::Working))
+            .collect();
+        let mut facts = base_facts();
+        facts.hints.alive = true;
+        for width in 0..=80u16 {
+            let text = render_and_capture_text(Rect::new(0, 0, width, 1), |f, area| {
+                render_header_tabs(f, area, &facts, &rows, 0)
+            });
+            assert!(
+                style::display_width(&text) <= width as usize,
+                "width {width} overflowed: {text:?}"
+            );
+        }
+    }
+
+    /// Dash refresh PR1: below the narrow-terminal floor the footer shows
+    /// the focused pane's own harness usage instead of the ordinary
+    /// verdict/mail row -- `5h {pct}% · resets {time}`.
+    #[test]
+    fn render_footer_narrow_usage_shows_the_five_hour_reading_and_its_reset() {
+        let now = 100 * 86_400 + 14 * 3600;
+        let usage = HarnessUsage {
+            name: "claude",
+            five_hour: Some(41.0),
+            seven_day: None,
+            five_hour_detail: Some(WindowDetail {
+                resets_at: now + 2 * 3600 + 13 * 60,
+                limit_reached: false,
+                overage_covered: false,
+            }),
+            seven_day_detail: None,
+            credits: false,
+        };
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer_narrow_usage(f, area, Some(&usage), now, utc())
+        });
+        assert!(text.contains("5h 41%"), "got {text:?}");
+        assert!(text.contains("resets"), "got {text:?}");
+    }
+
+    /// No usage at all for the focused harness (or nothing focused) draws
+    /// nothing, never a fabricated reading.
+    #[test]
+    fn render_footer_narrow_usage_draws_nothing_with_no_reading() {
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer_narrow_usage(f, area, None, 0, utc())
+        });
+        assert!(text.trim().is_empty(), "got {text:?}");
     }
 
     /// The header is one row at every height. A zero/one-row frame never
@@ -4816,6 +5215,8 @@ mod tests {
             assert_eq!(
                 l.header.height
                     + l.rule_top.height
+                    + l.sidebar_title.height
+                    + l.mid_rule.height
                     + l.main.height
                     + l.rule_bottom.height
                     + l.footer.height,
@@ -4828,9 +5229,9 @@ mod tests {
     fn base_facts() -> HeaderFacts {
         HeaderFacts {
             hints: HintContext::default(),
-            harness: "claude".to_string(),
-            live: 1,
-            total: 1,
+            sessions: 1,
+            working: 0,
+            needs_you: 0,
             error_count: 0,
             latest_error: None,
             notice: None,
@@ -4839,24 +5240,39 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_the_brand_chip_and_the_harness_label() {
+    fn header_shows_the_brand_mark_and_the_session_count() {
+        let mut facts = base_facts();
+        facts.sessions = 3;
+        let area = Rect::new(0, 0, 80, 1);
+        let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
+        assert!(text.contains("zirv"), "brand mark missing: {text}");
+        assert!(text.contains("3 sessions"), "got {text:?}");
+    }
+
+    /// A zero `working`/`needs_you` count omits its whole segment -- never a
+    /// literal "0 working" or "0 needs you".
+    #[test]
+    fn header_omits_zero_count_segments() {
         let facts = base_facts();
         let area = Rect::new(0, 0, 80, 1);
         let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
-        assert!(text.contains("zirv"), "chip text missing: {text}");
-        assert!(text.contains("claude"), "harness label missing: {text}");
+        assert!(!text.contains("working"), "got {text:?}");
+        assert!(!text.contains("needs you"), "got {text:?}");
     }
 
+    /// The mock's own worked example (§01): `3 sessions · 1 working · 1
+    /// needs you`, in that order, once both counts are nonzero.
     #[test]
-    fn header_shows_the_live_over_total_count() {
+    fn header_shows_working_and_needs_you_when_nonzero() {
         let mut facts = base_facts();
-        facts.live = 2;
-        facts.total = 5;
+        facts.sessions = 3;
+        facts.working = 1;
+        facts.needs_you = 1;
         let area = Rect::new(0, 0, 80, 1);
         let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
         assert!(
-            text.contains("2/5live") || text.contains("2/5 live"),
-            "got {text}"
+            text.contains("3 sessions \u{b7} 1 working \u{b7} 1 needs you"),
+            "got {text:?}"
         );
     }
 
@@ -4882,22 +5298,22 @@ mod tests {
         assert!(!text.contains("SELECT"), "header text was: {text}");
     }
 
-    /// A long-but-valid harness/model label must not consume the whole row:
-    /// the hint cluster (`^A e errors  ^A ? help`) has priority over the
-    /// label and must still be visible at a typical terminal width, even
-    /// though only the label itself -- not the hints -- gets ellipsis-
-    /// truncated to make room.
+    /// The count cluster is short and digit-bounded (unlike the old
+    /// free-text harness/model label it replaces), but the hint cluster
+    /// must still win the row over it when every segment is showing at
+    /// once, at a typical terminal width.
     #[test]
-    fn header_keeps_the_hint_cluster_visible_behind_an_absurdly_long_model_name() {
+    fn header_keeps_the_hint_cluster_visible_with_every_count_segment_shown() {
         let mut facts = base_facts();
-        facts.harness =
-            "claude-".to_string() + &"opus-4-1-20260830-preview-extra-long-alias".repeat(4);
+        facts.sessions = 42;
+        facts.working = 17;
+        facts.needs_you = 9;
         let area = Rect::new(0, 0, 80, 1);
         let text = render_and_capture_text(area, |f, area| render_header(f, area, &facts));
         assert!(text.contains("errors"), "hints missing: {text}");
         assert!(text.contains("help"), "hints missing: {text}");
-        // The chip stays intact even though the label had to give up room.
-        assert!(text.contains("zirv"), "chip missing: {text}");
+        // The brand mark stays intact alongside every count segment.
+        assert!(text.contains("zirv"), "brand mark missing: {text}");
     }
 
     /// Issue #354 phase 2 (review of bf1474f): the header's click rects come
@@ -4950,13 +5366,13 @@ mod tests {
                         "{what}, width {width}: {id:?} rect {rect:?} must start on its own chord"
                     );
                 }
-                // And no rect may claim a column the chip or the harness label
-                // owns: at every width the leftmost rect starts at or after the
-                // last drawn non-hint character.
+                // And no rect may claim a column the brand mark owns: at
+                // every width the leftmost rect starts at or after `▌zirv`
+                // itself (the left cluster's own fixed-shape prefix).
                 if let Some((first, _)) = regions.first() {
                     assert!(
-                        first.x >= style::display_width(" zirv ") as u16,
-                        "{what}, width {width}: a hint rect overlapped the brand chip"
+                        first.x >= style::display_width("\u{258c}zirv") as u16,
+                        "{what}, width {width}: a hint rect overlapped the brand mark"
                     );
                 }
             }
@@ -5164,6 +5580,10 @@ mod tests {
             selected: false,
             focused: false,
             supervised: true,
+            fact_state: "working".into(),
+            fact_since_secs: Some(90),
+            workflow: None,
+            unread_mail: 0,
         }
     }
 
@@ -5235,15 +5655,6 @@ mod tests {
             glyph_char_for(Glyph::Working, 0),
             glyph_char_for(Glyph::Working, frames.len())
         );
-    }
-
-    /// A summary with no live aggregate cells: the phase 2 tests below are
-    /// about the glyph rollups, and the aggregate row only ever draws under a
-    /// summary line the cursor is actually parked on.
-    fn test_summary() -> SidebarSummary {
-        SidebarSummary {
-            aggregate: no_live_source(),
-        }
     }
 
     /// The plain text of one laid-out roster line -- what an operator sees on
@@ -5446,54 +5857,66 @@ mod tests {
         let roster = roster_frame(
             Rect::new(0, 0, 44, 50),
             &rows,
-            &test_summary(),
             &test_roster_view(&nothing_collapsed),
         );
 
-        // The summary line: `  <n> live` left, the attention rollup right.
-        // Every row is a live pane, so `live` counts all five even though one
-        // of them has failed verification.
-        let counts = "\u{25b2}1  \u{2717}1  \u{25c6}1";
+        // Line 0 is the ungrouped orchestrator: spawn order is never
+        // re-sorted by attention, so the group header sits at its first
+        // member's own position, on line 1. Dash refresh PR1: no summary
+        // line in front of it any more (that title lives in its own rect
+        // now, `DashLayout::sidebar_title`/`render_sidebar_title`) -- `name`
+        // is `orch` (the orchestrator), `harness` and `rot` fill the rest
+        // of the 44-column row (`name` widens to 26 at this width), and the
+        // badge column is blank.
         assert_eq!(
             roster_line_text(&roster, 0),
-            format!("  5 live{}{counts}", " ".repeat(44 - 8 - 10))
+            format!(
+                " {} orch{}claude \u{273b}12    ",
+                style::tui::SPINNER_FRAMES[0],
+                " ".repeat(23)
+            )
         );
 
-        // Line 1 is the ungrouped orchestrator: spawn order is never re-sorted
-        // by attention, so the group header sits at its first member's own
-        // position, on line 2.
+        // The group header keeps its own rollup, over its members only --
+        // `▾ {scope}` alone now, no lead/worker-count text.
+        let counts = "\u{25b2}1  \u{2717}1  \u{25c6}1";
+        let header = "\u{25be} audit";
         assert_eq!(
             roster_line_text(&roster, 1),
             format!(
-                "  {} a0000001 \u{273b}12 14m orch     fable         ",
-                style::tui::SPINNER_FRAMES[0]
+                "{header}{}{counts}",
+                " ".repeat(44 - style::display_width(header) - style::display_width(counts))
             )
         );
 
-        // The group header keeps its own rollup, over its members only.
-        let header = "\u{25be} audit \u{b7} a0000002 \u{b7} 4 workers ";
+        // And the `▲` row itself, column for column: tree(1) glyph(1) sp
+        // name(26) sp harness(6) sp rot(3) sp badge(2) sp.
         assert_eq!(
             roster_line_text(&roster, 2),
             format!(
-                "{header}{}{counts}",
-                " ".repeat(44 - style::display_width(header) - 10)
+                "\u{251c}\u{25b2} a0000002{} claude \u{273b}21    ",
+                " ".repeat(18)
             )
         );
-
-        // And the `▲` row itself, column for column:
-        // tree(2) glyph(1) sp short(8) sp rot(3) sp age(3) sp role(8) sp model(14).
-        assert_eq!(
-            roster_line_text(&roster, 3),
-            "\u{251c} \u{25b2} a0000002 \u{273b}21  9m sub-orch gpt-6-astra   "
+        assert_eq!(style::display_width(&roster_line_text(&roster, 2)), 44);
+        // Selected: its own fact-block line 1 follows immediately, indented
+        // under the group's own tree continuation (this member is not the
+        // group's last, so the fact hangs off a `│` rather than plain
+        // indentation).
+        assert!(
+            roster_line_text(&roster, 3).contains("working \u{b7}"),
+            "got {:?}",
+            roster_line_text(&roster, 3)
         );
-        assert_eq!(style::display_width(&roster_line_text(&roster, 3)), 44);
+        assert!(roster_line_text(&roster, 3).starts_with('\u{2502}'));
     }
 
-    /// #209 §B holds for the new glyphs too: the selected row is uniformly
-    /// REVERSED and every glyph -- the `▲` included -- drops its own colour so
-    /// the reversal reads as one band; keyboard focus adds BOLD.
+    /// Dash refresh PR1 (§B replacement): a selected row gets a subtle
+    /// `Color::Indexed(236)` background rather than REVERSED, so every
+    /// glyph -- the `▲` included -- KEEPS its own colour under the tint;
+    /// keyboard focus still adds BOLD.
     #[test]
-    fn a_selected_needs_action_row_reverses_and_drops_the_glyph_colour() {
+    fn a_selected_needs_action_row_keeps_the_glyph_colour_under_the_background() {
         use super::super::super::attention::Attention;
         let mut row = attention_row("aaa11111", Projection::Blocked(Attention::Approval));
         let unselected = sidebar_row_parts(&row, 0, 44, 40, 70);
@@ -5505,11 +5928,13 @@ mod tests {
         let selected = sidebar_row_parts(&row, 0, 44, 40, 70);
         assert_eq!(selected[1].content, "\u{25b2}", "the shape never changes");
         assert_eq!(
-            selected[1].style.fg, None,
-            "a selected row's glyph drops its own colour (#209 §B)"
+            selected[1].style.fg,
+            style::tui::warning().fg,
+            "a selected row's glyph keeps its own colour (dash refresh PR1, §B replacement)"
         );
         for span in &selected {
-            assert!(span.style.add_modifier.contains(Modifier::REVERSED));
+            assert_eq!(span.style.bg, Some(Color::Indexed(236)));
+            assert!(!span.style.add_modifier.contains(Modifier::REVERSED));
             assert!(span.style.add_modifier.contains(Modifier::BOLD));
         }
     }
@@ -5547,10 +5972,12 @@ mod tests {
                     let roster = roster_frame(
                         sidebar,
                         std::slice::from_ref(&row),
-                        &test_summary(),
                         &test_roster_view(&collapsed),
                     );
-                    let line = roster_line_text(&roster, if grouped { 2 } else { 1 });
+                    // Dash refresh PR1: no summary line in front of the tree
+                    // any more, so a grouped row is now at line 1 (behind
+                    // its own group header) and a flat one at line 0.
+                    let line = roster_line_text(&roster, if grouped { 1 } else { 0 });
                     assert_eq!(
                         style::display_width(&line),
                         sidebar.width as usize,
@@ -5567,24 +5994,45 @@ mod tests {
         }
     }
 
+    /// Dash refresh PR1's 28-column row contract: `name` (the short id, not
+    /// `orch`, since this row's role is `worker`), `harness`, and the row
+    /// starts with the flat tree column (1 char) plus the idle glyph.
     #[test]
-    fn a_sidebar_row_renders_short_role_model_and_age() {
+    fn a_sidebar_row_renders_name_and_harness() {
         let row = sidebar_row("aaa11111", "claude", RowState::Idle);
         let text = sidebar_row_text(&row, 0, 200);
         assert!(text.contains("aaa11111"), "got {text}");
-        assert!(text.contains("worker"), "got {text}");
-        assert!(text.contains("1m"), "got {text}");
-        assert!(text.starts_with("  ●"), "got {text}");
+        assert!(text.contains("claude"), "got {text}");
+        assert!(text.starts_with(" \u{25cf}"), "got {text}");
     }
 
-    /// Unknown age (no matching registry record at the moment this row was
-    /// built) renders as the shared placeholder, never a fabricated `0s`.
+    /// The orchestrator's own row shows `orch`, never its short id.
     #[test]
-    fn a_sidebar_row_with_unknown_age_shows_the_placeholder() {
-        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
-        row.age_secs = None;
+    fn the_orchestrator_row_shows_orch_not_its_short_id() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Working);
+        row.role = "orch".into();
         let text = sidebar_row_text(&row, 0, 200);
-        assert!(text.contains(style::PLACEHOLDER), "got {text}");
+        assert!(text.contains("orch"), "got {text}");
+        assert!(!text.contains("aaa11111"), "got {text}");
+    }
+
+    /// Dash refresh PR1: `age_secs` no longer has a column of its own in the
+    /// row -- the fact block's own line 1 (`{state} · {age}`) carries the
+    /// elapsed time now, and renders the shared placeholder rather than a
+    /// fabricated `0s` when nothing has ever been recorded.
+    #[test]
+    fn the_fact_block_shows_the_placeholder_with_no_recorded_age() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.selected = true;
+        row.fact_since_secs = None;
+        let nothing_collapsed = HashSet::new();
+        let roster = roster_frame(
+            Rect::new(0, 0, 28, 6),
+            std::slice::from_ref(&row),
+            &test_roster_view(&nothing_collapsed),
+        );
+        let fact = roster_line_text(&roster, 1);
+        assert!(fact.contains(style::PLACEHOLDER), "got {fact:?}");
     }
 
     /// `dash.sidebar_cols` is configurable and a terminal can be narrower than
@@ -5658,6 +6106,10 @@ mod tests {
                 selected: false,
                 focused: true,
                 supervised: true,
+                fact_state: "working".into(),
+                fact_since_secs: Some(5),
+                workflow: None,
+                unread_mail: 0,
             },
             SidebarRow {
                 role: "worker".into(),
@@ -5676,6 +6128,10 @@ mod tests {
                 selected: true,
                 focused: false,
                 supervised: true,
+                fact_state: "unknown".into(),
+                fact_since_secs: Some(5),
+                workflow: None,
+                unread_mail: 0,
             },
         ];
         let backend = TestBackend::new(40, 6);
@@ -5694,8 +6150,9 @@ mod tests {
             buf[(2, 1)].modifier.contains(Modifier::DIM),
             "a view-only row is dimmed"
         );
-        assert!(
-            buf[(2, 1)].modifier.contains(Modifier::REVERSED),
+        assert_eq!(
+            buf[(2, 1)].bg,
+            Color::Indexed(236),
             "and still carries the selection highlight the cursor put on it"
         );
     }
@@ -5723,6 +6180,10 @@ mod tests {
             selected,
             focused: false,
             supervised: true,
+            fact_state: "idle".into(),
+            fact_since_secs: None,
+            workflow: None,
+            unread_mail: 0,
         };
         let rows: Vec<SidebarRow> = (0..12).map(|i| row(i, i == 10)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {
@@ -5798,11 +6259,11 @@ mod tests {
     // Issue #209/v3 §B: the selected-row REVERSED-over-colored-glyph bug fix.
 
     /// A selected row's own state glyph (cyan for `Working`, in this case)
-    /// must drop its colour entirely and join the row's uniform reversed
-    /// style -- not layer REVERSED on top of its own fg, which used to
-    /// render a colored block with a background-colored glyph.
+    /// Dash refresh PR1 (§B replacement): a selected row's state glyph keeps
+    /// its own colour under a subtle `Color::Indexed(236)` background --
+    /// REVERSED is no longer used for the selection at all.
     #[test]
-    fn a_selected_rows_state_glyph_carries_no_explicit_fg() {
+    fn a_selected_rows_state_glyph_keeps_its_own_fg() {
         let mut row = sidebar_row("aaa11111", "claude", RowState::Working);
         row.selected = true;
         let backend = TestBackend::new(40, 4);
@@ -5810,23 +6271,23 @@ mod tests {
         term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
             .expect("draw");
         let buf = term.backend().buffer();
-        let glyph_cell = &buf[(2, 0)];
+        // Tree(1) then glyph -- column 1, not 2 (dash refresh PR1 narrowed
+        // the tree prefix to one column).
+        let glyph_cell = &buf[(1, 0)];
         assert_eq!(
             glyph_cell.fg,
-            Color::Reset,
-            "a selected row's glyph must carry no explicit fg colour, got {:?}",
+            style::tui::accent().fg.expect("accent has a fg"),
+            "a selected row's glyph keeps its own colour, got {:?}",
             glyph_cell.fg
         );
-        assert!(
-            glyph_cell.modifier.contains(Modifier::REVERSED),
-            "and still reverses uniformly with the rest of the row"
-        );
+        assert_eq!(glyph_cell.bg, Color::Indexed(236));
+        assert!(!glyph_cell.modifier.contains(Modifier::REVERSED));
     }
 
     /// The same fix, for a selected row whose rot glyph is coloured
-    /// (rotting, red-bold): it must drop that colour too when selected.
+    /// (rotting, red-bold): it keeps that colour too, under the same tint.
     #[test]
-    fn a_selected_rows_rot_glyph_carries_no_explicit_fg_either() {
+    fn a_selected_rows_rot_glyph_keeps_its_own_fg_too() {
         let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
         row.score = Some(90); // well past any default compact_at threshold
         row.selected = true;
@@ -5838,12 +6299,20 @@ mod tests {
         for x in 0..40u16 {
             let cell = &buf[(x, 0)];
             assert_eq!(
-                cell.fg,
-                Color::Reset,
-                "no cell in a selected row may carry an explicit fg colour, got {:?} at column {x}",
-                cell.fg
+                cell.bg,
+                Color::Indexed(236),
+                "every cell in a selected row carries the tint, got {:?} at column {x}",
+                cell.bg
             );
         }
+        // The rot column (tree(1) glyph(1) sp(1) name(N) sp(1) harness(6)
+        // sp(1) -- rot starts right after) keeps its own red colour.
+        let name_width = 40usize.saturating_sub(SIDEBAR_FIXED_COLS);
+        let rot_x = (1 + 1 + 1 + name_width + 1 + 6 + 1) as u16;
+        assert_eq!(
+            buf[(rot_x, 0)].fg,
+            style::tui::error().fg.expect("error has a fg")
+        );
     }
 
     /// The list-dialog primitive's own cursor row has the identical defect
@@ -5967,13 +6436,17 @@ mod tests {
         let mut row = sidebar_row("aaa11111", "codex", RowState::Dead);
         row.score = Some(12);
         let text = sidebar_row_text(&row, 0, 40);
+        // Dash refresh PR1: the rot column is always `✻NN` or `✻ {placeholder}`
+        // (never the placeholder alone) -- a dead pane's stale cached score
+        // still reads as unknown, but the glyph itself is part of the
+        // 3-column contract regardless.
         assert!(
-            text.contains(style::PLACEHOLDER),
-            "dead pane must show the placeholder: {text:?}"
+            text.contains(&format!("{ROT_GLYPH} {}", style::PLACEHOLDER)),
+            "dead pane must show the rot glyph plus the placeholder: {text:?}"
         );
         assert!(
-            !text.contains('\u{273b}'),
-            "and never the rot glyph: {text:?}"
+            !text.contains("\u{273b}12"),
+            "never the stale score: {text:?}"
         );
     }
 
@@ -5986,29 +6459,30 @@ mod tests {
         assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
     }
 
-    /// Issue #354 replaced §C's width-degradation ladder (age first, then the
-    /// score's digits, then `short`) with fixed columns: every column keeps
-    /// its position at every width, and a sidebar narrower than the contract
-    /// simply clips from the right. So a row at any width is exactly the
-    /// prefix of the same row at the full 44 -- nothing shifts left to fill
-    /// the space something else gave up, which is what made a narrow sidebar
-    /// unreadable before.
+    /// Issue #354's original §C ladder is gone (fixed columns instead of a
+    /// width-degradation order), and dash refresh PR1 keeps that -- but
+    /// unlike the old 44-column contract (where the ONE widening column,
+    /// `model`, was the last field, so a narrower row really was a strict
+    /// left-hand prefix of the wider one), the new contract's widening
+    /// column (`name`) sits in the MIDDLE, before `harness`/`rot`/`badge`.
+    /// So narrowing the sidebar no longer just clips a tail -- it also
+    /// shifts every column after `name` left as `name` itself shrinks. That
+    /// is by design (`name` tracks `dash.sidebar_cols` itself, not a
+    /// per-frame width squeeze: below 100 total columns the sidebar hides
+    /// outright rather than rendering squeezed). What still must hold at
+    /// any width is safety: the row never overflows its own budget.
     #[test]
-    fn sidebar_fixed_columns_clip_from_the_right_without_shifting() {
+    fn sidebar_fixed_columns_never_overflow_their_own_width() {
         let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
         row.score = Some(47);
         row.role = "sub-orch".to_string();
-        row.model = Some("gpt-6-astra".to_string());
-        // The full contract row: every column present, in order.
+        // The full contract row: every column present, in order -- dash
+        // refresh PR1's `tree(1) glyph(1) sp name(N) sp harness(6) sp
+        // rot(3) sp badge(2) sp`, `name` widening to 26 at this width
+        // (`role` is `sub-orch`, so `name` is the short id, never `orch`).
         let full = sidebar_row_text(&row, 0, 44);
         assert_eq!(style::display_width(&full), 44, "got {full:?}");
-        for (column, at) in [
-            ("aaa11111", 4),
-            ("\u{273b}47", 13),
-            (" 1m", 17),
-            ("sub-orch", 21),
-            ("gpt-6-astra", 30),
-        ] {
+        for (column, at) in [("aaa11111", 3), ("claude", 30), ("\u{273b}47", 37)] {
             assert_eq!(
                 full.chars()
                     .skip(at)
@@ -6023,10 +6497,6 @@ mod tests {
             assert!(
                 style::display_width(&text) <= cols as usize,
                 "{cols} cols overflowed: {text:?}"
-            );
-            assert!(
-                full.starts_with(&text),
-                "{cols} cols is not a prefix of the full row: {text:?}"
             );
         }
     }
@@ -6052,46 +6522,38 @@ mod tests {
 
     fn alive_footer_facts() -> FooterAliveFacts {
         FooterAliveFacts {
-            harness: "claude".to_string(),
             score: Some(12),
-            usage_five_hour: Some(61.0),
-            usage_seven_day: Some(18.0),
             unread_mail: 0,
-            workflow: FooterWorkflow::Active {
-                kind: "feature".to_string(),
-                step: "design".to_string(),
-                gated: false,
-            },
             supervised: true,
             stalled: false,
         }
     }
 
-    /// The mock's own "healthy" example (§04): fresh green verdict with a
-    /// dim score number, usage windows, no mail, the workflow's kind and
-    /// step, and supervised.
+    /// Dash refresh PR1: the healthy footer is just the fresh verdict
+    /// (`✻ NN {band}`) and the dim mail placeholder -- harness, usage and
+    /// workflow moved to the pane header, and a healthy, reachable,
+    /// unstalled pane renders NO supervision segment at all any more.
     #[test]
     fn footer_renders_the_healthy_example() {
         let facts = FooterFacts::Alive(alive_footer_facts());
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
             render_footer(f, area, &facts, 40, 60)
         });
-        assert!(text.contains("claude"), "got {text:?}");
         assert!(text.contains("fresh"), "got {text:?}");
         assert!(text.contains("12"), "got {text:?}");
-        assert!(text.contains("61%"), "got {text:?}");
-        assert!(text.contains("18%"), "got {text:?}");
-        assert!(text.contains("feature"), "got {text:?}");
-        assert!(text.contains("design"), "got {text:?}");
-        assert!(text.contains("supervised"), "got {text:?}");
         assert!(
-            !text.contains("stalled"),
-            "an unlatched session must not render the stalled badge: got {text:?}"
+            text.contains(style::PLACEHOLDER),
+            "dim mail placeholder: got {text:?}"
         );
+        assert!(
+            !text.contains("supervised"),
+            "a healthy, reachable, unstalled pane shows no supervision segment at all: got {text:?}"
+        );
+        assert!(!text.contains("stalled"), "got {text:?}");
     }
 
-    /// Issue #310: an armed stall latch overrides the ordinary
-    /// supervised/unsupervised segment with a `stalled` badge.
+    /// Issue #310: an armed stall latch overrides the (now absent) healthy
+    /// segment with a `stalled` badge.
     #[test]
     fn footer_renders_a_stalled_badge_when_the_latch_is_armed() {
         let mut alive = alive_footer_facts();
@@ -6101,27 +6563,27 @@ mod tests {
             render_footer(f, area, &facts, 40, 60)
         });
         assert!(text.contains("stalled"), "got {text:?}");
-        assert!(
-            !text.contains("supervised"),
-            "the stalled badge replaces the supervised segment: got {text:?}"
-        );
     }
 
-    /// The mock's own "attention" example: warming, unread mail, and a
-    /// gated workflow step -- `▸ {step} awaits approval`.
+    /// An unsupervised (turn-signal bind failed) pane still renders the
+    /// problem, even though a healthy one now renders nothing.
+    #[test]
+    fn footer_renders_unsupervised_when_the_pane_never_bound_a_signal() {
+        let mut alive = alive_footer_facts();
+        alive.supervised = false;
+        let facts = FooterFacts::Alive(alive);
+        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60)
+        });
+        assert!(text.contains("unsupervised"), "got {text:?}");
+    }
+
+    /// The mock's own "attention" example: warming, with unread mail.
     #[test]
     fn footer_renders_the_attention_example() {
         let facts = FooterFacts::Alive(FooterAliveFacts {
-            harness: "claude".to_string(),
             score: Some(47),
-            usage_five_hour: Some(62.0),
-            usage_seven_day: Some(31.0),
             unread_mail: 2,
-            workflow: FooterWorkflow::Active {
-                kind: "feature".to_string(),
-                step: "spec".to_string(),
-                gated: true,
-            },
             supervised: true,
             stalled: false,
         });
@@ -6130,10 +6592,6 @@ mod tests {
         });
         assert!(text.contains("warming"), "got {text:?}");
         assert!(text.contains('2'), "unread mail count: got {text:?}");
-        assert!(
-            text.contains("spec awaits approval"),
-            "gated step reads as awaiting approval: got {text:?}"
-        );
     }
 
     /// A rotting verdict, and a session with no unread mail (the dim
@@ -6148,19 +6606,6 @@ mod tests {
             render_footer(f, area, &facts, 40, 60)
         });
         assert!(text.contains("rotting"), "got {text:?}");
-        assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
-    }
-
-    /// A session with no active workflow at all renders the dim `▸ –`
-    /// placeholder.
-    #[test]
-    fn footer_renders_no_active_workflow_as_a_dim_placeholder() {
-        let mut alive = alive_footer_facts();
-        alive.workflow = FooterWorkflow::None;
-        let facts = FooterFacts::Alive(alive);
-        let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
-        });
         assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
     }
 
@@ -6236,13 +6681,14 @@ mod tests {
         }
     }
 
-    /// §D's drop order: usage drops first, then the verdict's score number,
-    /// then the workflow segment (full form, then compressed, then dropped
-    /// entirely), then the harness label -- verdict, mail and supervision
-    /// never drop.
+    /// Dash refresh PR1's own (much shorter) drop order: only the verdict's
+    /// score number is ever dropped under width pressure -- the word, mail
+    /// and supervision (when there is a problem to show at all) never drop.
     #[test]
     fn footer_drop_order_matches_the_spec() {
-        let facts = FooterFacts::Alive(alive_footer_facts());
+        let mut alive = alive_footer_facts();
+        alive.stalled = true;
+        let facts = FooterFacts::Alive(alive);
         let render = |cols: u16| {
             render_and_capture_text(Rect::new(0, 0, cols, 1), |f, area| {
                 render_footer(f, area, &facts, 40, 60)
@@ -6250,93 +6696,33 @@ mod tests {
         };
 
         let wide = render(80);
-        assert!(wide.contains("61%"), "usage shows at 80 cols: {wide:?}");
         assert!(
-            wide.contains("claude"),
-            "harness shows at 80 cols: {wide:?}"
+            wide.contains("12"),
+            "the score number shows at 80 cols: {wide:?}"
         );
-        assert!(wide.contains("feature"), "workflow long form: {wide:?}");
+        assert!(wide.contains("stalled"), "got {wide:?}");
 
-        // Narrowing must drop usage before it drops the harness, and the
-        // workflow's long form before it drops the harness too -- never the
-        // verdict word, mail, or supervision.
-        let mut saw_usage_drop = false;
-        let mut saw_workflow_compress = false;
-        let mut saw_harness_drop = false;
+        let mut saw_score_drop = false;
         for cols in (0..=80u16).rev() {
             let text = render(cols);
-            if !text.contains('\u{25d4}') && !saw_usage_drop && text.contains("claude") {
-                saw_usage_drop = true;
-            }
-            if !text.contains("feature") && text.contains("design") && !saw_workflow_compress {
-                saw_workflow_compress = true;
-            }
-            if !text.contains("claude") {
-                saw_harness_drop = true;
-                // Once the harness is gone, the irreducible core must
-                // survive: verdict word, mail and supervision are never
-                // dropped outright (down to whatever `cols` can still hold).
-                if cols >= 20 {
+            if !text.contains("12") && !saw_score_drop {
+                saw_score_drop = true;
+                // Once the score number is gone, the irreducible core must
+                // survive down to whatever `cols` can still hold.
+                if cols >= 15 {
                     assert!(
-                        text.contains("fresh") || text.contains(style::PLACEHOLDER),
-                        "verdict must survive at {cols} cols: {text:?}"
+                        text.contains("fresh"),
+                        "verdict word must survive at {cols} cols: {text:?}"
+                    );
+                    assert!(
+                        text.contains("stalled"),
+                        "supervision must survive at {cols} cols: {text:?}"
                     );
                 }
                 break;
             }
         }
-        assert!(saw_usage_drop, "usage must drop before the harness does");
-        assert!(
-            saw_workflow_compress,
-            "the workflow segment must compress before the harness drops"
-        );
-        assert!(saw_harness_drop, "the harness must eventually drop too");
-    }
-
-    /// The mock's own 44-column drop-order example (§04): warming verdict
-    /// (score number already gone), unread mail, the workflow compressed to
-    /// `spec!` (gated -- the `!` suffix), supervised -- and, critically, NO
-    /// harness label at all. Issue #209/v3 codex review finding 4: the
-    /// harness must drop while the workflow segment is still compressed,
-    /// not the other way around.
-    #[test]
-    fn footer_44_col_mock_example_renders_exactly() {
-        let facts = FooterFacts::Alive(FooterAliveFacts {
-            harness: "claude".to_string(),
-            score: Some(47),
-            usage_five_hour: Some(62.0),
-            usage_seven_day: Some(31.0),
-            unread_mail: 2,
-            workflow: FooterWorkflow::Active {
-                kind: "feature".to_string(),
-                step: "spec".to_string(),
-                gated: true,
-            },
-            supervised: true,
-            stalled: false,
-        });
-        let text = render_and_capture_text(Rect::new(0, 0, 44, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
-        });
-        assert!(text.contains("warming"), "got {text:?}");
-        assert!(
-            !text.contains("47"),
-            "the score number must have dropped by 44 cols: got {text:?}"
-        );
-        assert!(text.contains('2'), "unread mail count: got {text:?}");
-        assert!(
-            text.contains("spec!"),
-            "compressed gated workflow: got {text:?}"
-        );
-        assert!(text.contains("supervised"), "got {text:?}");
-        assert!(
-            !text.contains("claude"),
-            "the harness must have dropped by 44 cols: got {text:?}"
-        );
-        assert!(
-            style::display_width(&text) <= 44,
-            "must never exceed its own column budget: got {text:?}"
-        );
+        assert!(saw_score_drop, "the score number must eventually drop");
     }
 
     /// The dead-pane footer's own drop order: the exited notice and the
@@ -7042,14 +7428,8 @@ mod tests {
         let area = Rect::new(0, 0, 120, 40);
         let layout = layout(area, 44);
         let rows: Vec<SidebarRow> = vec![sidebar_row("aaaa1111", "claude", RowState::Idle)];
-        let summary = test_summary();
         let nothing_collapsed = HashSet::new();
-        let roster = roster_frame(
-            layout.sidebar,
-            &rows,
-            &summary,
-            &test_roster_view(&nothing_collapsed),
-        );
+        let roster = roster_frame(layout.sidebar, &rows, &test_roster_view(&nothing_collapsed));
         let header = base_facts();
         for overlay in every_overlay() {
             let snap = frame_snapshot(area, &layout, false, &roster, &header, &overlay, 0);
@@ -7502,5 +7882,441 @@ mod tests {
             non_blank,
             "expected the real session fixture to render at least one non-blank cell"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Dash refresh PR1: the pane header row.
+    // ------------------------------------------------------------------
+
+    fn pane_header_facts() -> PaneHeaderFacts {
+        PaneHeaderFacts {
+            harness: "claude".to_string(),
+            role: "worker".to_string(),
+            model: Some("sonnet-5".to_string()),
+            cwd: "~/zirv-482".to_string(),
+            workflow: None,
+            glyph: Glyph::Working,
+            state_word: "working".to_string(),
+            age_secs: Some(180),
+        }
+    }
+
+    /// The mock's own "Running" example (§04): workflow segment, then the
+    /// glyph, the CAPITALIZED state word, and the age -- the sidebar's own
+    /// fact line keeps the word lowercase, this is the one place it is
+    /// capitalized.
+    #[test]
+    fn render_pane_header_shows_identity_workflow_and_capitalized_state() {
+        let mut facts = pane_header_facts();
+        facts.workflow = Some(SessionWorkflowFact {
+            kind: "bugfix".to_string(),
+            step: "debug".to_string(),
+            index: 3,
+            total: 7,
+            awaiting_approval: false,
+            completed: false,
+        });
+        let text = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
+            render_pane_header(f, area, &facts, 0)
+        });
+        assert!(text.contains("claude"), "got {text:?}");
+        assert!(text.contains("worker"), "got {text:?}");
+        assert!(text.contains("sonnet-5"), "got {text:?}");
+        assert!(text.contains("~/zirv-482"), "got {text:?}");
+        assert!(text.contains("bugfix"), "got {text:?}");
+        assert!(text.contains("debug 3/7"), "got {text:?}");
+        assert!(
+            text.contains("Working"),
+            "state word is capitalized here: got {text:?}"
+        );
+        assert!(text.contains("3m"), "got {text:?}");
+    }
+
+    /// A session with no bound workflow shows nothing for that segment --
+    /// never a guess from the repo-wide pointer.
+    #[test]
+    fn render_pane_header_with_no_workflow_shows_nothing_for_it() {
+        let facts = pane_header_facts();
+        let text = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
+            render_pane_header(f, area, &facts, 0)
+        });
+        assert!(
+            !text.contains('\u{203a}'),
+            "no workflow segment (its own `›` step separator) at all: got {text:?}"
+        );
+    }
+
+    /// Truncates the LEFT side (identity) before it ever touches the right
+    /// (workflow/state/age) -- the right is what is actually happening now.
+    #[test]
+    fn render_pane_header_truncates_left_before_right() {
+        let mut facts = pane_header_facts();
+        facts.cwd =
+            "~/a-very-long-checkout-path-that-will-not-fit-in-a-narrow-pane-header".to_string();
+        facts.workflow = Some(SessionWorkflowFact {
+            kind: "bugfix".to_string(),
+            step: "debug".to_string(),
+            index: 3,
+            total: 7,
+            awaiting_approval: false,
+            completed: false,
+        });
+        let narrow = render_and_capture_text(Rect::new(0, 0, 40, 1), |f, area| {
+            render_pane_header(f, area, &facts, 0)
+        });
+        assert!(
+            style::display_width(&narrow) <= 40,
+            "must never overflow its own budget: got {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("a-very-long-checkout-path"),
+            "the long cwd is the first thing to go: got {narrow:?}"
+        );
+        assert!(
+            narrow.contains("debug"),
+            "the workflow/state segment survives the squeeze: got {narrow:?}"
+        );
+    }
+
+    /// A completed workflow reads `✓ done`, and a gated one (awaiting
+    /// approval) is bold yellow.
+    #[test]
+    fn render_pane_header_workflow_states() {
+        let mut facts = pane_header_facts();
+        facts.workflow = Some(SessionWorkflowFact {
+            kind: "bugfix".to_string(),
+            step: "done".to_string(),
+            index: 7,
+            total: 7,
+            awaiting_approval: false,
+            completed: true,
+        });
+        let done = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
+            render_pane_header(f, area, &facts, 0)
+        });
+        assert!(done.contains("\u{2713} done"), "got {done:?}");
+
+        facts.workflow = Some(SessionWorkflowFact {
+            kind: "feature".to_string(),
+            step: "review".to_string(),
+            index: 6,
+            total: 8,
+            awaiting_approval: true,
+            completed: false,
+        });
+        let gated = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
+            render_pane_header(f, area, &facts, 0)
+        });
+        assert!(gated.contains("review 6/8"), "got {gated:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // Dash refresh PR1: the LIMITS block.
+    // ------------------------------------------------------------------
+
+    fn no_detail() -> WindowDetail {
+        WindowDetail {
+            resets_at: 0,
+            limit_reached: false,
+            overage_covered: false,
+        }
+    }
+
+    /// UTC, standing in for "no offset" wherever a test's own point is not
+    /// the offset itself.
+    fn utc() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
+    #[test]
+    fn limits_reset_time_today_is_bare_hhmm() {
+        // now = day 100 at 10:00 UTC; resets later the same day at 16:20.
+        let now = 100 * 86_400 + 10 * 3600;
+        let resets_at = 100 * 86_400 + 16 * 3600 + 20 * 60;
+        assert_eq!(limits_reset_time(utc(), resets_at, now), "16:20");
+    }
+
+    #[test]
+    fn limits_reset_time_within_a_week_names_the_weekday() {
+        // 1970-01-01 (day 0) was a Thursday.
+        let now = 0;
+        let resets_at = 3 * 86_400 + 9 * 3600; // day 3 (Sunday) at 09:00
+        assert_eq!(limits_reset_time(utc(), resets_at, now), "Sun 09:00");
+    }
+
+    #[test]
+    fn limits_reset_time_later_names_the_date() {
+        let now = 0;
+        let resets_at = 40 * 86_400; // day 40: 1970-02-10
+        assert_eq!(limits_reset_time(utc(), resets_at, now), "10 Feb");
+    }
+
+    #[test]
+    fn limits_reset_time_uses_the_given_offset_for_the_today_boundary() {
+        // Denmark-shaped case: at +2h, a reset just past UTC midnight can
+        // still be "today" on the operator's own clock even though the UTC
+        // calendar date has already turned over.
+        let offset = FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = 100 * 86_400 + 23 * 3600; // 23:00 UTC == day 101, 01:00 local
+        let resets_at = 101 * 86_400 + 1_800; // 00:30 UTC == day 101, 02:30 local
+        assert_eq!(
+            limits_reset_time(offset, resets_at, now),
+            "02:30",
+            "same local day as `now`, so bare HH:MM, not a weekday/date"
+        );
+    }
+
+    #[test]
+    fn limits_countdown_drops_the_hour_under_sixty_minutes() {
+        assert_eq!(limits_countdown(600, 0), "10m");
+        assert_eq!(limits_countdown(1, 0), "1m", "never a literal 0m");
+        assert_eq!(limits_countdown(8_000, 0), "2h13m");
+    }
+
+    #[test]
+    fn limits_reset_line_reads_resets_with_a_countdown_when_due_today() {
+        let now = 100 * 86_400;
+        let detail = WindowDetail {
+            resets_at: now + 2 * 3600 + 13 * 60,
+            ..no_detail()
+        };
+        let (text, style) = limits_reset_line(utc(), 41.0, &detail, now);
+        assert_eq!(
+            text,
+            format!(
+                "resets {} \u{b7} in 2h13m",
+                limits_hhmm(utc(), detail.resets_at)
+            )
+        );
+        assert_eq!(style, style::tui::muted());
+    }
+
+    #[test]
+    fn limits_reset_line_at_80_percent_or_more_turns_yellow_with_no_countdown_beyond_today() {
+        let now = 0;
+        let detail = WindowDetail {
+            resets_at: 3 * 86_400,
+            ..no_detail()
+        };
+        let (text, style) = limits_reset_line(utc(), 86.0, &detail, now);
+        assert!(
+            !text.contains("in "),
+            "no countdown past today: got {text:?}"
+        );
+        assert_eq!(style, style::tui::warning());
+    }
+
+    /// Round 2 coordinator review, CONFIRMED: a `resets_at` already in the
+    /// past (a stale vendor reading) must never read as an ordinary future
+    /// `resets HH:MM` -- it gets its own muted "stale" wording instead, at
+    /// every `pct`, and fits well inside the 28-col sidebar row.
+    #[test]
+    fn limits_reset_line_on_a_past_resets_at_reads_stale_not_a_future_reset() {
+        let now = 100 * 86_400;
+        let detail = WindowDetail {
+            resets_at: now - 3600,
+            ..no_detail()
+        };
+        let (text, style) = limits_reset_line(utc(), 95.0, &detail, now);
+        assert_eq!(
+            text,
+            format!(
+                "reset at {} \u{b7} stale",
+                limits_hhmm(utc(), detail.resets_at)
+            )
+        );
+        assert!(!text.contains("in "), "no countdown on a stale reading");
+        assert_eq!(
+            style,
+            style::tui::muted(),
+            "always muted, even at a high pct"
+        );
+        assert!(
+            style::display_width(&text) <= 25,
+            "must fit the 28-col sidebar row with its own 3-col indent: got {text:?}"
+        );
+    }
+
+    #[test]
+    fn limits_reset_line_at_the_limit_reads_back_at_with_a_countdown() {
+        let now = 100 * 86_400;
+        let detail = WindowDetail {
+            resets_at: now + 12 * 60,
+            limit_reached: true,
+            overage_covered: false,
+        };
+        let (text, style) = limits_reset_line(utc(), 100.0, &detail, now);
+        assert_eq!(
+            text,
+            format!(
+                "back at {} \u{b7} 12m",
+                limits_hhmm(utc(), detail.resets_at)
+            )
+        );
+        assert_eq!(style, style::tui::error());
+    }
+
+    #[test]
+    fn limits_reset_line_on_credits_reads_credits_until_with_no_countdown() {
+        let now = 100 * 86_400;
+        let detail = WindowDetail {
+            resets_at: now + 3600,
+            limit_reached: false,
+            overage_covered: true,
+        };
+        let (text, style) = limits_reset_line(utc(), 100.0, &detail, now);
+        assert_eq!(
+            text,
+            format!("credits until {}", limits_hhmm(utc(), detail.resets_at))
+        );
+        assert!(
+            !text.contains("in "),
+            "on-credits has no countdown: got {text:?}"
+        );
+        assert_eq!(style, Style::default().fg(Color::Magenta));
+    }
+
+    #[test]
+    fn limits_blocks_from_usage_pairs_5h_before_wk_and_blanks_the_repeat_harness() {
+        let usages = vec![
+            HarnessUsage {
+                name: "claude",
+                five_hour: Some(41.0),
+                seven_day: Some(12.0),
+                five_hour_detail: Some(no_detail()),
+                seven_day_detail: Some(no_detail()),
+                credits: false,
+            },
+            HarnessUsage {
+                name: "codex",
+                five_hour: None,
+                seven_day: Some(58.0),
+                five_hour_detail: None,
+                seven_day_detail: Some(no_detail()),
+                credits: false,
+            },
+            HarnessUsage {
+                name: "gemini",
+                five_hour: None,
+                seven_day: None,
+                five_hour_detail: None,
+                seven_day_detail: None,
+                credits: false,
+            },
+        ];
+        let blocks = limits_blocks_from_usage(&usages);
+        // gemini has neither window, so it contributes nothing at all.
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].harness, "claude");
+        assert_eq!(blocks[0].window_label, "5h");
+        assert!(blocks[0].show_harness);
+        assert_eq!(blocks[1].harness, "claude");
+        assert_eq!(blocks[1].window_label, "wk");
+        assert!(!blocks[1].show_harness, "the repeat harness label is blank");
+        assert_eq!(blocks[2].harness, "codex");
+        assert_eq!(blocks[2].window_label, "wk");
+        assert!(
+            blocks[2].show_harness,
+            "codex's first block for THIS harness still shows its name, even though it is wk not 5h"
+        );
+    }
+
+    #[test]
+    fn limits_blocks_fitting_drops_a_whole_window_at_a_time() {
+        // 2 rows for title+rule, 2 rows per block: 3 blocks need 8 rows.
+        assert_eq!(limits_blocks_fitting(3, 8), 3, "everything fits");
+        assert_eq!(
+            limits_blocks_fitting(3, 7),
+            2,
+            "one whole block drops, never a half"
+        );
+        assert_eq!(limits_blocks_fitting(3, 5), 1);
+        assert_eq!(
+            limits_blocks_fitting(3, 3),
+            0,
+            "3 rows is only the title/rule, no room left over"
+        );
+        assert_eq!(
+            limits_blocks_fitting(3, 2),
+            0,
+            "room for the title/rule but no block"
+        );
+        assert_eq!(
+            limits_blocks_fitting(3, 1),
+            0,
+            "not even room for the title"
+        );
+        assert_eq!(limits_blocks_fitting(3, 0), 0);
+        assert_eq!(
+            limits_rows_for(0),
+            0,
+            "nothing to show draws nothing at all"
+        );
+        assert_eq!(limits_rows_for(2), 6);
+    }
+
+    /// The mock's own worked example (§03/§01): claude 5h 41% / wk 12%,
+    /// rendered exactly, at the sidebar's own 28-column width.
+    #[test]
+    fn render_limits_matches_the_mock_worked_example() {
+        let now = 100 * 86_400 + 14 * 3600 + 7 * 60; // 14:07 UTC
+        let usages = vec![HarnessUsage {
+            name: "claude",
+            five_hour: Some(41.0),
+            seven_day: Some(12.0),
+            five_hour_detail: Some(WindowDetail {
+                resets_at: now + 2 * 3600 + 13 * 60,
+                limit_reached: false,
+                overage_covered: false,
+            }),
+            seven_day_detail: Some(WindowDetail {
+                resets_at: now + 3 * 86_400,
+                limit_reached: false,
+                overage_covered: false,
+            }),
+            credits: false,
+        }];
+        let blocks = limits_blocks_from_usage(&usages);
+        // 2 (title+rule) + 2 blocks * 2 rows each = 6 rows.
+        let area = Rect::new(0, 0, 28, 6);
+        let text =
+            render_and_capture_text(area, |f, area| render_limits(f, area, &blocks, now, utc()));
+        assert!(text.contains(" LIMITS"), "got {text:?}");
+        assert!(text.contains("claude"), "got {text:?}");
+        assert!(text.contains("5h"), "got {text:?}");
+        assert!(text.contains("41%"), "got {text:?}");
+        assert!(text.contains("wk"), "got {text:?}");
+        assert!(text.contains("12%"), "got {text:?}");
+        assert!(text.contains("in 2h13m"), "got {text:?}");
+    }
+
+    /// Coordinator scope addition: a disabled/unavailable harness must never
+    /// appear in the LIMITS block, even with stale usage files still on
+    /// disk for it -- `limits_blocks_from_usage` only ever sees whatever
+    /// `disk.usage` already carries, and that list is built from `cfg.
+    /// agents.is_enabled(name)`-filtered adapters (`FactsCache::refresh_
+    /// if_due`), so a disabled harness's `HarnessUsage` never reaches here
+    /// at all.
+    #[test]
+    fn limits_blocks_from_usage_never_shows_a_harness_missing_from_the_list() {
+        // Simulates what the facts refresh already filtered out: a disabled
+        // harness's usage never becomes a `HarnessUsage` entry in the first
+        // place, so `disk.usage` (what this function reads) never carries
+        // it even if its window file is still sitting on disk.
+        let usages = vec![HarnessUsage {
+            name: "claude",
+            five_hour: Some(41.0),
+            seven_day: None,
+            five_hour_detail: Some(no_detail()),
+            seven_day_detail: None,
+            credits: false,
+        }];
+        let blocks = limits_blocks_from_usage(&usages);
+        assert!(
+            blocks.iter().all(|b| b.harness == "claude"),
+            "a harness the facts refresh never enabled must not appear: {:?}",
+            blocks.iter().map(|b| b.harness).collect::<Vec<_>>()
+        );
+        assert_eq!(blocks.len(), 1);
     }
 }

@@ -1904,6 +1904,21 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
     Ok(value)
 }
 
+/// Dash refresh PR1: `id`'s own state file's last-modified time, in epoch
+/// seconds -- a pragmatic stand-in for "when did this run finish" (there is
+/// no dedicated `completed_at` field on `WorkflowState`), used to fade the
+/// sidebar/pane-header "done" fact 10 minutes after a `Completed` run's last
+/// write. `None` when the file cannot be resolved or its metadata cannot be
+/// read (never fabricated as "now" or "never").
+pub fn state_mtime_secs(state: &StateDir, repo: &Path, id: &str) -> Option<u64> {
+    let path = resolve_state_path_for_id(state, repo, id).ok()?;
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 fn load_from_path(path: &Path, id: &str) -> CtxResult<WorkflowState> {
     // Every verb that resolves a workflow by id (`status`, `resume`,
     // `context`, `artifacts`, `approve`, `advance`, ...) goes through this
@@ -2071,6 +2086,22 @@ fn record_workflow_attention(
         .with_attention(attention),
         now,
     );
+}
+
+/// Dash refresh PR1: best-effort companion to [`record_workflow_attention`]
+/// -- same env-only lookup (deliberately just `SESSION_ENV`, not the
+/// stricter [`session_identity`], for the identical reason: a workflow start
+/// with a malformed or missing adapter-name env must not lose its binding),
+/// same "quietly do nothing" fallback for a headless caller or a test.
+fn bind_started_workflow_to_calling_session(state_dir: &StateDir, workflow_id: &str) {
+    let Ok(session_id) = std::env::var(crate::commands::ctx::adapters::SESSION_ENV) else {
+        return;
+    };
+    if session_id.is_empty() {
+        return;
+    }
+    let short = crate::commands::ctx::sessions::short_id(&session_id);
+    crate::commands::ctx::sessions::bind_workflow_id(state_dir, &short, workflow_id);
 }
 
 fn adapter_by_name(name: &str) -> Option<Box<dyn crate::commands::ctx::adapters::AgentAdapter>> {
@@ -4932,6 +4963,15 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     // treats a still-missing file exactly like an untouched template.
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
     save(state_dir, &state, true)?;
+    // Dash refresh PR1: bind this workflow onto the calling session's own
+    // record, so the dashboard can resolve THIS pane's workflow from its own
+    // session rather than the one repo-wide "active" pointer every pane used
+    // to share (see `sessions::bind_workflow_id`'s own doc comment).
+    // Best-effort and silent when `ZIRV_CTX_SESSION` is unset (a headless or
+    // scripted `workflow start`, or a test) -- exactly like every other
+    // env-keyed, best-effort write in this module (`record_workflow_
+    // attention`).
+    bind_started_workflow_to_calling_session(state_dir, &state.id);
     if let Some(old) = previously_active
         && old.id != state.id
         && matches!(
@@ -8346,6 +8386,71 @@ mod tests {
         assert_eq!(
             reloaded.frontend_target_root,
             Some(target_repo.path().canonicalize().unwrap())
+        );
+    }
+
+    /// Dash refresh PR1: `zirv workflow start` binds the workflow it just
+    /// started onto whatever `ZIRV_CTX_SESSION` names, so the dashboard can
+    /// resolve THIS pane's own workflow step from its own session record
+    /// rather than the repo-wide active pointer.
+    #[test]
+    fn start_binds_the_new_workflow_onto_the_calling_session() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "ZIRV_CTX_STATE_DIR",
+                Some(root.path().to_str().expect("utf-8 tempdir path")),
+            ),
+            ("ZIRV_CTX_SESSION", Some(session_id)),
+        ]);
+        let state_dir = resolve_state().unwrap();
+        // The calling session must already be registered -- `bind_workflow_
+        // id` is a patch onto an existing record, never a fresh one.
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        let record = crate::commands::ctx::sessions::Record::new(
+            session_id,
+            "claude",
+            repo.path(),
+            crate::commands::ctx::sessions::Verb::Chat,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state_dir, record);
+
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Start(StartArgs {
+                id: Some("bugfix".into()),
+                task: "fix a database retry bug".into(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                paths: vec![PathBuf::from("src/commands/ctx/safety.rs")],
+                changed_lines: Some(40),
+                tests_changed: true,
+                complexity: None,
+                risk: None,
+                branch: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: None,
+                json: false,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).unwrap();
+
+        let started = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert!(
+            crate::commands::ctx::sessions::load_record(&state_dir, &short).is_some(),
+            "the calling session's record is still there"
+        );
+        // Round 2 coordinator review: the binding lives in its own sibling
+        // file now, never a `Record` field -- see `bind_workflow_id`'s own
+        // doc comment.
+        assert_eq!(
+            crate::commands::ctx::sessions::workflow_id_for(&state_dir, &short).as_deref(),
+            Some(started.id.as_str())
         );
     }
 
