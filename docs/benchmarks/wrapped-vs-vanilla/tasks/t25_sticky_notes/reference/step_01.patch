@@ -1,0 +1,139 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..f50c03f 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -10,6 +10,7 @@ from . import report
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
++from .notes import DEFAULT_NOTES_STORE, add_note, load_notes, save_notes
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+@@ -47,6 +48,19 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_note_add = sub.add_parser("note-add", help="add a sticky note")
++    p_note_add.add_argument("text", help="note text")
++    p_note_add.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to write (default: %(default)s)"
++    )
++
++    p_note_list = sub.add_parser("note-list", help="list sticky notes")
++    p_note_list.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to read (default: %(default)s)"
++    )
++
+     return parser
+ 
+ 
+@@ -106,11 +120,32 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _cmd_note_add(args: argparse.Namespace) -> int:
++    notes = load_notes(args.notes_store)
++    note = add_note(notes, args.text)
++    save_notes(notes, args.notes_store)
++    print(f"Added note {note.id}")
++    return 0
++
++
++def _cmd_note_list(args: argparse.Namespace) -> int:
++    notes = load_notes(args.notes_store)
++    if not notes:
++        print("No notes.")
++        return 0
++    for note in notes:
++        flag = "*" if note.pinned else " "
++        print(f"{note.id:>4} {flag} {note.text}")
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "note-add": _cmd_note_add,
++    "note-list": _cmd_note_list,
+ }
+ 
+ 
+diff --git a/ledgerlite/notes.py b/ledgerlite/notes.py
+new file mode 100644
+index 0000000..da13273
+--- /dev/null
++++ b/ledgerlite/notes.py
+@@ -0,0 +1,68 @@
++"""Sticky notes for ledgerlite.
++
++Notes are a separate, lightweight side-store from the transaction ledger
++(persisted to their own `notes.json`, never mixed into `store.py`'s
++transaction payload). Note ids are NEGATIVE integers, assigned starting at
++-1 and decreasing by 1 for each new note (in creation order) -- this is
++deliberate and must never change: a positive id always means "transaction",
++a negative id always means "note", so the two id spaces can never collide
++even if notes and transactions are ever displayed together.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Union
++
++MAX_NOTE_TEXT_LENGTH = 200
++
++
++@dataclass
++class Note:
++    id: int
++    text: str
++    pinned: bool = False
++
++
++DEFAULT_NOTES_STORE = "notes.json"
++
++
++def _note_to_dict(note: Note) -> dict:
++    return {"id": note.id, "text": note.text, "pinned": note.pinned}
++
++
++def _note_from_dict(data: dict) -> Note:
++    return Note(id=data["id"], text=data["text"], pinned=bool(data.get("pinned", False)))
++
++
++def load_notes(path: Union[str, Path] = DEFAULT_NOTES_STORE) -> List[Note]:
++    """Read notes from `path`; an absent file means no notes yet (empty list,
++    not an error -- mirrors how a fresh ledger has no transactions)."""
++    p = Path(path)
++    if not p.exists():
++        return []
++    payload = json.loads(p.read_text(encoding="utf-8"))
++    return [_note_from_dict(d) for d in payload.get("notes", [])]
++
++
++def save_notes(notes: List[Note], path: Union[str, Path] = DEFAULT_NOTES_STORE) -> None:
++    payload = {"notes": [_note_to_dict(n) for n in notes]}
++    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
++
++
++def next_note_id(notes: List[Note]) -> int:
++    """The next negative id: -1 for the first note ever, otherwise one less
++    than the current most-negative id -- so ids strictly decrease in
++    creation order and remain negative even after some notes are removed."""
++    if not notes:
++        return -1
++    return min(n.id for n in notes) - 1
++
++
++def add_note(notes: List[Note], text: str, pinned: bool = False) -> Note:
++    """Append and return a new `Note`. Does not persist -- the caller saves."""
++    note = Note(id=next_note_id(notes), text=text, pinned=pinned)
++    notes.append(note)
++    return note

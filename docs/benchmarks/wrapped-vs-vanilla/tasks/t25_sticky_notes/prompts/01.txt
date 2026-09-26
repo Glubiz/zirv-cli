@@ -1,0 +1,20 @@
+Add a lightweight "sticky notes" feature to ledgerlite, separate from the
+transaction ledger:
+
+- A new `ledgerlite/notes.py` module with a `Note` dataclass (`id: int`,
+  `text: str`, `pinned: bool = False`) and JSON persistence to its own
+  `notes.json` file (do not touch `store.py` or the transaction ledger
+  file at all -- notes are a completely separate store).
+- IMPORTANT, and this must hold for the rest of this feature no matter what
+  we build on top of it later: note ids are always NEGATIVE integers,
+  starting at -1 for the first note ever created and decreasing by 1 for
+  each new note (-1, -2, -3, ...). This is deliberate: a positive id always
+  means "transaction", a negative id always means "note", so the two id
+  spaces can never collide.
+- CLI commands: `note-add TEXT [--notes-store PATH]` (adds a note, prints a
+  confirmation that includes the new note's id) and `note-list
+  [--notes-store PATH]` (prints one line per note, each showing that note's
+  id and its text, or a clear "no notes" message when there are none).
+
+`--notes-store` should default to `notes.json` in the current directory,
+same style as the existing `--store` flag.

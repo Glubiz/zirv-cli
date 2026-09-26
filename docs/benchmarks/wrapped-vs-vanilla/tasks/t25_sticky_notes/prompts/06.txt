@@ -1,0 +1,9 @@
+That's everything for the notes feature. Please:
+
+1. Add a section to the project's docs (create `docs/NOTES.md` if there
+   isn't a good place for it already) covering: every `note-*` command and
+   its flags, the negative-id rule and why it exists, the 200-character
+   limit, and the pinned-notes summary line.
+2. In your final reply, give a clear summary of everything built across
+   this whole session: the commands added, the ordering bug we deferred
+   and then fixed, and the 200-character limit change.

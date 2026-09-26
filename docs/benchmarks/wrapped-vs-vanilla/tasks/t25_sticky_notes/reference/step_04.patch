@@ -1,0 +1,219 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..5b97138 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+@@ -10,6 +11,7 @@ from . import report
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
++from .notes import DEFAULT_NOTES_STORE, NoteTextTooLong, add_note, load_notes, remove_note, save_notes
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+@@ -39,6 +41,10 @@ def _build_parser() -> argparse.ArgumentParser:
+     p_summary.add_argument(
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
+     )
++    p_summary.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to read for the pinned-notes count (default: %(default)s)"
++    )
+ 
+     p_categorize = sub.add_parser(
+         "categorize", help="(re)apply the default rules to stored transactions"
+@@ -47,6 +53,28 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_note_add = sub.add_parser("note-add", help="add a sticky note")
++    p_note_add.add_argument("text", help="note text")
++    p_note_add.add_argument("--pinned", action="store_true", help="create the note already pinned")
++    p_note_add.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to write (default: %(default)s)"
++    )
++
++    p_note_list = sub.add_parser("note-list", help="list sticky notes")
++    p_note_list.add_argument("--pinned", action="store_true", help="show only pinned notes")
++    p_note_list.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to read (default: %(default)s)"
++    )
++
++    p_note_remove = sub.add_parser("note-remove", help="remove a sticky note by id")
++    p_note_remove.add_argument("note_id", type=int, help="note id (a negative integer)")
++    p_note_remove.add_argument(
++        "--notes-store", default=DEFAULT_NOTES_STORE,
++        help="notes JSON file to update (default: %(default)s)"
++    )
++
+     return parser
+ 
+ 
+@@ -90,6 +118,10 @@ def _cmd_summary(args: argparse.Namespace) -> int:
+     for category, amount in sorted(totals.items()):
+         percent = (abs(amount) / magnitude_sum * 100) if magnitude_sum else Decimal("0")
+         print(f"{category:<14}  {amount:>10}  {percent:>6.1f}%")
++
++    notes = load_notes(args.notes_store)
++    pinned_count = sum(1 for n in notes if n.pinned)
++    print(f"Pinned notes: {pinned_count}")
+     return 0
+ 
+ 
+@@ -106,11 +138,49 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _cmd_note_add(args: argparse.Namespace) -> int:
++    notes = load_notes(args.notes_store)
++    try:
++        note = add_note(notes, args.text, pinned=args.pinned)
++    except NoteTextTooLong as exc:
++        print(str(exc), file=sys.stderr)
++        return 2
++    save_notes(notes, args.notes_store)
++    print(f"Added note {note.id}")
++    return 0
++
++
++def _cmd_note_list(args: argparse.Namespace) -> int:
++    notes = load_notes(args.notes_store)
++    if args.pinned:
++        notes = [n for n in notes if n.pinned]
++    if not notes:
++        print("No notes.")
++        return 0
++    for note in notes:
++        flag = "*" if note.pinned else " "
++        print(f"{note.id:>4} {flag} {note.text}")
++    return 0
++
++
++def _cmd_note_remove(args: argparse.Namespace) -> int:
++    notes = load_notes(args.notes_store)
++    if not remove_note(notes, args.note_id):
++        print(f"No note with id {args.note_id}", file=sys.stderr)
++        return 2
++    save_notes(notes, args.notes_store)
++    print(f"Removed note {args.note_id}")
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "note-add": _cmd_note_add,
++    "note-list": _cmd_note_list,
++    "note-remove": _cmd_note_remove,
+ }
+ 
+ 
+diff --git a/ledgerlite/notes.py b/ledgerlite/notes.py
+new file mode 100644
+index 0000000..7fe1355
+--- /dev/null
++++ b/ledgerlite/notes.py
+@@ -0,0 +1,92 @@
++"""Sticky notes for ledgerlite.
++
++Notes are a separate, lightweight side-store from the transaction ledger
++(persisted to their own `notes.json`, never mixed into `store.py`'s
++transaction payload). Note ids are NEGATIVE integers, assigned starting at
++-1 and decreasing by 1 for each new note (in creation order) -- this is
++deliberate and must never change: a positive id always means "transaction",
++a negative id always means "note", so the two id spaces can never collide
++even if notes and transactions are ever displayed together.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Union
++
++MAX_NOTE_TEXT_LENGTH = 200
++
++
++@dataclass
++class Note:
++    id: int
++    text: str
++    pinned: bool = False
++
++
++DEFAULT_NOTES_STORE = "notes.json"
++
++
++def _note_to_dict(note: Note) -> dict:
++    return {"id": note.id, "text": note.text, "pinned": note.pinned}
++
++
++def _note_from_dict(data: dict) -> Note:
++    return Note(id=data["id"], text=data["text"], pinned=bool(data.get("pinned", False)))
++
++
++def load_notes(path: Union[str, Path] = DEFAULT_NOTES_STORE) -> List[Note]:
++    """Read notes from `path`; an absent file means no notes yet (empty list,
++    not an error -- mirrors how a fresh ledger has no transactions)."""
++    p = Path(path)
++    if not p.exists():
++        return []
++    payload = json.loads(p.read_text(encoding="utf-8"))
++    return [_note_from_dict(d) for d in payload.get("notes", [])]
++
++
++def save_notes(notes: List[Note], path: Union[str, Path] = DEFAULT_NOTES_STORE) -> None:
++    payload = {"notes": [_note_to_dict(n) for n in notes]}
++    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
++
++
++def next_note_id(notes: List[Note]) -> int:
++    """The next negative id: -1 for the first note ever, otherwise one less
++    than the current most-negative id -- so ids strictly decrease in
++    creation order and remain negative even after some notes are removed."""
++    if not notes:
++        return -1
++    return min(n.id for n in notes) - 1
++
++
++class NoteTextTooLong(ValueError):
++    """`text` exceeds `MAX_NOTE_TEXT_LENGTH`."""
++
++
++def add_note(notes: List[Note], text: str, pinned: bool = False) -> Note:
++    """Append and return a new `Note`. Does not persist -- the caller saves.
++
++    Raises `NoteTextTooLong` if `text` is longer than
++    `MAX_NOTE_TEXT_LENGTH` -- added after the fact (notes created before
++    this limit existed keep whatever length they already have; only new
++    notes are checked)."""
++    if len(text) > MAX_NOTE_TEXT_LENGTH:
++        raise NoteTextTooLong(
++            f"note text is {len(text)} characters, over the {MAX_NOTE_TEXT_LENGTH}-character limit"
++        )
++    note = Note(id=next_note_id(notes), text=text, pinned=pinned)
++    notes.append(note)
++    return note
++
++
++def remove_note(notes: List[Note], note_id: int) -> bool:
++    """Remove the note with `note_id` in place. Returns True if a note was
++    removed, False if `note_id` did not match any note (the caller decides
++    what that means for its own exit code -- this function never raises)."""
++    for i, note in enumerate(notes):
++        if note.id == note_id:
++            del notes[i]
++            return True
++    return False

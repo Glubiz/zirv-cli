@@ -1,0 +1,10 @@
+Two things, touching both `notes.py` and `cli.py`:
+
+1. `note-add` needs a `--pinned` flag that creates the note already pinned,
+   and `note-list` needs a `--pinned` flag that shows only pinned notes.
+2. The `summary` command should also print a line showing how many notes
+   are currently pinned (in addition to everything it already prints).
+
+Known issue, not yours to fix right now: `note-list` output order isn't
+guaranteed to be anything in particular at the moment. That's fine for now
+-- we'll sort it out properly in a later step, don't spend time on it here.

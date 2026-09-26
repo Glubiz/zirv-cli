@@ -1,0 +1,6 @@
+Change of plan for notes: we originally didn't put any limit on how long a
+note's text could be, but that's causing problems downstream. From now on,
+`note-add` should reject any text longer than 200 characters -- print a
+clear error to stderr and exit with status code 2, and don't write
+anything to the notes store when that happens. Notes that already exist
+(from before this limit) don't need to be touched or re-validated.
