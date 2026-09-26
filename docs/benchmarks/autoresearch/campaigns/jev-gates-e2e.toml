@@ -15,6 +15,23 @@
 # credential/base_url/budget related) are never candidates here, per
 # #802's compiled-in env allowlist.
 #
+# `classes` on every stage excludes `long_session` (dev's t23_afternoon,
+# validation's t25_sticky_notes, holdout's t24_long_haul/t24b_long_haul --
+# see ../../wrapped-vs-vanilla/corpus.toml): a per-gate ablation over a
+# short single-prompt task set has no business paying for the most
+# expensive task class this harness runs. dev keeps mechanical/bounded/bug/
+# feature/architecture (12 tasks), validation keeps feature/bug/
+# architecture (7 tasks), holdout keeps architecture/ambiguous (3 tasks).
+#
+# Pair counts: validate = 7 tasks * 2 reps = 14 pairs, holdout = 3 tasks *
+# 2 reps = 6 pairs, both >= criteria.min_pairs = 6.
+#
+# Budgets: baseline (screen 12*2 + validate 7*2 + holdout 3*2 = 44 trials)
+# plus screening all 10 candidates once (10 * 12*2 = 240 trials) = 284
+# trials * $1.50 = $426.00, and 284 * calls_per_trial(3) = 852 calls --
+# both drive the caps below (with headroom for survivors to reach
+# validate).
+#
 # Corresponds to design spec #803's "Per-gate e2e campaigns reuse run.py's
 # per-gate conditions via overlays."
 
@@ -49,25 +66,28 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 40.00
+max_spend_usd = 450.00
 max_wall_secs = 21600
-max_calls = 400
-max_trials = 160
+max_calls = 1000
+max_trials = 350
 max_retries = 1
 concurrency = 2
 
 [stages.screen]
 split = "dev"
 reps = 2
+classes = ["mechanical", "bounded", "bug", "feature", "architecture"]
 
 [stages.validate]
 split = "validation"
 reps = 2
+classes = ["feature", "bug", "architecture"]
 
 [stages.holdout]
 split = "holdout"
-reps = 1
+reps = 2
 max_uses = 1
+classes = ["architecture", "ambiguous"]
 
 [criteria]
 min_pairs = 6
