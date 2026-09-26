@@ -26,7 +26,7 @@ zirv keeps the contract and replaces the parts that do not transfer:
 ## Architecture
 
 ```
-zirv workflow research plan|run|status|report|spend   (Rust, src/commands/workflow/research/)
+zirv workflow research plan|run|status|report   (Rust, src/commands/workflow/research/)
         |  manifest.toml  ->  lock.json + ledger.jsonl in <campaign dir>
         |  per trial: spec.json -> backend command -> <trial>/trial.json
         v
@@ -36,7 +36,7 @@ backend "fixture"  scripted trial results (deterministic tests and the demo camp
         |
         v  every zirv process in a trial runs with ZIRV_CTX_STATE_DIR=<trial>/state and ZIRV_ATTR_* ids
 existing usage seams (delegations.jsonl, jev-decisions/effects.jsonl, proxy-decisions.jsonl, outcomes)
-        -> `zirv workflow research spend --state-dir <trial>/state --json` (the one reconciler)
+        -> `zirv workflow spend --state-dir <trial>/state --json` (the one reconciler)
 ```
 
 No new billing ledger: attribution ids ride on the existing records; the
