@@ -67,6 +67,34 @@ impl Corpus {
             .collect()
     }
 
+    /// Issue #804: `classes` narrows `tasks_for_split` to only the named
+    /// `class` values; an empty list (the default, no `[stages.*] classes`
+    /// declared) keeps every task of the split, unchanged from
+    /// `tasks_for_split`.
+    pub fn tasks_for_split_and_classes(&self, split: Split, classes: &[String]) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|task| task.split == split)
+            .filter(|task| classes.is_empty() || classes.iter().any(|c| c == &task.class))
+            .collect()
+    }
+
+    /// The task count per `class`, after the same split+classes filter
+    /// `tasks_for_split_and_classes` applies -- used to find the smallest
+    /// cohort a `stratify = "class"` campaign would produce for a stage, so
+    /// a `min_pairs` check can be against the worst case, not the total.
+    pub fn class_counts_for_split(
+        &self,
+        split: Split,
+        classes: &[String],
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for task in self.tasks_for_split_and_classes(split, classes) {
+            *counts.entry(task.class.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+
     pub fn families(&self) -> BTreeSet<&str> {
         self.tasks.iter().map(|task| task.family.as_str()).collect()
     }
@@ -112,6 +140,28 @@ split = "holdout"
         assert_eq!(corpus.tasks_for_split(Split::Validation).len(), 1);
         assert_eq!(corpus.tasks_for_split(Split::Holdout).len(), 1);
         assert!(corpus.is_single_family());
+    }
+
+    #[test]
+    fn tasks_for_split_and_classes_narrows_by_class_empty_keeps_everything() {
+        let corpus = Corpus::parse(sample()).unwrap();
+        let filtered = corpus.tasks_for_split_and_classes(Split::Dev, &["bounded".to_string()]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "t1");
+
+        let none_of_this_class =
+            corpus.tasks_for_split_and_classes(Split::Dev, &["long_session".to_string()]);
+        assert!(none_of_this_class.is_empty());
+
+        let unfiltered = corpus.tasks_for_split_and_classes(Split::Dev, &[]);
+        assert_eq!(unfiltered.len(), corpus.tasks_for_split(Split::Dev).len());
+    }
+
+    #[test]
+    fn class_counts_for_split_groups_by_class() {
+        let corpus = Corpus::parse(sample()).unwrap();
+        let counts = corpus.class_counts_for_split(Split::Dev, &[]);
+        assert_eq!(counts.get("bounded"), Some(&1));
     }
 
     #[test]

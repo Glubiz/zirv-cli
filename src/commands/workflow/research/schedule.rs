@@ -67,9 +67,9 @@ pub(crate) fn shuffled(tasks: &[String], seed: u64) -> Vec<String> {
     items
 }
 
-pub(crate) fn task_ids(corpus: &Corpus, split: Split) -> Vec<String> {
+pub(crate) fn task_ids(corpus: &Corpus, split: Split, classes: &[String]) -> Vec<String> {
     corpus
-        .tasks_for_split(split)
+        .tasks_for_split_and_classes(split, classes)
         .into_iter()
         .map(|task| task.id.clone())
         .collect()
