@@ -289,3 +289,38 @@ pub(crate) fn apply_proposal_outcome(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::production_proposer_argv;
+
+    /// The production proposer spawn is a self-recursion into this very
+    /// executable's own path (`std::env::current_exe()`, falling back to the
+    /// bare `"zirv"` name if that ever fails): `zirv agent <harness>
+    /// "<prompt>" -- --model <model>`, the same harness-invocation shape a
+    /// declared candidate's own trial dispatch uses. Never actually spawned
+    /// here -- that would need a real harness binary on PATH;
+    /// `spawn_and_validate_proposal`'s own tests (in `run.rs`, alongside the
+    /// rest of this module's execute()-level coverage) substitute a
+    /// portable stub argv instead and cover the spawn+validate half of this
+    /// seam.
+    #[test]
+    fn production_proposer_argv_shapes_a_self_recursive_agent_invocation() {
+        let argv = production_proposer_argv("claude", "sonnet", "propose one candidate");
+        assert!(
+            !argv[0].is_empty(),
+            "argv[0] must be this executable's own path (or the `zirv` fallback)"
+        );
+        assert_eq!(
+            argv[1..],
+            [
+                "agent".to_string(),
+                "claude".to_string(),
+                "propose one candidate".to_string(),
+                "--".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ]
+        );
+    }
+}

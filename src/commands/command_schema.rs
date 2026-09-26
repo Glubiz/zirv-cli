@@ -190,6 +190,12 @@ const READ_ONLY: &[&str] = &[
     "zirv workflow stats",
     // Issue #757: reads the outcome log only; proposals are printed, never applied.
     "zirv workflow calibrate",
+    // Issue #799: reads config/attribution receipts and prints a spend
+    // report; never appends a receipt or touches the campaign ledger.
+    "zirv workflow spend",
+    // Issue #802: reads a campaign's own ledger.jsonl/lock.json and prints
+    // its current state -- never writes.
+    "zirv workflow research status",
     "zirv test changed",
     "zirv test all",
     "zirv verify",
@@ -347,6 +353,19 @@ const MUTATING: &[&str] = &[
     "zirv setup profile",
     "zirv setup reset",
     "zirv setup restore",
+    // Issue #802: for a source-patch candidate, `plan` shells out to `git
+    // apply --check` inside a disposable, detached `git worktree add`,
+    // cleaned up with `git worktree remove` right after -- a real write to
+    // disk (and to the repo's worktree list) even though it is transient,
+    // so it fails READ_ONLY's own "never write to disk" bar; classified by
+    // what the verb does, not by how quickly it cleans up after itself,
+    // the same reasoning `ctx capabilities`/`ctx doctor` above already use.
+    "zirv workflow research plan",
+    // Issue #802: dispatches trials (spawns the backend, writes trial
+    // dirs/state) and appends every campaign ledger event.
+    "zirv workflow research run",
+    // Issue #802: writes report.json/report.md into the campaign directory.
+    "zirv workflow research report",
 ];
 
 fn classify(path: &str) -> Option<bool> {
