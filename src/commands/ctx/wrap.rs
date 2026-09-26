@@ -4129,24 +4129,21 @@ fn pump(
                 );
                 let defer = adapter.capabilities().defer_injection_submit;
                 // Issue #789 (`[jev] compaction_select`): best-effort, off by
-                // default -- see the identical comment at `exec.rs`'s own
-                // headless `compact_in_place` call site. Reading and parsing
-                // the transcript here costs nothing observable when the gate
-                // is off (today's default), since `compaction_focus_text`
-                // returns `COMPACT_FOCUS` byte-identical in that case.
-                let compact_focus = {
-                    let jsonl = transcript
-                        .path()
-                        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
-                        .unwrap_or_default();
-                    let ctx = adapter.structural_context(&jsonl, tail_items);
-                    handoff::compaction_focus_text(
-                        cfg,
-                        state_dir,
-                        &ctx,
-                        super::supervise::COMPACT_FOCUS,
-                    )
-                };
+                // default -- `compaction_focus_for_transcript` checks the
+                // gate and credential BEFORE touching the transcript at all
+                // (review of 6bdd7675, defect #1), so with the gate off
+                // (today's default) this never reads or parses the
+                // transcript inline in the pump loop, and with the gate on
+                // it bounds the Jev call so it cannot stall the pump for the
+                // full configured typesafe timeout.
+                let compact_focus = handoff::compaction_focus_for_transcript(
+                    cfg,
+                    state_dir,
+                    adapter.as_ref(),
+                    transcript.path(),
+                    tail_items,
+                    super::supervise::COMPACT_FOCUS,
+                );
                 let injected = writer
                     .lock()
                     .map_err(|_| "pty writer poisoned".to_string())

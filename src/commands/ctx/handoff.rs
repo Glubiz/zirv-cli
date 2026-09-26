@@ -1960,11 +1960,22 @@ const COMPACTION_ITEM_CHAR_CAP: usize = 120;
 
 /// Truncates `text` to at most `cap` characters (on a char boundary), the
 /// same shape [`quote_partial_text`] already uses for a partial-text quote,
-/// generalised to a caller-chosen cap.
+/// generalised to a caller-chosen cap. Every control character (`\r`, `\n`,
+/// `\t`, and any other `char::is_control` codepoint that might survive in
+/// raw tool output) is replaced with a single space FIRST (review of
+/// 6bdd7675, defect #2): `wrap::inject_compact` writes the whole rendered
+/// focus text followed by one trailing `\r` into the PTY, so a stray `\r`/
+/// `\n` surviving into a candidate's own text would submit the injected
+/// `/compact ...` prompt mid-string and leave stray keystrokes queued behind
+/// it.
 fn truncate_chars(text: &str, cap: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
+    let sanitized: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = sanitized.chars().collect();
     if chars.len() <= cap {
-        return text.to_string();
+        return sanitized;
     }
     let truncated: String = chars[..cap.saturating_sub(3)].iter().collect();
     format!("{truncated}...")
@@ -2260,6 +2271,55 @@ pub(crate) fn compaction_focus_text(
     jev::record_effect(cfg, state, cfg.jev.compaction_select, &effect);
 
     format!("{base_focus} Keep in particular: {}.", items.join("; "))
+}
+
+/// Ceiling on the `[jev] compaction_select` call's own connect/receive
+/// timeout (review of 6bdd7675, defect #1): unlike every other `[jev]`-gated
+/// site, this one call sits inline in `wrap.rs`'s PTY pump loop and inside
+/// `exec.rs`/`run_loop.rs`'s own `compact_in_place` `compact_timeout_ms`
+/// budget -- neither can afford to block for a full, operator-configured
+/// `proxy.typesafe.timeout_secs` on top of its own budget. Never raises the
+/// configured timeout, only ever lowers it.
+const COMPACTION_SELECT_TIMEOUT_SECS: u64 = 2;
+
+/// The one seam all three compaction call sites (`exec.rs`'s `zirv ctx exec`,
+/// `run_loop.rs`'s `zirv ctx loop`, `wrap.rs`'s headless-pump compaction
+/// inject) share for turning `base_focus` into a possibly keep-list-carrying
+/// focus text -- factored out (review of 6bdd7675, defect #1) so the gate
+/// check happens BEFORE any filesystem read or transcript parse, not after:
+/// with `[jev] compaction_select` off (the default) or no credential
+/// available, this returns `base_focus` completely untouched, with zero
+/// filesystem access and zero allocation beyond the one `to_string()` --
+/// byte-identical and zero-cost versus before issue #789, exactly like every
+/// other `[jev]`-gated site's own off-by-default contract. Only once the
+/// gate and credential both check out does this read `transcript`, parse it
+/// into a [`StructuralContext`], and hand off to [`compaction_focus_text`]
+/// with the typesafe timeout capped at [`COMPACTION_SELECT_TIMEOUT_SECS`].
+pub(crate) fn compaction_focus_for_transcript(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    adapter: &dyn AgentAdapter,
+    transcript: Option<&Path>,
+    tail_items: usize,
+    base_focus: &str,
+) -> String {
+    if !cfg.jev.compaction_select || !jev::available(&cfg.proxy.typesafe) {
+        return base_focus.to_string();
+    }
+    let Some(transcript) = transcript else {
+        return base_focus.to_string();
+    };
+    let Ok(jsonl) = std::fs::read_to_string(transcript) else {
+        return base_focus.to_string();
+    };
+    let ctx = adapter.structural_context(&jsonl, tail_items);
+    let mut bounded_cfg = cfg.clone();
+    bounded_cfg.proxy.typesafe.timeout_secs = bounded_cfg
+        .proxy
+        .typesafe
+        .timeout_secs
+        .min(COMPACTION_SELECT_TIMEOUT_SECS);
+    compaction_focus_text(&bounded_cfg, state, &ctx, base_focus)
 }
 
 #[derive(Debug, clap::Args)]
@@ -3375,6 +3435,72 @@ mod tests {
         assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
     }
 
+    /// Review of 6bdd7675, defect #1: with the gate off,
+    /// [`compaction_focus_for_transcript`] must return `base_focus`
+    /// byte-identical WITHOUT ever touching `transcript` -- proved here by
+    /// pointing it at a path that does not exist at all. A version that read
+    /// the transcript before checking the gate would still pass this
+    /// particular assertion (a missing file just yields an empty string
+    /// today), so this also stands as the regression guard for the ordering
+    /// itself, not only for the fallback value.
+    #[test]
+    fn compaction_focus_for_transcript_is_a_pass_through_when_the_gate_is_off_and_never_reads_a_missing_transcript()
+     {
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_FOR_TRANSCRIPT_GATE_OFF";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.compaction_select, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None);
+        let missing = Path::new("Z:/definitely/does/not/exist/nope.jsonl");
+
+        let result = compaction_focus_for_transcript(
+            &cfg,
+            &state,
+            &adapter,
+            Some(missing),
+            cfg.handoff.tail_items,
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+    }
+
+    /// The other half of the same guard: no credential at all, gate ON,
+    /// still no read.
+    #[test]
+    fn compaction_focus_for_transcript_never_reads_a_missing_transcript_without_a_credential() {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.compaction_select = true;
+        cfg.proxy.typesafe.credential_env =
+            "COMPACTION_TEST_JEV_SELECT_789_FOR_TRANSCRIPT_NO_CRED".to_string();
+        unsafe {
+            std::env::remove_var(&cfg.proxy.typesafe.credential_env);
+        }
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None);
+        let missing = Path::new("Z:/definitely/does/not/exist/nope.jsonl");
+
+        let result = compaction_focus_for_transcript(
+            &cfg,
+            &state,
+            &adapter,
+            Some(missing),
+            cfg.handoff.tail_items,
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+    }
+
     /// Direct proof that the exact `(state, questions)` pair
     /// [`compaction_focus_text`] sends via [`compaction_select_request`]
     /// passes `jev::safe_metadata_request`, the same way [`handoff_select_
@@ -3457,6 +3583,44 @@ mod tests {
                 .any(|c| matches!(c.kind, CompactionItemKind::FailingTest)),
             "a later-passing verification must never surface a failing-test candidate: \
              {candidates:?}"
+        );
+    }
+
+    /// Review of 6bdd7675, defect #2: raw tool output can carry an embedded
+    /// `\r`/`\n`/`\t` (or any other control character) in the middle of a
+    /// line, not just at its edges where `.trim()`/`.lines()` would already
+    /// remove or split it. `wrap::inject_compact` writes the whole rendered
+    /// focus text followed by one trailing `\r` into the PTY, so a stray
+    /// mid-string `\r` there would submit the injected `/compact ...` prompt
+    /// early and leave stray keystrokes queued behind it -- every candidate's
+    /// own rendered `text` must never carry one through to that point.
+    #[test]
+    fn compaction_candidates_scrubs_control_characters_from_a_failing_test_excerpt() {
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                status: VerificationStatus::Failed,
+                error_excerpt: vec![
+                    "assertion failed\r\x1b[31mleft\t== right\x1b[0m\nmore".to_string(),
+                ],
+            }),
+            ..StructuralContext::default()
+        };
+        let candidates = compaction_candidates(&ctx);
+
+        let failing_test = candidates
+            .iter()
+            .find(|c| matches!(c.kind, CompactionItemKind::FailingTest))
+            .expect("an unresolved failing test must be a candidate");
+        assert!(
+            !failing_test.text.contains(['\r', '\n', '\t']),
+            "no raw control character may reach the rendered text: {:?}",
+            failing_test.text
+        );
+        assert!(
+            !failing_test.text.chars().any(|c| c.is_control()),
+            "no control character at all may reach the rendered text: {:?}",
+            failing_test.text
         );
     }
 

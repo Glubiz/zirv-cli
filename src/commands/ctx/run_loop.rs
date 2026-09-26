@@ -777,13 +777,17 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 // Issue #789 (`[jev] compaction_select`): same best-effort,
                 // off-by-default seam as `exec.rs`'s own `zirv ctx exec`
                 // compaction -- `zirv ctx loop` composes the identical
-                // `compact_in_place` call, so it gets the identical keep-list
-                // treatment.
-                let compact_focus = {
-                    let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
-                    let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
-                    handoff::compaction_focus_text(&cfg, &state, &ctx, supervise::COMPACT_FOCUS)
-                };
+                // `compact_in_place` call, so it gets the identical
+                // gate-checked-before-any-read treatment (review of
+                // 6bdd7675, defect #1).
+                let compact_focus = handoff::compaction_focus_for_transcript(
+                    &cfg,
+                    &state,
+                    adapter.as_ref(),
+                    Some(&transcript),
+                    cfg.handoff.tail_items,
+                    supervise::COMPACT_FOCUS,
+                );
                 let compact_result = super::exec::compact_in_place(
                     adapter.as_ref(),
                     Some(&transcript),

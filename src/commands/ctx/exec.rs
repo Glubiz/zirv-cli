@@ -2659,16 +2659,18 @@ fn run_with_clock_inner<W: Write>(
                 .chain(prompt_args.iter().cloned())
                 .collect();
             // Issue #789 (`[jev] compaction_select`): best-effort, off by
-            // default -- gate off, no credential, or an indecisive/failed
-            // call all leave `compact_focus` byte-identical to
-            // `supervise::COMPACT_FOCUS`, so reading and parsing the
-            // transcript here costs nothing observable on that (today's
-            // default) path beyond the read itself.
-            let compact_focus = {
-                let jsonl = std::fs::read_to_string(&transcript).unwrap_or_default();
-                let ctx = adapter.structural_context(&jsonl, cfg.handoff.tail_items);
-                handoff::compaction_focus_text(&cfg, &state, &ctx, supervise::COMPACT_FOCUS)
-            };
+            // default -- `compaction_focus_for_transcript` checks the gate
+            // and credential BEFORE touching the transcript at all (review
+            // of 6bdd7675, defect #1), so this costs nothing observable on
+            // that (today's default) path.
+            let compact_focus = handoff::compaction_focus_for_transcript(
+                &cfg,
+                &state,
+                adapter.as_ref(),
+                Some(&transcript),
+                cfg.handoff.tail_items,
+                supervise::COMPACT_FOCUS,
+            );
             let compact_result = compact_in_place(
                 adapter.as_ref(),
                 Some(&transcript),
