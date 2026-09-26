@@ -1325,6 +1325,9 @@ fn automatic_rollover_request(
         idle,
         blocked,
         interactive,
+        // `wrap` has no dashboard footer to feed; only `dash::mod::
+        // rollover_sweep` reads this evaluation's own headroom back.
+        &mut None,
     );
     // Anything but a plain `Skip` is worth a line: it is the only record of
     // why the seat did (or deliberately did not) move. A `Skip` is the

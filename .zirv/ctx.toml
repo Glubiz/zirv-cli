@@ -223,7 +223,7 @@ model = "fable"
 # bar = true                         # the reserved bottom status bar
 # events = true                      # REPO-FORBIDDEN (ZIRV_CTX_QUIET, inverted): the `zirv \u{25b8}` announcement channel on stderr. Default: true.
 
-# [dash]                             # every key below is REPO-FORBIDDEN except idle_quiet_ms
+# [dash]                             # every key below is REPO-FORBIDDEN except idle_quiet_ms and motion
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_DASH): whether `zirv chat` opens the dashboard multiplexer. Default: true.
 # sidebar_cols = 44                  # REPO-FORBIDDEN (ZIRV_CTX_DASH_SIDEBAR_COLS): width, in columns, of the persistent session sidebar. Default: 44.
 # roster_max_age_secs = 604_800      # REPO-FORBIDDEN (ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS): how long a quit-time roster stays offered for restore. Default: 604800 (7 days).
@@ -231,6 +231,7 @@ model = "fable"
 # mouse = true                       # REPO-FORBIDDEN (ZIRV_CTX_DASH_MOUSE): whether the dashboard captures the mouse for wheel-scroll. Default: true.
 # workdir_roots = []                 # REPO-FORBIDDEN (ZIRV_CTX_DASH_WORKDIR_ROOTS): additional roots a pane `--workdir` request may canonicalise inside, beyond the dashboard's own repo root and that root's parent (always allowed). Default: [] (empty).
 # idle_quiet_ms = 10000              # not REPO-FORBIDDEN (a tuning knob, like pace.soft_percent): how long a signal-less pane's pty output must be quiet before it counts as Idle. Default: 10000 (10s).
+# motion = "full"                    # not REPO-FORBIDDEN (a tuning knob, like idle_quiet_ms): "full" | "reduced" -- spinner/shimmer/gauge-easing/breathing/flash/fade motion, vs. state changes only. Default: "full".
 
 # [workflow]                         # operator-controlled except workflow.deploy.minimum_tier, the one repo narrowing-only carve-out.
 # repo_checks_enabled = true         # REPO-FORBIDDEN (ZIRV_CTX_WORKFLOW_REPO_CHECKS): whether the commands in .zirv/verify.toml and the npm scripts in package.json may actually execute. Off = listed in the report with a skip line, never run, and never passing evidence. Default: true.

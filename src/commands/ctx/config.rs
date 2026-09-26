@@ -1818,6 +1818,13 @@ pub struct DashConfig {
     /// replaces the merged file value outright, the operator's own final
     /// word.
     pub workdir_roots: Vec<String>,
+    /// Dash refresh PR2: `"full"` (default) or `"reduced"` -- see
+    /// [`DashMotion`]'s own doc comment. Not `REPO_FORBIDDEN`, same
+    /// reasoning as `idle_quiet_ms` right above: a presentation-only knob
+    /// over a session the operator already chose to run interactively, not
+    /// a cap standing between an untrusted layer and something it must not
+    /// raise for itself.
+    pub motion: DashMotion,
 }
 
 impl Default for DashConfig {
@@ -1830,6 +1837,7 @@ impl Default for DashConfig {
             mouse: true,
             idle_quiet_ms: 10_000,
             workdir_roots: Vec::new(),
+            motion: DashMotion::default(),
         }
     }
 }
@@ -2381,6 +2389,23 @@ pub enum ObfuscateEmailDomain {
     #[default]
     Keep,
     Mask,
+}
+
+/// The dash refresh's own motion switch (PR2): `Full` (default) runs
+/// clock-driven spinners, the pane-header shimmer, gauge easing, pending-
+/// rollover breathing, mail/finished-worker row flashes and toast fades;
+/// `Reduced` keeps every STATE change (a spinner still shows working, a
+/// gauge still lands on its new value, a toast still appears and expires)
+/// and drops only the animation between states. Presentation only -- it
+/// never changes what the dashboard supervises or how, so it is not
+/// `REPO_FORBIDDEN`, the same reasoning `DashConfig::idle_quiet_ms`'s own
+/// doc comment gives for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DashMotion {
+    #[default]
+    Full,
+    Reduced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3977,6 +4002,7 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["dash", "idle_quiet_ms"],
         EnvKind::Int,
     ),
+    ("ZIRV_CTX_DASH_MOTION", &["dash", "motion"], EnvKind::Str),
     ("ZIRV_CTX_CHAT_MODEL", &["chat", "model"], EnvKind::Str),
     (
         "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
@@ -12170,6 +12196,34 @@ intake_discipline = true
             "the wheel scrolls a pane's scrollback out of the box"
         );
         assert_eq!(cfg.dash.idle_quiet_ms, 10_000);
+        assert_eq!(cfg.dash.motion, DashMotion::Full);
+    }
+
+    /// Dash refresh PR2: same repo-settable exception as `idle_quiet_ms`
+    /// right above -- `motion` is purely presentational.
+    #[test]
+    fn a_repository_config_may_set_dash_motion() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[dash]\nmotion = \"reduced\"\n",
+        )
+        .expect("write");
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.motion, DashMotion::Reduced);
+    }
+
+    #[test]
+    fn env_overrides_dash_motion() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_DASH_MOTION", "reduced")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.dash.motion, DashMotion::Reduced);
     }
 
     /// Unlike every other `dash.*` key, `idle_quiet_ms` is a pure timing knob
@@ -13861,6 +13915,7 @@ intake_discipline = true
         ("dash", "mouse"),
         ("dash", "idle_quiet_ms"),
         ("dash", "workdir_roots"),
+        ("dash", "motion"),
         ("workflow", "repo_checks_enabled"),
         ("workflow", "repo_skills_enabled"),
         ("workflow", "repo_agents_enabled"),

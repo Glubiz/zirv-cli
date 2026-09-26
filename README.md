@@ -382,10 +382,13 @@ copy silently.
 
 Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
-change its own limits) with one deliberate exception: `idle_quiet_ms` is a
+change its own limits) with two deliberate exceptions: `idle_quiet_ms` is a
 pure per-session timing knob over a session the operator already chose to run
 interactively, not a cap standing between an untrusted layer and something it
-must not raise for itself, so a repository may set it:
+must not raise for itself, so a repository may set it; `motion` is the same
+kind of knob, purely presentational (spinners, shimmer, gauge easing,
+pending-rollover breathing, row flashes and toast fades vs. state changes
+only), so it is repo-settable too:
 
 ```toml
 [dash]
@@ -395,6 +398,7 @@ roster_max_age_secs = 604800 # ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS
 max_panes = 9                 # ZIRV_CTX_DASH_MAX_PANES
 mouse = true                  # ZIRV_CTX_DASH_MOUSE
 idle_quiet_ms = 10000          # ZIRV_CTX_DASH_IDLE_QUIET_MS -- repo-settable
+motion = "full"                # ZIRV_CTX_DASH_MOTION -- "full" | "reduced", repo-settable
 ```
 
 ### Harness proxy

@@ -3817,7 +3817,9 @@ pub(crate) mod tests {
                 request,
                 generation,
                 ..
-            } = rollover::evaluate(&state, &cfg, "dash", &short, now, true, None, true)
+            } = rollover::evaluate(
+                &state, &cfg, "dash", &short, now, true, None, true, &mut None,
+            )
             else {
                 panic!("usage exhaustion must prepare a successor")
             };
@@ -3991,7 +3993,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 assert!(
-                    matches!(rollover::evaluate(&state, &cfg, "dash", &short, refreshed, true, None, true),
+                    matches!(rollover::evaluate(&state, &cfg, "dash", &short, refreshed, true, None, true, &mut None),
                     rollover::Evaluation::Skip(reason) if reason.contains("backoff"))
                 );
             }

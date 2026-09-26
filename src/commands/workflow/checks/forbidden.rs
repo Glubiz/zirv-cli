@@ -81,6 +81,7 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "compact_advisory.min_reclaim_tokens",
     "compact_advisory.window_fraction",
     "dash.idle_quiet_ms",
+    "dash.motion",
     "fallback.enabled",
     "fallback.min_candidate_headroom_pct",
     "fallback.predictive_headroom_pct",

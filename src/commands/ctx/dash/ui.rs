@@ -518,6 +518,32 @@ pub struct SidebarRow {
     /// `focused`'s own doc comment) -- the footer is the only reader, and
     /// it only ever reads this off the focused row.
     pub supervised: bool,
+    /// Dash refresh PR2: this row's own orchestrator-seat rollover
+    /// lifecycle, for the badge column -- `None` for every non-orchestrator
+    /// row and for an orchestrator seat with nothing pending or parked.
+    /// `dash::mod` resolves this from the same `seat`/`rollover_runtime`
+    /// reads the footer's own `RolloverFooterFact` uses.
+    pub rollover_badge: Option<RolloverBadge>,
+    /// Dash refresh PR2: this row's own flash overlay style, already
+    /// resolved by the caller from the elapsed time since a flash-worthy
+    /// edge (new mail, a worker finishing) and `dash.motion` -- `None` once
+    /// the flash (900ms) has finished, always `None` under reduced motion.
+    /// Patched onto every span's own style (`with_row_overlay`) rather than
+    /// replacing it, so the row's own glyph/rot colours survive the tint,
+    /// the same convention the selected-row background already follows.
+    pub flash: Option<Style>,
+}
+
+/// Dash refresh PR2: the two orchestrator-seat rollover states the sidebar
+/// badge column shows -- see [`SidebarRow::rollover_badge`] and
+/// `RolloverFooterFact`, the footer's own richer telling of the same states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloverBadge {
+    /// The seat is marked pending; the swap fires on the next idle boundary.
+    Pending,
+    /// Parked on its own current harness, waiting for that harness's own
+    /// usage window to reset.
+    Parked,
 }
 
 /// The work group a row belongs to. Membership comes only from
@@ -1648,15 +1674,32 @@ pub struct PaneHeaderFacts {
     /// capitalized here (`capitalize_first`) -- the sidebar keeps it plain.
     pub state_word: String,
     pub age_secs: Option<u64>,
+    /// Dash refresh PR2: a toast slot, between the left facts and the
+    /// workflow segment -- already-resolved text and style (`toast_style`),
+    /// `None` with nothing to show (no recent rollover/finished-worker edge,
+    /// or the toast has already faded past its own 5s). At most one at a
+    /// time, dashboard-wide (`dash::mod` keeps a single slot; "newest
+    /// wins" is enforced there, not here).
+    pub toast: Option<(String, Style)>,
 }
 
 /// Dash refresh PR1: the focused pane's own header row (`DashLayout::
 /// pane_header`) -- left ` {harness} ▸ {role} · {model} · {cwd}`, right
-/// `▸ {workflow} › {step} {i}/{n}  {glyph} {State word} {age}` (the workflow
-/// segment absent without a bound workflow). Truncates the left side before
-/// ever touching the right, since the right is the part naming what is
-/// actually happening right now.
-pub fn render_pane_header(f: &mut Frame, area: Rect, facts: &PaneHeaderFacts, tick: usize) {
+/// `{toast}  ▸ {workflow} › {step} {i}/{n}  {glyph} {State word} {age}` (the
+/// toast and workflow segments each absent without something to show).
+/// Truncates the left side before ever touching the right, since the right
+/// is the part naming what is actually happening right now. Dash refresh
+/// PR2: the state word gets the Claude Code shimmer (`shimmer_spans`)
+/// while `facts.glyph` is [`Glyph::Working`]; `elapsed_ms`/`motion` drive
+/// that alone -- the glyph's own spinner frame is `tick`, unchanged.
+pub fn render_pane_header(
+    f: &mut Frame,
+    area: Rect,
+    facts: &PaneHeaderFacts,
+    tick: usize,
+    elapsed_ms: u64,
+    motion: Motion,
+) {
     if area.is_empty() {
         return;
     }
@@ -1676,6 +1719,9 @@ pub fn render_pane_header(f: &mut Frame, area: Rect, facts: &PaneHeaderFacts, ti
     ];
 
     let mut right: Vec<(String, Style)> = Vec::new();
+    if let Some((text, style)) = &facts.toast {
+        right.push((format!("{text}  "), *style));
+    }
     if let Some(workflow) = &facts.workflow {
         let (text, style) = pane_header_workflow_span(workflow);
         right.push((format!("{text}  "), style));
@@ -1685,10 +1731,13 @@ pub fn render_pane_header(f: &mut Frame, area: Rect, facts: &PaneHeaderFacts, ti
         format!("{} ", glyph_char_for(facts.glyph, tick)),
         glyph_style,
     ));
-    right.push((
-        format!("{} ", capitalize_first(&facts.state_word)),
-        glyph_style,
-    ));
+    let state_word = capitalize_first(&facts.state_word);
+    if facts.glyph == Glyph::Working {
+        right.extend(shimmer_spans(&state_word, elapsed_ms, glyph_style, motion));
+        right.push((" ".to_string(), glyph_style));
+    } else {
+        right.push((format!("{state_word} "), glyph_style));
+    }
     if let Some(age) = facts.age_secs {
         right.push((style::format_age(age), style::tui::muted()));
     }
@@ -1778,6 +1827,14 @@ pub struct LimitsBlock {
     pub show_harness: bool,
     pub window_label: &'static str,
     pub pct: f64,
+    /// Dash refresh PR2: the bar's own eased fill value (`ease_toward`,
+    /// mod.rs's render loop) -- lags `pct` by up to ~300ms while it moves;
+    /// the percentage TEXT and the tone/reset-line colour stay instant off
+    /// `pct` itself, the same "instant label, eased gauge" split the rot
+    /// track uses. `limits_blocks_from_usage` seeds this equal to `pct`
+    /// (this pure function knows nothing of animation); mod.rs overwrites
+    /// it with the actually-eased value before rendering.
+    pub eased_pct: f64,
     pub detail: WindowDetail,
 }
 
@@ -1796,6 +1853,7 @@ pub fn limits_blocks_from_usage(usages: &[HarnessUsage]) -> Vec<LimitsBlock> {
                 show_harness,
                 window_label: "5h",
                 pct,
+                eased_pct: pct,
                 detail,
             });
             show_harness = false;
@@ -1806,6 +1864,7 @@ pub fn limits_blocks_from_usage(usages: &[HarnessUsage]) -> Vec<LimitsBlock> {
                 show_harness,
                 window_label: "wk",
                 pct,
+                eased_pct: pct,
                 detail,
             });
         }
@@ -1951,7 +2010,7 @@ pub fn render_limits(
         } else {
             String::new()
         };
-        let bar_filled = ((block.pct / 100.0) * 6.0).round().clamp(0.0, 6.0) as usize;
+        let bar_filled = ((block.eased_pct / 100.0) * 6.0).round().clamp(0.0, 6.0) as usize;
         let bar_filled_text = "\u{25b0}".repeat(bar_filled);
         let bar_empty_text = "\u{25b1}".repeat(6 - bar_filled);
         let pct_text = format!("{:>3.0}%", block.pct.round());
@@ -1971,6 +2030,209 @@ pub fn render_limits(
             style::truncate_display(&format!("   {reset_text}"), cols).into_owned(),
             reset_style,
         )));
+    }
+    let height = lines.len().min(area.height as usize) as u16;
+    f.render_widget(Paragraph::new(Text::from(lines)), Rect { height, ..area });
+}
+
+// ---------------------------------------------------------------------
+// Dash refresh PR2: the JEV sidebar section, between SESSIONS and LIMITS
+// (mock §03) -- what Jev did in the last 24h, refreshed on its own ~10s
+// cadence (`dash::mod`, never the render path). Hidden entirely with every
+// `[jev]` gate off.
+// ---------------------------------------------------------------------
+
+/// One site's own bar row -- `{name} {calls} {bar}`, the bar relative to the
+/// busiest site among the (already top-3, already sorted) rows shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JevSiteBar {
+    pub name: String,
+    pub calls: u64,
+    /// Out of 6 cells, matching LIMITS' own bar width.
+    pub filled: usize,
+    /// Dash refresh PR2: the bar's own eased fill value (`ease_toward`,
+    /// mod.rs's render loop) -- same "instant label (`calls`), eased
+    /// gauge" split `LimitsBlock::eased_pct` uses. Built equal to `filled`
+    /// wherever this struct is constructed outside the render loop itself
+    /// (`dash::mod::jev_section_fact`, and this module's own tests); the
+    /// render loop overwrites it with the actually-eased value before
+    /// rendering.
+    pub eased_filled: f64,
+}
+
+/// The JEV section's own `last` line -- which site, and how long ago,
+/// flashing (`row_flash_style`) whenever a NEW call has just landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JevLastLine {
+    pub site: String,
+    pub age_secs: u64,
+}
+
+/// Dash refresh PR2: the JEV sidebar section's facts (mock §03), built by
+/// `dash::mod` from `jev::usage_rollup`'s own 24h-windowed read, off the
+/// render path. `dash::mod` simply does not construct one (`DiskFacts::jev`
+/// stays `None`) with every `[jev]` gate off -- that is what hides the
+/// section entirely.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JevSectionFact {
+    /// Every configured gate is on, but the credential env var is not set.
+    NoKey { credential_env: String },
+    Active {
+        calls: u64,
+        /// `0.0..=1.0`; `None` with zero calls in the window (nothing to
+        /// take a cache-hit rate of).
+        cache_hit_rate: Option<f64>,
+        wait_p95_ms: Option<u64>,
+        errors: u64,
+        /// Plain-words reason for the most recent erroring call, or `None`
+        /// with zero errors in the window.
+        latest_error_reason: Option<String>,
+        last: Option<JevLastLine>,
+        /// Top 3 by calls, busiest first, bars already relative to the
+        /// busiest -- see [`JevSiteBar`].
+        sites: Vec<JevSiteBar>,
+    },
+}
+
+/// Pure: how many of `fact`'s own site rows (already sorted, top 3) fit in
+/// `rows` additional lines -- vertical priority (sessions, then LIMITS,
+/// then JEV) drops JEV's site rows first, then the section itself, when
+/// rows run out (spec's own words); this is the "drop site rows" half.
+pub fn jev_sites_fitting(site_count: usize, rows: u16) -> usize {
+    site_count.min(rows as usize)
+}
+
+/// Pure: the total rows [`render_jev`] draws for `fact` with `shown_sites`
+/// of its own site rows kept -- title+rule (2) plus either the one `no key`
+/// line or the four fixed `Active` lines (calls/wait/errors/last) plus
+/// `shown_sites`.
+pub fn jev_rows_for(fact: &JevSectionFact, shown_sites: usize) -> u16 {
+    match fact {
+        JevSectionFact::NoKey { .. } => 3,
+        JevSectionFact::Active { .. } => 2 + 4 + shown_sites as u16,
+    }
+}
+
+/// Draws the JEV section: ` JEV               24h · on`, a rule, then either
+/// the one `no key` line or `calls`/`wait`/`errors`/`last`/site-bar rows
+/// (mock §03). `elapsed_ms`/`motion` flash the `last` line
+/// (`row_flash_style`) when `last_flash_started` says a new call just
+/// landed; `shown_sites` is the caller's own `jev_sites_fitting` result --
+/// this draws exactly that many site rows and no more, never guessing at
+/// the cut itself (mirrors `render_limits`'s own contract).
+pub fn render_jev(
+    f: &mut Frame,
+    area: Rect,
+    fact: &JevSectionFact,
+    shown_sites: usize,
+    last_flash: Option<Style>,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let cols = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match fact {
+        JevSectionFact::NoKey { credential_env } => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    column(" JEV", cols.saturating_sub(6), false),
+                    style::tui::title(),
+                ),
+                Span::styled("no key".to_string(), style::tui::warning()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "\u{2500}".repeat(cols),
+                style::tui::muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                style::truncate_display(&format!(" set {credential_env}"), cols).into_owned(),
+                style::tui::warning(),
+            )));
+        }
+        JevSectionFact::Active {
+            calls,
+            cache_hit_rate,
+            wait_p95_ms,
+            errors,
+            latest_error_reason,
+            last,
+            sites,
+        } => {
+            let right = "24h \u{b7} on";
+            let room = cols.saturating_sub(style::display_width(right));
+            lines.push(Line::from(vec![
+                Span::styled(column(" JEV", room, false), style::tui::title()),
+                Span::styled("24h \u{b7} ".to_string(), style::tui::muted()),
+                Span::styled("on".to_string(), style::tui::ok()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "\u{2500}".repeat(cols),
+                style::tui::muted(),
+            )));
+            let cache_text = match cache_hit_rate {
+                Some(rate) => format!(" \u{b7} {:.0}% cached", rate * 100.0),
+                None => String::new(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" calls   ".to_string(), style::tui::muted()),
+                Span::raw(calls.to_string()),
+                Span::styled(cache_text, style::tui::muted()),
+            ]));
+            let wait_text = match wait_p95_ms {
+                Some(ms) => format!("p95 {ms} ms"),
+                None => style::PLACEHOLDER.to_string(),
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" wait    {wait_text}"),
+                style::tui::muted(),
+            )));
+            let (errors_text, errors_style) = if *errors > 0 {
+                (
+                    format!(
+                        " errors  {errors} \u{b7} {}",
+                        latest_error_reason.as_deref().unwrap_or("unknown reason")
+                    ),
+                    style::tui::error(),
+                )
+            } else {
+                (" errors  0".to_string(), style::tui::muted())
+            };
+            lines.push(Line::from(Span::styled(
+                style::truncate_display(&errors_text, cols).into_owned(),
+                errors_style,
+            )));
+            let last_text = match last {
+                Some(line) => format!(
+                    " last    {} \u{b7} {} ago",
+                    line.site,
+                    style::format_age(line.age_secs)
+                ),
+                None => format!(" last    {}", style::PLACEHOLDER),
+            };
+            let mut last_span = Span::styled(
+                style::truncate_display(&last_text, cols).into_owned(),
+                style::tui::muted(),
+            );
+            if let Some(flash) = last_flash {
+                last_span.style = last_span.style.patch(flash);
+            }
+            lines.push(Line::from(last_span));
+            for site in sites.iter().take(shown_sites) {
+                let eased_filled = (site.eased_filled.round().clamp(0.0, 6.0)) as usize;
+                let bar_filled = "\u{25b0}".repeat(eased_filled);
+                let bar_empty = "\u{25b1}".repeat(6 - eased_filled);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        style::truncate_display(&format!(" {:<9}", site.name), cols).into_owned(),
+                        style::tui::muted(),
+                    ),
+                    Span::styled(format!("{:>4} ", site.calls), Style::default()),
+                    Span::styled(bar_filled, style::tui::accent()),
+                    Span::styled(bar_empty, style::tui::muted()),
+                ]));
+            }
+        }
     }
     let height = lines.len().min(area.height as usize) as u16;
     f.render_widget(Paragraph::new(Text::from(lines)), Rect { height, ..area });
@@ -2003,6 +2265,129 @@ pub enum FooterFacts {
     Dead(FooterDeadFacts),
 }
 
+/// Dash refresh PR2's own motion switch, mirroring `config::DashMotion` --
+/// this module takes no config dependency (see its own module doc comment),
+/// so `dash::mod` converts. `Full` (default) runs every animation this
+/// module draws: clock-driven spinners, the pane-header shimmer, gauge
+/// easing, pending-rollover breathing, mail/finished-worker row flashes and
+/// toast fades. `Reduced` keeps every STATE change these same functions
+/// report (a spinner still shows working, a gauge still lands on its
+/// target, a toast still appears and expires on schedule) and drops only
+/// the animation between states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Full,
+    Reduced,
+}
+
+impl Motion {
+    pub fn is_full(self) -> bool {
+        matches!(self, Motion::Full)
+    }
+}
+
+/// Pure: one exponential-decay step of `current` toward `target`, `dt_ms`
+/// milliseconds after the previous step -- the caller keeps `current`
+/// across frames (mod.rs's render loop). Settles to within a third of a
+/// point of `target` in about 300ms of real steps (mock §06's own "ease to
+/// new values over about 300ms"), and snaps to `target` outright once the
+/// gap is negligible so a caller never has to special-case "close enough".
+/// Reduced motion returns `target` outright: state changes land instantly,
+/// with no animation at all.
+pub fn ease_toward(current: f64, target: f64, dt_ms: u64, motion: Motion) -> f64 {
+    if motion == Motion::Reduced {
+        return target;
+    }
+    const HALF_LIFE_MS: f64 = 90.0;
+    let decay = 0.5_f64.powf(dt_ms as f64 / HALF_LIFE_MS);
+    let next = target + (current - target) * decay;
+    if (next - target).abs() < 0.3 {
+        target
+    } else {
+        next
+    }
+}
+
+/// Pure: the sidebar row's own flash overlay style, `None` once the flash
+/// (900ms, mock §06's own `@keyframes flash`) has finished counting from
+/// `elapsed_ms`, and always `None` under reduced motion -- the row's own
+/// badge/glyph state change is the only signal there; terminals have no
+/// partial alpha, so "fade" here is a solid highlight for the flash's own
+/// duration rather than a true opacity ramp.
+pub fn row_flash_style(elapsed_ms: u64, motion: Motion) -> Option<Style> {
+    if motion == Motion::Reduced || elapsed_ms >= 900 {
+        return None;
+    }
+    Some(Style::default().bg(Color::Indexed(60)))
+}
+
+/// Pure: a pane-header toast's own style, `None` once it has fully expired
+/// (5s) -- full [`style::tui::ok`] green for the first 4s, then a plain
+/// (un-bolded, un-dimmed) green for the last second as a one-step fade-out.
+/// Reduced motion skips the fade: full green for the whole 5s, then gone.
+pub fn toast_style(elapsed_ms: u64, motion: Motion) -> Option<Style> {
+    if elapsed_ms >= 5_000 {
+        return None;
+    }
+    if motion == Motion::Reduced || elapsed_ms < 4_000 {
+        Some(style::tui::ok())
+    } else {
+        Some(Style::default().fg(Color::Green))
+    }
+}
+
+/// Pure: a pending rollover's own breathing style -- bold half the 1.6s
+/// period, plain the other half (mock §02/§06's own `@keyframes breathe`
+/// opacity ramp, approximated here as a bold/plain duty cycle since a
+/// terminal cell has no partial opacity). Reduced motion holds it bold
+/// throughout: the "pending" state is still visually distinct, just still.
+pub fn pending_pulse_style(elapsed_ms: u64, motion: Motion) -> Style {
+    let base = style::tui::warning();
+    if motion == Motion::Reduced {
+        return base.add_modifier(Modifier::BOLD);
+    }
+    const PERIOD_MS: u64 = 1_600;
+    if (elapsed_ms % PERIOD_MS) < PERIOD_MS / 2 {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
+}
+
+/// Pure: `word`'s own characters, each styled from `base_style` alone
+/// (Claude Code's own shimmer, mock §06's own script: a bright sweep moving
+/// through the working verb, one step every ~90ms). The sweep position
+/// starts three columns before the word and ends three past it, so the
+/// highlight visibly enters and leaves rather than teleporting at the
+/// edges. Reduced motion paints the whole word in `base_style` with no
+/// sweep at all.
+pub fn shimmer_spans(
+    word: &str,
+    elapsed_ms: u64,
+    base_style: Style,
+    motion: Motion,
+) -> Vec<(String, Style)> {
+    let chars: Vec<char> = word.chars().collect();
+    if motion == Motion::Reduced || chars.is_empty() {
+        return vec![(word.to_string(), base_style)];
+    }
+    let period = chars.len() as i64 + 6;
+    let pos = ((elapsed_ms / 90) as i64 % period) - 3;
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let dist = (i as i64 - pos).unsigned_abs();
+            let style = if dist == 0 {
+                base_style.add_modifier(Modifier::BOLD)
+            } else {
+                base_style
+            };
+            (c.to_string(), style)
+        })
+        .collect()
+}
+
 /// The healthy/attention footer shapes (mock §04's first two examples) --
 /// they differ only in *values*, not in which fields exist.
 ///
@@ -2016,6 +2401,12 @@ pub struct FooterAliveFacts {
     /// the same `✻ –` unknown placeholder the wrap bar's own `BarState`
     /// uses for the identical case.
     pub score: Option<u32>,
+    /// Dash refresh PR2: the rot TRACK's own eased fill value -- lags
+    /// `score` by up to ~300ms while it climbs or falls (`ease_toward`,
+    /// mod.rs's render loop); the numeric label stays instant off `score`
+    /// itself. `None` exactly when `score` is (the caller keeps the two in
+    /// lockstep: there is nothing to ease toward with no cached score).
+    pub eased_score: Option<f64>,
     /// Total unread mail (broadcast + direct) for this session. The mock's
     /// footer shows one unlabeled number, unlike the wrap bar's own
     /// broadcast/direct `+`-split -- `0` renders the dim placeholder.
@@ -2040,6 +2431,74 @@ pub struct FooterAliveFacts {
     /// `supervised`: a session can be both reachable and stalled at once,
     /// and the operator needs to see the more urgent fact.
     pub stalled: bool,
+    /// Dash refresh PR2: the orchestrator seat's own rollover facts for the
+    /// footer's right-hand segment (mock §02) -- built by `dash::mod` from
+    /// the seat/rollover-runtime records it already reads on the facts-
+    /// refresh cadence (never per frame). `None` for a non-orchestrator
+    /// focus, or whenever rollover itself should show nothing at all (see
+    /// [`RolloverFooterFact`]'s own doc comment for every hidden case).
+    pub rollover: Option<RolloverFooterFact>,
+}
+
+/// Dash refresh PR2: the orchestrator seat's own rollover state for the
+/// footer's right-hand segment (mock §02).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RolloverFooterFact {
+    /// Headroom is comfortably clear of the rollover floor.
+    Distance { floor_pct: f64, headroom_pct: f64 },
+    /// Within 10 points of the floor.
+    Soon { floor_pct: f64, headroom_pct: f64 },
+    /// The seat is marked pending (`seat::Seat::pending`); the swap fires on
+    /// the next idle boundary. There is no confirmed successor to name at
+    /// this point -- `seat::decide`'s own "idle boundary" wait short-
+    /// circuits before any candidate is even considered (see that
+    /// function's own doc comment) -- so the wording deliberately does not
+    /// claim a target harness the dashboard cannot yet name.
+    Pending,
+    /// Parked on its own current harness (no fallback had headroom), waiting
+    /// for that harness's own usage window to reset.
+    Parked { harness: String, resets_at: u64 },
+}
+
+/// Pure: [`RolloverFooterFact`]'s own footer spans. `now`/`offset` format
+/// `Parked`'s reset time the same way LIMITS does (`limits_hhmm`/
+/// `limits_countdown`); `elapsed_ms`/`motion` drive `Pending`'s breathing
+/// (`pending_pulse_style`).
+fn rollover_footer_spans(
+    fact: &RolloverFooterFact,
+    now: u64,
+    offset: FixedOffset,
+    elapsed_ms: u64,
+    motion: Motion,
+) -> FooterSeg {
+    match fact {
+        RolloverFooterFact::Distance {
+            floor_pct,
+            headroom_pct,
+        } => vec![(
+            format!("\u{2913} rollover at {floor_pct:.0}% left \u{b7} now {headroom_pct:.0}%"),
+            style::tui::muted(),
+        )],
+        RolloverFooterFact::Soon {
+            floor_pct,
+            headroom_pct,
+        } => vec![(
+            format!("\u{2913} rollover soon \u{b7} {headroom_pct:.0}% left (at {floor_pct:.0}%)"),
+            style::tui::warning(),
+        )],
+        RolloverFooterFact::Pending => vec![(
+            "\u{2913} switching when idle".to_string(),
+            pending_pulse_style(elapsed_ms, motion),
+        )],
+        RolloverFooterFact::Parked { harness, resets_at } => vec![(
+            format!(
+                "\u{23f8} parked until {harness} resets at {} \u{b7} {}",
+                limits_hhmm(offset, *resets_at),
+                limits_countdown(*resets_at, now)
+            ),
+            Style::default().fg(Color::Magenta),
+        )],
+    }
 }
 
 /// The dead-pane-focused footer shape (mock §04's third example): a
@@ -2097,15 +2556,24 @@ const FOOTER_SEGMENT_GAP: &str = "   ";
 /// refresh PR1 dropped the harness/usage/workflow segments entirely (the
 /// first two moved to the pane header; PR2 replaces usage with the
 /// next-action forecast) -- what is left is the rot verdict (`✻ NN {band}`),
+/// PR2's own track and recommendation words, an optional rollover segment,
 /// mail, and supervision, which shrinks to nothing at all while the pane is
 /// healthy and reachable (`Remove the healthy ● supervised segment`) and
-/// only ever shows `▲ unsupervised` or `◆ stalled`. Only the verdict's own
-/// score number is ever dropped, under real width pressure -- the word,
-/// mail and supervision are never dropped.
+/// only ever shows `▲ unsupervised` or `◆ stalled`. Drop order, most
+/// generous first: the track+recommendation+rollover trio drops before the
+/// verdict's own score number, which is the only PR1-era piece ever
+/// dropped -- the word, mail and supervision are never dropped, unchanged
+/// from PR1.
+#[allow(clippy::too_many_arguments)]
 fn footer_alive_spans(
     facts: &FooterAliveFacts,
     advise_at: u32,
     compact_at: u32,
+    restart_at: u32,
+    now: u64,
+    offset: FixedOffset,
+    elapsed_ms: u64,
+    motion: Motion,
     cols: u16,
 ) -> Vec<Span<'static>> {
     let cols = cols as usize;
@@ -2131,6 +2599,25 @@ fn footer_alive_spans(
             (unknown.clone(), unknown)
         }
     };
+
+    // Dash refresh PR2: the track eases toward the score (`eased_score`) so
+    // it never jumps once a second; the recommendation words read the
+    // instant, real `score` -- there is no reason to lag a "do this now"
+    // sentence behind its own gauge.
+    let track: FooterSeg = facts
+        .eased_score
+        .map(|eased| rot_track_cells(eased, advise_at, compact_at))
+        .unwrap_or_default();
+    let recommendation: FooterSeg = facts
+        .score
+        .and_then(|score| rot_recommendation(score, compact_at, restart_at))
+        .map(|(text, style)| vec![(text.to_string(), style)])
+        .unwrap_or_default();
+    let rollover: FooterSeg = facts
+        .rollover
+        .as_ref()
+        .map(|fact| rollover_footer_spans(fact, now, offset, elapsed_ms, motion))
+        .unwrap_or_default();
 
     let mail: FooterSeg = if facts.unread_mail == 0 {
         vec![(
@@ -2158,6 +2645,15 @@ fn footer_alive_spans(
     };
 
     let tiers = [
+        join_footer_segments(&[
+            &verdict_full,
+            &track,
+            &recommendation,
+            &rollover,
+            &mail,
+            &supervision,
+        ]),
+        join_footer_segments(&[&verdict_full, &track, &rollover, &mail, &supervision]),
         join_footer_segments(&[&verdict_full, &mail, &supervision]),
         join_footer_segments(&[&verdict_reduced, &mail, &supervision]),
     ];
@@ -2256,21 +2752,33 @@ fn footer_dead_spans(facts: &FooterDeadFacts, cols: u16) -> Vec<Span<'static>> {
 }
 
 /// Issue #209/v3 §D: the footer signal row, describing whichever pane is
-/// focused. `advise_at`/`compact_at` are `rot::ScoreConfig`'s own
-/// thresholds, threaded through exactly as [`render_sidebar`] takes them.
+/// focused. `advise_at`/`compact_at`/`restart_at` are `rot::ScoreConfig`'s
+/// own thresholds, threaded through exactly as [`render_sidebar`] takes the
+/// first two. `now`/`offset` format a `Parked` rollover's reset time;
+/// `elapsed_ms`/`motion` drive a `Pending` rollover's breathing (dash
+/// refresh PR2) -- neither is read for a `Dead` focus, which carries no
+/// rollover fact at all.
+#[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     f: &mut Frame,
     area: Rect,
     facts: &FooterFacts,
     advise_at: u32,
     compact_at: u32,
+    restart_at: u32,
+    now: u64,
+    offset: FixedOffset,
+    elapsed_ms: u64,
+    motion: Motion,
 ) {
     if area.is_empty() {
         return;
     }
     let spans = match facts {
         FooterFacts::None => return,
-        FooterFacts::Alive(alive) => footer_alive_spans(alive, advise_at, compact_at, area.width),
+        FooterFacts::Alive(alive) => footer_alive_spans(
+            alive, advise_at, compact_at, restart_at, now, offset, elapsed_ms, motion, area.width,
+        ),
         FooterFacts::Dead(dead) => footer_dead_spans(dead, area.width),
     };
     f.render_widget(
@@ -2440,6 +2948,67 @@ fn footer_rot_style(band: RotBand) -> Style {
 /// whether it is shown from inside (wrap) or from the dash.
 const ROT_GLYPH: &str = "\u{273b}";
 
+/// Dash refresh PR2: the footer's own 22-column rot track -- 20 cells of 5
+/// points each plus the two `┊` threshold ticks, inserted before the cell at
+/// `advise_at`/`compact_at` (i.e. after `threshold / 5` cells). Filled cells
+/// (`eased_score / 5`, floored) all take the current band's own colour;
+/// empty cells and the two ticks never do -- the ticks are a fixed, dim
+/// reference mark, not part of the verdict itself.
+///
+/// Matches the approved mock's own static examples (`docs/design/mocks/
+/// 2026-09-26-dash-refresh.html` §02: `score.advise_at`/`score.compact_at`
+/// default 40/60, ticks after 8 and 12 cells, floor division throughout).
+/// Its animated §06 demo instead hardcodes ticks at fixed columns 12/16 with
+/// `Math.round` fill -- an inconsistency inside the mock itself between its
+/// own static and animated sections; resolved here in the written spec
+/// text's favour (the configured thresholds, floor division, matching §02).
+fn rot_track_cells(eased_score: f64, advise_at: u32, compact_at: u32) -> FooterSeg {
+    let clamped = eased_score.clamp(0.0, 100.0);
+    let band = rot_band_for(clamped.round() as u32, advise_at, compact_at);
+    let fill_style = footer_rot_style(band);
+    let empty_style = style::tui::muted();
+    let advise_tick_style = style::tui::warning().add_modifier(Modifier::DIM);
+    let compact_tick_style = style::tui::error().add_modifier(Modifier::DIM);
+    let filled = (clamped / 5.0) as usize;
+    let advise_idx = (advise_at / 5) as usize;
+    let compact_idx = (compact_at / 5) as usize;
+    let mut cells = FooterSeg::new();
+    for i in 0..20usize {
+        if i == advise_idx {
+            cells.push(("┊".to_string(), advise_tick_style));
+        }
+        if i == compact_idx {
+            cells.push(("┊".to_string(), compact_tick_style));
+        }
+        let style = if i < filled { fill_style } else { empty_style };
+        cells.push((
+            (if i < filled { "\u{25b0}" } else { "\u{25b1}" }).to_string(),
+            style,
+        ));
+    }
+    cells
+}
+
+/// Pure: the footer's own "what to do about it" words, shown only once
+/// useful (`score >= compact_at`) -- zirv does not compact or restart a
+/// dashboard pane (operator decision, PR2's own constraint), so these are
+/// recommendations for the operator to act on, never a claim of an action
+/// zirv itself will take. `restart_at` and above supersedes the `compact_at`
+/// wording outright rather than showing both.
+fn rot_recommendation(
+    score: u32,
+    compact_at: u32,
+    restart_at: u32,
+) -> Option<(&'static str, Style)> {
+    if score >= restart_at {
+        Some(("fresh session recommended", style::tui::error()))
+    } else if score >= compact_at {
+        Some(("/compact recommended", style::tui::warning()))
+    } else {
+        None
+    }
+}
+
 /// Pure: a sidebar row's rot column text, colourless -- [`render_sidebar`]
 /// paints it. `None` (dead pane, or no cached score at all) is always the
 /// shared placeholder, never a fabricated reading: a dead pane's last cached
@@ -2492,6 +3061,18 @@ fn badge_for(row: &SidebarRow) -> Option<(String, Style)> {
             "\u{2691} ".to_string(),
             style::tui::warning().add_modifier(Modifier::BOLD),
         ));
+    }
+    match row.rollover_badge {
+        Some(RolloverBadge::Pending) => {
+            return Some((
+                "\u{2913} ".to_string(),
+                style::tui::warning().add_modifier(Modifier::BOLD),
+            ));
+        }
+        Some(RolloverBadge::Parked) => {
+            return Some(("\u{23f8} ".to_string(), Style::default().fg(Color::Magenta)));
+        }
+        None => {}
     }
     if row.unread_mail > 0 {
         let count = if row.unread_mail > 9 {
@@ -2852,7 +3433,10 @@ fn roster_entry(
 ) -> (Hit, Line<'static>, Vec<Line<'static>>) {
     let mut row = row.clone();
     row.selected &= selected_session;
-    let line = Line::from(sidebar_row_parts(&row, tick, width, bands.0, bands.1));
+    let mut line = Line::from(sidebar_row_parts(&row, tick, width, bands.0, bands.1));
+    if let Some(overlay) = row.flash {
+        line = with_row_overlay(line, overlay);
+    }
     let prefix = if row.tree == TreePos::Child {
         "\u{2502}  "
     } else {
@@ -2881,6 +3465,20 @@ fn roster_entry(
         }
     }
     (Hit::SidebarRow(row.short), line, fact_lines)
+}
+
+/// Pure: `line`, with `overlay` patched onto every span's own style -- each
+/// span's own foreground colour and modifiers survive; only the fields
+/// `overlay` actually sets (here always just a background colour) are
+/// added on top. The sidebar's own selected-row tint uses a whole-`Paragraph`
+/// background instead (`render_roster`'s caller draws the selection band
+/// separately today); a flash has no such second layer to draw into, so it
+/// patches the row's own spans directly.
+fn with_row_overlay(mut line: Line<'static>, overlay: Style) -> Line<'static> {
+    for span in &mut line.spans {
+        span.style = span.style.patch(overlay);
+    }
+    line
 }
 
 /// Draws a [`roster_frame`] result. The lines were already fitted to `area`
@@ -4311,6 +4909,8 @@ mod tests {
                         fact_since_secs: Some(90 + i * 60),
                         workflow: None,
                         unread_mail: 0,
+                        rollover_badge: None,
+                        flash: None,
                     })
                     .collect();
                 if scenario == "nine-panes" {
@@ -4380,7 +4980,18 @@ mod tests {
                                 },
                             );
                             render_rule(f, layout.rule_bottom, layout.sidebar.width, false);
-                            render_footer(f, layout.footer, &footer, 40, 70);
+                            render_footer(
+                                f,
+                                layout.footer,
+                                &footer,
+                                40,
+                                70,
+                                80,
+                                0,
+                                utc(),
+                                0,
+                                Motion::Reduced,
+                            );
                         }
                         if !empty {
                             render_grid(f, main, parser.screen(), None);
@@ -4532,6 +5143,11 @@ mod tests {
                                 &FooterFacts::Alive(alive_footer_facts()),
                                 40,
                                 70,
+                                80,
+                                0,
+                                utc(),
+                                0,
+                                Motion::Reduced,
                             );
                         }
                     })
@@ -5584,6 +6200,8 @@ mod tests {
             fact_since_secs: Some(90),
             workflow: None,
             unread_mail: 0,
+            rollover_badge: None,
+            flash: None,
         }
     }
 
@@ -6110,6 +6728,8 @@ mod tests {
                 fact_since_secs: Some(5),
                 workflow: None,
                 unread_mail: 0,
+                rollover_badge: None,
+                flash: None,
             },
             SidebarRow {
                 role: "worker".into(),
@@ -6132,6 +6752,8 @@ mod tests {
                 fact_since_secs: Some(5),
                 workflow: None,
                 unread_mail: 0,
+                rollover_badge: None,
+                flash: None,
             },
         ];
         let backend = TestBackend::new(40, 6);
@@ -6184,6 +6806,8 @@ mod tests {
             fact_since_secs: None,
             workflow: None,
             unread_mail: 0,
+            rollover_badge: None,
+            flash: None,
         };
         let rows: Vec<SidebarRow> = (0..12).map(|i| row(i, i == 10)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {
@@ -6523,9 +7147,11 @@ mod tests {
     fn alive_footer_facts() -> FooterAliveFacts {
         FooterAliveFacts {
             score: Some(12),
+            eased_score: Some(12.0),
             unread_mail: 0,
             supervised: true,
             stalled: false,
+            rollover: None,
         }
     }
 
@@ -6537,7 +7163,7 @@ mod tests {
     fn footer_renders_the_healthy_example() {
         let facts = FooterFacts::Alive(alive_footer_facts());
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("fresh"), "got {text:?}");
         assert!(text.contains("12"), "got {text:?}");
@@ -6560,7 +7186,7 @@ mod tests {
         alive.stalled = true;
         let facts = FooterFacts::Alive(alive);
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("stalled"), "got {text:?}");
     }
@@ -6573,7 +7199,7 @@ mod tests {
         alive.supervised = false;
         let facts = FooterFacts::Alive(alive);
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("unsupervised"), "got {text:?}");
     }
@@ -6583,12 +7209,14 @@ mod tests {
     fn footer_renders_the_attention_example() {
         let facts = FooterFacts::Alive(FooterAliveFacts {
             score: Some(47),
+            eased_score: Some(47.0),
             unread_mail: 2,
             supervised: true,
             stalled: false,
+            rollover: None,
         });
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("warming"), "got {text:?}");
         assert!(text.contains('2'), "unread mail count: got {text:?}");
@@ -6603,7 +7231,7 @@ mod tests {
         alive.unread_mail = 0;
         let facts = FooterFacts::Alive(alive);
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("rotting"), "got {text:?}");
         assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
@@ -6623,7 +7251,7 @@ mod tests {
             },
         });
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(text.contains("codex"), "got {text:?}");
         assert!(text.contains("exited"), "got {text:?}");
@@ -6637,7 +7265,18 @@ mod tests {
     #[test]
     fn footer_draws_nothing_when_nothing_is_focused() {
         let text = render_and_capture_text(Rect::new(0, 0, 80, 1), |f, area| {
-            render_footer(f, area, &FooterFacts::None, 40, 60)
+            render_footer(
+                f,
+                area,
+                &FooterFacts::None,
+                40,
+                60,
+                80,
+                0,
+                utc(),
+                0,
+                Motion::Reduced,
+            )
         });
         assert!(text.trim().is_empty(), "got {text:?}");
     }
@@ -6691,7 +7330,7 @@ mod tests {
         let facts = FooterFacts::Alive(alive);
         let render = |cols: u16| {
             render_and_capture_text(Rect::new(0, 0, cols, 1), |f, area| {
-                render_footer(f, area, &facts, 40, 60)
+                render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
             })
         };
 
@@ -6738,7 +7377,7 @@ mod tests {
         // dropped, but the exited notice and restore hint -- the one thing
         // this state exists to tell the operator -- still fit and survive.
         let tight = render_and_capture_text(Rect::new(0, 0, 35, 1), |f, area| {
-            render_footer(f, area, &facts, 40, 60)
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
         });
         assert!(tight.contains("exited"), "got {tight:?}");
         assert!(tight.contains("restore"), "got {tight:?}");
@@ -6753,13 +7392,436 @@ mod tests {
         // with it.
         for cols in [80u16, 40, 20, 10, 1, 0] {
             let text = render_and_capture_text(Rect::new(0, 0, cols, 1), |f, area| {
-                render_footer(f, area, &facts, 40, 60)
+                render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
             });
             assert!(
                 style::display_width(&text) <= cols as usize,
                 "width {cols} produced {text:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Dash refresh PR2: rot track, rollover footer, motion primitives, JEV.
+    // ------------------------------------------------------------------
+
+    /// The track's own tick placement follows the CONFIGURED thresholds,
+    /// not fixed columns -- ticks sit before the cell at `threshold / 5`.
+    /// Custom thresholds (not the 40/60 defaults) prove this: a lower
+    /// advise_at moves its own tick earlier without touching the other.
+    #[test]
+    fn rot_track_places_ticks_at_the_configured_thresholds() {
+        let cells = rot_track_cells(0.0, 20, 80);
+        // advise_at=20 -> tick before cell 4; compact_at=80 -> tick before
+        // cell 16. Each cell is one entry, so counting non-tick entries
+        // before each tick's own index confirms the placement.
+        let tick_positions: Vec<usize> = cells
+            .iter()
+            .enumerate()
+            .filter(|(_, (text, _))| text == "\u{250a}")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tick_positions.len(), 2, "exactly two ticks: {cells:?}");
+        // Before the first tick there must be exactly 4 cells (advise_at/5).
+        assert_eq!(tick_positions[0], 4, "advise_at=20 tick at index 4");
+        // Before the second tick: 4 cells + 1 tick + 12 cells = index 17.
+        assert_eq!(tick_positions[1], 17, "compact_at=80 tick at index 17");
+        // Total length: 20 cells + 2 ticks.
+        assert_eq!(cells.len(), 22);
+    }
+
+    /// Filled cells (floor(score/5)) take the CURRENT band's colour; empty
+    /// cells are always muted regardless of band.
+    #[test]
+    fn rot_track_fills_by_floor_division_and_bands_the_colour() {
+        let cells = rot_track_cells(47.0, 40, 60);
+        let filled_count = cells
+            .iter()
+            .filter(|(text, style)| text == "\u{25b0}" && style.fg == style::tui::warning().fg)
+            .count();
+        // floor(47/5) = 9 filled (warming band, since 40 <= 47 < 60).
+        assert_eq!(filled_count, 9, "{cells:?}");
+        let empty_count = cells.iter().filter(|(text, _)| text == "\u{25b1}").count();
+        assert_eq!(empty_count, 20 - 9);
+    }
+
+    /// No recommendation below `compact_at`; `/compact recommended` from
+    /// `compact_at` up to (not including) `restart_at`; `fresh session
+    /// recommended` supersedes it outright at `restart_at` and above.
+    #[test]
+    fn rot_recommendation_thresholds() {
+        assert_eq!(rot_recommendation(59, 60, 80), None);
+        let (text, style) = rot_recommendation(60, 60, 80).expect("compact_at itself recommends");
+        assert_eq!(text, "/compact recommended");
+        assert_eq!(style.fg, style::tui::warning().fg);
+        let (text, style) = rot_recommendation(80, 60, 80).expect("restart_at supersedes");
+        assert_eq!(text, "fresh session recommended");
+        assert_eq!(style.fg, style::tui::error().fg);
+    }
+
+    fn rollover_alive_facts(rollover: Option<RolloverFooterFact>) -> FooterAliveFacts {
+        FooterAliveFacts {
+            score: Some(22),
+            eased_score: Some(22.0),
+            unread_mail: 0,
+            supervised: true,
+            stalled: false,
+            rollover,
+        }
+    }
+
+    /// `None` draws no rollover segment at all -- the hidden case (fallback
+    /// off, auto rollover off, or a non-orchestrator focus) is simply never
+    /// constructing one; this proves the footer itself adds nothing extra
+    /// when it is not there.
+    #[test]
+    fn footer_rollover_hidden_shows_no_rollover_segment() {
+        let facts = FooterFacts::Alive(rollover_alive_facts(None));
+        let text = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
+        });
+        assert!(!text.contains("rollover"), "got {text:?}");
+    }
+
+    #[test]
+    fn footer_rollover_distance_and_soon() {
+        let distance =
+            FooterFacts::Alive(rollover_alive_facts(Some(RolloverFooterFact::Distance {
+                floor_pct: 20.0,
+                headroom_pct: 59.0,
+            })));
+        let text = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+            render_footer(f, area, &distance, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
+        });
+        assert!(
+            text.contains("rollover at 20% left") && text.contains("now 59%"),
+            "got {text:?}"
+        );
+
+        let soon = FooterFacts::Alive(rollover_alive_facts(Some(RolloverFooterFact::Soon {
+            floor_pct: 20.0,
+            headroom_pct: 24.0,
+        })));
+        let text = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+            render_footer(f, area, &soon, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
+        });
+        assert!(
+            text.contains("rollover soon") && text.contains("24% left (at 20%)"),
+            "got {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_rollover_pending_names_no_harness() {
+        // Decision: `seat::Seat::pending` carries only a `Cause`, never a
+        // candidate harness (`seat::decide`'s own "idle boundary" wait
+        // returns before any candidate is even considered) -- the footer
+        // must not fabricate one, unlike the mock's own illustrative
+        // "switching to codex when idle".
+        let facts = FooterFacts::Alive(rollover_alive_facts(Some(RolloverFooterFact::Pending)));
+        let text = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+            render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
+        });
+        assert!(text.contains("switching when idle"), "got {text:?}");
+        assert!(
+            !text.contains(" to ") || !text.contains("when idle to"),
+            "must not name an unverified target harness: got {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_rollover_parked_names_the_harness_and_reset() {
+        let facts = FooterFacts::Alive(rollover_alive_facts(Some(RolloverFooterFact::Parked {
+            harness: "claude".to_string(),
+            resets_at: 100 * 86_400 + 16 * 3600 + 20 * 60,
+        })));
+        let text = render_and_capture_text(Rect::new(0, 0, 120, 1), |f, area| {
+            render_footer(
+                f,
+                area,
+                &facts,
+                40,
+                60,
+                80,
+                100 * 86_400 + 16 * 3600,
+                utc(),
+                0,
+                Motion::Reduced,
+            )
+        });
+        assert!(
+            text.contains("parked until claude resets at 16:20"),
+            "got {text:?}"
+        );
+    }
+
+    /// The sidebar badge column: a rollover-pending seat outranks unread
+    /// mail, and a parked one gets its own distinct glyph -- both above `✉`
+    /// in priority (spec's own words), matching the workflow-gate badge's
+    /// existing precedence over mail.
+    #[test]
+    fn sidebar_badge_rollover_outranks_mail() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Working);
+        row.unread_mail = 3;
+        row.rollover_badge = Some(RolloverBadge::Pending);
+        let (text, _) = badge_for(&row).expect("a badge");
+        assert!(text.starts_with('\u{2913}'), "got {text:?}");
+
+        row.rollover_badge = Some(RolloverBadge::Parked);
+        let (text, _) = badge_for(&row).expect("a badge");
+        assert!(text.starts_with('\u{23f8}'), "got {text:?}");
+
+        row.rollover_badge = None;
+        let (text, _) = badge_for(&row).expect("mail badge once rollover clears");
+        assert!(text.starts_with('\u{2709}'), "got {text:?}");
+    }
+
+    /// `ease_toward`: converges toward the target over successive steps,
+    /// snaps once close enough, and reduced motion always snaps outright.
+    #[test]
+    fn ease_toward_converges_and_reduced_motion_snaps() {
+        let mut value = 0.0;
+        for _ in 0..40 {
+            value = ease_toward(value, 100.0, 20, Motion::Full);
+        }
+        assert!(
+            (value - 100.0).abs() < 1.0,
+            "must have converged after 40 steps of 20ms: {value}"
+        );
+        assert_eq!(ease_toward(0.0, 100.0, 20, Motion::Reduced), 100.0);
+    }
+
+    /// A row's flash overlay is present for its own 900ms and gone after --
+    /// reduced motion never shows one at all.
+    #[test]
+    fn row_flash_style_expires_at_900ms() {
+        assert!(row_flash_style(0, Motion::Full).is_some());
+        assert!(row_flash_style(899, Motion::Full).is_some());
+        assert!(row_flash_style(900, Motion::Full).is_none());
+        assert!(row_flash_style(0, Motion::Reduced).is_none());
+    }
+
+    /// A toast is green for its first 4s, a plain (un-bolded) green for its
+    /// last second, and gone at 5s -- reduced motion skips the fade but
+    /// still expires on schedule (a state change, kept).
+    #[test]
+    fn toast_style_fades_then_expires() {
+        assert_eq!(toast_style(0, Motion::Full), Some(style::tui::ok()));
+        assert_eq!(toast_style(3_999, Motion::Full), Some(style::tui::ok()));
+        assert_eq!(
+            toast_style(4_000, Motion::Full),
+            Some(Style::default().fg(Color::Green))
+        );
+        assert_eq!(
+            toast_style(4_999, Motion::Full),
+            Some(Style::default().fg(Color::Green))
+        );
+        assert_eq!(toast_style(5_000, Motion::Full), None);
+        assert_eq!(
+            toast_style(4_999, Motion::Reduced),
+            Some(style::tui::ok()),
+            "reduced motion skips the fade, staying bright until it expires"
+        );
+        assert_eq!(toast_style(5_000, Motion::Reduced), None);
+    }
+
+    /// Pending rollover breathes: bold for the first half of each 1.6s
+    /// period, plain for the second half; reduced motion holds it bold.
+    #[test]
+    fn pending_pulse_breathes_and_reduced_motion_holds_bold() {
+        assert!(
+            pending_pulse_style(0, Motion::Full)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            !pending_pulse_style(900, Motion::Full)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            pending_pulse_style(1_600, Motion::Full)
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "a new period starts bold again"
+        );
+        assert!(
+            pending_pulse_style(900, Motion::Reduced)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    /// The shimmer sweeps a single bold character through the word over
+    /// time; reduced motion paints the whole word in one plain span.
+    #[test]
+    fn shimmer_spans_sweep_and_reduced_motion_is_flat() {
+        let base = Style::default();
+        let reduced = shimmer_spans("Working", 0, base, Motion::Reduced);
+        assert_eq!(reduced, vec![("Working".to_string(), base)]);
+
+        let full = shimmer_spans("Working", 0, base, Motion::Full);
+        assert_eq!(full.len(), "Working".len());
+        let bold_count = full
+            .iter()
+            .filter(|(_, style)| style.add_modifier.contains(Modifier::BOLD))
+            .count();
+        assert!(bold_count <= 1, "at most one bright character: {full:?}");
+
+        // The bright character's own index moves with elapsed time --
+        // `pos = floor(elapsed/90) % (len+6) - 3`, so index 0 is bright at
+        // elapsed=270ms and index 3 at elapsed=540ms (both inside the word,
+        // unlike elapsed=0/900 which sweep just off either edge).
+        let bold_index = |spans: &[(String, Style)]| {
+            spans
+                .iter()
+                .position(|(_, style)| style.add_modifier.contains(Modifier::BOLD))
+        };
+        let at_270 = shimmer_spans("Working", 270, base, Motion::Full);
+        let at_540 = shimmer_spans("Working", 540, base, Motion::Full);
+        assert_eq!(bold_index(&at_270), Some(0), "{at_270:?}");
+        assert_eq!(bold_index(&at_540), Some(3), "{at_540:?}");
+    }
+
+    fn jev_active(sites: Vec<JevSiteBar>) -> JevSectionFact {
+        JevSectionFact::Active {
+            calls: 739,
+            cache_hit_rate: Some(0.82),
+            wait_p95_ms: Some(670),
+            errors: 0,
+            latest_error_reason: None,
+            last: Some(JevLastLine {
+                site: "approve".to_string(),
+                age_secs: 2,
+            }),
+            sites,
+        }
+    }
+
+    fn jev_sites() -> Vec<JevSiteBar> {
+        vec![
+            JevSiteBar {
+                name: "memory".to_string(),
+                calls: 417,
+                filled: 6,
+                eased_filled: 6.0,
+            },
+            JevSiteBar {
+                name: "approve".to_string(),
+                calls: 240,
+                filled: 3,
+                eased_filled: 3.0,
+            },
+            JevSiteBar {
+                name: "classify".to_string(),
+                calls: 38,
+                filled: 1,
+                eased_filled: 1.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn render_jev_active_shows_calls_wait_last_and_sites() {
+        let fact = jev_active(jev_sites());
+        let text = render_and_capture_text(Rect::new(0, 0, 28, 9), |f, area| {
+            render_jev(f, area, &fact, 3, None)
+        });
+        assert!(text.contains("JEV"), "got {text:?}");
+        assert!(text.contains("739"), "got {text:?}");
+        assert!(text.contains("82% cached"), "got {text:?}");
+        assert!(text.contains("p95 670 ms"), "got {text:?}");
+        assert!(text.contains("approve"), "got {text:?}");
+        assert!(text.contains("memory"), "got {text:?}");
+    }
+
+    /// Dash refresh PR2 (coordinator follow-up): the site bar's own fill
+    /// comes from `eased_filled`, not the already-rounded `filled` -- the
+    /// same "instant label (`calls`), eased gauge" split LIMITS uses.
+    #[test]
+    fn render_jev_site_bar_eases_independently_of_calls() {
+        let settled = jev_sites();
+        // Unchanged, all three sites at their own `filled` value: 6+3+1.
+        let settled_text = render_and_capture_text(Rect::new(0, 0, 28, 9), |f, area| {
+            render_jev(f, area, &jev_active(settled.clone()), 3, None)
+        });
+        assert!(
+            settled_text.contains("417"),
+            "the calls number stays instant: got {settled_text:?}"
+        );
+        assert_eq!(settled_text.matches('\u{25b0}').count(), 6 + 3 + 1);
+
+        // memory mid-ease at 2 instead of its settled 6 -- calls stays the
+        // same (still instant), but the total filled-cell count drops by 4.
+        let mut mid_ease = settled;
+        mid_ease[0].eased_filled = 2.0;
+        let mid_ease_text = render_and_capture_text(Rect::new(0, 0, 28, 9), |f, area| {
+            render_jev(f, area, &jev_active(mid_ease), 3, None)
+        });
+        assert!(mid_ease_text.contains("417"), "got {mid_ease_text:?}");
+        assert_eq!(
+            mid_ease_text.matches('\u{25b0}').count(),
+            2 + 3 + 1,
+            "the bar reflects eased_filled (2), not filled (6): {mid_ease_text:?}"
+        );
+    }
+
+    /// Errors turn the errors line red with the latest reason; zero errors
+    /// stays muted with no reason text at all.
+    #[test]
+    fn render_jev_errors_show_the_latest_reason() {
+        let mut fact = jev_active(jev_sites());
+        if let JevSectionFact::Active {
+            errors,
+            latest_error_reason,
+            ..
+        } = &mut fact
+        {
+            *errors = 3;
+            *latest_error_reason = Some("rate limited".to_string());
+        }
+        let text = render_and_capture_text(Rect::new(0, 0, 28, 9), |f, area| {
+            render_jev(f, area, &fact, 3, None)
+        });
+        assert!(
+            text.contains("3") && text.contains("rate limited"),
+            "got {text:?}"
+        );
+    }
+
+    /// Gates enabled but no credential: one yellow `no key` line and the
+    /// remedy, nothing else -- no calls/wait/errors/site rows at all.
+    #[test]
+    fn render_jev_no_key_state() {
+        let fact = JevSectionFact::NoKey {
+            credential_env: "TYPESAFE_API_KEY".to_string(),
+        };
+        let text = render_and_capture_text(Rect::new(0, 0, 28, 9), |f, area| {
+            render_jev(f, area, &fact, 0, None)
+        });
+        assert!(text.contains("no key"), "got {text:?}");
+        assert!(text.contains("set TYPESAFE_API_KEY"), "got {text:?}");
+        assert!(!text.contains("calls"), "got {text:?}");
+    }
+
+    /// Vertical priority: site rows drop before the section itself
+    /// disappears -- `jev_sites_fitting` caps at whatever room is left.
+    #[test]
+    fn jev_sites_fitting_caps_to_available_rows() {
+        assert_eq!(jev_sites_fitting(3, 5), 3, "everything fits");
+        assert_eq!(jev_sites_fitting(3, 2), 2, "only two rows left");
+        assert_eq!(jev_sites_fitting(3, 0), 0, "no room for a single site row");
+    }
+
+    #[test]
+    fn jev_rows_for_accounts_for_the_fixed_lines() {
+        let fact = jev_active(jev_sites());
+        assert_eq!(jev_rows_for(&fact, 3), 2 + 4 + 3);
+        assert_eq!(jev_rows_for(&fact, 0), 2 + 4);
+        let no_key = JevSectionFact::NoKey {
+            credential_env: "X".to_string(),
+        };
+        assert_eq!(jev_rows_for(&no_key, 0), 3);
     }
 
     #[test]
@@ -7898,6 +8960,7 @@ mod tests {
             glyph: Glyph::Working,
             state_word: "working".to_string(),
             age_secs: Some(180),
+            toast: None,
         }
     }
 
@@ -7917,7 +8980,7 @@ mod tests {
             completed: false,
         });
         let text = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
-            render_pane_header(f, area, &facts, 0)
+            render_pane_header(f, area, &facts, 0, 0, Motion::Reduced)
         });
         assert!(text.contains("claude"), "got {text:?}");
         assert!(text.contains("worker"), "got {text:?}");
@@ -7938,7 +9001,7 @@ mod tests {
     fn render_pane_header_with_no_workflow_shows_nothing_for_it() {
         let facts = pane_header_facts();
         let text = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
-            render_pane_header(f, area, &facts, 0)
+            render_pane_header(f, area, &facts, 0, 0, Motion::Reduced)
         });
         assert!(
             !text.contains('\u{203a}'),
@@ -7962,7 +9025,7 @@ mod tests {
             completed: false,
         });
         let narrow = render_and_capture_text(Rect::new(0, 0, 40, 1), |f, area| {
-            render_pane_header(f, area, &facts, 0)
+            render_pane_header(f, area, &facts, 0, 0, Motion::Reduced)
         });
         assert!(
             style::display_width(&narrow) <= 40,
@@ -7992,7 +9055,7 @@ mod tests {
             completed: true,
         });
         let done = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
-            render_pane_header(f, area, &facts, 0)
+            render_pane_header(f, area, &facts, 0, 0, Motion::Reduced)
         });
         assert!(done.contains("\u{2713} done"), "got {done:?}");
 
@@ -8005,7 +9068,7 @@ mod tests {
             completed: false,
         });
         let gated = render_and_capture_text(Rect::new(0, 0, 91, 1), |f, area| {
-            render_pane_header(f, area, &facts, 0)
+            render_pane_header(f, area, &facts, 0, 0, Motion::Reduced)
         });
         assert!(gated.contains("review 6/8"), "got {gated:?}");
     }
@@ -8218,6 +9281,46 @@ mod tests {
         assert!(
             blocks[2].show_harness,
             "codex's first block for THIS harness still shows its name, even though it is wk not 5h"
+        );
+        assert!(
+            blocks.iter().all(|b| b.eased_pct == b.pct),
+            "this pure function knows nothing of animation -- eased_pct starts equal to pct"
+        );
+    }
+
+    /// Dash refresh PR2 (coordinator follow-up): the bar's own fill comes
+    /// from `eased_pct`, while the percentage TEXT stays instant off `pct`
+    /// -- the same "instant label, eased gauge" split the rot track uses.
+    #[test]
+    fn render_limits_bar_eases_independently_of_the_percentage_text() {
+        let mut block = LimitsBlock {
+            harness: "claude",
+            show_harness: true,
+            window_label: "5h",
+            pct: 80.0,
+            eased_pct: 20.0,
+            detail: no_detail(),
+        };
+        let text = render_and_capture_text(Rect::new(0, 0, 28, 4), |f, area| {
+            render_limits(f, area, std::slice::from_ref(&block), 0, utc())
+        });
+        // eased_pct=20 -> floor/round to 1 of 6 cells; pct=80 -> the TEXT
+        // still reads 80%, not lagging behind its own bar.
+        assert!(text.contains("80%"), "got {text:?}");
+        assert_eq!(
+            text.matches('\u{25b0}').count(),
+            1,
+            "the bar itself reflects eased_pct (20), not pct (80): {text:?}"
+        );
+
+        block.eased_pct = block.pct;
+        let settled = render_and_capture_text(Rect::new(0, 0, 28, 4), |f, area| {
+            render_limits(f, area, std::slice::from_ref(&block), 0, utc())
+        });
+        assert_eq!(
+            settled.matches('\u{25b0}').count(),
+            5,
+            "once eased_pct catches up to 80, the bar shows all 5 of 6 (round(80/100*6)): {settled:?}"
         );
     }
 

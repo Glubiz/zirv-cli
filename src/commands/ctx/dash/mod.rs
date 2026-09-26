@@ -1464,6 +1464,12 @@ fn assemble_sidebar(
         fact_since_secs: p.ended.map(|e| now_secs.saturating_sub(e.exited_at)),
         workflow: None,
         unread_mail: 0,
+        // Dash refresh PR2 placeholders, same convention as `workflow`/
+        // `unread_mail` above: `enrich_sidebar` fills these from this same
+        // throttled tick's seat/rollover-runtime reads and the flash
+        // tracker.
+        rollover_badge: None,
+        flash: None,
     };
     let mut rows: Vec<ui::SidebarRow> = live_panes.iter().copied().map(row_of).collect();
 
@@ -1509,6 +1515,8 @@ fn assemble_sidebar(
             fact_since_secs: None,
             workflow: None,
             unread_mail: 0,
+            rollover_badge: None,
+            flash: None,
         });
     }
 
@@ -1886,6 +1894,310 @@ fn assemble_header_facts(
 /// (`FactsCache::disk.mail_by_session`, looked up by its short id) -- never
 /// the dashboard's own fixed launch identity's, which answers a different
 /// question (see `MailMap`'s own doc comment).
+/// Dash refresh PR2: `cfg.dash.motion` (`config::DashMotion`) as `ui::
+/// Motion` -- `dash::ui` takes no config dependency of its own (see that
+/// module's own doc comment), so this thin mapping is where the two meet.
+fn dash_motion_of(cfg: &CtxConfig) -> ui::Motion {
+    match cfg.dash.motion {
+        super::config::DashMotion::Full => ui::Motion::Full,
+        super::config::DashMotion::Reduced => ui::Motion::Reduced,
+    }
+}
+
+/// Review fix: `cached`'s own `pct`, but ONLY when it names the exact seat
+/// (`short` + `generation`) `current` reads as live right now -- a pane's
+/// registry short id survives a handover unchanged (`Pane::handover` never
+/// re-registers), so `short` alone cannot tell an old seat from the new one
+/// a rollover just put in its place; only `generation` advances. Pulled out
+/// of the render loop as its own pure function so the identity check has a
+/// test independent of the whole loop.
+fn seat_headroom_for_current(
+    cached: Option<&SeatHeadroom>,
+    current: Option<&seat::Seat>,
+) -> Option<f64> {
+    let cached = cached?;
+    let current = current?;
+    (current.short == cached.short && current.generation == cached.generation).then_some(cached.pct)
+}
+
+/// Review fix: which of `after`'s own sessions should flash for newly
+/// arrived mail -- `None` (never flashes anything) on the first observation
+/// (`seen_before: false`), since `before` is then `FactsCache`'s still-empty
+/// starting map and every already-unread row would otherwise read as "just
+/// arrived" (the same false-transition mistake the DoneUnread path avoids
+/// for free, since ITS OWN `previous: Option<Projection>` genuinely means
+/// "never sampled" when absent -- a plain `MailMap` has no such marker, so
+/// this flag stands in for one).
+fn mail_flash_targets(before: &MailMap, after: &MailMap, seen_before: bool) -> Vec<String> {
+    if !seen_before {
+        return Vec::new();
+    }
+    after
+        .iter()
+        .filter(|(short, (broadcast, direct))| {
+            let prior = before.get(*short).map(|(b, d)| b + d).unwrap_or(0);
+            *broadcast + *direct > prior
+        })
+        .map(|(short, _)| short.clone())
+        .collect()
+}
+
+/// Review fix: the "rolled over" toast text, if this observation earns one
+/// -- `None` on the first observation (`seen_before: false`) even when
+/// `current` is already `Committed`, since that settlement may predate this
+/// dashboard process entirely (a prior session's rollover); the toast is
+/// for a commit that happens WHILE this dashboard is watching, never one it
+/// merely discovers on its first read.
+fn rollover_committed_toast(
+    current: &Option<super::rollover_runtime::Settlement>,
+    previous: &Option<super::rollover_runtime::Settlement>,
+    seen_before: bool,
+    source_agent: &str,
+) -> Option<String> {
+    if !seen_before || current == previous {
+        return None;
+    }
+    let super::rollover_runtime::Settlement::Committed { generation, .. } = current.as_ref()?
+    else {
+        return None;
+    };
+    Some(format!(
+        "\u{2913} rolled over from {source_agent} \u{b7} gen {generation}"
+    ))
+}
+
+/// Dash refresh PR2: the JEV sidebar section's facts, off `jev::
+/// usage_rollup`'s own 24h-windowed read (`JEV_SECTION_WINDOW_SECS`) --
+/// `None` with every `[jev]` gate off, which is what hides the section
+/// entirely. Gates enabled but no credential is the one-line `NoKey` state;
+/// otherwise the top 3 sites by calls, bars relative to the busiest.
+fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionFact> {
+    if !super::jev::any_gate_enabled(&cfg.jev) {
+        return None;
+    }
+    if !super::jev::credential_present(cfg) {
+        return Some(ui::JevSectionFact::NoKey {
+            credential_env: super::jev::credential_env_name(cfg),
+        });
+    }
+    let rollup = super::jev::usage_rollup(state, JEV_SECTION_WINDOW_SECS);
+    let now = super::state::now_secs();
+    let total_calls: u64 = rollup.sites.values().map(|u| u.calls).sum();
+    let total_errors: u64 = rollup.sites.values().map(|u| u.errors).sum();
+    let cache_hit_rate = if total_calls > 0 {
+        let hits: f64 = rollup
+            .sites
+            .values()
+            .filter_map(|u| u.cache_hit_rate.map(|rate| rate * u.calls as f64))
+            .sum();
+        Some(hits / total_calls as f64)
+    } else {
+        None
+    };
+    let wait_p95_ms = rollup.sites.values().filter_map(|u| u.wall_ms_p95).max();
+    let mut sites: Vec<(&String, u64)> = rollup
+        .sites
+        .iter()
+        .map(|(site, usage)| (site, usage.calls))
+        .collect();
+    sites.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let busiest = sites.first().map(|(_, calls)| *calls).unwrap_or(0).max(1);
+    let site_bars: Vec<ui::JevSiteBar> = sites
+        .into_iter()
+        .take(3)
+        .map(|(name, calls)| {
+            let target = ((calls as f64 / busiest as f64) * 6.0).clamp(0.0, 6.0);
+            ui::JevSiteBar {
+                name: name.clone(),
+                calls,
+                filled: target.round() as usize,
+                eased_filled: target,
+            }
+        })
+        .collect();
+    Some(ui::JevSectionFact::Active {
+        calls: total_calls,
+        cache_hit_rate,
+        wait_p95_ms,
+        errors: total_errors,
+        latest_error_reason: rollup.latest_error_reason,
+        last: rollup.last_call.map(|call| ui::JevLastLine {
+            site: call.site,
+            age_secs: now.saturating_sub(call.ts),
+        }),
+        sites: site_bars,
+    })
+}
+
+/// One step of the footer rot track's own eased fill -- `prev` is `None`
+/// exactly when there was nothing to ease FROM (no focused row last tick,
+/// or it carried no score), in which case the track starts AT `target`
+/// rather than easing up from zero.
+fn ease_toward_score(prev: Option<f64>, target: f64, dt_ms: u64, motion: ui::Motion) -> f64 {
+    ui::ease_toward(prev.unwrap_or(target), target, dt_ms, motion)
+}
+
+/// Coordinator follow-up: one step of a keyed bar's own eased value --
+/// LIMITS bars and JEV site bars share this cache-and-step pattern with
+/// the rot track's own [`ease_toward_score`], just keyed by name since
+/// several bars are ever on screen together. Starts AT `target` (no
+/// climb-from-zero) the first time a given key is ever seen, the same
+/// "nothing to ease FROM yet" rule `ease_toward_score` follows.
+fn ease_bar(
+    cache: &mut HashMap<String, f64>,
+    key: &str,
+    target: f64,
+    dt_ms: u64,
+    motion: ui::Motion,
+) -> f64 {
+    let current = cache.get(key).copied().unwrap_or(target);
+    let eased = ui::ease_toward(current, target, dt_ms, motion);
+    cache.insert(key.to_string(), eased);
+    eased
+}
+
+/// Coordinator follow-up: `fact`'s own site bars, eased the same way LIMITS
+/// bars are -- a rendering-only clone. `facts_cache.disk.jev` itself is
+/// NEVER mutated in place: it is the raw target from the last 10s refresh,
+/// and easing it here would corrupt what the NEXT frame eases FROM.
+fn eased_jev_fact(
+    fact: &ui::JevSectionFact,
+    cache: &mut HashMap<String, f64>,
+    dt_ms: u64,
+    motion: ui::Motion,
+    touched: &mut HashSet<String>,
+) -> ui::JevSectionFact {
+    let mut fact = fact.clone();
+    if let ui::JevSectionFact::Active { sites, .. } = &mut fact {
+        for site in sites.iter_mut() {
+            let key = format!("jev:{}", site.name);
+            // `site.eased_filled` still carries the RAW continuous target
+            // (`jev_section_fact` seeds it that way, unrounded) -- the
+            // cache eases toward that, never toward the already-rounded
+            // `filled`.
+            let target = site.eased_filled;
+            site.eased_filled = ease_bar(cache, &key, target, dt_ms, motion);
+            touched.insert(key);
+        }
+    }
+    fact
+}
+
+/// Review fix: `rollover_sweep`'s own captured headroom, tagged with the
+/// seat it was computed for -- `short` alone is not enough, since a pane's
+/// registry short id survives a handover unchanged (`Pane::handover` never
+/// re-registers); only `generation` actually advances when the seat swaps.
+/// The render loop compares this against `DiskFacts::seat_full`'s own
+/// current `(short, generation)` before ever handing the `pct` to
+/// [`rollover_state`], so a reading computed for the seat BEFORE a rollover
+/// never gets shown against the seat AFTER one.
+#[derive(Debug, Clone, PartialEq)]
+struct SeatHeadroom {
+    short: String,
+    generation: u64,
+    pct: f64,
+}
+
+/// Dash refresh PR2: this dashboard's own orchestrator seat's rollover
+/// state, from the same two small JSON files (`seat`/`record`) read on the
+/// facts-refresh cadence -- shared by the footer's `RolloverFooterFact` and
+/// the sidebar's `RolloverBadge` (see [`rollover_footer_fact_of`]/
+/// [`rollover_badge_of`]). `None` (nothing shown anywhere) when cross-
+/// harness fallback or automatic orchestrator rollover is off, or this
+/// dashboard has no seat at all yet.
+///
+/// Priority, most urgent first: a `Parked` settlement/phase (nothing could
+/// take the seat) outranks a merely-`Pending` one (a candidate is already
+/// lined up), which outranks the plain distance/soon reading -- and THAT
+/// reading is `seat_headroom_pct`, exactly the `source_headroom_pct`
+/// `rollover::evaluate` itself last computed for this seat (`rollover_
+/// sweep`'s own out-parameter capture), never a separately estimated
+/// value. Coordinator follow-up: the operator does not want the dashboard
+/// guessing at a number the real trigger does not use -- with no
+/// evaluation having produced one yet (`None`), the distance/soon segment
+/// is hidden entirely rather than approximated.
+fn rollover_state(
+    cfg: &CtxConfig,
+    seat: Option<&seat::Seat>,
+    record: Option<&super::rollover_runtime::Record>,
+    seat_headroom_pct: Option<f64>,
+) -> Option<RolloverState> {
+    if !cfg.fallback.enabled || !cfg.auto_orchestrator_rollover() {
+        return None;
+    }
+    let seat = seat?;
+    if let Some(super::rollover_runtime::Settlement::Parked { until, .. }) =
+        record.and_then(|r| r.settlement.as_ref())
+    {
+        return Some(RolloverState::Parked {
+            harness: seat.agent.clone(),
+            resets_at: *until,
+        });
+    }
+    if let seat::Phase::Parked { until, .. } = seat.phase {
+        return Some(RolloverState::Parked {
+            harness: seat.agent.clone(),
+            resets_at: until,
+        });
+    }
+    if seat.pending.is_some() {
+        return Some(RolloverState::Pending);
+    }
+    let floor = cfg.fallback.rollover_headroom_pct();
+    let headroom = seat_headroom_pct?;
+    if headroom <= floor + 10.0 {
+        Some(RolloverState::Soon(floor, headroom))
+    } else {
+        Some(RolloverState::Distance(floor, headroom))
+    }
+}
+
+/// [`rollover_state`]'s own verdict -- one type shared by the footer and
+/// sidebar-badge conversions right below it, so the two can never disagree
+/// about which state the seat is in.
+#[derive(Debug, Clone, PartialEq)]
+enum RolloverState {
+    /// `(floor_pct, headroom_pct)`, comfortably clear of the floor.
+    Distance(f64, f64),
+    /// `(floor_pct, headroom_pct)`, within 10 points of the floor.
+    Soon(f64, f64),
+    Pending,
+    Parked {
+        harness: String,
+        resets_at: u64,
+    },
+}
+
+/// [`RolloverState`] as the footer's own [`ui::RolloverFooterFact`].
+fn rollover_footer_fact_of(state: &RolloverState) -> ui::RolloverFooterFact {
+    match state {
+        RolloverState::Distance(floor_pct, headroom_pct) => ui::RolloverFooterFact::Distance {
+            floor_pct: *floor_pct,
+            headroom_pct: *headroom_pct,
+        },
+        RolloverState::Soon(floor_pct, headroom_pct) => ui::RolloverFooterFact::Soon {
+            floor_pct: *floor_pct,
+            headroom_pct: *headroom_pct,
+        },
+        RolloverState::Pending => ui::RolloverFooterFact::Pending,
+        RolloverState::Parked { harness, resets_at } => ui::RolloverFooterFact::Parked {
+            harness: harness.clone(),
+            resets_at: *resets_at,
+        },
+    }
+}
+
+/// [`RolloverState`] as the sidebar's own [`ui::RolloverBadge`] -- only the
+/// two states a badge shows at all (spec's own words: "⤓ pending, ⏸
+/// parked"); distance/soon have no badge of their own.
+fn rollover_badge_of(state: &RolloverState) -> Option<ui::RolloverBadge> {
+    match state {
+        RolloverState::Pending => Some(ui::RolloverBadge::Pending),
+        RolloverState::Parked { .. } => Some(ui::RolloverBadge::Parked),
+        RolloverState::Distance(..) | RolloverState::Soon(..) => None,
+    }
+}
+
 fn assemble_footer_facts(
     focused_row: Option<&ui::SidebarRow>,
     mail: Option<(usize, usize)>,
@@ -1899,6 +2211,17 @@ fn assemble_footer_facts(
     // above is) -- see `FooterAliveFacts::stalled`'s own doc comment for how
     // this overrides the supervision segment.
     stalled: bool,
+    // Dash refresh PR2: the rot track's own eased fill value, kept across
+    // frames by the caller (`ease_toward`) -- `None` in lockstep with
+    // `focused_row`'s own score (there is nothing to ease toward without a
+    // cached score).
+    eased_score: Option<f64>,
+    // Dash refresh PR2: the orchestrator seat's own rollover facts, built by
+    // the caller from the same seat/rollover-runtime reads the sidebar
+    // badge uses -- `None` unless the focused pane IS the orchestrator seat
+    // and rollover has something to say (see `RolloverFooterFact`'s own doc
+    // comment for every hidden case).
+    rollover: Option<ui::RolloverFooterFact>,
 ) -> ui::FooterFacts {
     let footer_workflow = match workflow {
         Some(wf) => ui::FooterWorkflow::Active {
@@ -1937,6 +2260,7 @@ fn assemble_footer_facts(
 
     ui::FooterFacts::Alive(ui::FooterAliveFacts {
         score: row.score,
+        eased_score,
         unread_mail,
         // Issue #209/v3 codex review finding 5: `Pane::reachable()`, via
         // `SidebarRow::supervised` -- a pane whose turn-signal socket
@@ -1944,6 +2268,7 @@ fn assemble_footer_facts(
         // footer now says so instead of assuming every alive pane is fine.
         supervised: row.supervised,
         stalled,
+        rollover,
     })
 }
 
@@ -1972,6 +2297,16 @@ type MailMap = HashMap<String, (usize, usize)>;
 /// last_draw` pattern (`wrap.rs:1362`): the render loop polls every 50ms,
 /// but nothing here needs a disk hit that often.
 const FACTS_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Dash refresh PR2: the JEV sidebar section's own cadence -- coarser than
+/// [`FACTS_THROTTLE`] because the section rolls up a 24h window; nothing
+/// about it needs second-level freshness.
+const JEV_THROTTLE: Duration = Duration::from_secs(10);
+
+/// Dash refresh PR2: how far back the JEV sidebar section's own
+/// `jev::usage_rollup` looks -- 24h (mock §03's own words), narrower than
+/// `zirv ctx jev status`'s 7-day window.
+const JEV_SECTION_WINDOW_SECS: u64 = 24 * 60 * 60;
 
 /// Pure: whether an action last performed at `last` is due again as of `now`,
 /// given how often it may run (`interval`). Shared by the header facts refresh
@@ -2186,6 +2521,20 @@ struct DiskFacts {
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
     /// registered for it.
     pool_seat: Option<String>,
+    /// Dash refresh PR2: this dashboard's own orchestrator seat, in full --
+    /// `pool_seat` above only ever kept the formatted generation string.
+    /// Read on the same throttled tick, the same `<short>.seat.json` file
+    /// `pool_seat` already opens. `None` until a seat is registered.
+    seat_full: Option<super::seat::Seat>,
+    /// Dash refresh PR2: that same seat's own rollover-runtime record
+    /// (`<short>.rollover.json`), read alongside `seat_full` above. `None`
+    /// with no rollover history at all for this seat.
+    rollover_record: Option<super::rollover_runtime::Record>,
+    /// Dash refresh PR2: the JEV sidebar section's facts, refreshed on its
+    /// OWN (much coarser, 10s) cadence -- see `jev_due`/its own call site.
+    /// `None` with every `[jev]` gate off, which is also how the section
+    /// hides itself entirely.
+    jev: Option<ui::JevSectionFact>,
     /// Issue #354: every live pane's work group, by id -- the sidebar's group
     /// headers name a scope, and `group::load` is a disk read that must never
     /// happen per frame. Read by the background [`FactsRefresher`] and swapped
@@ -2720,8 +3069,16 @@ impl FactsCache {
         // short` is this dashboard's own registry short id (D2's own
         // "deliberately the dashboard's own identity" convention, the same
         // field every other per-dashboard disk read on this tick keys off).
-        self.disk.pool_seat =
-            seat::load(state, session_short).map(|s| format!("gen {}", s.generation));
+        let loaded_seat = seat::load(state, session_short);
+        self.disk.pool_seat = loaded_seat
+            .as_ref()
+            .map(|s| format!("gen {}", s.generation));
+        // Dash refresh PR2: the same seat record in full, plus its own
+        // rollover-runtime settlement -- two small JSON files, both already
+        // being read (or immediately adjacent) on this same throttled tick,
+        // never per frame.
+        self.disk.rollover_record = super::rollover_runtime::load(state, session_short);
+        self.disk.seat_full = loaded_seat;
 
         // Issue #264/#457: the aggregate row's own `failed`/`cost` cells --
         // delegations, the seat's own transcript, and its native subagent
@@ -4350,6 +4707,7 @@ fn handover_pane(
 /// and the swap all go through the same seams a manual `Ctrl+A o` does; the
 /// only difference is who decided. A parked seat is asked first, in case its
 /// window has elapsed and the best harness is no longer its own.
+#[allow(clippy::too_many_arguments)]
 fn rollover_sweep(
     panes: &mut [Pane],
     cfg: &CtxConfig,
@@ -4357,6 +4715,15 @@ fn rollover_sweep(
     state: &StateDir,
     pending: &mut Option<(String, u64, Instant)>,
     errors: &mut ErrorLog,
+    // Coordinator follow-up: the footer's rollover distance/soon reading
+    // must be the SAME `source_headroom_pct` this evaluation computed, not
+    // a separate guess -- captured here (via `evaluate`'s own out-param)
+    // and kept across ticks by the caller so the footer can read it on
+    // frames this sweep does not itself run on. Left untouched (not
+    // cleared) on any tick this function returns before calling `evaluate`
+    // at all (e.g. the `on_resume`/parked-return path) -- the last real
+    // reading is still the best answer until a fresh one replaces it.
+    seat_headroom_pct: &mut Option<SeatHeadroom>,
 ) {
     let Some(idx) = panes
         .iter()
@@ -4365,11 +4732,16 @@ fn rollover_sweep(
         return;
     };
     let short = panes[idx].short().to_string();
-    // The seat's own currently-registered model (`Seat::model`, stamped by
-    // the same `seat::register` call `Pane::spawn`/`Pane::handover` make),
-    // not `Pane`'s own state -- this is a point-in-time rollover-eligibility
-    // read, not a reserve/settle pairing, so it can resolve per-model freely.
-    let seat_model = super::seat::load(state, &short).and_then(|seat| seat.model);
+    // The seat in full: its currently-registered model (`Seat::model`,
+    // stamped by the same `seat::register` call `Pane::spawn`/`Pane::
+    // handover` make), for a point-in-time rollover-eligibility read, and
+    // its own `generation`, which is what tags whatever headroom this tick
+    // computes below (review fix: a pane's registry short id survives a
+    // handover unchanged, so `short` alone cannot tell an old seat from a
+    // new one at the same address -- only `generation` advances).
+    let loaded_seat = super::seat::load(state, &short);
+    let seat_generation = loaded_seat.as_ref().map(|seat| seat.generation);
+    let seat_model = loaded_seat.and_then(|seat| seat.model);
     let provider =
         adapters::provider_for_agent_and_model(Some(panes[idx].agent()), seat_model.as_deref())
             .to_string();
@@ -4380,12 +4752,44 @@ fn rollover_sweep(
         Some(req) => req,
         None => {
             let blocked = super::rollover::confirmed_block(state, cfg, now, &provider, &short);
-            match super::rollover::evaluate(state, cfg, "dash", &short, now, idle, blocked, true) {
+            let mut headroom_out: Option<f64> = None;
+            let evaluation = super::rollover::evaluate(
+                state,
+                cfg,
+                "dash",
+                &short,
+                now,
+                idle,
+                blocked,
+                true,
+                &mut headroom_out,
+            );
+            // Cache the reading -- tagged with the generation it was
+            // actually read against -- regardless of what this evaluation
+            // decided: Skip/Pending/Park all still computed a real,
+            // current headroom worth showing. A Rollover decision is
+            // cleared right below instead, before the handover itself.
+            if let (Some(pct), Some(generation)) = (headroom_out, seat_generation) {
+                *seat_headroom_pct = Some(SeatHeadroom {
+                    short: short.clone(),
+                    generation,
+                    pct,
+                });
+            }
+            match evaluation {
                 super::rollover::Evaluation::Rollover { request, .. } => request,
                 _ => return,
             }
         }
     };
+    // Review fix: a handover is about to be attempted (from `on_resume` or
+    // the fresh `Rollover` decision just above) -- `evaluate`'s own
+    // `seat::prepare_onto` already advanced the on-disk seat to `Phase::
+    // Prepared` under a NEW generation before this point, so whatever
+    // headroom is cached for the OLD generation is stale the instant it is
+    // cleared here, not merely once the identity check downstream happens
+    // to notice.
+    *seat_headroom_pct = None;
     // The seat transaction is already open, so a pane that is no longer at a
     // clean boundary has to close it rather than leave it prepared -- the
     // same rule `wrap`'s own refusal arm follows.
@@ -12065,10 +12469,98 @@ fn run_dashboard_inner(
     // shows briefly and then clears instead of pinning behind a warning glyph.
     let mut notices: Vec<Notice> = Vec::new();
     // Issue #202 phase 2b: the sidebar's own working-pane spinner frame
-    // index (`tick % style::tui::SPINNER_FRAMES.len()`). Advanced once per
-    // drawn frame, not on a clock of its own -- the dashboard already
-    // redraws every frame, so this is the only "polling" the spinner needs.
+    // index (`tick % style::tui::SPINNER_FRAMES.len()`). Dash refresh PR2
+    // moved this off "once per drawn frame" (which sped a spinner up to
+    // ~100fps while typing and slowed it to ~20fps idle) onto `dash_start`'s
+    // own clock, 80ms per frame (mock §06's own script) -- see where it is
+    // set, below the input poll. Reduced motion freezes it at 0: the glyph
+    // itself still says "working", only its own movement stops.
+    #[allow(unused_assignments)]
     let mut render_tick: usize = 0;
+    // Dash refresh PR2: `dash.motion`, converted once at launch (see
+    // `dash_motion_of`) -- presentation only, so unlike `sidebar_cols` this
+    // is read straight off `cfg` rather than needing a live-reload seam.
+    let motion = dash_motion_of(cfg);
+    // Dash refresh PR2: the one wall clock every animation in this loop
+    // reads from -- spinners, shimmer and pending-rollover breathing all
+    // want a continuously advancing phase, never one tied to a disk-backed
+    // "since" timestamp (those only have whole-second resolution). Flashes
+    // and the toast track their OWN start `Instant` instead (below), since
+    // those need to measure elapsed time from a specific edge, not just
+    // oscillate forever.
+    let dash_start = Instant::now();
+    // Dash refresh PR2: the footer rot track's own eased fill value --
+    // lags the real score by up to ~300ms so the gauge never jumps once a
+    // second (`ease_toward`); the numeric label stays instant. Seeded from
+    // whatever the very first tick's own score turns out to be, the same
+    // "no fabricated history" rule `FactsCache::state_since` follows.
+    let mut eased_rot_score: Option<f64> = None;
+    let mut last_ease_tick = dash_start;
+    // Coordinator follow-up: LIMITS bars and JEV site bars ease the same
+    // way the rot track does, off the same per-frame `ease_dt_ms` step --
+    // keyed by a caller-chosen string (`"{harness}:{window}"` for LIMITS,
+    // `"jev:{site}"` for JEV) so unrelated bars never share state, and
+    // pruned each frame to whatever bars are actually still drawn (a stale
+    // entry for a harness/site that stopped showing must not linger and
+    // then "ease" a completely different bar that later reuses the key).
+    let mut eased_bars: HashMap<String, f64> = HashMap::new();
+    // Dash refresh PR2: per-pane flash-start times (new mail, or a worker
+    // finishing) -- `Instant`, not the disk-backed facts cache, since a
+    // flash (900ms) needs sub-second precision the facts refresh's own
+    // whole-second clock cannot give it. Cleared for any short no longer on
+    // screen by the same throttled tick that populates it.
+    let mut flash_started: HashMap<String, Instant> = HashMap::new();
+    // Dash refresh PR2: the single most recent toast, dashboard-wide (a
+    // rollover committing, or a worker finishing) -- "at most one visible;
+    // newest wins" (the spec's own words), so one slot, not one per pane.
+    let mut toast: Option<(String, Instant)> = None;
+    // Dash refresh PR2: the orchestrator seat's own rollover-runtime
+    // settlement, as last seen on the facts-refresh cadence -- compared
+    // against the freshly-read one each throttled tick to edge-trigger the
+    // "rolled over" toast (a `Committed` settlement that was not there, or
+    // was a different generation, last time).
+    let mut last_rollover_settlement: Option<super::rollover_runtime::Settlement> = None;
+    // Review fix: both `last_rollover_settlement` above and
+    // `mail_before_refresh` (seeded from `FactsCache`'s still-empty
+    // `mail_by_session` before the very first refresh) look, on tick one,
+    // exactly like "nothing was there before" -- which for a `Committed`
+    // settlement or unread mail that predates this dashboard process is
+    // false: it was already there, this process just had not read it yet.
+    // Without this flag the first real read edge-triggers a "rolled over"
+    // toast off a stale prior settlement and flashes every already-unread
+    // row, the same false-transition mistake the DoneUnread path avoids
+    // for free (its own `previous: Option<Projection>` genuinely means
+    // "never sampled" when absent). Sees exactly one `false` tick, then
+    // stays `true` for the rest of this dashboard's life.
+    let mut seen_first_facts_refresh = false;
+    // Dash refresh PR2: the JEV sidebar section's own (much coarser) 10s
+    // refresh cadence -- `jev::usage_rollup` is a plain read of two small
+    // append-only logs, cheap enough on its own, but there is no reason to
+    // pay it every second when the section only ever needs a 24h rollup.
+    // Seeded a full interval in the past, same reasoning as the mail sweep.
+    let mut last_jev_refresh = Instant::now()
+        .checked_sub(JEV_THROTTLE)
+        .unwrap_or_else(Instant::now);
+    // Dash refresh PR2: when the JEV section's own `last` line last changed
+    // which call it names -- the flash-start clock for that line.
+    let mut jev_last_flash_started: Option<Instant> = None;
+    let mut jev_last_seen: Option<(String, u64)> = None;
+    // Coordinator follow-up: the footer's own rollover distance/soon must
+    // show the exact `source_headroom_pct` the last real `rollover::
+    // evaluate` call computed for this dashboard's orchestrator seat, not
+    // a separately estimated reading -- `None` until that call has run at
+    // least once, which is what hides the distance segment entirely (never
+    // an estimate) before then.
+    //
+    // Review fix: tagged with the seat's own identity (short + generation)
+    // at the moment it was read, and explicitly cleared the instant a
+    // handover fires -- without either, a reading computed for the OLD
+    // seat kept showing (as if it were current) against the NEW seat a
+    // rollover just swapped onto, for up to a whole `evaluate_interval`
+    // (~60s). `rollover_sweep` sets and clears this; the render loop
+    // compares it against `facts_cache.disk.seat_full`'s own current
+    // identity before ever handing it to `rollover_state`.
+    let mut seat_headroom_pct: Option<SeatHeadroom> = None;
     // Dash refresh PR1: the pane header's own `cwd` field is `~`-shortened
     // against the operator's home directory, resolved once here (an env
     // lookup, not a per-frame read) rather than inside the render loop.
@@ -12428,6 +12920,29 @@ fn run_dashboard_inner(
             // one-shot reminder has no sub-tick latency requirement either.
             report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
+        // Dash refresh PR2: the JEV sidebar section, on its own coarser
+        // cadence -- never the render path, never `FACTS_THROTTLE` either
+        // (the section only ever needs 24h-rollup freshness).
+        if due(last_jev_refresh, sweep_now, JEV_THROTTLE) {
+            last_jev_refresh = sweep_now;
+            facts_cache.disk.jev = jev_section_fact(cfg, state);
+            let last_now = facts_cache.disk.jev.as_ref().and_then(|fact| match fact {
+                ui::JevSectionFact::Active { last, .. } => {
+                    last.as_ref().map(|l| (l.site.clone(), l.age_secs))
+                }
+                ui::JevSectionFact::NoKey { .. } => None,
+            });
+            // Edge-triggered on the SITE changing, not the age (age moves
+            // every refresh regardless): a new call landing is a different
+            // site/timestamp pair from what the last refresh saw.
+            if last_now.as_ref().map(|(site, _)| site)
+                != jev_last_seen.as_ref().map(|(site, _)| site)
+                && last_now.is_some()
+            {
+                jev_last_flash_started = Some(Instant::now());
+            }
+            jev_last_seen = last_now;
+        }
         // Issue #358 (task 5): the orchestrator pane's automatic rollover.
         // The evaluation half costs a capacity snapshot, so it runs on its own
         // cadence; its readiness watch (`settle_pending_rollover`, above) is
@@ -12466,6 +12981,7 @@ fn run_dashboard_inner(
                     state,
                     &mut pending_rollover,
                     &mut errors,
+                    &mut seat_headroom_pct,
                 );
                 reactive_pending = panes
                     .iter()
@@ -12530,6 +13046,11 @@ fn run_dashboard_inner(
             }
         }
         let facts_now = Instant::now();
+        // Dash refresh PR2: snapshotted before the refresh overwrites it, so
+        // a NEW-mail flash can edge-trigger on "this short's own count just
+        // went up" rather than "this short has unread mail" (which would
+        // flash on every tick a session sits unread, not just the arrival).
+        let mail_before_refresh = facts_cache.disk.mail_by_session.clone();
         let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
             state,
@@ -12586,8 +13107,58 @@ fn run_dashboard_inner(
                 {
                     push_notice(&mut notices, Instant::now(), text);
                 }
+                // Dash refresh PR2: a worker finishing is the SAME transition
+                // the notice above already computed (`DoneUnread`, not
+                // focused) -- reused here rather than re-derived, for the
+                // row's own flash and the dashboard-wide toast. Unlike the
+                // notice, a flash/toast is not suppressed for the focused
+                // pane: those exist to be *noticed*, not to interrupt.
+                if sample.next == super::attention::Projection::DoneUnread
+                    && sample.previous.is_some_and(|prev| prev != sample.next)
+                {
+                    flash_started.insert(short.clone(), Instant::now());
+                    toast = Some((format!("\u{23fa} {short} finished"), Instant::now()));
+                }
             }
             attention_notices.retain(&shorts);
+            // Dash refresh PR2: new mail (this short's own unread count just
+            // went UP, not merely "is nonzero") flashes its row -- see
+            // `mail_flash_targets`'s own doc comment for the review fix
+            // (nothing flashes on the first real refresh).
+            for short in mail_flash_targets(
+                &mail_before_refresh,
+                &facts_cache.disk.mail_by_session,
+                seen_first_facts_refresh,
+            ) {
+                flash_started.insert(short, Instant::now());
+            }
+            flash_started.retain(|short, _| shorts.iter().any(|s| s == short));
+            // Dash refresh PR2: a rollover that just committed -- see
+            // `rollover_committed_toast`'s own doc comment for the review
+            // fix (no toast for a settlement this dashboard merely
+            // DISCOVERS on its first read).
+            let current_settlement = facts_cache
+                .disk
+                .rollover_record
+                .as_ref()
+                .and_then(|record| record.settlement.clone());
+            if let Some(text) = facts_cache
+                .disk
+                .rollover_record
+                .as_ref()
+                .and_then(|record| {
+                    rollover_committed_toast(
+                        &current_settlement,
+                        &last_rollover_settlement,
+                        seen_first_facts_refresh,
+                        &record.source_agent,
+                    )
+                })
+            {
+                toast = Some((text, Instant::now()));
+            }
+            last_rollover_settlement = current_settlement;
+            seen_first_facts_refresh = true;
         }
         // L19: drop any recently-reaped short the registry snapshot no longer
         // carries -- once a refresh clears the released record, the exclusion
@@ -14708,7 +15279,61 @@ fn run_dashboard_inner(
         );
         let mut rows = rows;
         enrich_sidebar(&mut rows, &facts_cache.disk, super::state::now_secs());
-        render_tick = render_tick.wrapping_add(1);
+        // Dash refresh PR2: clock-driven, not per-drawn-frame -- see this
+        // variable's own doc comment above the loop.
+        render_tick = if motion.is_full() {
+            (dash_start.elapsed().as_millis() / 80) as usize
+        } else {
+            0
+        };
+        // Dash refresh PR2: the orchestrator seat's own rollover state,
+        // computed once per frame from this same tick's disk-backed reads
+        // (never new I/O) -- shared by the sidebar badge (this seat's own
+        // row) and the footer segment (only when that seat is FOCUSED, see
+        // below).
+        //
+        // Review fix: `seat_headroom_pct` is only trusted when it names the
+        // SAME seat (short + generation) `seat_full` reads as current right
+        // now -- a reading cached for a seat a rollover has since replaced
+        // must never be shown against its successor.
+        let seat_headroom_for_current = seat_headroom_for_current(
+            seat_headroom_pct.as_ref(),
+            facts_cache.disk.seat_full.as_ref(),
+        );
+        let rollover_state_now = rollover_state(
+            cfg,
+            facts_cache.disk.seat_full.as_ref(),
+            facts_cache.disk.rollover_record.as_ref(),
+            seat_headroom_for_current,
+        );
+        if let Some(state) = &rollover_state_now
+            && let Some(seat) = facts_cache.disk.seat_full.as_ref()
+            && let Some(row) = rows.iter_mut().find(|r| r.short == seat.short)
+        {
+            row.rollover_badge = rollover_badge_of(state);
+        }
+        for row in rows.iter_mut() {
+            row.flash = flash_started
+                .get(&row.short)
+                .map(|started| ui::row_flash_style(started.elapsed().as_millis() as u64, motion))
+                .unwrap_or(None);
+        }
+        flash_started.retain(|_, started| started.elapsed().as_millis() < 900);
+        // Dash refresh PR2: the rot track's own eased fill -- lags the
+        // focused row's real score by up to ~300ms (`ease_toward`); reset to
+        // the raw score outright whenever nothing was there to ease FROM
+        // (no focused row last tick, or it had no score) rather than easing
+        // from a stale, unrelated pane's reading.
+        let ease_now = Instant::now();
+        let ease_dt_ms = ease_now.duration_since(last_ease_tick).as_millis() as u64;
+        last_ease_tick = ease_now;
+        let focused_score_now = rows
+            .iter()
+            .find(|r| r.focused)
+            .and_then(|r| r.score)
+            .map(|s| s as f64);
+        eased_rot_score = focused_score_now
+            .map(|target| ease_toward_score(eased_rot_score, target, ease_dt_ms, motion));
 
         // L13: a live notice (info) shows as plain text and takes precedence
         // while fresh; once it expires the sticky error line (⚠) shows through
@@ -14783,6 +15408,14 @@ fn run_dashboard_inner(
         // way `focused_mail` is right above.
         let focused_stalled =
             focused_row.is_some_and(|row| facts_cache.disk.stalled.contains(&row.short));
+        // Dash refresh PR2: the rollover segment is orchestrator-seat-only,
+        // and only when that seat is the one FOCUSED right now (`FooterAlive
+        // Facts` is always about the focused pane, never any other row).
+        let footer_rollover = panes
+            .get(focused)
+            .filter(|p| p.role() == prompt::PromptRole::Orchestrator)
+            .and(rollover_state_now.as_ref())
+            .map(rollover_footer_fact_of);
         let footer_facts = assemble_footer_facts(
             focused_row,
             focused_mail,
@@ -14798,6 +15431,8 @@ fn run_dashboard_inner(
                 )
             }),
             focused_stalled,
+            eased_rot_score,
+            footer_rollover,
         );
 
         let bands = (cfg.score.advise_at, cfg.score.compact_at);
@@ -14864,6 +15499,18 @@ fn run_dashboard_inner(
         // same `&overlay` it was built from -- see `overlay_route_is_current`.
         let next_snapshot_overlay_ident = overlay_identity(&overlay);
         let focus_cwd = panes.get(focused).map(|p| p.cwd().display().to_string());
+        // Dash refresh PR2: drop the toast once it has fully faded (5s) --
+        // harmless to keep, but there is no reason to.
+        if toast
+            .as_ref()
+            .is_some_and(|(_, started)| started.elapsed().as_millis() >= 5_000)
+        {
+            toast = None;
+        }
+        let pane_header_toast = toast.as_ref().and_then(|(text, started)| {
+            ui::toast_style(started.elapsed().as_millis() as u64, motion)
+                .map(|style| (text.clone(), style))
+        });
         // Dash refresh PR1: the focused pane's own header row -- left
         // identity, right workflow/state -- replaces `render_focus_rule`'s
         // old text-in-the-rule treatment. `None` (nothing focused, an empty
@@ -14880,6 +15527,7 @@ fn run_dashboard_inner(
             glyph: ui::glyph_for(row),
             state_word: row.fact_state.clone(),
             age_secs: row.fact_since_secs,
+            toast: pane_header_toast,
         });
         // Dash refresh PR1: the LIMITS block, pinned to the bottom of the
         // session column -- session rows win the space (`roster.lines` is
@@ -14889,7 +15537,18 @@ fn run_dashboard_inner(
         // enough room. `disk.usage` is already filtered to enabled
         // harnesses (`FactsCache::refresh_if_due`'s own `cfg.agents.
         // is_enabled` gate), so a disabled harness never reaches here.
-        let limits_blocks = ui::limits_blocks_from_usage(&facts_cache.disk.usage);
+        // Coordinator follow-up: LIMITS/JEV bars ease the same way the rot
+        // track does -- `touched_bar_keys` is every key either one used
+        // this frame, so a harness/site that stopped showing drops out of
+        // `eased_bars` instead of lingering to "ease" whatever later reuses
+        // its key.
+        let mut touched_bar_keys: HashSet<String> = HashSet::new();
+        let mut limits_blocks = ui::limits_blocks_from_usage(&facts_cache.disk.usage);
+        for block in &mut limits_blocks {
+            let key = format!("limits:{}:{}", block.harness, block.window_label);
+            block.eased_pct = ease_bar(&mut eased_bars, &key, block.pct, ease_dt_ms, motion);
+            touched_bar_keys.insert(key);
+        }
         let limits_available_rows = layout
             .sidebar
             .height
@@ -14901,6 +15560,65 @@ fn run_dashboard_inner(
             height: limits_height,
             ..layout.sidebar
         };
+        // Dash refresh PR2: the JEV section sits between the roster and
+        // LIMITS -- vertical priority (spec's own words) is sessions, then
+        // LIMITS, then JEV, so LIMITS' own budget above is computed exactly
+        // as PR1 left it (unaffected by JEV's existence), and JEV gets
+        // whatever is left between the roster's own last drawn row and
+        // wherever LIMITS starts. `jev_fixed_rows` is the title/rule plus
+        // either the one `no key` line or the four `Active` fixed lines
+        // (`calls`/`wait`/`errors`/`last`) -- the section hides entirely the
+        // instant even those do not fit, before a single site row is drawn.
+        let jev_available_rows = layout
+            .sidebar
+            .height
+            .saturating_sub(roster.drawn_rows() as u16)
+            .saturating_sub(limits_height);
+        let (jev_shown_sites, jev_height) = match &facts_cache.disk.jev {
+            Some(fact) => {
+                let jev_fixed_rows: u16 = match fact {
+                    ui::JevSectionFact::NoKey { .. } => 2 + 1,
+                    ui::JevSectionFact::Active { .. } => 2 + 4,
+                };
+                if jev_available_rows < jev_fixed_rows {
+                    (0, 0)
+                } else {
+                    let site_count = match fact {
+                        ui::JevSectionFact::NoKey { .. } => 0,
+                        ui::JevSectionFact::Active { sites, .. } => sites.len(),
+                    };
+                    let shown =
+                        ui::jev_sites_fitting(site_count, jev_available_rows - jev_fixed_rows);
+                    (shown, ui::jev_rows_for(fact, shown))
+                }
+            }
+            None => (0, 0),
+        };
+        let jev_area = Rect {
+            y: layout.sidebar.y + roster.drawn_rows() as u16,
+            height: jev_height,
+            ..layout.sidebar
+        };
+        // Dash refresh PR2: the JEV `last` line flashes on a NEW call
+        // landing -- edge-triggered the same way a sidebar row's mail flash
+        // is (`jev_last_flash_started`, set where the 10s Jev refresh runs).
+        let jev_last_flash = jev_last_flash_started
+            .map(|started| ui::row_flash_style(started.elapsed().as_millis() as u64, motion))
+            .unwrap_or(None);
+        // Coordinator follow-up: the JEV section's own site bars ease too --
+        // a rendering-only clone (`facts_cache.disk.jev` itself stays the
+        // raw target from the last 10s refresh; see `eased_jev_fact`'s own
+        // doc comment for why).
+        let jev_eased_fact = facts_cache.disk.jev.as_ref().map(|fact| {
+            eased_jev_fact(
+                fact,
+                &mut eased_bars,
+                ease_dt_ms,
+                motion,
+                &mut touched_bar_keys,
+            )
+        });
+        eased_bars.retain(|key, _| touched_bar_keys.contains(key));
         // Dash refresh PR1: below the narrow-terminal floor `layout.sidebar`
         // is 0-wide (`sidebar_cols` is 0), and the two rules must draw a
         // plain line with no `┬`/`┼`/`┴` junction at all -- there is no
@@ -14931,11 +15649,23 @@ fn run_dashboard_inner(
                     ui::render_sidebar_title(f, layout.sidebar_title, rows.len());
                 }
                 if let Some(pane_header_facts) = &pane_header_facts {
-                    ui::render_pane_header(f, layout.pane_header, pane_header_facts, render_tick);
+                    ui::render_pane_header(
+                        f,
+                        layout.pane_header,
+                        pane_header_facts,
+                        render_tick,
+                        dash_start.elapsed().as_millis() as u64,
+                        motion,
+                    );
                 }
                 ui::render_mid_rule(f, layout.mid_rule, rule_divider_col);
                 if !sidebar_hidden_now {
                     ui::render_roster(f, layout.sidebar, &roster);
+                    if jev_height > 0
+                        && let Some(fact) = &jev_eased_fact
+                    {
+                        ui::render_jev(f, jev_area, fact, jev_shown_sites, jev_last_flash);
+                    }
                     if limits_height > 0 {
                         ui::render_limits(
                             f,
@@ -14981,6 +15711,11 @@ fn run_dashboard_inner(
                         &footer_facts,
                         cfg.score.advise_at,
                         cfg.score.compact_at,
+                        cfg.score.restart_at,
+                        super::state::now_secs(),
+                        local_offset,
+                        dash_start.elapsed().as_millis() as u64,
+                        motion,
                     );
                 }
             }
@@ -17712,12 +18447,274 @@ mod tests {
             fact_since_secs: Some(90),
             workflow: None,
             unread_mail: 0,
+            rollover_badge: None,
+            flash: None,
         }
+    }
+
+    // Coordinator follow-up: `rollover_state` must show the exact
+    // `source_headroom_pct` `rollover::evaluate` computed, never a separate
+    // estimate, and must hide the distance/soon segment entirely (not
+    // approximate one) when no evaluation has produced a reading yet.
+
+    fn test_seat(agent: &str, phase: seat::Phase, pending: Option<seat::Pending>) -> seat::Seat {
+        seat::Seat {
+            short: "orch0001".to_string(),
+            session: "s".to_string(),
+            generation: 1,
+            agent: agent.to_string(),
+            model: None,
+            provider: "anthropic".to_string(),
+            role: "orchestrator".to_string(),
+            pinned: false,
+            phase,
+            visited: Vec::new(),
+            last_rollover_at: None,
+            rollover_failures: 0,
+            failed_rollover_observed_at: None,
+            pending,
+            displaced: None,
+            created_at: 0,
+            updated_at: 0,
+            runtime: Default::default(),
+        }
+    }
+
+    fn rollover_test_cfg() -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.enabled = true;
+        cfg.fallback.auto_orchestrator_rollover = Some(true);
+        cfg.fallback.order = vec!["claude".to_string(), "codex".to_string()];
+        cfg
+    }
+
+    #[test]
+    fn rollover_state_hides_the_distance_segment_with_no_evaluation_yet() {
+        let cfg = rollover_test_cfg();
+        let seat = test_seat("claude", seat::Phase::Idle, None);
+        assert_eq!(
+            rollover_state(&cfg, Some(&seat), None, None),
+            None,
+            "no rollover::evaluate has run yet -- never fabricate a headroom reading"
+        );
+    }
+
+    #[test]
+    fn rollover_state_distance_and_soon_use_the_evaluations_own_headroom() {
+        let cfg = rollover_test_cfg();
+        let seat = test_seat("claude", seat::Phase::Idle, None);
+        // floor defaults to `predictive_headroom_pct` (20.0).
+        assert_eq!(
+            rollover_state(&cfg, Some(&seat), None, Some(59.0)),
+            Some(RolloverState::Distance(20.0, 59.0))
+        );
+        assert_eq!(
+            rollover_state(&cfg, Some(&seat), None, Some(24.0)),
+            Some(RolloverState::Soon(20.0, 24.0)),
+            "within 10 points of the floor is soon, not distance"
+        );
+    }
+
+    #[test]
+    fn rollover_state_pending_and_parked_never_read_the_headroom_at_all() {
+        let cfg = rollover_test_cfg();
+        let pending_seat = test_seat(
+            "claude",
+            seat::Phase::Idle,
+            Some(seat::Pending {
+                cause: seat::Cause::Manual,
+                since: 0,
+            }),
+        );
+        // A `None` headroom would hide a plain distance reading, but
+        // pending/parked never consult it in the first place.
+        assert_eq!(
+            rollover_state(&cfg, Some(&pending_seat), None, None),
+            Some(RolloverState::Pending)
+        );
+        let parked_seat = test_seat(
+            "claude",
+            seat::Phase::Parked {
+                until: 100,
+                window: "5h".to_string(),
+                reason: "no headroom anywhere".to_string(),
+                since: 0,
+            },
+            None,
+        );
+        assert_eq!(
+            rollover_state(&cfg, Some(&parked_seat), None, None),
+            Some(RolloverState::Parked {
+                harness: "claude".to_string(),
+                resets_at: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn rollover_state_hidden_when_fallback_or_auto_rollover_is_off() {
+        let seat = test_seat("claude", seat::Phase::Idle, None);
+        let mut cfg = rollover_test_cfg();
+        cfg.fallback.enabled = false;
+        assert_eq!(rollover_state(&cfg, Some(&seat), None, Some(59.0)), None);
+
+        let mut cfg = rollover_test_cfg();
+        cfg.fallback.auto_orchestrator_rollover = Some(false);
+        assert_eq!(rollover_state(&cfg, Some(&seat), None, Some(59.0)), None);
+    }
+
+    // Coordinator follow-up: LIMITS/JEV bar easing (`ease_bar`).
+
+    #[test]
+    fn ease_bar_starts_at_target_for_a_never_seen_key_then_converges() {
+        let mut cache: HashMap<String, f64> = HashMap::new();
+        let first = ease_bar(&mut cache, "claude:5h", 80.0, 0, ui::Motion::Full);
+        assert_eq!(
+            first, 80.0,
+            "nothing to ease FROM yet -- starts at the target"
+        );
+
+        // The target drops (a fresh, lower reading); repeated small steps
+        // converge toward it rather than jumping.
+        let mut value = first;
+        for _ in 0..30 {
+            value = ease_bar(&mut cache, "claude:5h", 20.0, 20, ui::Motion::Full);
+        }
+        assert!(
+            (value - 20.0).abs() < 1.0,
+            "must have converged after 30 steps of 20ms: {value}"
+        );
+    }
+
+    #[test]
+    fn ease_bar_reduced_motion_snaps_and_keys_never_cross_talk() {
+        let mut cache: HashMap<String, f64> = HashMap::new();
+        ease_bar(&mut cache, "claude:5h", 80.0, 0, ui::Motion::Full);
+        assert_eq!(
+            ease_bar(&mut cache, "claude:5h", 20.0, 20, ui::Motion::Reduced),
+            20.0,
+            "reduced motion snaps to the target outright"
+        );
+        // A different key never inherits "claude:5h"'s own cached value.
+        assert_eq!(
+            ease_bar(&mut cache, "codex:wk", 50.0, 0, ui::Motion::Full),
+            50.0
+        );
+    }
+
+    // Review fix: stale headroom after a handover (`seat_headroom_for_current`).
+
+    #[test]
+    fn seat_headroom_for_current_matches_only_the_exact_seat_identity() {
+        let cached = SeatHeadroom {
+            short: "orch0001".to_string(),
+            generation: 2,
+            pct: 41.0,
+        };
+        let same_seat = test_seat("claude", seat::Phase::Idle, None);
+        assert_eq!(
+            seat_headroom_for_current(Some(&cached), Some(&same_seat)),
+            None,
+            "test_seat's own generation (1) does not match the cached one (2)"
+        );
+
+        let mut matching_seat = test_seat("codex", seat::Phase::Idle, None);
+        matching_seat.short = "orch0001".to_string();
+        matching_seat.generation = 2;
+        assert_eq!(
+            seat_headroom_for_current(Some(&cached), Some(&matching_seat)),
+            Some(41.0)
+        );
+
+        // A rollover bumped the generation at the SAME short address -- the
+        // whole point of keying by generation, not short alone.
+        let mut new_generation = matching_seat.clone();
+        new_generation.generation = 3;
+        assert_eq!(
+            seat_headroom_for_current(Some(&cached), Some(&new_generation)),
+            None,
+            "same short, new generation -- must not show the old seat's reading"
+        );
+
+        assert_eq!(seat_headroom_for_current(None, Some(&matching_seat)), None);
+        assert_eq!(seat_headroom_for_current(Some(&cached), None), None);
+    }
+
+    // Review fix: false toast/flash on the dashboard's first observation.
+
+    #[test]
+    fn mail_flash_targets_never_flashes_on_the_first_observation() {
+        let mut after: MailMap = HashMap::new();
+        after.insert("aaa11111".to_string(), (1, 0));
+        assert_eq!(
+            mail_flash_targets(&MailMap::new(), &after, false),
+            Vec::<String>::new(),
+            "pre-existing unread mail must not flash just because this is the first read"
+        );
+    }
+
+    #[test]
+    fn mail_flash_targets_flashes_only_a_count_that_rose_since_the_last_observation() {
+        let mut before: MailMap = HashMap::new();
+        before.insert("aaa11111".to_string(), (1, 0));
+        before.insert("bbb22222".to_string(), (2, 0));
+        let mut after: MailMap = HashMap::new();
+        after.insert("aaa11111".to_string(), (2, 0)); // rose 1 -> 2
+        after.insert("bbb22222".to_string(), (2, 0)); // unchanged
+        after.insert("ccc33333".to_string(), (1, 0)); // brand new short
+        let mut flashed = mail_flash_targets(&before, &after, true);
+        flashed.sort();
+        assert_eq!(
+            flashed,
+            vec!["aaa11111".to_string(), "ccc33333".to_string()]
+        );
+    }
+
+    #[test]
+    fn rollover_committed_toast_never_fires_on_the_first_observation() {
+        let committed = Some(super::super::rollover_runtime::Settlement::Committed {
+            route: "codex".to_string(),
+            generation: 2,
+        });
+        assert_eq!(
+            rollover_committed_toast(&committed, &None, false, "claude"),
+            None,
+            "a settlement that predates this dashboard process must not toast on discovery"
+        );
+    }
+
+    #[test]
+    fn rollover_committed_toast_fires_only_for_a_genuinely_new_commit() {
+        let committed = Some(super::super::rollover_runtime::Settlement::Committed {
+            route: "codex".to_string(),
+            generation: 2,
+        });
+        // A transition INTO Committed, seen after at least one observation.
+        let text = rollover_committed_toast(&committed, &None, true, "claude")
+            .expect("a fresh commit must toast");
+        assert!(text.contains("claude"), "got {text:?}");
+        assert!(text.contains("gen 2"), "got {text:?}");
+
+        // Unchanged from the last observation: no repeat toast.
+        assert_eq!(
+            rollover_committed_toast(&committed, &committed, true, "claude"),
+            None
+        );
+
+        // Not a Committed settlement at all: no toast.
+        let parked = Some(super::super::rollover_runtime::Settlement::Parked {
+            until: 100,
+            reason: "no headroom anywhere".to_string(),
+        });
+        assert_eq!(
+            rollover_committed_toast(&parked, &None, true, "claude"),
+            None
+        );
     }
 
     #[test]
     fn assemble_footer_facts_is_none_with_nothing_focused_and_no_exit_to_report() {
-        let facts = assemble_footer_facts(None, None, None, None, false);
+        let facts = assemble_footer_facts(None, None, None, None, false, None, None);
         assert!(matches!(facts, ui::FooterFacts::None));
     }
 
@@ -17726,7 +18723,15 @@ mod tests {
     /// the dead-pane variant instead of drawing nothing.
     #[test]
     fn assemble_footer_facts_is_dead_when_nothing_is_focused_but_something_just_exited() {
-        let facts = assemble_footer_facts(None, None, None, Some(("codex", Some(720))), false);
+        let facts = assemble_footer_facts(
+            None,
+            None,
+            None,
+            Some(("codex", Some(720))),
+            false,
+            None,
+            None,
+        );
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "codex");
@@ -17742,7 +18747,7 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_score_and_mail_for_the_focused_row() {
         let row = focused_alive_row(Some(47));
-        let facts = assemble_footer_facts(Some(&row), Some((2, 1)), None, None, false);
+        let facts = assemble_footer_facts(Some(&row), Some((2, 1)), None, None, false, None, None);
         match facts {
             ui::FooterFacts::Alive(alive) => {
                 assert_eq!(alive.score, Some(47));
@@ -17760,7 +18765,7 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_unsupervised_through() {
         let row = focused_alive_row_supervised(None, false);
-        let facts = assemble_footer_facts(Some(&row), None, None, None, false);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, false, None, None);
         match facts {
             ui::FooterFacts::Alive(alive) => assert!(!alive.supervised),
             _ => panic!("expected FooterFacts::Alive"),
@@ -17773,7 +18778,7 @@ mod tests {
     #[test]
     fn assemble_footer_facts_carries_stalled_through() {
         let row = focused_alive_row(Some(47));
-        let facts = assemble_footer_facts(Some(&row), None, None, None, true);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, true, None, None);
         match facts {
             ui::FooterFacts::Alive(alive) => assert!(alive.stalled),
             _ => panic!("expected FooterFacts::Alive"),
@@ -17787,7 +18792,7 @@ mod tests {
         let mut row = focused_alive_row(Some(12));
         row.state = ui::RowState::Dead;
         row.age_secs = Some(720);
-        let facts = assemble_footer_facts(Some(&row), None, None, None, false);
+        let facts = assemble_footer_facts(Some(&row), None, None, None, false, None, None);
         match facts {
             ui::FooterFacts::Dead(dead) => {
                 assert_eq!(dead.harness, "claude");
@@ -17963,7 +18968,8 @@ mod tests {
             step: "design".to_string(),
             awaiting_approval: false,
         };
-        let facts = assemble_footer_facts(Some(&row), None, Some(&summary), None, false);
+        let facts =
+            assemble_footer_facts(Some(&row), None, Some(&summary), None, false, None, None);
         match facts {
             ui::FooterFacts::Alive(_) => {}
             _ => panic!("expected FooterFacts::Alive"),
@@ -17983,7 +18989,8 @@ mod tests {
             step: "spec".to_string(),
             awaiting_approval: true,
         };
-        let facts = assemble_footer_facts(Some(&row), None, Some(&summary), None, false);
+        let facts =
+            assemble_footer_facts(Some(&row), None, Some(&summary), None, false, None, None);
         match facts {
             ui::FooterFacts::Dead(dead) => match dead.workflow {
                 ui::FooterWorkflow::Active { kind, step, gated } => {

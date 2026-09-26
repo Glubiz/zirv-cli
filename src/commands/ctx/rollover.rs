@@ -457,6 +457,16 @@ impl<'a> LiveAutoRollover<'a> {
 /// `interactive` is the seat's own launch interactivity, carried
 /// onto the request so the successor's permission posture matches the
 /// predecessor's (`handover::resolve_swap_launch`).
+///
+/// `source_headroom_out`, when given, is set to the source seat's own
+/// `source_headroom_pct` reading the instant this call computes it --
+/// `None` (left untouched) for every early return above that point (no
+/// seat record, fallback/auto-rollover off, pinned, not idle-phased, or
+/// fewer than two enabled harnesses), and whatever the fresh-window check
+/// found afterward (including `None` for stale/missing/`overage_covered`).
+/// Dash refresh PR2's own seam: the dashboard's footer wants to show
+/// exactly the headroom this evaluation used to decide, never a separate
+/// guess of its own -- see `dash::mod::rollover_sweep`.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     state: &StateDir,
@@ -467,6 +477,7 @@ pub fn evaluate(
     idle: bool,
     confirmed_block: Option<String>,
     interactive: bool,
+    source_headroom_out: &mut Option<f64>,
 ) -> Evaluation {
     let Some(current) = seat::load(state, seat_short) else {
         return Evaluation::Skip(format!("no seat record for {seat_short}"));
@@ -524,6 +535,7 @@ pub fn evaluate(
         .filter(|window| !window.stale && !window.overage_covered);
     let source_headroom_pct =
         fresh.and_then(|_| source.and_then(|p| allocator::projected_headroom(p, cfg, 0)));
+    *source_headroom_out = source_headroom_pct;
     let source_observed_at = fresh.map(|window| window.observed_at).unwrap_or(now);
     if seat::failure_backoff_active(
         &current,
@@ -2032,7 +2044,9 @@ mod tests {
         idle: bool,
         blocked: Option<String>,
     ) -> Evaluation {
-        evaluate(state, cfg, "wrap", SHORT, NOW, idle, blocked, true)
+        evaluate(
+            state, cfg, "wrap", SHORT, NOW, idle, blocked, true, &mut None,
+        )
     }
 
     #[test]
@@ -2553,6 +2567,60 @@ mod tests {
         );
     }
 
+    /// Coordinator follow-up (dash refresh PR2): `evaluate`'s own
+    /// `source_headroom_out` is set to exactly the `source_headroom_pct`
+    /// this call computed on a normal run, and left `None` (untouched) for
+    /// an early return that never reaches that computation at all -- the
+    /// dashboard's footer must never show a stale or fabricated reading.
+    #[test]
+    fn evaluate_reports_its_own_source_headroom_and_leaves_it_none_before_computing_one() {
+        let (_dir, state) = temp_state();
+        let mut cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 85.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+
+        let mut headroom = None;
+        let _ = evaluate(
+            &state,
+            &cfg,
+            "wrap",
+            SHORT,
+            NOW,
+            true,
+            None,
+            true,
+            &mut headroom,
+        );
+        let headroom = headroom.expect("a fresh, non-stale window computed a reading");
+        assert!(
+            headroom < cfg.fallback.rollover_headroom_pct(),
+            "85% used must read as headroom below the default threshold: {headroom}"
+        );
+
+        // An early return (here: auto rollover disabled) never reaches the
+        // headroom computation at all -- the out-param stays exactly what
+        // the caller seeded it with.
+        cfg.fallback.auto_orchestrator_rollover = Some(false);
+        let mut headroom = Some(999.0);
+        let _ = evaluate(
+            &state,
+            &cfg,
+            "wrap",
+            SHORT,
+            NOW,
+            true,
+            None,
+            true,
+            &mut headroom,
+        );
+        assert_eq!(
+            headroom,
+            Some(999.0),
+            "an early Skip must not touch the caller's out-param at all"
+        );
+    }
+
     #[test]
     fn a_disabled_or_pinned_seat_is_skipped() {
         let (_dir, state) = temp_state();
@@ -2922,6 +2990,7 @@ mod tests {
                 false,
                 Some("confirmed block".to_string()),
                 true,
+                &mut None,
             );
             if elapsed < 120 {
                 assert!(matches!(result, Evaluation::Pending(_)), "{result:?}");
@@ -2961,7 +3030,8 @@ mod tests {
                     NOW + elapsed,
                     false,
                     None,
-                    true
+                    true,
+                    &mut None,
                 ),
                 Evaluation::Pending(seat::Cause::Proactive { .. })
             ));
