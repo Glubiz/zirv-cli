@@ -1900,6 +1900,15 @@ implements.
   a scripted `fixture`), route, `[budgets]`, per-stage repetitions, the
   promotion `[criteria]`, and a `[candidate_space]` bounding what a
   `[[candidates]]` entry may actually vary.
+- **Stages and splits**: `screen`/`validate`/`holdout` each name a corpus
+  split and a repetition count, and may optionally narrow to specific
+  corpus `class` values with `classes = [...]`. `screen` and `validate`
+  must use different splits, and neither may use `holdout` (reserved for
+  the single final confirmation) -- a manifest violating either is refused
+  at load time. `plan` also refuses a `validate`/`holdout` stage that could
+  never reach `criteria.min_pairs` given its split, `classes` filter, and
+  `reps`, so a campaign that can never promote anything is caught before a
+  single real trial runs.
 - **Campaign directory**: `<ctx state dir>/research/<id>/` by default (or
   `--dir`) -- an immutable `lock.json` (resolved manifest + hash, baseline
   sha, evaluator file hashes, zirv version) written once, an append-only
