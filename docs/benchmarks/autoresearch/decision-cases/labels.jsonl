@@ -1,0 +1,36 @@
+{"id": "ic001", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic002", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic003", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic010", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic011", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic012", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic019", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic020", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic021", "seat_tier": "standard", "clarify": true, "tags": ["ambiguous"], "weight": 1.0}
+{"id": "ic004", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic005", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic006", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic013", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic014", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic015", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic022", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic023", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic024", "seat_tier": "standard", "clarify": false, "tags": ["misleading_metadata", "costly_error"], "weight": 2.0}
+{"id": "ic007", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic008", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic009", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic016", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic017", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic018", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic025", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic026", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic027", "seat_tier": "standard", "clarify": true, "tags": ["insufficient_facts"], "weight": 1.0}
+{"id": "ic028", "seat_tier": "deep", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic029", "seat_tier": "deep", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic030", "seat_tier": "frontier", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic031", "seat_tier": "deep", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic032", "seat_tier": "frontier", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic033", "seat_tier": "deep", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic034", "seat_tier": "frontier", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic035", "seat_tier": "deep", "clarify": false, "tags": ["costly_error"], "weight": 2.0}
+{"id": "ic036", "seat_tier": "frontier", "clarify": false, "tags": ["costly_error"], "weight": 2.0}

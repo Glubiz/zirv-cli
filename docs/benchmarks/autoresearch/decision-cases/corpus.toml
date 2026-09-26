@@ -1,0 +1,264 @@
+# Intake decision-case corpus (issue #803).
+#
+# Same format as ../../wrapped-vs-vanilla/corpus.toml: every case in
+# inputs.jsonl/labels.jsonl appears here exactly once, family="intake",
+# kind="decision" (graded by decision_trial.py, not run.py). class reuses
+# wrapped-vs-vanilla's class enum (ambiguous/sensitive fit best here); tags
+# (in labels.jsonl, not here) are the finer #803 axis: ambiguous,
+# misleading_metadata, insufficient_facts, costly_error -- every tag is
+# represented in every split.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "ic001"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic002"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic003"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic010"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic011"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic012"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic019"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic020"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic021"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic004"
+family = "intake"
+class = "sensitive"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic005"
+family = "intake"
+class = "sensitive"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic006"
+family = "intake"
+class = "sensitive"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic013"
+family = "intake"
+class = "sensitive"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic014"
+family = "intake"
+class = "sensitive"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic015"
+family = "intake"
+class = "sensitive"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic022"
+family = "intake"
+class = "sensitive"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic023"
+family = "intake"
+class = "sensitive"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic024"
+family = "intake"
+class = "sensitive"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic007"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic008"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic009"
+family = "intake"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic016"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic017"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic018"
+family = "intake"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic025"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic026"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic027"
+family = "intake"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic028"
+family = "intake"
+class = "sensitive"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic029"
+family = "intake"
+class = "sensitive"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic030"
+family = "intake"
+class = "architecture"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ic031"
+family = "intake"
+class = "sensitive"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic032"
+family = "intake"
+class = "architecture"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic033"
+family = "intake"
+class = "sensitive"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ic034"
+family = "intake"
+class = "architecture"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic035"
+family = "intake"
+class = "sensitive"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ic036"
+family = "intake"
+class = "architecture"
+split = "holdout"
+kind = "decision"
