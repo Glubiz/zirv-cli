@@ -165,27 +165,47 @@ impl Split {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Every task `class` the corpus contract (`CONTRACT.md`'s "Task corpus and
+/// splits") recognizes -- a `[stages.*] classes` entry outside this set is
+/// refused at manifest-validate time rather than silently matching nothing.
+pub const KNOWN_TASK_CLASSES: &[&str] = &[
+    "mechanical",
+    "bounded",
+    "bug",
+    "feature",
+    "architecture",
+    "ambiguous",
+    "sensitive",
+    "long_session",
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StageSpec {
     pub split: Split,
     pub reps: u32,
+    /// Issue #804: narrows this stage to only these corpus `class` values
+    /// (empty/absent, the default -- every task of the split).
+    #[serde(default)]
+    pub classes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HoldoutStageSpec {
     pub split: Split,
     pub reps: u32,
     #[serde(default = "default_holdout_max_uses")]
     pub max_uses: u32,
+    #[serde(default)]
+    pub classes: Vec<String>,
 }
 
 fn default_holdout_max_uses() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stages {
     pub screen: StageSpec,
@@ -428,6 +448,46 @@ impl Manifest {
             // Unmeasured downstream (issue #802's `runtime = native` clause).
         }
 
+        for (label, classes) in [
+            ("screen", &self.stages.screen.classes),
+            ("validate", &self.stages.validate.classes),
+            ("holdout", &self.stages.holdout.classes),
+        ] {
+            for class in classes {
+                if !KNOWN_TASK_CLASSES.contains(&class.as_str()) {
+                    return Err(format!(
+                        "stages.{label}.classes: '{class}' is not a known task class (expected one of {KNOWN_TASK_CLASSES:?})"
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Issue #801 split discipline: screen and validate measuring the
+        // same split would let validate re-confirm exactly what screen
+        // already saw rather than generalizing past it, and holdout is
+        // reserved for the single final confirmation -- neither earlier
+        // stage may spend it.
+        if self.stages.screen.split == self.stages.validate.split {
+            return Err(format!(
+                "stages.screen and stages.validate must use different splits (both use {:?}): validate would re-measure exactly what screen already saw",
+                self.stages.screen.split
+            )
+            .into());
+        }
+        if self.stages.screen.split == Split::Holdout {
+            return Err(
+                "stages.screen.split may not be \"holdout\": holdout is reserved for the single final confirmation"
+                    .into(),
+            );
+        }
+        if self.stages.validate.split == Split::Holdout {
+            return Err(
+                "stages.validate.split may not be \"holdout\": holdout is reserved for the single final confirmation"
+                    .into(),
+            );
+        }
+
         Ok(())
     }
 }
@@ -532,6 +592,106 @@ requires_receipts = ["totally-made-up:thing"]
         assert!(
             err.to_string().contains("totally-made-up:thing"),
             "got: {err}"
+        );
+    }
+
+    fn manifest_with_stage_splits(screen_split: &str, validate_split: &str) -> String {
+        format!(
+            r#"
+schema = 1
+id = "demo"
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "subscription"
+
+[baseline]
+commit = "HEAD"
+
+[corpus]
+file = "corpus.toml"
+
+[backend]
+kind = "fixture"
+file = "fixture.toml"
+per_trial_ceiling_usd = 1.0
+calls_per_trial = 4
+timeout_secs = 60
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 10.0
+max_wall_secs = 3600
+max_calls = 100
+max_trials = 20
+max_retries = 1
+concurrency = 2
+
+[stages.screen]
+split = "{screen_split}"
+reps = 1
+
+[stages.validate]
+split = "{validate_split}"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+"#
+        )
+    }
+
+    #[test]
+    fn screen_and_validate_on_the_same_split_are_refused() {
+        let err = Manifest::parse(&manifest_with_stage_splits("dev", "dev"))
+            .expect_err("screen and validate sharing a split must be refused");
+        assert!(err.to_string().contains("different splits"), "got: {err}");
+    }
+
+    #[test]
+    fn screen_or_validate_on_holdout_is_refused() {
+        let err = Manifest::parse(&manifest_with_stage_splits("holdout", "validation"))
+            .expect_err("stages.screen.split = holdout must be refused");
+        assert!(
+            err.to_string().contains("stages.screen.split"),
+            "got: {err}"
+        );
+
+        let err = Manifest::parse(&manifest_with_stage_splits("dev", "holdout"))
+            .expect_err("stages.validate.split = holdout must be refused");
+        assert!(
+            err.to_string().contains("stages.validate.split"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_stage_class_is_refused() {
+        let text = manifest_with_stage_splits("dev", "validation").replacen(
+            "[stages.screen]\nsplit = \"dev\"\nreps = 1\n",
+            "[stages.screen]\nsplit = \"dev\"\nreps = 1\nclasses = [\"not-a-real-class\"]\n",
+            1,
+        );
+        let err = Manifest::parse(&text).expect_err("an unrecognized class must be refused");
+        assert!(err.to_string().contains("not-a-real-class"), "got: {err}");
+    }
+
+    #[test]
+    fn a_known_stage_class_is_accepted() {
+        let text = manifest_with_stage_splits("dev", "validation").replacen(
+            "[stages.screen]\nsplit = \"dev\"\nreps = 1\n",
+            "[stages.screen]\nsplit = \"dev\"\nreps = 1\nclasses = [\"long_session\"]\n",
+            1,
+        );
+        let manifest = Manifest::parse(&text).expect("a known class must parse and validate");
+        assert_eq!(
+            manifest.stages.screen.classes,
+            vec!["long_session".to_string()]
         );
     }
 }

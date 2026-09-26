@@ -211,7 +211,8 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
     };
 
     let corpus_path = repo.join(&manifest.corpus.file);
-    let splits = match Corpus::load(&corpus_path) {
+    let loaded_corpus = Corpus::load(&corpus_path);
+    let splits = match &loaded_corpus {
         Ok(corpus) => SplitCounts {
             dev: corpus.tasks_for_split(manifest::Split::Dev).len(),
             validation: corpus.tasks_for_split(manifest::Split::Validation).len(),
@@ -251,17 +252,31 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
         }
     }
 
-    let split_count = |split: manifest::Split| match split {
-        manifest::Split::Dev => splits.dev,
-        manifest::Split::Validation => splits.validation,
-        manifest::Split::Holdout => splits.holdout,
+    // Issue #804: a stage's own `classes` filter (if any) narrows which
+    // tasks of its split actually run -- the same
+    // `tasks_for_split_and_classes` the runner itself dispatches from, so
+    // this preview and the real schedule can never disagree.
+    let class_filtered_count = |split: manifest::Split, classes: &[String]| -> usize {
+        loaded_corpus
+            .as_ref()
+            .map(|corpus| corpus.tasks_for_split_and_classes(split, classes).len())
+            .unwrap_or(0)
     };
-    let screen_trials =
-        split_count(manifest.stages.screen.split) * manifest.stages.screen.reps as usize;
-    let validate_trials =
-        split_count(manifest.stages.validate.split) * manifest.stages.validate.reps as usize;
-    let holdout_trials =
-        split_count(manifest.stages.holdout.split) * manifest.stages.holdout.reps as usize;
+    let screen_task_count = class_filtered_count(
+        manifest.stages.screen.split,
+        &manifest.stages.screen.classes,
+    );
+    let validate_task_count = class_filtered_count(
+        manifest.stages.validate.split,
+        &manifest.stages.validate.classes,
+    );
+    let holdout_task_count = class_filtered_count(
+        manifest.stages.holdout.split,
+        &manifest.stages.holdout.classes,
+    );
+    let screen_trials = screen_task_count * manifest.stages.screen.reps as usize;
+    let validate_trials = validate_task_count * manifest.stages.validate.reps as usize;
+    let holdout_trials = holdout_task_count * manifest.stages.holdout.reps as usize;
     let baseline_trials = screen_trials + validate_trials + holdout_trials;
     // Every declared candidate runs its own screen + validate trials paired
     // against the shared baseline; at most one (the winner) also reaches
@@ -286,6 +301,47 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
     let fits_budgets = worst_case_spend_usd <= manifest.budgets.max_spend_usd
         && worst_case_calls <= manifest.budgets.max_calls
         && worst_case_trials as u64 <= manifest.budgets.max_trials;
+
+    // Issue #802/#804: a stage that can never produce `criteria.min_pairs`
+    // pairs can never promote a candidate at all -- `evaluate_cohort`
+    // returns Inconclusive below that floor, forever, on every run. Catch
+    // it at plan time rather than after real trials have already spent
+    // money. With `stratify = "class"`, the gate never pools cohorts, so
+    // the binding constraint is the SMALLEST class's own pair count, not
+    // the stage's total.
+    let min_pairs = manifest.criteria.min_pairs;
+    for (label, split, classes, reps) in [
+        (
+            "validate",
+            manifest.stages.validate.split,
+            &manifest.stages.validate.classes,
+            manifest.stages.validate.reps,
+        ),
+        (
+            "holdout",
+            manifest.stages.holdout.split,
+            &manifest.stages.holdout.classes,
+            manifest.stages.holdout.reps,
+        ),
+    ] {
+        let Ok(corpus) = &loaded_corpus else { continue };
+        let worst_case_tasks = if matches!(manifest.stratify, manifest::Stratify::Class) {
+            corpus
+                .class_counts_for_split(split, classes)
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(0)
+        } else {
+            corpus.tasks_for_split_and_classes(split, classes).len()
+        };
+        let pairs = worst_case_tasks * reps as usize;
+        if pairs < min_pairs {
+            errors.push(format!(
+                "stage {label} yields {pairs} pairs < criteria.min_pairs={min_pairs}: no candidate could ever be promoted"
+            ));
+        }
+    }
 
     let mut coverage = Vec::new();
     if matches!(manifest.runtime, manifest::Runtime::Native) {
@@ -415,6 +471,9 @@ reps = 1
 split = "holdout"
 reps = 1
 max_uses = 1
+
+[criteria]
+min_pairs = 0
 "#,
         )
         .unwrap();
@@ -451,18 +510,53 @@ max_uses = 1
         assert!(report.errors.iter().any(|e| e.contains("baseline")));
     }
 
+    /// Issue #802/#804: a validate/holdout stage that can never produce
+    /// `criteria.min_pairs` pairs can never promote a candidate -- `plan`
+    /// must refuse before any real trial spends money finding that out the
+    /// slow way.
+    #[test]
+    fn plan_refuses_a_stage_that_can_never_reach_min_pairs() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let manifest_path = write_manifest(repo.path());
+        // `write_manifest`'s corpus has exactly one `dev` task and none in
+        // `validation`/`holdout` -- raise min_pairs above 0 so the stage
+        // yields fewer pairs than required.
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        let text = text.replace("min_pairs = 0", "min_pairs = 1");
+        std::fs::write(&manifest_path, text).unwrap();
+
+        let report = plan(&manifest_path, repo.path()).unwrap();
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e == "stage validate yields 0 pairs < criteria.min_pairs=1: no candidate could ever be promoted"),
+            "got: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e == "stage holdout yields 0 pairs < criteria.min_pairs=1: no candidate could ever be promoted"),
+            "got: {:?}",
+            report.errors
+        );
+    }
+
     /// Every manifest under `docs/benchmarks/autoresearch/campaigns/` (Lane
     /// C's real, hand-authored campaigns plus the fixture demo), planned
     /// against this actual worktree -- never a synthetic repo -- so
     /// `corpus.file`/`evaluator.protected`/`backend.command` really resolve
     /// or really fail exactly as a real `zirv workflow research plan` run
-    /// would see them. `plan` must not skip one silently: every manifest is
-    /// asserted either valid, or refused with a specific, expected reason
-    /// (the four real, expensive campaigns here were authored with
-    /// deliberately conservative dollar caps that their own declared
-    /// screen+validate+holdout repetition counts do not fit -- `plan`
-    /// catching that before any provider call is the whole point of this
-    /// check, not a bug to paper over).
+    /// would see them. Every committed manifest must be genuinely runnable:
+    /// `plan` must not skip one silently, and none may be refused --
+    /// phase-3 retuned the four real campaigns' stage splits/classes/reps/
+    /// budgets so each one's baseline fits with room to screen every
+    /// candidate, and every validate/holdout stage clears
+    /// `criteria.min_pairs`.
     #[test]
     fn plan_covers_every_committed_campaign_manifest_without_dispatching() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -475,40 +569,34 @@ max_uses = 1
             .collect();
         manifests.sort();
 
-        let expected_valid: &[&str] = &["fixture-demo.toml", "jev-intake-floors.toml"];
-        let expected_refused_baseline: &[&str] = &[
-            "context-compaction.toml",
+        let expected: &[&str] = &[
             "context-compaction-forced.toml",
+            "context-compaction.toml",
+            "fixture-demo.toml",
             "jev-gates-e2e.toml",
+            "jev-intake-floors.toml",
             "routing-ladder.toml",
         ];
         assert_eq!(
             manifests.len(),
-            expected_valid.len() + expected_refused_baseline.len(),
+            expected.len(),
             "a new/removed campaign manifest must update this test's expectations, not be skipped: {manifests:?}"
         );
 
         super::super::backend::reset_fixture_dispatch_count();
         for manifest_path in &manifests {
             let name = manifest_path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                expected.contains(&name),
+                "{name}: not in the expectation list -- update this test, don't skip it"
+            );
             let report = plan(manifest_path, repo)
                 .unwrap_or_else(|err| panic!("plan({name}) must not error outright: {err}"));
-            if expected_valid.contains(&name) {
-                assert!(
-                    report.valid,
-                    "{name} was expected valid; errors: {:?}",
-                    report.errors
-                );
-            } else if expected_refused_baseline.contains(&name) {
-                assert!(!report.valid, "{name} was expected refused");
-                assert!(
-                    report.errors.iter().any(|e| e.contains("baseline")),
-                    "{name}: expected a baseline-budget refusal reason, got {:?}",
-                    report.errors
-                );
-            } else {
-                panic!("{name}: not in either expectation list -- update this test, don't skip it");
-            }
+            assert!(
+                report.valid,
+                "{name} was expected valid; errors: {:?}",
+                report.errors
+            );
         }
         assert_eq!(
             super::super::backend::fixture_dispatch_count(),

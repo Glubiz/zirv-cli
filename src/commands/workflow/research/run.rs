@@ -541,7 +541,14 @@ pub fn execute(
 
     if stop_reason.is_none() && matches!(manifest.cache_mode, manifest::CacheMode::Warm) {
         let seed = seed_for(&manifest.id, "baseline", "screen");
-        let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
+        let screen_tasks = shuffled(
+            &task_ids(
+                &corpus,
+                manifest.stages.screen.split,
+                &manifest.stages.screen.classes,
+            ),
+            seed,
+        );
         if let Some(task) = screen_tasks.first() {
             let mut warmups = vec![warmup_trial(
                 "baseline",
@@ -563,7 +570,14 @@ pub fn execute(
 
     if stop_reason.is_none() {
         let seed = seed_for(&manifest.id, "baseline", "screen");
-        let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
+        let screen_tasks = shuffled(
+            &task_ids(
+                &corpus,
+                manifest.stages.screen.split,
+                &manifest.stages.screen.classes,
+            ),
+            seed,
+        );
         let baseline_screen = trials_for(
             "baseline",
             Arm::Baseline,
@@ -603,7 +617,14 @@ pub fn execute(
         let baseline_screen_records =
             stage_records_from_ledger(&events_now, Stage::Screen, "baseline");
         let seed = seed_for(&manifest.id, "baseline", "screen");
-        let screen_tasks = shuffled(&task_ids(&corpus, manifest.stages.screen.split), seed);
+        let screen_tasks = shuffled(
+            &task_ids(
+                &corpus,
+                manifest.stages.screen.split,
+                &manifest.stages.screen.classes,
+            ),
+            seed,
+        );
 
         for candidate in &all_candidates {
             if stop_reason.is_some() {
@@ -664,7 +685,14 @@ pub fn execute(
     let mut decisions: Vec<(String, Decision)> = Vec::new();
     if stop_reason.is_none() && !survivors.is_empty() {
         let seed = seed_for(&manifest.id, "baseline", "validate");
-        let validate_tasks = shuffled(&task_ids(&corpus, manifest.stages.validate.split), seed);
+        let validate_tasks = shuffled(
+            &task_ids(
+                &corpus,
+                manifest.stages.validate.split,
+                &manifest.stages.validate.classes,
+            ),
+            seed,
+        );
         let baseline_validate = trials_for(
             "baseline",
             Arm::Baseline,
@@ -755,7 +783,11 @@ pub fn execute(
             manifest.stages.holdout.max_uses,
         ) {
             Ok(()) => {
-                let holdout_tasks = task_ids(&corpus, manifest.stages.holdout.split);
+                let holdout_tasks = task_ids(
+                    &corpus,
+                    manifest.stages.holdout.split,
+                    &manifest.stages.holdout.classes,
+                );
                 let baseline_holdout = trials_for(
                     "baseline",
                     Arm::Baseline,
