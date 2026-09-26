@@ -210,14 +210,34 @@ fn trials_for(
     out
 }
 
-fn cohort_key(manifest: &Manifest) -> String {
-    format!(
+/// The base cohort key, plus (issue #804) the observation's own corpus task
+/// `class` appended when `manifest.stratify = "class"` -- cohorts are never
+/// pooled, so a routing/gate change that helps `bounded` work while hurting
+/// `architecture` work is reported as two separate verdicts, not averaged
+/// into one misleading one. `task_class` is `None` only when `stratify =
+/// "class"` and the task is missing from the loaded corpus (should not
+/// happen in practice; falls back to an explicit `unknown` bucket rather
+/// than silently reusing another class's cohort).
+fn cohort_key(manifest: &Manifest, task_class: Option<&str>) -> String {
+    let base = format!(
         "{}:{}:{}:{}",
         manifest.runtime.as_str(),
         manifest.route.model,
         manifest.cache_mode.as_str(),
         manifest.cohort.pressure.as_str()
-    )
+    );
+    match manifest.stratify {
+        manifest::Stratify::None => base,
+        manifest::Stratify::Class => format!("{base}:{}", task_class.unwrap_or("unknown")),
+    }
+}
+
+fn build_task_classes(corpus: &Corpus) -> BTreeMap<String, String> {
+    corpus
+        .tasks
+        .iter()
+        .map(|task| (task.id.clone(), task.class.clone()))
+        .collect()
 }
 
 fn trial_dir_for(campaign_dir: &Path, trial_id: &str, attempt: u32) -> PathBuf {
@@ -250,11 +270,13 @@ fn parse_status(text: &str) -> backend::TrialStatus {
 }
 
 fn to_observation(
-    cohort: &str,
+    manifest: &Manifest,
+    task_classes: &BTreeMap<String, String>,
     required_receipts: &[String],
     pair_fingerprint: Option<&str>,
     record: &TrialRecord,
 ) -> Observation {
+    let cohort = cohort_key(manifest, task_classes.get(&record.task).map(String::as_str));
     let mut excluded = None;
     if let (Some(other), Some(mine)) = (pair_fingerprint, record.env_fingerprint.as_deref())
         && other != mine
@@ -272,7 +294,7 @@ fn to_observation(
     Observation {
         task: record.task.clone(),
         rep: record.rep,
-        cohort: cohort.to_string(),
+        cohort,
         arm: match record.arm {
             Arm::Baseline => promote::Arm::Baseline,
             Arm::Candidate => promote::Arm::Candidate,
@@ -288,7 +310,8 @@ fn to_observation(
 }
 
 fn pair_observations(
-    cohort: &str,
+    manifest: &Manifest,
+    task_classes: &BTreeMap<String, String>,
     baseline: &[TrialRecord],
     candidate: &[TrialRecord],
     required_receipts: &[String],
@@ -299,13 +322,19 @@ fn pair_observations(
         .collect();
     let mut obs: Vec<Observation> = baseline
         .iter()
-        .map(|r| to_observation(cohort, &[], None, r))
+        .map(|r| to_observation(manifest, task_classes, &[], None, r))
         .collect();
     for record in candidate {
         let pair_fp = baseline_by_key
             .get(&(record.task.clone(), record.rep))
             .and_then(|b| b.env_fingerprint.as_deref());
-        obs.push(to_observation(cohort, required_receipts, pair_fp, record));
+        obs.push(to_observation(
+            manifest,
+            task_classes,
+            required_receipts,
+            pair_fp,
+            record,
+        ));
     }
     obs
 }
@@ -1409,7 +1438,7 @@ pub fn execute(
     };
 
     let corpus = Corpus::load(&repo.join(&manifest.corpus.file))?;
-    let cohort = cohort_key(&manifest);
+    let task_classes = build_task_classes(&corpus);
 
     if stop_reason.is_none() {
         let seed = seed_for(&manifest.id, "baseline", "screen");
@@ -1453,7 +1482,8 @@ pub fn execute(
             let candidate_records =
                 stage_records_from_ledger(&events_now, Stage::Screen, &candidate.id);
             let obs = pair_observations(
-                &cohort,
+                &manifest,
+                &task_classes,
                 &baseline_screen_records,
                 &candidate_records,
                 &candidate.requires_receipts,
@@ -1534,7 +1564,8 @@ pub fn execute(
                 let candidate_records =
                     stage_records_from_ledger(&events_now, Stage::Validate, candidate_id);
                 let obs = pair_observations(
-                    &cohort,
+                    &manifest,
+                    &task_classes,
                     &baseline_validate_records,
                     &candidate_records,
                     &candidate.requires_receipts,
@@ -1630,7 +1661,8 @@ pub fn execute(
                     let candidate_holdout_records =
                         stage_records_from_ledger(&events_now, Stage::Holdout, winner_id);
                     let obs = pair_observations(
-                        &cohort,
+                        &manifest,
+                        &task_classes,
                         &baseline_holdout_records,
                         &candidate_holdout_records,
                         &candidate.requires_receipts,
@@ -1699,6 +1731,7 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// Hand-authored TOML (like `manifest.rs`'s own tests) rather than
     /// `toml::to_string` on a `Manifest` value -- the `toml` crate cannot
@@ -2444,6 +2477,77 @@ crash_first = 5
         assert!(
             report_md.contains("completeness:"),
             "report.md must state data completeness"
+        );
+    }
+
+    /// Issue #804: `stratify = "class"` gives every corpus task class its
+    /// own cohort key (never pooled with another class), while the default
+    /// `stratify = "none"` keeps today's single cohort per campaign
+    /// regardless of how many classes the paired tasks span.
+    #[test]
+    fn stratify_class_splits_cohorts_by_task_class_stratify_none_keeps_one() {
+        let base_toml = manifest_toml(
+            "stratify-demo",
+            "corpus.toml",
+            "fixture.toml",
+            1,
+            0,
+            100.0,
+            1,
+            "",
+        );
+        let unstratified = Manifest::parse(&base_toml).unwrap();
+        // Inserted right after the top-level scalar keys, before any
+        // `[table]` header -- appending it at the end of the file would
+        // land inside `[stages.holdout]`, TOML's last-opened table.
+        let stratified_toml = base_toml.replacen(
+            "billing = \"subscription\"",
+            "billing = \"subscription\"\nstratify = \"class\"",
+            1,
+        );
+        let stratified = Manifest::parse(&stratified_toml).unwrap();
+
+        let mut classes = BTreeMap::new();
+        classes.insert("t1".to_string(), "bounded".to_string());
+        classes.insert("t2".to_string(), "architecture".to_string());
+
+        let record = |task: &str, arm: Arm| TrialRecord {
+            task: task.to_string(),
+            rep: 0,
+            arm,
+            status: backend::TrialStatus::Ok,
+            correctness: Some(1.0),
+            quality: Some(1.0),
+            cost_usd: Some(1.0),
+            cost_complete: true,
+            wall_ms: 10,
+            env_fingerprint: None,
+            receipts: BTreeMap::new(),
+        };
+        let baseline = vec![record("t1", Arm::Baseline), record("t2", Arm::Baseline)];
+        let candidate = vec![record("t1", Arm::Candidate), record("t2", Arm::Candidate)];
+
+        let stratified_obs = pair_observations(&stratified, &classes, &baseline, &candidate, &[]);
+        let stratified_cohorts: BTreeSet<&str> =
+            stratified_obs.iter().map(|o| o.cohort.as_str()).collect();
+        assert_eq!(
+            stratified_cohorts.len(),
+            2,
+            "one cohort per task class: {stratified_cohorts:?}"
+        );
+        assert!(stratified_cohorts.iter().any(|c| c.ends_with(":bounded")));
+        assert!(
+            stratified_cohorts
+                .iter()
+                .any(|c| c.ends_with(":architecture"))
+        );
+
+        let plain_obs = pair_observations(&unstratified, &classes, &baseline, &candidate, &[]);
+        let plain_cohorts: BTreeSet<&str> = plain_obs.iter().map(|o| o.cohort.as_str()).collect();
+        assert_eq!(
+            plain_cohorts.len(),
+            1,
+            "stratify = none must keep a single cohort: {plain_cohorts:?}"
         );
     }
 }

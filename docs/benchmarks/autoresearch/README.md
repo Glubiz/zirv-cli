@@ -139,7 +139,12 @@ A campaign manifest is TOML, `schema = 1`. Top-level: `id`, `description`,
 `runtime` (`meta` -- measured; `native` -- unmeasured while `zirv native` is
 release-gated), `seat_mode` (`single`; `orchestration` is refused until an
 orchestration suite exists), `cache_mode` (`cold|warm`), `billing`
-(`metered|subscription|unknown`).
+(`metered|subscription|unknown`), `stratify` (`none` default; `class`
+appends each observation's own corpus task `class` to its cohort key --
+issue #804's stratification, so a routing/gate candidate that helps
+`bounded` work while hurting `architecture` work is reported as two
+separate per-class verdicts instead of one averaged, misleading one;
+cohorts stay never-pooled either way).
 
 - `[baseline] commit` -- the commit a candidate diffs against (for a source
   patch) and what `zirv_dir`'s baseline build comes from.

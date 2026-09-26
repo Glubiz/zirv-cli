@@ -303,6 +303,22 @@ pub struct Manifest {
     pub candidates: Vec<Candidate>,
     #[serde(default)]
     pub proposer: Option<Proposer>,
+    /// Issue #804: `"none"` (default) keeps today's single cohort key per
+    /// campaign; `"class"` appends each observation's own corpus task
+    /// `class` to it, so the promotion gate evaluates every class
+    /// separately -- cohorts are never pooled, and a routing candidate that
+    /// helps `bounded` work while hurting `architecture` work must not be
+    /// averaged into one misleading verdict.
+    #[serde(default)]
+    pub stratify: Stratify,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stratify {
+    #[default]
+    None,
+    Class,
 }
 
 impl Manifest {
