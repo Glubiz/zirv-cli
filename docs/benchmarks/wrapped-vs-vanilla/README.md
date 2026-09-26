@@ -5,6 +5,15 @@ referenced by `docs/benchmarks/wrapped-vs-vanilla.md` and the README. It is
 copied here verbatim (minus run output) so the numbers are reproducible from
 this repository. See `CONTRACT.md` for the full spec.
 
+This harness also backs `../autoresearch/`'s candidate campaigns (issues
+#799-#805): `run.py --trial <spec.json> --out <dir>` and `run.py
+--check-graders` are the two entry points a campaign manifest actually
+calls; see CONTRACT.md's "Autoresearch trial mode" and "Task corpus and
+splits" sections for what they do, and `corpus.toml` for the versioned
+task/split list every campaign reads instead of a hand-picked `--tasks`
+list. Nothing below this point changes for an ordinary `--tasks/--conds/
+--reps` grid run.
+
 ## What it measures
 
 Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
@@ -193,7 +202,12 @@ is the current one (9 steps on the `ledgerlite` template: features that
 build on each other, a bug report on something the agent itself built two
 steps earlier, a mid-chain refactor, a request referencing an earlier
 decision, a change of mind that partially reverts a step, and a final
-README-plus-summary wrap-up).
+README-plus-summary wrap-up). `t24_long_haul`/`t24b_long_haul` (22 steps) and
+`t25_sticky_notes` (6 steps, issue #805: a constraint stated only in step 1
+that a later step must still honour, a changed requirement mid-chain, an
+unresolved failure deliberately carried forward and fixed only after a
+step phrased as a resume-after-handoff, and a multi-module edit) are the
+others -- see `tasks/README.md` for the per-task step tables.
 
 ```
 python run.py --tasks t23_afternoon --conds vanilla,zirv-nojev,zirv-jev-full --reps 2 --model sonnet \

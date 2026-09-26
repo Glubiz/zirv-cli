@@ -229,3 +229,26 @@ parameter `read_csv` already has, and step 14's `report.cashflow()` needs
 its own `to_usd` keyword parameter (not just the CLI's `--usd` flag). Use
 t24b in place of t24 for any run where those two steps should be
 solvable from the prompt alone.
+
+## t25_sticky_notes: autoresearch's context/handoff long-session task (issue #805)
+
+`t25_sticky_notes` is a 6-step `kind=chain` task (a lightweight sticky-notes
+feature added to `ledgerlite`, separate from the transaction ledger),
+purpose-built for #805's context/compaction/handoff/review-reuse
+candidates rather than as a general afternoon-of-work story like t23/t24:
+
+| step | shape | tests the axis... | hidden tests | reference score |
+|---|---|---|---|---|
+| 01 | greenfield: `notes.py` + `note-add`/`note-list`, note ids permanently negative | -- (constraint origin) | 8 | 1.0 |
+| 02 | feature: `--pinned` add/list filter + `summary` pinned count (multi-module: notes.py + cli.py); plants a deferred ordering bug | multi-module edit; unresolved-failure origin | 6 | 1.0 |
+| 03 | bug report: `note-remove` | earlier-decision recall (ids still negative after a removal) | 6 | 1.0 |
+| 04 | change of plan: cap note text at 200 chars | changed requirement mid-chain | 4 | 1.0 |
+| 05 | "picking this back up after a handoff": fix the deferred ordering bug + `report.notes_summary()` (multi-module: report.py + notes.py + cli.py) | resume-after-handoff phrasing; unresolved-failure fixed; multi-module edit; recall regression check | 7 | 1.0 |
+| 06 | wrap-up: `docs/NOTES.md` + final summary naming the deferred-bug-then-fixed arc | -- (judge only, no hidden tests) | - | rubric-graded |
+
+Every hidden-test step's reference score was verified with `python run.py
+--check-graders --tasks t25_sticky_notes`: each cumulative
+`reference/step_NN.patch` applied to a fresh pristine template copy scores
+1.0 on that step's own hidden tests (the template's one known baseline-red
+visible test excepted), and an unpatched pristine copy scores well below
+that on every step.
