@@ -3111,6 +3111,8 @@ fn apply_jev_harvest_gate(
     ) else {
         return accepted;
     };
+    let (memory_min_confidence, memory_min_margin) =
+        jev::floor(cfg, jev::FloorSite::Memory, 0.0, jev::DEFAULT_MIN_MARGIN);
     accepted
         .into_iter()
         .zip(ids)
@@ -3126,7 +3128,7 @@ fn apply_jev_harvest_gate(
                 // a missing answer: kept.
                 (Some(answer), Some(value))
                     if value < MEMORY_RELEVANCE_FLOOR
-                        && answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) =>
+                        && answer.decisive(memory_min_confidence, memory_min_margin) =>
                 {
                     let detail =
                         format!("'{key}' scored {value:.2} below the Jev durability floor");
@@ -3471,7 +3473,14 @@ fn jev_harvest_prescreen<'a>(
                 jev::record_effect(cfg, state, cfg.jev.harvest_screen, &effect);
                 return false;
             };
-            let decisive = answer.decisive(HARVEST_SCREEN_MIN_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
+            let (harvest_screen_min_confidence, harvest_screen_min_margin) = jev::floor(
+                cfg,
+                jev::FloorSite::HarvestScreen,
+                HARVEST_SCREEN_MIN_CONFIDENCE,
+                jev::DEFAULT_MIN_MARGIN,
+            );
+            let decisive =
+                answer.decisive(harvest_screen_min_confidence, harvest_screen_min_margin);
             if decisive
                 && answer
                     .as_noul()

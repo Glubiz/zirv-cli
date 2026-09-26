@@ -502,6 +502,8 @@ mod tests {
             task_class: None,
             principal: "root".to_string(),
             envelope_sha256: None,
+            attribution: Default::default(),
+            cached: false,
         }];
         let spend = fold_session_spend(
             &rows,
@@ -585,6 +587,8 @@ mod tests {
                 task_class: None,
                 principal: "root".to_string(),
                 envelope_sha256: None,
+                attribution: Default::default(),
+                cached: false,
             },
             DelegationRow {
                 ts: 1,
@@ -604,6 +608,8 @@ mod tests {
                 task_class: None,
                 principal: "root".to_string(),
                 envelope_sha256: None,
+                attribution: Default::default(),
+                cached: false,
             },
         ];
         let spend = fold_session_spend(
@@ -671,6 +677,8 @@ mod tests {
             task_class: None,
             principal: "root".to_string(),
             envelope_sha256: None,
+            attribution: Default::default(),
+            cached: false,
         };
         let new_delegation = DelegationRow {
             ts: since + 1,

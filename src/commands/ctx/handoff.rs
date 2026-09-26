@@ -1564,9 +1564,14 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
     ) else {
         return false;
     };
+    let (min_confidence, min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::HandoffSelect,
+        HANDOFF_THIN_FLOOR,
+        jev::DEFAULT_MIN_MARGIN,
+    );
     answers.get("quality").is_some_and(|answer| {
-        answer.as_choice() == Some("thin")
-            && answer.decisive(HANDOFF_THIN_FLOOR, jev::DEFAULT_MIN_MARGIN)
+        answer.as_choice() == Some("thin") && answer.decisive(min_confidence, min_margin)
     })
 }
 
@@ -1860,6 +1865,12 @@ fn jev_select_optional_handoff_items(
 
     let mut dropped: std::collections::HashSet<(u32, usize)> = std::collections::HashSet::new();
     let mut removed_bytes = 0u64;
+    let (handoff_select_min_confidence, handoff_select_min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::HandoffSelect,
+        0.0,
+        jev::DEFAULT_MIN_MARGIN,
+    );
     for (candidate, id) in sent.iter().zip(ids.iter()) {
         // Jev determinism fix, matching every other keep/drop noul in this
         // crate: a non-decisive (margin below `jev::DEFAULT_MIN_MARGIN`) or
@@ -1868,7 +1879,7 @@ fn jev_select_optional_handoff_items(
         let Some(answer) = answers.get(id) else {
             continue;
         };
-        if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+        if !answer.decisive(handoff_select_min_confidence, handoff_select_min_margin) {
             continue;
         }
         if matches!(answer.as_noul(), Some(value) if value < HANDOFF_SELECT_DROP_FLOOR) {
@@ -2228,6 +2239,12 @@ pub(crate) fn compaction_focus_text(
     };
 
     let mut kept: Vec<&str> = Vec::new();
+    let (compaction_select_min_confidence, compaction_select_min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::CompactionSelect,
+        0.0,
+        jev::DEFAULT_MIN_MARGIN,
+    );
     for (candidate, id) in sent.iter().zip(ids.iter()) {
         // Only a decisive (margin at or above `jev::DEFAULT_MIN_MARGIN`) KEEP
         // verdict ever adds an item -- missing, unparseable, indecisive, or
@@ -2237,7 +2254,10 @@ pub(crate) fn compaction_focus_text(
         let Some(answer) = answers.get(id) else {
             continue;
         };
-        if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+        if !answer.decisive(
+            compaction_select_min_confidence,
+            compaction_select_min_margin,
+        ) {
             continue;
         }
         if matches!(answer.as_noul(), Some(value) if value >= COMPACTION_SELECT_KEEP_FLOOR) {

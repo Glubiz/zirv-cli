@@ -407,6 +407,8 @@ fn apply_intent_answer(cfg: &CtxConfig, answers: &Answers, classification: &mut 
 fn apply_classify_answers(cfg: &CtxConfig, answers: &Answers, profile: &mut ExecutionProfile) {
     apply_intent_answer(cfg, answers, &mut profile.classification);
 
+    let (min_confidence, min_margin) =
+        jev::floor(cfg, jev::FloorSite::Classify, 0.0, jev::DEFAULT_MIN_MARGIN);
     let mut added_security = false;
     for id in DOMAIN_QUESTION_IDS {
         let Some(tag) = domain_tag_for(id) else {
@@ -415,7 +417,7 @@ fn apply_classify_answers(cfg: &CtxConfig, answers: &Answers, profile: &mut Exec
         let Some(answer) = answers.get(id) else {
             continue;
         };
-        if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+        if !answer.decisive(min_confidence, min_margin) {
             continue;
         }
         let Some(probability) = answer.as_noul() else {

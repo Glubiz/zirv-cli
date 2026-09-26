@@ -3,6 +3,7 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
+use super::attribution::Attribution;
 use super::permit::WorkerMode;
 use super::state::StateDir;
 
@@ -159,6 +160,26 @@ pub struct Delegation<'a> {
     pub envelope_sha256: Option<&'a str>,
 }
 
+/// The JSON [`append_delegation`]/[`append_delegation_cached`] actually
+/// write: [`Delegation`]'s own fields, flattened, plus this process's own
+/// attribution (issue #800) and whether this row is a CACHED Jev hit (issue
+/// #803 follow-up) -- both computed in this ONE place rather than threaded
+/// through every one of `Delegation`'s many call sites, and both skipped when
+/// at their default so an existing row's JSON stays byte-identical.
+#[derive(Serialize)]
+struct DelegationWire<'a> {
+    #[serde(flatten)]
+    inner: &'a Delegation<'a>,
+    #[serde(default, skip_serializing_if = "Attribution::is_empty")]
+    attribution: Attribution,
+    #[serde(default, skip_serializing_if = "is_false")]
+    cached: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The owned, deserializable counterpart of [`Delegation`] (which borrows
 /// and is serialize-only) -- what [`read_delegations`] parses one logged
 /// line back into for `status::group_tree_lines` to render. Field names and
@@ -220,6 +241,19 @@ pub struct DelegationRow {
     #[serde(default)]
     #[allow(dead_code)]
     pub envelope_sha256: Option<String>,
+    /// Issue #800: this row's own campaign/candidate/trial/task ids, from
+    /// `DelegationWire`. `#[serde(default)]` so a row written before this
+    /// field existed deserializes as the empty (unattributed) default.
+    #[serde(default)]
+    pub attribution: Attribution,
+    /// Issue #803 follow-up: whether this row is a CACHED Jev hit (a real
+    /// call was skipped) rather than a priced one -- see `attribution::
+    /// Receipt::cached`'s own doc comment for how the reconciler uses this.
+    /// `#[serde(default)]` so a row written before this field existed
+    /// deserializes as `false`, the only honest reading for a row that
+    /// predates it (every such row WAS a real, priced call).
+    #[serde(default)]
+    pub cached: bool,
 }
 
 /// The owned, deserializable counterpart of `hook::PermissionPromptRow`
@@ -394,10 +428,28 @@ pub fn append(state: &StateDir, decision: &Decision<'_>) -> CtxResult<()> {
 }
 
 pub fn append_delegation(state: &StateDir, record: &Delegation<'_>) -> CtxResult<()> {
+    append_delegation_cached(state, record, false)
+}
+
+/// [`append_delegation`], but marking this row a CACHED Jev hit (issue #803
+/// follow-up) -- used only by `jev::record`, the one call site where whether
+/// an answer came from the decision cache genuinely varies per call; every
+/// other caller's row is never cached, so it keeps calling plain
+/// `append_delegation` unchanged.
+pub(crate) fn append_delegation_cached(
+    state: &StateDir,
+    record: &Delegation<'_>,
+    cached: bool,
+) -> CtxResult<()> {
     let dir = state.logs();
     super::state::create_private_dir_all(&dir)?;
     let mut file = super::state::open_private_append(&dir.join(DELEGATION_FILE))?;
-    writeln!(file, "{}", serde_json::to_string(record)?)?;
+    let wire = DelegationWire {
+        inner: record,
+        attribution: Attribution::from_env(),
+        cached,
+    };
+    writeln!(file, "{}", serde_json::to_string(&wire)?)?;
     Ok(())
 }
 

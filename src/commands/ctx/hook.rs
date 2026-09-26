@@ -5142,7 +5142,13 @@ capable a model does it actually need?",
         &questions,
     )?;
     let answer = answers.get("tier")?;
-    if !answer.decisive(DISPATCH_TIER_FLOOR, super::jev::DEFAULT_MIN_MARGIN) {
+    let (min_confidence, min_margin) = super::jev::floor(
+        cfg,
+        super::jev::FloorSite::Dispatch,
+        DISPATCH_TIER_FLOOR,
+        super::jev::DEFAULT_MIN_MARGIN,
+    );
+    if !answer.decisive(min_confidence, min_margin) {
         return None;
     }
     let (tier, tier_label) = match answer.as_choice()? {
