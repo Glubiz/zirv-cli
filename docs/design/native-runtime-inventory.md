@@ -177,9 +177,11 @@ criterion).
 | `workflow list` | shared |  |
 | `workflow maintain` | shared |  |
 | `workflow reclassify` | shared |  |
+| `workflow research` | shared | plans/runs/inspects/reports a bounded, resumable autoresearch campaign (issue #802); `runtime = "native"` is release-gated and returns an unmeasured result, so this needs no separate Nxx roadmap owner |
 | `workflow resume` | shared |  |
 | `workflow review` | N15 (#484) | the model-calling cross-harness review flow (`review.rs`) |
 | `workflow show` | shared |  |
+| `workflow spend` | shared | reconciles delegation/Jev/proxy receipts into one attributable `SpendReport` (issue #800); never a new ledger |
 | `workflow start` | shared |  |
 | `workflow stats` | shared |  |
 | `workflow calibrate` | shared |  |
@@ -254,6 +256,7 @@ installed binary during self-update; never spawns it).
 | Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec.rs/wrap.rs restart and session-end seams |
 | Memory optimize consolidation | `src/commands/ctx/memory_optimize.rs` | `apply_consolidation` | N06 (#475) | `zirv memory optimize`'s model-assisted merge |
 | Builtin argv-shape checks | `src/commands/workflow/checks/argv.rs` | `headless_cmd` | shared | Notes: probe/check only -- `ZCHK-ARGV-CODEX-EXEC` / `ZCHK-ARGV-CLAUDE-HEADLESS` build argv to inspect it, never spawn |
+| Autoresearch proposer spawn | `src/commands/workflow/research/proposer.rs` | `production_proposer_argv` | harness-backend | issue #802: builds the self-recursion argv (`current_exe agent <harness> "<prompt>" -- --model <model>`) for the optional `[proposer]` round's production spawn; `spawn_and_validate_proposal` is the actual `Command::new`/`.output()` call, and tests substitute a portable stub argv there instead of this function |
 
 Beyond the starter set given in this issue, this pass added: `src/commands/
 ctx/ask.rs` (`run_model`), `src/commands/ctx/optimize.rs` (`run_with`),
