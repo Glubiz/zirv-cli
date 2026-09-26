@@ -7,10 +7,13 @@
 # sit in `holdout` together -- using one for screening and the other as the
 # "unseen" holdout would leak almost the whole task into iterative candidate
 # selection. `dev` is the cheap small-task set used for autoresearch
-# screening (#802); `validation`/`holdout` each cover several `class`
-# values and at least one `long_session` chain task, per #801's evaluation
-# contract. See CONTRACT.md's "Task corpus and splits" section for the full
-# rule this file follows.
+# screening (#802); `dev`/`validation`/`holdout` each cover several `class`
+# values and each carries at least one `long_session` chain task (dev:
+# t23_afternoon; validation: t25_sticky_notes; holdout: t24_long_haul +
+# t24b_long_haul) so a `[stages.*] classes = ["long_session"]` filter has
+# something to screen/validate/holdout against on every stage, per #801's
+# evaluation contract. See CONTRACT.md's "Task corpus and splits" section
+# for the full rule this file follows.
 #
 # Today there is exactly one project family (`ledgerlite`); every report
 # built from this corpus must flag `single_family` per the design spec's
@@ -104,6 +107,13 @@ split = "dev"
 kind = "answer"
 
 [[task]]
+id = "t23_afternoon"
+family = "ledgerlite"
+class = "long_session"
+split = "dev"
+kind = "chain"
+
+[[task]]
 id = "t13_recurring"
 family = "ledgerlite"
 class = "feature"
@@ -151,13 +161,6 @@ family = "ledgerlite"
 class = "feature"
 split = "validation"
 kind = "tests"
-
-[[task]]
-id = "t23_afternoon"
-family = "ledgerlite"
-class = "long_session"
-split = "validation"
-kind = "chain"
 
 [[task]]
 id = "t25_sticky_notes"
