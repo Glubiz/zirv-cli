@@ -164,8 +164,23 @@ cohorts stay never-pooled either way).
   max_retries, concurrency` -- hard caps, enforced by reserving each
   dispatch's declared ceiling before it starts.
 - `[stages.screen|validate|holdout] split, reps` (+ holdout's own
-  `max_uses`) -- which `corpus.toml` split and how many paired repetitions
-  each stage runs.
+  `max_uses`), plus an optional `classes = [...]` -- which `corpus.toml`
+  split and how many paired repetitions each stage runs, narrowed (if
+  `classes` is set) to only those corpus `class` values; empty/absent runs
+  every task of the split, unchanged. `classes` entries are validated
+  against the corpus contract's known class set (`mechanical|bounded|bug|
+  feature|architecture|ambiguous|sensitive|long_session`) -- an unrecognized
+  one is refused at manifest-load time. **Split discipline (#801):**
+  `screen` and `validate` must use different splits (letting them share one
+  would have validate just re-measure exactly what screen already saw), and
+  neither may use `holdout` -- that split is reserved for the single final
+  confirmation. `plan` also refuses a campaign whose `validate` or
+  `holdout` stage could never reach `criteria.min_pairs` (task count after
+  the `classes` filter, times `reps`; with `stratify = "class"`, the
+  *smallest* class present, since the gate never pools cohorts) --
+  `"stage <x> yields N pairs < criteria.min_pairs=M: no candidate could
+  ever be promoted"` -- before any real trial spends money finding that out
+  the slow way.
 - `[criteria] min_pairs, correctness_floor, quality_floor,
   max_correctness_regression, max_quality_regression, min_effect,
   confidence, bootstrap_resamples` -- the promotion gate (see the design
