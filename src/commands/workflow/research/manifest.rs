@@ -385,6 +385,8 @@ impl Manifest {
                 &self.candidate_space.allowed_models,
             )
             .map_err(|reason| format!("candidate '{}': {reason}", candidate.id))?;
+            super::guard::validate_requires_receipts(&candidate.requires_receipts)
+                .map_err(|reason| format!("candidate '{}': {reason}", candidate.id))?;
             if let Some(strategy) = &candidate.strategy
                 && let Some(to_model) = &strategy.to_model
                 && !self
@@ -497,5 +499,23 @@ budgets = { max_spend_usd = 5.0 }
         );
         let err = Manifest::parse(&text).expect_err("candidate budgets field must be refused");
         assert!(err.to_string().contains("budgets"), "got: {err}");
+    }
+
+    #[test]
+    fn a_requires_receipts_entry_with_an_unknown_prefix_is_rejected() {
+        let text = minimal_toml(
+            r#"
+[[candidates]]
+id = "cand-a"
+hypothesis = "test"
+requires_receipts = ["totally-made-up:thing"]
+"#,
+        );
+        let err =
+            Manifest::parse(&text).expect_err("an unrecognized receipt prefix must be refused");
+        assert!(
+            err.to_string().contains("totally-made-up:thing"),
+            "got: {err}"
+        );
     }
 }

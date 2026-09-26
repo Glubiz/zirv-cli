@@ -177,10 +177,17 @@ orchestration suite exists), `cache_mode` (`cold|warm`), `billing`
   spec's #802 section) is refused before any trial runs.
 - `[[candidates]] id, hypothesis, mechanism, env, patch?, requires_receipts,
   strategy?` -- one candidate; `requires_receipts` names the receipt
-  key(s) (`jev:<site>`, `effect:<name>`, or `proxy:decision`) that must
-  appear in a trial's `receipts.jsonl` for it to count as having actually
-  exercised the mechanism under test -- a trial missing one is
-  `untriggered`, excluded from that candidate's evidence.
+  key(s) (`jev:<site>`, `effect:<name>`, `proxy:decision`, or
+  `proxy:decider:<decider>`) that must appear in a trial's receipts for it
+  to count as having actually exercised the mechanism under test -- a trial
+  missing one is `untriggered`, excluded from that candidate's evidence.
+  `plan` refuses a `requires_receipts` entry with an unrecognized prefix
+  outright, rather than silently marking every trial untriggered forever.
+  `proxy:decision` alone is written even when Jev never ran (the
+  deterministic decider appends one too, issue #803); a candidate proving
+  the production Jev/helper intake path specifically ran should require
+  `proxy:decider:typesafe` or `proxy:decider:helper` instead (from that same
+  row's own `decider` field -- see `jev-intake-floors.toml`).
 - optional `[proposer] harness, model, max_proposals, per_call_ceiling_usd`
   -- an agent that proposes bounded env-overlay candidates from the dev
   aggregates; its own spend counts as overhead, never execution.

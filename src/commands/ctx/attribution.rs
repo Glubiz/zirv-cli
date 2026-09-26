@@ -719,6 +719,16 @@ struct EffectCountRow {
 struct ProxyDecisionCountRow {
     #[serde(default)]
     attribution: Attribution,
+    /// `"typesafe"|"helper"|"deterministic"` (kebab-case, matching
+    /// `proxy::decision::Decider`'s own serde spelling). `#[serde(default)]`
+    /// so a decision persisted before this field is read here still counts
+    /// toward the plain `proxy:decision` bucket, just not the per-decider
+    /// one. Issue #803: `proxy:decision` alone is written even when Jev
+    /// never actually ran (the deterministic decider still appends a row),
+    /// so it cannot prove the production Jev intake path ran --
+    /// `proxy:decider:typesafe`/`proxy:decider:helper` can.
+    #[serde(default)]
+    decider: Option<String>,
 }
 
 fn read_jsonl_lines(path: &Path) -> Vec<String> {
@@ -730,10 +740,15 @@ fn read_jsonl_lines(path: &Path) -> Vec<String> {
 /// Advisory call/effect counts for `SpendReport.receipts`: `jev:<site>`
 /// (every `jev-decisions.jsonl` row for that site), `jev:<site>:fallback`
 /// (the subset whose `fallbacks` was non-empty), `effect:<site>` (every
-/// `jev-effects.jsonl` row), and `proxy:decision` (every `proxy-
-/// decisions.jsonl` row). Filtered by `filter` exactly like [`reconcile`]
-/// filters receipts, so two campaigns sharing one state dir never see each
-/// other's counts either.
+/// `jev-effects.jsonl` row), `proxy:decision` (every `proxy-decisions.jsonl`
+/// row, written even when Jev never ran -- the deterministic decider writes
+/// one too, so this alone cannot prove the production Jev path ran), and
+/// `proxy:decider:<decider>` (`typesafe`/`helper`/`deterministic`, from
+/// that same row's own `decider` field -- `proxy:decider:typesafe` or
+/// `proxy:decider:helper` is the receipt that actually proves the
+/// production Jev/helper intake path ran, issue #803). Filtered by `filter`
+/// exactly like [`reconcile`] filters receipts, so two campaigns sharing
+/// one state dir never see each other's counts either.
 pub fn load_receipt_counts(state_dir: &Path, filter: &Attribution) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     for line in read_jsonl_lines(&state_dir.join("jev-decisions.jsonl")) {
@@ -767,6 +782,11 @@ pub fn load_receipt_counts(state_dir: &Path, filter: &Attribution) -> BTreeMap<S
             continue;
         }
         *counts.entry("proxy:decision".to_string()).or_insert(0u64) += 1;
+        if let Some(decider) = &row.decider {
+            *counts
+                .entry(format!("proxy:decider:{decider}"))
+                .or_insert(0u64) += 1;
+        }
     }
     counts
 }
@@ -1145,5 +1165,32 @@ mod tests {
         assert_eq!(counts["jev:memory"], 2);
         assert_eq!(counts["jev:memory:fallback"], 1);
         assert_eq!(counts["effect:handoff_select"], 1);
+    }
+
+    /// Issue #803: `proxy:decision` alone is written even when Jev never
+    /// ran (the deterministic decider writes one too), so it cannot prove
+    /// the production Jev intake path actually ran. `proxy:decider:<decider>`
+    /// (from the row's own `decider` field) can -- a row missing that field
+    /// entirely (persisted before it existed) still counts toward the plain
+    /// bucket, just not a per-decider one.
+    #[test]
+    fn load_receipt_counts_splits_proxy_decisions_by_decider() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("proxy-decisions.jsonl"),
+            "{\"decider\":\"typesafe\"}\n{\"decider\":\"deterministic\"}\n{\"decider\":\"deterministic\"}\n{}\n",
+        )
+        .unwrap();
+        let counts = load_receipt_counts(root.path(), &Attribution::default());
+        assert_eq!(
+            counts["proxy:decision"], 4,
+            "every row counts toward the plain bucket"
+        );
+        assert_eq!(counts["proxy:decider:typesafe"], 1);
+        assert_eq!(counts["proxy:decider:deterministic"], 2);
+        assert!(
+            !counts.contains_key("proxy:decider:"),
+            "a row with no decider field must not fabricate an empty-string bucket"
+        );
     }
 }
