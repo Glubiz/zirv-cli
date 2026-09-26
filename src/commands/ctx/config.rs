@@ -9430,6 +9430,70 @@ mod tests {
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
+    /// Issue #803: the WHOLE `[jev.floors]` table is `REPO_FORBIDDEN`, same
+    /// reasoning as `jev_keys_are_repo_forbidden` above -- a repo checkout
+    /// setting any site's floor at all must be rejected.
+    #[test]
+    fn jev_floors_table_is_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[jev.floors.dispatch]\nmin_confidence = 0.9\n",
+        )
+        .expect("write");
+
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to set jev.floors.*");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "jev.floors must be rejected as REPO_FORBIDDEN: {err}"
+        );
+    }
+
+    /// Issue #803: the operator's own `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_
+    /// CONFIDENCE|_MIN_MARGIN` env vars set the matching site's floor, and
+    /// only that site -- every other site stays unset.
+    #[test]
+    fn jev_floor_env_overrides_set_only_the_named_site() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_JEV_FLOOR_DISPATCH_MIN_CONFIDENCE", "0.9"),
+            ("ZIRV_CTX_JEV_FLOOR_DISPATCH_MIN_MARGIN", "0.35"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set jev.floors.*");
+        assert_eq!(cfg.jev.floors.dispatch.min_confidence, Some(0.9));
+        assert_eq!(cfg.jev.floors.dispatch.min_margin, Some(0.35));
+        assert_eq!(cfg.jev.floors.memory.min_confidence, None);
+        assert_eq!(cfg.jev.floors.memory.min_margin, None);
+    }
+
+    /// Issue #803: an out-of-range floor is a loud load-time error, the same
+    /// convention `proxy.min_confidence`/`proxy.min_margin` already hold --
+    /// never a silent clamp.
+    #[test]
+    fn jev_floor_out_of_range_is_a_named_config_error() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE", "1.5")]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an out-of-range floor must fail to load");
+        assert!(
+            err.to_string().contains("jev.floors.memory.min_confidence"),
+            "error must name the exact offending key: {err}"
+        );
+    }
+
     /// Every `[headless]` key is `REPO_FORBIDDEN`: a repo checkout must not
     /// be able to turn on a headless cost lever for itself -- same reasoning
     /// as `jev_keys_are_repo_forbidden` above.
