@@ -32,28 +32,21 @@ CLI agent harness with real dollar costs and safety floors:
 | loop forever | explicit spend / wall-clock / call / trial / retry / concurrency budgets, reserved before each dispatch |
 | `keep` = commit to the branch | a report plus a reviewable overlay/patch proposal and rollback notes -- never merged, applied, or turned into a PR automatically |
 
-## Status in this worktree
+## What is here
 
-**Evaluator side (this PR, Lane C) -- implemented and tested:**
+- `zirv workflow research plan|run|status|report` -- the campaign runner
+  (issue #802) -- and `zirv workflow spend`, the spend reconciler (#800).
 - `../wrapped-vs-vanilla/run.py --trial <spec.json> --out <dir>` and
-  `--check-graders` (issues #801, #802, #804).
-- `decision_trial.py` and the labelled intake decision-case corpus (issue
-  #803).
-- `../wrapped-vs-vanilla/corpus.toml` (the versioned task/split list, issue
-  #801) and `t25_sticky_notes` (issue #805's long-session chain task).
-- The campaign manifests under `campaigns/` (issue #802's schema, authored
-  against the contract below).
+  `--check-graders` (#801, #802, #804).
+- `decision_trial.py` and the labelled intake decision-case corpus (#803).
+- `../wrapped-vs-vanilla/corpus.toml` (the versioned task/split list, #801)
+  and `t25_sticky_notes` (#805's long-session chain task).
+- The campaign manifests under `campaigns/`; `plan` accepts every one of
+  them.
+- `sample-report.md`: the `report.md` the free fixture campaign produces.
 
-**Runner side -- NOT yet in this worktree:** `zirv workflow research
-plan|run|status|report` and `zirv workflow spend` (issues #800, #802) are
-designed in
-[`docs/superpowers/specs/2026-09-26-autoresearch-design.md`](../../superpowers/specs/2026-09-26-autoresearch-design.md)
-but not implemented here -- a separate lane owns that Rust command. Every
-manifest under `campaigns/` is authored against that design's contract and
-validated to parse, but **cannot be run end to end in this worktree yet**;
-`run.py --trial`/`--check-graders` and `decision_trial.py` (the backends
-those manifests call) work today and are what this page's examples
-actually run.
+The full contract is in
+[`docs/superpowers/specs/2026-09-26-autoresearch-design.md`](../../superpowers/specs/2026-09-26-autoresearch-design.md).
 
 ## Setup
 
@@ -68,7 +61,7 @@ manifests) -- no install step for the benchmark side. You need:
 - Nothing else for `--check-graders` or the unit tests: both run entirely
   locally.
 
-## Running the parts that exist today
+## Running the backends by hand
 
 Grader self-check (no provider call, safe to run any time):
 
@@ -120,18 +113,37 @@ Unit tests (no provider call, ever):
 python -m unittest discover -s docs/benchmarks -p "test_*.py"
 ```
 
-## `zirv workflow research plan|run|status|report` and `zirv workflow spend` (designed, not yet built here)
+## `zirv workflow research` and `zirv workflow spend`
 
-Once the runner lands, the intended flow (see the design spec for the full
-contract) is: `plan` resolves a manifest and prints the work/budget it would
-do without calling a provider; `run` executes it (screen -> validate ->
-holdout, respecting every budget); `status`/`report` inspect an in-progress
-or finished campaign's ledger. `zirv workflow spend --state-dir <dir>
---receipts <file> --campaign <c> --trial <t> --json` is the one spend
-reconciler both `run.py --trial` and `decision_trial.py` already call (and
-fall back from, with a `completeness: "partial"`/`"unknown"` `SpendReport`,
-when it's missing) -- see `../wrapped-vs-vanilla/CONTRACT.md`'s
-"Autoresearch trial mode" section for that fallback's exact shape.
+```
+zirv workflow research plan <manifest> [--repo <dir>] [--json]
+zirv workflow research run <manifest> [--repo <dir>] [--dir <campaign-dir>] [--resume] [--json]
+zirv workflow research status <campaign-id|campaign-dir> [--json]
+zirv workflow research report <campaign-id|campaign-dir> [--json]
+```
+
+`plan` resolves a manifest and prints the work and worst-case budget it
+would use, without calling a provider; it exits 2 when the manifest is
+refused. `run` executes it: baseline, then screen -> validate -> holdout per
+candidate, within every budget. Without `--dir`, a campaign lives under
+`<ctx state dir>/research/<id>/`. `--resume` continues a stopped campaign
+without re-running a finished trial, and refuses a manifest that changed
+since the campaign started. `status` shows stage, trial counts and spend
+against caps; `report` regenerates the outputs from the ledger.
+
+The free way to see all of it is the fixture campaign, which launches no
+process:
+
+```
+zirv workflow research run docs/benchmarks/autoresearch/campaigns/fixture-demo.toml --dir fixture-demo-out
+```
+
+`zirv workflow spend --state-dir <dir> [--receipts <file>] [--campaign <c>]
+[--candidate <c>] [--trial <t>] [--task <t>] [--json]` is the spend
+reconciler that both `run.py --trial` and `decision_trial.py` call. When
+it is missing they fall back to a `completeness: "partial"`/`"unknown"`
+`SpendReport`; `../wrapped-vs-vanilla/CONTRACT.md`'s "Autoresearch trial
+mode" section gives the exact shape.
 
 ## Manifest reference
 
@@ -229,8 +241,8 @@ specifically fired should use `requires_receipts = ["proxy:decider:
 typesafe"]` (see above), which is the runner's own exclusion mechanism for
 that.
 
-See `campaigns/*.toml` for five worked examples: `fixture-demo.toml` (free,
-scripted, safe to run once the runner exists), and four real campaigns
+See `campaigns/*.toml` for six worked examples: `fixture-demo.toml` (free,
+scripted, safe to run any time), and four real campaigns
 (`jev-intake-floors.toml`, `jev-gates-e2e.toml`, `routing-ladder.toml`,
 `context-compaction.toml` + its forced-pressure variant) that spend real
 money and are never run in CI.
@@ -277,7 +289,7 @@ the design spec's #801 section for the full six-step decision tree.
 
 ## Outputs
 
-A finished campaign writes (once the runner exists) `report.md`,
+A finished campaign writes `report.md` (see `sample-report.md`),
 `report.json`, `results.tsv` (an autoresearch-style summary line per
 candidate), and, for the single simplest accepted candidate (fewest
 overlay keys + patch lines among CI-overlapping winners),
@@ -291,10 +303,8 @@ explicit, operator-taken action.
 - **Single project family**: every task is `ledgerlite`. A report built
   from this corpus is flagged `single_family`; it is not evidence a
   candidate generalizes to a different codebase or language.
-- **No paid campaign has been run** as part of this PR -- every non-fixture
-  manifest here is authored against the contract and validated to parse,
-  never executed (the runner it targets doesn't exist in this worktree
-  yet).
+- **No paid campaign has been run** yet -- every non-fixture manifest here
+  passes `plan`, but none has been executed, so no gain is claimed.
 - **Orchestration is unmeasured**: no multi-seat suite exists; every result
   here is single-seat.
 - **#762 owns rot-threshold calibration**; this campaign framework only
