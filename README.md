@@ -509,43 +509,95 @@ everywhere when empty.
 yes/no reading, but a consumer only acts on it when it is ALSO decisive at
 `min_margin` (a confident-looking but thin-margin "ambiguous" reading must
 not interrupt a launch on its own). When the winning decision's
-`needs_clarification` is at or above `0.5` and decisive, an interactive
-`zirv chat`/bare `zirv` launch prints one
-prompt (`proxy: the request looks ambiguous (0.72). Add detail and press
-Enter, or press Enter to launch as is:`) and reads one line from stdin. An
-empty answer leaves the decision as is; a non-empty one is appended to the
-request (separated by a blank line) and `decide()` runs exactly once more —
-never a second round, however ambiguous the new decision still looks.
-`zirv ctx proxy` itself never prompts; it keeps printing
-`needs_clarification` as a plain field, same as every other value. A launch
-that never got the chance to ask (a dashboard pane, a resumed session) still
-carries a `clarify: ask the user one precise question before acting` line in
-its `[zirv proxy]` prompt layer when the same threshold-and-decisive
-condition holds.
+`needs_clarification` is at or above `0.5` and decisive, the intake view (see
+"The intake plan card" below) shows one reworded question in a box
+(`Which part should change? Name a file, a module or a screen.` for the
+`target` category, and similarly for `behavior`/`constraint`/generic) —
+`⏎` answers it, `Tab` skips and plans anyway. An empty or skipped answer
+leaves the decision as is; a non-empty one is appended to the request
+(separated by a blank line) and `decide()` runs exactly once more — never a
+second round, however ambiguous the new decision still looks. `zirv ctx
+proxy` itself never prompts; it keeps printing `needs_clarification` as a
+plain field, same as every other value. A launch that never got the chance to
+ask (a dashboard pane, a resumed session) still carries a `clarify: ask the
+user one precise question before acting` line in its `[zirv proxy]` prompt
+layer when the same threshold-and-decisive condition holds.
 
 **When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
-view first only when `[proxy] enabled = true` and the configured decider has a
-usable model: `typesafe` needs a non-empty `model` and the environment variable
-named by `credential_env` set; `helper` needs a resolvable default adapter;
-`deterministic` never takes over. Otherwise the launch proceeds exactly as it
-does today — the full orchestrator harness — after one `zirv ▸` advisory line
-carrying the reason, for example `proxy: enabled but TYPESAFE_API_KEY is
-unset; starting the orchestrator harness`.
+view first only when `[proxy] enabled = true`, the configured decider has a
+usable model (`typesafe` needs a non-empty `model` and the environment
+variable named by `credential_env` set; `helper` needs a resolvable default
+adapter; `deterministic` never takes over), and the terminal can actually
+render it (an interactive stdin, VT output enabled, and stderr itself a
+terminal — the region is inline ratatui, drawn on the plain screen before the
+harness starts). Otherwise the launch proceeds exactly as it does today — the
+full orchestrator harness, keeping whatever task text was already typed —
+after one `zirv ▸` advisory line carrying the reason, for example `proxy:
+enabled but TYPESAFE_API_KEY is unset; starting the orchestrator harness` or
+`proxy: this terminal cannot render the intake view; starting the
+orchestrator harness`.
 
-**What `zirv chat` does with it.** When the proxy is active, the decided
-harness and `--model` replace the resolved adapter and `cfg.chat.model`
-before launch; the decision's workflow starts with the request text as the
-first prompt when the repo has no workflow already active; and one `zirv ▸`
-line announces the outcome, e.g.:
+### The intake plan card
 
-```
-zirv ▸ proxy: orchestrated · orchestrator claude/sonnet (standard) · workers standard · workflow feature (substantial/medium) · typesafe 0.81
-zirv ▸ proxy: direct · single seat · claude/sonnet (cheap) · no workflow · typesafe 0.75
-```
+When the proxy is active, `zirv chat`/bare `zirv` opens a short inline view
+— on the normal screen, before the harness's own full-screen start, so it
+survives that switch (issue #701) — instead of the harness starting
+immediately:
 
-Before either decider call runs, one `zirv ▸ proxy: asking …` line tells the
-operator the request has gone out, e.g. `proxy: asking typesafe
-(jev-1.13.0)…` or `proxy: asking helper model…`.
+1. A boxed prompt (`⏎ plan and start · shift+⏎ new line · esc start without a
+   plan`) reads the task description; `Alt+⏎`/`Ctrl+J` also insert a
+   newline.
+2. `✻ Sizing the task… Ns · esc to start without a plan` — a spinner while
+   `decide()` runs on a worker thread; Esc or Ctrl+C abandons it (the
+   thread's result is then just discarded) and starts the harness without a
+   plan, keeping whatever was typed.
+3. The clarify box above, only when the decision asks.
+4. A plan card in plain words — no seat tiers, decider names, domain scores
+   or confidence numbers, ever; `zirv ctx proxy --json` still has those:
+
+   ```
+   ╭─ Plan ───────────────────────────────────────────────────────────────╮
+   │ A bounded bug fix.                                                   │
+   │                                                                       │
+   │   Model     Sonnet 5, working alone                                  │
+   │   Workflow  bugfix · 7 steps, starting at reproduce                  │
+   │   Why       one area, low risk                                       │
+   │                                                                       │
+   │ ❯ 1. Start                                                           │
+   │   2. Start with a different model                                    │
+   │   3. Start without a workflow                                        │
+   │   4. Edit the task                                                   │
+   ╰──────────────────────────────────────────────────────────────────────╯
+     ↑↓ choose · ⏎ confirm · esc start without a plan
+   ```
+
+   An orchestrated decision shows `Lead`/`Helpers` instead of `Model`.
+   `↑↓`/digits `1`-`4` choose, `⏎` confirms — every plan waits for Enter, no
+   countdown. Choice 2 opens a short list of the models every enabled-and-
+   ready harness's own tier ladder offers (cheap through frontier, minus the
+   already-planned seat) — the harness can change too, not only the model;
+   picking one replaces the whole seat. Omitted (and the rest renumbered)
+   when there is nothing else to offer. Choice 3 starts no workflow; choice 4
+   returns to the prompt with the typed text kept. **Esc or Ctrl+C at any
+   point** — the prompt, the clarify box, the plan card, the model list —
+   starts the harness without a plan.
+5. The decided workflow starts only once choice 1 or 2 is confirmed (choice 3
+   starts none) — not, as before, ahead of the operator ever seeing a plan.
+6. When the configured decider failed or timed out, a yellow `⚠` line above
+   the card names it in plain words (`Typesafe did not answer within 10s. The
+   plan below uses local rules.`), with `zirv ctx proxy --json` for details.
+7. Confirming clears the region and leaves exactly one line in scrollback,
+   e.g.:
+
+   ```
+   ✻ zirv planned in 3s · Sonnet 5 alone · bugfix workflow w-3f2a
+   ```
+
+**What `zirv chat` does with it.** The decided harness and `--model` replace
+the resolved adapter and `cfg.chat.model` before launch (a picked model from
+choice 2 replaces `orchestrator.model` the same way); the decision's workflow
+starts with the request text as the first prompt when the repo has no
+workflow already active and the plan was confirmed with choice 1 or 2.
 
 **Single seat vs. orchestrator seat.** A Direct or Bounded decision launches
 the harness as a `single` seat (`PromptRole::Single`): it gets none of the

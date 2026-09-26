@@ -7,14 +7,8 @@
 //! allowed to hear about delegating to other harnesses (`zirv ctx send`,
 //! `zirv ctx inbox`, `zirv ctx agent`).
 
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-
-use crossterm::cursor::{MoveDown, MoveToColumn, MoveUp};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::style::Print;
-use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
-use unicode_width::UnicodeWidthChar;
 
 use super::adapters::{self, AgentAdapter, DefaultOrigin};
 use super::chrome::{self, BannerFacts, ChromeCaps, HarnessRule};
@@ -22,7 +16,6 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::dash;
 use super::dash::pane::PaneSpec;
 use super::event::SessionId;
-use super::jev::{self, JevEffect};
 use super::prompt::PromptRole;
 use super::proxy::{
     self,
@@ -33,6 +26,8 @@ use super::state::StateDir;
 use super::term;
 use super::wrap::{self, WrapArgs};
 use super::{CtxResult, handoff, resume};
+
+mod intake;
 
 #[derive(Debug, clap::Args)]
 pub struct ChatArgs {
@@ -372,21 +367,32 @@ pub fn resolve_initial_prompt<W: Write>(
 }
 
 /// Issue #537 (T2): what the harness proxy's intake step decided for this
-/// launch, evaluated once, before `resolve_adapter`.
+/// launch, evaluated once, before `resolve_adapter`. PR3 (issue #799):
+/// replaced the blocking stderr prompt with an inline ratatui plan card
+/// (`intake::run`); see that module's own doc comment for the full
+/// prompt/sizing/clarify/plan flow.
 #[derive(Debug, PartialEq)]
 enum ProxyIntakeOutcome {
-    /// The proxy took no part in this launch; `advisory`, when present, is
-    /// the one line `run_with` prints on the same `zirv \u{25b8}` channel as
-    /// every other announcement (so it still honors `--quiet`).
-    Inactive { advisory: Option<String> },
+    /// The proxy took no part in this launch (a routine skip), OR the
+    /// operator pressed Esc somewhere in the plan-card flow: `request`, when
+    /// present, is whatever task text had already been typed at that point --
+    /// preserved as the launch's own initial prompt rather than thrown away.
+    /// `advisory`, when present, is the one line `run_with` prints on the
+    /// same `zirv \u{25b8}` channel as every other announcement (so it still
+    /// honors `--quiet`).
+    Inactive {
+        advisory: Option<String>,
+        request: Option<String>,
+    },
     /// Activation succeeded but stdin is not a terminal, so there is
     /// nowhere to read the task description from: `run_with` refuses the
     /// whole launch with this message rather than silently skipping the
     /// proxy (unlike every other `Inactive` case, this one was never given
     /// a chance to say anything at all).
     Refuse { message: String },
-    /// The proxy decided this launch: `request` is the raw text `decide`
-    /// classified, carried alongside so it can also become the launch's own
+    /// The operator confirmed a plan card (choice 1, 2 or 3): `request` is
+    /// the raw text `decide` classified (folded with any clarification
+    /// answer), carried alongside so it can also become the launch's own
     /// initial prompt. Boxed: `ProxyDecision` is far larger than every other
     /// variant here (clippy's `large_enum_variant`), and this variant is
     /// matched far less often than it is passed around.
@@ -396,379 +402,9 @@ enum ProxyIntakeOutcome {
     },
 }
 
-/// One line of text under construction by the operator, tracked as
-/// codepoints with an interior edit point (`cursor`, a codepoint index into
-/// `chars`) rather than only ever appending at the end. See
-/// [`read_edited_line`]'s own doc comment for why this exists at all.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct EditLine {
-    chars: Vec<char>,
-    cursor: usize,
-}
-
-impl EditLine {
-    fn text(&self) -> String {
-        self.chars.iter().collect()
-    }
-
-    /// How many terminal cells the first `upto` codepoints occupy -- NOT how
-    /// many codepoints they are. A CJK ideograph or a wide emoji occupies two
-    /// cells and a combining mark occupies none, so cursor positioning that
-    /// counted codepoints (as this did before review) put the cursor in the
-    /// wrong column the moment the line held either. `None` from
-    /// `UnicodeWidthChar::width` means a control character, which this editor
-    /// never inserts (`apply_key` only ever inserts what `KeyCode::Char`
-    /// carries, and the control chords are matched out before it).
-    fn cells_upto(&self, upto: usize) -> usize {
-        self.chars[..upto.min(self.chars.len())]
-            .iter()
-            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
-            .sum()
-    }
-
-    /// Terminal cells the whole line occupies.
-    fn cells(&self) -> usize {
-        self.cells_upto(self.chars.len())
-    }
-
-    fn insert(&mut self, c: char) {
-        self.chars.insert(self.cursor, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        self.chars.remove(self.cursor);
-        true
-    }
-
-    fn delete_forward(&mut self) -> bool {
-        if self.cursor >= self.chars.len() {
-            return false;
-        }
-        self.chars.remove(self.cursor);
-        true
-    }
-
-    fn move_left(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        true
-    }
-
-    fn move_right(&mut self) -> bool {
-        if self.cursor >= self.chars.len() {
-            return false;
-        }
-        self.cursor += 1;
-        true
-    }
-
-    fn move_home(&mut self) -> bool {
-        let moved = self.cursor != 0;
-        self.cursor = 0;
-        moved
-    }
-
-    fn move_end(&mut self) -> bool {
-        let moved = self.cursor != self.chars.len();
-        self.cursor = self.chars.len();
-        moved
-    }
-}
-
-/// What one raw key does to an [`EditLine`] in progress -- pure so the
-/// mapping from a key to an edit is unit-tested without a real terminal.
-/// `Eof`/`Cancel` exist because raw mode (needed to see Left/Right at all --
-/// a canonical-mode tty has no concept of them beyond their raw escape
-/// bytes) disables `ICANON`/`ISIG` along with it, which otherwise silently
-/// takes Ctrl+D's end-of-input and Ctrl+C's interrupt away too; see
-/// [`read_edited_line`]'s own doc comment for how each is put back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditAction {
-    Edited,
-    Submit,
-    Eof,
-    Cancel,
-    Ignored,
-}
-
-/// Pure: what pressing `code` (with `modifiers`) does to `line`.
-///
-/// Ctrl+D only ends input on an EMPTY line. A canonical-mode tty delivers
-/// whatever is already typed when `VEOF` arrives mid-line rather than
-/// throwing it away (confirmed on a real pty during review), so treating
-/// every Ctrl+D as end-of-input -- as this did before review -- silently
-/// discarded a line the operator had finished typing but not yet sent.
-fn apply_key(line: &mut EditLine, code: KeyCode, modifiers: KeyModifiers) -> EditAction {
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        return match code {
-            KeyCode::Char('c' | 'C') => EditAction::Cancel,
-            KeyCode::Char('d' | 'D') => {
-                if line.chars.is_empty() {
-                    EditAction::Eof
-                } else {
-                    EditAction::Submit
-                }
-            }
-            _ => EditAction::Ignored,
-        };
-    }
-    let edited = match code {
-        KeyCode::Enter => return EditAction::Submit,
-        KeyCode::Char(c) => {
-            line.insert(c);
-            true
-        }
-        KeyCode::Backspace => line.backspace(),
-        KeyCode::Delete => line.delete_forward(),
-        KeyCode::Left => line.move_left(),
-        KeyCode::Right => line.move_right(),
-        KeyCode::Home => line.move_home(),
-        KeyCode::End => line.move_end(),
-        _ => false,
-    };
-    if edited {
-        EditAction::Edited
-    } else {
-        EditAction::Ignored
-    }
-}
-
-/// Pure: where a point `cursor_cells` cells into a line sits, as `(row, col)`
-/// relative to the row the line started on, when the terminal is `width`
-/// columns wide. Split out of [`redraw_edit_line`] so the wrapping arithmetic
-/// -- the part review found wrong, and the part no terminal is needed to
-/// check -- is unit-tested directly. `width` of 0 is treated as 1: a
-/// zero-width terminal would divide by zero, and one column is the smallest
-/// layout that still makes sense to draw into.
-fn edit_line_layout(cursor_cells: usize, width: usize) -> (usize, usize) {
-    let width = width.max(1);
-    (cursor_cells / width, cursor_cells % width)
-}
-
-/// Redraws `line`, which may occupy more than one terminal row once it is
-/// longer than the terminal is wide.
-///
-/// `previous_cursor_row` is how many rows below the line's own first row the
-/// cursor was left on by the last redraw -- the only state this needs, and
-/// the fix for what review found: the old version issued a bare
-/// `MoveToColumn(0)` + `Clear(CurrentLine)`, which on a wrapped line returns
-/// to the start of whichever row the cursor happens to be on and clears only
-/// that row, so every further keystroke reprinted the whole line one row
-/// further down. Moving up by the tracked row count first anchors the redraw
-/// back at the line's own first row, and `FromCursorDown` then clears every
-/// row the previous render used.
-///
-/// Deliberately relative (move up from wherever the cursor is) rather than
-/// absolute (remember the origin row from `cursor::position()`): when the
-/// content grows past the bottom of the screen the terminal scrolls, which
-/// moves an absolute origin row out from under itself but leaves every
-/// relative move still correct.
-///
-/// Returns the cursor's new row offset, for the next call to pass back in.
-fn redraw_edit_line(
-    out: &mut impl Write,
-    line: &EditLine,
-    previous_cursor_row: usize,
-    width: u16,
-) -> io::Result<usize> {
-    let cells = line.cells();
-    let cursor_cells = line.cells_upto(line.cursor);
-    let (cursor_row, cursor_col) = edit_line_layout(cursor_cells, usize::from(width));
-
-    if previous_cursor_row > 0 {
-        crossterm::execute!(out, MoveUp(previous_cursor_row as u16))?;
-    }
-    crossterm::execute!(
-        out,
-        MoveToColumn(0),
-        Clear(ClearType::FromCursorDown),
-        Print(line.text())
-    )?;
-    // A line that ends exactly on a row boundary leaves the cursor somewhere
-    // terminals disagree about -- at the end of the row just filled (deferred
-    // wrap, the common behaviour) or at the start of the next one. Printing
-    // one space forces the wrap to have happened either way, and erasing it
-    // again leaves the screen as if it never did, so the arithmetic below has
-    // exactly one cursor position to reason about.
-    let width_cells = usize::from(width.max(1));
-    if cells > 0 && cells.is_multiple_of(width_cells) {
-        crossterm::execute!(out, Print(" "), Clear(ClearType::UntilNewLine))?;
-    }
-    // The cursor is now on the line's last row; step back up to the row the
-    // edit point is on and into its column.
-    let last_row = cells / width_cells;
-    if last_row > cursor_row {
-        crossterm::execute!(out, MoveUp((last_row - cursor_row) as u16))?;
-    }
-    crossterm::execute!(out, MoveToColumn(cursor_col as u16))?;
-    Ok(cursor_row)
-}
-
-/// What one call to [`read_edited_line`] produced: a submitted line, or
-/// end of input (Ctrl+D) -- Ctrl+C exits the process directly (see that
-/// function's own doc comment) rather than surfacing as a third variant
-/// here, so every caller of this type only ever has these two to handle,
-/// same as a plain `read_line`'s `Some`/`None`.
-enum LineOutcome {
-    Line(String),
-    Eof,
-}
-
-/// Reads one line from the operator with a real, relocatable cursor --
-/// Left/Right/Home/End actually move the edit point, and Backspace/Delete
-/// act on wherever it is -- instead of what bare canonical-mode
-/// `stdin().read_line()` gives: appending is the only edit there is, since
-/// the tty's own line discipline has no notion of an interior cursor at all
-/// (an arrow key's raw escape bytes just get inserted as literal text, or
-/// swallowed by whatever the terminal makes of them). That was reported as
-/// the harness-proxy intake prompt being stuck in "insert mode".
-///
-/// Needs raw mode to see Left/Right as `KeyCode`s at all, which as a side
-/// effect disables `ISIG`/`ICANON`, so this hand-restores what those
-/// otherwise gave for free: a bare Ctrl+C would otherwise do nothing
-/// (silently swallowed instead of raising `SIGINT`), so it exits the
-/// process itself with 130 (128 + `SIGINT`, the conventional code an
-/// interrupted process reports) -- the same outward result canonical mode's
-/// own signal delivery always had here. A bare Ctrl+D would otherwise be
-/// read back as a literal `KeyCode::Char('d')` instead of ending input, so
-/// it maps to [`LineOutcome::Eof`] by hand instead. Raw mode is always
-/// disabled again before returning, on every exit path including an I/O
-/// error, so a failure here can never leave the terminal stuck in it.
-fn read_edited_line() -> io::Result<LineOutcome> {
-    enable_raw_mode()?;
-    let mut term = io::stderr();
-    let mut line = EditLine::default();
-    // How far below the line's own first row the cursor was left by the last
-    // redraw -- see `redraw_edit_line`, which needs it to anchor a wrapped
-    // line's redraw back at the row it started on.
-    let mut cursor_row = 0usize;
-    let outcome = loop {
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                match apply_key(&mut line, key.code, key.modifiers) {
-                    EditAction::Submit => break Ok(LineOutcome::Line(line.text())),
-                    EditAction::Eof => break Ok(LineOutcome::Eof),
-                    EditAction::Cancel => {
-                        let _ = disable_raw_mode();
-                        let _ = writeln!(term);
-                        std::process::exit(130);
-                    }
-                    EditAction::Edited => {
-                        // A terminal that cannot report its width still gets a
-                        // usable editor: 80 columns is the conventional
-                        // fallback, and the only cost of guessing it wrong is
-                        // the wrapped-line redraw this width feeds.
-                        let width = crossterm::terminal::size().map_or(80, |(cols, _)| cols);
-                        match redraw_edit_line(&mut term, &line, cursor_row, width) {
-                            Ok(row) => cursor_row = row,
-                            Err(e) => break Err(e),
-                        }
-                    }
-                    EditAction::Ignored => {}
-                }
-            }
-            Ok(_) => {}
-            Err(e) => break Err(e),
-        }
-    };
-    let _ = disable_raw_mode();
-    if outcome.is_ok() {
-        // From wherever the edit point was, drop past the LAST row the line
-        // occupies before ending it, so a wrapped line's tail is not
-        // overwritten by whatever prints next.
-        let width = usize::from(
-            crossterm::terminal::size()
-                .map_or(80u16, |(cols, _)| cols)
-                .max(1),
-        );
-        let last_row = line.cells() / width;
-        if last_row > cursor_row {
-            let _ = crossterm::execute!(term, MoveDown((last_row - cursor_row) as u16));
-        }
-        let _ = writeln!(term);
-    }
-    outcome
-}
-
-/// A `Read` source, meant to be wrapped in a `BufReader` (which then
-/// satisfies the `BufRead` [`proxy_intake`] takes), that serves each line
-/// from [`read_edited_line`] instead of raw stdin bytes. `proxy::
-/// read_request`'s own multi-line-until-blank-or-EOF loop does not change at
-/// all -- only where its bytes come from.
-struct EditedStdin {
-    pending: Vec<u8>,
-    pos: usize,
-    eof: bool,
-}
-
-impl EditedStdin {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-            pos: 0,
-            eof: false,
-        }
-    }
-}
-
-impl Read for EditedStdin {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.pending.len() {
-            if self.eof {
-                return Ok(0);
-            }
-            self.pending.clear();
-            self.pos = 0;
-            match read_edited_line()? {
-                LineOutcome::Line(text) => {
-                    self.pending.extend_from_slice(text.as_bytes());
-                    self.pending.push(b'\n');
-                }
-                LineOutcome::Eof => {
-                    self.eof = true;
-                    return Ok(0);
-                }
-            }
-        }
-        let n = buf.len().min(self.pending.len() - self.pos);
-        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-/// The `reader` a real, interactive `proxy_intake` call reads the task
-/// description from: [`EditedStdin`] (real cursor editing) when stdin is a
-/// terminal capable of rendering the raw-mode escape codes that needs
-/// (`vt_ok`), plain stdin otherwise -- an older Windows console without VT
-/// processing enabled cannot be assumed to render `redraw_edit_line`'s
-/// cursor-movement codes correctly, so it keeps today's append-only
-/// behaviour rather than risking a garbled prompt.
-fn intake_reader(stdin_is_tty: bool, vt_ok: bool) -> Box<dyn BufRead> {
-    // `io::stderr()` is where `read_edited_line` echoes what is typed, so its
-    // OWN tty-ness is what decides whether the operator can see the editor at
-    // all -- gating on stdin/stdout alone (as this did before review) left
-    // `2>file` with a live raw-mode editor echoing into the file and nothing
-    // on screen.
-    if stdin_is_tty && vt_ok && io::stderr().is_terminal() {
-        Box::new(io::BufReader::new(EditedStdin::new()))
-    } else {
-        Box::new(io::stdin().lock())
-    }
-}
-
-/// The harness proxy's intake step (issue #537 T2), evaluated before any
-/// dashboard/TUI or `wrap` launch and before `resolve_adapter`. Pure of the
-/// real terminal/stdin: `stdin_is_tty` and `reader` are both passed in
-/// (`run_with` supplies `std::io::stdin()`'s own tty probe and a locked
-/// handle onto it), so the decision logic here is testable without one.
+/// The harness proxy's intake step (issue #537 T2; PR3/#799 rewrite),
+/// evaluated before any dashboard/TUI or `wrap` launch and before
+/// `resolve_adapter`.
 ///
 /// `--simple`/`--resume` always skip the proxy outright -- a resumed
 /// session's first prompt is the stored handoff, and `--simple` promises no
@@ -778,23 +414,28 @@ fn intake_reader(stdin_is_tty: bool, vt_ok: bool) -> Box<dyn BufRead> {
 /// decides (`--proxy`/`--no-proxy` already folded into `cfg.proxy.enabled`
 /// by the caller): `Err` skips with that reason as the advisory; `Ok` opens
 /// the intake view, refusing outright on a non-tty stdin (there is nowhere
-/// to read a request from) and falling back to `Inactive` on an empty
-/// request, exactly like every other skip.
-fn proxy_intake<E: Write>(
+/// to read a request from) and on a terminal that cannot render it (no VT
+/// output, or stderr itself is not a terminal -- the same posture
+/// `intake_reader` used to gate the old line editor on) -- ratatui's
+/// cursor-movement escapes need VT processing the same way the old
+/// `redraw_edit_line` did, so there is no partial fallback left to offer.
+fn proxy_intake(
     cfg: &CtxConfig,
     state: &StateDir,
     repo: &Path,
     args: &ChatArgs,
     stdin_is_tty: bool,
-    reader: &mut dyn BufRead,
-    stderr: &mut E,
+    vt_ok: bool,
 ) -> CtxResult<ProxyIntakeOutcome> {
     if args.simple || args.resume {
         let advisory = args.proxy.then(|| {
             let flag = if args.simple { "--simple" } else { "--resume" };
             format!("proxy: skipped ({flag}); starting the orchestrator harness")
         });
-        return Ok(ProxyIntakeOutcome::Inactive { advisory });
+        return Ok(ProxyIntakeOutcome::Inactive {
+            advisory,
+            request: None,
+        });
     }
     if let Err(reason) = proxy::activation(cfg) {
         // Issue #537 review: the plain `[proxy] enabled = false` default --
@@ -804,7 +445,10 @@ fn proxy_intake<E: Write>(
         // "enabled (by config or --proxy) but not usable"; the disabled
         // default (or an explicit `--no-proxy`) prints nothing.
         let advisory = cfg.proxy.enabled.then_some(reason);
-        return Ok(ProxyIntakeOutcome::Inactive { advisory });
+        return Ok(ProxyIntakeOutcome::Inactive {
+            advisory,
+            request: None,
+        });
     }
     if !stdin_is_tty {
         return Ok(ProxyIntakeOutcome::Refuse {
@@ -813,137 +457,25 @@ fn proxy_intake<E: Write>(
                 .to_string(),
         });
     }
-    writeln!(
-        stderr,
-        "zirv \u{25b8} proxy: describe the task (empty line to send)"
-    )?;
-    // Issue #701 (operator field report): a blank FIRST line used to skip the
-    // proxy outright, and that skip is invisible -- the advisory below is
-    // wiped by the harness's own alternate screen a moment later, so the
-    // launch looks exactly like one where the proxy never ran at all. Two
-    // ordinary things produce that blank line: the reflexive Enter at a
-    // prompt an operator did not expect, and a stray newline left in the
-    // console input buffer by a line editor (clink on `cmd.exe` here). Ask
-    // once more, naming both ways out; only a SECOND blank line (or EOF)
-    // skips, so a deliberate skip still costs one keypress.
-    let request = match proxy::read_request(reader) {
-        Some(request) => request,
-        None => {
-            writeln!(
-                stderr,
-                "zirv \u{25b8} proxy: nothing typed -- describe the task, or press Enter again to \
-                 start the harness without the proxy"
-            )?;
-            match proxy::read_request(reader) {
-                Some(request) => request,
-                None => {
-                    return Ok(ProxyIntakeOutcome::Inactive {
-                        advisory: Some(
-                            "proxy: no request given; starting the orchestrator harness"
-                                .to_string(),
-                        ),
-                    });
-                }
-            }
-        }
-    };
-    // Issue #537 review (operator field report): nothing on screen showed
-    // that the request was actually sent to the configured decider, so a
-    // slow or falling-back `decide()` looked identical to a hung session.
-    // Same `zirv \u{25b8}` channel and `--quiet` gate every other proxy
-    // advisory uses, printed immediately before the call it describes.
-    super::announce::Announcer::new(
-        cfg.chrome.events && !args.quiet,
-        console::colors_enabled_stderr(),
-    )
-    .emit_to(
-        stderr,
-        &super::announce::Event::ProxyAdvisory {
-            text: proxy::asking_line(cfg),
-        },
-    );
-    // `zirv chat` is always interactive (TTY-gated before this is ever
-    // reached) -- never a headless launch, so `headless` is always `false`
-    // here. See `proxy::decide`'s own doc comment for what that flag does.
-    let decision = proxy::decide(cfg, state.root(), repo, &request, false);
-    let (decision, request) = maybe_clarify(cfg, state, repo, decision, request, reader, stderr)?;
-    Ok(ProxyIntakeOutcome::Decided {
-        decision: Box::new(decision),
-        request,
-    })
-}
-
-/// Issue #537 (A2): one round of interactive follow-up when `decision.
-/// needs_clarification` is at or above `proxy::CLARIFY_THRESHOLD` AND
-/// `decision.needs_clarification_decisive` (the margin gate `proxy::decision
-/// ::merge` applied -- a confident-looking but thin-margin "ambiguous"
-/// reading must not interrupt a launch on its own) -- prints one prompt
-/// (unconditional, same as `proxy_intake`'s own "describe the task" prompt
-/// right above: this blocks on stdin, so it must stay visible regardless of
-/// `--quiet`) and reads one line. An empty line (or EOF)
-/// leaves `decision`/`request` untouched -- an operator who has nothing to
-/// add is not forced to add anything. A non-empty line is appended to
-/// `request` (separated by a blank line, so the harness's own first prompt
-/// still reads as one coherent task) and `decide` runs exactly once more --
-/// never a second clarification round, however ambiguous the new decision
-/// still looks.
-fn maybe_clarify<E: Write>(
-    cfg: &CtxConfig,
-    state: &StateDir,
-    repo: &Path,
-    decision: ProxyDecision,
-    request: String,
-    reader: &mut (impl BufRead + ?Sized),
-    stderr: &mut E,
-) -> CtxResult<(ProxyDecision, String)> {
-    if decision.needs_clarification < proxy::CLARIFY_THRESHOLD
-        || !decision.needs_clarification_decisive
-    {
-        return Ok((decision, request));
-    }
-    let clarification = match decision.clarification_category.as_deref() {
-        Some("target") => {
-            "Which service or files should change? Add detail and press Enter, or press Enter to launch as is:"
-        }
-        Some("behavior") => {
-            "What should happen when the change is complete? Add detail and press Enter, or press Enter to launch as is:"
-        }
-        Some("constraint") => {
-            "Which constraint or compatibility requirement must hold? Add detail and press Enter, or press Enter to launch as is:"
-        }
-        _ => "Add detail and press Enter, or press Enter to launch as is:",
-    };
-    writeln!(
-        stderr,
-        "zirv \u{25b8} proxy: the request looks ambiguous ({:.2}). {clarification}",
-        decision.needs_clarification,
-    )?;
-    let record_clarification = |action| {
-        if !matches!(decision.decider, proxy::decision::Decider::Typesafe) {
-            return;
-        }
-        let mut effect = JevEffect::new("intake_clarification", action);
-        effect.subject_id = Some(&decision.request_sha256);
-        effect.reason = Some(match decision.clarification_category.as_deref() {
-            Some("target") => "target",
-            Some("behavior") => "behavior",
-            Some("constraint") => "constraint",
-            _ => "generic",
+    if !vt_ok || !io::stderr().is_terminal() {
+        return Ok(ProxyIntakeOutcome::Inactive {
+            advisory: Some(
+                "proxy: this terminal cannot render the intake view; starting the orchestrator \
+                 harness"
+                    .to_string(),
+            ),
+            request: None,
         });
-        jev::record_effect(cfg, state, cfg.jev.intake_savings, &effect);
-    };
-    record_clarification("requested");
-    let mut line = String::new();
-    let read = reader.read_line(&mut line).unwrap_or(0);
-    let addition = line.trim_end_matches(['\n', '\r']);
-    if read == 0 || addition.trim().is_empty() {
-        record_clarification("unanswered");
-        return Ok((decision, request));
     }
-    record_clarification("answered");
-    let combined_request = format!("{request}\n\n{addition}");
-    let combined_decision = proxy::decide(cfg, state.root(), repo, &combined_request, false);
-    Ok((combined_decision, combined_request))
+    match intake::run(cfg, state, repo)? {
+        intake::IntakeOutcome::Decided { decision, request } => {
+            Ok(ProxyIntakeOutcome::Decided { decision, request })
+        }
+        intake::IntakeOutcome::Unplanned { request } => Ok(ProxyIntakeOutcome::Inactive {
+            advisory: None,
+            request,
+        }),
+    }
 }
 
 /// The chat-launch overrides an active harness-proxy decision applies:
@@ -1325,15 +857,7 @@ fn run_native_chat<E: Write>(
     // native launch honors the same decision through the same guards; see
     // `proxy_intake`'s own doc comment for the full skip/refuse/decide
     // sequence.
-    let intake = proxy_intake(
-        cfg,
-        &state,
-        repo,
-        args,
-        stdin_is_tty,
-        &mut *intake_reader(stdin_is_tty, vt_ok),
-        stderr,
-    )?;
+    let intake = proxy_intake(cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
         return Ok(1);
@@ -1537,15 +1061,7 @@ pub fn run_with<W: Write, E: Write>(
     // Issue #537 (T2): the harness proxy's own intake, before any adapter
     // resolution or dashboard/wrap launch -- see `proxy_intake`'s own doc
     // comment for the full skip/refuse/decide sequence.
-    let intake = proxy_intake(
-        &cfg,
-        &state,
-        repo,
-        args,
-        stdin_is_tty,
-        &mut *intake_reader(stdin_is_tty, vt_ok),
-        stderr,
-    )?;
+    let intake = proxy_intake(&cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
         return Ok(1);
@@ -1563,6 +1079,7 @@ pub fn run_with<W: Write, E: Write>(
     match &intake {
         ProxyIntakeOutcome::Inactive {
             advisory: Some(reason),
+            ..
         } => {
             proxy_announcer.emit_to(
                 stderr,
@@ -1572,15 +1089,16 @@ pub fn run_with<W: Write, E: Write>(
             );
         }
         ProxyIntakeOutcome::Decided { decision, .. } => {
+            // PR3 (#799): the old immediate `proxy::announce_line` advisory
+            // (seat tiers, decider name, confidence numbers) is gone -- the
+            // plan card the operator just confirmed already said this in
+            // plain words, and the one line left in scrollback (`intake::
+            // summary_line`, printed below once `started_workflow_id` is
+            // known) is its receipt.
             requested_agent = Some(apply_proxy_decision(&mut cfg, decision));
-            proxy_announcer.emit_to(
-                stderr,
-                &super::announce::Event::ProxyAdvisory {
-                    text: proxy::announce_line(decision),
-                },
-            );
         }
-        ProxyIntakeOutcome::Inactive { advisory: None } | ProxyIntakeOutcome::Refuse { .. } => {}
+        ProxyIntakeOutcome::Inactive { advisory: None, .. } | ProxyIntakeOutcome::Refuse { .. } => {
+        }
     }
 
     let (adapter, rule) = match resolve_adapter(&cfg, requested_agent.as_deref()) {
@@ -1619,6 +1137,13 @@ pub fn run_with<W: Write, E: Write>(
     // request never race for this slot).
     let initial_prompt = match &intake {
         ProxyIntakeOutcome::Decided { request, .. } => Some(request.clone()),
+        // Esc anywhere in the plan-card flow keeps whatever task text was
+        // already typed rather than discarding it -- see `ProxyIntakeOutcome
+        // ::Inactive`'s own doc comment.
+        ProxyIntakeOutcome::Inactive {
+            request: Some(text),
+            ..
+        } => Some(text.clone()),
         _ => resolve_initial_prompt(args.resume, &state, repo, w, &cfg.screen.thresholds())?,
     };
     let resuming = args.resume && initial_prompt.is_some();
@@ -1653,6 +1178,18 @@ pub fn run_with<W: Write, E: Write>(
     let started_workflow_id = start_proxy_workflow(&intake, &state, repo, |text| {
         proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
     });
+    // PR3 (#799): the one line the plan card promised stays in scrollback
+    // once it clears -- printed here, not inside the intake view itself,
+    // because only NOW is the concrete started workflow id (rather than only
+    // its kind) known. Not gated by `--quiet`: it is the receipt of a plan
+    // the operator just confirmed with Enter, not a discretionary advisory.
+    if let ProxyIntakeOutcome::Decided { decision, .. } = &intake {
+        writeln!(
+            stderr,
+            "{}",
+            intake::summary_line(decision, started_workflow_id.as_deref())
+        )?;
+    }
     // Issue #537 (T2a): the harness proxy's own bounded layer text, computed
     // once here and threaded to every place that needs it -- the fallback
     // just below, `dash_orchestrator_pane` and `wrap_args_for` -- so all
@@ -2226,198 +1763,6 @@ mod tests {
     use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
     use crate::commands::workflow::profile::{ExecutionMode, ValidationProfile};
     use std::collections::BTreeMap;
-
-    /// The exact defect the intake prompt was reported as: Left/Right must
-    /// actually relocate the edit point, not just be ignored (which is what
-    /// bare canonical-mode `read_line` effectively does with them) or always
-    /// append at the end regardless of where the cursor visually is.
-    #[test]
-    fn arrow_keys_relocate_the_cursor_instead_of_only_ever_appending() {
-        let mut line = EditLine::default();
-        for c in "hllo".chars() {
-            line.insert(c);
-        }
-        assert_eq!(line.text(), "hllo");
-        assert_eq!(line.cursor, 4);
-
-        // Move left three times to sit right after the "h".
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.cursor, 1);
-
-        // Insert at the relocated cursor, not at the end.
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Char('e'), KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.text(), "hello");
-        assert_eq!(line.cursor, 2);
-
-        // Right moves back toward the end.
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Right, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.cursor, 3);
-    }
-
-    #[test]
-    fn cursor_movement_is_a_no_op_and_ignored_at_either_edge() {
-        let mut line = EditLine::default();
-        line.insert('a');
-        line.insert('b');
-        line.cursor = 0;
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Left, KeyModifiers::NONE),
-            EditAction::Ignored,
-            "already at column 0 -- nothing to move left into"
-        );
-        line.cursor = line.chars.len();
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Right, KeyModifiers::NONE),
-            EditAction::Ignored,
-            "already past the last char -- nothing to move right into"
-        );
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Home, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.cursor, 0);
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Home, KeyModifiers::NONE),
-            EditAction::Ignored,
-            "already at column 0"
-        );
-        assert_eq!(
-            apply_key(&mut line, KeyCode::End, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.cursor, 2);
-    }
-
-    #[test]
-    fn backspace_and_delete_act_on_the_cursor_not_the_end_of_the_line() {
-        let mut line = EditLine::default();
-        for c in "abcd".chars() {
-            line.insert(c);
-        }
-        line.cursor = 2; // between 'b' and 'c'
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Backspace, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(line.text(), "acd", "erases 'b', the char before the cursor");
-        assert_eq!(line.cursor, 1);
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Delete, KeyModifiers::NONE),
-            EditAction::Edited
-        );
-        assert_eq!(
-            line.text(),
-            "ad",
-            "erases 'c', the char at/after the cursor"
-        );
-        assert_eq!(line.cursor, 1);
-    }
-
-    /// Raw mode's own cost: `ISIG`/`ICANON` going away silently takes
-    /// Ctrl+C's interrupt and Ctrl+D's end-of-input with them unless mapped
-    /// back explicitly, which is what `EditAction::Cancel`/`Eof` are for.
-    #[test]
-    fn ctrl_c_and_ctrl_d_map_to_cancel_and_eof_not_a_literal_character() {
-        let mut line = EditLine::default();
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Char('c'), KeyModifiers::CONTROL),
-            EditAction::Cancel
-        );
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Char('d'), KeyModifiers::CONTROL),
-            EditAction::Eof
-        );
-        assert!(
-            line.chars.is_empty(),
-            "neither control chord ever gets typed into the line itself"
-        );
-    }
-
-    /// Review finding: Ctrl+D mapped to `Eof` unconditionally, so the chord
-    /// that ends input on an empty prompt silently threw away a request the
-    /// operator had already typed. Canonical mode only ever sends `VEOF` on
-    /// an empty line; with text present the terminal submits it instead.
-    #[test]
-    fn ctrl_d_on_a_typed_line_submits_it_instead_of_discarding_it() {
-        let mut line = EditLine::default();
-        for c in "ship it".chars() {
-            line.insert(c);
-        }
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Char('d'), KeyModifiers::CONTROL),
-            EditAction::Submit
-        );
-        assert_eq!(line.text(), "ship it", "the typed request survives intact");
-    }
-
-    #[test]
-    fn enter_submits_without_touching_the_line() {
-        let mut line = EditLine::default();
-        line.insert('h');
-        line.insert('i');
-        assert_eq!(
-            apply_key(&mut line, KeyCode::Enter, KeyModifiers::NONE),
-            EditAction::Submit
-        );
-        assert_eq!(line.text(), "hi", "submitting must not mutate the buffer");
-    }
-
-    /// Review finding: the redraw put the cursor at `MoveToColumn(cursor)`
-    /// using the codepoint index, so a request longer than the terminal is
-    /// wide left the cursor on the wrong row entirely -- and every edit after
-    /// that painted over the wrong line.
-    #[test]
-    fn the_cursor_wraps_onto_the_row_its_own_cell_count_puts_it_on() {
-        assert_eq!(edit_line_layout(0, 20), (0, 0));
-        assert_eq!(edit_line_layout(19, 20), (0, 19));
-        assert_eq!(
-            edit_line_layout(20, 20),
-            (1, 0),
-            "the cell just past the last column belongs to the next row"
-        );
-        assert_eq!(edit_line_layout(45, 20), (2, 5));
-        assert_eq!(
-            edit_line_layout(3, 0),
-            (3, 0),
-            "a zero width is treated as one column rather than dividing by zero"
-        );
-    }
-
-    /// The other half of the same finding: cells, not codepoints. A CJK
-    /// glyph takes two columns and a combining mark takes none, so counting
-    /// `chars` put the cursor a whole row out on any non-ASCII request.
-    #[test]
-    fn cursor_position_counts_display_cells_not_codepoints() {
-        let mut line = EditLine::default();
-        for c in "日本".chars() {
-            line.insert(c);
-        }
-        assert_eq!(line.chars.len(), 2);
-        assert_eq!(line.cells(), 4, "each CJK glyph occupies two columns");
-        assert_eq!(line.cells_upto(1), 2);
-        assert_eq!(
-            edit_line_layout(line.cells(), 3),
-            (1, 1),
-            "four cells in a three-column terminal wrap onto the second row"
-        );
-    }
 
     fn handoff() -> Handoff {
         Handoff {
@@ -4656,28 +4001,17 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let args = chat_args(false);
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            false,
-            &mut &b""[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, false, false).expect("never errors");
 
         assert_eq!(
             outcome,
-            ProxyIntakeOutcome::Inactive { advisory: None },
+            ProxyIntakeOutcome::Inactive {
+                advisory: None,
+                request: None
+            },
             "the disabled default must be byte-identical to today, announcements included"
-        );
-        assert!(
-            stderr.is_empty(),
-            "proxy_intake itself never prints the advisory -- that is the caller's job \
-             (through the announce channel), so it must not touch stderr here"
         );
     }
 
@@ -4695,22 +4029,14 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let args = chat_args(false);
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            false,
-            &mut &b""[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, false, false).expect("never errors");
 
         match outcome {
             ProxyIntakeOutcome::Inactive {
                 advisory: Some(reason),
+                ..
             } => assert!(reason.contains("deterministic"), "got {reason}"),
             other => panic!("expected Inactive with a reason, got {other:?}"),
         }
@@ -4728,22 +4054,14 @@ mod tests {
         let mut args = chat_args(false);
         args.resume = true;
         args.proxy = true;
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            false,
-            &mut &b""[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, false, false).expect("never errors");
 
         match outcome {
             ProxyIntakeOutcome::Inactive {
                 advisory: Some(reason),
+                ..
             } => assert!(reason.contains("--resume"), "got {reason}"),
             other => panic!("expected Inactive naming --resume, got {other:?}"),
         }
@@ -4760,22 +4078,16 @@ mod tests {
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let mut args = chat_args(false);
         args.simple = true;
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            false,
-            &mut &b""[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, false, false).expect("never errors");
 
         assert_eq!(
             outcome,
-            ProxyIntakeOutcome::Inactive { advisory: None },
+            ProxyIntakeOutcome::Inactive {
+                advisory: None,
+                request: None
+            },
             "no explicit --proxy means no advisory at all"
         );
     }
@@ -4815,18 +4127,9 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let args = chat_args(false);
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            false,
-            &mut &b""[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, false, false).expect("never errors");
 
         match outcome {
             ProxyIntakeOutcome::Refuse { message } => {
@@ -4836,23 +4139,16 @@ mod tests {
         }
     }
 
-    /// Issue #537 review (operator field report): nothing on screen showed
-    /// that a request was actually sent to the decider, so a slow or
-    /// falling-back `decide()` looked identical to a hung session.
-    /// `proxy_intake` must print `proxy::asking_line` on stderr immediately
-    /// before calling `decide()`, even when every model decider falls
-    /// through to the deterministic floor. A connection-refused loopback
-    /// address keeps `decide()`'s own Typesafe attempt instant rather than
-    /// waiting out `timeout_secs`, so this stays fast and network-free; the
-    /// "never when inactive" half is already proven by the disabled/resume/
-    /// simple/non-tty tests above, all of which assert `stderr` is empty or
-    /// carries only their own named reason.
+    /// A stdin that IS a terminal but a console with no VT output support
+    /// (or a redirected stderr) cannot render the ratatui inline region --
+    /// its cursor-movement escapes need the same VT processing the old line
+    /// editor's `redraw_edit_line` did. This degrades to a routine, advised
+    /// skip rather than `Refuse`: the operator still gets a harness, just
+    /// without a plan.
     #[test]
-    fn the_asking_line_is_announced_before_decide_runs() {
+    fn a_tty_stdin_with_no_vt_support_skips_with_an_advisory_instead_of_refusing() {
         let mut cfg = CtxConfig::default();
         cfg.proxy.enabled = true;
-        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
-        cfg.proxy.typesafe.timeout_secs = 1;
         let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
             cfg.proxy.typesafe.credential_env.as_str(),
             Some("a-test-key"),
@@ -4861,321 +4157,17 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
         let args = chat_args(false);
-        let mut stderr = Vec::new();
 
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            true,
-            &mut &b"fix the flaky retry test\n"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-
-        assert!(
-            matches!(outcome, ProxyIntakeOutcome::Decided { .. }),
-            "the deterministic floor never fails: {outcome:?}"
-        );
-        let printed = String::from_utf8(stderr).expect("utf8");
-        assert!(
-            printed.contains(&proxy::asking_line(&cfg)),
-            "the asking line must reach the operator before decide() runs: {printed}"
-        );
-    }
-
-    /// Issue #701 (operator field report): the launch looked like the proxy
-    /// had never run at all. A blank FIRST line -- the reflexive Enter at an
-    /// unexpected prompt, or a stray newline a console line editor left in
-    /// the input buffer -- used to skip the proxy outright, and the one-line
-    /// advisory saying so is wiped by the harness's alternate screen a
-    /// moment later. `proxy_intake` must re-prompt once and decide on the
-    /// request that follows.
-    #[test]
-    fn a_blank_first_line_reprompts_instead_of_skipping_the_proxy() {
-        let mut cfg = CtxConfig::default();
-        cfg.proxy.enabled = true;
-        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
-        cfg.proxy.typesafe.timeout_secs = 1;
-        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
-            cfg.proxy.typesafe.credential_env.as_str(),
-            Some("a-test-key"),
-        )]);
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let args = chat_args(false);
-        let mut stderr = Vec::new();
-
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            true,
-            &mut &b"
-fix the flaky retry test
-"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-
-        match outcome {
-            ProxyIntakeOutcome::Decided { request, .. } => {
-                assert_eq!(request, "fix the flaky retry test");
-            }
-            other => panic!("expected Decided after the re-prompt, got {other:?}"),
-        }
-        let printed = String::from_utf8(stderr).expect("utf8");
-        assert!(
-            printed.contains("nothing typed"),
-            "the re-prompt must say why it is asking again: {printed}"
-        );
-    }
-
-    /// The other half of the test above: a deliberate skip is still one
-    /// keypress away -- a SECOND blank line (or EOF) falls through to the
-    /// ordinary harness launch with the same named advisory as before.
-    #[test]
-    fn a_second_blank_line_still_skips_the_proxy() {
-        let mut cfg = CtxConfig::default();
-        cfg.proxy.enabled = true;
-        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".to_string();
-        cfg.proxy.typesafe.timeout_secs = 1;
-        let _cred = crate::commands::ctx::testenv::VarGuard::set(&[(
-            cfg.proxy.typesafe.credential_env.as_str(),
-            Some("a-test-key"),
-        )]);
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let args = chat_args(false);
-        let mut stderr = Vec::new();
-
-        let outcome = proxy_intake(
-            &cfg,
-            &state,
-            repo.path(),
-            &args,
-            true,
-            &mut &b"
-
-"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
+        let outcome =
+            proxy_intake(&cfg, &state, repo.path(), &args, true, false).expect("never errors");
 
         match outcome {
             ProxyIntakeOutcome::Inactive {
                 advisory: Some(reason),
-            } => {
-                assert!(reason.contains("no request given"), "got {reason}");
-            }
-            other => panic!("expected an Inactive skip, got {other:?}"),
+                request: None,
+            } => assert!(reason.contains("cannot render"), "got {reason}"),
+            other => panic!("expected an advised Inactive skip, got {other:?}"),
         }
-    }
-
-    /// Issue #537 (A2): below `proxy::CLARIFY_THRESHOLD`, `maybe_clarify` is
-    /// a complete no-op -- no prompt, `decision`/`request` unchanged --
-    /// regardless of what stdin holds; at or above it with an empty answer
-    /// (just Enter), the prompt still prints but the outcome is the same
-    /// no-op, since an operator with nothing to add must not be forced to
-    /// add something.
-    #[test]
-    fn maybe_clarify_is_a_no_op_below_the_threshold_or_on_an_empty_answer() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let cfg = CtxConfig::default();
-
-        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
-        decision.needs_clarification = 0.1;
-        let mut stderr = Vec::new();
-        let (unchanged, request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            decision.clone(),
-            "original request".to_string(),
-            &mut &b"ignored, never read below the threshold\n"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-        assert_eq!(unchanged, decision);
-        assert_eq!(request, "original request");
-        assert!(stderr.is_empty(), "below the threshold, no prompt at all");
-
-        let mut ambiguous = decision;
-        ambiguous.needs_clarification = 0.9;
-        ambiguous.needs_clarification_decisive = true;
-        let mut stderr = Vec::new();
-        let (unchanged, request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            ambiguous.clone(),
-            "original request".to_string(),
-            &mut &b"\n"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-        assert_eq!(unchanged, ambiguous);
-        assert_eq!(request, "original request");
-        assert!(
-            !stderr.is_empty(),
-            "the prompt itself must still print even when the answer is empty"
-        );
-    }
-
-    /// Jev determinism fix: at or above `proxy::CLARIFY_THRESHOLD`, a
-    /// `needs_clarification` answer that was NOT decisive at merge time
-    /// (thin margin between "ambiguous" and "clear enough") must never fire
-    /// the interactive round -- the raw value alone is not enough once
-    /// `needs_clarification_decisive` is `false`.
-    #[test]
-    fn maybe_clarify_is_a_no_op_above_the_threshold_when_not_decisive() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let cfg = CtxConfig::default();
-
-        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
-        decision.needs_clarification = 0.9;
-        decision.needs_clarification_decisive = false;
-        let mut stderr = Vec::new();
-        let (unchanged, request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            decision.clone(),
-            "original request".to_string(),
-            &mut &b"ignored, never read when not decisive\n"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-        assert_eq!(unchanged, decision);
-        assert_eq!(request, "original request");
-        assert!(
-            stderr.is_empty(),
-            "a non-decisive answer must never prompt, however high its raw value"
-        );
-    }
-
-    #[test]
-    fn material_ambiguity_category_asks_a_fixed_question_before_launch() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_CHAT_CLARIFY_EMPTY".to_string();
-        unsafe { std::env::set_var("JEV_TEST_KEY_CHAT_CLARIFY_EMPTY", "test-key") };
-        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
-        decision.decider = proxy::decision::Decider::Typesafe;
-        decision.needs_clarification = 0.9;
-        decision.needs_clarification_decisive = true;
-        decision.clarification_category = Some("target".to_string());
-        let mut stderr = Vec::new();
-        let (unchanged, request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            decision.clone(),
-            "change the service".to_string(),
-            &mut &b"\n"[..],
-            &mut stderr,
-        )
-        .expect("clarification prompt");
-        assert_eq!(unchanged, decision);
-        assert_eq!(request, "change the service");
-        assert!(
-            String::from_utf8(stderr)
-                .expect("utf8")
-                .contains("Which service or files")
-        );
-        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
-            .expect("clarification effects");
-        assert!(effects.contains("\"action\":\"requested\""));
-        assert!(effects.contains("\"action\":\"unanswered\""));
-        unsafe { std::env::remove_var("JEV_TEST_KEY_CHAT_CLARIFY_EMPTY") };
-    }
-
-    #[test]
-    fn nonempty_clarification_records_answer_before_redeciding() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_CHAT_CLARIFY_ANSWER".to_string();
-        unsafe { std::env::set_var("JEV_TEST_KEY_CHAT_CLARIFY_ANSWER", "test-key") };
-        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
-        decision.decider = proxy::decision::Decider::Typesafe;
-        decision.needs_clarification = 0.9;
-        decision.needs_clarification_decisive = true;
-        let (_, request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            decision,
-            "change service".to_string(),
-            &mut &b"service A; preserve API B\n"[..],
-            &mut Vec::new(),
-        )
-        .expect("clarify");
-        unsafe { std::env::remove_var("JEV_TEST_KEY_CHAT_CLARIFY_ANSWER") };
-        assert_eq!(request, "change service\n\nservice A; preserve API B");
-        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
-            .expect("clarification effects");
-        assert!(effects.contains("\"action\":\"requested\""));
-        assert!(effects.contains("\"action\":\"answered\""));
-        assert!(!effects.contains("service A"));
-    }
-
-    /// Issue #537 (A2): at or above the threshold, a non-empty answer is
-    /// appended to the request (separated by a blank line) and `decide` runs
-    /// exactly once more against the combined text -- never a second
-    /// clarification round, however ambiguous the new decision still looks.
-    #[test]
-    fn maybe_clarify_appends_a_non_empty_answer_and_redecides_once() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let mut cfg = CtxConfig::default();
-        // Deterministic only: this test must never depend on network access
-        // or an ambient credential, and must be reproducible.
-        cfg.proxy.decider = crate::commands::ctx::config::ProxyDecider::Deterministic;
-
-        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
-        decision.needs_clarification = 0.9;
-        decision.needs_clarification_decisive = true;
-        let mut stderr = Vec::new();
-
-        let (new_decision, new_request) = maybe_clarify(
-            &cfg,
-            &state,
-            repo.path(),
-            decision,
-            "original request".to_string(),
-            &mut &b"more detail here\n"[..],
-            &mut stderr,
-        )
-        .expect("never errors");
-
-        assert_eq!(new_request, "original request\n\nmore detail here");
-        // `elapsed_ms`/`created_at` legitimately differ between two separate
-        // `decide()` calls; every other field must match exactly.
-        let mut new_decision = new_decision;
-        let mut expected = proxy::decide(&cfg, state.root(), repo.path(), &new_request, false);
-        new_decision.elapsed_ms = 0;
-        expected.elapsed_ms = 0;
-        new_decision.created_at = 0;
-        expected.created_at = 0;
-        assert_eq!(new_decision, expected, "must redecide on the combined text");
-        let printed = String::from_utf8(stderr).expect("utf8");
-        assert!(printed.contains("ambiguous (0.90)"), "{printed}");
     }
 
     /// The wiring `run_with` applies once the proxy actually decided this
@@ -5261,7 +4253,10 @@ fix the flaky retry test
         assert_eq!(proxy_prompt_role(&orchestrated), PromptRole::Orchestrator);
 
         assert_eq!(
-            proxy_prompt_role(&ProxyIntakeOutcome::Inactive { advisory: None }),
+            proxy_prompt_role(&ProxyIntakeOutcome::Inactive {
+                advisory: None,
+                request: None
+            }),
             PromptRole::Orchestrator
         );
     }
@@ -5370,7 +4365,10 @@ fix the flaky retry test
     #[test]
     fn native_pane_spec_keeps_the_orchestrator_role_when_the_proxy_never_decided() {
         let repo = crate::commands::ctx::testenv::repo();
-        let seat_role = proxy_prompt_role(&ProxyIntakeOutcome::Inactive { advisory: None });
+        let seat_role = proxy_prompt_role(&ProxyIntakeOutcome::Inactive {
+            advisory: None,
+            request: None,
+        });
         assert_eq!(seat_role, PromptRole::Orchestrator);
 
         let (pane, native) =
@@ -5419,7 +4417,10 @@ fix the flaky retry test
     #[test]
     fn proxy_decided_model_is_none_when_the_proxy_never_decided() {
         assert_eq!(
-            proxy_decided_model(&ProxyIntakeOutcome::Inactive { advisory: None }),
+            proxy_decided_model(&ProxyIntakeOutcome::Inactive {
+                advisory: None,
+                request: None
+            }),
             None
         );
     }
@@ -5456,7 +4457,10 @@ fix the flaky retry test
         let repo = tempfile::tempdir().expect("tempdir");
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let outcome = ProxyIntakeOutcome::Inactive { advisory: None };
+        let outcome = ProxyIntakeOutcome::Inactive {
+            advisory: None,
+            request: None,
+        };
         let mut announced: Vec<String> = Vec::new();
 
         let started_id =

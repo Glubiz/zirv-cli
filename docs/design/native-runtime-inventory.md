@@ -223,7 +223,7 @@ installed binary during self-update; never spawns it).
 | Native compaction distillation | `src/commands/ctx/runtime/compaction.rs` | `distill` | N17 (#486) | summarises a compacted prefix through the session's OWN `ProviderAdapter`, with a bounded output budget and no tool schemas at all; falls back to the deterministic structural summary when no capacity, credential or valid reply exists, so it needs no vendor CLI |
 | Native headless session | `src/commands/ctx/runtime/native.rs` | `run_headless` | N09 (#478) | `zirv ctx exec --runtime native`: resolves the route, builds the direct provider adapter and drives `NativeLoop` to a structured final status |
 | Native interactive dashboard session | `src/commands/ctx/runtime/native.rs` | `spawn_interactive` | N11 (#480) | `zirv chat --runtime native`: resolves transport/journal/seat/writer exactly like `run_session`, then drives a fresh `NativeLoop` to completion once per submitted turn on a background thread for the pane's whole lifetime |
-| Interactive orchestrator launch | `src/commands/ctx/chat.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
+| Interactive orchestrator launch | `src/commands/ctx/chat/mod.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
 | Wrap first-launch PTY spawn | `src/commands/ctx/wrap.rs` | `run_with` | harness-backend | initial `zirv ctx wrap` PTY `CommandBuilder` |
 | Wrap mid-session PTY relaunch | `src/commands/ctx/wrap.rs` | `relaunch` | harness-backend | in-place restart after compaction/handoff |
 | Dash pane restore | `src/commands/ctx/dash/roster.rs` | `restore_argv` | N11 (#480) | rebuilds a verified resume argv for a restored dashboard pane |
