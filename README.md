@@ -17,6 +17,8 @@
 
 > **Zirv CLI** is a cross-platform command-line interface for developers to automate and streamline workflows with YAML, JSON, or TOML scripts.
 
+**Wrapping Claude Code in zirv:** about 20% cheaper on large tasks, up to 42% on long sessions, and work rated 10% better, on the same model. ([measured](#what-wrapping-costs-measured))
+
 ---
 
 ## Table of Contents
@@ -1067,10 +1069,15 @@ to the section that documents it in depth.
 
 ### What wrapping costs (measured)
 
-In a headless benchmark against Claude Code with a popular skills plugin,
-zirv was **up to 41% faster** and **up to 51% cheaper** (Sonnet, larger
-multi-module tasks). Protocol, per-task results and the harness:
-[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
+In a headless benchmark against Claude Code with the superpowers plugin (78
+runs on Claude Sonnet 5), zirv cut cost per task by about 20% on ten large
+coding tasks, and by up to 42% on a 9-step working session. A blind
+reviewer (Claude Opus, not told which setup produced the work) rated zirv's
+work 9–11% higher. Hidden-test pass rates matched, and wall-clock speed was
+on par. The large-task cost and quality gains are statistically significant
+(paired bootstrap, 95% CI). Results and caveats:
+[the 2026-09 benchmark round](docs/benchmarks/wrapped-vs-vanilla/results/2026-09-24-fix-loop/README.md);
+protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 
