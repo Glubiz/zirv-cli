@@ -212,6 +212,23 @@ cohorts stay never-pooled either way).
   -- an agent that proposes bounded env-overlay candidates from the dev
   aggregates; its own spend counts as overhead, never execution.
 
+`decision_trial.py`'s `details.json` (referenced from `trial.json.details`)
+carries a `jev_ran` boolean, read from the trial's own `<state_dir>/
+proxy-decisions.jsonl` (the production's persisted receipt, not this
+script's own parsed decision object): `true` when that file's last row's
+`decider` is `"typesafe"` or `"helper"`, `false` for a `"deterministic"`
+row OR an empty/missing file. This is deliberately a DIFFERENT signal from
+`details.abstained` (computed from the live decision object returned by
+this trial's own `zirv ctx proxy` call): `abstained` cannot tell "Jev was
+asked but not decisive" apart from "Jev never ran at all" (missing
+credential, or every `[jev]` gate off), while `jev_ran` answers exactly
+that from the persisted receipt. Neither ever nulls `correctness` -- a
+deterministic-only arm is a legitimate #803 baseline to compare against,
+not a failure; a candidate that needs proof the production Jev/helper path
+specifically fired should use `requires_receipts = ["proxy:decider:
+typesafe"]` (see above), which is the runner's own exclusion mechanism for
+that.
+
 See `campaigns/*.toml` for five worked examples: `fixture-demo.toml` (free,
 scripted, safe to run once the runner exists), and four real campaigns
 (`jev-intake-floors.toml`, `jev-gates-e2e.toml`, `routing-ladder.toml`,
