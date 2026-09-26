@@ -1,0 +1,118 @@
+# context-compaction-forced: the FORCED-pressure cohort variant of
+# context-compaction.toml -- same candidate set, same long-session split,
+# but `[cohort] pressure = "forced"` with `ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO`
+# lowered for BOTH arms (baseline and every candidate alike, via `[cohort]
+# env`, applied on top of whatever a candidate's own env sets -- never a
+# candidate-only advantage). Design spec #805: "Forced pressure (pressure =
+# forced, lowered ceiling ratio for both arms) is its own cohort" -- its
+# results are reported separately from context-compaction.toml's
+# natural-pressure trials and NEVER pooled with them; a report built from
+# BOTH files must label which cohort each row belongs to.
+#
+# Same reasoning applies here as in context-compaction.toml for
+# requires_receipts naming (compaction_select/handoff_select site strings
+# are underscored in the real code; workflow-review-reuse is already
+# hyphenated there) -- see that file's header comment for the source lines.
+#
+# Backend is run.py; costs real money; never run in CI.
+
+schema = 1
+id = "context-compaction-forced"
+description = "Same compaction/handoff/review-reuse candidates as context-compaction.toml, forced pressure (lowered token ceiling ratio for both arms). Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["run.py", "corpus.toml", "quality_rubric.md"]
+self_check = ["python", "run.py", "--check-graders"]
+
+[corpus]
+file = "../wrapped-vs-vanilla/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "../wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+per_trial_ceiling_usd = 8.00
+calls_per_trial = 6
+timeout_secs = 7200
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 120.00
+max_wall_secs = 86400
+max_calls = 200
+max_trials = 60
+max_retries = 1
+concurrency = 2
+
+[stages.screen]
+split = "validation"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 3
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+min_pairs = 4
+correctness_floor = 0.6
+quality_floor = 0.5
+max_correctness_regression = 0.05
+max_quality_regression = 0.1
+min_effect = 0.1
+confidence = 0.85
+bootstrap_resamples = 1000
+
+# The forced-pressure cohort: both arms get a lower ceiling ratio than
+# their own candidate env would otherwise set, forcing compaction/handoff
+# machinery to actually engage even on a task that would not naturally
+# have pressured it -- distinct from, and never pooled with, the
+# `pressure = "natural"` cohort in context-compaction.toml.
+[cohort]
+pressure = "forced"
+env = { ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO = "0.55" }
+
+[candidate_space]
+allow_env = [
+  "ZIRV_CTX_JEV_COMPACTION_SELECT", "ZIRV_CTX_JEV_HANDOFF_SELECT", "ZIRV_CTX_JEV_REVIEW_REUSE",
+  "ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT",
+  "ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_CONFIDENCE",
+  "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE",
+  "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO", "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO",
+]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "compaction-select-on"
+hypothesis = "Under forced pressure, the compaction_select gate keeps required context through a compaction that would otherwise be a plain drop."
+mechanism = "ZIRV_CTX_JEV_COMPACTION_SELECT=true under a forced-low token ceiling; requires an effect:compaction_select receipt to count."
+env = { ZIRV_CTX_JEV_COMPACTION_SELECT = "true" }
+requires_receipts = ["effect:compaction_select"]
+
+[[candidates]]
+id = "handoff-select-on"
+hypothesis = "Under forced pressure, handoff_select still carries the step-1 constraint and the deferred fix through a forced handoff."
+mechanism = "ZIRV_CTX_JEV_HANDOFF_SELECT=true under a forced-low token ceiling; requires an effect:handoff_select receipt to count."
+env = { ZIRV_CTX_JEV_HANDOFF_SELECT = "true" }
+requires_receipts = ["effect:handoff_select"]
+
+[[candidates]]
+id = "review-reuse-on"
+hypothesis = "Review-finding reuse still avoids redundant review rounds under forced pressure."
+mechanism = "ZIRV_CTX_JEV_REVIEW_REUSE=true under a forced-low token ceiling; requires an effect:workflow-review-reuse receipt to count."
+env = { ZIRV_CTX_JEV_REVIEW_REUSE = "true" }
+requires_receipts = ["effect:workflow-review-reuse"]

@@ -1,0 +1,119 @@
+# jev-intake-floors: candidates vary the proxy's own confidence/margin
+# floors (ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN -- src/commands/ctx/
+# proxy/mod.rs's `cfg.proxy.min_confidence`/`min_margin`) against the
+# labelled intake decision-cases corpus (../decision-cases/). Backend is
+# `decision_trial.py`, which drives the REAL `zirv ctx proxy --json
+# --headless` path -- this campaign spends real money (every trial is one
+# live intake decision call) and is NEVER run in CI.
+#
+# `requires_receipts = ["proxy:decision"]`: the SpendReport shape in
+# docs/superpowers/specs/2026-09-26-autoresearch-design.md's #800 section
+# names `proxy:decision` as the receipt key for a proxy/intake decision
+# (its own worked example: `"receipts":{"jev:<site>":N,"effect:<name>":N,
+# "proxy:decision":N}`) -- a trial missing that receipt did not actually run
+# the production intake path (issue #803's "Candidate measurements prove
+# the intended production Jev path actually ran"), so it is `untriggered`,
+# not silently counted.
+#
+# Corresponds to design spec #803 ("Build independent labelled decision
+# cases... Expose a bounded candidate space: per-site confidence/margin
+# thresholds").
+
+schema = 1
+id = "jev-intake-floors"
+description = "Sweep ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN against the labelled intake decision-case corpus. Costs real money (live zirv ctx proxy calls); not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["decision-cases/labels.jsonl", "decision-cases/corpus.toml"]
+self_check = []
+
+[corpus]
+file = "decision-cases/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "decision_trial.py", "--trial", "{spec}", "--out", "{out}"]
+per_trial_ceiling_usd = 0.05
+calls_per_trial = 1
+timeout_secs = 60
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 5.00
+max_wall_secs = 3600
+max_calls = 200
+max_trials = 200
+max_retries = 1
+concurrency = 3
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+min_pairs = 8
+correctness_floor = 0.6
+quality_floor = 0.0
+max_correctness_regression = 0.05
+max_quality_regression = 1.0
+min_effect = 0.1
+confidence = 0.9
+bootstrap_resamples = 1000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_PROXY_MIN_CONFIDENCE", "ZIRV_CTX_PROXY_MIN_MARGIN"]
+allowed_models = ["sonnet"]
+
+# Baseline floors, restated explicitly (never rely on an unset default
+# matching what the compiled-in constant happens to be today).
+[[candidates]]
+id = "floors-default"
+hypothesis = "Restating today's compiled-in floors changes nothing (sanity candidate)."
+mechanism = "No-op: same confidence/margin the deterministic path already uses."
+env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.6", ZIRV_CTX_PROXY_MIN_MARGIN = "0.15" }
+requires_receipts = ["proxy:decision"]
+
+# Looser floors: more decisions trust a lower-confidence Jev/helper answer
+# instead of falling back to the deterministic decider -- tests whether
+# that reduces unnecessary_clarification/false_escalation without raising
+# unsafe_under_selection on the costly_error-tagged cases.
+[[candidates]]
+id = "looser-floors"
+hypothesis = "A lower confidence/margin bar resolves more ambiguous/insufficient_facts cases decisively without under-tiering costly_error cases."
+mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN lowered -- more Jev/helper answers clear the bar."
+env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.5", ZIRV_CTX_PROXY_MIN_MARGIN = "0.10" }
+requires_receipts = ["proxy:decision"]
+
+# Tighter floors: fewer decisions trust Jev/helper, more fall back to the
+# deterministic decider -- tests whether that costs unnecessary
+# clarification/coverage without a matching safety gain.
+[[candidates]]
+id = "tighter-floors"
+hypothesis = "A higher confidence/margin bar mainly costs abstention/coverage, not safety."
+mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN raised -- fewer Jev/helper answers clear the bar."
+env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.75", ZIRV_CTX_PROXY_MIN_MARGIN = "0.25" }
+requires_receipts = ["proxy:decision"]

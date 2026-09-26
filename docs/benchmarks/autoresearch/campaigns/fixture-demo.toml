@@ -1,0 +1,123 @@
+# fixture-demo: a fully scripted, zero-cost campaign for `zirv workflow
+# research` itself. Backend is `fixture` (fixtures/demo.toml), so NOTHING in
+# this file ever calls a model provider, runs `claude`, or spends real
+# money -- it exists to exercise the runner's own promotion logic (accept /
+# reject / inconclusive / crash / an untriggered per-candidate case) against
+# known, hand-scripted outcomes. Safe to run in CI once `zirv workflow
+# research` exists; as of this PR that command is not implemented in this
+# worktree (see docs/benchmarks/autoresearch/README.md's "Supported
+# backends" section), so this manifest is authored-but-unexecuted here.
+#
+# Corresponds to design spec docs/superpowers/specs/2026-09-26-autoresearch-design.md
+# #801's "A deterministic fixture campaign demonstrates accept/reject/
+# inconclusive results" acceptance criterion and #802's "A fixture campaign
+# covers baseline, accepted/rejected candidates, crash, timeout, budget
+# exhaustion and resume."
+
+schema = 1
+id = "fixture-demo"
+description = "Scripted fixture campaign proving accept/reject/inconclusive/crash/untriggered outcomes. Costs nothing; never run against a real provider."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "unknown"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["campaigns/fixtures/demo.toml"]
+self_check = []
+
+[corpus]
+file = "../wrapped-vs-vanilla/corpus.toml"
+
+[backend]
+kind = "fixture"
+file = "fixtures/demo.toml"
+per_trial_ceiling_usd = 0.0
+calls_per_trial = 0
+timeout_secs = 30
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 0.0
+max_wall_secs = 600
+max_calls = 0
+max_trials = 200
+max_retries = 1
+concurrency = 4
+
+[stages.screen]
+split = "dev"
+reps = 4
+
+[stages.validate]
+split = "validation"
+reps = 4
+
+[stages.holdout]
+split = "holdout"
+reps = 2
+max_uses = 1
+
+[criteria]
+min_pairs = 3
+correctness_floor = 0.8
+quality_floor = 0.6
+max_correctness_regression = 0.05
+max_quality_regression = 0.1
+min_effect = 0.1
+confidence = 0.9
+bootstrap_resamples = 500
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT"]
+allowed_models = ["sonnet", "opus", "haiku"]
+
+# Cheaper, equal correctness on enough pairs -> Accept. Its very first
+# trial is scripted to `crash_first = 1` (see fixtures/demo.toml), proving
+# the runner retries/reconciles a crashed trial rather than treating the
+# whole candidate as dead.
+[[candidates]]
+id = "cheaper-equal"
+hypothesis = "Turning on the memory gate cuts cost with no correctness loss."
+mechanism = "ZIRV_CTX_JEV_MEMORY=true trims context without dropping anything the task needs."
+env = { ZIRV_CTX_JEV_MEMORY = "true" }
+requires_receipts = []
+
+# Cheaper but wrong on enough pairs -> Reject (correctness regression
+# exceeds max_correctness_regression).
+[[candidates]]
+id = "cheaper-but-incorrect"
+hypothesis = "A more aggressive context gate cuts cost further."
+mechanism = "ZIRV_CTX_JEV_CONTEXT=true drops more context, saving tokens."
+env = { ZIRV_CTX_JEV_CONTEXT = "true" }
+requires_receipts = []
+
+# No material win on either axis, and not enough of a loss to reject either
+# -> Inconclusive.
+[[candidates]]
+id = "no-clear-win"
+hypothesis = "Both gates together might help a little."
+mechanism = "Combining memory+context gates; effect could go either way."
+env = { ZIRV_CTX_JEV_MEMORY = "true", ZIRV_CTX_JEV_CONTEXT = "true" }
+requires_receipts = []
+
+# Declares a required receipt the fixture never produces for it -> every
+# trial is `untriggered`, all excluded -> candidate reports `unmeasured`,
+# never promoted on absent evidence.
+[[candidates]]
+id = "untriggered-gate"
+hypothesis = "A gate that never actually fires in these tasks should not be measurable."
+mechanism = "ZIRV_CTX_JEV_HARVEST_SCREEN=true, but none of the screened tasks trigger it."
+env = { ZIRV_CTX_JEV_HARVEST_SCREEN = "true" }
+requires_receipts = ["jev:harvest_screen"]

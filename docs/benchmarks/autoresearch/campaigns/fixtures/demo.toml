@@ -1,0 +1,82 @@
+# Fixture backend results for fixture-demo.toml. Protected evaluator data
+# (campaign header names this file under `[evaluator].protected`) -- never
+# edited by a candidate. `task = "*"` matches every task in the manifest's
+# corpus/split for that stage, so one row covers a whole arm without
+# enumerating every dev/validation/holdout task id by hand.
+#
+# `arm` is `"baseline"` or a `[[candidates]] id` from fixture-demo.toml.
+# `cost_usd` omitted means "unknown" (never 0) -- every row below states one
+# explicitly since this fixture's whole point is a clean, fully-known cost
+# comparison.
+
+# --- baseline: correctness 1.0, quality 0.8, cost $1.00 ---
+[[result]]
+arm = "baseline"
+task = "*"
+status = "ok"
+correctness = 1.0
+quality = 0.8
+cost_usd = 1.00
+wall_ms = 60000
+receipts = {}
+
+# --- cheaper-equal: correctness 1.0 (equal), quality 0.8, cost $0.60 (40%
+# cheaper) -> Accept. Its rep 1 trial crashes first (proving the runner
+# reconciles a crashed-then-retried trial rather than discarding the whole
+# candidate); every other rep succeeds normally. ---
+[[result]]
+arm = "cheaper-equal"
+task = "*"
+rep = 1
+status = "crash"
+crash_first = 1
+wall_ms = 5000
+receipts = {}
+
+[[result]]
+arm = "cheaper-equal"
+task = "*"
+status = "ok"
+correctness = 1.0
+quality = 0.8
+cost_usd = 0.60
+wall_ms = 45000
+receipts = {}
+
+# --- cheaper-but-incorrect: cheaper ($0.55) but correctness drops to 0.5,
+# well past max_correctness_regression -> Reject. ---
+[[result]]
+arm = "cheaper-but-incorrect"
+task = "*"
+status = "ok"
+correctness = 0.5
+quality = 0.5
+cost_usd = 0.55
+wall_ms = 40000
+receipts = {}
+
+# --- no-clear-win: correctness/quality/cost all within noise of baseline,
+# no axis clears min_effect -> Inconclusive. ---
+[[result]]
+arm = "no-clear-win"
+task = "*"
+status = "ok"
+correctness = 0.98
+quality = 0.79
+cost_usd = 0.97
+wall_ms = 59000
+receipts = {}
+
+# --- untriggered-gate: looks fine on paper, but never produces the
+# "jev:harvest_screen" receipt its own manifest entry requires -> every
+# trial for this candidate is `untriggered`, all excluded, the candidate
+# reports `unmeasured` rather than being promoted on absent evidence. ---
+[[result]]
+arm = "untriggered-gate"
+task = "*"
+status = "ok"
+correctness = 1.0
+quality = 0.8
+cost_usd = 0.90
+wall_ms = 58000
+receipts = {}
