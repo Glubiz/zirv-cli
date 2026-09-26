@@ -4711,7 +4711,7 @@ fn record_direct_outcome_if_needed(repo: &Path, env: EnvLookup<'_>, report: &Exe
     let Ok(state) = StateDir::resolve(env) else {
         return;
     };
-    if crate::commands::workflow::outcomes::has_workflow_row_for_session(&state, &segment.session) {
+    if crate::commands::workflow::outcomes::has_any_row_for_session(&state, &segment.session) {
         return;
     }
     let row = crate::commands::workflow::outcomes::OutcomeRow::direct(
