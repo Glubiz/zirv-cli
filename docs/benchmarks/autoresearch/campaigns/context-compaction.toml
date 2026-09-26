@@ -40,15 +40,15 @@ commit = "HEAD"
 
 [evaluator]
 version = "1"
-protected = ["run.py", "corpus.toml", "quality_rubric.md"]
-self_check = ["python", "run.py", "--check-graders"]
+protected = ["docs/benchmarks/wrapped-vs-vanilla/run.py", "docs/benchmarks/wrapped-vs-vanilla/corpus.toml", "docs/benchmarks/wrapped-vs-vanilla/quality_rubric.md"]
+self_check = ["python", "docs/benchmarks/wrapped-vs-vanilla/run.py", "--check-graders"]
 
 [corpus]
-file = "../wrapped-vs-vanilla/corpus.toml"
+file = "docs/benchmarks/wrapped-vs-vanilla/corpus.toml"
 
 [backend]
 kind = "command"
-command = ["python", "../wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+command = ["python", "docs/benchmarks/wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
 per_trial_ceiling_usd = 8.00
 calls_per_trial = 6
 timeout_secs = 7200

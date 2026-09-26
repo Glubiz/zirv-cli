@@ -2301,4 +2301,149 @@ crash_first = 5
         // A different corpus version is unaffected.
         assert!(check_holdout_uses(&state_dir, corpus_file, "2", 1).is_ok());
     }
+
+    /// The committed `docs/benchmarks/autoresearch/campaigns/fixture-demo.toml`
+    /// run end to end against the REAL promotion gate (not a stub): one
+    /// accepted candidate promoted through holdout, one rejected outright by
+    /// the screen pre-filter, one inconclusive, one candidate whose crashed
+    /// first attempt is retried and recorded, and one discarded for being
+    /// untriggered -- every outcome the manifest's own header comment
+    /// promises, verified against this repo's actual committed data. Fixed
+    /// paths resolve from `CARGO_MANIFEST_DIR` (this worktree), never a
+    /// synthetic repo, and the campaign directory is a fresh tempdir.
+    #[test]
+    fn the_committed_fixture_demo_campaign_produces_every_promised_outcome() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest_path = repo.join("docs/benchmarks/autoresearch/campaigns/fixture-demo.toml");
+        let campaign_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_root(state_root.path().to_path_buf());
+
+        let summary = execute(
+            &manifest_path,
+            repo,
+            Some(campaign_root.path()),
+            false,
+            &state_dir,
+        )
+        .expect("the committed fixture-demo campaign must run to completion");
+        assert!(
+            summary.stopped_reason.is_none(),
+            "must never hit a budget/drift stop: {:?}",
+            summary.stopped_reason
+        );
+        assert_eq!(
+            summary.promoted,
+            Some("cheaper-equal".to_string()),
+            "cheaper-equal is the only candidate that should clear screen, validate and holdout"
+        );
+        assert_eq!(summary.verdict, Verdict::Accept);
+
+        let events = ledger::replay(&Ledger::path(&summary.campaign_dir)).unwrap();
+
+        // cheaper-but-incorrect: correctness 0.5 is both below the
+        // correctness_floor (0.8) and a large regression vs baseline's 1.0
+        // -- the cheap screen pre-filter catches it before validate ever
+        // spends anything on it, and records it as rejected.
+        assert!(
+            events.iter().any(
+                |e| matches!(e, LedgerEvent::CandidateRejected { candidate, .. } if candidate == "cheaper-but-incorrect")
+            ),
+            "cheaper-but-incorrect must be rejected"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                LedgerEvent::StageDecision { candidate, stage, verdict, .. }
+                    if candidate == "cheaper-but-incorrect" && stage == "screen" && verdict == "discard"
+            )),
+            "the rejection must come from the screen stage, not a wasted validate run"
+        );
+
+        // no-clear-win: no axis clears min_effect -> inconclusive, reached
+        // only after surviving screen (so validate actually ran for it).
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                LedgerEvent::StageDecision { candidate, stage, verdict, .. }
+                    if candidate == "no-clear-win" && stage == "validate" && verdict == "inconclusive"
+            )),
+            "no-clear-win must be inconclusive at validate"
+        );
+
+        // untriggered-gate: requires a jev:harvest_screen receipt the
+        // fixture never produces for it -> discarded as untriggered before
+        // ever reaching validate.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                LedgerEvent::StageDecision { candidate, stage, verdict, .. }
+                    if candidate == "untriggered-gate" && stage == "screen" && verdict == "discard"
+            )),
+            "untriggered-gate must be discarded at screen"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                LedgerEvent::CandidateRejected { candidate, reason, .. }
+                    if candidate == "untriggered-gate" && reason.contains("untriggered")
+            )),
+            "untriggered-gate's discard reason must say untriggered"
+        );
+
+        // cheaper-equal: its rep-1 trial is scripted to crash once, then
+        // recover on retry -- both must show up in the ledger.
+        let cheaper_equal_failures: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                LedgerEvent::TrialFailed {
+                    trial_id,
+                    retryable,
+                    ..
+                } if trial_id.contains("cheaper-equal") => Some(*retryable),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !cheaper_equal_failures.is_empty(),
+            "cheaper-equal's scripted crash must appear as a trial_failed event"
+        );
+        let cheaper_equal_finished_ok = events.iter().any(|e| {
+            matches!(
+                e,
+                LedgerEvent::TrialFinished { trial_id, status, .. }
+                    if trial_id.contains("cheaper-equal") && status == "ok"
+            )
+        });
+        assert!(
+            cheaper_equal_finished_ok,
+            "the retried trial must eventually finish ok"
+        );
+
+        // Every promised output file.
+        let dir = &summary.campaign_dir;
+        assert!(dir.join("report.md").is_file());
+        assert!(dir.join("report.json").is_file());
+        assert!(dir.join("results.tsv").is_file());
+        assert!(dir.join("proposal/overlay.toml").is_file());
+        assert!(dir.join("proposal/ROLLBACK.md").is_file());
+
+        let report_md = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(
+            report_md.contains("## Spend"),
+            "report.md must have its own spend section"
+        );
+        assert!(
+            report_md.contains("execution:"),
+            "report.md must separate execution spend"
+        );
+        assert!(
+            report_md.contains("overhead:"),
+            "report.md must separate overhead spend"
+        );
+        assert!(
+            report_md.contains("completeness:"),
+            "report.md must state data completeness"
+        );
+    }
 }

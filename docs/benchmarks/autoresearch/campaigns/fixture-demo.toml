@@ -27,17 +27,24 @@ commit = "HEAD"
 
 [evaluator]
 version = "1"
-protected = ["campaigns/fixtures/demo.toml"]
+protected = ["docs/benchmarks/autoresearch/campaigns/fixtures/demo.toml"]
 self_check = []
 
 [corpus]
-file = "../wrapped-vs-vanilla/corpus.toml"
+file = "docs/benchmarks/wrapped-vs-vanilla/corpus.toml"
 
 [backend]
 kind = "fixture"
 file = "fixtures/demo.toml"
-per_trial_ceiling_usd = 0.0
-calls_per_trial = 0
+# Reservation/ceiling numbers below are deliberately real-looking (not 0):
+# the scripted rows in fixtures/demo.toml carry non-zero simulated
+# `cost_usd` values (so the promotion gate has a real cost axis to compare),
+# and the runner charges those simulated dollars against these same
+# budgets exactly like a real trial's cost -- nothing here ever calls a
+# model provider, but the accounting is real, so the caps must be sized to
+# the scripted numbers, not to the true (zero) real-world cost.
+per_trial_ceiling_usd = 1.50
+calls_per_trial = 1
 timeout_secs = 30
 
 [route]
@@ -45,10 +52,10 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 0.0
+max_spend_usd = 500.00
 max_wall_secs = 600
-max_calls = 0
-max_trials = 200
+max_calls = 500
+max_trials = 500
 max_retries = 1
 concurrency = 4
 
@@ -80,7 +87,7 @@ pressure = "natural"
 env = {}
 
 [candidate_space]
-allow_env = ["ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT"]
+allow_env = ["ZIRV_CTX_JEV_MEMORY", "ZIRV_CTX_JEV_CONTEXT", "ZIRV_CTX_JEV_HARVEST_SCREEN"]
 allowed_models = ["sonnet", "opus", "haiku"]
 
 # Cheaper, equal correctness on enough pairs -> Accept. Its very first

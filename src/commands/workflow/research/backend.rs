@@ -254,31 +254,26 @@ impl FixtureFile {
         Ok(toml::from_str(&text)?)
     }
 
-    /// Most specific match wins: `(arm, task, rep)` beats `(arm, task, *)`
-    /// beats `(arm, *, *)`.
-    fn best_match(&self, arm: &str, task: &str, rep: u32) -> Option<&FixtureRow> {
-        let mut best: Option<(&FixtureRow, u8)> = None;
-        for row in &self.results {
-            if row.arm != arm {
-                continue;
-            }
-            let task_matches = row.task == "*" || row.task == task;
-            if !task_matches {
-                continue;
-            }
-            let rep_matches = match row.rep {
-                Some(r) => r == rep,
-                None => true,
-            };
-            if !rep_matches {
-                continue;
-            }
-            let specificity = (row.task != "*") as u8 * 2 + row.rep.is_some() as u8;
-            if best.map(|(_, s)| specificity > s).unwrap_or(true) {
-                best = Some((row, specificity));
-            }
-        }
-        best.map(|(row, _)| row)
+    /// Every row matching `(arm, task, rep)`, most specific first:
+    /// `(arm, task, rep)` beats `(arm, task, *)` beats `(arm, *, *)`. More
+    /// than one row can legitimately match -- a rep-specific row that only
+    /// covers a `crash_first` window, plus a wildcard-rep row supplying the
+    /// eventual real result once that window is exhausted (see
+    /// `run_fixture_trial`).
+    fn matching_rows(&self, arm: &str, task: &str, rep: u32) -> Vec<&FixtureRow> {
+        let mut matches: Vec<(&FixtureRow, u8)> = self
+            .results
+            .iter()
+            .filter(|row| row.arm == arm)
+            .filter(|row| row.task == "*" || row.task == task)
+            .filter(|row| row.rep.map(|r| r == rep).unwrap_or(true))
+            .map(|row| {
+                let specificity = (row.task != "*") as u8 * 2 + row.rep.is_some() as u8;
+                (row, specificity)
+            })
+            .collect();
+        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.into_iter().map(|(row, _)| row).collect()
     }
 }
 
@@ -361,29 +356,54 @@ fn run_fixture_trial(
         .as_ref()
         .ok_or("backend.file is required for a fixture backend")?;
     let fixture = FixtureFile::load(&fixture_dir.join(file))?;
-    let row = fixture.best_match(&spec.arm, &spec.task, spec.rep);
+    // The fixture format's own `arm` field names WHICH side of the pair a
+    // row is for -- `"baseline"` or a `[[candidates]] id` -- matching
+    // `spec.candidate`, not `spec.arm` (which only ever holds the generic
+    // `"baseline"|"candidate"` the trial-spec JSON contract documents).
+    let candidates = fixture.matching_rows(&spec.candidate, &spec.task, spec.rep);
 
-    let Some(row) = row else {
+    if candidates.is_empty() {
         return Ok(TrialOutcome::Crash {
             reason: format!(
-                "no fixture result for arm='{}' task='{}' rep={}",
-                spec.arm, spec.task, spec.rep
+                "no fixture result for candidate='{}' task='{}' rep={}",
+                spec.candidate, spec.task, spec.rep
             ),
         });
-    };
-
-    if let Some(delay_ms) = row.delay_ms {
-        let current = FIXTURE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-        FIXTURE_MAX_IN_FLIGHT.fetch_max(current, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        FIXTURE_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
-    if attempt < row.crash_first || row.status == "crash" {
+    // Walk the matches most-specific-first: a row still inside its own
+    // `crash_first` window governs this attempt outright (crash). A row
+    // past its window but whose own `status` is itself `"crash"` (a
+    // crash-only placeholder with no result data of its own, e.g. one that
+    // exists only to script "rep N crashes on attempt 0") is spent and
+    // falls through to the next best match -- typically a wildcard-rep row
+    // carrying the real eventual result. Reaching the end of the list with
+    // nothing chosen means every match was a crash placeholder, past or
+    // present -- also a crash.
+    let mut chosen: Option<&FixtureRow> = None;
+    for row in &candidates {
+        if let Some(delay_ms) = row.delay_ms {
+            let current = FIXTURE_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            FIXTURE_MAX_IN_FLIGHT.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            FIXTURE_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+        if attempt < row.crash_first {
+            return Ok(TrialOutcome::Crash {
+                reason: "fixture-scripted crash".to_string(),
+            });
+        }
+        if row.status != "crash" {
+            chosen = Some(row);
+            break;
+        }
+    }
+
+    let Some(row) = chosen else {
         return Ok(TrialOutcome::Crash {
             reason: "fixture-scripted crash".to_string(),
         });
-    }
+    };
 
     let status = match row.status.as_str() {
         "ok" => TrialStatus::Ok,

@@ -32,15 +32,15 @@ commit = "HEAD"
 
 [evaluator]
 version = "1"
-protected = ["decision-cases/labels.jsonl", "decision-cases/corpus.toml"]
+protected = ["docs/benchmarks/autoresearch/decision-cases/labels.jsonl", "docs/benchmarks/autoresearch/decision-cases/corpus.toml"]
 self_check = []
 
 [corpus]
-file = "decision-cases/corpus.toml"
+file = "docs/benchmarks/autoresearch/decision-cases/corpus.toml"
 
 [backend]
 kind = "command"
-command = ["python", "decision_trial.py", "--trial", "{spec}", "--out", "{out}"]
+command = ["python", "docs/benchmarks/autoresearch/decision_trial.py", "--trial", "{spec}", "--out", "{out}"]
 per_trial_ceiling_usd = 0.05
 calls_per_trial = 1
 timeout_secs = 60
