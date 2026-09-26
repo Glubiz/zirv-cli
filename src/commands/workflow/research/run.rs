@@ -2245,4 +2245,142 @@ split = "holdout"
                 if candidate == "proposal-1" && reason == "a forbidden key"
         )));
     }
+
+    /// Regression for issue-review finding R2: a proposal with `id =
+    /// "baseline"` must never reach `apply_proposal_outcome`'s
+    /// `candidates_map.insert` -- if it did, it would silently overwrite the
+    /// baseline's own `CandidateRuntime`, corrupting every subsequent trial
+    /// dispatched as "baseline" for the rest of the campaign.
+    #[test]
+    fn spawn_and_validate_proposal_rejects_the_reserved_baseline_id() {
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
+        let dir = tempfile::tempdir().unwrap();
+        let argv = stub_argv(
+            dir.path(),
+            r#"{"id": "baseline", "hypothesis": "h", "env": {}}"#,
+        );
+        let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
+            .expect_err("the reserved id 'baseline' must be refused");
+        assert!(err.contains("baseline"), "got: {err}");
+    }
+
+    /// Regression for issue-review finding R2: a proposal's `id` must be
+    /// validated the same way a declared candidate's `id` is (manifest's own
+    /// `[A-Za-z0-9._-]{1,48}` rule) -- an empty or otherwise malformed id
+    /// must never reach `candidates_map`.
+    #[test]
+    fn spawn_and_validate_proposal_rejects_a_malformed_id() {
+        let manifest = manifest_with_candidate_space(&["ZIRV_CTX_JEV_MEMORY"], &["sonnet"]);
+        let dir = tempfile::tempdir().unwrap();
+        let argv = stub_argv(
+            dir.path(),
+            r#"{"id": "has a space", "hypothesis": "h", "env": {}}"#,
+        );
+        let err = spawn_and_validate_proposal(&argv, dir.path(), &[], &manifest)
+            .expect_err("a malformed id must be refused");
+        assert!(err.contains("must match"), "got: {err}");
+    }
+
+    /// Regression for issue-review finding R2: even once a proposal's id has
+    /// passed format validation, `apply_proposal_outcome` must refuse to
+    /// insert it into `candidates_map` when it collides with an id already
+    /// there -- "baseline" (seeded before any proposer round ever runs) or a
+    /// declared/previously-proposed candidate -- rather than silently
+    /// overwriting that entry's runtime.
+    #[test]
+    fn apply_proposal_outcome_refuses_a_proposal_that_collides_with_an_existing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::open(dir.path()).unwrap();
+        let mut candidates_map: BTreeMap<String, CandidateRuntime> = BTreeMap::new();
+        candidates_map.insert("baseline".to_string(), CandidateRuntime::default());
+        candidates_map.insert(
+            "declared-a".to_string(),
+            CandidateRuntime {
+                env: BTreeMap::from([("MARKER".to_string(), "original".to_string())]),
+                zirv_dir: None,
+                strategy: None,
+                patch_lines: 0,
+            },
+        );
+        let mut all_candidates: Vec<Candidate> = Vec::new();
+
+        let overwrite_baseline = Candidate {
+            id: "baseline".to_string(),
+            hypothesis: "h".to_string(),
+            mechanism: None,
+            env: BTreeMap::from([("MARKER".to_string(), "hijacked".to_string())]),
+            patch: None,
+            requires_receipts: Vec::new(),
+            strategy: None,
+        };
+        apply_proposal_outcome(
+            Ok(Some(overwrite_baseline)),
+            0,
+            &mut ledger,
+            &mut candidates_map,
+            &mut all_candidates,
+        )
+        .unwrap();
+
+        let overwrite_declared = Candidate {
+            id: "declared-a".to_string(),
+            hypothesis: "h".to_string(),
+            mechanism: None,
+            env: BTreeMap::from([("MARKER".to_string(), "hijacked".to_string())]),
+            patch: None,
+            requires_receipts: Vec::new(),
+            strategy: None,
+        };
+        apply_proposal_outcome(
+            Ok(Some(overwrite_declared)),
+            1,
+            &mut ledger,
+            &mut candidates_map,
+            &mut all_candidates,
+        )
+        .unwrap();
+
+        assert!(
+            candidates_map
+                .get("baseline")
+                .is_some_and(|r| r.env.is_empty()),
+            "the baseline runtime must not be overwritten by a colliding proposal"
+        );
+        assert_eq!(
+            candidates_map
+                .get("declared-a")
+                .and_then(|r| r.env.get("MARKER"))
+                .map(String::as_str),
+            Some("original"),
+            "a declared candidate's runtime must not be overwritten by a colliding proposal"
+        );
+        assert!(
+            !all_candidates.iter().any(|c| c.id == "baseline"),
+            "baseline must never be pushed into all_candidates via the proposer"
+        );
+        assert!(
+            all_candidates
+                .iter()
+                .filter(|c| c.id == "declared-a")
+                .count()
+                == 0,
+            "declared-a must not be duplicated in all_candidates via the proposer"
+        );
+
+        let events = ledger::replay(&Ledger::path(dir.path())).unwrap();
+        let rejections: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                LedgerEvent::CandidateRejected {
+                    candidate, reason, ..
+                } if reason.contains("collides") => Some(candidate.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rejections,
+            vec!["baseline", "declared-a"],
+            "both collisions must be recorded as rejections, in order"
+        );
+    }
 }
