@@ -441,6 +441,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             adapter.as_ref(),
             &user_extra,
             adapters::LaunchMode::Headless,
+            super::prompt::PromptRole::Worker,
         );
         // Visible, not silent: announced every cycle, the same "at every
         // session start" discipline the M2 injection-attribution comment
@@ -773,11 +774,26 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
 
             if super::exec::should_attempt_compact(compact_requested, limit_hit) {
+                // Issue #798 (`[jev] compaction_select`): same best-effort,
+                // off-by-default seam as `exec.rs`'s own `zirv ctx exec`
+                // compaction -- `zirv ctx loop` composes the identical
+                // `compact_in_place` call, so it gets the identical
+                // gate-checked-before-any-read treatment (review of
+                // 6bdd7675, defect #1).
+                let compact_focus = handoff::compaction_focus_for_transcript(
+                    &cfg,
+                    &state,
+                    adapter.as_ref(),
+                    Some(&transcript),
+                    cfg.handoff.tail_items,
+                    supervise::COMPACT_FOCUS,
+                );
                 let compact_result = super::exec::compact_in_place(
                     adapter.as_ref(),
                     Some(&transcript),
-                    Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                    Duration::from_millis(cfg.supervise.compact_timeout_ms),
                     poll,
+                    &compact_focus,
                     |compact_prompt| {
                         let session_ref = SessionRef {
                             id: session.clone(),
@@ -1871,7 +1887,7 @@ fn handle_cycle_outcome<W: Write>(
     Ok(None)
 }
 
-pub fn run<W: Write>(args: &LoopArgs, w: &mut W) -> CtxResult<i32> {
+pub fn run<W: Write>(args: &LoopArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
     // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
@@ -1880,7 +1896,25 @@ pub fn run<W: Write>(args: &LoopArgs, w: &mut W) -> CtxResult<i32> {
     // scrubbed rather than trusted; `agent::parent_session_env`'s fold with
     // `parent: None` does that unconditionally.
     let env = super::agent::parent_session_env(&ambient, None);
-    run_with(args, w, &repo, &env)
+    // Round 4B (stdout/stderr separation), applied here the same way
+    // `exec::run` applies it to its own harness branch: each cycle's child
+    // inherits nothing of its own -- `supervise::spawn_tapped`'s `forward`
+    // echoes the CHILD's stdout line by line straight to this process's own
+    // real `std::io::stdout()`, on its own thread, entirely independent of
+    // `w`. Every "zirv ctx loop: ..." notice `run_with` writes to `w` used to
+    // go to that SAME real stdout too -- on this, the one production call
+    // site (`mod.rs`'s `CtxVerb::Loop` dispatch), `w` IS `std::io::Stdout` --
+    // racing the forwarding thread and landing a notice (a cycle-failed
+    // line, a backoff line, an objective-gate line, and so on) in front of a
+    // child's own output, which a machine consumer piping this process's
+    // stdout cannot recover from. Unlike `exec::run`, `zirv ctx loop` has no
+    // `--runtime native`/`--view json` branch to preserve: every launch here
+    // supervises a real harness child, so the redirect is unconditional.
+    // `run_with` itself is untouched -- this function alone owns the real-
+    // process CLI entry, so redirecting here cannot perturb a test that
+    // asserts on a loop notice via its own `Vec<u8>` writer through
+    // `run_with` directly.
+    run_with(args, &mut std::io::stderr(), &repo, &env)
 }
 
 #[cfg(test)]
@@ -1941,6 +1975,46 @@ mod tests {
             simple: false,
             objective: None,
         }
+    }
+
+    /// Round 4B (mirrored for `ctx loop`, issue #779 round 5): the direct CLI
+    /// entry (`run`, not `run_with`) is `mod.rs`'s one production call site
+    /// (`CtxVerb::Loop(a) => run_loop::run(a, &mut out)`, `out` real
+    /// `std::io::Stdout`), and every cycle's fake-agent child forwards its
+    /// own stdout independently via `supervise::spawn_tapped`'s `forward`.
+    /// Before the redirect, the per-cycle "zirv ctx loop: cycle ..." notice
+    /// (written unconditionally at the top of every cycle) went to that SAME
+    /// writer, racing the forwarding thread on the real process's stdout.
+    /// Mirrors `exec.rs`'s
+    /// `direct_exec_entry_never_leaks_a_harness_notice_into_its_own_writer`.
+    #[test]
+    fn direct_loop_entry_never_leaks_a_harness_notice_into_its_own_writer() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let agent_bin = format!("sh {}", fixture("fake-agent.sh").display());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state.to_str()),
+            ("ZIRV_CTX_AGENT_BIN", Some(agent_bin.as_str())),
+            ("ZIRV_CTX_POLL_MS", Some("50")),
+            ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),
+            ("ZIRV_CTX_PROMPT_SKILL_INDEX", Some("false")),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+        ]);
+
+        let args = args_for(1);
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            !rendered.contains("zirv ctx loop:"),
+            "a supervisor notice reached the caller's own writer instead of stderr: {rendered}"
+        );
     }
 
     /// Final wave item 1: `adapter.launches_through_cmd_shim()` only
@@ -2081,7 +2155,10 @@ mod tests {
         let argv_log = tmp.path().join("argv.log");
         std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
         let mut env = base_env(&state);
-        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "2000".to_string());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);

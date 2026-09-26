@@ -228,6 +228,81 @@ evidence, then do what they decide.
 - Report honestly and briefly: lead with the outcome. If a command failed, a test did not \
 pass, or a step was skipped, say so and show the output. Never call unverified work done.";
 
+/// Issue #772 (wrapper-overhead audit follow-through): the `PromptRole::
+/// Worker`/`PromptRole::Single` counterpart to [`DEFAULT_PROMPT`], selected by
+/// [`default_prompt_for`] -- the same role split [`PromptSource::SkillPointer`]
+/// already draws (v13's own wrapper-overhead audit) for the identical reason:
+/// a delegated worker doing one bounded task, already sized by whoever
+/// dispatched it, re-reads this layer on every headless turn, so its cost is
+/// not amortised the way an interactive Orchestrator/SubOrchestrator session's
+/// is.
+///
+/// Every bullet that changes what a worker actually DOES survives, most
+/// compressed to their shortest form that still changes behaviour: read
+/// before you write, simplicity/reuse, deliver exactly what was asked,
+/// decide-or-ask on ambiguity, debug-by-evidence plus the stuck-twice circuit
+/// breaker, verify-with-evidence plus the stated-detail check, no slop, tool-
+/// output hygiene, one focused test per behaviour change (QA thinking,
+/// including the unhappy path), repo conventions, finish-the-whole-task, no
+/// flattery, and the honest-report closer. Dropped: the three-tier sizing
+/// taxonomy's own long-form explanation (trivial/bounded/substantial) --
+/// deciding how MUCH ceremony a whole task needs is the dispatcher's call, the
+/// one made before a worker ever sees a task, not something a single-task
+/// worker re-derives for itself -- replaced by one sentence naming the same
+/// proportionality expectation; and the UI/design-thinking bullet, which
+/// speaks to what the ORCHESTRATOR must gate before dispatching a design-
+/// shaped task (`HARNESS_PROMPT`'s own design-approval bullet), not to a
+/// worker already handed a scoped implementation brief.
+pub const DEFAULT_PROMPT_WORKER: &str = "\
+zirv engineering standard (worker, v1)
+
+Work the way a top-tier engineer works: judgment first, nothing wasted. Your task is already \
+sized by whoever dispatched you -- match it, no more.
+
+- Read before you write: understand the code you're changing and mirror its naming, structure \
+and style. Touch only what the task needs.
+- Choose the simplest design that fully meets the requirement. Reuse before adding; prefer \
+deleting to adding; no speculative abstractions, flags, or future-proofing nobody asked for.
+- Deliver exactly what was asked: no quiet narrowing, no bonus refactors, no drive-by \
+improvements. Mention further ideas in one line instead of building them.
+- Decide routine ambiguity yourself and name the assumption in your report; ask only when the \
+readings would lead to materially different work.
+- Debug by evidence: reproduce first, fix the root cause not the symptom, one change at a time. \
+Never make a failing check pass by weakening, deleting, or silencing it. Stuck twice on the same \
+error: stop retrying variants, step back, change approach.
+- Verify with evidence, once: run the check that would catch the failure this change could \
+cause, read its result, and trust it. Before calling a multi-part request done, check each \
+stated detail -- names, spellings, messages, exit codes, formats -- against your change.
+- No slop: no filler or narration, no comments that restate the code, no redundant docs or \
+hedging. Delete whatever it orphans and rename what no longer fits.
+- Keep tool output small: quiet flags, --stat/-n limits, ranged file reads, never re-print \
+output already shown.
+- Think like QA: one focused test per behaviour change, including the unhappy path; none for a \
+change that cannot alter behaviour.
+- Follow the repository's own conventions, style, test layout and commit format; a repo \
+instruction file wins over these defaults.
+- Finish the whole task: never hand back partial work. If genuinely blocked, finish the rest \
+and say exactly what's left and why.
+- No flattery: when the user or a reviewer is wrong, say so with evidence, then do what they \
+decide.
+- Report honestly and briefly: lead with the outcome. If a command failed, a test did not \
+pass, or a step was skipped, say so and show the output. Never call unverified work done.";
+
+/// Issue #772: selects the tiered [`DEFAULT_PROMPT`] variant for `role` -- the
+/// single place `compose` (and every byte-accounting call site that needs the
+/// same length: `compile.rs`'s `render_measure_table`, `with_adapter_layer`'s
+/// splice point) goes through, so no caller hardcodes which constant belongs
+/// to which role. `Worker`/`Single` get the compact variant; `Orchestrator`/
+/// `SubOrchestrator` keep the full standard -- see [`DEFAULT_PROMPT_WORKER`]'s
+/// own doc comment for why the split lands exactly there, the same as
+/// [`PromptSource::SkillPointer`]'s.
+pub fn default_prompt_for(role: PromptRole) -> &'static str {
+    match role {
+        PromptRole::Worker | PromptRole::Single => DEFAULT_PROMPT_WORKER,
+        PromptRole::Orchestrator | PromptRole::SubOrchestrator => DEFAULT_PROMPT,
+    }
+}
+
 /// Deterministic, agent-agnostic teaching about the zirv meta-harness itself:
 /// context, usage and cross-harness communication. Included only for an
 /// interactive orchestrator session (`PromptRole::Orchestrator`), never for a
@@ -1855,7 +1930,10 @@ pub fn compose(
         return None;
     }
 
-    let mut text = String::from(DEFAULT_PROMPT);
+    // Issue #772: `Worker`/`Single` get the compact `DEFAULT_PROMPT_WORKER`
+    // variant instead of the full standard -- see `default_prompt_for`'s own
+    // doc comment.
+    let mut text = String::from(default_prompt_for(role));
     let mut sources = vec![PromptSource::Default];
 
     if role == PromptRole::Orchestrator {
@@ -2706,8 +2784,14 @@ fn with_adapter_layer(
         return Some(composed);
     }
 
-    debug_assert!(composed.text.starts_with(DEFAULT_PROMPT));
-    let tail = composed.text.split_off(DEFAULT_PROMPT.len());
+    // Issue #772: the splice point is whichever `default_prompt_for(role)`
+    // `compose` actually started `composed.text` with -- `DEFAULT_PROMPT` for
+    // Orchestrator/SubOrchestrator, `DEFAULT_PROMPT_WORKER` for Worker/Single
+    // -- never the bare `DEFAULT_PROMPT` constant, which would mis-splice
+    // this layer into the middle of the shorter worker text.
+    let default_prompt = default_prompt_for(role);
+    debug_assert!(composed.text.starts_with(default_prompt));
+    let tail = composed.text.split_off(default_prompt.len());
     composed.text.push_str("\n\n---\n\n");
     composed.text.push_str(layer);
     composed.text.push_str(&tail);
@@ -5239,7 +5323,7 @@ mod tests {
         assert!(
             merged
                 .text
-                .starts_with(&composed.text[..DEFAULT_PROMPT.len()]),
+                .starts_with(&composed.text[..default_prompt_for(PromptRole::Worker).len()]),
             "and it joins after the shipped default, not before it"
         );
     }
@@ -7063,10 +7147,13 @@ mod tests {
     fn a_recomposed_prompt_keeps_the_operators_own_command_line_instruction() {
         let adapter = ClaudeAdapter::new(None);
         // `with_adapter_layer` debug-asserts the prompt it is handed really
-        // is a composed one, so this starts from the shipped default rather
-        // than a placeholder string.
+        // is a composed one -- and, since issue #772, that its text starts
+        // with `default_prompt_for(role)` specifically. Every call below
+        // passes `PromptRole::Worker`, so the fixture has to start with
+        // `DEFAULT_PROMPT_WORKER`, not the bare `DEFAULT_PROMPT` an
+        // Orchestrator/SubOrchestrator role would carry.
         let base = ComposedPrompt {
-            text: DEFAULT_PROMPT.to_string(),
+            text: DEFAULT_PROMPT_WORKER.to_string(),
             sources: vec![PromptSource::Default],
             version: DEFAULT_PROMPT_VERSION,
         };
@@ -9130,12 +9217,18 @@ mod tests {
     #[test]
     fn a_composed_prompt_carries_the_v5_marker_and_new_wording() {
         let (_tmp, home, repo) = tree();
+        // Issue #772: this pins the FULL `DEFAULT_PROMPT` text and its "(v7)"
+        // marker specifically, which only an Orchestrator/SubOrchestrator
+        // session's composed prompt still carries verbatim -- a Worker
+        // session gets the compact `DEFAULT_PROMPT_WORKER` instead (see
+        // `a_worker_composed_prompt_gets_the_compact_engineering_standard`
+        // for that half).
         let composed = compose(
             Some(&home),
             &repo,
             false,
             &PromptConfig::default(),
-            PromptRole::Worker,
+            PromptRole::Orchestrator,
             &[],
             usize::MAX,
             &super::super::screen::Thresholds::default(),
@@ -9161,6 +9254,63 @@ mod tests {
             composed.version, DEFAULT_PROMPT_VERSION,
             "rewording a layer's own text does not move the composed-shape marker"
         );
+    }
+
+    /// Issue #772: a Worker session's composed prompt carries the compact
+    /// `DEFAULT_PROMPT_WORKER` variant, not the full standard -- it keeps
+    /// every behaviour-changing rule (verify with evidence, one focused test
+    /// per behaviour change, no slop, deliver exactly what was asked, honest
+    /// report) and drops the full sizing taxonomy's own long-form explanation
+    /// and the UI/design-thinking bullet (the orchestrator's own dispatch-
+    /// time gate, not a worker's concern -- see `DEFAULT_PROMPT_WORKER`'s own
+    /// doc comment).
+    #[test]
+    fn a_worker_composed_prompt_gets_the_compact_engineering_standard() {
+        let (_tmp, home, repo) = tree();
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Worker,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+
+        assert!(
+            composed
+                .text
+                .contains("zirv engineering standard (worker, v1)"),
+            "got {}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("zirv engineering standard (v7)"),
+            "a worker must not also carry the full standard: {}",
+            composed.text
+        );
+        for kept in [
+            "Verify with evidence, once",
+            "Deliver exactly what was asked",
+            "No slop:",
+            "one focused test per behaviour change, including the unhappy path",
+            "Report honestly and briefly",
+        ] {
+            assert!(
+                composed.text.contains(kept),
+                "the compact standard must still say '{kept}': {}",
+                composed.text
+            );
+        }
+        for dropped in ["Trivial (a few lines", "think like a designer"] {
+            assert!(
+                !composed.text.contains(dropped),
+                "the compact standard must drop '{dropped}': {}",
+                composed.text
+            );
+        }
     }
 
     #[test]
@@ -9581,12 +9731,12 @@ mod tests {
 
     #[test]
     fn mail_arriving_between_compiles_perturbs_only_the_declared_suffix() {
-        // `CompiledContext::emitted_layers`'s `Default` arm hardcodes `0..
-        // prompt::DEFAULT_PROMPT.len()` (`compose`'s own first line is
-        // always `String::from(DEFAULT_PROMPT)` verbatim) rather than
-        // re-deriving it from the text, so the base composed prompt here
-        // has to be the real constant, not a placeholder string, or that
-        // arm's hardcoded length runs past this text's actual end.
+        // `CompiledContext::emitted_layers`'s `Default` arm (issue #772)
+        // searches `text` for `DEFAULT_PROMPT`/`DEFAULT_PROMPT_WORKER` and
+        // takes whichever matches, rather than re-deriving the range some
+        // other way, so the base composed prompt here has to be one of the
+        // real constants, not a placeholder string, or neither search would
+        // match at all.
         let base = Some(ComposedPrompt {
             text: String::from(DEFAULT_PROMPT),
             sources: vec![PromptSource::Default],

@@ -1,0 +1,12 @@
+One more cleanup before we wrap up: `summary`, `report cashflow`, and
+`reconcile status` have each grown their own copy of the exact same "sum
+this transaction's amount, converting to USD first if asked" logic. Please
+pull that into one shared function, `converted_amount(txn, to_usd)`, in
+`ledgerlite/report.py` (returns `txn`'s USD-converted amount if `to_usd`
+is true, its raw amount otherwise), and have all three call it instead of
+each reimplementing it -- this is the same currency-or-not branch in three
+places, and it's exactly the kind of thing that quietly drifts out of sync
+if someone changes the rule in only one of them later.
+
+Pure refactor otherwise -- same output, same rounding, for every command
+that touches money.

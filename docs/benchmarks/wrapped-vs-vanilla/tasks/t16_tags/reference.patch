@@ -1,0 +1,287 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..af7f53c 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+@@ -10,6 +11,7 @@ from . import report
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
++from .tagging import normalize_tags
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+@@ -34,6 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
+     p_list.add_argument(
+         "--page-size", type=int, default=10, dest="page_size", help="rows per page (default: %(default)s)"
+     )
++    p_list.add_argument("--tag", default=None, help="only show transactions carrying this tag")
+ 
+     p_summary = sub.add_parser("summary", help="show per-category totals")
+     p_summary.add_argument(
+@@ -47,6 +50,28 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_tag = sub.add_parser("tag", help="manage tags on stored transactions")
++    tag_sub = p_tag.add_subparsers(dest="tag_command", required=True)
++
++    p_tag_add = tag_sub.add_parser("add", help="add tag(s) to a transaction")
++    p_tag_add.add_argument("--id", type=int, required=True, dest="txn_id")
++    p_tag_add.add_argument("--tag", action="append", required=True, dest="tags")
++    p_tag_add.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++    p_tag_remove = tag_sub.add_parser("remove", help="remove tag(s) from a transaction")
++    p_tag_remove.add_argument("--id", type=int, required=True, dest="txn_id")
++    p_tag_remove.add_argument("--tag", action="append", required=True, dest="tags")
++    p_tag_remove.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++    p_tag_list = tag_sub.add_parser("list", help="list all tags in use")
++    p_tag_list.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++
+     return parser
+ 
+ 
+@@ -60,18 +85,37 @@ def _cmd_import(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _format_row(txn) -> str:
++    line = (
++        f"{txn.id:>4}  {txn.date.isoformat():<10}  {txn.amount:>10}  "
++        f"{txn.payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
++    )
++    if txn.tags:
++        line += f"  [{','.join(sorted(txn.tags))}]"
++    return line
++
++
+ def _cmd_list(args: argparse.Namespace) -> int:
+     txns = load(args.store)
++
++    if args.tag is not None:
++        wanted = args.tag.strip().lower()
++        rows = [t for t in txns if wanted in {tag.lower() for tag in t.tags}]
++        if not rows:
++            print("No transactions match that tag.")
++            return 0
++        print(f"{'ID':>4}  {'Date':<10}  {'Amount':>10}  {'Payee':<24}  {'Category':<14}  Memo")
++        for txn in rows:
++            print(_format_row(txn))
++        return 0
++
+     rows = report.page(txns, args.page, args.page_size)
+     if not rows:
+         print("No transactions on this page.")
+         return 0
+     print(f"{'ID':>4}  {'Date':<10}  {'Amount':>10}  {'Payee':<24}  {'Category':<14}  Memo")
+     for txn in rows:
+-        print(
+-            f"{txn.id:>4}  {txn.date.isoformat():<10}  {txn.amount:>10}  "
+-            f"{txn.payee:<24}  {(txn.category or ''):<14}  {txn.memo}"
+-        )
++        print(_format_row(txn))
+     return 0
+ 
+ 
+@@ -106,11 +150,72 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _find_txn(txns, txn_id):
++    for txn in txns:
++        if txn.id == txn_id:
++            return txn
++    return None
++
++
++def _cmd_tag_add(args: argparse.Namespace) -> int:
++    new_tags = normalize_tags(args.tags)
++    if not new_tags:
++        print("error: no valid (non-blank) tags given", file=sys.stderr)
++        return 2
++    txns = load(args.store)
++    txn = _find_txn(txns, args.txn_id)
++    if txn is None:
++        print(f"error: no transaction with id {args.txn_id}", file=sys.stderr)
++        return 2
++    txn.tags = normalize_tags(list(txn.tags) + new_tags)
++    save(args.store, txns)
++    print(f"Tagged transaction {txn.id} with {len(txn.tags)} tag(s): {','.join(txn.tags)}")
++    return 0
++
++
++def _cmd_tag_remove(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    txn = _find_txn(txns, args.txn_id)
++    if txn is None:
++        print(f"error: no transaction with id {args.txn_id}", file=sys.stderr)
++        return 2
++    remove = {t.strip().lower() for t in args.tags}
++    txn.tags = [t for t in txn.tags if t.lower() not in remove]
++    save(args.store, txns)
++    remaining = ",".join(sorted(txn.tags)) if txn.tags else "none"
++    print(f"Untagged transaction {txn.id}, remaining tags: {remaining}")
++    return 0
++
++
++def _cmd_tag_list(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    counts: dict = {}
++    for txn in txns:
++        for tag in txn.tags:
++            counts[tag] = counts.get(tag, 0) + 1
++    if not counts:
++        print("No tags.")
++        return 0
++    for tag in sorted(counts):
++        print(f"{tag}: {counts[tag]}")
++    return 0
++
++
++def _cmd_tag(args: argparse.Namespace) -> int:
++    handler = {
++        "add": _cmd_tag_add,
++        "remove": _cmd_tag_remove,
++        "list": _cmd_tag_list,
++    }[args.tag_command]
++    return handler(args)
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "tag": _cmd_tag,
+ }
+ 
+ 
+diff --git a/ledgerlite/models.py b/ledgerlite/models.py
+index 4cfa174..2da737a 100644
+--- a/ledgerlite/models.py
++++ b/ledgerlite/models.py
+@@ -2,10 +2,10 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from datetime import date
+ from decimal import Decimal, InvalidOperation
+-from typing import Optional
++from typing import List, Optional
+ 
+ 
+ @dataclass
+@@ -20,6 +20,8 @@ class Transaction:
+             statement.
+         memo: a free-text note or the statement's own description field.
+         category: the assigned spending category, or None if uncategorized.
++        tags: already-normalized free-form labels attached to this
++            transaction; defaults to an empty list.
+     """
+ 
+     id: int
+@@ -28,6 +30,7 @@ class Transaction:
+     payee: str
+     memo: str
+     category: Optional[str] = None
++    tags: List[str] = field(default_factory=list)
+ 
+ 
+ def parse_money(text: str) -> Decimal:
+diff --git a/ledgerlite/parse.py b/ledgerlite/parse.py
+index 65717e0..f92105f 100644
+--- a/ledgerlite/parse.py
++++ b/ledgerlite/parse.py
+@@ -8,6 +8,7 @@ from pathlib import Path
+ from typing import List, Union
+ 
+ from .models import Transaction, parse_money
++from .tagging import parse_tag_list
+ 
+ #: Date formats accepted in the `date` column, tried in order.
+ _DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y")
+@@ -39,6 +40,7 @@ def read_csv(path: Union[str, Path]) -> List[Transaction]:
+         reader = csv.DictReader(fh)
+         for i, row in enumerate(reader, start=1):
+             category = (row.get("category") or "").strip() or None
++            tags = parse_tag_list(row.get("tags") or "")
+             txns.append(
+                 Transaction(
+                     id=i,
+@@ -47,6 +49,7 @@ def read_csv(path: Union[str, Path]) -> List[Transaction]:
+                     payee=(row.get("payee") or "").strip(),
+                     memo=(row.get("memo") or "").strip(),
+                     category=category,
++                    tags=tags,
+                 )
+             )
+     return txns
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..ff2a276 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -19,6 +19,7 @@ def _txn_to_dict(txn: Transaction) -> dict:
+         "payee": txn.payee,
+         "memo": txn.memo,
+         "category": txn.category,
++        "tags": list(txn.tags),
+     }
+ 
+ 
+@@ -30,6 +31,7 @@ def _txn_from_dict(data: dict) -> Transaction:
+         payee=data["payee"],
+         memo=data["memo"],
+         category=data.get("category"),
++        tags=list(data.get("tags") or []),
+     )
+ 
+ 
+diff --git a/ledgerlite/tagging.py b/ledgerlite/tagging.py
+new file mode 100644
+index 0000000..125b270
+--- /dev/null
++++ b/ledgerlite/tagging.py
+@@ -0,0 +1,27 @@
++"""Tag normalization helpers for ledgerlite."""
++
++from __future__ import annotations
++
++from typing import Iterable, List
++
++
++def normalize_tags(raw: Iterable[str]) -> List[str]:
++    """Normalize an iterable of tag strings.
++
++    Each tag is stripped of surrounding whitespace and lowercased; blank
++    tags (empty after stripping) are dropped; duplicates are removed; the
++    result is sorted alphabetically.
++    """
++    seen = set()
++    for item in raw:
++        tag = item.strip().lower()
++        if tag:
++            seen.add(tag)
++    return sorted(seen)
++
++
++def parse_tag_list(text: str) -> List[str]:
++    """Parse a comma-separated tag string into a normalized tag list."""
++    if not text:
++        return []
++    return normalize_tags(text.split(","))

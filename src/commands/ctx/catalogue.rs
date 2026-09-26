@@ -161,7 +161,14 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "sonnet",
         id: "claude-sonnet-5",
         strength: 2,
-        context_window: Some(200_000),
+        // Round 4 bug 4a (2026-09-25): verified directly against a real
+        // `claude -p --output-format json` result, which reports
+        // `"modelUsage":{"claude-sonnet-5":{"contextWindow":1000000,...}}`
+        // -- five times the 200_000 this rung previously stated. Changed
+        // only here, on real evidence: every other rung's window stays
+        // whatever was last verified for IT specifically (see `Rung`'s own
+        // doc comment on why an unverified guess is never an improvement).
+        context_window: Some(1_000_000),
         price: Some(SONNET),
         tier: Some(Tier::Standard),
     },

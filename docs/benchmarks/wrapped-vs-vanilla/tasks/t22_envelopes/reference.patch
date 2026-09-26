@@ -1,0 +1,576 @@
+diff --git a/ledgerlite/__init__.py b/ledgerlite/__init__.py
+index a5054fb..610fb57 100644
+--- a/ledgerlite/__init__.py
++++ b/ledgerlite/__init__.py
+@@ -1,5 +1,7 @@
+ """ledgerlite: a small personal-finance ledger library and CLI."""
+ 
++from .allocation import suggest_allocations
++from .envelopes import Envelope, balance_through_month, spent_in_month
+ from .models import Transaction, parse_money
+ from .rules import DEFAULT_RULES, Rule, categorize
+ 
+@@ -9,4 +11,8 @@ __all__ = [
+     "Rule",
+     "DEFAULT_RULES",
+     "categorize",
++    "Envelope",
++    "spent_in_month",
++    "balance_through_month",
++    "suggest_allocations",
+ ]
+diff --git a/ledgerlite/allocation.py b/ledgerlite/allocation.py
+new file mode 100644
+index 0000000..134f973
+--- /dev/null
++++ b/ledgerlite/allocation.py
+@@ -0,0 +1,44 @@
++"""Proportional income allocation across envelopes (largest-remainder method)."""
++
++from __future__ import annotations
++
++from decimal import ROUND_DOWN, Decimal
++from typing import Dict, List
++
++from .envelopes import Envelope
++
++CENT = Decimal("0.01")
++
++
++def suggest_allocations(envelopes: List[Envelope], total_income: Decimal) -> Dict[str, Decimal]:
++    """Split `total_income` across `envelopes` proportionally to `monthly_budget`.
++
++    Uses the largest-remainder method so the result always sums to exactly
++    `total_income` (to the cent): each envelope's exact share is floored to
++    2 decimals, then the leftover cents are handed out one at a time to the
++    envelopes with the largest fractional remainder, ties broken
++    alphabetically by name. If every envelope's `monthly_budget` is 0 (or
++    there are no envelopes), every result is `Decimal("0.00")`.
++    """
++    total_budget = sum((e.monthly_budget for e in envelopes), Decimal("0"))
++    if not envelopes or total_budget == 0:
++        return {e.name: Decimal("0.00") for e in envelopes}
++
++    exact: Dict[str, Decimal] = {}
++    floors: Dict[str, Decimal] = {}
++    remainders: Dict[str, Decimal] = {}
++    for e in envelopes:
++        share = (total_income * e.monthly_budget / total_budget)
++        floor = share.quantize(CENT, rounding=ROUND_DOWN)
++        exact[e.name] = share
++        floors[e.name] = floor
++        remainders[e.name] = share - floor
++
++    allocated = sum(floors.values(), Decimal("0"))
++    leftover_cents = int((total_income - allocated) / CENT)
++
++    order = sorted(envelopes, key=lambda e: (-remainders[e.name], e.name))
++    result = dict(floors)
++    for e in order[:leftover_cents]:
++        result[e.name] += CENT
++    return result
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..24f3bd5 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -7,6 +7,7 @@ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+ from . import report
++from .envelope_cli import add_envelope_subcommand, cmd_envelope
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
+@@ -47,6 +48,8 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    add_envelope_subcommand(sub, DEFAULT_STORE)
++
+     return parser
+ 
+ 
+@@ -111,6 +114,7 @@ _HANDLERS = {
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "envelope": cmd_envelope,
+ }
+ 
+ 
+diff --git a/ledgerlite/envelope_cli.py b/ledgerlite/envelope_cli.py
+new file mode 100644
+index 0000000..e98142c
+--- /dev/null
++++ b/ledgerlite/envelope_cli.py
+@@ -0,0 +1,299 @@
++"""`envelope` subcommand family: argparse wiring + handlers.
++
++Kept out of `cli.py` (which only imports `add_envelope_subcommand` and
++`cmd_envelope`) so that module doesn't grow unboundedly as more subcommand
++families are added.
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import sys
++from decimal import Decimal
++from pathlib import Path
++from typing import List
++
++from .allocation import suggest_allocations
++from .envelopes import Envelope, balance_through_month, is_valid_month
++from .envelope_store import load_envelopes, save_envelopes
++from .store import load as load_transactions
++
++CSV_HEADER = ["Name", "Category", "MonthlyBudget", "Rollover", "StartMonth", "StartingBalance"]
++
++
++def add_envelope_subcommand(sub: "argparse._SubParsersAction", default_store: str) -> None:
++    p_envelope = sub.add_parser("envelope", help="track envelope budgets")
++    envelope_sub = p_envelope.add_subparsers(dest="envelope_command", required=True)
++
++    p_add = envelope_sub.add_parser("add", help="add a new envelope")
++    p_add.add_argument("--name", required=True)
++    p_add.add_argument("--monthly-budget", required=True, dest="monthly_budget")
++    p_add.add_argument("--category", action="append", required=True, dest="categories")
++    p_add.add_argument("--start-month", required=True, dest="start_month")
++    p_add.add_argument("--rollover", action="store_true")
++    p_add.add_argument("--starting-balance", default="0", dest="starting_balance")
++    p_add.add_argument("--store", default=default_store)
++
++    p_list = envelope_sub.add_parser("list", help="list saved envelopes")
++    p_list.add_argument("--store", default=default_store)
++
++    p_status = envelope_sub.add_parser("status", help="show one envelope's monthly status")
++    p_status.add_argument("name")
++    p_status.add_argument("--year", type=int, required=True)
++    p_status.add_argument("--month", type=int, required=True)
++    p_status.add_argument("--store", default=default_store)
++
++    p_transfer = envelope_sub.add_parser("transfer", help="move balance between envelopes")
++    p_transfer.add_argument("--from", required=True, dest="from_name")
++    p_transfer.add_argument("--to", required=True, dest="to_name")
++    p_transfer.add_argument("--amount", required=True)
++    p_transfer.add_argument("--year", type=int, required=True)
++    p_transfer.add_argument("--month", type=int, required=True)
++    p_transfer.add_argument("--store", default=default_store)
++
++    p_suggest = envelope_sub.add_parser("suggest", help="suggest an income allocation")
++    p_suggest.add_argument("--income", required=True)
++    p_suggest.add_argument("--store", default=default_store)
++
++    p_alerts = envelope_sub.add_parser("alerts", help="show overspent envelopes")
++    p_alerts.add_argument("--year", type=int, required=True)
++    p_alerts.add_argument("--month", type=int, required=True)
++    p_alerts.add_argument("--store", default=default_store)
++
++    p_close = envelope_sub.add_parser("close-month", help="fold a month's balance into starting_balance")
++    p_close.add_argument("--year", type=int, required=True)
++    p_close.add_argument("--month", type=int, required=True)
++    p_close.add_argument("--store", default=default_store)
++
++    p_export = envelope_sub.add_parser("export", help="export envelopes to CSV")
++    p_export.add_argument("--store", default=default_store)
++    p_export.add_argument("--out", required=True)
++
++    p_import = envelope_sub.add_parser("import-csv", help="import envelopes from CSV")
++    p_import.add_argument("--store", default=default_store)
++    p_import.add_argument("--file", required=True)
++
++    p_remove = envelope_sub.add_parser("remove", help="remove an envelope")
++    p_remove.add_argument("name")
++    p_remove.add_argument("--store", default=default_store)
++
++
++def _find(envelopes: List[Envelope], name: str):
++    for e in envelopes:
++        if e.name == name:
++            return e
++    return None
++
++
++def _cmd_add(args: argparse.Namespace) -> int:
++    budget = Decimal(args.monthly_budget)
++    if budget <= 0:
++        print("error: --monthly-budget must be strictly positive", file=sys.stderr)
++        return 2
++    if not is_valid_month(args.start_month):
++        print(f"error: --start-month {args.start_month!r} is not in YYYY-MM form", file=sys.stderr)
++        return 2
++    envelopes = load_envelopes(args.store)
++    if _find(envelopes, args.name) is not None:
++        print(f"error: an envelope named {args.name!r} already exists", file=sys.stderr)
++        return 2
++    envelopes.append(Envelope(
++        name=args.name,
++        categories=list(args.categories),
++        monthly_budget=budget,
++        start_month=args.start_month,
++        rollover=args.rollover,
++        starting_balance=Decimal(args.starting_balance),
++    ))
++    save_envelopes(args.store, envelopes)
++    print(f"Added envelope {args.name}")
++    return 0
++
++
++def _cmd_list(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    if not envelopes:
++        print("No envelopes.")
++        return 0
++    for e in envelopes:
++        line = (f"{e.name}: budget {e.monthly_budget}/mo categories {','.join(e.categories)} "
++                f"from {e.start_month}")
++        if e.rollover:
++            line += " (rollover)"
++        print(line)
++    return 0
++
++
++def _cmd_status(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    env = _find(envelopes, args.name)
++    if env is None:
++        print(f"error: no envelope named {args.name!r}", file=sys.stderr)
++        return 2
++    txns = load_transactions(args.store)
++    try:
++        balance = balance_through_month(env, txns, args.year, args.month)
++    except ValueError as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 2
++    from .envelopes import spent_in_month
++    spent = spent_in_month(env, txns, args.year, args.month)
++    print(f"{env.name}: spent {spent:.2f}/{env.monthly_budget:.2f} for "
++          f"{args.year:04d}-{args.month:02d}, balance {balance:.2f}")
++    return 0
++
++
++def _cmd_transfer(args: argparse.Namespace) -> int:
++    if args.from_name == args.to_name:
++        print("error: --from and --to must be different envelopes", file=sys.stderr)
++        return 2
++    envelopes = load_envelopes(args.store)
++    src = _find(envelopes, args.from_name)
++    dst = _find(envelopes, args.to_name)
++    if src is None:
++        print(f"error: no envelope named {args.from_name!r}", file=sys.stderr)
++        return 2
++    if dst is None:
++        print(f"error: no envelope named {args.to_name!r}", file=sys.stderr)
++        return 2
++    amount = Decimal(args.amount)
++    month = f"{args.year:04d}-{args.month:02d}"
++    src.adjustments[month] = src.adjustments.get(month, Decimal("0")) - amount
++    dst.adjustments[month] = dst.adjustments.get(month, Decimal("0")) + amount
++    save_envelopes(args.store, envelopes)
++    print(f"Transferred {args.amount} from {args.from_name} to {args.to_name} for {month}")
++    return 0
++
++
++def _cmd_suggest(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    if not envelopes:
++        print("No envelopes.")
++        return 0
++    result = suggest_allocations(envelopes, Decimal(args.income))
++    for name in sorted(result):
++        print(f"{name}: {result[name]:.2f}")
++    return 0
++
++
++def _cmd_alerts(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    txns = load_transactions(args.store)
++    overspent = []
++    for e in envelopes:
++        try:
++            balance = balance_through_month(e, txns, args.year, args.month)
++        except ValueError:
++            continue
++        if balance < 0:
++            overspent.append((e.name, balance))
++    if not overspent:
++        print("No envelopes over budget.")
++        return 0
++    overspent.sort(key=lambda item: (item[1], item[0]))
++    for name, balance in overspent:
++        print(f"{name}: over by {abs(balance):.2f}")
++    return 0
++
++
++def _cmd_close_month(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    txns = load_transactions(args.store)
++    target = (args.year, args.month)
++    closed_count = 0
++    for e in envelopes:
++        if not e.rollover:
++            continue
++        start = tuple(int(x) for x in e.start_month.split("-"))
++        if target < start:
++            continue
++        if e.closed_through:
++            closed = tuple(int(x) for x in e.closed_through.split("-"))
++            if target <= closed:
++                continue
++        new_balance = balance_through_month(e, txns, args.year, args.month)
++        e.starting_balance = new_balance
++        e.closed_through = f"{args.year:04d}-{args.month:02d}"
++        e.adjustments = {m: v for m, v in e.adjustments.items()
++                          if tuple(int(x) for x in m.split("-")) > target}
++        closed_count += 1
++    save_envelopes(args.store, envelopes)
++    print(f"Closed {args.year:04d}-{args.month:02d} for {closed_count} envelope(s)")
++    return 0
++
++
++def _cmd_export(args: argparse.Namespace) -> int:
++    envelopes = sorted(load_envelopes(args.store), key=lambda e: e.name)
++    with open(args.out, "w", newline="", encoding="utf-8") as f:
++        writer = csv.writer(f)
++        writer.writerow(CSV_HEADER)
++        for e in envelopes:
++            writer.writerow([
++                e.name,
++                ",".join(e.categories),
++                f"{e.monthly_budget:.2f}",
++                "true" if e.rollover else "false",
++                e.start_month,
++                f"{e.starting_balance:.2f}",
++            ])
++    print(f"Exported {len(envelopes)} envelope(s) to {args.out}")
++    return 0
++
++
++def _cmd_import_csv(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    by_name = {e.name: i for i, e in enumerate(envelopes)}
++    count = 0
++    with open(args.file, newline="", encoding="utf-8") as f:
++        reader = csv.DictReader(f)
++        for row in reader:
++            new_env = Envelope(
++                name=row["Name"],
++                categories=[c for c in row["Category"].split(",") if c],
++                monthly_budget=Decimal(row["MonthlyBudget"]),
++                start_month=row["StartMonth"],
++                rollover=row["Rollover"].strip().lower() == "true",
++                starting_balance=Decimal(row["StartingBalance"]),
++                closed_through=None,
++                adjustments={},
++            )
++            if new_env.name in by_name:
++                envelopes[by_name[new_env.name]] = new_env
++            else:
++                by_name[new_env.name] = len(envelopes)
++                envelopes.append(new_env)
++            count += 1
++    save_envelopes(args.store, envelopes)
++    print(f"Imported {count} envelope(s) from {args.file}")
++    return 0
++
++
++def _cmd_remove(args: argparse.Namespace) -> int:
++    envelopes = load_envelopes(args.store)
++    env = _find(envelopes, args.name)
++    if env is None:
++        print(f"error: no envelope named {args.name!r}", file=sys.stderr)
++        return 2
++    envelopes = [e for e in envelopes if e.name != args.name]
++    save_envelopes(args.store, envelopes)
++    print(f"Removed envelope {env.name}")
++    return 0
++
++
++_HANDLERS = {
++    "add": _cmd_add,
++    "list": _cmd_list,
++    "status": _cmd_status,
++    "transfer": _cmd_transfer,
++    "suggest": _cmd_suggest,
++    "alerts": _cmd_alerts,
++    "close-month": _cmd_close_month,
++    "export": _cmd_export,
++    "import-csv": _cmd_import_csv,
++    "remove": _cmd_remove,
++}
++
++
++def cmd_envelope(args: argparse.Namespace) -> int:
++    return _HANDLERS[args.envelope_command](args)
+diff --git a/ledgerlite/envelope_store.py b/ledgerlite/envelope_store.py
+new file mode 100644
+index 0000000..4a16093
+--- /dev/null
++++ b/ledgerlite/envelope_store.py
+@@ -0,0 +1,59 @@
++"""JSON persistence for `Envelope`s, under the `"envelopes"` key of the same
++store file `ledgerlite.store` uses for transactions."""
++
++from __future__ import annotations
++
++import json
++from decimal import Decimal
++from pathlib import Path
++from typing import List, Union
++
++from .envelopes import Envelope
++
++
++def _load_raw(path: Union[str, Path]) -> dict:
++    p = Path(path)
++    if not p.exists():
++        return {}
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def _save_raw(path: Union[str, Path], raw: dict) -> None:
++    Path(path).write_text(json.dumps(raw, indent=2), encoding="utf-8")
++
++
++def _to_dict(env: Envelope) -> dict:
++    return {
++        "name": env.name,
++        "categories": list(env.categories),
++        "monthly_budget": str(env.monthly_budget),
++        "start_month": env.start_month,
++        "rollover": env.rollover,
++        "starting_balance": str(env.starting_balance),
++        "closed_through": env.closed_through,
++        "adjustments": {k: str(v) for k, v in env.adjustments.items()},
++    }
++
++
++def _from_dict(data: dict) -> Envelope:
++    return Envelope(
++        name=data["name"],
++        categories=list(data.get("categories") or []),
++        monthly_budget=Decimal(data["monthly_budget"]),
++        start_month=data["start_month"],
++        rollover=bool(data.get("rollover", False)),
++        starting_balance=Decimal(data.get("starting_balance", "0")),
++        closed_through=data.get("closed_through"),
++        adjustments={k: Decimal(v) for k, v in (data.get("adjustments") or {}).items()},
++    )
++
++
++def load_envelopes(path: Union[str, Path]) -> List[Envelope]:
++    raw = _load_raw(path)
++    return [_from_dict(d) for d in raw.get("envelopes", [])]
++
++
++def save_envelopes(path: Union[str, Path], envelopes: List[Envelope]) -> None:
++    raw = _load_raw(path)
++    raw["envelopes"] = [_to_dict(e) for e in envelopes]
++    _save_raw(path, raw)
+diff --git a/ledgerlite/envelopes.py b/ledgerlite/envelopes.py
+new file mode 100644
+index 0000000..c9ed28e
+--- /dev/null
++++ b/ledgerlite/envelopes.py
+@@ -0,0 +1,100 @@
++"""Envelope budgeting model for ledgerlite.
++
++An `Envelope` budgets a fixed amount per month against one or more
++categories. `spent_in_month`/`balance_through_month` are pure: no I/O, no
++clock -- persistence lives in `envelope_store.py`, CLI wiring in
++`envelope_cli.py`.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from decimal import Decimal
++from typing import Dict, List, Optional
++
++from .models import Transaction
++
++_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
++
++
++@dataclass
++class Envelope:
++    name: str
++    categories: List[str]
++    monthly_budget: Decimal
++    start_month: str
++    rollover: bool = False
++    starting_balance: Decimal = Decimal("0")
++    closed_through: Optional[str] = None
++    adjustments: Dict[str, Decimal] = field(default_factory=dict)
++
++
++def is_valid_month(text: str) -> bool:
++    """Whether `text` is a well-formed `"YYYY-MM"` month string."""
++    return bool(_MONTH_RE.match(text))
++
++
++def _parse_month(text: str):
++    y, m = text.split("-")
++    return int(y), int(m)
++
++
++def _month_str(year: int, month: int) -> str:
++    return f"{year:04d}-{month:02d}"
++
++
++def _next_month(year: int, month: int):
++    return (year + 1, 1) if month == 12 else (year, month + 1)
++
++
++def spent_in_month(envelope: Envelope, txns: List[Transaction], year: int, month: int) -> Decimal:
++    """Sum of `abs(amount)` for transactions in `envelope.categories`, that month."""
++    total = Decimal("0")
++    wanted = set(envelope.categories)
++    for txn in txns:
++        if txn.category in wanted and txn.date.year == year and txn.date.month == month:
++            total += abs(txn.amount)
++    return total
++
++
++def balance_through_month(envelope: Envelope, txns: List[Transaction], year: int, month: int) -> Decimal:
++    """The envelope's remaining balance for `year`-`month`.
++
++    Raises `ValueError` for a month before `start_month` (or before
++    `closed_through`, once set) -- see envelopes.py's module docstring and
++    the task prompt for the exact rules.
++    """
++    target = (year, month)
++    start = _parse_month(envelope.start_month)
++
++    if not envelope.rollover:
++        if target < start:
++            raise ValueError(f"{_month_str(*target)} is before start_month {envelope.start_month}")
++        spent = spent_in_month(envelope, txns, year, month)
++        adj = envelope.adjustments.get(_month_str(year, month), Decimal("0"))
++        return envelope.monthly_budget - spent + adj
++
++    if envelope.closed_through:
++        closed = _parse_month(envelope.closed_through)
++        if target < closed:
++            raise ValueError(f"{_month_str(*target)} is before closed_through {envelope.closed_through}")
++        if target == closed:
++            return envelope.starting_balance
++        base = _next_month(*closed)
++    else:
++        if target < start:
++            raise ValueError(f"{_month_str(*target)} is before start_month {envelope.start_month}")
++        base = start
++
++    running = envelope.starting_balance
++    cur = base
++    while True:
++        y, m = cur
++        spent = spent_in_month(envelope, txns, y, m)
++        adj = envelope.adjustments.get(_month_str(y, m), Decimal("0"))
++        running = running + envelope.monthly_budget - spent + adj
++        if (y, m) == target:
++            break
++        cur = _next_month(y, m)
++    return running

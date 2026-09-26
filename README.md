@@ -17,6 +17,8 @@
 
 > **Zirv CLI** is a cross-platform command-line interface for developers to automate and streamline workflows with YAML, JSON, or TOML scripts.
 
+**Wrapping Claude Code in zirv:** about 20% cheaper on large tasks, up to 42% on long sessions, and work rated 10% better, on the same model. ([measured](#what-wrapping-costs-measured))
+
 ---
 
 ## Table of Contents
@@ -456,15 +458,26 @@ same stored answer instead of asking Jev again, at zero additional cost.
 a model decision can raise them but never lower them — and `validation` is
 recomputed from the merged complexity and risk, so a raise always
 propagates. `execution`, seat tier, worker tier and seat role then derive
-entirely from that merged `complexity`: Trivial → direct/cheap/single seat,
+entirely from that merged `complexity`: Trivial → direct/standard/single seat,
 Bounded → bounded/standard/single seat, Substantial or Architectural →
 orchestrated/orchestrator seat — floored upward when risk reaches
 High (at least Bounded) or the request names a security surface, and a
-Direct execution always clears any chosen workflow back to none. An
-orchestrated seat runs the frontier tier only for Architectural complexity
-or High-or-worse risk; a Substantial one stays on the standard tier. When a
-workflow starts, the proxy layer names its id so the seat can run
-`zirv workflow status` and follow the current step. The
+Direct execution always clears any chosen workflow back to none. `execution`
+alone never routes to the cheap seat tier any more (cheap-seat overhead fix,
+wrapper-overhead benchmark 2026-09-24): a live 85-run replay found `Direct`
+sending 16/28 runs to haiku, which then took 2-5x the turns of a sonnet run
+on the same code task for +133% wall time and no cost saving, so `Direct`
+now maps to the same `Standard` seat tier `Bounded` already used; `worker_tier`
+is unaffected. An orchestrated seat runs the frontier tier only for
+Architectural complexity or High-or-worse risk; a Substantial one stays on
+the standard tier. The baseline's own deterministic pick of a workflow to
+start (`selection::select_definition`) fires only at Substantial or
+Architectural complexity — the same 2026-09-24 benchmark found intake
+starting a workflow for every Bounded-complexity headless run even though
+headless agents never read it, adding ~11s/run; an explicit "start a
+`<name>` workflow" request still starts one at any complexity, exactly as
+before. When a workflow starts, the proxy layer names its id so the seat can
+run `zirv workflow status` and follow the current step. The
 winning decision is then validated against the live roster (an unready
 harness falls back to the baseline harness, its model re-derived for the
 decision's own seat tier; an unknown workflow id falls back to the baseline)
@@ -543,12 +556,33 @@ the seat gets its own optional `~/.zirv/system-prompt.single.md`
 keeps today's orchestrator seat and every one of its existing conventions
 unchanged.
 
-**`zirv ctx proxy [--json] [REQUEST]`** decides and prints without launching
-anything. `REQUEST` is read from stdin when omitted and stdin is not a tty;
-human output is the announce line plus one line per field with its source
-and confidence, then reasons and fallbacks; `--json` prints the full
-decision. `zirv ctx chat --proxy` / `--no-proxy` overrides `cfg.proxy.enabled`
-for one launch; `--resume` and `--simple` always skip the proxy.
+**`zirv ctx proxy [--json] [--headless] [REQUEST]`** decides and prints
+without launching anything. `REQUEST` is read from stdin when omitted and
+stdin is not a tty; human output is the announce line plus one line per
+field with its source and confidence, then reasons and fallbacks; `--json`
+prints the full decision. `zirv ctx chat --proxy` / `--no-proxy` overrides
+`cfg.proxy.enabled` for one launch; `--resume` and `--simple` always skip the
+proxy.
+
+**Headless single seat.** A headless launch works unattended — nobody is
+watching the seat, so it must never be told it is an orchestrator: zirv's own
+rule for a worker is "runs unattended and must not delegate further". Pass
+`--headless`, or leave it unset and let `zirv ctx proxy` fall back to reading
+`ZIRV_CTX_HEADLESS=1` (`adapters::HEADLESS_ENV`, the same marker zirv itself
+sets on a headless launch's own process environment) from the calling
+process's environment — either is enough. Either one forces `execution`/
+`seat_role` to their single-seat equivalents (`Orchestrated`/`Orchestrator`
+downgrades to `Bounded`/`Single`; a decision already `Direct`/`Bounded` is a
+no-op) for BOTH the deterministic decider and a Jev/helper-assisted decision
+alike — applied last, after everything else has run. `complexity`, `risk`,
+`seat_tier`, `worker_tier`, and `workflow` are left exactly as the rest of
+the pipeline decided; only which seat executes the request changes. The
+rendered `[zirv proxy]` prompt layer then carries the same "You are the
+single seat for this request: do the work here yourself; do not delegate."
+line an interactive single-seat decision already gets. An interactive launch
+(`zirv chat`, a dashboard pane) never passes this and is unaffected. An
+external harness that launches zirv headlessly (a benchmark, CI, or any
+caller outside a session) should always pass `--headless`.
 
 Disabled by default:
 
@@ -1035,10 +1069,15 @@ to the section that documents it in depth.
 
 ### What wrapping costs (measured)
 
-In a headless benchmark against Claude Code with a popular skills plugin,
-zirv was **up to 41% faster** and **up to 51% cheaper** (Sonnet, larger
-multi-module tasks). Protocol, per-task results and the harness:
-[docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
+In a headless benchmark against Claude Code with the superpowers plugin (78
+runs on Claude Sonnet 5), zirv cut cost per task by about 20% on ten large
+coding tasks, and by up to 42% on a 9-step working session. A blind
+reviewer (Claude Opus, not told which setup produced the work) rated zirv's
+work 9–11% higher. Hidden-test pass rates matched, and wall-clock speed was
+on par. The large-task cost and quality gains are statistically significant
+(paired bootstrap, 95% CI). Results and caveats:
+[the 2026-09 benchmark round](docs/benchmarks/wrapped-vs-vanilla/results/2026-09-24-fix-loop/README.md);
+protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wrapped-vs-vanilla.md).
 
 ### Development workflow commands
 
@@ -1953,15 +1992,22 @@ substantial/high-risk work, spec) artifact gates plus an approval-gated design
 step. Frontend work overlays the same engine rather than running a separate
 one, selected automatically from task language and changed frontend paths.
 
-Artifact steps write fixed templates to `.zirv/work/<workflow-id>/` (`intent.md`,
-`spec.md`, `plan.md`, ...) committed to the repository. `zirv workflow approve`
-refuses an untouched template, then pins the accepted file's SHA-256 digest and
-timestamp in private state; a later step folds only accepted, hash-matching
-artifacts into prompt context. Editing or deleting an accepted file after the
-fact reopens its acceptance gate and invalidates later completed steps, so
+Artifact steps name a fixed template path under `.zirv/work/<workflow-id>/`
+(`intent.md`, `spec.md`, `plan.md`, ...) for the agent to write itself — `zirv
+workflow start`/advance/resume never pre-create the file or touch the git
+index (issue F6: a blind reviewer flagged the untouched, unfilled file as a
+stray addition), so nothing appears in the worktree until the agent actually
+fills it in. `zirv workflow status`/`context` print both the path and the
+template text for a step whose artifact does not exist yet, so it stays
+discoverable either way. `zirv workflow approve` treats a still-missing file
+exactly like an untouched template and refuses it the same way, then pins the
+accepted file's SHA-256 digest and timestamp in private state once it is
+genuinely filled in; a later step folds only accepted, hash-matching artifacts
+into prompt context. Editing or deleting an accepted file after the fact
+reopens its acceptance gate and invalidates later completed steps, so
 implementation can never silently proceed against a plan that changed
-underneath it — `zirv workflow artifacts <id>` shows pending/accepted/drifted
-state directly.
+underneath it — `zirv workflow artifacts <id>` shows pending/accepted/drifted/
+missing state directly.
 
 Classification is re-measured (never downgraded) whenever a workflow advances
 into a review or verify step, so a review/verify gate the initial `workflow
@@ -3565,7 +3611,10 @@ lists against what serde actually writes — so the documentation cannot drift
 from the wire.
 
 **Transport.** A unix domain socket at `<state>/s/api.sock` on unix, a named
-pipe on Windows, carrying NDJSON in both directions. The server writes one
+pipe on Windows, carrying NDJSON in both directions. The same transport also
+backs one other owner-only, per-session endpoint outside this protocol: the
+Jev session relay at `<state>/s/jev-<hash-of-session-id>` (see
+[`[jev]`](#configuration)'s "Session relay" above). The server writes one
 `hello` frame per connection before reading anything; a client intersects the
 capabilities that frame advertises with its own and disables locally whatever
 is missing, which is how an older client connects to a newer server and vice
@@ -3929,7 +3978,7 @@ ordinary zirv CLI for that repository before starting the host.
 
 ### Signals and verdicts
 
-Four signals over the trailing window (default 10 turns):
+Five signals over the trailing window (default 10 turns):
 
 1. **Context size** (a gate, not a vote). The floor and ceiling scale with the
    model's real context window (issue #155): by default the floor sits at 50%
@@ -3947,6 +3996,19 @@ Four signals over the trailing window (default 10 turns):
    (weight 30).
 4. **Reply-marker misses** on final answers (weight 30, active only when the
    marker hook is installed and the session is at least 10 turns old).
+5. **Same-error loops** (weight 120 by default, `score.same_error_weight`):
+   the longest run of consecutive identical (normalized) tool-result errors
+   across *different* attempts, distinct from the repetition signal above,
+   which needs the identical call repeated. Trips at `score.
+   same_error_threshold` repeats (default 3); `0.0` restores the pre-#763,
+   fully inert behaviour. The default weight is calibrated, not measured, so
+   that a freshly-tripped streak alone -- the ramp's lowest nonzero point,
+   `1 / same_error_threshold` -- raises an otherwise healthy score to exactly
+   `advise_at`'s default (40): the first action this signal can ever cause is
+   an advisory ("the fix isn't landing, try a different approach"), never an
+   immediate `compact`/`restart`. Further repeats ramp it the same way every
+   other signal ramps, through the identical weighted-sum/threshold verdict
+   below.
 
 Verdicts: score 40 or more is `advise`, 60 or more is `compact`, 80 or more is
 `restart`. At the token ceiling a score of 60 or more escalates to `restart`.
@@ -4041,17 +4103,40 @@ intake_savings = false # clarification category and optional planner; ZIRV_CTX_J
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
-approve = false     # safety-hook risk check: sends local facts only (program/subcommand class, write/delete/network/privilege flags, path-scope class, pipe/redirect/substitution/secret-placeholder counts), may only escalate a deterministic allow to ask; ZIRV_CTX_JEV_APPROVE (#781)
+approve = false     # safety-hook risk check: sends local facts only (program/subcommand class, write/delete/network/privilege flags, path-scope class, pipe/redirect/substitution/secret-placeholder counts), may only escalate a deterministic allow to ask; makes no call at all for a read-only, worktree/scratchpad-confined command (grep/cat/head/git status/..., pipes between them); ZIRV_CTX_JEV_APPROVE (#781)
 approve_allow = false # opt-in auto-approve, effective only when `approve` is also true: may lower a SIMPLE unmatched-default ask to allow (single segment, no pipe/redirect/substitution/env-prefix/code-bearing argument, program not a shell/eval/wrapper/refused-destructive program, not destructive/network/privilege) on a high-confidence/margin answer, with every check ALSO re-run on each token suffix to defeat launcher prefixes (nohup, timeout N, nice, ...); never a hard deny, and never a matched deny/ask rule (rm -rf, force-push, credential paths, ...) -- see "Command safety policy" below for the full structural rule; ZIRV_CTX_JEV_APPROVE_ALLOW (#781)
 classify = false    # intent refinement for `zirv workflow start`/`classify` (classify also adds domain tags); ZIRV_CTX_JEV_CLASSIFY (#782)
 handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_JEV_HANDOFF_SELECT (#783)
+compaction_select = false # appends a short Jev-chosen keep list ("Keep in particular: ...") to a compaction's own focus text, from candidates (edited files, an unresolved failing test, first-prompt constraints, the latest plan) extracted deterministically from the transcript; ZIRV_CTX_JEV_COMPACTION_SELECT (#798)
 inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
 inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
+missing_tests = false # when the deterministic `[missing_tests_gate]` is about to block, asks one metadata-only question from local numeric facts and skips that one block on a decisive "not owed" answer; ZIRV_CTX_JEV_MISSING_TESTS
+launch_effort = false # may steer a headless launch's first-turn CLAUDE_CODE_EFFORT_LEVEL pick, from local numeric facts only; see `[headless.effort]` below; ZIRV_CTX_JEV_LAUNCH_EFFORT
 cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
+
+**Session relay.** Every Jev call now goes through a process-wide keep-alive
+`ureq::Agent` instead of opening a fresh connection each time, which already
+helps any process making more than one call. Most `[jev]`-gated sites,
+though, run inside a short-lived, one-per-tool-call `zirv ctx hook`/`zirv ctx
+safety check` process, so there is nothing for that agent to keep alive
+across calls on its own. When at least one `[jev]` gate is on and a
+credential is present, `zirv ctx exec`/`zirv ctx wrap`'s own long-lived
+supervisor hosts a small per-session relay for the duration of the session:
+an owner-only duplex endpoint (the same NDJSON transport `zirv ctx api`
+uses, `<state>/s/jev-<hash-of-session-id>` — a sibling of that command's own
+`<state>/s/api.sock`) that a hook process dials, over its own `ZIRV_CTX_
+SESSION`, to reuse the supervisor's warm connection instead of paying a
+fresh TCP+TLS handshake. The client never sends its credential over that
+socket — the relay forwards with its own `[proxy.typesafe]` credential — and
+falls straight through to a normal direct call whenever there is no relay to
+dial, the relay times out, or it reports its own failure; caching, decision
+recording and error mapping are identical either way. A relay is always an
+optimisation: it is never required, and its absence never changes an answer,
+only how fast it arrives.
 
 Jev requests now accept only a bounded numeric metadata envelope with static
 questions. The shared client rejects text, paths, diffs, secrets, dynamic
@@ -4170,6 +4255,61 @@ config, an unreadable file -- silently rebuilds it from a full parse. See
 [Usage pacing](#usage-pacing) below for the `[pace]` table that governs
 subscription-window waiting.
 
+#### Headless cost levers
+
+Operator-only, off-by-default cost levers for the Claude Code
+sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
+`--prompt` path and its `-- claude -p ...` passthrough, plus `zirv agent
+claude` headless workers (they share `ctx exec`'s own launch builder).
+Interactive `wrap`/`chat`/dash sessions never read this table.
+
+Every key is unset or off by default. The example below is an opt-in configuration, not the defaults:
+
+```toml
+[headless]
+prompt_cache_ttl = "5m"          # "5m" | "1h", unset by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
+lean = true                      # adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer; ZIRV_CTX_HEADLESS_LEAN
+disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
+
+[headless.effort]
+trivial = "low"                  # low | medium | high | xhigh | max, unset by default; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
+bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
+substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also what an Architectural-complexity request reads; see below
+```
+
+`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
+`effort` table classifies the prompt text with the SAME deterministic
+classifier the intake hook uses (`proxy::decision::try_classify_request`,
+text-only by default -- see `jev.launch_effort` below for the opt-in
+exception) and sets env `CLAUDE_CODE_EFFORT_LEVEL` when the resolved
+complexity has a configured value; an operator's own `CLAUDE_CODE_EFFORT_LEVEL`
+or an argv that already carries `--effort` wins over it. `lean` and
+`disallowed_tools` only ever narrow a HEADLESS launch -- an interactive
+session, where a human is present, is untouched. With every key unset (the
+shipped default) a headless launch is byte-identical to one built before
+this table existed.
+
+The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
+
+The effort decision is made ONCE, from the FIRST headless launch of a conversation, and every later launch of that SAME session -- a `--resume`, an in-place compaction, any other relaunch that keeps the id -- reuses it regardless of its own prompt text, including a bare resume with no new prompt at all. Changing `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation invalidates Claude's whole prompt cache, not just that turn's own addition to it, so re-classifying every launch independently was actively counter-productive.
+
+**`jev.launch_effort`** (off by default) may refine that FIRST launch's pick:
+when the gate is on and Jev is available (same `[proxy.typesafe]` credential
+every other `[jev]` site shares), a metadata-only Noul question asks whether
+the request is unusually hard, deliberate work (-> `headless.effort.
+substantial`) or a small, low-deliberation follow-up (-> `headless.effort.
+trivial`), from local numeric facts only -- prompt word-count bucket,
+enumerated-item count, the deterministic classifier's own complexity index,
+and whether the prompt reads as a question -- never the prompt text itself.
+An indecisive answer, a failed call, an unavailable credential, or a decisive
+pick whose tier has no configured value all fall back to the plain
+deterministic classification above, exactly as with the gate off. Whichever
+value wins goes through the SAME sticky, per-session record as the
+deterministic path: a resumed session never re-asks and never changes effort
+mid-conversation, and this can never override an explicit `--effort` or the
+operator's own `CLAUDE_CODE_EFFORT_LEVEL` (both checks happen before the
+sticky decision is even reached).
+
 #### Tool-output compaction
 
 `zirv setup` installs the claude `PostToolUse` hook: a large `Bash` result is
@@ -4232,6 +4372,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
@@ -4251,7 +4392,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, `review`, `worker.claude`,
+`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
@@ -4387,6 +4528,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `supervise.in_tool_secs` | `ZIRV_CTX_SUPERVISE_IN_TOOL_SECS` |
 | `supervise.stall_grace_secs` | `ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS` |
 | `supervise.compact_stall_secs` | `ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS` |
+| `supervise.compact_timeout_ms` | `ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS` |
 | `supervise.chain_max_restarts` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS` |
 | `supervise.chain_max_gap_secs` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |
@@ -4488,10 +4630,19 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.approve_allow` | `ZIRV_CTX_JEV_APPROVE_ALLOW` |
 | `jev.classify` | `ZIRV_CTX_JEV_CLASSIFY` |
 | `jev.handoff_select` | `ZIRV_CTX_JEV_HANDOFF_SELECT` |
+| `jev.compaction_select` | `ZIRV_CTX_JEV_COMPACTION_SELECT` |
 | `jev.inject_screen` | `ZIRV_CTX_JEV_INJECT_SCREEN` |
 | `jev.inject` | `ZIRV_CTX_JEV_INJECT` |
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
+| `jev.missing_tests` | `ZIRV_CTX_JEV_MISSING_TESTS` |
+| `jev.launch_effort` | `ZIRV_CTX_JEV_LAUNCH_EFFORT` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
+| `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
+| `headless.effort.trivial` | `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL` |
+| `headless.effort.bounded` | `ZIRV_CTX_HEADLESS_EFFORT_BOUNDED` |
+| `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
+| `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
+| `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
 | `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |
@@ -5232,13 +5383,14 @@ Add to `~/.claude/settings.json`:
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook prompt" }] }],
     "PreCompact": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook pre-compact" }] }],
     "PreToolUse": [{
-      "matcher": "Agent|Task",
+      "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task",
       "hooks": [{ "type": "command", "command": "zirv ctx hook pretool" }]
     }],
     "SessionStart": [{
       "matcher": "resume|clear",
       "hooks": [{ "type": "command", "command": "zirv ctx hook session-start" }]
-    }]
+    }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook subagent-stop" }] }]
   }
 }
 ```
@@ -5246,10 +5398,123 @@ Add to `~/.claude/settings.json`:
 `SessionStart` (issue #244) re-injects the latest stored handoff on `resume`/`clear` — a bare
 `claude --resume` or `/clear` sees it too, not only `zirv ctx resume`'s own explicit flow.
 
+Issue #769: a single `PreToolUse` entry now covers every tool name zirv's own
+guards care about, dispatching internally by `tool_name` — the command-safety
+check for `Bash`/`PowerShell` (previously its own separate `zirv ctx safety
+check` registration, matched on `Bash|PowerShell` alone), placeholder
+rehydration for shell/write/lookup tools, the orchestrator-write guard for
+file-modification tools, and the expensive-seat/skill-pointer guard for
+`Agent|Task`. `zirv setup apply` migrates an operator's own
+`~/.claude/settings.json` away from the old, separately-registered safety
+hook automatically; `zirv ctx safety check` itself is unaffected as a
+standalone CLI command (`-- <command>`) and still self-suppresses if invoked
+as a leftover hook on a settings file that has not been migrated yet, so the
+two never evaluate the same tool call twice.
+
+`SubagentStop` (issue #774) gates a native `Task` subagent's own final report
+against a few cheap, deterministic checks read from the SUBAGENT's own
+transcript — never the lead's — before it reaches the lead: a declared
+`OUTPUT CONTRACT` block with no fenced JSON reply at all, a claimed test run
+with no matching verification command anywhere in the transcript, and a bare
+`BLOCKED` report with no reason after it. The first violation found blocks
+with `{"decision": "block", "reason": "..."}`, capped at one block per
+subagent, ever, and fails open on any doubt (an unreadable transcript,
+`stop_hook_active`, or an unresolvable state dir). `[subagent_stop_gate]
+enabled` (default `true`) gates it, the identical narrow-only fold
+`[missing_tests_gate] enabled` uses below — a repository checkout may only
+turn it off, never force it on for an operator who disabled it.
+
 The Stop hook forwards verdicts to a supervising `wrap` or `exec` when one owns
-the session, and otherwise prints a non-blocking advisory. It never blocks a
-stop, and it exits 0 even when it is invoked wrongly, because Claude Code reads
-a Stop hook's exit 2 as "block the stop".
+the session, and otherwise prints a non-blocking advisory. It exits 0 even when
+it is invoked wrongly, because Claude Code reads a Stop hook's exit 2 as
+"block the stop" -- a real block instead uses the JSON `{"decision": "block",
+"reason": "..."}` envelope on stdout with exit 0.
+
+The one case where the Stop hook actually blocks is the missing-tests gate
+(`[missing_tests_gate]`, default `enabled = true`): for a HEADLESS Worker/
+Single session (`ZIRV_CTX_HEADLESS=1` -- an interactive session is never
+affected) that edited or created a non-test source file this turn but touched
+no test file for the change (a `tests`/`test` path component, a
+`test_*`/`*_test.*`/`*.test.*` filename, or -- Rust only -- a change on or
+after a file's own `#[cfg(test)]` line), it blocks once with a reason asking
+for a focused test of the behaviour change, including the invalid-input path,
+then a test-suite run. It never blocks a second time in the same session (a
+persisted per-session marker, independent of `stop_hook_active`), never fires
+when `stop_hook_active` is already true, and fails open -- like every other
+Stop-hook check -- on any doubt at all (an unreadable repo, no git, a config
+load failure). A repository checkout may only turn it off
+(`[missing_tests_gate] enabled = false` in `<repo>/.zirv/ctx.toml`), never
+force it on for an operator who disabled it.
+
+**`jev.missing_tests`** (off by default) softens that block with one Jev call
+instead of removing it: right before the deterministic gate above would block,
+it asks Jev a single metadata-only question built from local numeric facts
+alone (never a path, filename, or file content) — how many non-test source
+files changed, a changed-lines size bucket, whether the repo has any test
+files at all, how many existing test files already mention a changed module's
+own name, and the change's doc-only share — "is a new test owed for this
+change?". Only a decisive, strongly "not owed" answer (at or below Jev's own
+skip threshold) skips that one block, and skipping never persists it as
+blocked, so a later, still-test-less turn in the same session can still be
+asked or blocked. Anything else — the gate off, no credential, an indecisive
+or error answer, or a decisive answer that isn't strongly "not owed" — blocks
+exactly as the deterministic gate already does.
+
+**Scope guard** (`[scope_guard]`, default `enabled = true`) is a scope-creep
+guard, not a correctness check: it never decides whether an edit is right,
+only makes the request's own preservation language visible at the moment of
+editing and catches an unrequested-fix claim once at the end. `UserPromptSubmit`
+splits the prompt into sentences and keeps up to three (capped at 400 characters
+joined) that use preservation/limitation language -- "same as always/before",
+"works the same", "as before", "exactly as", "unchanged", "keep ", "preserve",
+"don't/do not/never change/touch/modify/alter", "only ", "backward(s) compat",
+"existing behavio(u)r", "leave ... alone" -- plus whether the request itself
+already asks for a fix (fix/bug/broken/error/wrong/crash/regression/off-by-one
+wording), into a small per-session record; a new prompt replaces the record.
+`PreToolUse` shows a non-blocking checkpoint (`additionalContext`, never a
+permission change) on the first `Edit`/`MultiEdit`/`NotebookEdit` call, or a
+`Write` to a file that already exists, after each new prompt: it quotes the
+extracted constraints (when there are any) and asks the agent to check the
+edit is actually needed for what was asked, rather than an unrequested fix or
+improvement -- interactively, "ask the user first"; headlessly
+(`permission_mode == "dontAsk"`), "leave it and list it under 'Found, not
+changed' in your final report" instead, since there is no one to ask. It rides
+in the same `additionalContext` envelope as the orchestrator-write advisory and
+the reuse probe rather than replacing either. The same one-time checkpoint
+also fires from `PostToolUse` after the first `Bash`/`PowerShell` command that
+changes an existing tracked file, worded for a change that already happened,
+for a headless agent that edits through the shell and never touches
+`Edit`/`Write` at all. The same checkpoint also folds in a "tests owed" line
+("Write a focused test for each behaviour change in this same pass -- the run
+cannot finish without one.") whenever the missing-tests gate below is enabled,
+the session is headless, and the file being changed is a non-test, non-doc
+source file -- fired at the FIRST edit rather than waiting for the
+missing-tests Stop gate to say it after the whole turn is already done. This
+line can fire the checkpoint on its own even with `[scope_guard] enabled =
+false`. `UserPromptSubmit` also extracts up to eight stated, checkable
+details -- a backtick- or double-quoted literal, or an ordering/format/
+exactness word ("sorted", "order", "ascending", "descending", "exactly",
+"exact", "format", "exit status"/"exit code", "stderr", "stdout", "print(s)",
+"message", "case-insensitive", "comma-separated", "no spaces", "trailing",
+"leading"), never duplicating a sentence already captured as a constraint --
+and the checkpoint appends them as a numbered "Stated details to check before
+you finish: (1) ... (2) ..." list, governed by `[scope_guard] enabled` like
+the constraints themselves. `Stop` is a backstop, run only
+after every other Stop gate/backstop above already had its chance to block (at
+most one block per Stop): when the request did NOT itself ask for a fix and the
+closing report's own wording claims one anyway (a fix verb alongside a bug
+word in the same or the next sentence, "also fixed/changed/updated/refactored",
+or "while (I was) at it/there/here"), it blocks once, quoting the offending
+sentence and the request's own constraints, asking the agent to revert the
+change and report it as "found, not changed" unless it was strictly required
+-- interactively, or ask the user first. It never fires twice for the same
+prompt, never fires when `stop_hook_active` is already true, and fails open on
+any doubt at all (no session identity, no recorded prompt, an unreadable
+transcript). A repository checkout may only turn it off
+(`[scope_guard] enabled = false` in `<repo>/.zirv/ctx.toml`, or the operator's
+own `ZIRV_CTX_SCOPE_GUARD_ENABLED`), never force it on for an operator who
+disabled it; disabled means no record is ever written, no checkpoint is ever
+shown, and Stop never blocks for it.
 
 The Stop hook is also how a supervisor learns which file the agent is writing:
 the agent mints its own session id, so the transcript path travels on the turn
@@ -5974,6 +6239,19 @@ stop after 2 fix rounds. It is `REPO_FORBIDDEN`: set it in
 verbosity = "verbose"
 ```
 
+Issue #772 also tiers the shipped engineering-standard floor itself
+(`DEFAULT_PROMPT`/`DEFAULT_PROMPT_WORKER`, not a `[prompt]` key -- there is
+nothing to configure): an Orchestrator/SubOrchestrator session gets the full
+standard, while a delegated Worker/Single session -- already handed a
+bounded, pre-sized task -- gets a compact variant that keeps every rule that
+changes behaviour (verify with evidence, one focused test per behaviour
+change, no slop, deliver exactly what was asked, honest report) and drops the
+full sizing taxonomy's own long-form explanation and the UI/design-thinking
+bullet, the same role split the standing skill index already draws (`prompt.
+skill_index`) for the identical reason: a delegated worker re-reads this
+layer on every headless turn, so its cost is not amortised the way an
+interactive session's is.
+
 Pass `--simple` to any of the four verbs to start the agent with no zirv text at
 all, shipped default included. Supervision, pacing and hooks are unaffected.
 Whether a prompt was injected, and from which layers, is recorded in the decision
@@ -5996,7 +6274,8 @@ text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough
 or the explicit opt-out below do.
 
 - **Claude interactive:** `--permission-mode default`, native workspace/tool
-  scoping, and a `Bash|PowerShell` `PreToolUse` safety hook attested on every
+  scoping, and a `PreToolUse` safety hook (covering `Bash`/`PowerShell` among
+  the other tool names its own consolidated matcher names) attested on every
   Zirv launch through fingerprinted settings and immutable policy snapshots
   under `~/.zirv/runtime/` as the sole per-command gate. The hook evaluates
   both the launch snapshot and the policy resolved now, keeps the stricter
@@ -6011,7 +6290,8 @@ or the explicit opt-out below do.
   `sudo apt install bubblewrap socat` on Debian/Ubuntu to enable it. When they
   are missing, Zirv still launches Claude Code, which prints "Sandbox disabled"
   and runs Bash without OS sandboxing; Zirv's permission mode, allowed/disallowed
-  tools and `zirv ctx safety check` PreToolUse hook remain in force.
+  tools and the safety check running inside the `PreToolUse` hook (`zirv ctx
+  hook pretool`) remain in force.
   macOS uses the built-in `sandbox-exec`. Native Windows has no OS sandbox
   and receives the hook and credential rules. The interactive `Edit(./**)`/
   `Read(./**)` scope also covers Claude Code's own agent-worktree convention
@@ -6180,11 +6460,12 @@ zirv ctx safety list                     # the effective merged policy, with eac
 zirv ctx safety explain --mode headless -- git push --force  # rule plus launch consequence
 ```
 
-`zirv ctx safety check` (with no trailing command) is also what `zirv setup
-apply` wires into claude's `PreToolUse` hook for `Bash` and `PowerShell` calls,
-so the same
-evaluator zirv's own CLI uses is what claude consults before running a
-command — see [Context Management](#context-management-zirv-ctx).
+`zirv ctx safety check` (with no trailing command) is the hook-mode entrypoint
+`hook::run_pretool` calls in-process for `Bash`/`PowerShell` calls (issue
+#769: `zirv setup apply` no longer wires it in as its own separate
+`PreToolUse` registration — see [Hook registration](#hook-registration-claude-code)),
+so the same evaluator zirv's own CLI uses is what claude consults before
+running a command — see [Context Management](#context-management-zirv-ctx).
 
 `[jev] approve`/`approve_allow` (issue #781, both operator-only and off by
 default) add an optional Jev risk check on top of this deterministic policy,
@@ -6197,10 +6478,20 @@ credential path), pipe/redirect/command-substitution counts, a
 secret-placeholder count from the same detector `[obfuscate]` uses (issue
 #466), and a shell/eval/inline-interpreter wrapper flag — never the command
 text, paths, arguments, env values, or file contents; the request must pass
-`jev::safe_metadata_request` like every other `[jev]`-gated site.
-`approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
+`jev::safe_metadata_request` like every other `[jev]`-gated site. Neither key
+makes a call under `dontAsk` (every headless launch): the hook emits nothing
+there for `allow` or a non-operator `ask`, so the answer could not change the
+decision. `approve` may only ESCALATE a deterministic `allow` to `ask`, on a decisive
 answer; widening what may be escalated is always safe, so this direction has
-no further restriction. `approve_allow` (effective only when `approve` is
+no further restriction — except one operator-decided carve-out: `approve`
+makes no Jev call at all for a command that is read-only and confined to the
+worktree/scratchpad (a fixed allowlist of inspection programs/subcommands —
+`grep`/`rg`/`cat`/`head`/`tail`/`wc`/`ls`/`find` without `-exec`/`-delete`/
+`-ok`, read-only `git` subcommands including `branch --list`, `pwd`, `echo`,
+and pipes ONLY between such programs — with no writes/deletes/network/
+privilege flags, no eval/shell wrapper, no code-bearing argument, no command
+substitution, and no redirection to a file; anything it cannot positively
+confirm still reaches Jev). `approve_allow` (effective only when `approve` is
 also on) may only LOWER an `ask` to `allow`, on a decisive `safe` answer
 clearing a HIGH margin and confidence floor (2026-09-18 probe: 8/10 correct,
 both misses cautious, n=10 — too small to gate on at a normal bar), and only

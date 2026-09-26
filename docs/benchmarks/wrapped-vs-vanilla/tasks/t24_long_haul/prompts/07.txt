@@ -1,0 +1,28 @@
+Time to reconcile against my actual bank statement. Add
+`ledgerlite/reconcile.py` that tracks which transaction ids I've confirmed
+against the statement ("cleared"), persisted in the store like everything
+else this session (again: don't clobber other data already there).
+
+CLI:
+
+- `python -m ledgerlite reconcile mark ID [ID ...] --store PATH` marks
+  each given transaction id as cleared (marking an already-cleared id
+  again is harmless) and prints `Marked N transactions as cleared` (`N` =
+  how many ids you passed on the command line).
+- `python -m ledgerlite reconcile status --statement-balance N --store
+  PATH` sums the amounts of every cleared transaction and prints exactly:
+
+```
+Cleared total: X.XX
+Statement balance: N.NN
+Difference: D.DD
+Status: reconciled
+```
+
+  where `X.XX` is the cleared total, `D.DD` is `N - X` (statement balance
+  minus cleared total, can be negative), and the last line is `Status:
+  reconciled` when the difference is exactly zero, `Status: out of
+  balance` otherwise. All three money figures to 2 decimal places.
+
+One currency for now, same as everything else so far -- I'll ask about
+multi-currency reconciliation later.

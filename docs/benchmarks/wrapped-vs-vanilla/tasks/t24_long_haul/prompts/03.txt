@@ -1,0 +1,28 @@
+Now let's automate the stuff that happens every month without me importing
+a statement for it -- rent, subscriptions, my paycheck.
+
+Add `ledgerlite/recurring.py` with a `RecurringRule` (payee, amount, day of
+month, optional category, currency (default `"USD"`), memo (default
+`""`)). To sidestep short-month weirdness, `day` must be between 1 and 28
+inclusive -- reject anything else.
+
+CLI, under `python -m ledgerlite recurring ...`:
+
+- `recurring add --payee P --amount N --day D [--category C] [--currency
+  CUR] [--memo M] --store PATH` saves the rule and prints `Added recurring
+  P: N on day D`. If `--day` is out of range, print an error to stderr and
+  exit with status 2, leaving the store unchanged.
+- `recurring list --store PATH` prints one line per saved rule, in the
+  order added: `PAYEE: AMOUNT CURRENCY day D`. `No recurring rules.` when
+  there are none.
+- `recurring apply --from YYYY-MM --to YYYY-MM --store PATH` generates one
+  transaction per rule for every calendar month in that inclusive range
+  (rule's day, amount, payee, category, currency, memo carried straight
+  through, no re-categorization), in month order and rule order within
+  each month, and ADDS them to the ledger the same way you add to an
+  existing ledger elsewhere in this app -- it must never wipe out
+  transactions that are already there. Prints `Applied N recurring
+  transactions`.
+
+Recurring rules need to be persisted in the same `--store` file as
+everything else, without disturbing whatever else is already saved there.

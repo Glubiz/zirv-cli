@@ -1,0 +1,21 @@
+I really want an undo button for the operations that can dump a pile of
+wrong transactions into my ledger in one shot: `import`, `import-ofx`, and
+`recurring apply`. (Not `budget`/`reconcile` -- those are easy to fix by
+hand, and not worth the complexity right now.)
+
+Add `python -m ledgerlite undo --store PATH`: undoes the most recent of
+those three operations, restoring the ledger's transactions to exactly
+what they were right before that operation ran, and prints `Undid: <what
+you're undoing>` -- for `import`, that's `import <csv_path>`; for
+`import-ofx`, `import-ofx <ofx_path>`; for `recurring apply`, `recurring
+apply <from>..<to>` (e.g. `recurring apply 2024-01..2024-03`). If there's
+nothing to undo, print `Nothing to undo.` and exit 0 (not an error).
+
+Also add `python -m ledgerlite undo --list --store PATH`, printing one
+line per undo-able operation still on the stack, MOST RECENT FIRST, using
+the exact same label text `undo` itself would print after "Undid: ". Same
+`Nothing to undo.` when the stack is empty.
+
+Undo only goes one operation at a time and only one level of history per
+call (calling `undo` twice undoes the two most recent operations, in
+order) -- there's no redo.

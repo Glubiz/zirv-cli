@@ -61,9 +61,21 @@ pub struct ScoreConfig {
     pub weight_marker: f64,
     /// Score weight for a stuck same-error loop -- the longest run of
     /// consecutive identical (normalized) tool-result error texts within
-    /// the window (`rot::Signals::same_error_repeats`). Default `0.0`: this
-    /// signal ships inert so it never moves an existing verdict fixture
-    /// until an operator opts in deliberately by raising it.
+    /// the window (`rot::Signals::same_error_repeats`).
+    ///
+    /// Issue #763: default `120.0`, enabling the signal that used to ship
+    /// inert (`0.0`). Chosen, not measured, so that a FRESHLY-tripped streak
+    /// -- exactly `same_error_threshold` (default `3`) consecutive identical
+    /// errors, `rot::repetition_component`'s own ramp at its lowest nonzero
+    /// point, `1 / same_error_threshold` -- raises the score to exactly
+    /// `advise_at`'s default (`120.0 * (1.0 / 3.0) == 40.0`) in an otherwise
+    /// healthy session: the FIRST action this signal can ever cause is
+    /// `advise`, never `compact`/`restart`, matching `DEFAULT_PROMPT`'s own
+    /// "stuck twice on the same error: change approach" bullet. A session
+    /// that keeps repeating past that point escalates the same way every
+    /// other signal does, through the identical weighted-sum/threshold
+    /// machinery -- see `rot::score_from`/`verdict_for`. Set `0.0` to restore
+    /// the old, fully inert behaviour.
     pub same_error_weight: f64,
     pub repetition_threshold: usize,
     /// Repeat count of the SAME normalized error text before the
@@ -90,7 +102,7 @@ impl Default for ScoreConfig {
             weight_tool_failure: 40.0,
             weight_repetition: 30.0,
             weight_marker: 30.0,
-            same_error_weight: 0.0,
+            same_error_weight: 120.0,
             repetition_threshold: 3,
             same_error_threshold: 3,
             advise_at: 40,
@@ -268,6 +280,29 @@ pub struct SuperviseConfig {
     /// repo raising its own compaction fuse could silently defeat the
     /// detector for a session running against it.
     pub compact_stall_secs: u64,
+    /// Round 4 bug 2: the hard upper bound `exec`'s and `loop`'s headless
+    /// in-place compaction (`exec::compact_in_place`) waits for the compact
+    /// child to exit and, after that, for the transcript's own
+    /// `compact_boundary` verification marker. Previously this reused
+    /// `wrap.inject_timeout_ms` (20s) -- a value sized for `wrap` injecting a
+    /// nudge into an already-running interactive PTY session, not for a
+    /// whole model turn's worth of headless compute. A real ~150k-token
+    /// compaction takes minutes, so the 20s reuse killed compactions that
+    /// were actively in progress (see the production incident this field
+    /// exists to fix). 600_000ms (10 minutes) mirrors `compact_stall_secs`'s
+    /// own evidence: "5-6.5 minutes" is the slowest compaction actually
+    /// observed elsewhere in this codebase, so 10 minutes is a safe margin
+    /// above it. `compact_in_place` uses no transcript-growth stall clock at
+    /// all: a single headless compaction turn writes nothing back until it
+    /// completes, so growth is not a valid liveness signal for it. This bound
+    /// is the only thing that can kill an in-progress compaction -- see
+    /// `compact_in_place`'s own doc comment.
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
+    /// repo shortening this could force premature restarts of a session
+    /// running against it, and lengthening it could hide a truly hung
+    /// compaction past its usefulness.
+    pub compact_timeout_ms: u64,
     /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
     /// this many unplanned, same-class respawns, each no more than
     /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
@@ -340,6 +375,7 @@ impl Default for SuperviseConfig {
             in_tool_secs: 1200,
             stall_grace_secs: 120,
             compact_stall_secs: 600,
+            compact_timeout_ms: 600_000,
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
@@ -605,6 +641,80 @@ impl Default for VerifyOnStopConfig {
             enabled: true,
             max_nudges: 2,
         }
+    }
+}
+
+/// Q1 (blind-review completion quality): whether the Stop hook may block a
+/// HEADLESS Worker/Single session (`ZIRV_CTX_HEADLESS=1`) once when it
+/// edited/created non-test source files this turn but touched no test file
+/// for the change -- see `hook::missing_tests_gate_reason`'s own doc comment
+/// for the detector and `hook::run_stop`'s own doc comment for every other
+/// gate (interactive, `stop_hook_active`, already-blocked-this-session).
+///
+/// `enabled` goes through the same T9 repo-narrowing fold `verify_on_stop.
+/// enabled` already uses (`narrow_missing_tests_gate_enabled` below), not
+/// `REPO_FORBIDDEN`: an operator who wants the check is never blocked by the
+/// repo, but a repo checkout may only ever turn it off, never force it on
+/// for an operator who disabled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MissingTestsGateConfig {
+    pub enabled: bool,
+}
+
+impl Default for MissingTestsGateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Issue #774: whether claude's `SubagentStop` hook may block a native `Task`
+/// subagent's own final turn once, on a cheap deterministic result-contract
+/// violation -- see `hook::run_subagent_stop`'s own doc comment for the three
+/// checks and the fail-open/cap-at-one-block contract.
+///
+/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
+/// tests_gate.enabled` already uses (`narrow_subagent_stop_gate_enabled`
+/// below), not `REPO_FORBIDDEN`: an operator who wants the gate is never
+/// blocked by the repo, but a repo checkout may only ever turn it off, never
+/// force it on for an operator who disabled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubagentStopGateConfig {
+    pub enabled: bool,
+}
+
+impl Default for SubagentStopGateConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// The scope-creep guard: a `UserPromptSubmit`-recorded, per-session note of
+/// any preservation/limitation language the request itself used (`hook::
+/// record_scope_guard_request`), a non-blocking `PreToolUse` checkpoint on
+/// the first `Edit`/`MultiEdit`/`NotebookEdit`/existing-file `Write` after
+/// each new prompt (`hook::scope_checkpoint_note`), and a once-per-prompt
+/// `Stop` backstop that blocks when the closing report claims an
+/// unrequested fix the request never asked for (`hook::
+/// scope_guard_stop_reason`).
+///
+/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
+/// tests_gate.enabled`/`subagent_stop_gate.enabled` already use
+/// (`narrow_scope_guard_enabled` below), not `REPO_FORBIDDEN`: an operator
+/// who wants the guard is never blocked by the repo, but a repo checkout may
+/// only ever turn it off, never force it on for an operator who disabled it.
+/// Disabled means no record is ever written, no checkpoint is ever shown,
+/// and no Stop is ever blocked.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScopeGuardConfig {
+    pub enabled: bool,
+}
+
+impl Default for ScopeGuardConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -1926,6 +2036,9 @@ pub struct JevConfig {
     pub classify: bool,
     /// Issue #783: Jev keep/drop scoring of handoff candidate items.
     pub handoff_select: bool,
+    /// Issue #798: Jev-ranked keep list appended to a compaction's own focus
+    /// text.
+    pub compaction_select: bool,
     /// Issue #784: Jev prompt-injection screening of untrusted inputs.
     pub inject_screen: bool,
     /// Issue #785: Jev inject-now/defer gate for automatic compact/restart/
@@ -1933,6 +2046,29 @@ pub struct JevConfig {
     pub inject: bool,
     /// Issue #786: Jev Stop-hook check for unverified completion claims.
     pub stop_verify: bool,
+    /// Off by default: when the deterministic missing-tests Stop gate
+    /// (`[missing_tests_gate]`) is about to block, asks Jev one metadata-only
+    /// Noul question from local numeric facts (non-test source files
+    /// changed, changed-lines bucket, whether the repo has any test files,
+    /// how many mention a changed module, doc-only share) -- "is a new test
+    /// owed for this change?". A decisive "not owed" answer skips that one
+    /// block without persisting it as blocked; anything else (indecisive, an
+    /// error, no credential, or this key off) blocks exactly as the
+    /// deterministic gate already does.
+    pub missing_tests: bool,
+    /// Jev refinement of `[headless.effort]`'s own deterministic pick, at a
+    /// headless launch's first turn only: a metadata-only low/high call
+    /// (`exec.rs`'s `sticky_headless_effort`) that may steer the launch
+    /// toward `headless.effort.trivial` (low) or `headless.effort.substantial`
+    /// (high) instead of the plain classifier's own class. Effective only
+    /// when `[headless.effort]` itself has at least one key set -- with none
+    /// set, `apply_headless_cost_levers` never reaches the sticky decision at
+    /// all, Jev included. An indecisive, failed, or unavailable answer falls
+    /// back to the deterministic class exactly as with the gate off, and the
+    /// chosen value is recorded through the same sticky, per-session record
+    /// as the deterministic path, so a resumed session never re-asks or
+    /// changes effort mid-conversation.
+    pub launch_effort: bool,
     /// How long a cached answer (`<state_dir>/jev-cache/<hash>.json`, keyed
     /// by the exact request body -- see `jev::ask`'s own doc comment) stays
     /// usable, in seconds. `0` disables the cache entirely: every call
@@ -1959,12 +2095,69 @@ impl Default for JevConfig {
             approve_allow: false,
             classify: false,
             handoff_select: false,
+            compaction_select: false,
             inject_screen: false,
             inject: false,
             stop_verify: false,
+            missing_tests: false,
+            launch_effort: false,
             cache_ttl_secs: 86_400,
         }
     }
+}
+
+/// Issue #788: operator-only, off-by-default cost levers for the Claude Code
+/// sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
+/// `--prompt` path and its `-- claude -p ...` passthrough, plus `zirv agent
+/// claude` headless workers (they share `ctx exec`'s own launch builder).
+/// Interactive `wrap`/`chat`/dash sessions never read this table. Every key
+/// is `REPO_FORBIDDEN`, same trust asymmetry as `[jev]` above: a repo
+/// checkout must not be able to turn on prompt-cache billing behavior,
+/// per-request effort, or a narrower tool/memory surface for itself. With
+/// every key unset (the shipped default) a headless launch is byte-identical
+/// to one built before this table existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadlessEffortConfig {
+    pub trivial: Option<String>,
+    pub bounded: Option<String>,
+    /// Also what a request classifying `Complexity::Architectural` reads:
+    /// the deterministic classifier this table's own caller uses
+    /// (`proxy::decision::try_classify_request`) is TEXT-ONLY (no paths/
+    /// changed lines), and `infer_complexity`/the request-size floor it
+    /// folds in can never return `Architectural` from text alone -- so
+    /// there is no separate `architectural` key to configure.
+    pub substantial: Option<String>,
+}
+
+/// Issue #788: `[headless]` itself -- see [`HeadlessEffortConfig`]'s own doc
+/// comment for the trust/scope statement shared by every key here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadlessConfig {
+    /// `"5m"` or `"1h"`, unset by default. When set, a headless claude
+    /// launch gets env `CLAUDE_CODE_PROMPT_CACHE_TTL=<value>` -- skipped
+    /// when the operator's own process environment already sets
+    /// `CLAUDE_CODE_PROMPT_CACHE_TTL`, `FORCE_PROMPT_CACHING_5M` or
+    /// `ENABLE_PROMPT_CACHING_1H` (the operator's own env wins).
+    pub prompt_cache_ttl: Option<String>,
+    /// Per intake-complexity `CLAUDE_CODE_EFFORT_LEVEL`, from the same
+    /// deterministic classifier the intake hook uses
+    /// (`proxy::decision::try_classify_request`), text-only by default --
+    /// `[jev] launch_effort` may steer a first launch's pick toward `trivial`
+    /// or `substantial` instead, from local numeric facts only (see that
+    /// field's own doc comment); with the gate off this stays a pure
+    /// classifier lookup, never a Jev call. Every class unset by default;
+    /// skipped when the operator's own process environment already sets
+    /// `CLAUDE_CODE_EFFORT_LEVEL` or the claude argv already carries
+    /// `--effort`.
+    pub effort: HeadlessEffortConfig,
+    /// When true, a headless launch's settings layer adds
+    /// `"autoMemoryEnabled": false` and `"disableBundledSkills": true`.
+    pub lean: bool,
+    /// Extra tool names appended to a headless launch's `--disallowedTools`
+    /// deny list. Empty by default.
+    pub disallowed_tools: Vec<String>,
 }
 
 /// Per-agent override for which model runs code review, keyed the same way
@@ -3011,6 +3204,9 @@ pub struct CtxConfig {
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub missing_tests_gate: MissingTestsGateConfig,
+    pub subagent_stop_gate: SubagentStopGateConfig,
+    pub scope_guard: ScopeGuardConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -3049,6 +3245,10 @@ pub struct CtxConfig {
     /// proxy may consult the shared Jev client. Every key is
     /// `REPO_FORBIDDEN`; see [`JevConfig`].
     pub jev: JevConfig,
+    /// Issue #788: operator-only, off-by-default cost levers for a headless
+    /// (`-p`) Claude Code launch. Every key is `REPO_FORBIDDEN`; see
+    /// [`HeadlessConfig`].
+    pub headless: HeadlessConfig,
     /// Issue #352's experimental persistent-runtime gate. Every key is
     /// `REPO_FORBIDDEN`; see [`SessionConfig`].
     pub session: SessionConfig,
@@ -3254,6 +3454,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
         &["supervise", "compact_stall_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS",
+        &["supervise", "compact_timeout_ms"],
         EnvKind::Int,
     ),
     (
@@ -4047,6 +4252,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_COMPACTION_SELECT",
+        &["jev", "compaction_select"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_INJECT_SCREEN",
         &["jev", "inject_screen"],
         EnvKind::Bool,
@@ -4058,9 +4268,56 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_JEV_MISSING_TESTS",
+        &["jev", "missing_tests"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_JEV_LAUNCH_EFFORT",
+        &["jev", "launch_effort"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_JEV_CACHE_TTL_SECS",
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
+    ),
+    // Issue #788: the operator's own override for every `[headless]` cost
+    // lever -- see that same const's own entries in `REPO_FORBIDDEN`, below.
+    // `headless.disallowed_tools` has no `ENV_MAP` entry: like `sandbox.
+    // extra_allow`/`dash.workdir_roots`, `EnvKind` has no list-shaped
+    // variant, so `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` is a plain
+    // comma-separated override applied directly to `cfg.headless.
+    // disallowed_tools` after `ENV_MAP` runs.
+    (
+        "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
+        &["headless", "prompt_cache_ttl"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL",
+        &["headless", "effort", "trivial"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED",
+        &["headless", "effort", "bounded"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
+        &["headless", "effort", "substantial"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_HEADLESS_LEAN",
+        &["headless", "lean"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SCOPE_GUARD_ENABLED",
+        &["scope_guard", "enabled"],
+        EnvKind::Bool,
     ),
 ];
 
@@ -4391,6 +4648,26 @@ fn narrow_max_nudges(home: u32, repo: Option<u32>) -> u32 {
 /// the same polarity as `narrow_verify_on_stop_enabled`, since `false` (the
 /// checker never runs) is this key's strict direction.
 fn narrow_diagnostics_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Q1: the repo-narrowing fold for `missing_tests_gate.enabled` -- the same
+/// polarity as `narrow_verify_on_stop_enabled`/`narrow_diagnostics_enabled`,
+/// since `false` (the check never blocks) is this key's strict direction.
+fn narrow_missing_tests_gate_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// Issue #774: the repo-narrowing fold for `subagent_stop_gate.enabled` --
+/// identical shape/polarity to `narrow_missing_tests_gate_enabled` above.
+fn narrow_subagent_stop_gate_enabled(home: bool, repo: Option<bool>) -> bool {
+    home.min(repo.unwrap_or(true))
+}
+
+/// The repo-narrowing fold for `scope_guard.enabled` -- identical
+/// shape/polarity to `narrow_missing_tests_gate_enabled`/`narrow_subagent_
+/// stop_gate_enabled` above.
+fn narrow_scope_guard_enabled(home: bool, repo: Option<bool>) -> bool {
     home.min(repo.unwrap_or(true))
 }
 
@@ -4927,6 +5204,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["supervise", "compact_stall_secs"],
         "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
     ),
+    // Round 4 bug 2: same trust asymmetry -- a repo checkout shortening the
+    // headless in-place compaction's hard timeout could force premature
+    // restarts of a session running against it (see `SuperviseConfig::
+    // compact_timeout_ms`'s own doc comment).
+    (
+        &["supervise", "compact_timeout_ms"],
+        "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS",
+    ),
     // Same reasoning, for the 3b restart-chain breaker: a repo checkout
     // raising its own restart budget or gap window could silently defeat
     // the breaker.
@@ -5398,10 +5683,40 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "approve_allow"], "ZIRV_CTX_JEV_APPROVE_ALLOW"),
     (&["jev", "classify"], "ZIRV_CTX_JEV_CLASSIFY"),
     (&["jev", "handoff_select"], "ZIRV_CTX_JEV_HANDOFF_SELECT"),
+    (
+        &["jev", "compaction_select"],
+        "ZIRV_CTX_JEV_COMPACTION_SELECT",
+    ),
     (&["jev", "inject_screen"], "ZIRV_CTX_JEV_INJECT_SCREEN"),
     (&["jev", "inject"], "ZIRV_CTX_JEV_INJECT"),
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
+    (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
+    (&["jev", "launch_effort"], "ZIRV_CTX_JEV_LAUNCH_EFFORT"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
+    // Issue #788: `[headless]` cost levers for a headless Claude Code
+    // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
+    // reasoning as `[jev]` right above.
+    (
+        &["headless", "prompt_cache_ttl"],
+        "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
+    ),
+    (
+        &["headless", "effort", "trivial"],
+        "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL",
+    ),
+    (
+        &["headless", "effort", "bounded"],
+        "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED",
+    ),
+    (
+        &["headless", "effort", "substantial"],
+        "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
+    ),
+    (&["headless", "lean"], "ZIRV_CTX_HEADLESS_LEAN"),
+    (
+        &["headless", "disallowed_tools"],
+        "ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS",
+    ),
 ];
 
 /// Operator-only keys nested inside array-of-table configuration. `value_at`
@@ -5829,6 +6144,18 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
+        // Q1: `missing_tests_gate.enabled` gets the identical lift-before-merge
+        // treatment -- see `narrow_missing_tests_gate_enabled` below.
+        let home_missing_tests_gate_enabled =
+            bool_at(take_nested(&mut merged, "missing_tests_gate", "enabled"));
+        // Issue #774: `subagent_stop_gate.enabled` gets the identical
+        // lift-before-merge treatment -- see `narrow_subagent_stop_gate_
+        // enabled` below.
+        let home_subagent_stop_gate_enabled =
+            bool_at(take_nested(&mut merged, "subagent_stop_gate", "enabled"));
+        // `scope_guard.enabled` gets the identical lift-before-merge
+        // treatment -- see `narrow_scope_guard_enabled` below.
+        let home_scope_guard_enabled = bool_at(take_nested(&mut merged, "scope_guard", "enabled"));
         // Issue #312: both `compact_advisory` keys are narrow-only in the
         // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
         let home_compact_advisory_min_reclaim = integer_at(take_nested(
@@ -6030,6 +6357,18 @@ impl CtxConfig {
         ));
         let repo_diagnostics_timeout =
             integer_at(take_nested(&mut repo_layer, "diagnostics", "timeout_secs"));
+        let repo_missing_tests_gate_enabled = bool_at(take_nested(
+            &mut repo_layer,
+            "missing_tests_gate",
+            "enabled",
+        ));
+        let repo_subagent_stop_gate_enabled = bool_at(take_nested(
+            &mut repo_layer,
+            "subagent_stop_gate",
+            "enabled",
+        ));
+        let repo_scope_guard_enabled =
+            bool_at(take_nested(&mut repo_layer, "scope_guard", "enabled"));
         let repo_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut repo_layer,
             "compact_advisory",
@@ -6367,6 +6706,36 @@ impl CtxConfig {
                 ))
                 .unwrap_or(i64::MAX),
             ),
+        );
+
+        let default_missing_tests_gate = MissingTestsGateConfig::default();
+        insert_path(
+            &mut merged,
+            &["missing_tests_gate", "enabled"],
+            toml::Value::Boolean(narrow_missing_tests_gate_enabled(
+                home_missing_tests_gate_enabled.unwrap_or(default_missing_tests_gate.enabled),
+                repo_missing_tests_gate_enabled,
+            )),
+        );
+
+        let default_subagent_stop_gate = SubagentStopGateConfig::default();
+        insert_path(
+            &mut merged,
+            &["subagent_stop_gate", "enabled"],
+            toml::Value::Boolean(narrow_subagent_stop_gate_enabled(
+                home_subagent_stop_gate_enabled.unwrap_or(default_subagent_stop_gate.enabled),
+                repo_subagent_stop_gate_enabled,
+            )),
+        );
+
+        let default_scope_guard = ScopeGuardConfig::default();
+        insert_path(
+            &mut merged,
+            &["scope_guard", "enabled"],
+            toml::Value::Boolean(narrow_scope_guard_enabled(
+                home_scope_guard_enabled.unwrap_or(default_scope_guard.enabled),
+                repo_scope_guard_enabled,
+            )),
         );
 
         let default_compact_advisory = CompactAdvisoryConfig::default();
@@ -6894,6 +7263,15 @@ impl CtxConfig {
             cfg.dash.workdir_roots = split_csv_list(&raw);
         }
 
+        // Same operator-only override shape as `dash.workdir_roots` right
+        // above: `headless.disallowed_tools` is `REPO_FORBIDDEN` outright, so
+        // there is no repo contribution to union in -- only the operator's
+        // own home layer, or `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` replacing
+        // it outright when set.
+        if let Some(raw) = env("ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS") {
+            cfg.headless.disallowed_tools = split_csv_list(&raw);
+        }
+
         // Same operator-only override shape as `extra_allow` right above:
         // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
         // whatever `workflow.check_env_passthrough` the merged TOML layers
@@ -7013,6 +7391,38 @@ impl CtxConfig {
                 )
                 .into(),
             ));
+        }
+
+        // Issue #788: `headless.prompt_cache_ttl` reaches a headless launch's
+        // `CLAUDE_CODE_PROMPT_CACHE_TTL` env verbatim -- the same "loud
+        // rather than silent" constraint as `chat.claude_permission_mode`
+        // right above, against the two values Claude Code's own docs name.
+        if let Some(ttl) = cfg.headless.prompt_cache_ttl.as_deref()
+            && !matches!(ttl, "5m" | "1h")
+        {
+            return Err(add_config_error_prefix(
+                format!("headless.prompt_cache_ttl must be \"5m\" or \"1h\", got \"{ttl}\"").into(),
+            ));
+        }
+        for (key, effort) in [
+            ("headless.effort.trivial", &cfg.headless.effort.trivial),
+            ("headless.effort.bounded", &cfg.headless.effort.bounded),
+            (
+                "headless.effort.substantial",
+                &cfg.headless.effort.substantial,
+            ),
+        ] {
+            if let Some(level) = effort.as_deref()
+                && !matches!(level, "low" | "medium" | "high" | "xhigh" | "max")
+            {
+                return Err(add_config_error_prefix(
+                    format!(
+                        "{key} must be \"low\", \"medium\", \"high\", \"xhigh\" or \"max\", got \
+                         \"{level}\""
+                    )
+                    .into(),
+                ));
+            }
         }
 
         // `review.claude`/`review.codex` land in injected prompt text (see
@@ -8680,9 +9090,11 @@ mod tests {
         assert!(!cfg.approve_allow);
         assert!(!cfg.classify);
         assert!(!cfg.handoff_select);
+        assert!(!cfg.compaction_select);
         assert!(!cfg.inject_screen);
         assert!(!cfg.inject);
         assert!(!cfg.stop_verify);
+        assert!(!cfg.launch_effort);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
     }
 
@@ -8732,9 +9144,12 @@ mod tests {
             ("[jev]\napprove_allow = true\n", "approve_allow"),
             ("[jev]\nclassify = true\n", "classify"),
             ("[jev]\nhandoff_select = true\n", "handoff_select"),
+            ("[jev]\ncompaction_select = true\n", "compaction_select"),
             ("[jev]\ninject_screen = true\n", "inject_screen"),
             ("[jev]\ninject = true\n", "inject"),
             ("[jev]\nstop_verify = true\n", "stop_verify"),
+            ("[jev]\nmissing_tests = true\n", "missing_tests"),
+            ("[jev]\nlaunch_effort = true\n", "launch_effort"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -8771,9 +9186,12 @@ mod tests {
             ("ZIRV_CTX_JEV_APPROVE_ALLOW", "true"),
             ("ZIRV_CTX_JEV_CLASSIFY", "true"),
             ("ZIRV_CTX_JEV_HANDOFF_SELECT", "true"),
+            ("ZIRV_CTX_JEV_COMPACTION_SELECT", "true"),
             ("ZIRV_CTX_JEV_INJECT_SCREEN", "true"),
             ("ZIRV_CTX_JEV_INJECT", "true"),
             ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
+            ("ZIRV_CTX_JEV_MISSING_TESTS", "true"),
+            ("ZIRV_CTX_JEV_LAUNCH_EFFORT", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -8795,10 +9213,111 @@ mod tests {
         assert!(cfg.jev.approve_allow);
         assert!(cfg.jev.classify);
         assert!(cfg.jev.handoff_select);
+        assert!(cfg.jev.compaction_select);
         assert!(cfg.jev.inject_screen);
         assert!(cfg.jev.inject);
         assert!(cfg.jev.stop_verify);
+        assert!(cfg.jev.missing_tests);
+        assert!(cfg.jev.launch_effort);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
+    }
+
+    /// Every `[headless]` key is `REPO_FORBIDDEN`: a repo checkout must not
+    /// be able to turn on a headless cost lever for itself -- same reasoning
+    /// as `jev_keys_are_repo_forbidden` above.
+    #[test]
+    fn headless_keys_are_repo_forbidden() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        for (toml, offending_key) in [
+            (
+                "[headless]\nprompt_cache_ttl = \"1h\"\n",
+                "prompt_cache_ttl",
+            ),
+            ("[headless]\nlean = true\n", "lean"),
+            (
+                "[headless]\ndisallowed_tools = [\"WebFetch\"]\n",
+                "disallowed_tools",
+            ),
+            ("[headless.effort]\ntrivial = \"low\"\n", "effort.trivial"),
+            (
+                "[headless.effort]\nbounded = \"medium\"\n",
+                "effort.bounded",
+            ),
+            (
+                "[headless.effort]\nsubstantial = \"high\"\n",
+                "effort.substantial",
+            ),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect_err(
+                &format!("a repository must not be able to set headless.{offending_key}"),
+            );
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "headless.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
+    }
+
+    /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
+    /// `ZIRV_CTX_HEADLESS_*` env var may still set these keys.
+    #[test]
+    fn the_operator_can_still_set_headless_keys_from_the_environment() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL", "5m"),
+            ("ZIRV_CTX_HEADLESS_LEAN", "true"),
+            ("ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS", "WebFetch, Task"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "low"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_BOUNDED", "medium"),
+            ("ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL", "high"),
+        ]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect("the operator's own environment may set these keys");
+        assert_eq!(cfg.headless.prompt_cache_ttl.as_deref(), Some("5m"));
+        assert!(cfg.headless.lean);
+        assert_eq!(
+            cfg.headless.disallowed_tools,
+            vec!["WebFetch".to_string(), "Task".to_string()]
+        );
+        assert_eq!(cfg.headless.effort.trivial.as_deref(), Some("low"));
+        assert_eq!(cfg.headless.effort.bounded.as_deref(), Some("medium"));
+        assert_eq!(cfg.headless.effort.substantial.as_deref(), Some("high"));
+    }
+
+    /// `headless.prompt_cache_ttl` and `headless.effort.*` are constrained to
+    /// exactly the values Claude Code's own CLI/env accept -- an
+    /// unrecognized value is a load-time error naming the key, the same
+    /// "loud rather than silent" style `chat.claude_permission_mode`'s own
+    /// validation above uses.
+    #[test]
+    fn headless_prompt_cache_ttl_and_effort_reject_bad_values() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL", "30m")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an unrecognized ttl must be refused");
+        assert!(
+            err.to_string().contains("headless.prompt_cache_ttl"),
+            "got {err}"
+        );
+
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL", "extreme")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("an unrecognized effort level must be refused");
+        assert!(
+            err.to_string().contains("headless.effort.trivial"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -9473,12 +9992,19 @@ mod tests {
         assert_eq!(narrow_max_diagnostics(10, Some(5)), 5);
         // max_diagnostics: home 10 / repo 20 -> 10 (repo may not raise it).
         assert_eq!(narrow_max_diagnostics(10, Some(20)), 10);
-        assert_eq!(narrow_max_diagnostics(10, None), 10);
+    }
 
-        // timeout_secs: the identical shape, one level up in width.
-        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(30)), 30);
-        assert_eq!(narrow_diagnostics_timeout_secs(120, Some(600)), 120);
-        assert_eq!(narrow_diagnostics_timeout_secs(120, None), 120);
+    /// Q1: the fold rule itself, pure and direct -- the same shape as
+    /// `the_diagnostics_narrowing_fold_rule_favours_the_stricter_layer_either_direction`.
+    #[test]
+    fn the_missing_tests_gate_narrowing_fold_rule_favours_the_stricter_layer_either_direction() {
+        // enabled: home true / repo false -> false (repo may disable it).
+        assert!(!narrow_missing_tests_gate_enabled(true, Some(false)));
+        // enabled: home false / repo true -> false (repo may not re-enable an
+        // operator-disabled check).
+        assert!(!narrow_missing_tests_gate_enabled(false, Some(true)));
+        assert!(narrow_missing_tests_gate_enabled(true, None));
+        assert!(narrow_missing_tests_gate_enabled(true, Some(true)));
     }
 
     /// Issue #262: the fold rule itself, the same no-config-file, no-
@@ -9926,6 +10452,145 @@ mod tests {
         assert_eq!(
             cfg.verify_on_stop.max_nudges, 1,
             "a repo may still tighten the nudge cap"
+        );
+    }
+
+    /// Q1: the full `CtxConfig::load` integration -- the same shape as
+    /// `a_repo_layer_may_only_narrow_verify_on_stop_enabled_and_max_nudges`:
+    /// a repo-layer `missing_tests_gate.enabled = true` must not resurrect a
+    /// check the operator's own `~/.zirv/ctx.toml` turned off, but a repo
+    /// layer may still turn an operator-enabled check off for itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_missing_tests_gate_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[missing_tests_gate]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[missing_tests_gate]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.missing_tests_gate.enabled,
+            "a repo may not re-enable an operator-disabled missing_tests_gate"
+        );
+    }
+
+    /// Q1: default-on, unlike `diagnostics` -- an operator who never touches
+    /// `missing_tests_gate` still gets the check.
+    #[test]
+    fn missing_tests_gate_defaults_on() {
+        assert!(MissingTestsGateConfig::default().enabled);
+    }
+
+    /// Issue #774: identical shape to `a_repo_layer_may_only_narrow_missing_
+    /// tests_gate_enabled` -- a repo-layer `subagent_stop_gate.enabled = true`
+    /// must not resurrect a gate the operator's own `~/.zirv/ctx.toml` turned
+    /// off, but a repo layer may still turn an operator-enabled gate off for
+    /// itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_subagent_stop_gate_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[subagent_stop_gate]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[subagent_stop_gate]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.subagent_stop_gate.enabled,
+            "a repo may not re-enable an operator-disabled subagent_stop_gate"
+        );
+    }
+
+    /// Issue #774: default-on, the same as `missing_tests_gate` -- an
+    /// operator who never touches `subagent_stop_gate` still gets the check.
+    #[test]
+    fn subagent_stop_gate_defaults_on() {
+        assert!(SubagentStopGateConfig::default().enabled);
+    }
+
+    /// Identical shape to `a_repo_layer_may_only_narrow_subagent_stop_gate_
+    /// enabled` -- a repo-layer `scope_guard.enabled = true` must not
+    /// resurrect a guard the operator's own `~/.zirv/ctx.toml` turned off,
+    /// but a repo layer may still turn an operator-enabled guard off for
+    /// itself.
+    #[test]
+    fn a_repo_layer_may_only_narrow_scope_guard_enabled() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.scope_guard.enabled,
+            "a repo may not re-enable an operator-disabled scope_guard"
+        );
+    }
+
+    /// Default-on, the same as `missing_tests_gate`/`subagent_stop_gate` --
+    /// an operator who never touches `scope_guard` still gets the guard.
+    #[test]
+    fn scope_guard_defaults_on() {
+        assert!(ScopeGuardConfig::default().enabled);
+    }
+
+    /// The operator environment override wins outright, the same as every
+    /// other `ENV_MAP` entry.
+    #[test]
+    fn scope_guard_env_override_wins_over_a_disabling_home_layer() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SCOPE_GUARD_ENABLED", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            cfg.scope_guard.enabled,
+            "ZIRV_CTX_SCOPE_GUARD_ENABLED must override the home layer"
         );
     }
 
@@ -11301,6 +11966,14 @@ intake_discipline = true
         let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS", "90")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.supervise.compact_stall_secs, 90);
+    }
+
+    #[test]
+    fn compact_timeout_ms_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS", "12345")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.compact_timeout_ms, 12345);
     }
 
     #[test]
@@ -13103,6 +13776,7 @@ intake_discipline = true
         ("supervise", "in_tool_secs"),
         ("supervise", "stall_grace_secs"),
         ("supervise", "compact_stall_secs"),
+        ("supervise", "compact_timeout_ms"),
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),

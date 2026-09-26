@@ -1,0 +1,9 @@
+I'd like to pull up every transaction in a single category at once,
+without paging through `list`. Add `python -m ledgerlite report
+transactions --category C --store PATH`: prints every transaction whose
+category is exactly `C`, in the same row format `list` already uses (same
+columns), in the same default order `list` already uses (most recent
+first) -- and support the same flag we already added to `list` for
+falling back to the old order, spelled exactly the same way, for anyone
+used to it. If there are no transactions in that category, print `No
+transactions in category C.`

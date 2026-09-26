@@ -1204,6 +1204,13 @@ pub struct ClaudeAdapter {
     /// overriding the operator's own `permissions.defaultMode`, which a CLI
     /// flag outranks.
     claude_permission_mode: Option<String>,
+    /// Issue #788: an operator-only `[headless]` cost-lever table, attached
+    /// post-construction via `AgentAdapter::apply_headless_config`
+    /// (production) or `with_headless_config` (tests/direct construction) --
+    /// mirrors `claude_permission_mode`'s own pattern immediately above.
+    /// Default (unset) is byte-identical to every launch before this table
+    /// existed.
+    headless: super::super::config::HeadlessConfig,
     #[cfg(test)]
     forced_file_support: Option<bool>,
     #[cfg(test)]
@@ -1230,6 +1237,7 @@ impl ClaudeAdapter {
             home: None,
             endpoint: None,
             claude_permission_mode: None,
+            headless: super::super::config::HeadlessConfig::default(),
             #[cfg(test)]
             forced_file_support: None,
             #[cfg(test)]
@@ -1260,6 +1268,17 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_claude_permission_mode(mut self, mode: impl Into<String>) -> Self {
         self.claude_permission_mode = Some(mode.into());
+        self
+    }
+
+    /// Issue #788: attaches an operator `[headless]` cost-lever table.
+    /// Production code reaches this through `AgentAdapter::
+    /// apply_headless_config` (see `adapters::apply_headless_override`),
+    /// mirroring `with_claude_permission_mode` immediately above; this
+    /// builder is only the direct-construction path tests use.
+    #[cfg(test)]
+    pub fn with_headless_config(mut self, headless: super::super::config::HeadlessConfig) -> Self {
+        self.headless = headless;
         self
     }
 
@@ -1343,10 +1362,15 @@ impl ClaudeAdapter {
     /// Zirv home. The write is atomic and private on Unix; if either step
     /// fails, the caller deliberately falls back to Claude's native prompt
     /// flow without adding a blanket Bash allow.
+    /// `lean`: issue #788's `[headless] lean` lever, resolved by the caller
+    /// (`default_sandbox_args`) to true only for a HEADLESS launch with the
+    /// operator's `[headless] lean = true` -- never for an interactive one,
+    /// whatever this table holds.
     fn launch_settings_path(
         &self,
         sandbox: &super::super::config::SandboxConfig,
         safety: &super::super::safety::SafetyPolicy,
+        lean: bool,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
@@ -1357,9 +1381,24 @@ impl ClaudeAdapter {
         let fingerprint = super::super::safety::policy_fingerprint(safety).ok()?;
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
-        let path = dir.join(format!("claude-launch-settings-{fingerprint}.json"));
+        // Issue #788 review finding L1: `fingerprint` is hashed from
+        // `SafetyPolicy` alone, so a `lean` and a non-`lean` launch under the
+        // identical safety policy used to collide on the SAME settings file
+        // (`claude-launch-settings-{fingerprint}.json`) while writing
+        // DIFFERENT content -- a concurrent headless-lean worker and an
+        // interactive dash pane under the same policy raced that one path,
+        // and the interactive session could start with the lean settings.
+        // The `-lean` suffix folds the lever into the file name itself, so
+        // the two contents never share a path; `lean == false` keeps the
+        // pre-#788 name byte-identical.
+        let path = if lean {
+            dir.join(format!("claude-launch-settings-{fingerprint}-lean.json"))
+        } else {
+            dir.join(format!("claude-launch-settings-{fingerprint}.json"))
+        };
         let mut launch_environment = LaunchEnvironment::resolve();
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
+        launch_environment.lean = lean;
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -1452,14 +1491,15 @@ impl ClaudeAdapter {
 /// execution, so dangerous `gh` and push forms and repo `deny`/`ask` rules
 /// continue to narrow the broad native families.
 ///
-/// Issue #334: `launch_settings_value`'s own `PreToolUse` array also carries
-/// an `Edit|Write|MultiEdit|NotebookEdit` matcher running `zirv ctx hook
-/// pretool` -- the orchestrator-write guard that makes an orchestrator seat
-/// technically unable to edit repository files itself. It sits alongside,
-/// not instead of, an `Agent|Task` matcher running the same command: that
-/// entry attests the existing expensive-seat-inheritance guard on every
-/// launch, rather than depending on a one-time `zirv setup apply` having
-/// installed it into the operator's own global settings first.
+/// Issue #334: `launch_settings_value`'s own consolidated `PreToolUse` entry
+/// (issue #769 folded what used to be four separate matchers into this one --
+/// see that entry's own comment) covers `Edit|Write|MultiEdit|NotebookEdit`
+/// tool names too, running `zirv ctx hook pretool`'s orchestrator-write guard
+/// that makes an orchestrator seat technically unable to edit repository
+/// files itself, alongside (not instead of) `Agent|Task` coverage for the
+/// same command: that half attests the existing expensive-seat-inheritance
+/// guard on every launch, rather than depending on a one-time `zirv setup
+/// apply` having installed it into the operator's own global settings first.
 struct CommandFamilyProjection {
     pattern: &'static str,
     sandbox_excluded: bool,
@@ -1531,6 +1571,11 @@ struct LaunchEnvironment {
     /// `[sandbox] scrub_subprocess_env` -- see `SandboxConfig`'s doc comment
     /// for what the upstream switch does and why it is off by default.
     scrub_subprocess_env: bool,
+    /// Issue #788: `[headless] lean`, already narrowed to HEADLESS-only by
+    /// `launch_settings_path`'s own caller -- see that field's doc comment.
+    /// Adds `autoMemoryEnabled: false`/`disableBundledSkills: true` to the
+    /// settings layer `launch_settings_value` builds.
+    lean: bool,
 }
 
 impl LaunchEnvironment {
@@ -1578,6 +1623,7 @@ impl LaunchEnvironment {
             ssh_auth_sock,
             workspace_write_roots,
             scrub_subprocess_env: false,
+            lean: false,
         }
     }
 }
@@ -1771,30 +1817,31 @@ fn launch_settings_value(
             .filter(|family| family.sandbox_excluded)
             .map(|family| family.pattern.to_string()),
     );
+    // Issue #769: every `PreToolUse` matcher this launch used to register
+    // separately -- the standalone safety check (`Bash|PowerShell`), the
+    // rehydration/lookup-tool set, the file-modification-tool set (already a
+    // strict subset of the rehydration set, so already redundant with it
+    // before this change), and `Agent|Task` -- collapses into ONE slot here.
+    // `hook::run_pretool` dispatches by `tool_name` itself (safety for
+    // `Bash`/`PowerShell`, rehydration/orchestrator-write guards for the file
+    // tools, the expensive-seat/skill-pointer guards for `Agent`/`Task`), so
+    // one union matcher naming every tool name any of the four used to name,
+    // running the identical `zirv ctx hook pretool` command every non-safety
+    // entry already ran, is behaviourally the same coverage as before -- just
+    // one registered hook instead of four, and one spawned process per tool
+    // call instead of up to two.
+    let pretool_matcher = {
+        let mut tools: Vec<&str> = super::super::hook::REHYDRATION_TOOLS.to_vec();
+        tools.push("Agent");
+        tools.push("Task");
+        tools.join("|")
+    };
     #[cfg_attr(windows, allow(unused_mut))]
     let mut settings = serde_json::json!({
         "disableAllHooks": false,
         "hooks": {
             "PreToolUse": [{
-                "matcher": "Bash|PowerShell",
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx safety check"
-                }]
-            }, {
-                "matcher": super::super::hook::REHYDRATION_TOOLS.join("|"),
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx hook pretool"
-                }]
-            }, {
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx hook pretool"
-                }]
-            }, {
-                "matcher": "Agent|Task",
+                "matcher": pretool_matcher,
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"
@@ -1804,8 +1851,8 @@ fn launch_settings_value(
             // own result, and replaces it via `updatedToolOutput` -- the full
             // output is stored verbatim under the state dir first, so this is
             // compression, never loss. Deliberately a separate event from the
-            // `Bash|PowerShell` PreToolUse entry above: nothing here can
-            // touch a permission decision.
+            // consolidated `PreToolUse` entry above: nothing here can touch a
+            // permission decision.
             "PostToolUse": [{
                 "matcher": ".*",
                 "hooks": [{
@@ -1852,6 +1899,13 @@ fn launch_settings_value(
     // forces the permission mode to `default` -- see `SandboxConfig`.
     if launch_environment.scrub_subprocess_env {
         settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = serde_json::json!("1");
+    }
+    // Issue #788: operator opt-in only (`[headless] lean`), already narrowed
+    // to a headless launch by the caller -- see `LaunchEnvironment::lean`'s
+    // own doc comment.
+    if launch_environment.lean {
+        settings["autoMemoryEnabled"] = serde_json::json!(false);
+        settings["disableBundledSkills"] = serde_json::json!(true);
     }
 
     let additional_directories: Vec<&String> = launch_environment
@@ -2268,6 +2322,14 @@ impl AgentAdapter for ClaudeAdapter {
         self.claude_permission_mode = chat.claude_permission_mode.clone();
     }
 
+    /// Issue #788: the production seam (`adapters::apply_headless_override`,
+    /// called by `select`/`resolve_default`) that attaches the operator's
+    /// `[headless]` cost-lever table after construction, mirroring
+    /// `apply_chat_config` immediately above.
+    fn apply_headless_config(&mut self, headless: &super::super::config::HeadlessConfig) {
+        self.headless = headless.clone();
+    }
+
     fn endpoint_vendor(&self) -> Option<&str> {
         self.endpoint.as_ref().map(|ep| ep.vendor.as_str())
     }
@@ -2282,11 +2344,23 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn headless_cmd(&self, prompt: &str, session: &SessionId, extra: &[String]) -> Command {
         let mut cmd = self.base();
-        cmd.arg("-p")
-            .arg(prompt)
-            .arg("--session-id")
-            .arg(session.as_str())
-            .args(extra);
+        cmd.arg("-p").arg(prompt);
+        // Issue #778: `extra` may already pin this launch to an existing
+        // conversation -- `exec::run_with_clock_inner`'s very first launch
+        // forwards an operator's own `-- --resume <id>`/`--continue` here
+        // verbatim (`exec::resume_pin`), and a dashboard restore pane can
+        // carry `session_pin_args`'s own `--session-id` the same way. Minting
+        // a fresh `--session-id` on top of one used to make claude silently
+        // start a brand-new, unrelated conversation (ignoring `--resume`
+        // entirely), or refuse outright with "Session ID ... is already in
+        // use" once a caller's own explicit `--session-id` rode alongside it.
+        // Skipped only when nothing in `extra` already claims this launch --
+        // `exec::pins_an_existing_conversation` is the same check `chat.rs`'s
+        // own dashboard-restore path already trusts for this exact question.
+        if !crate::commands::ctx::exec::pins_an_existing_conversation(extra, self.name()) {
+            cmd.arg("--session-id").arg(session.as_str());
+        }
+        cmd.args(extra);
         cmd
     }
 
@@ -2848,6 +2922,15 @@ impl AgentAdapter for ClaudeAdapter {
             );
         }
         deny_entries.extend(sandbox.extra_deny.iter().cloned());
+        // Issue #788: `[headless] disallowed_tools` -- operator-only extra
+        // tool names appended to the SAME `--disallowedTools` deny list
+        // above, exactly like `sandbox.extra_deny` right above it, rather
+        // than a second `--disallowedTools` flag. Headless only, like the
+        // `safety.ask` fold-in above: an interactive session has a human
+        // present to answer a prompt, so this lever never narrows it.
+        if !mode.is_interactive() {
+            deny_entries.extend(self.headless.disallowed_tools.iter().cloned());
+        }
         let deny = deny_entries.join(",");
 
         // `dontAsk` is "don't prompt, deny if not pre-approved" (the
@@ -2899,7 +2982,11 @@ impl AgentAdapter for ClaudeAdapter {
         }
         args.push(format!("--allowedTools={allow}"));
         args.push(format!("--disallowedTools={deny}"));
-        if let Some(path) = self.launch_settings_path(sandbox, safety) {
+        // Issue #788: `[headless] lean` only ever narrows a HEADLESS launch's
+        // settings layer -- see `launch_settings_path`/`launch_settings_
+        // value`'s own doc comments.
+        let lean = !mode.is_interactive() && self.headless.lean;
+        if let Some(path) = self.launch_settings_path(sandbox, safety, lean) {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
@@ -2918,7 +3005,27 @@ impl AgentAdapter for ClaudeAdapter {
     /// chooses whether to use it; this only makes the id resolvable.
     /// `--bare`/`--disable-slash-commands` turn Claude's plugin surface off
     /// entirely, so the flag is skipped rather than passed uselessly.
-    fn plugin_dir_args(&self, flags: &[String]) -> Vec<String> {
+    ///
+    /// Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// a live init message showed 79 skills in the launch's `Skill` tool
+    /// listing (vs vanilla's 33) because this plugin registered ALL ~46 of
+    /// zirv's own skills, on every launch, even though `PromptRole::Worker`/
+    /// `PromptRole::Single` already carry the one-line `SKILL_POINTER_LAYER`
+    /// (`prompt.rs`) telling them to load one on demand via `zirv skill load
+    /// <id>` -- those two roles pay the full listing cost for a mechanism
+    /// they are told not to use. `PromptRole::Orchestrator`/
+    /// `PromptRole::SubOrchestrator` still decide which harnesses run and
+    /// still need `zirv:<id>` resolvable through the `Skill` tool, so they
+    /// keep the plugin.
+    fn plugin_dir_args(
+        &self,
+        flags: &[String],
+        role: crate::commands::ctx::prompt::PromptRole,
+    ) -> Vec<String> {
+        use crate::commands::ctx::prompt::PromptRole;
+        if matches!(role, PromptRole::Worker | PromptRole::Single) {
+            return Vec::new();
+        }
         if flags
             .iter()
             .any(|flag| flag == "--bare" || flag == "--disable-slash-commands")
@@ -3054,6 +3161,16 @@ impl AgentAdapter for ClaudeAdapter {
             .is_some_and(|m| m.contains("[1m]") || m.contains("-1m"))
         {
             return Some(LONG_CONTEXT_WINDOW_TOKENS);
+        }
+        // Round 4 bug 4a: a value `exec.rs` actually observed in a real
+        // `-p --output-format json` result for THIS model (see
+        // `model_window`'s own doc comment) outranks the catalogue's own
+        // built-in number -- learned fact beats a verified-on-a-different-
+        // day table entry, exactly the direction `cfg.model_context_tokens`
+        // (checked separately, by every caller, ahead of this whole
+        // function's answer) already outranks both.
+        if let Some(observed) = super::super::model_window::lookup(&self.home_dir(), model) {
+            return Some(observed);
         }
         Some(
             catalogue::vendor(CATALOGUE_VENDOR)
@@ -4160,6 +4277,38 @@ mod tests {
         );
     }
 
+    /// Issue #778: `extra` already carrying a resume-pinning flag means this
+    /// launch is continuing an existing conversation, not starting one --
+    /// claude refuses `--session-id` alongside `--resume` outright ("Session
+    /// ID ... is already in use"), and even without that explicit conflict,
+    /// minting one anyway used to make claude silently start a brand-new,
+    /// unrelated conversation while ignoring `--resume` entirely. Both the
+    /// value-carrying and the bare spellings must suppress the injection.
+    #[test]
+    fn headless_cmd_never_pins_its_own_session_id_over_an_existing_pin() {
+        let adapter = ClaudeAdapter::new(Some("/tmp/fake-claude"));
+        for extra in [
+            vec!["--resume".to_string(), "real-conversation-id".to_string()],
+            vec!["--continue".to_string()],
+        ] {
+            let cmd = adapter.headless_cmd(
+                "keep going",
+                &SessionId::parse("fresh-uuid-zirv-minted"),
+                &extra,
+            );
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let mut expected = vec!["-p".to_string(), "keep going".to_string()];
+            expected.extend(extra.clone());
+            assert_eq!(
+                args, expected,
+                "no --session-id must ride alongside an existing pin: {extra:?}"
+            );
+        }
+    }
+
     /// FIX B: the stdin headless form keeps `-p` and the session pin but never
     /// puts the prompt on argv -- claude reads it from stdin instead, so a
     /// prompt bearing a cmd.exe metacharacter is never reparsed on the shim
@@ -4357,6 +4506,13 @@ mod tests {
     /// that rule silently defeated every hook-side allow for an escape
     /// retry (the gh carve-out, and the new `[safety] escape_allow` gate).
     /// The attested safety hook is now the sole zirv-side decision point.
+    ///
+    /// Issue #769: the safety check, the rehydration/lookup-tool guard, the
+    /// file-modification guard, and the expensive-seat/skill-pointer guard
+    /// used to be four separate `PreToolUse` entries (the first three
+    /// overlapping in tool coverage already); `hook::run_pretool` now runs
+    /// all of it itself from ONE consolidated entry, dispatching by
+    /// `tool_name` -- see that entry's own matcher below for the exact union.
     #[test]
     fn launch_settings_attest_the_safety_hook_and_no_longer_inject_the_native_sandbox_escape_ask_rule()
      {
@@ -4364,46 +4520,21 @@ mod tests {
         assert_eq!(settings["disableAllHooks"], false);
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/0/matcher"),
-            Some(&serde_json::json!("Bash|PowerShell"))
-        );
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
-            Some(&serde_json::json!("zirv ctx safety check"))
-        );
-        // Issue #466: the rehydration hook is the second `PreToolUse` entry,
-        // matching every tool a device action can rehydrate placeholders
-        // for (shell, write and lookup tools), also running `zirv
-        // ctx hook pretool` -- the same command decides both this and the
-        // orchestrator-write guard below from the payload it receives.
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/1/matcher"),
             Some(&serde_json::json!(
-                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob"
+                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task"
             ))
         );
         assert_eq!(
-            settings.pointer("/hooks/PreToolUse/1/hooks/0/command"),
-            Some(&serde_json::json!("zirv ctx hook pretool"))
-        );
-        // Issue #334: the orchestrator-write guard and the expensive-seat
-        // guard are separate `PreToolUse` entries, both running `zirv ctx
-        // hook pretool` -- the former attested on every launch instead of
-        // depending on a one-time `zirv setup apply`.
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/2/matcher"),
-            Some(&serde_json::json!("Edit|Write|MultiEdit|NotebookEdit"))
-        );
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/2/hooks/0/command"),
+            settings.pointer("/hooks/PreToolUse/0/hooks/0/command"),
             Some(&serde_json::json!("zirv ctx hook pretool"))
         );
         assert_eq!(
-            settings.pointer("/hooks/PreToolUse/3/matcher"),
-            Some(&serde_json::json!("Agent|Task"))
-        );
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/3/hooks/0/command"),
-            Some(&serde_json::json!("zirv ctx hook pretool"))
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .expect("PreToolUse array")
+                .len(),
+            1,
+            "issue #769: exactly one PreToolUse entry now, not four: {settings}"
         );
         assert!(
             !settings["permissions"]["ask"]
@@ -4439,6 +4570,32 @@ mod tests {
             .expect("settings");
         assert!(settings["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"].is_null());
         assert!(settings["env"][super::super::super::safety::POLICY_FINGERPRINT_ENV].is_string());
+    }
+
+    /// Issue #788: `[headless] lean` adds `autoMemoryEnabled: false` and
+    /// `disableBundledSkills: true` to the settings layer only when the
+    /// caller (`default_sandbox_args`, headless-only) resolved `lean` true --
+    /// same opt-in shape as `scrub_subprocess_env` right above.
+    #[test]
+    fn launch_settings_emit_the_lean_keys_only_on_operator_opt_in() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let settings = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                lean: true,
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(settings["autoMemoryEnabled"], false);
+        assert_eq!(settings["disableBundledSkills"], true);
+
+        let settings = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(settings["autoMemoryEnabled"].is_null());
+        assert!(settings["disableBundledSkills"].is_null());
     }
 
     /// Writes the mutual link git keeps between `<repo>/.git/worktrees/
@@ -4557,7 +4714,8 @@ mod tests {
     #[test]
     fn launch_settings_rehydrate_lookup_tools_and_audit_misses() {
         let settings = test_launch_settings();
-        let matcher = settings["hooks"]["PreToolUse"][1]["matcher"]
+        // Issue #769: the consolidated hook is the ONLY PreToolUse entry now.
+        let matcher = settings["hooks"]["PreToolUse"][0]["matcher"]
             .as_str()
             .expect("matcher");
         let home = tempfile::tempdir().expect("home");
@@ -4621,33 +4779,17 @@ mod tests {
     #[test]
     fn launch_settings_observe_permission_events_without_changing_pretooluse() {
         let settings = test_launch_settings();
-        // Issue #334 added the two guard entries below; wiring the
-        // `PermissionRequest`/`PermissionDenied` observers in must not
-        // perturb this array further, and neither may issue #326's
-        // compact-output hook, which is a `PostToolUse` entry of its own
-        // (asserted below) and never touches this array at all.
+        // Issue #334's two guard entries and issue #769's consolidation both
+        // predate this test's own concern: wiring the `PermissionRequest`/
+        // `PermissionDenied` observers in must not perturb this array
+        // further, and neither may issue #326's compact-output hook, which
+        // is a `PostToolUse` entry of its own (asserted below) and never
+        // touches this array at all. Issue #769: one consolidated entry now,
+        // not four.
         assert_eq!(
             settings["hooks"]["PreToolUse"],
             serde_json::json!([{
-                "matcher": "Bash|PowerShell",
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx safety check"
-                }]
-            }, {
-                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob",
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx hook pretool"
-                }]
-            }, {
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                "hooks": [{
-                    "type": "command",
-                    "command": "zirv ctx hook pretool"
-                }]
-            }, {
-                "matcher": "Agent|Task",
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"
@@ -4821,10 +4963,14 @@ mod tests {
             settings["env"][super::super::super::safety::POLICY_SNAPSHOT_ENV],
             policy_path.display().to_string()
         );
-        assert_eq!(
-            settings.pointer("/hooks/PreToolUse/0/matcher"),
-            Some(&serde_json::json!("Bash|PowerShell")),
-            "the identical hook must guard both native Windows and Unix shell tools"
+        let matcher = settings
+            .pointer("/hooks/PreToolUse/0/matcher")
+            .and_then(serde_json::Value::as_str)
+            .expect("matcher");
+        assert!(
+            matcher.split('|').any(|tool| tool == "Bash")
+                && matcher.split('|').any(|tool| tool == "PowerShell"),
+            "the identical hook must guard both native Windows and Unix shell tools: {matcher}"
         );
     }
 
@@ -5097,7 +5243,8 @@ mod tests {
             .with_home(home.path().to_path_buf())
             .with_live_plugin_dir(state.path().to_path_buf());
 
-        let args = adapter.plugin_dir_args(&[]);
+        let args =
+            adapter.plugin_dir_args(&[], crate::commands::ctx::prompt::PromptRole::Orchestrator);
         let index = args
             .iter()
             .position(|arg| arg == "--plugin-dir")
@@ -5117,12 +5264,51 @@ mod tests {
     #[test]
     fn plugin_dir_args_is_empty_under_bare_or_disabled_slash_commands() {
         let adapter = ClaudeAdapter::new(None);
-        assert!(adapter.plugin_dir_args(&["--bare".to_string()]).is_empty());
+        use crate::commands::ctx::prompt::PromptRole;
         assert!(
             adapter
-                .plugin_dir_args(&["--disable-slash-commands".to_string()])
+                .plugin_dir_args(&["--bare".to_string()], PromptRole::Orchestrator)
                 .is_empty()
         );
+        assert!(
+            adapter
+                .plugin_dir_args(
+                    &["--disable-slash-commands".to_string()],
+                    PromptRole::Orchestrator
+                )
+                .is_empty()
+        );
+    }
+
+    /// Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// `PromptRole::Worker`/`PromptRole::Single` never register zirv's own
+    /// skills as a native plugin -- they already carry the one-line
+    /// `SKILL_POINTER_LAYER` telling them to load one on demand via `zirv
+    /// skill load <id>` -- while `PromptRole::Orchestrator`/
+    /// `PromptRole::SubOrchestrator` still need `zirv:<id>` resolvable
+    /// through the `Skill` tool, since they are the ones deciding which
+    /// harnesses run.
+    #[test]
+    fn plugin_dir_args_is_empty_for_worker_and_single_but_not_orchestrator_roles() {
+        use crate::commands::ctx::prompt::PromptRole;
+        let state = tempfile::tempdir().expect("state");
+        let home = tempfile::tempdir().expect("home");
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_plugin_dir(state.path().to_path_buf());
+
+        for role in [PromptRole::Worker, PromptRole::Single] {
+            assert!(
+                adapter.plugin_dir_args(&[], role).is_empty(),
+                "{role:?} must never register the native skill plugin"
+            );
+        }
+        for role in [PromptRole::Orchestrator, PromptRole::SubOrchestrator] {
+            assert!(
+                !adapter.plugin_dir_args(&[], role).is_empty(),
+                "{role:?} must still register the native skill plugin"
+            );
+        }
     }
 
     /// Without this fix, `claude_plugin_dir` fell back to `home_dir()`'s `.`
@@ -5172,7 +5358,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&Default::default(), &policy)
+            .launch_settings_path(&Default::default(), &policy, false)
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -5217,6 +5403,63 @@ mod tests {
         )
         .expect("valid policy JSON");
         assert_eq!(snapshotted, policy);
+    }
+
+    /// Issue #788 review finding L1: `lean` and non-`lean` launches under the
+    /// IDENTICAL safety policy must never materialize to the same settings
+    /// path -- their JSON bodies differ (`autoMemoryEnabled`/
+    /// `disableBundledSkills`), so sharing a path lets one overwrite the
+    /// other and lets an unrelated interactive launch start from a headless
+    /// worker's lean settings, or vice versa. With `lean == false` the path
+    /// must stay byte-identical to the pre-#788 name (pinned by
+    /// `launch_settings_are_materialized_atomically_under_the_zirv_home`
+    /// right above).
+    #[test]
+    fn lean_and_non_lean_launches_never_share_a_settings_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("state");
+        let _state = super::super::super::testenv::VarGuard::set(&[(
+            super::super::super::state::STATE_ENV,
+            Some(state.path().to_str().expect("utf8 state path")),
+        )]);
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings();
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let fingerprint =
+            super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
+
+        let lean_path = adapter
+            .launch_settings_path(&Default::default(), &policy, true)
+            .expect("lean settings materialized");
+        let plain_path = adapter
+            .launch_settings_path(&Default::default(), &policy, false)
+            .expect("non-lean settings materialized");
+
+        assert_ne!(
+            lean_path, plain_path,
+            "a lean and a non-lean launch under the same policy must never share a path"
+        );
+        assert_eq!(
+            plain_path,
+            home.path()
+                .join(".zirv")
+                .join("runtime")
+                .join(format!("claude-launch-settings-{fingerprint}.json")),
+            "lean == false must keep the pre-#788 file name byte-identical"
+        );
+
+        let lean_written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&lean_path).expect("read lean settings"))
+                .expect("valid settings JSON");
+        let plain_written: Value = serde_json::from_str(
+            &std::fs::read_to_string(&plain_path).expect("read non-lean settings"),
+        )
+        .expect("valid settings JSON");
+        assert_eq!(lean_written["autoMemoryEnabled"], false);
+        assert_eq!(lean_written["disableBundledSkills"], true);
+        assert!(plain_written["autoMemoryEnabled"].is_null());
+        assert!(plain_written["disableBundledSkills"].is_null());
     }
 
     /// If the private settings file cannot be materialized, the projection
@@ -5686,6 +5929,46 @@ mod tests {
         assert!(
             deny_arg.contains("Bash(sudo *)"),
             "the shipped deny entries must still be present, not replaced: {deny_arg}"
+        );
+    }
+
+    /// Issue #788: `[headless] disallowed_tools` appends to the SAME
+    /// `--disallowedTools` deny list, headless only -- an interactive launch
+    /// (a human present to answer a prompt) is never narrowed by this lever,
+    /// whatever the operator configured.
+    #[test]
+    fn default_sandbox_args_appends_headless_disallowed_tools_only_when_headless() {
+        let adapter = ClaudeAdapter::new(None).with_headless_config(
+            crate::commands::ctx::config::HeadlessConfig {
+                disallowed_tools: vec!["WebFetch".to_string()],
+                ..Default::default()
+            },
+        );
+        let headless_args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &[],
+            super::super::LaunchMode::Headless,
+        );
+        let deny_arg = headless_args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(deny_arg.contains("WebFetch"), "got {deny_arg}");
+
+        let interactive_args = adapter.default_sandbox_args(
+            &Default::default(),
+            &Default::default(),
+            &[],
+            super::super::LaunchMode::Interactive,
+        );
+        let deny_arg = interactive_args
+            .iter()
+            .find(|a| a.starts_with("--disallowedTools="))
+            .expect("a --disallowedTools= token");
+        assert!(
+            !deny_arg.contains("WebFetch"),
+            "interactive must not be narrowed by a headless-only lever: {deny_arg}"
         );
     }
 
@@ -6366,6 +6649,47 @@ mod tests {
             adapter.capabilities().context_window_tokens,
             Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
             "every existing capabilities() caller gets a capacity with no new plumbing"
+        );
+    }
+
+    /// Round 4 bug 4a: a window `exec.rs` actually observed for this model
+    /// (persisted under `<home>/.zirv/model-windows.json`, see
+    /// `model_window`'s own doc comment) outranks the catalogue's own
+    /// built-in number, whether or not the two agree.
+    #[test]
+    fn an_observed_context_window_outranks_the_catalogue() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let adapter = ClaudeAdapter::new(None).with_home(home.path().to_path_buf());
+
+        // Nothing observed yet: the catalogue's own (now-corrected) number.
+        assert_eq!(
+            adapter.context_window_tokens(Some("claude-sonnet-5")),
+            Some(1_000_000)
+        );
+
+        // A DIFFERENT number than the catalogue states, so the assertion
+        // below cannot pass by coincidence: proves the observed value is
+        // actually consulted, not just present alongside an already-correct
+        // catalogue entry.
+        super::super::super::model_window::record(
+            home.path(),
+            &["claude-sonnet-5", "sonnet"],
+            1_234_567,
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("claude-sonnet-5")),
+            Some(1_234_567),
+            "an observed value for the resolved model id must win"
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("sonnet")),
+            Some(1_234_567),
+            "the same observation is also keyed by the requested alias"
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("opus")),
+            Some(200_000),
+            "an unrelated model's catalogue answer is untouched"
         );
     }
 

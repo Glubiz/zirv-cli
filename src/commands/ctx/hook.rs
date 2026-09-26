@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
@@ -60,6 +62,11 @@ pub enum HookEvent {
     Permission,
     /// Claude SessionStart hook: re-inject the latest handoff on resume/clear.
     SessionStart,
+    /// Issue #774: claude's `SubagentStop` hook, fired once a native `Task`
+    /// subagent's own turn ends -- gates a few cheap, deterministic result-
+    /// contract checks against the SUBAGENT's own transcript before its
+    /// report reaches the lead. See [`run_subagent_stop`]'s own doc comment.
+    SubagentStop,
     /// Codex notify program: same role as Stop.
     Notify {
         /// Payload, when the agent passes it as an argument instead of stdin.
@@ -119,6 +126,21 @@ pub struct HookPayload {
     pub stop_hook_active: bool,
     /// SessionStart only: `"startup" | "resume" | "clear" | "compact"`.
     pub source: String,
+    /// `SubagentStop` only (issue #774, review fix): claude's own unique id
+    /// for the specific subagent dispatch that just finished -- documented
+    /// (code.claude.com/docs/en/agent-sdk/hooks) alongside `agent_
+    /// transcript_path` below. `session_id` above is the LEAD session's own
+    /// id, shared by every subagent dispatched within it ("subagents work
+    /// within a single session"), so it can never distinguish one subagent's
+    /// own completion from another's -- `agent_id` is the field that can.
+    #[serde(default)]
+    pub agent_id: String,
+    /// `SubagentStop` only: the SUBAGENT's own transcript file. `transcript_
+    /// path` above is documented as the LEAD session's main transcript on
+    /// this event, never the subagent's -- reading it for what a subagent
+    /// itself said would silently check the wrong conversation's content.
+    #[serde(default)]
+    pub agent_transcript_path: String,
 }
 
 impl HookPayload {
@@ -438,7 +460,27 @@ fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
 /// observation landing between check and act cannot be clobbered.
 /// Best-effort like every other attention write in this file: a failure to
 /// read or persist never affects the calling hook's own exit code.
+///
+/// Perf: this runs on EVERY `PreToolUse`/`PostToolUse`/
+/// `PermissionRequest`/`PermissionDenied` hook invocation -- the single
+/// hottest call in the hook fleet, since it fires several times per turn
+/// where every other per-turn hook fires once. `record_if` already skips its
+/// own write once `applies` reads false under the lock, but still pays for
+/// the lock file's open-and-lock round trip to reach that check. An
+/// `Approval` latch is the rare case (a permission prompt is not pending for
+/// most tool calls), so a plain unlocked [`super::attention::load`] first
+/// avoids that lock entirely on the common path; only a read that might
+/// actually need clearing falls through to the locked, race-safe
+/// `record_if`, which re-reads and re-checks under the lock exactly as
+/// before -- this pre-check changes nothing about what gets persisted, only
+/// how often the lock is taken to find out there is nothing to do. A stale
+/// or missed read here can only ever skip a clear it would have skipped
+/// anyway on the next call (this hook always runs again), the same
+/// best-effort tolerance `record_if`'s own doc comment already states.
 fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
+    if super::attention::load(state, short).attention != super::attention::Attention::Approval {
+        return;
+    }
     let _ = super::attention::record_if(
         state,
         short,
@@ -715,6 +757,32 @@ fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize
 /// own `CORRECTION_CHECKPOINT_VERSION` pattern.
 const COMPACT_ADVISORY_CHECKPOINT_VERSION: u32 = 1;
 
+/// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24): how
+/// long a sampled `system_bytes`/`schema_bytes` pair (see [`CachedPromptBytes`])
+/// is trusted before [`compact_advisory_stop_nudge`] recompiles the prompt to
+/// resample it. A live measurement found `compile::compile_with_harness_
+/// roster` averaging ~230ms per Stop hook call, almost entirely
+/// `harness_roster_lines`' own per-adapter `AgentAdapter::ready()` calls (a
+/// `resolve_program` PATH walk for every registered adapter, ~14 of them) --
+/// NOT covered by that function's own `ProbeCache` (which only memoizes the
+/// separate `liveness_probe` check, not `ready()` itself), so it paid this
+/// cost fresh on every single turn. Mirrors [`super::adapters::
+/// ProbeCache`]'s own `PROBE_CACHE_TTL_SECS`: the harness roster's byte size
+/// is driven by the exact same "which harnesses are installed" fact that
+/// cache already tolerates up to an hour stale.
+const COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS: u64 = 3600;
+
+/// A sampled `(system_bytes, schema_bytes)` pair from `compile::
+/// compile_with_harness_roster`, plus when it was taken -- see
+/// [`COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS`] for why this is cached rather
+/// than resampled on every Stop hook call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct CachedPromptBytes {
+    system_bytes: u64,
+    schema_bytes: Option<u64>,
+    sampled_at: u64,
+}
+
 /// Issue #312: the reclaim-gated compact advisory's own persisted state, one
 /// file per transcript (mirrors `CorrectionCheckpoint`). `accumulator` is
 /// `breakdown::BreakdownAccumulator`, folded incrementally the same way
@@ -726,7 +794,10 @@ const COMPACT_ADVISORY_CHECKPOINT_VERSION: u32 = 1;
 /// at, so it cannot refire until the window has regrown a full
 /// trigger-sized runway past that point -- mirroring Hermes's own
 /// disarm-until-regrowth rule (see the issue's Origin section), reimplemented
-/// here as advice rather than automatic pruning.
+/// here as advice rather than automatic pruning. `cached_prompt_bytes` is the
+/// hook start-up overhead fix's own cache -- `#[serde(default)]` so a
+/// checkpoint written before this field existed just resamples once, exactly
+/// like a fresh checkpoint would.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CompactAdvisoryCheckpoint {
     #[serde(default)]
@@ -739,6 +810,8 @@ struct CompactAdvisoryCheckpoint {
     consumed: u64,
     #[serde(default)]
     last_fired_window_tokens: Option<u64>,
+    #[serde(default)]
+    cached_prompt_bytes: Option<CachedPromptBytes>,
 }
 
 fn compact_advisory_checkpoint_path(state: &StateDir, transcript: &Path) -> PathBuf {
@@ -808,12 +881,20 @@ fn approx_tokens(tokens: u64) -> String {
 /// trigger-sized runway" must count from the post-compaction window, not a
 /// stale pre-compaction one.
 ///
-/// Reads the current compiled-prompt bytes (`compile::compile_with_harness_
-/// roster`) on every call, like `zirv ctx status --breakdown` does, so this
-/// advisory's own numbers can never disagree with that table's for the same
-/// session at the same moment -- a fixed, largely probe-cached cost, not an
-/// O(session) transcript reparse (the accumulator fold above already keeps
-/// that part incremental).
+/// Samples the compiled-prompt bytes (`compile::compile_with_harness_
+/// roster`), like `zirv ctx status --breakdown` does -- but, since the
+/// wrapper-overhead benchmark (2026-09-24), no more than once per
+/// [`COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS`]. A live measurement found that
+/// compile averaging ~230ms per call, almost entirely `harness_roster_
+/// lines`' own uncached per-adapter `ready()` PATH walk -- paid fresh on
+/// EVERY Stop hook of EVERY turn for a number this advisory only needs
+/// approximately right. `checkpoint.cached_prompt_bytes` (see
+/// [`CachedPromptBytes`]) carries the last sample forward across calls; a
+/// resample can therefore disagree with `status --breakdown`'s own live
+/// number by up to that TTL, which this advisory's own imprecise, threshold-
+/// gated wording ("~N tokens ... saves more than it costs") already assumes.
+/// The accumulator fold above stays exactly as incremental as before this
+/// fix -- only the prompt-bytes sample gained a cache.
 ///
 /// `None` on every failure path and whenever either gate is not met -- like
 /// every other hook advisory, this must never fail loudly.
@@ -835,6 +916,7 @@ fn compact_advisory_stop_nudge(
             offset: 0,
             consumed: 0,
             last_fired_window_tokens: None,
+            cached_prompt_bytes: None,
         });
 
     let mut watcher = Watcher::resuming(
@@ -867,28 +949,47 @@ fn compact_advisory_stop_nudge(
     let advisory = model_window
         .filter(|window| *window > 0)
         .and_then(|window| {
-            let home = crate::utils::home_dir().ok();
-            let compiled = super::compile::compile_with_harness_roster(
-                home.as_deref(),
-                repo,
-                false,
-                cfg,
-                adapter,
-                super::prompt::PromptRole::Orchestrator,
-                state,
-                now_secs(),
-                true,
-                adapters::LaunchMode::Interactive,
-                true,
-            );
-            let system_bytes = compiled
-                .composed
+            let now = now_secs();
+            let fresh = checkpoint
+                .cached_prompt_bytes
                 .as_ref()
-                .map_or(0, |composed| composed.text.len() as u64);
-            let schema_bytes = compiled
-                .harness_roster
-                .as_ref()
-                .map(|roster| roster.delivered_bytes as u64);
+                .filter(|cached| {
+                    now.saturating_sub(cached.sampled_at) < COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS
+                })
+                .cloned();
+            let (system_bytes, schema_bytes) = match fresh {
+                Some(cached) => (cached.system_bytes, cached.schema_bytes),
+                None => {
+                    let home = crate::utils::home_dir().ok();
+                    let compiled = super::compile::compile_with_harness_roster(
+                        home.as_deref(),
+                        repo,
+                        false,
+                        cfg,
+                        adapter,
+                        super::prompt::PromptRole::Orchestrator,
+                        state,
+                        now,
+                        true,
+                        adapters::LaunchMode::Interactive,
+                        true,
+                    );
+                    let system_bytes = compiled
+                        .composed
+                        .as_ref()
+                        .map_or(0, |composed| composed.text.len() as u64);
+                    let schema_bytes = compiled
+                        .harness_roster
+                        .as_ref()
+                        .map(|roster| roster.delivered_bytes as u64);
+                    checkpoint.cached_prompt_bytes = Some(CachedPromptBytes {
+                        system_bytes,
+                        schema_bytes,
+                        sampled_at: now,
+                    });
+                    (system_bytes, schema_bytes)
+                }
+            };
             let summary = checkpoint.accumulator.materialize(
                 score.context_tokens,
                 system_bytes,
@@ -1531,6 +1632,1467 @@ fn verify_on_stop_nudge(
     ))
 }
 
+/// Q1: whether this session has already been BLOCKED once by the
+/// missing-tests gate. A separate, persisted fact from `stop_hook_active`:
+/// that flag only breaks the loop within a single stop ATTEMPT (the harness
+/// re-invoking Stop immediately after a block), never across a session's
+/// later, genuinely new stop attempts -- and this gate must fire at most
+/// once per session, full stop, per the task's own contract.
+const MISSING_TESTS_GATE_RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MissingTestsGateRecord {
+    #[serde(default)]
+    version: u32,
+    blocked: bool,
+}
+
+// F6 (codex review fix): keyed by `stable_short` (the socket-derived
+// identifier `run_stop`'s own caller already computes -- issue #243, see its
+// doc comment there), NOT the rotating session id -- a supervised restart
+// mints a fresh `SESSION_ENV`/`payload.session_id`, and this gate's own
+// contract above ("at most once per session, full stop") means the whole
+// supervised run, which `stable_short` -- unlike the rotating id -- actually
+// tracks across a restart.
+fn missing_tests_gate_record_path(state: &StateDir, stable_short: &str) -> PathBuf {
+    // Mirrors `verify_on_stop_record_path`'s own naming/hash scheme, in the
+    // same scoring directory.
+    state.scoring().join(format!(
+        "{:016x}-missing-tests-gate.json",
+        input_hash(stable_short)
+    ))
+}
+
+/// `Default` (never yet blocked) on any doubt at all -- unreadable, corrupt,
+/// or a different schema version -- like every other hook state read.
+fn load_missing_tests_gate_record(path: &Path) -> MissingTestsGateRecord {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<MissingTestsGateRecord>(&body).ok())
+        .filter(|record| record.version == MISSING_TESTS_GATE_RECORD_VERSION)
+        .unwrap_or_default()
+}
+
+/// Best-effort, like every other hook checkpoint write: a save that fails
+/// costs (at most) one extra block later, never a hook failure now.
+fn save_missing_tests_gate_record(path: &Path, record: &MissingTestsGateRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Whether `path` is itself a test file by name/location alone --
+/// language-agnostic: any path component literally named `test`/`tests`
+/// (case-insensitive: a `tests/` directory, Rust's own `tests/` integration
+/// dir, `src/test/java/...`, ...), or a filename matching pytest's
+/// `test_*.py`, Go/Ruby/PHP/etc.'s `*_test.*`, or JS/TS's `*.test.*`.
+pub(crate) fn path_looks_like_test_file(path: &Path) -> bool {
+    if path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case("test") || name.eq_ignore_ascii_case("tests")
+        })
+    }) {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("test_") || lower.contains("_test.") || lower.contains(".test.")
+}
+
+/// Pure: whether a unified diff's text contains at least one hunk whose
+/// new-file side starts at or after `line`. Split out of
+/// `rust_change_touches_cfg_test` so the hunk-header parsing itself is
+/// directly unit-testable without shelling out to git.
+fn diff_touches_line_at_or_after(diff_text: &str, line: usize) -> bool {
+    diff_text
+        .lines()
+        .filter_map(hunk_new_start)
+        .any(|start| start >= line)
+}
+
+/// Parses a unified-diff hunk header's new-file start line: `"@@ -a,b +c,d
+/// @@"` -> `c` (and the single-line-hunk shorthand `"@@ -a +c @@"` -> `c`,
+/// since splitting `"c"` on `,` yields `["c"]`). `None` for anything that is
+/// not a hunk header at all.
+fn hunk_new_start(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("@@ ")?;
+    let plus = rest.split(' ').find(|part| part.starts_with('+'))?;
+    plus.trim_start_matches('+').split(',').next()?.parse().ok()
+}
+
+/// Rust-specific: whether a change to `path` (relative to `repo`, already
+/// known to exist in the working tree) landed on or after that file's own
+/// `#[cfg(test)]` line. This repo's own convention (CLAUDE.md: "Tests stay
+/// inline in `#[cfg(test)] mod tests`") and idiomatic Rust generally both
+/// keep unit tests in the same file as the code they cover, so
+/// [`path_looks_like_test_file`] alone would never see a test-only change to
+/// an existing source file -- every source file in a Rust project potentially
+/// carries its own inline test module. Never a false positive from an
+/// unrelated pre-existing test module elsewhere in a large file: the check is
+/// position-sensitive, not just "does this file contain `#[cfg(test)]`
+/// anywhere", because the file's tests conventionally sit at the bottom (last
+/// in the file), so a hunk landing at or after that line is, in practice, a
+/// change to the test module rather than to unrelated code above it.
+///
+/// `false` on any doubt at all -- an unreadable file, no `#[cfg(test)]`
+/// marker in it, or a `git diff` that fails for any reason.
+fn rust_change_touches_cfg_test(repo: &Path, path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(repo.join(path)) else {
+        return false;
+    };
+    let Some(test_line) = text
+        .lines()
+        .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+        .map(|zero_based| zero_based + 1)
+    else {
+        return false;
+    };
+    let Some(path_str) = path.to_str() else {
+        return false;
+    };
+    let Ok(output) = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["diff", "--unified=0", "HEAD", "--", path_str])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    diff_touches_line_at_or_after(&String::from_utf8_lossy(&output.stdout), test_line)
+}
+
+/// Q1 (blind-review completion quality): the Stop-hook supervision check for
+/// headless sessions. A blind reviewer scoring 24 headless runs made the same
+/// deduction on ~70% of them regardless of condition -- "the agent added no
+/// tests of its own for the change" -- even though zirv's own engineering
+/// standard already asks for one focused test per behaviour change plus the
+/// unhappy path. This makes a headless session that skips it stop with a
+/// concrete reason to fix that, exactly once, rather than relying on the
+/// prompt alone.
+///
+/// `None` on any doubt at all -- like every other Stop-hook advisory in this
+/// file, a supervision failure here is pure passthrough, never a reason to
+/// fail the hook or the session (CLAUDE.md: "supervision failure is
+/// passthrough"). Fires only when `cfg.missing_tests_gate.enabled`, only for
+/// a HEADLESS session (`adapters::HEADLESS_ENV == "1"` -- an interactive
+/// session, which never sets it, is never blocked by this), and only once
+/// per session (the persisted [`MissingTestsGateRecord`] -- a later call
+/// that finds `blocked` already `true` returns `None` regardless of what
+/// changed since). F6 (codex review fix): "session" here means the whole
+/// supervised run, so `stable_short` is keyed on, not the rotating
+/// `SESSION_ENV`/`payload.session_id` -- see [`missing_tests_gate_record_path`]'s
+/// own doc comment.
+///
+/// F6 residual (review round 2): `stable_short` is `short_id(&payload.
+/// session_id)` (`sessions::short_id`, ASCII-alphanumeric only) whenever no
+/// socket was ever bound -- an unsupervised/`--no-supervise` launch, or the
+/// codex `Notify` path -- and `short_id` degrades to the EMPTY string for a
+/// session id that is itself empty or carries no ASCII-alphanumeric
+/// character at all. Keying `missing_tests_gate_record_path` on that empty
+/// string would hash every such identity-less session onto the SAME record,
+/// letting one unrelated session's `blocked = true` silently suppress the
+/// gate for every other one. `raw_session_id` (`payload.session_id`,
+/// unfiltered -- `input_hash` hashes arbitrary UTF-8 bytes, not just ASCII)
+/// is the fallback key when `stable_short` is empty; when BOTH are empty
+/// there is no identity to key a shared, persisted record on at all, so the
+/// gate is skipped outright -- never blocks, never reads or writes a record
+/// -- rather than risk a cross-session collision. Supervision must never
+/// worsen a session.
+fn missing_tests_gate_reason(
+    state: &StateDir,
+    repo: &Path,
+    stable_short: &str,
+    raw_session_id: &str,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !cfg.missing_tests_gate.enabled {
+        return None;
+    }
+    if env(adapters::HEADLESS_ENV).as_deref() != Some("1") {
+        return None;
+    }
+    let gate_key = if !stable_short.is_empty() {
+        stable_short
+    } else if !raw_session_id.is_empty() {
+        raw_session_id
+    } else {
+        return None;
+    };
+    let path = missing_tests_gate_record_path(state, gate_key);
+    if load_missing_tests_gate_record(&path).blocked {
+        return None;
+    }
+    // Any doubt here (no git, no repo, ...) reads as "nothing changed": a
+    // block is a hard stop, never worth risking on an unreadable repo state.
+    let changed = verification::changed_paths(repo).ok()?;
+    let mut has_test_change = false;
+    let mut has_non_test_source_change = false;
+    for candidate in &changed {
+        let is_test = path_looks_like_test_file(candidate)
+            || (candidate.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && rust_change_touches_cfg_test(repo, candidate));
+        if is_test {
+            has_test_change = true;
+        } else if !super::lifecycle::changes_are_doc_only(std::slice::from_ref(candidate)) {
+            has_non_test_source_change = true;
+        }
+    }
+    if !has_non_test_source_change || has_test_change {
+        return None;
+    }
+    // Issue 6a (`[jev] missing_tests`, off by default): a decisive "not
+    // owed" answer skips this ONE block without ever persisting it as
+    // blocked -- the record stays untouched, so a later, still-test-less
+    // turn in the same session can still be asked/blocked. Everything else
+    // (gate off, no credential, indecisive, an error, or a decisive but not
+    // strongly "not owed" answer) blocks exactly as the deterministic gate
+    // already does above.
+    if missing_tests_owed_jev_says_skip(state, cfg, repo, &changed) {
+        return None;
+    }
+    let mut record = load_missing_tests_gate_record(&path);
+    record.version = MISSING_TESTS_GATE_RECORD_VERSION;
+    record.blocked = true;
+    save_missing_tests_gate_record(&path, &record);
+    Some(
+        "zirv: this turn edited source files with no test of its own -- add a focused test for \
+         each behaviour change the request asks for, asserting the exact formats, orderings and \
+         messages it states and the invalid-input/unhappy path, then run the test suite and \
+         finish."
+            .to_string(),
+    )
+}
+
+// -- Issue 6a: `[jev] missing_tests` -----------------------------------------
+
+/// At most this many tracked test files actually READ for the missing-
+/// tests-owed Jev gate's own "mentions" fact -- keeps a huge test suite from
+/// turning one Stop-hook call into an unbounded scan.
+const MISSING_TESTS_OWED_TEST_SCAN_CAP: usize = 50;
+
+/// The noul-probability floor a decisive answer must sit AT OR BELOW before
+/// `missing_tests_owed_jev_says_skip` treats it as "not owed" and skips the
+/// deterministic block. Mirrors [`STOP_VERIFY_MIN_PROBABILITY`]'s own
+/// conservative stance but inverted, and if anything stricter: skipping a
+/// real gate is riskier than one extra (already rare, once-per-session)
+/// false block, so only a strong "not owed" signal -- never merely "leaning
+/// no" -- may skip it.
+const MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY: f64 = 0.1;
+
+/// Every tracked path `git ls-files` reports that itself looks like a test
+/// file ([`path_looks_like_test_file`]) -- the missing-tests-owed Jev gate's
+/// own "does this repo even have tests" and "mentions" facts both read off
+/// this same listing. Empty on any doubt at all (git failure, no repo).
+fn missing_tests_owed_tracked_test_paths(repo: &Path) -> Vec<PathBuf> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .map(PathBuf::from)
+        .filter(|path| path_looks_like_test_file(path))
+        .collect()
+}
+
+/// Total added+removed lines across the working tree's own uncommitted
+/// changes (`git diff --numstat HEAD`) -- the missing-tests-owed Jev gate's
+/// own "how big is this change" fact. `0` on any doubt (git failure): the
+/// gate simply falls back to the coarsest bucket, never a hook failure.
+fn missing_tests_owed_changed_lines(repo: &Path) -> usize {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["diff", "--numstat", "HEAD"])
+        .current_dir(repo)
+        .output()
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let added: usize = fields.next()?.parse().ok()?;
+            let removed: usize = fields.next()?.parse().ok()?;
+            Some(added + removed)
+        })
+        .sum()
+}
+
+/// How many of `test_paths` (capped at [`MISSING_TESTS_OWED_TEST_SCAN_CAP`]
+/// files actually read) contain a plain substring match for at least one of
+/// `stems` (a changed non-test file's own file stem, e.g. `score` for
+/// `score.rs`) -- a cheap, deliberately approximate stand-in for "an
+/// existing test already imports/mentions this module". `0` when `stems` is
+/// empty or no test file matches.
+fn missing_tests_owed_mentions(repo: &Path, test_paths: &[PathBuf], stems: &[String]) -> usize {
+    if stems.is_empty() {
+        return 0;
+    }
+    test_paths
+        .iter()
+        .take(MISSING_TESTS_OWED_TEST_SCAN_CAP)
+        .filter(|path| {
+            std::fs::read_to_string(repo.join(path))
+                .ok()
+                .is_some_and(|text| stems.iter().any(|stem| text.contains(stem.as_str())))
+        })
+        .count()
+}
+
+/// The missing-tests-owed Jev gate's own local, numeric-only facts, folded
+/// from the SAME `changed` list the deterministic gate above already
+/// computed (never a fresh `changed_paths` re-query): `[non-test source
+/// files changed, changed-lines bucket (0 <10, 1 <100, 2 <500, 3 larger),
+/// whether the repo has any test files at all (0/1), how many existing test
+/// files mention a changed module's own name, doc-only share of the change
+/// (0-4, quarters)]`. Every cell a small capped integer -- never a path,
+/// filename, or file content.
+fn missing_tests_owed_facts(repo: &Path, changed: &[PathBuf]) -> Vec<u32> {
+    let non_test_source: Vec<&PathBuf> = changed
+        .iter()
+        .filter(|path| {
+            !path_looks_like_test_file(path)
+                && !super::lifecycle::changes_are_doc_only(std::slice::from_ref(path))
+        })
+        .collect();
+    let doc_only_count = changed
+        .iter()
+        .filter(|path| super::lifecycle::changes_are_doc_only(std::slice::from_ref(path)))
+        .count();
+    let lines_bucket = match missing_tests_owed_changed_lines(repo) {
+        0..10 => 0,
+        10..100 => 1,
+        100..500 => 2,
+        _ => 3,
+    };
+    let test_paths = missing_tests_owed_tracked_test_paths(repo);
+    let has_tests = u32::from(!test_paths.is_empty());
+    let stems: Vec<String> = non_test_source
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(str::to_string)
+        .collect();
+    let mentions = missing_tests_owed_mentions(repo, &test_paths, &stems);
+    let doc_only_share = if changed.is_empty() {
+        0
+    } else {
+        capped_u32(doc_only_count.saturating_mul(4) / changed.len())
+    };
+    vec![
+        capped_u32(non_test_source.len()),
+        lines_bucket,
+        has_tests,
+        capped_u32(mentions),
+        doc_only_share,
+    ]
+}
+
+fn missing_tests_owed_question() -> [super::jev::Question; 1] {
+    [super::jev::Question::metadata_noul(
+        "tests_owed",
+        // Kept under `safe_metadata_request`'s own 512-char instructions cap
+        // (checked once by `stop_verify_request_passes_the_metadata_guard`'s
+        // own sibling test below): an oversized instructions string fails
+        // that guard and `ask` never even reaches the network, which reads
+        // as a silent, permanent no-op for this whole gate.
+        "Facts [non-test source files changed, changed-lines bucket (0 <10, 1 <100, 2 <500, 3 \
+larger), repo has test files (0/1), test files mentioning a changed module, doc-only share (0-4, \
+quarters)] describe an uncommitted change with no test update. Is a new test owed? Answer false \
+only if clearly not owed. Answer true if unsure.",
+        "a new or updated test is owed for this change",
+        "no new test is owed for this change",
+    )]
+}
+
+/// Issue 6a: `[jev] missing_tests` (off by default). Asks Jev one metadata-
+/// only Noul question from [`missing_tests_owed_facts`] and returns `true`
+/// only for a DECISIVE, strongly "not owed" answer (at or below
+/// [`MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY`]) -- the one case
+/// `missing_tests_gate_reason` reads as "skip this block". `false` on every
+/// other outcome (the key off, no `[proxy.typesafe]` credential, no answer,
+/// an indecisive answer, or a decisive answer that is not strongly "not
+/// owed"): the deterministic gate then blocks exactly as it always has.
+fn missing_tests_owed_jev_says_skip(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    repo: &Path,
+    changed: &[PathBuf],
+) -> bool {
+    if !cfg.jev.missing_tests || !super::jev::available(&cfg.proxy.typesafe) {
+        return false;
+    }
+    let facts = missing_tests_owed_facts(repo, changed);
+    let advise_state = DispatchAdviseState {
+        metadata_only: true,
+        facts: vec![facts],
+    };
+    let Some(answers) = super::jev::advise(
+        cfg,
+        state,
+        "missing_tests",
+        cfg.jev.missing_tests,
+        &advise_state,
+        &missing_tests_owed_question(),
+    ) else {
+        return false;
+    };
+    let Some(answer) = answers.get("tests_owed") else {
+        return false;
+    };
+    if !answer.decisive(0.0, super::jev::DEFAULT_MIN_MARGIN) {
+        return false;
+    }
+    let Some(probability) = answer.as_noul() else {
+        return false;
+    };
+    if probability > MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY {
+        return false;
+    }
+    let effect = super::jev::JevEffect::new("missing_tests", "gate_skipped");
+    super::jev::record_effect(cfg, state, cfg.jev.missing_tests, &effect);
+    true
+}
+
+// -- Scope-creep guard ------------------------------------------------------
+//
+// Operator-requested guard: a hidden benchmark task asked for a sort-order
+// change plus "pagination works the same as always" and a `--legacy-order`
+// flag preserving "the old raw order exactly as before"; one agent noticed a
+// pre-existing pagination off-by-one, decided it "looked like an outright
+// bug" and fixed it unasked, and hidden tests expecting unchanged pagination
+// failed. This never blocks scope creep outright (that would need real
+// review); it only makes the request's own preservation language visible at
+// the moment of editing (`PreToolUse`) and catches an unrequested-fix claim
+// once at the end (`Stop`) as a backstop.
+//
+// `UserPromptSubmit` records the request's own state; `PreToolUse` reads it
+// for the checkpoint; `Stop` reads it for the backstop. All three degrade to
+// a silent no-op on any doubt at all (config off, no session identity, no
+// state dir, an I/O failure) -- a hook must never break a session over this.
+
+/// `ScopeGuardRecord`'s own schema version -- bumped if the shape ever
+/// changes, so an old record on disk reads back as "no record" rather than a
+/// deserialize failure or (worse) a wrongly-interpreted new field.
+///
+/// v2 (the shell-edit checkpoint): adds `shell_baseline`, the tracked
+/// modified/deleted file snapshot `record_scope_guard_request` takes at
+/// `UserPromptSubmit`. Bumped rather than defaulted in place because an old
+/// v1 record on disk has no baseline at all -- reading it back as "no
+/// record" (forcing the next `UserPromptSubmit` to rebuild one) is safer
+/// than silently treating an absent baseline as "nothing was ever modified",
+/// which would make the very first shell edit after an upgrade look like a
+/// change against an empty baseline and fire the checkpoint immediately.
+///
+/// v3 (the stated-details checklist): adds `stated_details`.
+const SCOPE_GUARD_RECORD_VERSION: u32 = 3;
+
+/// At most this many characters across every extracted constraint sentence,
+/// joined -- keeps the checkpoint/backstop text bounded regardless of how
+/// verbose the request was.
+const SCOPE_GUARD_CONSTRAINT_BUDGET: usize = 400;
+
+/// At most this many extracted constraint sentences.
+const SCOPE_GUARD_MAX_CONSTRAINTS: usize = 3;
+
+/// At most this many characters of the quoted "unrequested fix" sentence in
+/// a Stop block reason.
+const SCOPE_GUARD_QUOTE_BUDGET: usize = 200;
+
+/// Per-session scope-guard state, one record per prompt: a new prompt (a
+/// different `prompt_hash`) replaces the whole record rather than
+/// accumulating. Mirrors `AdoptionRecord`'s own per-session file layout
+/// (`state::scope_guard`, keyed the same way `adoption_record_path` is).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ScopeGuardRecord {
+    #[serde(default)]
+    version: u32,
+    /// `input_hash` of the prompt this record was built from.
+    #[serde(default)]
+    prompt_hash: u64,
+    /// The extracted preservation/limitation sentences, in prompt order.
+    #[serde(default)]
+    constraints: Vec<String>,
+    /// Whether the request itself already asks for a fix -- the Stop
+    /// backstop never fires when it does: there is no "unrequested" fix to
+    /// catch.
+    #[serde(default)]
+    asks_for_fix: bool,
+    /// Whether `PreToolUse` has already shown the checkpoint for this
+    /// prompt.
+    #[serde(default)]
+    checkpoint_shown: bool,
+    /// Whether `Stop` has already checked (and possibly blocked) this
+    /// prompt.
+    #[serde(default)]
+    stop_checked: bool,
+    /// The repo's tracked modified/deleted files (never untracked) at the
+    /// moment this prompt was recorded, each with a cheap size/mtime
+    /// fingerprint (never file contents) -- the baseline the `PostToolUse`
+    /// shell-edit checkpoint diffs its own re-query against, so a shell
+    /// command (`sed -i`, `python -c "open(p,'w')..."`, `cat > file`) that
+    /// changes an existing tracked file is visible even though it never
+    /// goes through `Edit`/`Write` at all. Empty when git failed, this is
+    /// not a git repo, or the guard was disabled -- see
+    /// `scope_guard_tracked_modified`'s own doc comment.
+    #[serde(default)]
+    shell_baseline: Vec<ScopeGuardBaselineEntry>,
+    /// The request's own stated, checkable details -- a quoted literal or an
+    /// ordering/format/exactness word (see
+    /// [`SCOPE_GUARD_STATED_DETAIL_RE`]) -- in prompt order, never
+    /// duplicating a sentence already captured in `constraints`. Shown in
+    /// the checkpoint as a numbered "Stated details to check before you
+    /// finish" list, governed by `cfg.scope_guard.enabled` the same as
+    /// `constraints` itself.
+    #[serde(default)]
+    stated_details: Vec<String>,
+}
+
+/// One tracked file's cheap fingerprint for the shell-edit checkpoint's own
+/// before/after comparison: never a content hash (CLAUDE.md: "a cheap
+/// fingerprint (size + mtime is fine; do not hash large file contents)").
+/// `exists` distinguishes a tracked file `git status` reports as deleted
+/// (no size/mtime to read) from one that is merely absent from a snapshot
+/// entirely -- so a delete, and a later re-create with different content,
+/// both still count as a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScopeGuardBaselineEntry {
+    /// Repo-relative, forward-slashed (`git status --porcelain`'s own
+    /// spelling) -- never a platform `PathBuf`, so the record round-trips
+    /// identically on every OS this hook runs on.
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    exists: bool,
+    #[serde(default)]
+    size: u64,
+    /// Nanoseconds since `UNIX_EPOCH`, never whole seconds -- a same-size
+    /// rewrite that lands within the same second as the baseline still
+    /// changes this value, so it is never mistaken for "unchanged".
+    #[serde(default)]
+    mtime: u64,
+}
+
+/// `ScopeGuardBaselineEntry` for one repo-relative path already known to be
+/// tracked-and-modified/deleted by `git status`: reads the file's current
+/// size/mtime off disk, or (a delete) records `exists: false` when it is not
+/// there at all. Never touches file contents.
+fn scope_guard_baseline_entry(repo: &Path, rel: &str) -> ScopeGuardBaselineEntry {
+    match std::fs::metadata(repo.join(rel)) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            ScopeGuardBaselineEntry {
+                path: rel.to_string(),
+                exists: true,
+                size: meta.len(),
+                mtime,
+            }
+        }
+        Err(_) => ScopeGuardBaselineEntry {
+            path: rel.to_string(),
+            exists: false,
+            size: 0,
+            mtime: 0,
+        },
+    }
+}
+
+/// The repo's currently tracked, modified-or-deleted files -- the shell-edit
+/// checkpoint's own snapshot, taken once at `UserPromptSubmit` as the
+/// baseline and re-taken on every qualifying `PostToolUse` shell call to
+/// diff against it. Deliberately narrower than
+/// `workflow::verification::changed_paths` (which also folds in untracked
+/// `??` files via `git ls-files --others`): an untracked file is a NEW file,
+/// never an edit to "existing code", so including it here would make the
+/// checkpoint fire for a shell command that only ever created something.
+///
+/// `None` on any doubt at all -- not a git repo, git missing, git failing
+/// for any other reason -- so both the baseline write and the later
+/// re-query degrade to silence together (see this guard's own module-level
+/// doc comment: "all three degrade to a silent no-op on any doubt at all").
+/// `Some(vec![])` is a real, successful "nothing is modified" answer, never
+/// conflated with the failure case.
+fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEntry>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--no-renames"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        // `git status --porcelain` lines are `XY PATH`, `XY` exactly two
+        // status characters, a space, then the path -- `??` (untracked) and
+        // `!!` (ignored) are the only two-letter codes with no tracked
+        // meaning at all; every other code names a real index/worktree
+        // change to a file git already tracks.
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..2];
+        if status == "??" || status == "!!" {
+            continue;
+        }
+        // The INDEX column (`status`'s first byte) is `A` for a file
+        // created and staged THIS turn, never for one that existed before
+        // it -- `AM` (staged-new, then edited again) contains an `M` that
+        // would otherwise be read as an edit to an EXISTING tracked file.
+        if status.as_bytes()[0] == b'A' {
+            continue;
+        }
+        if !status.contains('M') && !status.contains('D') {
+            continue;
+        }
+        let rel = line[3..].trim();
+        if rel.is_empty() {
+            continue;
+        }
+        // Issue #229/#232's own exclusion, mirrored from `changed_paths`:
+        // the workflow's own `.zirv/work/<id>/*` artifacts are not the
+        // operator's change surface, and this benchmark's own transcripts
+        // are full of concurrent writes to them.
+        if crate::commands::workflow::classify::is_workflow_work_path(Path::new(rel)) {
+            continue;
+        }
+        entries.push(scope_guard_baseline_entry(repo, rel));
+    }
+    Some(entries)
+}
+
+/// Diffs `repo`'s CURRENT tracked modified/deleted snapshot against
+/// `baseline`: every path that is new (absent from `baseline`) or whose
+/// fingerprint differs, sorted. `None` when the current snapshot itself
+/// cannot be read (see [`scope_guard_tracked_modified`]) -- the caller reads
+/// that identically to "nothing changed" (silent), never as a real empty
+/// result.
+fn scope_guard_tracked_changes_since(
+    repo: &Path,
+    baseline: &[ScopeGuardBaselineEntry],
+) -> Option<Vec<String>> {
+    let current = scope_guard_tracked_modified(repo)?;
+    let prior: std::collections::HashMap<&str, &ScopeGuardBaselineEntry> = baseline
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|entry| {
+            prior.get(entry.path.as_str()).is_none_or(|before| {
+                before.exists != entry.exists
+                    || before.size != entry.size
+                    || before.mtime != entry.mtime
+            })
+        })
+        .map(|entry| entry.path.clone())
+        .collect();
+    changed.sort();
+    Some(changed)
+}
+
+/// One file per session id, named after a hash of it -- identical layout to
+/// [`adoption_record_path`].
+fn scope_guard_record_path(state: &StateDir, session: &str) -> PathBuf {
+    state
+        .scope_guard()
+        .join(format!("{:016x}.json", input_hash(session)))
+}
+
+/// `None` on any doubt at all -- missing, corrupt, or a different schema
+/// version -- deliberately unlike [`load_adoption_record`]'s always-`Default`
+/// contract: an absent record here means no `UserPromptSubmit` ever ran for
+/// this session (the guard disabled, no session identity, a write failure),
+/// and the checkpoint/backstop must have nothing to say rather than
+/// synthesizing an empty one from scratch.
+fn load_scope_guard_record(path: &Path) -> Option<ScopeGuardRecord> {
+    let record = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ScopeGuardRecord>(&body).ok())?;
+    (record.version == SCOPE_GUARD_RECORD_VERSION).then_some(record)
+}
+
+/// Best-effort, like every other hook checkpoint write: a save that fails
+/// costs the guard for this one prompt, never a hook failure.
+fn save_scope_guard_record(path: &Path, record: &ScopeGuardRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// Splits `text` into naive sentences on `.`/`!`/`?` followed by whitespace
+/// or end-of-text -- good enough for classifying a user's own prose prompt
+/// or an assistant's own closing report (never source code), where an
+/// abbreviation-heavy false split costs nothing worse than one extra,
+/// harmless candidate sentence.
+fn scope_guard_split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let end = i + ch.len_utf8();
+        if !text[end..].chars().next().is_none_or(char::is_whitespace) {
+            continue;
+        }
+        let sentence = text[start..end].trim();
+        if !sentence.is_empty() {
+            sentences.push(sentence.to_string());
+        }
+        start = end;
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        sentences.push(tail.to_string());
+    }
+    sentences
+}
+
+/// Preservation/limitation phrasing (deliberately conservative -- favours
+/// catching a real constraint over precision): "same as always/before",
+/// "works the same", "as before", "exactly as", "unchanged", "keep ",
+/// "preserve", "don't/do not/never change/touch/modify/alter", "only ",
+/// "backward(s) compat[ible]", "existing behavio(u)r", "leave ... alone".
+static SCOPE_GUARD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?xi)
+        same\s+as\s+(?:always|before)
+        | works\s+the\s+same
+        | as\s+before
+        | exactly\s+as
+        | unchanged
+        | keep\s
+        | preserve
+        | (?:don'?t|do\ not|never)\s+(?:change|touch|modify|alter)
+        | only\s
+        | backwards?[\s-]*compat
+        | existing\s+behaviou?r
+        | leave\b[\s\S]*?\balone\b
+        ",
+    )
+    .expect("valid scope-guard constraint regex")
+});
+
+/// Shared selection algorithm for [`scope_guard_extract_constraints`]/
+/// [`scope_guard_extract_stated_details`]: keeps at most `max_count` of
+/// `candidates`, closest to the END of the prompt first -- a closing,
+/// clarifying sentence (e.g. "...exactly as before.") wins over an earlier
+/// one that only incidentally matches the same conservative pattern (e.g. a
+/// feature sentence that happens to use the word "keep" for an unrelated
+/// tie-break rule -- see this guard's own worked example, where exactly that
+/// happens) -- with the joined result capped at `budget` characters.
+/// Returned in the prompt's own original order.
+fn scope_guard_select_capped(
+    candidates: Vec<String>,
+    max_count: usize,
+    budget: usize,
+) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for sentence in candidates.into_iter().rev() {
+        if kept.len() >= max_count {
+            break;
+        }
+        let extra = sentence.chars().count() + usize::from(!kept.is_empty());
+        if total + extra > budget {
+            continue;
+        }
+        total += extra;
+        kept.push(sentence);
+    }
+    kept.reverse();
+    kept
+}
+
+/// Extracts up to [`SCOPE_GUARD_MAX_CONSTRAINTS`] preservation/limitation
+/// sentences from `prompt`, trimmed, with the joined result capped at
+/// [`SCOPE_GUARD_CONSTRAINT_BUDGET`] characters -- see
+/// [`scope_guard_select_capped`] for the selection rule.
+fn scope_guard_extract_constraints(prompt: &str) -> Vec<String> {
+    let matched: Vec<String> = scope_guard_split_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| SCOPE_GUARD_CONSTRAINT_RE.is_match(sentence))
+        .collect();
+    scope_guard_select_capped(
+        matched,
+        SCOPE_GUARD_MAX_CONSTRAINTS,
+        SCOPE_GUARD_CONSTRAINT_BUDGET,
+    )
+}
+
+/// At most this many characters across every extracted stated-detail
+/// sentence, joined -- mirrors [`SCOPE_GUARD_CONSTRAINT_BUDGET`]'s own role.
+const SCOPE_GUARD_STATED_DETAIL_BUDGET: usize = 700;
+
+/// At most this many extracted stated-detail sentences.
+const SCOPE_GUARD_MAX_STATED_DETAILS: usize = 8;
+
+/// A stated, checkable detail: a backtick- or double-quoted literal (a
+/// literal value, name, or message the request pins down exactly), or an
+/// ordering/format/exactness word -- "sorted", "order", "ascending",
+/// "descending", "exactly", "exact", "format", "exit status"/"exit code",
+/// "stderr", "stdout", "print(s)", "message", "case-insensitive",
+/// "comma-separated", "no spaces", "trailing", "leading". Deliberately
+/// conservative like [`SCOPE_GUARD_CONSTRAINT_RE`]: favours catching a real
+/// stated detail over precision.
+static SCOPE_GUARD_STATED_DETAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?xi)
+        `[^`]+`
+        | "[^"]+"
+        | \bsorted\b
+        | \border\b
+        | \bascending\b
+        | \bdescending\b
+        | \bexactly\b
+        | \bexact\b
+        | \bformat\b
+        | exit\s+status
+        | exit\s+code
+        | \bstderr\b
+        | \bstdout\b
+        | \bprints?\b
+        | \bmessage\b
+        | case-insensitive
+        | comma-separated
+        | no\s+spaces
+        | \btrailing\b
+        | \bleading\b
+        "#,
+    )
+    .expect("valid scope-guard stated-detail regex")
+});
+
+/// Extracts up to [`SCOPE_GUARD_MAX_STATED_DETAILS`] stated-detail sentences
+/// from `prompt` (see [`SCOPE_GUARD_STATED_DETAIL_RE`]), skipping any
+/// sentence already captured in `constraints` (never duplicated between the
+/// scope guard's own preservation language and this checklist), with the
+/// joined result capped at [`SCOPE_GUARD_STATED_DETAIL_BUDGET`] characters --
+/// see [`scope_guard_select_capped`] for the selection rule.
+fn scope_guard_extract_stated_details(prompt: &str, constraints: &[String]) -> Vec<String> {
+    let matched: Vec<String> = scope_guard_split_sentences(prompt)
+        .into_iter()
+        .filter(|sentence| {
+            SCOPE_GUARD_STATED_DETAIL_RE.is_match(sentence) && !constraints.contains(sentence)
+        })
+        .collect();
+    scope_guard_select_capped(
+        matched,
+        SCOPE_GUARD_MAX_STATED_DETAILS,
+        SCOPE_GUARD_STATED_DETAIL_BUDGET,
+    )
+}
+
+/// Whether the request itself already asks for a fix, anywhere in the
+/// prompt, case-insensitive. A superset of every word the Stop backstop's
+/// own [`SCOPE_GUARD_FIX_VERB_RE`]/[`SCOPE_GUARD_BUG_WORD_RE`] look for, so
+/// a request phrased as "resolve the pagination issue" can never have its
+/// own requested fix blocked as unrequested.
+fn scope_guard_prompt_asks_for_fix(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    [
+        "fix",
+        "bug",
+        "broken",
+        "error",
+        "wrong",
+        "crash",
+        "regression",
+        "off-by-one",
+        "issue",
+        "quirk",
+        "problem",
+        "resolve",
+        "correct",
+        "repair",
+        "patch",
+        "fail",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+/// `UserPromptSubmit`: records this session's scope-guard state for the
+/// CURRENT prompt, replacing any record from an earlier one (a different
+/// `prompt_hash`). Never emits anything -- the checkpoint/backstop are the
+/// only channels that speak; this only persists state for them to read.
+/// Every gate below (config off, no session identity, no state dir) is a
+/// silent skip: a hook must never fail a prompt over this.
+///
+/// `repo` also seeds `shell_baseline` (the `PostToolUse` shell-edit
+/// checkpoint's own before-snapshot, [`scope_guard_tracked_modified`]) --
+/// best-effort like everything else here: a failed git query just leaves it
+/// empty, which reads downstream as "no baseline to diff against" and keeps
+/// that checkpoint silent too, never as a hook failure.
+fn record_scope_guard_request(
+    cfg: &CtxConfig,
+    payload_session_id: &str,
+    prompt: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) {
+    // The record now also backs the missing-tests "tests owed" line folded
+    // into this same checkpoint (see `missing_tests_owed`/`scope_checkpoint_
+    // combine`), which fires independently of `scope_guard.enabled` -- so a
+    // record must exist whenever EITHER feature is on, not only when the
+    // scope guard itself is.
+    if !cfg.scope_guard.enabled && !cfg.missing_tests_gate.enabled {
+        return;
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
+    if session.is_empty() {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let path = scope_guard_record_path(&state, &session);
+    let prompt_hash = input_hash(prompt);
+    if load_scope_guard_record(&path).is_some_and(|existing| existing.prompt_hash == prompt_hash) {
+        // The identical prompt was already recorded -- leave the flags
+        // (`checkpoint_shown`/`stop_checked`) and the shell baseline exactly
+        // as they are.
+        return;
+    }
+    let constraints = scope_guard_extract_constraints(prompt);
+    let record = ScopeGuardRecord {
+        version: SCOPE_GUARD_RECORD_VERSION,
+        prompt_hash,
+        stated_details: scope_guard_extract_stated_details(prompt, &constraints),
+        constraints,
+        asks_for_fix: scope_guard_prompt_asks_for_fix(prompt),
+        checkpoint_shown: false,
+        stop_checked: false,
+        shell_baseline: scope_guard_tracked_modified(repo).unwrap_or_default(),
+    };
+    save_scope_guard_record(&path, &record);
+    super::state::prune_to_newest(&state.scope_guard(), super::state::KEEP_NEWEST);
+}
+
+/// `PreToolUse`, `Edit`/`MultiEdit`/`NotebookEdit`/an existing-file `Write`
+/// only: the non-blocking scope checkpoint's own TEXT, shown once per prompt
+/// (the persisted `checkpoint_shown` flag). `None` on every gate below (a
+/// tool this guard does not cover, a `Write` to a file that does not exist
+/// yet, no session identity, no recorded prompt at all, already shown for
+/// this prompt, and -- since neither `cfg.scope_guard.enabled` nor
+/// `missing_tests_owed` has anything to say -- both features off or neither
+/// applying to this edit) -- a silent skip, like every other advisory in
+/// this file. Never changes `payload`'s own permission outcome: this only
+/// ever rides as a non-blocking `additionalContext` note.
+///
+/// Folds in the missing-tests gate's own "tests owed" line
+/// ([`missing_tests_owed`]/[`scope_checkpoint_combine`]) alongside the scope
+/// guard's own text: a headless session that would otherwise only learn it
+/// owes a test once the missing-tests Stop gate blocks it -- after the whole
+/// turn is already done -- sees it here instead, at the FIRST edit, in the
+/// same one-time note. Independent of `cfg.scope_guard.enabled`: the tests-
+/// owed line can fire this checkpoint on its own even with the scope guard
+/// itself turned off.
+///
+/// Deliberately a pure read -- it never marks the checkpoint shown itself.
+/// `run_pretool`'s own orchestrator-write guard can still DENY this exact
+/// call after this function returns `Some`, in which case nothing is ever
+/// actually surfaced to the model; the caller commits the flag with
+/// [`scope_checkpoint_mark_shown`] only once it knows the text is really
+/// going out, so a denied write never silently spends the one checkpoint a
+/// later, actually-allowed edit still needed.
+fn scope_checkpoint_note(
+    payload: &PreToolPayload,
+    cwd: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !matches!(
+        payload.tool_name.as_str(),
+        "Edit" | "MultiEdit" | "NotebookEdit" | "Write"
+    ) {
+        return None;
+    }
+    let target = normalized_write_target(payload, cwd);
+    if payload.tool_name == "Write" && !target.as_deref().is_some_and(Path::is_file) {
+        return None;
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+    if session.is_empty() {
+        return None;
+    }
+    let state = StateDir::resolve(env).ok()?;
+    let path = scope_guard_record_path(&state, &session);
+    let record = load_scope_guard_record(&path)?;
+    if record.checkpoint_shown {
+        return None;
+    }
+    let headless = payload.permission_mode == "dontAsk";
+    let scope_text = cfg
+        .scope_guard
+        .enabled
+        .then(|| scope_checkpoint_text(&record.constraints, &record.stated_details, headless));
+    let tests_owed = target
+        .as_deref()
+        .is_some_and(|target| missing_tests_owed(cfg, env, &[target]));
+    scope_checkpoint_combine(scope_text, tests_owed)
+}
+
+/// Commits [`scope_checkpoint_note`]'s own `checkpoint_shown` flag -- called
+/// only once its text is actually about to reach the model (see that
+/// function's own doc comment for why this is split out). Best-effort, like
+/// every other state write in this file: a save that fails costs the guard
+/// for this one prompt, never a hook failure.
+fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLookup<'_>) {
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+    if session.is_empty() {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let path = scope_guard_record_path(&state, &session);
+    let Some(mut record) = load_scope_guard_record(&path) else {
+        return;
+    };
+    if record.checkpoint_shown {
+        return;
+    }
+    record.checkpoint_shown = true;
+    save_scope_guard_record(&path, &record);
+}
+
+/// zirv's own tests-owed sentence, folded into the same one-time checkpoint
+/// as the scope guard's own text (see [`missing_tests_owed`]/
+/// [`scope_checkpoint_combine`]) rather than waiting for the missing-tests
+/// Stop gate ([`missing_tests_gate_reason`]) to say it after the whole turn
+/// has already finished -- that costs a whole extra round for a headless
+/// session that never touched a test file.
+const MISSING_TESTS_OWED_LINE: &str = "Write a focused test for each behaviour change in this same pass -- the run cannot finish \
+     without one.";
+
+/// Whether `path` is the kind of change the missing-tests gate itself cares
+/// about: not a test file ([`path_looks_like_test_file`]) and not doc-only
+/// ([`super::lifecycle::changes_are_doc_only`]). Shared by
+/// `missing_tests_gate_reason` (which classifies every path the WHOLE turn
+/// changed) and [`missing_tests_owed`] (which classifies only the path(s) a
+/// single checkpoint call already knows about); unlike
+/// `missing_tests_gate_reason`'s own `rust_change_touches_cfg_test` check,
+/// this never shells out to `git diff` -- the checkpoint fires before
+/// (`PreToolUse`) or immediately after (`PostToolUse`, already cheap on its
+/// own hot path) an edit, so it only ever has a filename shape to go on, not
+/// a diff.
+fn missing_tests_owed_by_path(path: &Path) -> bool {
+    !path_looks_like_test_file(path)
+        && !super::lifecycle::changes_are_doc_only(&[path.to_path_buf()])
+}
+
+/// Whether the checkpoint's own "tests owed" line
+/// ([`MISSING_TESTS_OWED_LINE`]) applies: the missing-tests gate is enabled,
+/// this is a HEADLESS session (`adapters::HEADLESS_ENV == "1"`, the same
+/// condition `missing_tests_gate_reason` itself checks), and at least one of
+/// `paths` is a non-test, non-doc source file
+/// ([`missing_tests_owed_by_path`]). Independent of `cfg.scope_guard.
+/// enabled` -- this can fire the checkpoint on its own even with the scope
+/// guard itself turned off, and never changes `missing_tests_gate_reason`'s
+/// own Stop-hook logic, which stays the backstop it always was.
+fn missing_tests_owed(cfg: &CtxConfig, env: EnvLookup<'_>, paths: &[&Path]) -> bool {
+    cfg.missing_tests_gate.enabled
+        && env(adapters::HEADLESS_ENV).as_deref() == Some("1")
+        && paths.iter().any(|path| missing_tests_owed_by_path(path))
+}
+
+/// Combines the scope guard's own checkpoint text (`None` when `cfg.
+/// scope_guard.enabled` is off) with [`MISSING_TESTS_OWED_LINE`] (only when
+/// [`missing_tests_owed`] says so) into the single note the checkpoint
+/// actually shows. `None` only when NEITHER part applies -- the caller's own
+/// "nothing to say" case; a record still gets read for this (see
+/// `record_scope_guard_request`'s own doc comment), but nothing is ever
+/// shown and `checkpoint_shown` is never set.
+fn scope_checkpoint_combine(scope_text: Option<String>, tests_owed: bool) -> Option<String> {
+    match (scope_text, tests_owed) {
+        (Some(text), true) => Some(format!("{text} {MISSING_TESTS_OWED_LINE}")),
+        (Some(text), false) => Some(text),
+        (None, true) => Some(format!("Scope checkpoint: {MISSING_TESTS_OWED_LINE}")),
+        (None, false) => None,
+    }
+}
+
+/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
+/// the request's own quoted preservation sentences, or empty when none were
+/// extracted.
+fn scope_guard_quoted_constraints(constraints: &[String]) -> String {
+    if constraints.is_empty() {
+        String::new()
+    } else {
+        format!("the request says: \"{}\". ", constraints.join(" "))
+    }
+}
+
+/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
+/// the stated-details checklist itself -- a numbered "(1) ... (2) ..." list
+/// appended to the checkpoint, or empty when nothing was extracted. Leads
+/// with a space so the caller can splice it straight onto the end of its own
+/// sentence.
+fn scope_guard_stated_details_line(details: &[String]) -> String {
+    if details.is_empty() {
+        return String::new();
+    }
+    let items = details
+        .iter()
+        .enumerate()
+        .map(|(index, detail)| format!("({}) {detail}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" Stated details to check before you finish: {items}")
+}
+
+/// The checkpoint's own wording: interactive asks the user before an
+/// unrequested fix/improvement; headless (`permission_mode == "dontAsk"`,
+/// the same signal `safety.rs`'s `hook_output` reads for the identical
+/// purpose on its own payload) has no one to ask, so it defers to the final
+/// report instead. `stated_details` appends the queued item 2 checklist
+/// ([`scope_guard_stated_details_line`]) when the request pinned down any
+/// checkable detail.
+fn scope_checkpoint_text(
+    constraints: &[String],
+    stated_details: &[String],
+    headless: bool,
+) -> String {
+    let action = if headless {
+        "leave it and list it under 'Found, not changed' in your final report."
+    } else {
+        "ask the user first."
+    };
+    let quoted = scope_guard_quoted_constraints(constraints);
+    let details = scope_guard_stated_details_line(stated_details);
+    format!(
+        "Scope checkpoint: {quoted}Before changing existing code, check this edit is needed for \
+         what was asked. If it fixes a bug or makes an improvement you noticed but were not \
+         asked for, don't make it: {action}{details}"
+    )
+}
+
+/// At most this many changed paths named in the shell-edit checkpoint's own
+/// text -- keeps it bounded regardless of how many files one shell command
+/// touched.
+const SCOPE_GUARD_SHELL_PATH_CAP: usize = 5;
+
+/// The `PostToolUse`, after-the-fact counterpart to [`scope_checkpoint_text`]
+/// -- fires once the shell command has already changed `changed` (capped at
+/// [`SCOPE_GUARD_SHELL_PATH_CAP`] paths), so it names what changed and asks
+/// for an undo rather than warning before an edit. Shares
+/// [`scope_checkpoint_text`]'s own headless/interactive split, minus that
+/// variant's leading "leave it and" -- this sentence already opens with
+/// "undo it and".
+fn scope_checkpoint_shell_text(
+    constraints: &[String],
+    changed: &[String],
+    stated_details: &[String],
+    headless: bool,
+) -> String {
+    let action = if headless {
+        "list it under 'Found, not changed' in your final report."
+    } else {
+        "ask the user first."
+    };
+    let quoted = scope_guard_quoted_constraints(constraints);
+    let listed = changed
+        .iter()
+        .take(SCOPE_GUARD_SHELL_PATH_CAP)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details = scope_guard_stated_details_line(stated_details);
+    format!(
+        "Scope checkpoint: {quoted}You just changed existing file(s) {listed}. Check the change \
+         is needed for what was asked. If it fixes a bug or makes an improvement you noticed but \
+         were not asked for, undo it and {action}{details}"
+    )
+}
+
+/// `PostToolUse`, `Bash`/`PowerShell` only: the tool-agnostic, AFTER-the-fact
+/// counterpart to [`scope_checkpoint_note`]. Benchmark transcripts show a
+/// headless agent makes most of its edits to an existing file through the
+/// SHELL (`python -c "open(p,'w').write(...)"`, `sed -i`, `cat > file`),
+/// never touching `Edit`/`MultiEdit`/`NotebookEdit`/`Write` at all -- so that
+/// checkpoint never fires for it. This re-checks the repo's tracked-file
+/// state against the baseline `record_scope_guard_request` snapshotted at
+/// `UserPromptSubmit` ([`ScopeGuardRecord::shell_baseline`]), and the FIRST
+/// time anything differs, surfaces the same one-time note worded for a
+/// change that already happened ([`scope_checkpoint_shell_text`]). Shares
+/// `checkpoint_shown` with [`scope_checkpoint_note`]/
+/// [`scope_checkpoint_mark_shown`]: whichever path fires first is the only
+/// one that ever speaks for a given prompt, so an agent that mixes `Edit`
+/// and shell edits never sees the note twice.
+///
+/// `None` on every gate below (not a shell tool, no session identity, no
+/// state dir, no recorded prompt, already shown, a positively read-only
+/// command, nothing changed, and -- since neither `cfg.scope_guard.enabled`
+/// nor `missing_tests_owed` has anything to say -- both features off or
+/// neither applying to what changed) -- a silent skip, like every other
+/// advisory in this guard. Deliberately ordered cheapest-first: the `git
+/// status` re-query -- this function's only non-trivial cost -- only ever
+/// runs once every cheaper gate above it (most of all `checkpoint_shown` and
+/// the read-only check, which reuses `safety::jev_approve_is_read_only_
+/// local`) has already passed, since this runs after EVERY `Bash`/
+/// `PowerShell` call. A command the classifier cannot positively confirm
+/// read-only still runs the re-query below, unchanged from before.
+///
+/// Folds in the missing-tests gate's own "tests owed" line the same way
+/// [`scope_checkpoint_note`] does ([`missing_tests_owed`]/
+/// [`scope_checkpoint_combine`]), classified against `changed` (every path
+/// this call found different from the baseline) rather than a single
+/// target -- independent of `cfg.scope_guard.enabled`.
+fn scope_guard_shell_checkpoint_note(
+    tool_name: &str,
+    cwd: &Path,
+    cfg: &CtxConfig,
+    payload_session_id: &str,
+    command: &str,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !matches!(tool_name, "Bash" | "PowerShell") {
+        return None;
+    }
+    let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
+    if session.is_empty() {
+        return None;
+    }
+    let state = StateDir::resolve(env).ok()?;
+    let path = scope_guard_record_path(&state, &session);
+    let mut record = load_scope_guard_record(&path)?;
+    if record.checkpoint_shown {
+        return None;
+    }
+    // A positively read-only command (`git status`, `ls src`, ...) cannot
+    // itself have produced the shell edit this checkpoint looks for, so skip
+    // the `git status` re-query below entirely rather than run it after
+    // EVERY `Bash`/`PowerShell` call. `&[]` scratchpad roots is the
+    // conservative choice here (narrower than a caller's own configured
+    // roots, never wider), and anything the classifier cannot positively
+    // confirm still falls through to the re-query, unchanged.
+    if super::safety::jev_approve_is_read_only_local(command, &[]) {
+        return None;
+    }
+    let changed = scope_guard_tracked_changes_since(cwd, &record.shell_baseline)?;
+    if changed.is_empty() {
+        return None;
+    }
+    // Unlike `scope_checkpoint_note`'s own `payload.permission_mode`, claude's
+    // documented `PostToolUse` payload carries no permission-mode field at
+    // all, so this reads the same headless signal `scope_guard_stop_reason`
+    // already uses for its own `PostToolUse`-adjacent (`Stop`) wording.
+    let headless = env(adapters::HEADLESS_ENV).as_deref() == Some("1");
+    let scope_text = cfg.scope_guard.enabled.then(|| {
+        scope_checkpoint_shell_text(
+            &record.constraints,
+            &changed,
+            &record.stated_details,
+            headless,
+        )
+    });
+    let changed_paths: Vec<&Path> = changed.iter().map(Path::new).collect();
+    let tests_owed = missing_tests_owed(cfg, env, &changed_paths);
+    let note = scope_checkpoint_combine(scope_text, tests_owed)?;
+    record.checkpoint_shown = true;
+    save_scope_guard_record(&path, &record);
+    Some(note)
+}
+
+/// A COMPLETED fix verb, past tense only: `fixed`/`corrected`/`repaired`/
+/// `patched`. Bare `fix`/`fixing` are deliberately excluded (a benchmark
+/// false positive: "Fixing it would change the `--legacy-order` output
+/// too." names a hypothetical the agent explicitly did NOT do, not a claimed
+/// change) -- see [`SCOPE_GUARD_HYPOTHETICAL_RE`] for the second, general
+/// guard against a conditional/hypothetical sentence being read as a claim
+/// at all.
+static SCOPE_GUARD_FIX_VERB_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:fixed|corrected|repaired|patched)\b")
+        .expect("valid scope-guard fix-verb regex")
+});
+
+/// Whether `sentence` reads as conditional/hypothetical rather than a
+/// completed action: "would", "could", "if". Checked alongside
+/// [`SCOPE_GUARD_FIX_VERB_RE`]'s own past-tense-only restriction so a
+/// hypothetical aside about what a fix WOULD do is never mistaken for a
+/// claim that the agent actually made one.
+static SCOPE_GUARD_HYPOTHETICAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:would|could|if)\b").expect("valid scope-guard hypothetical regex")
+});
+
+/// A word naming what the fix was for: `bug(s)`/`off-by-one`/`quirk`/
+/// `broken`/`wrong`/`issue`. Plural `bugs` alongside the design's own
+/// singular `bug`, since a real closing report ("It had two bugs") uses it.
+static SCOPE_GUARD_BUG_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:bugs?|off-by-one|quirk|broken|wrong|issue)\b")
+        .expect("valid scope-guard bug-word regex")
+});
+
+/// "also fixed/changed/updated/refactored".
+static SCOPE_GUARD_ALSO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\balso\s+(?:fixed|changed|updated|refactored)\b")
+        .expect("valid scope-guard also-fixed regex")
+});
+
+/// "while (I was) at it/there/here".
+static SCOPE_GUARD_WHILE_AT_IT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bwhile\s+(?:i\s+was\s+)?(?:at\s+it|there|here)\b")
+        .expect("valid scope-guard while-at-it regex")
+});
+
+/// Truncates `text` to [`SCOPE_GUARD_QUOTE_BUDGET`] characters.
+fn scope_guard_truncate(text: &str) -> String {
+    if text.chars().count() <= SCOPE_GUARD_QUOTE_BUDGET {
+        return text.to_string();
+    }
+    text.chars().take(SCOPE_GUARD_QUOTE_BUDGET).collect()
+}
+
+/// Whether a `Stop` closing message claims a fix the request never asked
+/// for: a completed fix verb ([`SCOPE_GUARD_FIX_VERB_RE`]) alongside a bug
+/// word ([`SCOPE_GUARD_BUG_WORD_RE`]) in the same sentence OR the very next
+/// one -- a closing report often splits the claim and what it was for across
+/// two short adjacent sentences (this guard's own worked example: "`page()`
+/// had two bugs, and I fixed both.") -- OR an explicit "also fixed/changed/
+/// updated/refactored", OR "while (I was) at it/there/here". Every candidate
+/// sentence is first checked against [`SCOPE_GUARD_HYPOTHETICAL_RE`] and
+/// skipped if it reads as conditional/hypothetical ("Fixing it would change
+/// the `--legacy-order` output too." names something the agent did NOT do).
+/// Returns the first matching sentence, truncated, or `None`.
+fn scope_guard_unrequested_fix_sentence(closing: &str) -> Option<String> {
+    let sentences = scope_guard_split_sentences(closing);
+    for (index, sentence) in sentences.iter().enumerate() {
+        if SCOPE_GUARD_HYPOTHETICAL_RE.is_match(sentence) {
+            continue;
+        }
+        if !SCOPE_GUARD_FIX_VERB_RE.is_match(sentence) {
+            continue;
+        }
+        let window = match sentences.get(index + 1) {
+            Some(next) => format!("{sentence} {next}"),
+            None => sentence.clone(),
+        };
+        if SCOPE_GUARD_BUG_WORD_RE.is_match(&window) {
+            return Some(scope_guard_truncate(sentence));
+        }
+    }
+    sentences
+        .iter()
+        .find(|sentence| {
+            !SCOPE_GUARD_HYPOTHETICAL_RE.is_match(sentence)
+                && (SCOPE_GUARD_ALSO_RE.is_match(sentence)
+                    || SCOPE_GUARD_WHILE_AT_IT_RE.is_match(sentence))
+        })
+        .map(|sentence| scope_guard_truncate(sentence))
+}
+
+/// The last `budget` bytes of `path`'s content, lossily decoded and (unless
+/// this IS the file's start) trimmed back to the next full line -- the
+/// identical tail-read `stop_verify_reason` uses, so a Stop hook never
+/// re-parses a whole long-running transcript on every turn.
+fn scope_guard_tail_text(path: &Path, budget: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(budget);
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(if start == 0 {
+        text
+    } else {
+        text.split_once('\n')
+            .map_or_else(String::new, |(_, rest)| rest.to_string())
+    })
+}
+
+/// The current turn's closing assistant message -- everything after the last
+/// `TurnStart`, the identical window `stop_verify_facts` uses -- or `None`
+/// when there is none.
+fn scope_guard_closing_text(events: &[NormalizedEvent]) -> Option<&str> {
+    let start = events
+        .iter()
+        .rposition(|event| matches!(event, NormalizedEvent::TurnStart { .. }))
+        .map_or(0, |index| index + 1);
+    events[start..].iter().rev().find_map(|event| match event {
+        NormalizedEvent::AssistantFinal { text, .. } if !text.trim().is_empty() => {
+            Some(text.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// `Stop` backstop: blocks once, after every other Stop gate/backstop has
+/// already had its chance (see `run_stop`'s own call site -- this runs only
+/// when `stop_verify_block` did not already fire, so at most one block per
+/// Stop), when the closing report claims a fix the request never asked for.
+/// `None` on every gate below (config off, no session identity, no recorded
+/// prompt, already checked this prompt, the request itself asks for a fix,
+/// no adapter, an unreadable transcript, no unrequested-fix sentence found)
+/// -- a silent skip, like every other Stop-hook check in this file.
+fn scope_guard_stop_reason(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    session: &str,
+    transcript: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    if !cfg.scope_guard.enabled || session.is_empty() {
+        return None;
+    }
+    let path = scope_guard_record_path(state, session);
+    let mut record = load_scope_guard_record(&path)?;
+    if record.stop_checked || record.asks_for_fix {
+        return None;
+    }
+    let adapter = adapters::select_for_identity(
+        env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
+        &[],
+        cfg,
+    )
+    .ok()?;
+    let tail = scope_guard_tail_text(transcript, STOP_VERIFY_TAIL_BYTES)?;
+    let events = adapter.parse_events(&tail);
+    let closing = scope_guard_closing_text(&events)?;
+    let sentence = scope_guard_unrequested_fix_sentence(closing)?;
+    record.stop_checked = true;
+    save_scope_guard_record(&path, &record);
+    let headless = env(adapters::HEADLESS_ENV).as_deref() == Some("1");
+    let suffix = if headless { "" } else { " or ask the user." };
+    let constraints = record.constraints.join(" ");
+    Some(format!(
+        "Your report says you changed something the request did not ask for: \"{sentence}\". \
+         The request said: \"{constraints}\". Unless that change was strictly required to \
+         deliver the request, revert it and report it as found-not-changed{suffix}"
+    ))
+}
+
 /// Issue #786: minimum `true` probability before `stop_verify` blocks a Stop.
 /// Basis: jev-belay reached 1% false blocks with the closing TEXT; facts-only
 /// state is untested, so the floor sits well above the default margin.
@@ -1754,8 +3316,23 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // Issue #243: also screens the bytes this cycle ingested. Issue #293:
     // also surfaces this pass's speed sample, cheaply -- the same
     // incremental fold, nothing extra read or parsed.
+    //
+    // Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    // a live measurement found the Stop hook averaging ~400ms against
+    // ~60ms for the other three hooks, all four otherwise doing comparable
+    // `CtxConfig::load` work. Passing `None` here (with no `agent` key in
+    // config either, the common case) sent every single invocation through
+    // `adapters::resolve_default_with_presence`'s full scan -- a
+    // `resolve_program`/PATH probe per registered adapter (~14 of them) --
+    // even though a Stop hook is ALWAYS invoked by the exact harness whose
+    // own hook mechanism just ran it, which already told this process which
+    // one that is via [`adapters::AGENT_ENV`] (set by every supervised
+    // launch). Reading it here skips straight to that one adapter's own
+    // `ready()` check when it is set, and falls back to the identical
+    // resolve-default scan of today whenever it is not (an unsupervised
+    // invocation, or a test harness that never set it).
     let Ok((score, screening, speed_sample)) =
-        score::score_transcript_cached(transcript, None, &repo, env)
+        score::score_transcript_cached(transcript, env(adapters::AGENT_ENV).as_deref(), &repo, env)
     else {
         return Ok(0);
     };
@@ -1788,8 +3365,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut verify_nudge = None;
     let mut diagnostics_nudge = None;
     let mut compact_advisory_nudge = None;
+    let mut missing_tests_gate = None;
     let mut rot_advisory_deferred = false;
     let mut stop_verify_block = None;
+    let mut scope_guard_block = None;
     if let Ok(state) = StateDir::resolve(env) {
         // Issue #243: a flagged screening result rides the same
         // decision line this cycle already writes, and is persisted onto the
@@ -1919,11 +3498,29 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         record_speed_sample(&state, &repo, &session, &cfg, speed_sample);
         verify_nudge = verify_on_stop_nudge(&state, &repo, &session, &cfg, transcript);
         stop_verify_block = stop_verify_reason(&state, &cfg, verify_nudge.is_some(), transcript);
+        // Scope-creep guard backstop: runs only when the jev-based
+        // unverified-done backstop above did not already block this Stop --
+        // at most one block per Stop, applied in the same order below.
+        if stop_verify_block.is_none() {
+            scope_guard_block = scope_guard_stop_reason(&state, &cfg, &session, transcript, env);
+        }
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
+        missing_tests_gate =
+            missing_tests_gate_reason(&state, &repo, &stable_short, &payload.session_id, &cfg, env);
         // Issue #312: independent of the rot `Verdict` ladder above -- a
         // cost-driven tier of its own, gated on stale tool-result tokens and
         // window fraction, never on `score.verdict`.
-        if let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], &cfg) {
+        //
+        // Hook start-up overhead fix (2026-09-24): reads `AGENT_ENV` first,
+        // same reasoning and same fallback as `score::score_transcript_cached`'s
+        // own call above -- a Stop hook already knows its own harness without
+        // asking `adapters::resolve_default_with_presence` to scan every
+        // registered adapter's presence again.
+        if let Ok(adapter) = adapters::select_for_identity(
+            env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
+            &[],
+            &cfg,
+        ) {
             compact_advisory_nudge = compact_advisory_stop_nudge(
                 &state,
                 &repo,
@@ -1963,15 +3560,29 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             false => super::lifecycle::VerificationDecision::NotRequired,
         },
         workflow_gate: None,
+        missing_tests_gate,
     });
+    // Q1: a real `Block` overrides everything else this hook would otherwise
+    // say -- a session told to keep working must not also be handed an
+    // unrelated /compact advisory in the same breath. Claude Code's Stop-hook
+    // contract for an actual block is this flat envelope (no
+    // `hookSpecificOutput` wrapper, unlike PreToolUse/UserPromptSubmit); the
+    // top-of-function `payload.stop_hook_active` early return is what keeps
+    // this from looping (`stop()`'s own `already_blocked` maps to it).
+    if let super::lifecycle::StopDecision::Block(reason) = &stop_decision {
+        let _ = writeln!(
+            w,
+            "{}",
+            serde_json::json!({ "decision": "block", "reason": reason })
+        );
+        return Ok(0);
+    }
     let verify_nudge = match &stop_decision {
         // The service says fresh evidence is owed; the nudge computed above is
         // this hook's own wording for that, so it rides along.
         super::lifecycle::StopDecision::AllowWithNote(_) => verify_nudge.clone(),
-        // Allowed outright, or blocked for a reason that outranks a nudge --
-        // in either case the evidence note is not what should be said.
-        super::lifecycle::StopDecision::Allow => None,
-        super::lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
+        // Allowed outright; the block arm above already returned.
+        super::lifecycle::StopDecision::Allow | super::lifecycle::StopDecision::Block(_) => None,
     };
     let combined_nudge = [
         adoption_nudge.as_deref(),
@@ -1997,7 +3608,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     );
     let line = match stop_verify_block {
         Some(reason) => Some(with_stop_block(line.as_deref(), reason)),
-        None => line,
+        None => match &scope_guard_block {
+            Some(reason) => Some(with_stop_block(line.as_deref(), reason)),
+            None => line,
+        },
     };
     if let Some(line) = line {
         let _ = writeln!(w, "{line}");
@@ -2178,6 +3792,19 @@ fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult
     // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
     // `.ok()` fallback for the adoption marker.
     let cfg = super::config::CtxConfig::load(&repo, env).unwrap_or_default();
+
+    // Scope-creep guard: records this prompt's own preservation/limitation
+    // language (if any) for the `PreToolUse` checkpoint and `Stop` backstop
+    // to read back later. Never emits anything and never affects the rest of
+    // this handler -- see `record_scope_guard_request`'s own doc comment for
+    // every gate that silently skips it.
+    record_scope_guard_request(
+        &cfg,
+        &payload.session_id,
+        &prompt_text_from(stdin),
+        &repo,
+        env,
+    );
 
     // Issue #745: a closed-set, deterministic administrative dispatch that
     // answers a known-safe read-only request in-process and blocks the
@@ -2735,6 +4362,312 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
+// -- SubagentStop: gate a subagent's own result before it reaches the lead
+// (issue #774) ----------------------------------------------------------
+
+const SUBAGENT_STOP_GATE_RECORD_VERSION: u32 = 1;
+
+/// Mirrors `MissingTestsGateRecord`'s own shape/contract exactly: this gate
+/// may block a given subagent's own final turn at most once, ever, the same
+/// "capped at one block per subagent" rule issue #774 itself specifies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SubagentStopGateRecord {
+    #[serde(default)]
+    version: u32,
+    blocked: bool,
+}
+
+/// `dispatch_key` names the ONE subagent dispatch this record caps -- see
+/// `run_subagent_stop`'s own doc comment for which payload field that is and
+/// why (`agent_id`, falling back to `agent_transcript_path` then
+/// `transcript_path`), never the lead session's own `session_id`.
+fn subagent_stop_gate_record_path(state: &StateDir, dispatch_key: &str) -> PathBuf {
+    state.scoring().join(format!(
+        "{:016x}-subagent-stop-gate.json",
+        input_hash(dispatch_key)
+    ))
+}
+
+/// `Default` (never yet blocked) on any doubt at all, the same rule every
+/// other hook checkpoint read in this file follows.
+fn load_subagent_stop_gate_record(path: &Path) -> SubagentStopGateRecord {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<SubagentStopGateRecord>(&body).ok())
+        .filter(|record| record.version == SUBAGENT_STOP_GATE_RECORD_VERSION)
+        .unwrap_or_default()
+}
+
+/// Best-effort, like every other hook checkpoint write: a save that fails
+/// costs (at most) one extra block later, never a hook failure now.
+fn save_subagent_stop_gate_record(path: &Path, record: &SubagentStopGateRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    let _ = super::state::write_private(path, &json);
+}
+
+/// The three things [`subagent_stop_violation`] needs out of a subagent's own
+/// transcript. Deliberately narrower than a full `NormalizedEvent` parse (no
+/// adapter selection, no `CtxConfig` load): this gate must cost near nothing
+/// on every single subagent completion.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SubagentTranscriptScan {
+    /// The Task dispatch's own first user message -- what the subagent was
+    /// actually asked for, read from its OWN transcript rather than any
+    /// state this process shares with whatever `PreToolUse` invocation
+    /// dispatched it (a separate process, long since exited).
+    first_user_text: String,
+    /// The last assistant text seen -- the subagent's own final report, in
+    /// the ordinary case where its last turn ends in words rather than a
+    /// tool call the transcript happens to end on mid-turn.
+    final_assistant_text: String,
+    /// Every `Bash` `tool_use` command the subagent ran, in transcript order.
+    bash_commands: Vec<String>,
+}
+
+/// Concatenates every `"type":"text"` block's own `"text"` field, in order --
+/// the human-readable half of a claude message's `content` array, tool-use
+/// blocks aside.
+fn content_text(content: &[serde_json::Value]) -> String {
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads `transcript` (a claude JSONL transcript: one `{"type":...}` record
+/// per line) and pulls out just what [`subagent_stop_violation`] needs.
+/// `None` only on an unreadable file -- fail open, matching every other
+/// transcript read in this file. A malformed individual line is skipped, not
+/// fatal: a transcript is written turn by turn, and a partially-written last
+/// line is ordinary, not evidence of anything.
+fn scan_subagent_transcript(transcript: &Path) -> Option<SubagentTranscriptScan> {
+    let text = std::fs::read_to_string(transcript).ok()?;
+    let mut scan = SubagentTranscriptScan::default();
+    let mut seen_first_user = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = value.get("type").and_then(serde_json::Value::as_str);
+        let Some(content) = value
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        match role {
+            Some("user") if !seen_first_user => {
+                seen_first_user = true;
+                scan.first_user_text = content_text(content);
+            }
+            Some("assistant") => {
+                let text = content_text(content);
+                if !text.is_empty() {
+                    scan.final_assistant_text = text;
+                }
+                for block in content {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        && block.get("name").and_then(serde_json::Value::as_str) == Some("Bash")
+                        && let Some(command) = block
+                            .pointer("/input/command")
+                            .and_then(serde_json::Value::as_str)
+                    {
+                        scan.bash_commands.push(command.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(scan)
+}
+
+/// Explicit, literal completion phrases only -- issue #774's own "claimed
+/// tests actually run" check must never fire on ordinary prose that merely
+/// mentions testing (a false positive here blocks a subagent that never
+/// claimed anything), so this deliberately matches a short, high-confidence
+/// list rather than any looser pattern.
+const TEST_CLAIM_PHRASES: &[&str] = &[
+    "tests pass",
+    "tests passed",
+    "all tests passing",
+    "tests are passing",
+    "test suite passes",
+    "ran the tests",
+    "ran the test suite",
+    "tests ran successfully",
+];
+
+/// Issue #774's own three checks, in the order documented on
+/// [`run_subagent_stop`]. Returns the first one that fires, never more than
+/// one -- claude reads a single `reason` per decision anyway.
+fn subagent_stop_violation(scan: &SubagentTranscriptScan) -> Option<String> {
+    let final_report = scan.final_assistant_text.trim();
+    if final_report.is_empty() {
+        // Nothing to hold to any contract -- most likely an interrupted or
+        // tool-only turn, not a worker that skipped its own report.
+        return None;
+    }
+
+    if scan
+        .first_user_text
+        .contains("OUTPUT CONTRACT (machine-validated)")
+        && super::result_schema::extract_json_candidate(final_report).is_none()
+    {
+        return Some(
+            "your dispatch declared an OUTPUT CONTRACT but your final message carries no \
+             fenced ```json block at all -- reply again, ending in one that matches it"
+                .to_string(),
+        );
+    }
+
+    let claims_tests = {
+        let lower = final_report.to_lowercase();
+        TEST_CLAIM_PHRASES
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+    };
+    if claims_tests
+        && !scan
+            .bash_commands
+            .iter()
+            .any(|command| super::event::looks_like_verification(command))
+    {
+        return Some(
+            "your final message claims tests were run, but no test/verification command \
+             appears anywhere in this dispatch's own transcript -- run them for real, or \
+             correct the claim"
+                .to_string(),
+        );
+    }
+
+    if let Some(idx) = final_report.find("BLOCKED") {
+        let after = &final_report[idx + "BLOCKED".len()..];
+        let reason = after
+            .trim_start_matches([':', ' ', '\t'])
+            .split(['\n', '.'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if reason.is_empty() {
+            return Some(
+                "your final message says BLOCKED with no reason after it -- report `BLOCKED: \
+                 <short reason>` so your caller knows what to do next"
+                    .to_string(),
+            );
+        }
+    }
+
+    None
+}
+
+/// Claude's `SubagentStop` hook (issue #774): a cheap, deterministic gate on
+/// a native `Task` subagent's own final report, before it reaches the lead.
+/// Three checks against the SUBAGENT's own transcript -- a declared OUTPUT
+/// CONTRACT with no JSON reply at all, a claimed test run with no matching
+/// tool call anywhere in the transcript, and a `BLOCKED` report with no
+/// reason after it. The first one to fire blocks with
+/// `{"decision":"block","reason":...}` -- claude's documented contract for
+/// retrying the SAME subagent turn on a `SubagentStop` block, mirroring
+/// `run_stop`'s own real block envelope (issue #690's "Stop hook block
+/// decisions actually block" fix) -- and nothing else does.
+///
+/// Review fix (post-#774): the SUBAGENT's own transcript is `payload.
+/// agent_transcript_path`, NOT `payload.transcript_path` -- Claude's own
+/// hooks documentation (code.claude.com/docs/en/agent-sdk/hooks) states
+/// `transcript_path` on this event is the LEAD session's main transcript,
+/// the same file every subagent dispatched within that session shares, and
+/// `agent_transcript_path` is the subagent's own. Reading the wrong one
+/// would check the lead's own conversation, never the subagent's. Falls
+/// back to `transcript_path` only when a payload omits `agent_transcript_
+/// path` (an older harness, or a projected non-claude agent).
+///
+/// Capped at one block per subagent, ever (`SubagentStopGateRecord`).
+/// Review fix (post-#774): keyed by `payload.agent_id` -- claude's own
+/// unique id for the specific subagent dispatch, per the same
+/// documentation -- not `session_id`, which is the LEAD session's own id
+/// and is IDENTICAL across every subagent it dispatches ("subagents work
+/// within a single session"). Keying on `session_id` meant one subagent's
+/// block silently exempted every OTHER subagent in the same lead session
+/// forever. `agent_transcript_path` is the fallback when `agent_id` is
+/// missing (also unique per dispatch); `transcript_path` -- the lead's own,
+/// shared value -- is the last resort, no worse than this gate's previous
+/// behavior, for a payload carrying neither.
+///
+/// A subagent retried after a block gets exactly one more chance, never a
+/// loop. Fails open on every doubt -- an unparseable payload, a missing/
+/// unreadable transcript, `stop_hook_active`, the operator's own
+/// `[subagent_stop_gate] enabled = false` (narrow-only, the identical T9
+/// fold `missing_tests_gate.enabled` uses), an unresolvable state dir, or an
+/// already-spent block -- exits 0 with nothing on stdout, exactly like every
+/// other hook in this file. Nothing here may `unwrap`, `expect` or return
+/// `Err`.
+pub fn run_subagent_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let Ok(payload) = HookPayload::parse(stdin) else {
+        return Ok(0);
+    };
+    if payload.stop_hook_active {
+        return Ok(0);
+    }
+    let transcript_path = if !payload.agent_transcript_path.is_empty() {
+        payload.agent_transcript_path.as_str()
+    } else {
+        payload.transcript_path.as_str()
+    };
+    if transcript_path.is_empty() {
+        return Ok(0);
+    }
+    let transcript = Path::new(transcript_path);
+    if !transcript.is_file() {
+        return Ok(0);
+    }
+    let cfg = cfg_or_operator_only_gate(&payload.repo(), env);
+    if !cfg.subagent_stop_gate.enabled {
+        return Ok(0);
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return Ok(0);
+    };
+    let dispatch_key = if !payload.agent_id.is_empty() {
+        payload.agent_id.as_str()
+    } else if !payload.agent_transcript_path.is_empty() {
+        payload.agent_transcript_path.as_str()
+    } else {
+        payload.transcript_path.as_str()
+    };
+    let record_path = subagent_stop_gate_record_path(&state, dispatch_key);
+    if load_subagent_stop_gate_record(&record_path).blocked {
+        return Ok(0);
+    }
+    let Some(scan) = scan_subagent_transcript(transcript) else {
+        return Ok(0);
+    };
+    let Some(reason) = subagent_stop_violation(&scan) else {
+        return Ok(0);
+    };
+    let mut record = load_subagent_stop_gate_record(&record_path);
+    record.version = SUBAGENT_STOP_GATE_RECORD_VERSION;
+    record.blocked = true;
+    save_subagent_stop_gate_record(&record_path, &record);
+    let _ = writeln!(
+        w,
+        "{}",
+        serde_json::json!({ "decision": "block", "reason": reason })
+    );
+    Ok(0)
+}
+
 // -- PreToolUse: the expensive-seat inheritance guard, and (below) the
 // orchestrator-write guard that refuses an orchestrator seat's own direct
 // edit of a repository file (issue #334) ------------------------------------
@@ -2770,6 +4703,13 @@ pub struct PreToolPayload {
     #[allow(dead_code)]
     // retained from Claude's documented payload; agent_id is the discriminator
     pub agent_type: String,
+    /// Claude's own session mode (documented values include `"default"`,
+    /// `"plan"`, `"acceptEdits"`, `"dontAsk"`, ...) -- the scope-guard
+    /// checkpoint's own headless signal, the identical field/value
+    /// `safety.rs`'s `hook_output` reads for the same purpose on its own
+    /// (separately modelled) `Bash`/`PowerShell` payload.
+    #[serde(default)]
+    pub permission_mode: String,
 }
 
 /// `tool_input` is tool-specific, so only the subagent tool's own parameters
@@ -3594,6 +5534,26 @@ fn pretool_advise_output(note: &str) -> String {
     .to_string()
 }
 
+/// F7 (wrapper-overhead benchmark, 2026-09-24): the plain allow envelope
+/// `run_pretool_bash_rewrite` emits for a `Bash` command `safety::evaluate`
+/// already classifies `Allow`, on a headless launch, so Claude Code's own
+/// verdict is this exact decision rather than whatever `--permission-mode
+/// dontAsk` plus the static `--allowedTools` list would otherwise reach for
+/// a command that happens not to be literally on that list. No `updatedInput`
+/// (this never rewrites the command) and no `additionalContext` note --
+/// unlike `pretool_advise_output`, this fires on the ordinary, common case
+/// (an everyday dev command the operator's own policy already allows), so it
+/// stays silent rather than narrating every one of them.
+fn pretool_safety_allow_output() -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow"
+        }
+    })
+    .to_string()
+}
+
 /// The documented PreToolUse rewrite envelope (issue #419): the same `allow`
 /// shape [`pretool_advise_output`] prints, plus `updatedInput` -- claude
 /// replaces its own `tool_input` with this object before running the tool,
@@ -3674,72 +5634,235 @@ fn rewrite_bare_git_log(command: &str) -> Option<String> {
 
 /// Issue #419's whole `Bash` decision, independent of every guard above and
 /// below: rewrites exactly one shape (a bare `git log`) via `updatedInput`,
-/// and never denies or advises. `Bash` is not a [`FILE_MODIFICATION_TOOLS`]
-/// entry, so the orchestrator-write guard and the issue #406 reuse probe
-/// never see this call at all -- this function is the entirety of what
-/// `run_pretool` does for `Bash`.
+/// and, since F7 (2026-09-24), also names an explicit allow decision when
+/// the safety layer clears a headless command that Claude Code's own
+/// `--permission-mode dontAsk` plus the static `--allowedTools` list would
+/// otherwise deny purely for not being literally on that finite list (a
+/// heredoc, a pipe into an interpreter, `zirv ctx run --compact -- ...` --
+/// see [`pretool_safety_allow_output`]'s own doc comment). Never denies or
+/// asks: a `Deny`/`Ask` verdict here just falls through to Claude Code's own
+/// permission flow untouched, since `zirv ctx safety check`'s own separate
+/// hook (exit code 2, `run_check_hook_with_verdict`) is the one place a
+/// `Bash` command is actually blocked. `Bash` is not a
+/// [`FILE_MODIFICATION_TOOLS`] entry, so the orchestrator-write guard and the
+/// issue #406 reuse probe never see this call at all -- this function is the
+/// entirety of what `run_pretool` does for `Bash`.
 ///
 /// Fails open on every path, matching every other guard in this file: an
-/// empty or unrewritable command, an unresolvable `cwd`, or a command the
-/// safety layer does not classify as a plain, unconditional `Allow` all
-/// print nothing, and the `Bash` call proceeds through claude's ordinary
-/// permission flow untouched. The safety check uses `LaunchMode::Headless`
-/// -- the stricter of the two defaults -- because this payload carries no
-/// `permission_mode` field (that lives only in `safety.rs`'s own hook
-/// payload), so there is no in-band signal here that a human is watching to
-/// answer an `Ask` verdict.
+/// empty command, an unresolvable `cwd`, or a command the safety layer does
+/// not classify as a plain, unconditional `Allow` all print nothing, and the
+/// `Bash` call proceeds through claude's ordinary permission flow untouched.
+/// The safety check uses `LaunchMode::Headless` -- the stricter of the two
+/// defaults -- because this payload carries no `permission_mode` field (that
+/// lives only in `safety.rs`'s own hook payload), so there is no in-band
+/// signal here that a human is watching to answer an `Ask` verdict; the
+/// explicit-allow half below additionally requires
+/// [`super::adapters::HEADLESS_ENV`] to actually read `"1"` before it fires
+/// at all, so an interactive launch (where a human already answers Claude's
+/// own prompt) is never short-circuited by it.
 fn run_pretool_bash_rewrite<W: Write>(
     w: &mut W,
     payload: &PreToolPayload,
     env: EnvLookup<'_>,
+    attested_verdict: Option<super::safety::Verdict>,
 ) -> CtxResult<i32> {
     let command = payload.tool_input.command.trim();
     if command.is_empty() {
         return Ok(0);
     }
-    let Some(rewritten) = rewrite_bare_git_log(command) else {
-        return Ok(0);
-    };
-    let cwd = if !payload.cwd.is_empty() {
-        PathBuf::from(&payload.cwd)
-    } else {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Ok(0);
-        };
-        cwd
-    };
-    let cfg = cfg_or_operator_only_gate(&cwd, env);
-    let outcome =
-        super::safety::evaluate(&cfg.safety, command, super::adapters::LaunchMode::Headless);
-    if outcome.verdict != super::safety::Verdict::Allow {
+    // F1 (codex review fix): the rewrite/headless-allow logic below may only
+    // fire once the FULL attested/pinned safety check (`attested_verdict`,
+    // computed by the caller against both the launch snapshot and today's
+    // policy -- `safety::evaluate_with_attestation_evidence`) has itself
+    // resolved to `Allow`. Evaluating fresh, un-pinned config here (as
+    // before) could see today's home policy after an operator widened it
+    // mid-session, silently overriding the launch snapshot's stricter,
+    // pinned verdict -- the one `hook_output_with_extras` correctly (and
+    // deliberately) stays silent about under headless `dontAsk`.
+    if attested_verdict != Some(super::safety::Verdict::Allow) {
         return Ok(0);
     }
 
-    let reason =
-        format!("zirv rewrite: bare `git log` capped at 50 entries (`{command}` -> `{rewritten}`)");
-    let _ = writeln!(w, "{}", pretool_rewrite_output(&rewritten, &reason));
-
-    // Best-effort, matching every other decision log write on this path: a
-    // row that fails to write costs an operator one audit-log entry, never a
-    // hook failure.
-    if let Ok(state) = StateDir::resolve(env) {
-        let session =
-            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
-        let _ = log::append(
-            &state,
-            &log::Decision {
-                ts: now_secs(),
-                session: &session,
-                verb: "hook",
-                verdict: "n/a",
-                score: 0,
-                action: "rewrite",
-                detail: &format!("{command} -> {rewritten}"),
-                observed_at: None,
-            },
+    if let Some(rewritten) = rewrite_bare_git_log(command) {
+        let reason = format!(
+            "zirv rewrite: bare `git log` capped at 50 entries (`{command}` -> `{rewritten}`)"
         );
+        let _ = writeln!(w, "{}", pretool_rewrite_output(&rewritten, &reason));
+
+        // Best-effort, matching every other decision log write on this path:
+        // a row that fails to write costs an operator one audit-log entry,
+        // never a hook failure.
+        if let Ok(state) = StateDir::resolve(env) {
+            let session =
+                super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: &session,
+                    verb: "hook",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "rewrite",
+                    detail: &format!("{command} -> {rewritten}"),
+                    observed_at: None,
+                },
+            );
+        }
+        return Ok(0);
+    }
+
+    // F7 (wrapper-overhead benchmark, 2026-09-24): `safety::evaluate` just
+    // said `Allow` -- the operator's own `[safety] default`/`allow`/`ask`/
+    // `deny` rules, `default` and `allow` REPO_FORBIDDEN so this can never be
+    // a repo checkout loosening its own leash (`config.rs`'s own
+    // narrowing-fold table) -- but headlessly, `--permission-mode dontAsk`
+    // plus the static `--allowedTools` list denies anything not literally on
+    // that finite list before this hook's own verdict ever mattered. Naming
+    // the decision explicitly here is what actually lets it through.
+    if env(super::adapters::HEADLESS_ENV).as_deref() == Some("1") {
+        let _ = writeln!(w, "{}", pretool_safety_allow_output());
+
+        // Best-effort, matching every other decision log write on this
+        // path: a row that fails to write costs an operator one audit-log
+        // entry, never a hook failure.
+        if let Ok(state) = StateDir::resolve(env) {
+            let session =
+                super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: &session,
+                    verb: "hook",
+                    verdict: "allow",
+                    score: 0,
+                    action: "allow",
+                    detail: command,
+                    observed_at: None,
+                },
+            );
+        }
     }
     Ok(0)
+}
+
+/// Issue #769: the `Bash`/`PowerShell` half of the consolidated `PreToolUse`
+/// entry point -- runs the safety check ITSELF, in-process, that used to be
+/// `zirv ctx safety check`'s own separately-registered hook (a second
+/// process Claude spawned for the exact same tool call). Calls
+/// [`super::safety::run_check_hook_mode_for_agent`] directly (the identical
+/// function `zirv ctx safety check`'s own hook mode calls), so the
+/// deny/ask/allow verdict, its reason text, and every one of that check's own
+/// loop-breaker/identical-command behaviours are byte-for-byte the same as
+/// before -- only the process spawn is gone. `PowerShell` gets exactly this
+/// safety pass and nothing else, unchanged from before consolidation (only
+/// `Bash` ever reached [`run_pretool_bash_rewrite`]'s own rewrite/headless-
+/// allow logic, which is untouched by this change).
+///
+/// Precedence when both this and `run_pretool_bash_rewrite` have something to
+/// say (only possible for `Bash`): the safety verdict wins outright on
+/// `deny`/`ask` -- `run_pretool_bash_rewrite`'s own (cheaper, headless-only)
+/// `safety::evaluate` call independently reaches the same "say nothing"
+/// conclusion for a non-`Allow` verdict, so returning here loses nothing. On
+/// `allow`, the rewrite's own `updatedInput` (a bare `git log` cap) and its
+/// own more specific reason are layered onto the safety envelope, so an
+/// operator gets both the rewrite AND an explicit reason in the one JSON line
+/// claude reads, rather than whichever of two racing processes' output
+/// happened to be the one claude kept.
+///
+/// Config is loaded exactly the way `safety::run_check`'s own CLI-less hook
+/// mode always has: from `"."` (the hook process's own working directory,
+/// which `CheckArgs::repo` defaults to and this hook registration never
+/// overrides), not `payload.cwd` -- the two are the same directory in
+/// practice (claude spawns every hook for one tool call from the same
+/// working directory), but `"."` is what the pre-consolidation standalone
+/// process actually used, so this keeps the exact same config that decided
+/// the verdict before. Fails open, like everything else in this file: a
+/// config load failure here only means the safety portion says nothing (the
+/// rewrite/headless-allow logic below still runs against its own,
+/// independently-loaded config) -- never an `Err` out of this function.
+fn run_pretool_bash_or_powershell<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    payload: &PreToolPayload,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    // F1 (codex review fix): calls `run_check_hook_with_verdict` directly
+    // (the same function `run_check_hook_mode_for_agent`'s `agent: None` arm
+    // reduces to, so the rendered envelope is byte-for-byte unchanged) to
+    // also capture the REAL, pinned verdict -- needed below so
+    // `run_pretool_bash_rewrite` can gate its own rewrite/headless-allow
+    // logic on it even on the `dontAsk` path where the rendered envelope
+    // itself stays silent for a pinned-stricter `Ask` (see that function's
+    // own doc comment).
+    let cfg = CtxConfig::load(Path::new("."), env).ok();
+    let mut safety_buf: Vec<u8> = Vec::new();
+    let attested_verdict = cfg.as_ref().and_then(|cfg| {
+        super::safety::run_check_hook_with_verdict(cfg, &mut safety_buf, stdin, env)
+            .ok()
+            .flatten()
+    });
+    let safety_envelope = parsed_json_envelope(safety_buf);
+
+    let is_deny_or_ask = safety_envelope.as_ref().is_some_and(|value| {
+        matches!(
+            value
+                .pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(serde_json::Value::as_str),
+            Some("deny") | Some("ask")
+        )
+    });
+    // A real `deny`/`ask` is the final word -- `run_pretool_bash_rewrite`'s
+    // own, independent verdict would only ever have agreed (see this
+    // function's own doc comment), so there is nothing else to layer on.
+    if is_deny_or_ask || payload.tool_name != "Bash" {
+        if let Some(envelope) = &safety_envelope {
+            let _ = writeln!(w, "{envelope}");
+        }
+        return Ok(0);
+    }
+
+    let mut rewrite_buf: Vec<u8> = Vec::new();
+    run_pretool_bash_rewrite(&mut rewrite_buf, payload, env, attested_verdict)?;
+    let rewrite_envelope = parsed_json_envelope(rewrite_buf);
+
+    match (safety_envelope, rewrite_envelope) {
+        (Some(mut safety), Some(rewrite)) => {
+            // Both already agree on `allow` here -- let the rewrite's own
+            // `updatedInput` and its own more specific reason win, exactly
+            // what claude would have ended up applying from the rewrite
+            // hook's separate process before consolidation.
+            if let Some(updated_input) = rewrite.pointer("/hookSpecificOutput/updatedInput") {
+                safety["hookSpecificOutput"]["updatedInput"] = updated_input.clone();
+            }
+            if let Some(reason) = rewrite.pointer("/hookSpecificOutput/permissionDecisionReason") {
+                safety["hookSpecificOutput"]["permissionDecisionReason"] = reason.clone();
+            }
+            let _ = writeln!(w, "{safety}");
+        }
+        (Some(safety), None) => {
+            let _ = writeln!(w, "{safety}");
+        }
+        (None, Some(rewrite)) => {
+            let _ = writeln!(w, "{rewrite}");
+        }
+        (None, None) => {}
+    }
+    Ok(0)
+}
+
+/// Parses `buf` as UTF-8 and then as one JSON value, treating anything that
+/// is not exactly that -- invalid UTF-8, empty or whitespace-only text,
+/// invalid JSON -- as "nothing to say" rather than an error: the ordinary
+/// silent-allow shape every hook in this file already prints for.
+fn parsed_json_envelope(buf: Vec<u8>) -> Option<serde_json::Value> {
+    let text = String::from_utf8(buf).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
 }
 
 /// Runs four independent guards against the same payload: the expensive-seat
@@ -3809,12 +5932,13 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         return Ok(0);
     }
 
-    // Issue #419: a `Bash` call gets its own, much narrower treatment --
-    // see `run_pretool_bash_rewrite`'s own doc comment -- and never falls
-    // through to the orchestrator-write guard below, which only ever looks
-    // at `FILE_MODIFICATION_TOOLS` and would not recognize `Bash` anyway.
-    if payload.tool_name == "Bash" {
-        return run_pretool_bash_rewrite(w, &payload, env);
+    // Issue #419/#769: `Bash`/`PowerShell` get their own, much narrower
+    // treatment -- see `run_pretool_bash_or_powershell`'s own doc comment --
+    // and never fall through to the orchestrator-write guard below, which
+    // only ever looks at `FILE_MODIFICATION_TOOLS` and would not recognize
+    // either tool anyway.
+    if matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
+        return run_pretool_bash_or_powershell(w, stdin, &payload, env);
     }
 
     if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
@@ -3832,6 +5956,10 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     // every seat gets it, not only an orchestrator's -- so it is resolved
     // before that guard's own "outside my scope" early return.
     let reuse_note = reuse_advice(&payload, &cwd, &cfg, env, &session);
+
+    // The scope-creep guard's own checkpoint is likewise independent of the
+    // write guard below -- every seat gets it, orchestrator or not.
+    let checkpoint_note = scope_checkpoint_note(&payload, &cwd, &cfg, env);
 
     let outcome = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env, posture);
     match &outcome {
@@ -3853,8 +5981,16 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
             // One envelope, however many notes: claude reads a single
             // `additionalContext` per hook, so a second `writeln!` would
             // throw one of them away.
-            if let Some(note) = join_advisory_notes(advisory, reuse_note.as_deref()) {
+            if let Some(note) =
+                join_advisory_notes(&[advisory, reuse_note.as_deref(), checkpoint_note.as_deref()])
+            {
                 let _ = writeln!(w, "{}", pretool_advise_output(&note));
+            }
+            // Only committed here, now that the checkpoint text is actually
+            // going out (this branch is never reached on a `Deny` above) --
+            // see `scope_checkpoint_note`'s own doc comment.
+            if checkpoint_note.is_some() {
+                scope_checkpoint_mark_shown(&payload, env);
             }
         }
     }
@@ -3881,14 +6017,18 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     Ok(0)
 }
 
-/// The two non-blocking notes `run_pretool` can produce, joined into the one
-/// `additionalContext` string claude reads -- `None` when neither fired.
-fn join_advisory_notes(orchestrator: Option<&str>, reuse: Option<&str>) -> Option<String> {
-    match (orchestrator, reuse) {
-        (None, None) => None,
-        (Some(note), None) | (None, Some(note)) => Some(note.to_string()),
-        (Some(first), Some(second)) => Some(format!("{first}\n{second}")),
-    }
+/// The non-blocking notes `run_pretool` can produce, joined into the one
+/// `additionalContext` string claude reads -- `None` when none of them
+/// fired. Never drops one for another: claude reads a single
+/// `additionalContext` per hook, so every note that fired rides in the same
+/// envelope, newline-separated.
+fn join_advisory_notes(notes: &[Option<&str>]) -> Option<String> {
+    let joined = notes
+        .iter()
+        .filter_map(|note| *note)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Issue #406 layer 1: the pre-write reuse probe's own note, or `None` when
@@ -4013,6 +6153,65 @@ fn posttool_value_output(value: serde_json::Value) -> String {
         }
     })
     .to_string()
+}
+
+/// A standalone `additionalContext` envelope for `PostToolUse` -- used when
+/// this hook has nothing else to say for this call (no compaction, no
+/// obfuscation) but the scope-guard shell checkpoint fired anyway. Claude
+/// Code's `PostToolUse` schema accepts `additionalContext` in the same
+/// `hookSpecificOutput` object as `updatedToolOutput`, alongside or instead
+/// of it -- see [`posttool_envelope_with_context`], which merges it into an
+/// envelope that already carries one.
+fn posttool_additional_context_output(note: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": note
+        }
+    })
+    .to_string()
+}
+
+/// Merges the scope-guard shell checkpoint's own note into an already-built
+/// `PostToolUse` envelope string (one of `posttool_output`'s/
+/// `posttool_value_output`'s own outputs), or returns it unchanged when
+/// `note` is `None`. Only one JSON object may ever be written per hook call,
+/// so this is the seam every `run_posttool` return path routes through
+/// rather than writing `additionalContext` as a second line: re-parses
+/// rather than threading a `Value` through every caller, which keeps
+/// `posttool_output`/`posttool_value_output` -- and every existing assertion
+/// against their exact shape -- untouched. Fails safe: an envelope that
+/// somehow does not round-trip through JSON is returned as-is, dropping the
+/// note rather than corrupting the envelope claude actually reads.
+fn posttool_envelope_with_context(envelope: String, note: Option<&str>) -> String {
+    let Some(note) = note else {
+        return envelope;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&envelope) else {
+        return envelope;
+    };
+    if let Some(hook_output) = value
+        .get_mut("hookSpecificOutput")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        hook_output.insert(
+            "additionalContext".to_string(),
+            serde_json::Value::String(note.to_string()),
+        );
+    }
+    value.to_string()
+}
+
+/// The shared tail for every `run_posttool` return point that has no
+/// compaction/obfuscation envelope of its own to attach the scope-guard
+/// shell checkpoint to: writes it alone (standalone `additionalContext`)
+/// when present, otherwise writes nothing at all -- exactly this function's
+/// previous behaviour for every one of those paths.
+fn posttool_finish<W: Write>(w: &mut W, note: Option<&str>) -> CtxResult<i32> {
+    if let Some(note) = note {
+        let _ = writeln!(w, "{}", posttool_additional_context_output(note));
+    }
+    Ok(0)
 }
 
 fn withhold_strings(value: &mut serde_json::Value) {
@@ -4163,11 +6362,47 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
 /// much this hook has actually saved without re-deriving it from the raw
 /// output-capture files.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    // Scope-creep guard (item 1): the tool-agnostic shell-edit checkpoint is
+    // computed first, independent of everything below, so its note can be
+    // merged into whichever envelope this call ends up emitting below --
+    // obfuscation's masked replacement, output compaction's summary, or (when
+    // neither fires) a standalone envelope of its own -- since only one JSON
+    // object may ever be written per hook call. This narrow parse only reads
+    // `tool_name`/`cwd`/`session_id`; the same `PostToolPayload` is parsed
+    // again below for the rest of this function's own, untouched control
+    // flow.
+    let shell_checkpoint = serde_json::from_str::<PostToolPayload>(stdin)
+        .ok()
+        .filter(|payload| matches!(payload.tool_name.as_str(), "Bash" | "PowerShell"))
+        .and_then(|payload| {
+            let cwd = if payload.cwd.is_empty() {
+                std::env::current_dir().ok()?
+            } else {
+                PathBuf::from(&payload.cwd)
+            };
+            let cfg = cfg_or_operator_only_gate(&cwd, env);
+            scope_guard_shell_checkpoint_note(
+                &payload.tool_name,
+                &cwd,
+                &cfg,
+                &payload.session_id,
+                &payload.tool_input.command,
+                env,
+            )
+        });
+
     // Runs before the Bash-specific parser below: Read/Grep/Glob and custom
     // tool results have different schemas, but their `tool_response` value
     // can still be replaced byte-for-byte after recursively masking strings.
     if let Some(masked) = obfuscated_posttool_response(stdin, env) {
-        let _ = writeln!(w, "{}", posttool_value_output(masked));
+        let _ = writeln!(
+            w,
+            "{}",
+            posttool_envelope_with_context(
+                posttool_value_output(masked),
+                shell_checkpoint.as_deref()
+            )
+        );
         return Ok(0);
     }
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
@@ -4189,7 +6424,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     }
 
     if payload.tool_name != "Bash" || payload.tool_response.is_image {
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let response = &payload.tool_response;
     let combined = if response.stderr.is_empty() {
@@ -4208,14 +6443,14 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // that record nothing at all: there is nowhere to key or write a row.
     let cwd = if payload.cwd.is_empty() {
         let Ok(cwd) = std::env::current_dir() else {
-            return Ok(0);
+            return posttool_finish(w, shell_checkpoint.as_deref());
         };
         cwd
     } else {
         PathBuf::from(&payload.cwd)
     };
     let Ok(state) = StateDir::resolve(env) else {
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     let program = payload
         .tool_input
@@ -4245,12 +6480,12 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
 
     if already_offloaded(&combined) {
         record(super::ledger::Outcome::Offloaded, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     if !cfg.output.compact {
         record(super::ledger::Outcome::Disabled, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     // How much of THIS command's output may be replaced at all. A reader --
     // `cat`, `sed -n`, `rg`, `git diff`, an operator's own `[output]
@@ -4266,7 +6501,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     let threshold = match scope {
         super::output::CompactionScope::Verbatim => {
             record(super::ledger::Outcome::Verbatim, bytes_in, None);
-            return Ok(0);
+            return posttool_finish(w, shell_checkpoint.as_deref());
         }
         super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
         super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
@@ -4285,7 +6520,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // replacing claude's agree on when a result is worth compacting.
     if !super::lifecycle::should_compact_result(combined.len(), true, threshold.saturating_sub(1)) {
         record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     }
     let command = if payload.tool_input.command.trim().is_empty() {
         vec!["(bash)".to_string()]
@@ -4306,7 +6541,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // summary whose retrieval line names a file that does not exist would
         // turn this from compression into loss.
         record(super::ledger::Outcome::PersistFailed, bytes_in, None);
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     // `None` means the summary could not carry its own MANDATORY failure
     // content inside the cap. Replacing a result with a summary that had
@@ -4314,14 +6549,21 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // this fails open like every other path in here.
     let Some(summary) = summary else {
         record(super::ledger::Outcome::PersistFailed, bytes_in, Some(&id));
-        return Ok(0);
+        return posttool_finish(w, shell_checkpoint.as_deref());
     };
     record(
         super::ledger::Outcome::Compacted,
         summary.len() as u64,
         Some(&id),
     );
-    let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
+    let _ = writeln!(
+        w,
+        "{}",
+        posttool_envelope_with_context(
+            posttool_output(&summary, response.interrupted),
+            shell_checkpoint.as_deref()
+        )
+    );
     Ok(0)
 }
 
@@ -4365,6 +6607,8 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
         cwd: string_at("cwd"),
         stop_hook_active: false,
         source: String::new(),
+        agent_id: String::new(),
+        agent_transcript_path: String::new(),
     })
 }
 
@@ -4519,6 +6763,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         }
         HookEvent::Permission => run_permission(w, &read_stdin(), &env),
         HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
+        HookEvent::SubagentStop => run_subagent_stop(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
                 Some(text) => text.clone(),
@@ -4687,10 +6932,37 @@ fn run_pretool_with_rehydration<W: Write>(
         let _ = write!(w, "{existing}");
         return Ok(code);
     };
+    // Issue #769 (compounding issue #466's own fix): `raw["tool_input"]` was
+    // already overwritten with `rehydrated` (the REAL, unmasked value) above,
+    // BEFORE `prepared` was built and handed to the base `run_pretool` call --
+    // that call's own contract has always needed the real value (the
+    // orchestrator-write/reuse guards read real file content), which issue
+    // #466 relied on. Since #769, that base call ALSO runs the consolidated
+    // safety check itself for `Bash`/`PowerShell`, so any `permissionDecision`
+    // it produced for those two tools was decided against the REAL rehydrated
+    // command, and any reason text riding with it may quote that command
+    // verbatim (`safety::explain_text`'s own contract) -- exactly the leak
+    // issue #466 introduced this whole rehydration path to prevent. Dropped
+    // here, for `Bash`/`PowerShell` only, before anything downstream can
+    // forward it: the dedicated recheck a few lines down independently
+    // reaches the identical verdict against the identical real command and
+    // reports it through its own generic-text `Ask`/`Deny` branches, or (for
+    // `Allow`) needs no human-readable reason at all. Every other tool's own
+    // deny reasons (the orchestrator-write guard, the expensive-seat fork
+    // denial) are fixed, hand-authored strings that never quote arbitrary
+    // rehydrated content, so they are untouched.
+    if matches!(tool.as_str(), "Bash" | "PowerShell")
+        && let Some(hook_output) = envelope
+            .get_mut("hookSpecificOutput")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        hook_output.remove("permissionDecisionReason");
+    }
     if envelope
         .pointer("/hookSpecificOutput/permissionDecision")
         .and_then(serde_json::Value::as_str)
         == Some("deny")
+        && !matches!(tool.as_str(), "Bash" | "PowerShell")
     {
         let _ = writeln!(w, "{envelope}");
         return Ok(code);
@@ -5111,6 +7383,8 @@ mod tests {
             cwd: "/work/repo".to_string(),
             stop_hook_active: false,
             source: String::new(),
+            agent_id: String::new(),
+            agent_transcript_path: String::new(),
         }
     }
 
@@ -5305,6 +7579,71 @@ mod tests {
         assert!(
             advisory.contains("Read"),
             "names the stale source: {advisory}"
+        );
+    }
+
+    /// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// a fresh, unexpired `cached_prompt_bytes` on the checkpoint is used
+    /// as-is, never resampled via `compile::compile_with_harness_roster`.
+    /// Proven by seeding an absurdly large `system_bytes` before the call:
+    /// `BreakdownAccumulator::materialize`'s apportionment gives the
+    /// stale-tool-result bucket a share of `total_tokens` proportional to
+    /// its OWN byte weight against every other bucket's, so an inflated
+    /// `system_bytes` starves that share below `min_reclaim_tokens` even
+    /// though the exact same transcript fires the advisory in
+    /// `compact_advisory_fires_when_both_gates_clear` above with the real
+    /// (small) sampled value -- the only way that can happen is if the
+    /// seeded value was used, not a fresh compile.
+    #[test]
+    fn compact_advisory_reuses_a_fresh_cached_prompt_bytes_sample() {
+        use super::super::adapters::AgentAdapter as _;
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        let tokens = 150_000u64;
+        std::fs::write(&transcript, stale_read_then_edit_transcript(50_000, tokens))
+            .expect("write transcript");
+
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let cfg = CtxConfig::default();
+        let score = Score {
+            context_tokens: tokens,
+            ..score_of(Verdict::Healthy, 0)
+        };
+
+        let path = compact_advisory_checkpoint_path(&state, &transcript);
+        save_compact_advisory_checkpoint(
+            &path,
+            &CompactAdvisoryCheckpoint {
+                version: COMPACT_ADVISORY_CHECKPOINT_VERSION,
+                transcript: transcript.display().to_string(),
+                adapter: adapter.name().to_string(),
+                accumulator: super::super::breakdown::BreakdownAccumulator::default(),
+                offset: 0,
+                consumed: 0,
+                last_fired_window_tokens: None,
+                cached_prompt_bytes: Some(CachedPromptBytes {
+                    system_bytes: 100_000_000,
+                    schema_bytes: None,
+                    sampled_at: now_secs(),
+                }),
+            },
+        );
+
+        assert_eq!(
+            compact_advisory_stop_nudge(
+                &state,
+                repo_dir.path(),
+                &cfg,
+                &score,
+                &transcript,
+                &adapter,
+            ),
+            None,
+            "an inflated seeded system_bytes must starve the stale-tool-result share below the \
+             reclaim floor, proving the seeded cache -- not a fresh compile -- was used"
         );
     }
 
@@ -5510,6 +7849,8 @@ mod tests {
             cwd: repo.display().to_string(),
             stop_hook_active: false,
             source: source.to_string(),
+            agent_id: String::new(),
+            agent_transcript_path: String::new(),
         }
     }
 
@@ -6061,6 +8402,46 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
         assert!(log.contains("\"verb\":\"hook\""), "got {log}");
+    }
+
+    /// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// `run_stop` now reads [`adapters::AGENT_ENV`] and hands it to
+    /// `score::score_transcript_cached` as the agent hint, instead of always
+    /// passing `None` and paying for a full adapter-presence scan. A
+    /// supervised stop (the ordinary case: [`adapters::AGENT_ENV`] set, no
+    /// `agent` key configured) must score and advise exactly like the
+    /// unsupervised case above -- the fast path changes WHICH adapter answers
+    /// `ready()`, never the scored result.
+    #[test]
+    fn a_supervised_stop_scores_identically_to_an_unsupervised_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = rotting_transcript(dir.path());
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (adapters::AGENT_ENV.to_string(), "claude".to_string()),
+        ]
+        .into();
+
+        let stdin = stop_payload(&transcript, dir.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert!(
+            parsed["systemMessage"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart"),
+            "a supervised stop must still score and advise on the same rotting transcript: {parsed:?}"
+        );
     }
 
     /// Issue #243: a transcript carrying a prompt-injection marker
@@ -8369,6 +10750,56 @@ mod tests {
             super::super::attention::load(&state, &short).attention,
             super::super::attention::Attention::WriterConflict,
             "a posttool must never clear an attention it did not itself raise"
+        );
+    }
+
+    /// Perf: the fast unlocked pre-check in
+    /// `clear_resolved_approval` must skip `record_if`'s lock entirely when
+    /// there is no `Approval` latch to clear at all -- the common case on
+    /// every `PreToolUse`/`PostToolUse` call. Proven directly: a session with
+    /// no attention recorded yet (so nothing under `state.attention()` exists
+    /// for its short id) gets a plain `PostToolUse` hook call, and neither
+    /// the status file nor the lock file `record_if`'s own `lock_status`
+    /// would otherwise create is ever written.
+    #[test]
+    fn posttool_never_touches_the_attention_lock_when_nothing_is_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        // Nothing recorded yet: `state.attention()` may not even exist.
+        assert!(
+            !state.attention().join(format!("{short}.json")).exists(),
+            "test setup: no status file should exist before the hook runs"
+        );
+        assert!(
+            !state.attention().join(format!("{short}.lock")).exists(),
+            "test setup: no lock file should exist before the hook runs"
+        );
+
+        let posttool_stdin = serde_json::json!({
+            "session_id": "abc123",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {"stdout": "hi", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo",
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &posttool_stdin, &lookup).expect("never errors");
+
+        assert!(
+            !state.attention().join(format!("{short}.lock")).exists(),
+            "the fast unlocked pre-check must skip record_if's lock entirely when there is \
+             nothing to clear"
+        );
+        assert!(
+            !state.attention().join(format!("{short}.json")).exists(),
+            "nothing to clear must never write a status file either"
         );
     }
 
@@ -11186,9 +13617,269 @@ capable a model does it actually need?",
         );
     }
 
+    /// F7 (wrapper-overhead benchmark, 2026-09-24): a heredoc -- one of the
+    /// exact shapes the benchmark's 46 denials over 40 runs named -- matches
+    /// no specific `safety.allow`/`safety.deny`/`safety.ask` rule at all, so
+    /// its verdict is purely the operator's own configured `[safety]
+    /// default`. Headlessly, with that default set to `allow`, claude's own
+    /// `--permission-mode dontAsk` plus its static `--allowedTools` list
+    /// would otherwise deny this outright for not being literally on that
+    /// list -- this hook must instead name the decision explicitly, with no
+    /// rewrite (`updatedInput` absent) since this command shape is untouched.
+    ///
+    /// Issue #769: `permission_mode: "dontAsk"` here (unlike `bash_pretool_
+    /// stdin`'s own `"default"`) is deliberate -- it is what makes the merged
+    /// safety layer itself go SILENT for this `Allow` verdict (`safety::
+    /// hook_output_with_extras`'s own `dont_ask` branch), which is exactly
+    /// what proves this test is still pinning `run_pretool_bash_rewrite`'s
+    /// own F7 explicit-allow logic and not merely re-observing the safety
+    /// layer's now-merged-in explicit allow (which fires regardless of F7,
+    /// whenever `permission_mode` is not `"dontAsk"` -- see the interactive
+    /// sibling test below).
+    #[test]
+    fn run_pretool_bash_names_an_explicit_allow_headlessly_when_the_operator_default_is_allow() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> = [
+            (super::adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            ("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string()),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": "claude-session-id",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": repo.path().display().to_string(),
+            "permission_mode": "dontAsk",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat > f.py <<'EOF'\nprint(1)\nEOF"},
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_pretool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "a heredoc is never rewritten: {parsed}"
+        );
+    }
+
+    /// F1 (codex review, cff7ff57 follow-up): a session launched with the
+    /// pinned snapshot's `default = Ask` (issue #139's attestation), whose
+    /// home policy was then widened to `allow` mid-session. The full
+    /// attested check (`evaluate_with_attestation_evidence`) correctly keeps
+    /// the snapshot's stricter `Ask` -- which `hook_output_with_extras` then
+    /// silences under headless `dontAsk` by design (deferring to claude's
+    /// own permission flow) -- so `run_pretool_bash_rewrite`'s own F7
+    /// explicit-allow fallback must NOT independently re-evaluate against
+    /// today's (widened) policy and print its own `allow`: that would bypass
+    /// the pinned verdict entirely. Silence here is the correct, fail-closed
+    /// outcome: claude's own `dontAsk` plus its static `--allowedTools` list
+    /// denies anything not explicitly allowed.
+    #[test]
+    fn run_pretool_bash_headless_allow_never_bypasses_a_pinned_stricter_snapshot() {
+        let repo = orchestrator_repo();
+        let snapshot_dir = tempfile::tempdir().expect("tempdir");
+        let snapshot_path = snapshot_dir.path().join("policy.json");
+        // The launch-time snapshot: the shipped default policy, whose
+        // headless `default` is `Ask` (see `SafetyPolicy::default`'s own doc
+        // comment).
+        let launch_policy = super::super::safety::SafetyPolicy::default();
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string(&launch_policy).expect("serializes"),
+        )
+        .expect("writes snapshot");
+        let fingerprint =
+            super::super::safety::policy_fingerprint(&launch_policy).expect("fingerprints");
+
+        let env: std::collections::HashMap<String, String> = [
+            (super::adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            // The operator widened the home policy AFTER this session's own
+            // launch pinned `ask` -- exactly issue #139's divergence case.
+            ("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string()),
+            (
+                super::super::safety::POLICY_FINGERPRINT_ENV.to_string(),
+                fingerprint,
+            ),
+            (
+                super::super::safety::POLICY_SNAPSHOT_ENV.to_string(),
+                snapshot_path.to_str().expect("utf8 path").to_string(),
+            ),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": "claude-session-id",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": repo.path().display().to_string(),
+            "permission_mode": "dontAsk",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat > f.py <<'EOF'\nprint(1)\nEOF"},
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_pretool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.trim().is_empty(),
+            "a pinned-stricter Ask must stay silent (fail-closed under dontAsk), never an \
+             explicit allow from the un-pinned fallback: {printed}"
+        );
+    }
+
+    /// The same operator default, but NOT headless. Before issue #769 this
+    /// meant `run_pretool_bash_rewrite`'s own F7 explicit-allow logic (gated
+    /// on `HEADLESS_ENV`) stayed silent -- the SEPARATE `zirv ctx safety
+    /// check` hook was the only thing that ever explained an interactive
+    /// allow, invisible to `run_pretool` alone. Now that `run_pretool` runs
+    /// that exact check itself for `Bash`/`PowerShell`, the merged decision
+    /// is STILL an explicit `allow` with no `updatedInput` (a heredoc is
+    /// never rewritten) -- sourced from the safety layer this time, not the
+    /// F7 path, which independently stays silent here exactly as before.
+    #[test]
+    fn run_pretool_bash_names_an_explicit_allow_interactively_too_via_the_safety_check() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> =
+            [("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string())].into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(
+                &repo.path().display().to_string(),
+                "cat > f.py <<'EOF'\nprint(1)\nEOF",
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_allow_with_no_rewrite(
+            &printed,
+            "an interactive allow now comes from the merged safety check, not silence",
+        );
+    }
+
+    /// A command the operator's own `[safety] deny`/`ask` rules (or
+    /// `SHIPPED_POSTURE_DENY`) actually refuse must never receive the F7
+    /// explicit allow, even headlessly with a permissive default -- a
+    /// specific `deny`/`ask` rule always outranks the unmatched-command
+    /// `default` (`safety::evaluate`'s own precedence). `rm -rf /` matches
+    /// the shipped `[safety] ask` rule `rm -rf *` (not a hard `deny`), so the
+    /// real verdict here is `ask`, carrying the `BLOCKED: rm /` instruction
+    /// suffix `blocked_instruction_suffix` appends to any real `deny`/`ask`.
+    /// Issue #769: this is exactly the "safety deny/ask path" consolidation
+    /// must keep intact -- the merged hook now carries this REAL verdict
+    /// itself (before, only the separate `zirv ctx safety check` process
+    /// evaluated it, invisible to `run_pretool` alone), and it must never
+    /// carry `updatedInput` alongside a real `ask`/`deny`.
+    #[test]
+    fn run_pretool_bash_never_allows_a_denied_command_even_headlessly() {
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> = [
+            (super::adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            ("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string()),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "rm -rf /"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.is_empty(),
+            "a genuinely dangerous command must still be flagged, not silent: {printed}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "ask",
+            "got {parsed}"
+        );
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "a real ask/deny must never carry updatedInput: {parsed}"
+        );
+    }
+
+    /// Issue #769: `PowerShell` used to get NOTHING from `zirv ctx hook
+    /// pretool` -- only `Bash` ever reached `run_pretool_bash_rewrite`, and
+    /// the separate `zirv ctx safety check` hook (matcher `Bash|PowerShell`)
+    /// was the only thing that ever evaluated a `PowerShell` call at all.
+    /// Now the consolidated hook runs that exact check for `PowerShell` too.
+    /// `"git log"` as the command text is deliberate, not a claim about real
+    /// PowerShell syntax: the safety layer pattern-matches command TEXT
+    /// regardless of `tool_name`, and this is the same already-proven-Allow
+    /// command every `git log` rewrite test above already relies on.
+    #[test]
+    fn run_pretool_now_evaluates_powershell_directly_where_it_used_to_stay_silent() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &orchestrator_pretool_stdin(
+                &repo.path().display().to_string(),
+                "claude-session-id",
+                "PowerShell",
+                serde_json::json!({"command": "git log"}),
+            ),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            !printed.is_empty(),
+            "issue #769: PowerShell now gets the safety check's own explicit decision, not \
+             silence"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "the Bash-only git-log rewrite must never apply to PowerShell: {parsed}"
+        );
+    }
+
+    /// Asserts `printed` is an `allow` decision with no `updatedInput` --
+    /// issue #769: since the consolidated hook now also runs the safety
+    /// check itself, and `bash_pretool_stdin`'s `permission_mode: "default"`
+    /// is not `"dontAsk"`, every `Allow` verdict now prints an explicit
+    /// `allow` (the same "sole prompting gate" behavior the standalone
+    /// safety hook already had interactively before this consolidation --
+    /// see `safety::hook_output_with_extras`'s own doc comment). A shape the
+    /// rewrite would touch NOT firing is what these tests actually pin: no
+    /// `updatedInput` at all.
+    fn assert_allow_with_no_rewrite(printed: &str, context: &str) {
+        assert!(
+            !printed.is_empty(),
+            "{context}: expected an explicit allow, got silence"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["permissionDecision"], "allow",
+            "{context}: {parsed}"
+        );
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "{context}: no rewrite should have fired: {parsed}"
+        );
+    }
+
     /// A `git log` that already names its own limit -- `-n`, `--max-count=`,
-    /// or a bare `-<digits>` -- is left completely untouched: no output at
-    /// all, since nothing else can fire for a `Bash` call.
+    /// or a bare `-<digits>` -- gets no `updatedInput`: the rewrite never
+    /// fires. It still gets the merged hook's own explicit `allow` (issue
+    /// #769), the same as any other allowed `Bash` command now.
     #[test]
     fn run_pretool_leaves_an_already_limited_git_log_alone() {
         let repo = orchestrator_repo();
@@ -11201,16 +13892,14 @@ capable a model does it actually need?",
             )
             .expect("never errors");
             assert_eq!(code, 0);
-            assert!(
-                out.is_empty(),
-                "{command} already names its own limit, so no updatedInput: {out:?}"
-            );
+            let printed = String::from_utf8(out).expect("utf8");
+            assert_allow_with_no_rewrite(&printed, command);
         }
     }
 
     /// A piped `git log` is left alone entirely -- the author already shaped
     /// its output, so the whole command is skipped rather than only the
-    /// `git log` part.
+    /// `git log` part; no `updatedInput` ever appears for it.
     #[test]
     fn run_pretool_leaves_a_piped_git_log_alone() {
         let repo = orchestrator_repo();
@@ -11222,9 +13911,10 @@ capable a model does it actually need?",
         )
         .expect("never errors");
         assert_eq!(code, 0);
-        assert!(
-            out.is_empty(),
-            "a pipe means the author already shaped the output: {out:?}"
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_allow_with_no_rewrite(
+            &printed,
+            "a pipe means the author already shaped the output",
         );
     }
 
@@ -11243,9 +13933,10 @@ capable a model does it actually need?",
         )
         .expect("never errors");
         assert_eq!(code, 0);
-        assert!(
-            out.is_empty(),
-            "a compound command is not picked apart to rewrite one piece of it: {out:?}"
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_allow_with_no_rewrite(
+            &printed,
+            "a compound command is not picked apart to rewrite one piece of it",
         );
     }
 
@@ -11267,10 +13958,8 @@ capable a model does it actually need?",
         )
         .expect("never errors");
         assert_eq!(code, 0);
-        assert!(
-            out.is_empty(),
-            "a trailing `#` comment must never be rewritten: {out:?}"
-        );
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_allow_with_no_rewrite(&printed, "a trailing `#` comment must never be rewritten");
     }
 
     /// A denied command -- the expensive-seat guard's fork denial, and the
@@ -11544,6 +14233,32 @@ capable a model does it actually need?",
         repo
     }
 
+    /// `git status --porcelain`'s `A `/`AM` INDEX codes mark a file created
+    /// and staged THIS turn -- never one that existed before it -- so `AM`'s
+    /// own `M` must not be read as an edit to an EXISTING tracked file.
+    #[test]
+    fn scope_guard_tracked_modified_excludes_a_staged_new_file() {
+        let repo = git_repo();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(repo.path().join("brand_new.txt"), "one\n").expect("write");
+        git(&["add", "brand_new.txt"]);
+        std::fs::write(repo.path().join("brand_new.txt"), "one\ntwo\n").expect("modify staged");
+
+        let modified = scope_guard_tracked_modified(repo.path()).expect("git status");
+        assert!(
+            modified.iter().all(|entry| entry.path != "brand_new.txt"),
+            "a file created and staged this turn must not be reported as an existing-tracked \
+             edit: {modified:?}"
+        );
+    }
+
     #[test]
     fn session_has_modification_is_false_without_an_edit_like_call() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -11810,6 +14525,793 @@ capable a model does it actually need?",
             None,
             "3rd stale turn in the same session must not nudge again"
         );
+    }
+
+    // -- Q1: missing-tests Stop-hook gate -----------------------------------
+
+    #[test]
+    fn path_looks_like_test_file_matches_the_documented_patterns() {
+        for path in [
+            "tests/foo.rs",
+            "src/test/bar.py",
+            "Tests/Bar.cs",
+            "test_widget.py",
+            "widget_test.go",
+            "widget.test.ts",
+        ] {
+            assert!(
+                path_looks_like_test_file(Path::new(path)),
+                "{path} should be recognised as a test file"
+            );
+        }
+        for path in ["src/lib.rs", "README.md", "src/testing_helpers.rs"] {
+            assert!(
+                !path_looks_like_test_file(Path::new(path)),
+                "{path} should not be recognised as a test file"
+            );
+        }
+    }
+
+    #[test]
+    fn hunk_new_start_parses_standard_and_single_line_headers() {
+        assert_eq!(hunk_new_start("@@ -1,2 +3,4 @@ fn main() {"), Some(3));
+        assert_eq!(hunk_new_start("@@ -1 +7 @@"), Some(7));
+        assert_eq!(hunk_new_start("not a hunk header"), None);
+    }
+
+    #[test]
+    fn diff_touches_line_at_or_after_is_true_only_at_or_past_the_marker() {
+        let diff = "@@ -1,0 +1,2 @@\n+a\n+b\n";
+        assert!(diff_touches_line_at_or_after(diff, 1));
+        assert!(!diff_touches_line_at_or_after(diff, 5));
+    }
+
+    /// Commits whatever is currently in the working tree, on top of
+    /// `git_repo()`'s own base commit -- `rust_change_touches_cfg_test` reads
+    /// `git diff HEAD`, which shows nothing for an untracked file, so these
+    /// two tests need a real baseline commit before their "edit" write.
+    fn commit_all(repo: &Path, message: &str) {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", message]);
+    }
+
+    /// A change to the bottom-of-file `#[cfg(test)] mod tests` block (this
+    /// repo's own convention) is recognised as a test change even though the
+    /// path itself is an ordinary `.rs` source file.
+    #[test]
+    fn rust_change_touches_cfg_test_is_true_for_a_change_inside_the_test_module() {
+        let repo = git_repo();
+        let path = repo.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() {\n        assert_eq!(add(1, 1), 2);\n    }\n}\n",
+        )
+        .expect("write");
+        commit_all(repo.path(), "add lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() {\n        assert_eq!(add(1, 1), 2);\n    }\n\n    #[test]\n    fn adds_negative() {\n        assert_eq!(add(-1, -1), -2);\n    }\n}\n",
+        )
+        .expect("write");
+        assert!(rust_change_touches_cfg_test(
+            repo.path(),
+            Path::new("lib.rs")
+        ));
+    }
+
+    /// A change above the `#[cfg(test)]` line -- to the production code, not
+    /// the test module -- must not be mistaken for a test change just
+    /// because the file happens to carry one.
+    #[test]
+    fn rust_change_touches_cfg_test_is_false_for_a_change_above_the_test_module() {
+        let repo = git_repo();
+        let path = repo.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() {\n        assert_eq!(add(1, 1), 2);\n    }\n}\n",
+        )
+        .expect("write");
+        commit_all(repo.path(), "add lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b + 0\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn adds() {\n        assert_eq!(add(1, 1), 2);\n    }\n}\n",
+        )
+        .expect("write");
+        assert!(!rust_change_touches_cfg_test(
+            repo.path(),
+            Path::new("lib.rs")
+        ));
+    }
+
+    /// Behaviour 1: a headless session that edited a non-test source file and
+    /// touched no test file blocks once, with a reason naming tests.
+    #[test]
+    fn missing_tests_gate_blocks_once_when_source_is_edited_without_tests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason =
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-a", "sess-q1-a", &cfg, &|k| {
+                env.get(k).cloned()
+            })
+            .expect("non-test source change with no test change must block");
+        assert!(reason.contains("test"), "{reason}");
+    }
+
+    /// Behaviour 2: a session that also touched a test file for the same
+    /// change is never blocked.
+    #[test]
+    fn missing_tests_gate_does_not_block_when_tests_are_also_edited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        std::fs::create_dir_all(repo.path().join("tests")).expect("mkdir");
+        std::fs::write(repo.path().join("tests/src_test.rs"), "// test\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-b", "sess-q1-b", &cfg, &|k| {
+                env.get(k).cloned()
+            }),
+            None,
+            "a test file changed alongside the source change must not block"
+        );
+    }
+
+    /// Behaviour 3: once blocked, the same session never blocks again, even
+    /// though nothing about the (still test-less) change set changed.
+    #[test]
+    fn missing_tests_gate_never_blocks_twice_in_the_same_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        assert!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", "sess-q1-c", &cfg, &lookup)
+                .is_some(),
+            "first stop with missing tests must block"
+        );
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-c", "sess-q1-c", &cfg, &lookup),
+            None,
+            "a second stop in the same session must never block again"
+        );
+    }
+
+    /// Behaviour 4: an interactive session (no `ZIRV_CTX_HEADLESS=1`) is
+    /// never blocked, even with the identical qualifying change set.
+    #[test]
+    fn missing_tests_gate_does_not_block_interactive_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-d", "sess-q1-d", &cfg, &|_| {
+                None
+            }),
+            None,
+            "an interactive session (no ZIRV_CTX_HEADLESS=1) must never block"
+        );
+    }
+
+    /// F6 residual (review round 2): with NEITHER `stable_short` nor the raw
+    /// session id carrying any identity (both empty -- an unsupervised
+    /// launch whose session id is itself empty or has no ASCII-alphanumeric
+    /// character at all), the gate must skip entirely: never block, and
+    /// never persist a record at the shared empty-string hash -- otherwise
+    /// one such identity-less session's block would silently suppress the
+    /// gate for every other one.
+    #[test]
+    fn missing_tests_gate_skips_entirely_with_no_identity_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "", "", &cfg, &|k| {
+                env.get(k).cloned()
+            }),
+            None,
+            "no identity at all must never block"
+        );
+        let collision_path = missing_tests_gate_record_path(&state, "");
+        assert!(
+            !collision_path.exists(),
+            "a no-identity session must never persist a record at the shared empty-key path"
+        );
+    }
+
+    /// F6 residual (review round 2): when `stable_short` is empty (no
+    /// socket bound and the rotating session id filtered to nothing) but the
+    /// raw session id is non-empty, the gate keys on the raw id instead of
+    /// collapsing every such session onto the shared empty-string record --
+    /// two different raw ids get two independent records, neither inheriting
+    /// the other's block.
+    #[test]
+    fn missing_tests_gate_falls_back_to_the_raw_session_id_when_stable_short_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        assert!(
+            missing_tests_gate_reason(&state, repo.path(), "", "raw-session-one", &cfg, &lookup)
+                .is_some(),
+            "the raw session id must still key a real, blockable identity"
+        );
+        assert!(
+            missing_tests_gate_reason(&state, repo.path(), "", "raw-session-two", &cfg, &lookup)
+                .is_some(),
+            "an unrelated raw session id must not inherit another session's own block"
+        );
+    }
+
+    /// The operator-configurable toggle: off means never blocked, even for an
+    /// otherwise-qualifying headless change set.
+    #[test]
+    fn missing_tests_gate_is_silent_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let mut cfg = CtxConfig::default();
+        cfg.missing_tests_gate.enabled = false;
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-e", "sess-q1-e", &cfg, &|k| {
+                env.get(k).cloned()
+            }),
+            None
+        );
+    }
+
+    /// A doc-only change set (the same exemption `verify_on_stop_nudge`
+    /// already uses) has no source change to demand a test for.
+    #[test]
+    fn missing_tests_gate_does_not_block_a_doc_only_change_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("README.md"), "docs\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        assert_eq!(
+            missing_tests_gate_reason(&state, repo.path(), "sess-q1-f", "sess-q1-f", &cfg, &|k| {
+                env.get(k).cloned()
+            }),
+            None
+        );
+    }
+
+    /// End-to-end: `run_stop` actually renders the real Stop-hook block
+    /// envelope (`{"decision": "block", ...}`), not just an advisory line,
+    /// when the missing-tests gate fires.
+    #[test]
+    fn run_stop_emits_a_real_block_decision_for_a_missing_tests_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let stdin = stop_payload(&transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(parsed["decision"], "block");
+        assert!(
+            parsed["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("test"),
+            "{parsed:?}"
+        );
+    }
+
+    /// F6 (codex review, cff7ff57 follow-up): the missing-tests gate's own
+    /// per-session block record used to be keyed by the ROTATING session id
+    /// (`env(SESSION_ENV)`/`payload.session_id`), which changes on every
+    /// supervised restart -- so the gate could fire again after a restart
+    /// despite its own "blocks at most once per session, full stop"
+    /// contract. `stable_short` (issue #243) is computed in this same
+    /// `run_stop` block from `SOCKET_ENV`'s file stem, which stays bound
+    /// for the life of the whole supervised run across a restart -- exactly
+    /// the identifier this gate needed and `run_stop` already had in hand.
+    #[test]
+    fn missing_tests_gate_never_blocks_twice_across_a_supervised_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+
+        let state = dir.path().join("state");
+        let stable_short = "aaaa1111";
+        let socket_path = state.join("sockets").join(format!("{stable_short}.sock"));
+        let base_env: Vec<(String, String)> = vec![
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+            (SOCKET_ENV.to_string(), socket_path.display().to_string()),
+        ];
+
+        // First run of the supervised session.
+        let mut env: std::collections::HashMap<String, String> = base_env.iter().cloned().collect();
+        env.insert(
+            SESSION_ENV.to_string(),
+            "session-before-restart".to_string(),
+        );
+        let stdin = stop_payload(&transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(
+            parsed["decision"], "block",
+            "the first stop with a missing-tests change set must block: {parsed:?}"
+        );
+
+        // A supervised restart: the SAME socket (`stable_short`), a
+        // DIFFERENT (rotated) session id, the identical still-test-less
+        // change set.
+        let mut env: std::collections::HashMap<String, String> = base_env.into_iter().collect();
+        env.insert(SESSION_ENV.to_string(), "session-after-restart".to_string());
+        let stdin = stop_payload(&transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("no test of its own"),
+            "the gate must not block a second time after a supervised restart, keyed only by a \
+             rotated session id: {text}"
+        );
+    }
+
+    /// Behaviour 5: `stop_hook_active: true` in the payload must never block,
+    /// even with an otherwise-qualifying headless, test-less change set --
+    /// the top-of-function loop breaker runs before this gate is ever
+    /// reached.
+    #[test]
+    fn run_stop_never_blocks_when_stop_hook_active_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": "s",
+            "transcript_path": transcript,
+            "cwd": repo.path(),
+            "stop_hook_active": true,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "stop_hook_active must short-circuit before any hook output at all: {out:?}"
+        );
+    }
+
+    // -- Issue #774: SubagentStop result-contract gate -----------------------
+
+    fn subagent_transcript(dir: &Path, lines: &[serde_json::Value]) -> String {
+        let path = dir.join(format!(
+            "subagent-{}.jsonl",
+            input_hash(&format!("{lines:?}"))
+        ));
+        let body = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).expect("write transcript");
+        path.display().to_string()
+    }
+
+    fn subagent_stop_stdin(session_id: &str, transcript: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript,
+            "cwd": "/work/repo",
+            "stop_hook_active": false,
+        })
+        .to_string()
+    }
+
+    /// An isolated, per-test state dir -- every `run_subagent_stop` test
+    /// needs `StateDir::resolve` to succeed (the block-cap record lives
+    /// there), and must never touch this machine's own real platform state
+    /// directory, the same isolation `run_stop_emits_a_real_block_decision_
+    /// for_a_missing_tests_session` already gives itself.
+    fn subagent_state_env(dir: &Path) -> std::collections::HashMap<String, String> {
+        [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            dir.join("state").display().to_string(),
+        )]
+        .into()
+    }
+
+    fn assistant_text(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+    }
+
+    fn assistant_bash(command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use", "id": "t1", "name": "Bash",
+                    "input": {"command": command}
+                }]
+            }
+        })
+    }
+
+    fn user_text(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+    }
+
+    fn block_reason(out: &[u8]) -> Option<String> {
+        let text = String::from_utf8(out.to_vec()).expect("utf8");
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(trimmed).expect("json");
+        assert_eq!(parsed["decision"], "block", "{parsed}");
+        Some(
+            parsed["reason"]
+                .as_str()
+                .expect("reason is a string")
+                .to_string(),
+        )
+    }
+
+    /// A subagent that declared an OUTPUT CONTRACT (its own first user
+    /// message carries the fixed header `render_contract_block` always
+    /// renders) but whose final report has no fenced JSON block at all gets
+    /// blocked, with a reason naming the missing contract.
+    #[test]
+    fn run_subagent_stop_blocks_a_declared_contract_with_no_json_reply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[
+                user_text("Do the thing.\n\nOUTPUT CONTRACT (machine-validated)\n- ok: bool"),
+                assistant_text("All done, nothing more to say."),
+            ],
+        );
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-a", &transcript),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let reason = block_reason(&out).expect("must block");
+        assert!(reason.contains("OUTPUT CONTRACT"), "{reason}");
+    }
+
+    /// A final report claiming tests passed, with no `Bash` tool call
+    /// anywhere in the transcript that looks like a test/verification run,
+    /// gets blocked.
+    #[test]
+    fn run_subagent_stop_blocks_a_claimed_test_run_with_no_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[
+                user_text("Fix the bug."),
+                assistant_text("Fixed the bug. All tests passing."),
+            ],
+        );
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-b", &transcript),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let reason = block_reason(&out).expect("must block");
+        assert!(reason.contains("test"), "{reason}");
+    }
+
+    /// Sibling of the test above: the identical claim, but this time the
+    /// transcript actually contains a `cargo test` invocation -- no
+    /// violation, no block.
+    #[test]
+    fn run_subagent_stop_allows_a_claimed_test_run_with_real_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[
+                user_text("Fix the bug."),
+                assistant_bash("cargo test"),
+                assistant_text("Fixed the bug. All tests passing."),
+            ],
+        );
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-c", &transcript),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "a real test run must never block: {out:?}");
+    }
+
+    /// A final report that says `BLOCKED` with nothing after it -- not the
+    /// instructed `BLOCKED: <reason>` shape -- gets blocked once itself, so
+    /// the subagent has to say what actually happened.
+    #[test]
+    fn run_subagent_stop_blocks_a_bare_blocked_report_with_no_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[user_text("Do the thing."), assistant_text("BLOCKED")],
+        );
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-d", &transcript),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let reason = block_reason(&out).expect("must block");
+        assert!(reason.contains("BLOCKED"), "{reason}");
+    }
+
+    /// The instructed shape (`BLOCKED: <reason>`, exactly what `safety::
+    /// blocked_instruction_suffix` tells every worker to report) never
+    /// blocks -- only a bare `BLOCKED` with nothing after it does.
+    #[test]
+    fn run_subagent_stop_allows_a_blocked_report_that_names_a_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[
+                user_text("Do the thing."),
+                assistant_text("BLOCKED: missing dependency, see log for details."),
+            ],
+        );
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-e", &transcript),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a BLOCKED report that names a reason must never block: {out:?}"
+        );
+    }
+
+    /// Capped at one block per subagent: the SAME session id, with the SAME
+    /// violating transcript, blocks once and then stays silent forever --
+    /// `SubagentStopGateRecord` persists the fact across the two calls the
+    /// way `MissingTestsGateRecord` already does for the Stop hook.
+    #[test]
+    fn run_subagent_stop_blocks_at_most_once_per_subagent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[user_text("Do the thing."), assistant_text("BLOCKED")],
+        );
+        let stdin = subagent_stop_stdin("sess-774-f", &transcript);
+
+        let mut first = Vec::new();
+        run_subagent_stop(&mut first, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert!(block_reason(&first).is_some(), "the first call must block");
+
+        let mut second = Vec::new();
+        run_subagent_stop(&mut second, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert!(
+            second.is_empty(),
+            "a second call for the same subagent must never block again: {second:?}"
+        );
+    }
+
+    /// Review fix (post-#774, commit 5ca6b180): the block-cap must be per
+    /// SUBAGENT DISPATCH (`agent_id`), not per lead session (`session_id`) --
+    /// two DISTINCT subagents dispatched within the SAME lead session each
+    /// get their own one-block allowance. Keying on `session_id` alone (the
+    /// original #774 shape) meant subagent A's own block silently exempted
+    /// every later subagent B in that same session, even for B's own fresh,
+    /// unrelated violation.
+    #[test]
+    fn run_subagent_stop_gates_two_distinct_subagents_in_one_session_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let session_id = "sess-774-shared";
+
+        let transcript_a = subagent_transcript(
+            dir.path(),
+            &[user_text("Do thing A."), assistant_text("BLOCKED")],
+        );
+        let stdin_a = serde_json::json!({
+            "session_id": session_id,
+            "agent_id": "subagent-a",
+            "agent_transcript_path": transcript_a,
+            "cwd": "/work/repo",
+            "stop_hook_active": false,
+        })
+        .to_string();
+
+        let transcript_b = subagent_transcript(
+            dir.path(),
+            &[user_text("Do thing B."), assistant_text("BLOCKED")],
+        );
+        let stdin_b = serde_json::json!({
+            "session_id": session_id,
+            "agent_id": "subagent-b",
+            "agent_transcript_path": transcript_b,
+            "cwd": "/work/repo",
+            "stop_hook_active": false,
+        })
+        .to_string();
+
+        let mut out_a = Vec::new();
+        run_subagent_stop(&mut out_a, &stdin_a, &|k| env.get(k).cloned()).expect("runs");
+        assert!(
+            block_reason(&out_a).is_some(),
+            "subagent A's own violation must block"
+        );
+
+        let mut out_b = Vec::new();
+        run_subagent_stop(&mut out_b, &stdin_b, &|k| env.get(k).cloned()).expect("runs");
+        assert!(
+            block_reason(&out_b).is_some(),
+            "subagent B, a DIFFERENT dispatch in the same lead session, must still get its own \
+             one-block allowance rather than being silently exempted by A's own block: {out_b:?}"
+        );
+
+        // A itself stays capped at exactly one block, even after B's own.
+        let mut out_a_again = Vec::new();
+        run_subagent_stop(&mut out_a_again, &stdin_a, &|k| env.get(k).cloned()).expect("runs");
+        assert!(
+            out_a_again.is_empty(),
+            "subagent A must still never block a second time: {out_a_again:?}"
+        );
+    }
+
+    /// The operator's own `[subagent_stop_gate] enabled = false` silences the
+    /// gate entirely, even against an otherwise-violating transcript -- the
+    /// identical narrow-only T9 fold `missing_tests_gate.enabled` uses.
+    #[test]
+    fn run_subagent_stop_is_silent_when_disabled_by_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[subagent_stop_gate]\nenabled = false\n",
+        )
+        .expect("write ctx.toml");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[user_text("Do the thing."), assistant_text("BLOCKED")],
+        );
+        let stdin = serde_json::json!({
+            "session_id": "sess-774-g",
+            "transcript_path": transcript,
+            "cwd": repo.path().display().to_string(),
+            "stop_hook_active": false,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code =
+            run_subagent_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty(), "the opt-out must silence the gate: {out:?}");
+    }
+
+    /// Fails open on a transcript path that does not exist -- no panic, no
+    /// block, exactly the same fail-open contract `run_stop`'s own
+    /// `transcript.is_file()` guard holds to.
+    #[test]
+    fn run_subagent_stop_is_silent_on_a_missing_transcript() {
+        let mut out = Vec::new();
+        let code = run_subagent_stop(
+            &mut out,
+            &subagent_stop_stdin("sess-774-h", "/no/such/transcript.jsonl"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
     }
 
     /// Issue #308 stage 1: `diagnostics::post_edit_nudge`'s modification gate
@@ -12332,7 +15834,8 @@ capable a model does it actually need?",
                 assert!(
                     !envelope["hookSpecificOutput"]["permissionDecisionReason"]
                         .to_string()
-                        .contains(command)
+                        .contains(command),
+                    "{tool} {mode} deny={deny}: {envelope}"
                 );
             }
         }
@@ -13244,5 +16747,1354 @@ capable a model does it actually need?",
         )
         .expect("advisory");
         assert!(undeferred.contains("Consider /compact"), "{undeferred}");
+    }
+
+    // -- Scope-creep guard ---------------------------------------------------
+
+    /// The real t24 step 4 benchmark prompt, verbatim: a benchmark agent
+    /// treated its own pagination off-by-one as "an outright bug rather than
+    /// something to preserve" and fixed it unasked, failing hidden tests that
+    /// expected unchanged pagination.
+    const SCOPE_GUARD_T24_PROMPT: &str = r"I've got thousands of transactions in here now between imports and
+recurring rules, and `list` showing the oldest ones first means I have to
+page through everything to see what I did yesterday. Please make `list`
+show the most recent transactions first by default (sort by date
+descending; when two transactions share a date, keep the one with the
+lower id first). Pagination (`--page`/`--page-size`) works the same as
+always, just over this newly-ordered sequence.
+
+I know some of my own scripts probably depend on the old oldest-first
+order though, so keep it available: add a `--legacy-order` flag to `list`
+that skips the new sorting and shows transactions in the old raw order
+exactly as before.";
+
+    /// Constraint extraction picks the two sentences that actually restrict
+    /// what may change, and never the plain informational opener.
+    #[test]
+    fn scope_guard_extracts_the_preservation_sentences_from_the_t24_prompt() {
+        let constraints = scope_guard_extract_constraints(SCOPE_GUARD_T24_PROMPT);
+        assert!(
+            constraints
+                .iter()
+                .any(|s| s.contains("works the same as") && s.contains("Pagination")),
+            "must pick the pagination sentence: {constraints:?}"
+        );
+        assert!(
+            constraints.iter().any(|s| s.contains("exactly as before")),
+            "must pick the exactly-as-before sentence: {constraints:?}"
+        );
+        assert!(
+            !constraints
+                .iter()
+                .any(|s| s.contains("thousands of transactions")),
+            "must ignore the plain informational opener: {constraints:?}"
+        );
+    }
+
+    fn scope_guard_prompt_stdin(session: &str, cwd: &Path, prompt: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "prompt": prompt,
+        })
+        .to_string()
+    }
+
+    fn scope_guard_edit_stdin(session: &str, cwd: &Path, permission_mode: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": cwd.join("src/lib.rs").display().to_string(),
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "permission_mode": permission_mode,
+        })
+        .to_string()
+    }
+
+    /// End to end: the first `Edit` after a prompt gets the checkpoint, a
+    /// second `Edit` in the same prompt does not, and a new prompt re-arms
+    /// it.
+    #[test]
+    fn scope_guard_checkpoint_fires_once_then_a_new_prompt_rearms_it() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut first = Vec::new();
+        run_pretool(&mut first, &edit_stdin, &lookup).expect("run_pretool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Scope checkpoint"),
+            "the first Edit must show the checkpoint: {first}"
+        );
+        assert!(
+            first.contains("ask the user first."),
+            "interactive wording: {first}"
+        );
+
+        let mut second = Vec::new();
+        run_pretool(&mut second, &edit_stdin, &lookup).expect("run_pretool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Scope checkpoint"),
+            "a second Edit in the same prompt must stay silent: {second}"
+        );
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), "A different, unrelated request."),
+            &lookup,
+        )
+        .expect("run_prompt");
+        let mut third = Vec::new();
+        run_pretool(&mut third, &edit_stdin, &lookup).expect("run_pretool");
+        let third = String::from_utf8(third).expect("utf8");
+        assert!(
+            third.contains("Scope checkpoint"),
+            "a new prompt must re-arm the checkpoint: {third}"
+        );
+    }
+
+    /// A `Write` to a file that does not exist yet is a new file, not a
+    /// change to existing code, so it must not consume the checkpoint -- a
+    /// following `Edit` still gets it.
+    #[test]
+    fn scope_guard_checkpoint_ignores_a_write_to_a_new_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-2";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let write_stdin = serde_json::json!({
+            "session_id": session,
+            "cwd": repo.path().display().to_string(),
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": repo.path().join("brand_new.rs").display().to_string(),
+                "content": "fn x() {}\n",
+            },
+            "permission_mode": "default",
+        })
+        .to_string();
+        let mut write_out = Vec::new();
+        run_pretool(&mut write_out, &write_stdin, &lookup).expect("run_pretool");
+        let write_out = String::from_utf8(write_out).expect("utf8");
+        assert!(
+            !write_out.contains("Scope checkpoint"),
+            "a Write to a brand-new file must not trigger the checkpoint: {write_out}"
+        );
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut edit_out = Vec::new();
+        run_pretool(&mut edit_out, &edit_stdin, &lookup).expect("run_pretool");
+        let edit_out = String::from_utf8(edit_out).expect("utf8");
+        assert!(
+            edit_out.contains("Scope checkpoint"),
+            "the new-file Write must not have consumed the checkpoint: {edit_out}"
+        );
+    }
+
+    /// Headless (`permission_mode == "dontAsk"`) gets the "found, not
+    /// changed" wording instead of "ask the user first.".
+    #[test]
+    fn scope_guard_checkpoint_uses_headless_wording_under_dont_ask() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-checkpoint-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "dontAsk");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Found, not changed"),
+            "headless wording: {out}"
+        );
+        assert!(
+            !out.contains("ask the user first."),
+            "headless must not ask: {out}"
+        );
+    }
+
+    /// A `Write`/`Edit` the orchestrator-write guard DENIES must not consume
+    /// the checkpoint: nothing was ever shown to the model, so the very next
+    /// actually-allowed edit in the same prompt still gets it.
+    #[test]
+    fn scope_guard_checkpoint_survives_a_denied_orchestrator_write() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-deny-1";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let denied_edit = orchestrator_pretool_stdin(
+            &repo.path().display().to_string(),
+            session,
+            "Edit",
+            serde_json::json!({"file_path": repo.path().join("src/x.rs").display().to_string()}),
+        );
+        let mut denied_out = Vec::new();
+        run_pretool(&mut denied_out, &denied_edit, &lookup).expect("run_pretool");
+        let denied_out = String::from_utf8(denied_out).expect("utf8");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(denied_out.trim()).expect("json")["hookSpecificOutput"]
+                ["permissionDecision"],
+            "deny",
+            "{denied_out}"
+        );
+        assert!(
+            !denied_out.contains("Scope checkpoint"),
+            "a denied write must never show the checkpoint: {denied_out}"
+        );
+
+        // The same prompt's checkpoint must still be available for a real
+        // edit -- here, no orchestrator role at all, so the write proceeds.
+        let plain_env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let plain_lookup = |k: &str| plain_env.get(k).cloned();
+        let allowed_edit = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut allowed_out = Vec::new();
+        run_pretool(&mut allowed_out, &allowed_edit, &plain_lookup).expect("run_pretool");
+        let allowed_out = String::from_utf8(allowed_out).expect("utf8");
+        assert!(
+            allowed_out.contains("Scope checkpoint"),
+            "the denied attempt must not have consumed the checkpoint: {allowed_out}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false` AND `[missing_tests_gate] enabled =
+    /// false` in the repo's own `.zirv/ctx.toml` (narrow-only, the
+    /// operator's own home layer defaults both on): with NEITHER feature
+    /// this checkpoint now also backs left on, no record is written at all,
+    /// so no checkpoint ever shows. (`record_scope_guard_request` writes a
+    /// record whenever either feature is on, since item 1's "tests owed"
+    /// line can fire the checkpoint on its own -- see that function's own
+    /// doc comment.)
+    #[test]
+    fn scope_guard_disabled_shows_no_checkpoint_and_writes_no_record() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n[missing_tests_gate]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-disabled-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "disabled must never show the checkpoint: {out}"
+        );
+        let record_dir = state_dir.path().join("scope-guard");
+        assert!(
+            !record_dir.exists() || std::fs::read_dir(&record_dir).unwrap().next().is_none(),
+            "disabled must never write a scope-guard record"
+        );
+    }
+
+    /// A transcript whose last assistant message is `closing`, with a single
+    /// preceding user turn -- the identical minimal shape
+    /// `transcript_with_edits`/`rotting_transcript` already use elsewhere in
+    /// this file's own test suite.
+    fn scope_guard_transcript(dir: &Path, closing: &str) -> PathBuf {
+        let path = dir.join("scope-guard-stop.jsonl");
+        let text = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n{{\"type\":\"assistant\",\
+             \"message\":{{\"content\":[{{\"type\":\"text\",\"text\":{}}}],\"usage\":{{\
+             \"input_tokens\":100}}}}}}\n",
+            serde_json::to_string(closing).expect("json string")
+        );
+        std::fs::write(&path, text).expect("write");
+        path
+    }
+
+    fn scope_guard_stop_stdin(session: &str, transcript: &Path, cwd: &Path) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript.display().to_string(),
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string()
+    }
+
+    const SCOPE_GUARD_FIX_CLOSING: &str = "I fixed `report.page()` first. It had two bugs.";
+
+    /// End to end: `Stop` blocks once when the closing report claims a fix
+    /// the t24 step 4 request never asked for.
+    #[test]
+    fn scope_guard_stop_blocks_once_on_an_unrequested_fix_claim() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-1";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).expect("utf8").trim()).expect("json");
+        assert_eq!(parsed["decision"], "block", "{parsed:?}");
+        let reason = parsed["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("I fixed `report.page()` first."),
+            "must quote the unrequested-fix sentence: {reason}"
+        );
+        assert!(
+            reason.contains("works the same as") || reason.contains("exactly as before"),
+            "must quote the request's own constraints: {reason}"
+        );
+        assert!(
+            reason.contains("or ask the user."),
+            "interactive suffix: {reason}"
+        );
+
+        // Never blocks twice for the same prompt.
+        let mut second = Vec::new();
+        let code = run_stop(&mut second, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("found-not-changed"),
+            "must not block a second time: {second}"
+        );
+    }
+
+    /// The backstop never fires when the request itself already asked for a
+    /// fix -- there is no "unrequested" fix to catch.
+    #[test]
+    fn scope_guard_stop_does_not_block_when_the_request_itself_asks_for_a_fix() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-2";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(
+                session,
+                repo.path(),
+                "Please resolve the pagination issue in report.page().",
+            ),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &lookup).expect("runs");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("found-not-changed"),
+            "a requested fix must never trigger the backstop: {out}"
+        );
+    }
+
+    /// `stop_hook_active: true` must never block, exactly like every other
+    /// Stop-hook check in this file.
+    #[test]
+    fn scope_guard_stop_never_blocks_when_stop_hook_active_is_set() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-3";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript.display().to_string(),
+            "cwd": repo.path().display().to_string(),
+            "stop_hook_active": true,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &lookup).expect("runs");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "stop_hook_active must short-circuit before any hook output at all: {out:?}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false`: no block either, even with an
+    /// otherwise-qualifying unrequested-fix closing message.
+    #[test]
+    fn scope_guard_stop_does_not_block_when_disabled() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let session = "sess-stop-4";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), session.to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let transcript = scope_guard_transcript(repo.path(), SCOPE_GUARD_FIX_CLOSING);
+        let stdin = scope_guard_stop_stdin(session, &transcript, repo.path());
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &lookup).expect("runs");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("found-not-changed"),
+            "disabled must never block: {out}"
+        );
+    }
+
+    // -- Scope guard: the shell-edit checkpoint (item 1) --------------------
+
+    /// A temp home + a real git repo (one committed, tracked `tracked.txt` --
+    /// `git_repo()`'s own layout) + a state dir, so `record_scope_guard_
+    /// request`'s own baseline git query and `run_posttool`'s cfg load never
+    /// touch the developer's own machine.
+    struct ScopeGuardShellRig {
+        _home_dir: tempfile::TempDir,
+        _home: crate::commands::ctx::testenv::HomeGuard,
+        repo: tempfile::TempDir,
+        _state: tempfile::TempDir,
+        env: std::collections::HashMap<String, String>,
+    }
+
+    fn scope_guard_shell_rig() -> ScopeGuardShellRig {
+        let home_dir = tempfile::tempdir().expect("home");
+        let home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+        let repo = git_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        ScopeGuardShellRig {
+            _home_dir: home_dir,
+            _home: home,
+            repo,
+            _state: state_dir,
+            env,
+        }
+    }
+
+    fn scope_guard_bash_posttool_stdin(session: &str, cwd: &Path, command: &str) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            },
+            "tool_use_id": "toolu_scope_guard_shell",
+        })
+        .to_string()
+    }
+
+    /// Behaviour (a) -- the headline case: a shell command that changes an
+    /// EXISTING tracked file after the prompt gets the same one-time
+    /// checkpoint the `PreToolUse` `Edit`/`Write` path would have shown, even
+    /// though it never touches `Edit`/`Write` at all, worded for a change
+    /// that already happened; a second shell call in the same prompt stays
+    /// silent.
+    #[test]
+    fn scope_guard_shell_checkpoint_fires_once_after_an_existing_tracked_file_changes() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        // The shell command has ALREADY run by the time `PostToolUse` fires
+        // -- this simulates that after-the-fact state (`sed -i`/`cat >`/a
+        // Python `open(p, "w")`), not something `run_posttool` itself does.
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = scope_guard_bash_posttool_stdin(
+            session,
+            rig.repo.path(),
+            "sed -i 's/one/ONE/' tracked.txt",
+        );
+        let mut first = Vec::new();
+        run_posttool(&mut first, &stdin, &lookup).expect("run_posttool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Scope checkpoint"),
+            "a shell edit to an existing tracked file must show the checkpoint: {first}"
+        );
+        assert!(
+            first.contains("tracked.txt"),
+            "must name the changed file: {first}"
+        );
+        assert!(
+            first.contains("You just changed existing file(s)"),
+            "must use the after-the-fact wording: {first}"
+        );
+        assert!(
+            first.contains("ask the user first."),
+            "interactive wording by default: {first}"
+        );
+
+        let mut second = Vec::new();
+        run_posttool(&mut second, &stdin, &lookup).expect("run_posttool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Scope checkpoint"),
+            "a second shell call in the same prompt must stay silent: {second}"
+        );
+    }
+
+    /// Behaviour (b): a tracked file already modified BEFORE the prompt --
+    /// captured in `record_scope_guard_request`'s own baseline -- that is
+    /// never touched again must not trigger the checkpoint.
+    #[test]
+    fn scope_guard_shell_checkpoint_ignores_a_file_already_modified_before_the_prompt() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-2";
+
+        std::fs::write(rig.repo.path().join("tracked.txt"), "one\nalready dirty\n")
+            .expect("pre-existing modification");
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let stdin = scope_guard_bash_posttool_stdin(session, rig.repo.path(), "echo unrelated");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "a file already modified before the prompt, untouched since, must not trigger: {out}"
+        );
+    }
+
+    /// Behaviour (c): creating only a brand-new UNTRACKED file must not
+    /// trigger the checkpoint -- a new file is not a change to existing
+    /// code.
+    #[test]
+    fn scope_guard_shell_checkpoint_ignores_a_brand_new_untracked_file() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(rig.repo.path().join("brand_new.txt"), "new\n").expect("new file");
+
+        let stdin =
+            scope_guard_bash_posttool_stdin(session, rig.repo.path(), "touch brand_new.txt");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains("Scope checkpoint"),
+            "creating only a new untracked file must not trigger: {out}"
+        );
+    }
+
+    /// A positively read-only command (`safety::jev_approve_is_read_only_
+    /// local`) must skip the `git status` re-query entirely, even when a
+    /// real tracked-file edit is sitting there unreported -- and the
+    /// checkpoint must still fire on the very next NON-read-only call, since
+    /// skipping the query must never mark the checkpoint as shown.
+    #[test]
+    fn scope_guard_shell_checkpoint_skips_the_requery_for_a_read_only_command() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-readonly";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        // A real shell edit to an existing tracked file, exactly like
+        // behaviour (a) above -- but this time the FIRST `PostToolUse` call
+        // is a read-only command that cannot have produced it.
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let readonly_stdin =
+            scope_guard_bash_posttool_stdin(session, rig.repo.path(), "git status");
+        let mut readonly_out = Vec::new();
+        run_posttool(&mut readonly_out, &readonly_stdin, &lookup).expect("run_posttool");
+        let readonly_out = String::from_utf8(readonly_out).expect("utf8");
+        assert!(
+            !readonly_out.contains("Scope checkpoint"),
+            "a read-only command must skip the re-query and stay silent: {readonly_out}"
+        );
+
+        let stdin = scope_guard_bash_posttool_stdin(
+            session,
+            rig.repo.path(),
+            "sed -i 's/one/ONE/' tracked.txt",
+        );
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Scope checkpoint"),
+            "the next non-read-only call must still find the change and fire: {out}"
+        );
+    }
+
+    /// Behaviour (d): when the SAME `Bash` call also has output large enough
+    /// to compact, the checkpoint's `additionalContext` and the compaction's
+    /// own `updatedToolOutput` must both ride in the single envelope this
+    /// hook writes -- never two JSON objects, never one dropped for the
+    /// other.
+    #[test]
+    fn scope_guard_shell_checkpoint_merges_into_the_compaction_envelope() {
+        let rig = scope_guard_shell_rig();
+        let lookup = |k: &str| rig.env.get(k).cloned();
+        let session = "sess-shell-4";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(
+            rig.repo.path().join("tracked.txt"),
+            "one\nedited by shell\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = serde_json::json!({
+            "session_id": session,
+            "cwd": rig.repo.path().display().to_string(),
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+            "tool_response": {
+                "stdout": noisy_output(),
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            },
+            "tool_use_id": "toolu_scope_guard_compact",
+        })
+        .to_string();
+
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let hook = &parsed["hookSpecificOutput"];
+        assert_eq!(hook["hookEventName"], "PostToolUse");
+        assert!(
+            hook.get("updatedToolOutput")
+                .and_then(|v| v.get("stdout"))
+                .is_some(),
+            "the compaction envelope must still be present: {out}"
+        );
+        assert!(
+            hook["additionalContext"]
+                .as_str()
+                .is_some_and(|note| note.contains("Scope checkpoint")),
+            "the same envelope must also carry the checkpoint: {out}"
+        );
+    }
+
+    // -- Scope guard: the "tests owed" checkpoint line (queued item 1) ------
+
+    fn scope_guard_edit_stdin_for(
+        session: &str,
+        cwd: &Path,
+        permission_mode: &str,
+        target_rel: &str,
+    ) -> String {
+        serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.display().to_string(),
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": cwd.join(target_rel).display().to_string(),
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "permission_mode": permission_mode,
+        })
+        .to_string()
+    }
+
+    /// A headless session editing a non-test source file gets BOTH the
+    /// scope-guard text and the tests-owed line, in the same one-time note.
+    #[test]
+    fn scope_checkpoint_combines_tests_owed_with_scope_text_for_a_headless_edit() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains("Scope checkpoint") && out.contains("Before changing existing code"),
+            "must still carry the scope-guard text: {out}"
+        );
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "must also carry the tests-owed line: {out}"
+        );
+    }
+
+    /// `[scope_guard] enabled = false` with the missing-tests gate left on
+    /// (its default): the checkpoint still fires, carrying ONLY the
+    /// tests-owed line.
+    #[test]
+    fn scope_checkpoint_shows_tests_owed_alone_when_scope_guard_is_disabled() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[scope_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-2";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "must carry the tests-owed line even with scope_guard disabled: {out}"
+        );
+        assert!(
+            !out.contains("Before changing existing code"),
+            "must not carry the scope-guard's own body text: {out}"
+        );
+    }
+
+    /// An interactive session (no `ZIRV_CTX_HEADLESS=1`) never gets the
+    /// tests-owed line, even though the missing-tests gate itself is on.
+    #[test]
+    fn scope_checkpoint_never_shows_tests_owed_for_an_interactive_session() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-3";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "default", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains(MISSING_TESTS_OWED_LINE),
+            "an interactive session must never see the tests-owed line: {out}"
+        );
+    }
+
+    /// Editing a file that already looks like a test file never owes the
+    /// tests-owed line, even headlessly.
+    #[test]
+    fn scope_checkpoint_never_shows_tests_owed_for_a_test_file_edit() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-4";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin =
+            scope_guard_edit_stdin_for(session, repo.path(), "dontAsk", "tests/feature_test.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit_stdin, &lookup).expect("run_pretool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            !out.contains(MISSING_TESTS_OWED_LINE),
+            "editing a test file must never owe a test: {out}"
+        );
+        assert!(
+            out.contains("Scope checkpoint"),
+            "the scope-guard part must still fire: {out}"
+        );
+    }
+
+    /// The `PostToolUse` shell path folds in the same tests-owed line when a
+    /// headless shell command changes an existing non-test source file.
+    #[test]
+    fn scope_guard_shell_checkpoint_combines_tests_owed_for_a_headless_shell_edit() {
+        let rig = scope_guard_shell_rig();
+        let mut env = rig.env.clone();
+        env.insert(adapters::HEADLESS_ENV.to_string(), "1".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-owed-5";
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(rig.repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::write(rig.repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        git(&["add", "src.rs"]);
+        git(&["commit", "-q", "-m", "add src.rs"]);
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, rig.repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        std::fs::write(
+            rig.repo.path().join("src.rs"),
+            "fn main() { println!(\"x\"); }\n",
+        )
+        .expect("simulate a shell edit");
+
+        let stdin = scope_guard_bash_posttool_stdin(session, rig.repo.path(), "sed -i ... src.rs");
+        let mut out = Vec::new();
+        run_posttool(&mut out, &stdin, &lookup).expect("run_posttool");
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(
+            out.contains(MISSING_TESTS_OWED_LINE),
+            "a headless shell edit to a non-test source file must owe a test: {out}"
+        );
+    }
+
+    // -- Scope guard: the stated-details checklist (queued item 2) ----------
+
+    const SCOPE_GUARD_STATED_DETAILS_PROMPT: &str = "Please add a new export command. Print an \
+         exact `DONE` marker when it finishes. The rows must come out sorted in ascending order. \
+         This sentence is just plain descriptive prose about the feature with nothing special \
+         stated.";
+
+    /// Picks up a backtick-quoted literal AND an ordering word, and ignores
+    /// plain prose that matches neither.
+    #[test]
+    fn scope_guard_extract_stated_details_picks_up_quoted_literals_and_ordering_words() {
+        let details = scope_guard_extract_stated_details(SCOPE_GUARD_STATED_DETAILS_PROMPT, &[]);
+        assert!(
+            details.iter().any(|d| d.contains("`DONE`")),
+            "must pick up the backtick-quoted literal: {details:?}"
+        );
+        assert!(
+            details.iter().any(|d| d.contains("sorted")),
+            "must pick up the ordering word: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|d| d.contains("plain descriptive prose")),
+            "must ignore plain prose: {details:?}"
+        );
+    }
+
+    /// More than [`SCOPE_GUARD_MAX_STATED_DETAILS`] qualifying sentences
+    /// still caps out at the limit.
+    #[test]
+    fn scope_guard_extract_stated_details_respects_the_cap() {
+        let prompt: String = (1..=12)
+            .map(|i| format!("Field {i} must be formatted exactly as \"value{i}\". "))
+            .collect();
+        let details = scope_guard_extract_stated_details(&prompt, &[]);
+        assert_eq!(
+            details.len(),
+            SCOPE_GUARD_MAX_STATED_DETAILS,
+            "must cap at {SCOPE_GUARD_MAX_STATED_DETAILS}: {details:?}"
+        );
+    }
+
+    /// A sentence already captured as a scope constraint must never also
+    /// appear in the stated-details list.
+    #[test]
+    fn scope_guard_extract_stated_details_skips_a_sentence_already_captured_as_a_constraint() {
+        let prompt = "Keep the sort order exactly as before, unchanged and exact.";
+        let constraints = scope_guard_extract_constraints(prompt);
+        assert!(
+            !constraints.is_empty(),
+            "sanity: this sentence must match the constraint pattern too"
+        );
+        let details = scope_guard_extract_stated_details(prompt, &constraints);
+        assert!(
+            details.is_empty(),
+            "a sentence already captured as a constraint must not duplicate into stated details: \
+             {details:?}"
+        );
+    }
+
+    const SCOPE_GUARD_STATED_DETAILS_CHECKPOINT_PROMPT: &str = "Export contacts to CSV, but keep \
+         the existing pagination behaviour exactly as before. Sort rows by last name in \
+         ascending order. The header row must read exactly \"id,name,email\".";
+
+    /// End to end: the first `Edit` after a prompt with stated details shows
+    /// the numbered checklist exactly once; a second `Edit` in the same
+    /// prompt does not repeat it.
+    #[test]
+    fn scope_checkpoint_shows_the_stated_details_list_once() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-details-1";
+
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(
+                session,
+                repo.path(),
+                SCOPE_GUARD_STATED_DETAILS_CHECKPOINT_PROMPT,
+            ),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let edit_stdin = scope_guard_edit_stdin(session, repo.path(), "default");
+        let mut first = Vec::new();
+        run_pretool(&mut first, &edit_stdin, &lookup).expect("run_pretool");
+        let first = String::from_utf8(first).expect("utf8");
+        assert!(
+            first.contains("Stated details to check before you finish:"),
+            "must show the stated-details checklist: {first}"
+        );
+        assert!(first.contains("(1)"), "must number the first item: {first}");
+
+        let mut second = Vec::new();
+        run_pretool(&mut second, &edit_stdin, &lookup).expect("run_pretool");
+        let second = String::from_utf8(second).expect("utf8");
+        assert!(
+            !second.contains("Stated details to check before you finish:"),
+            "must appear at most once per prompt: {second}"
+        );
+    }
+
+    // -- Scope guard Stop backstop: hypothetical-fix false positive fix -----
+
+    /// Benchmark false positive: a hypothetical aside about what a fix WOULD
+    /// do must never be read as a claimed, completed fix -- while the two
+    /// true positives that fired correctly in the same benchmark run must
+    /// still be caught.
+    #[test]
+    fn scope_guard_unrequested_fix_sentence_ignores_a_hypothetical_aside() {
+        assert!(
+            scope_guard_unrequested_fix_sentence("`page()` had two bugs, and I fixed both.")
+                .is_some(),
+            "a completed fix alongside a bug word must still block"
+        );
+        assert!(
+            scope_guard_unrequested_fix_sentence(
+                "I also changed `report.page()`, which you didn't ask for."
+            )
+            .is_some(),
+            "an explicit 'also changed' claim must still block"
+        );
+        assert!(
+            scope_guard_unrequested_fix_sentence(
+                "Fixing it would change the `--legacy-order` output too."
+            )
+            .is_none(),
+            "a hypothetical 'would' aside naming something the agent did NOT do must never block"
+        );
+    }
+
+    // -- Issue 6a: `[jev] missing_tests` -------------------------------------
+
+    fn missing_tests_owed_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.missing_tests = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    const TESTS_OWED_FALSE: &str = r#"{"model": "jev-latest", "answers": {
+        "tests_owed": {"type": "noul", "noul": 0.02}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    const TESTS_OWED_INDECISIVE: &str = r#"{"model": "jev-latest", "answers": {
+        "tests_owed": {"type": "noul", "noul": 0.5}},
+        "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+
+    /// Guards against the exact bug this gate shipped with once already: an
+    /// oversized `instructions` string fails `safe_metadata_request` and
+    /// `ask` never even reaches the network -- a silent, permanent no-op for
+    /// the whole gate that no other test here would ever catch, since every
+    /// mocked-server test below only proves the RESPONSE path.
+    #[test]
+    fn missing_tests_owed_request_passes_the_metadata_guard() {
+        let advise_state = DispatchAdviseState {
+            metadata_only: true,
+            facts: vec![vec![1_000_000; 5]],
+        };
+        let value = serde_json::to_value(&advise_state).expect("json");
+        assert!(super::super::jev::safe_metadata_request(
+            &value,
+            &missing_tests_owed_question(),
+            "jev-latest"
+        ));
+    }
+
+    /// Gate off (the default): behaviour is byte-identical to before this
+    /// feature existed -- the deterministic gate still blocks, and no Jev
+    /// call is ever made (a bad/unreachable `base_url` would otherwise hang
+    /// or fail this test).
+    #[test]
+    fn missing_tests_gate_unaffected_when_jev_missing_tests_is_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let cfg = CtxConfig::default();
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-a",
+            "sess-jev-a",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        assert!(
+            reason.is_some(),
+            "gate off must behave exactly as before (still blocks): {reason:?}"
+        );
+    }
+
+    /// A decisive, strongly "not owed" answer skips the block, and the skip
+    /// is never persisted as a block -- a later, still-test-less turn in the
+    /// same session can still be asked/blocked.
+    #[test]
+    fn missing_tests_gate_skips_the_block_on_a_decisive_not_owed_jev_answer() {
+        let (url, handle) =
+            crate::commands::ctx::jev::tests::one_shot_server(200, TESTS_OWED_FALSE);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let env_name = "HOOK_TEST_MISSING_TESTS_JEV_SKIP";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env_name, "secret") };
+        let cfg = missing_tests_owed_cfg(url, env_name);
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-b",
+            "sess-jev-b",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        unsafe { std::env::remove_var(env_name) };
+        handle.join().expect("server thread");
+        assert_eq!(
+            reason, None,
+            "a decisive not-owed answer must skip the block"
+        );
+        assert!(
+            !load_missing_tests_gate_record(&missing_tests_gate_record_path(&state, "sess-jev-b"))
+                .blocked,
+            "a skipped block must never be persisted as blocked"
+        );
+    }
+
+    /// An indecisive answer (thin margin) blocks exactly as today.
+    #[test]
+    fn missing_tests_gate_still_blocks_on_an_indecisive_jev_answer() {
+        let (url, handle) =
+            crate::commands::ctx::jev::tests::one_shot_server(200, TESTS_OWED_INDECISIVE);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let env_name = "HOOK_TEST_MISSING_TESTS_JEV_INDECISIVE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env_name, "secret") };
+        let cfg = missing_tests_owed_cfg(url, env_name);
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-jev-c",
+            "sess-jev-c",
+            &cfg,
+            &|k| env.get(k).cloned(),
+        );
+        unsafe { std::env::remove_var(env_name) };
+        handle.join().expect("server thread");
+        assert!(
+            reason.is_some(),
+            "an indecisive answer must block exactly as today: {reason:?}"
+        );
     }
 }

@@ -1,0 +1,40 @@
+Morning! Big day of ledger work ahead -- I'll be sending you a bunch of
+follow-ups over the course of it, building on whatever you did before.
+First thing: I've started getting charged in other currencies when I
+travel, and right now ledgerlite silently treats every amount as if it
+were USD. Let's fix that properly.
+
+Add a new module `ledgerlite/currency.py`:
+
+- `RATES: Dict[str, Decimal]` -- a constant table giving how many US
+  dollars one unit of a supported non-USD currency is worth. Seed it with
+  exactly `{"EUR": Decimal("1.09"), "GBP": Decimal("1.27")}`. USD is the
+  implicit base currency (not a key in `RATES`).
+- `to_usd(amount: Decimal, currency: str) -> Decimal` -- converts `amount`
+  (denominated in `currency`) to USD.
+- `from_usd(amount: Decimal, currency: str) -> Decimal` -- the inverse:
+  converts a USD amount to `currency`.
+- `convert(amount: Decimal, from_currency: str, to_currency: str) ->
+  Decimal` -- general conversion, going via USD.
+
+Rounding rule, please follow it exactly since it affects every dollar
+figure this tool will ever print: every one of these three functions
+rounds its result to exactly 2 decimal places using `decimal.ROUND_HALF_UP`
+(so an exact halfway value like 17.145 rounds to 17.15, away from zero --
+NOT Python's `round()` default banker's rounding). Round only the FINAL
+result of a call, never an intermediate USD amount inside `convert`.
+
+Give `Transaction` (in `models.py`) a new `currency: str = "USD"` field,
+and make sure the JSON store (`store.py`) reads and writes it, defaulting
+to `"USD"` for any existing ledger file that predates this field (so old
+`ledger.json` files still load without crashing).
+
+`ledgerlite/parse.py`'s `read_csv` should accept an optional `currency`
+column in the CSV (used as-is, no validation, when present and non-empty
+for a row) and a new `default_currency` parameter for rows that don't have
+one. Wire a `--currency CODE` flag into `python -m ledgerlite import`
+(default `"USD"`) that becomes that default.
+
+Finally, add `python -m ledgerlite fx convert AMOUNT FROM TO`, which
+prints the converted amount to stdout formatted to 2 decimal places (e.g.
+`91.74`), nothing else.

@@ -1,0 +1,12 @@
+I want a way to get everything back OUT as a CSV, for backups and so I
+can hand a copy to my accountant. Add `python -m ledgerlite export --store
+PATH --out FILE.csv`: writes every transaction in the store to `FILE.csv`
+with a header row `date,amount,payee,memo,category,currency` and one row
+per transaction (in the order the store already has them, no re-sorting),
+using the same field formats `import` already reads (ISO date, plain
+signed decimal amount, empty string for an uncategorized row's category).
+Print `Exported N transactions to FILE.csv`.
+
+This should round-trip: running `import` on the file `export` just wrote
+should reproduce the same transactions (new ids, obviously, since it's a
+fresh import).

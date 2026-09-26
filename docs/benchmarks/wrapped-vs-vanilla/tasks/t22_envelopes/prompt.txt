@@ -1,0 +1,132 @@
+I want a full envelope-budgeting subsystem: named "envelopes" that each
+budget a fixed amount per month against one or more categories, with
+rollover, transfers between envelopes, an allocation helper, overspend
+alerts, and CSV import/export. This is a big feature -- please build it in
+these phases, in order, since later phases depend on earlier ones:
+
+**Phase 1 -- the model.** New module `ledgerlite/envelopes.py`:
+- An `Envelope` type: `name` (str), `categories` (list of str -- a
+  transaction counts toward this envelope if its `category` is any one of
+  them), `monthly_budget` (`Decimal`, always meant to be positive),
+  `start_month` (a `"YYYY-MM"` string -- the first month this envelope
+  applies to), `rollover` (bool, default `False`), `starting_balance`
+  (`Decimal`, default `0` -- the balance carried in from before
+  `start_month`), `closed_through` (an optional `"YYYY-MM"` string, default
+  `None` -- see Phase 7), and `adjustments` (a dict of `"YYYY-MM"` ->
+  `Decimal`, default empty -- see Phase 4).
+- `spent_in_month(envelope, txns, year, month)`: the sum of `abs(amount)`
+  over every transaction in `txns` dated in that calendar year/month whose
+  `category` is in `envelope.categories`.
+- `balance_through_month(envelope, txns, year, month)`: the envelope's
+  remaining balance for that month.
+  - If `envelope.rollover` is `False`: the balance for a month is just
+    `monthly_budget - spent_in_month(that month) + adjustments.get(that
+    month, 0)` -- months don't affect each other.
+  - If `envelope.rollover` is `True`: starting from `starting_balance` as
+    the balance for the month *before* whichever of (`closed_through`, if
+    set) or (the month before `start_month`, if not) applies, walk forward
+    one calendar month at a time up to and including the requested month,
+    each step adding that month's `monthly_budget - spent_in_month(that
+    month) + adjustments.get(that month, 0)` to the running balance.
+  - Requesting a month strictly before `start_month` (or before
+    `closed_through`, once set) is invalid -- raise `ValueError`.
+
+**Phase 2 -- persistence and basic CLI.** Envelopes are saved under a
+top-level `"envelopes"` key in the same JSON store file used by `--store`
+(a sibling of `"transactions"`), each with all of `Envelope`'s fields
+(`monthly_budget`/`starting_balance` as strings, `adjustments` as a
+`{"YYYY-MM": "amount"}` object).
+- `python -m ledgerlite envelope add --name NAME --monthly-budget AMOUNT
+  --category CAT [--category CAT2 ...] --start-month YYYY-MM [--rollover]
+  [--starting-balance AMOUNT] --store PATH` appends a new envelope
+  (categories kept in the order given) and prints `Added envelope <name>`.
+- `python -m ledgerlite envelope list --store PATH` prints one line per
+  saved envelope, in the order saved:
+  `<name>: budget <monthly_budget>/mo categories <cat1,cat2> from
+  <start_month>` with ` (rollover)` appended only when that envelope has
+  rollover on. If there are no saved envelopes, print exactly `No
+  envelopes.`.
+
+**Phase 3 -- monthly status.** `python -m ledgerlite envelope status NAME
+--year Y --month M --store PATH` (`NAME` positional) prints
+`f"{name}: spent {spent:.2f}/{budget:.2f} for {year:04d}-{month:02d},
+balance {balance:.2f}"`. If `NAME` doesn't match any saved envelope, or the
+requested year/month is invalid for that envelope per Phase 1's rule
+(`ValueError` from `balance_through_month`), print an error to stderr and
+exit with status 2, printing nothing to stdout.
+
+**Phase 4 -- transfers.** `python -m ledgerlite envelope transfer --from A
+--to B --amount AMOUNT --year Y --month M --store PATH` moves `AMOUNT` from
+envelope `A`'s balance to envelope `B`'s for that month: it subtracts
+`AMOUNT` from `A`'s `adjustments["YYYY-MM"]` (adding to any adjustment
+already there for that month, default `0`) and adds `AMOUNT` to `B`'s the
+same way, then saves. Prints `Transferred <amount> from <A> to <B> for
+<YYYY-MM>`. Rejects (error to stderr, exit 2, no changes saved) if `A`
+equals `B`, or if either name doesn't match a saved envelope.
+
+**Phase 5 -- allocation suggestions.** New module `ledgerlite/allocation.py`
+with `suggest_allocations(envelopes, total_income)`: returns a dict mapping
+each envelope's `name` to a `Decimal` amount, proportional to its
+`monthly_budget` relative to the sum of every envelope's `monthly_budget`,
+such that the amounts sum to *exactly* `total_income` (to 2 decimal
+places) -- use the largest-remainder method (compute each envelope's exact
+share, floor to 2 decimals, then hand out the leftover cents one at a time
+to the envelopes with the largest fractional remainder, breaking any tie
+alphabetically by name). If every envelope's `monthly_budget` is `0` (or
+there are no envelopes), every amount in the result is `Decimal("0.00")`
+regardless of `total_income`. `python -m ledgerlite envelope suggest
+--income AMOUNT --store PATH` prints one line per envelope, alphabetically
+by name: `<name>: <amount>`. If there are no saved envelopes, print exactly
+`No envelopes.`.
+
+**Phase 6 -- overspend alerts.** `python -m ledgerlite envelope alerts
+--year Y --month M --store PATH` computes each envelope's balance for that
+month (skipping any envelope for which that year/month is invalid per
+Phase 1 -- i.e. before its `start_month`/`closed_through`, silently, not as
+an error) and prints one line for every envelope whose balance is negative,
+sorted by balance ascending (most overspent first), ties broken
+alphabetically by name: `<name>: over by <amount>` (`amount` is the
+positive `abs()` of the balance, `:.2f`). If none are overspent, print
+exactly `No envelopes over budget.`.
+
+**Phase 7 -- closing a month.** `python -m ledgerlite envelope close-month
+--year Y --month M --store PATH` permanently folds every *rollover*
+envelope's balance through that month into its `starting_balance`, for
+every rollover envelope where that year/month is at or after
+`start_month` and strictly after `closed_through` (or `closed_through` is
+unset): computes `balance_through_month` for that envelope through that
+month (using its current state), sets `starting_balance` to that value and
+`closed_through` to `"YYYY-MM"`, and removes every entry in `adjustments`
+whose month is `<=` that `"YYYY-MM"` (they're now folded in; later months'
+adjustments are untouched). Non-rollover envelopes, and rollover envelopes
+already closed through that month or later, are left alone. Prints `Closed
+<YYYY>-<MM> for <n> envelope(s)` where `<n>` counts only the envelopes
+actually closed.
+
+**Phase 8 -- CSV export.** `python -m ledgerlite envelope export --store
+PATH --out CSVPATH` writes a CSV (via Python's `csv` module) with header
+`Name,Category,MonthlyBudget,Rollover,StartMonth,StartingBalance`, one row
+per saved envelope sorted alphabetically by name: `Category` is that
+envelope's categories comma-joined in their stored order, `Rollover` is
+the literal string `true` or `false`, `MonthlyBudget`/`StartingBalance` are
+formatted to exactly 2 decimal places. Prints `Exported <n> envelope(s) to
+<CSVPATH>`.
+
+**Phase 9 -- CSV import.** `python -m ledgerlite envelope import-csv
+--store PATH --file CSVPATH` reads that same CSV format back. For each
+row: if an envelope with that `Name` already exists, it is *replaced
+entirely* by the row's values (`closed_through` reset to `None` and
+`adjustments` reset to empty, since the old ones no longer correspond to
+the freshly-declared parameters) in its original list position; otherwise
+a brand-new envelope (also with `closed_through=None`,
+`adjustments={}`) is appended, in CSV row order. Saves, then prints
+`Imported <n> envelope(s) from <CSVPATH>` (`<n>` = number of data rows
+read).
+
+**Phase 10 -- validation and removal.** `envelope add` rejects (error to
+stderr, exit 2, nothing saved): a `--monthly-budget` that is not strictly
+positive, a `--start-month` not in `YYYY-MM` form, or a `--name` that
+already exists. `python -m ledgerlite envelope remove NAME --store PATH`
+removes the matching envelope and prints `Removed envelope <name>`; if
+`NAME` isn't found, print an error to stderr and exit with status 2 (no
+changes).

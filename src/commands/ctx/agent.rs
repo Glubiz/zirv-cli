@@ -2436,8 +2436,13 @@ fn worker_launch_flags(
     adapter: &dyn AgentAdapter,
     flags: &[String],
 ) -> Vec<String> {
-    let policy_extra =
-        adapters::policy_launch_args(cfg, adapter, flags, adapters::LaunchMode::Headless);
+    let policy_extra = adapters::policy_launch_args(
+        cfg,
+        adapter,
+        flags,
+        adapters::LaunchMode::Headless,
+        super::prompt::PromptRole::Worker,
+    );
     if flags_pin_model(flags) {
         let mut out = policy_extra;
         out.extend_from_slice(flags);
@@ -4139,8 +4144,13 @@ fn run_goal_bootstrap(
         .ok_or_else(|| GoalBootstrapError::before_launch("goal bootstrap called without --goal"))?;
     let adapter =
         adapters::select(Some(&args.name), &[], cfg).map_err(GoalBootstrapError::before_launch)?;
-    let mut command =
-        adapters::policy_launch_args(cfg, adapter.as_ref(), &[], adapters::LaunchMode::Headless);
+    let mut command = adapters::policy_launch_args(
+        cfg,
+        adapter.as_ref(),
+        &[],
+        adapters::LaunchMode::Headless,
+        super::prompt::PromptRole::Worker,
+    );
     if let Some(model) = adapters::resolve_tiered_model(
         cfg,
         adapter.name(),

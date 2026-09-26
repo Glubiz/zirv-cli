@@ -70,6 +70,32 @@ impl Endpoint {
         Self { path }
     }
 
+    /// `<state>/s/jev-<hash>` (issue jev-relay): the per-session Jev relay's
+    /// own duplex endpoint (`super::super::jev_relay`), a sibling of
+    /// [`Self::for_state`]'s own `api.sock` in the same short `s` directory,
+    /// for the same macOS `sun_path`-length reason -- the same "constructed
+    /// only from a [`StateDir`]" discipline too, so this endpoint too can
+    /// never be named by anything a checkout controls. Hashed rather than
+    /// truncated like `StateDir::socket_for`'s own short id: a truncation
+    /// collision there just costs a little disambiguation between two
+    /// already-random UUIDs, but a collision here would mean a client
+    /// silently dialling a DIFFERENT session's relay, so the full session id
+    /// goes through SHA-256 first and only then gets shortened.
+    pub fn for_jev_relay(state: &StateDir, session: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(session.as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            path: state.sockets().join(format!("jev-{hex}")),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

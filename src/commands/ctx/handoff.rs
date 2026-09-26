@@ -1903,6 +1903,425 @@ fn jev_select_optional_handoff_items(
     handoff
 }
 
+// -- compaction_select (issue #798) -----------------------------------------
+
+/// Issue #798 (`[jev] compaction_select`): one candidate this off-by-default
+/// pass may feature by name in a compaction's own focus text -- extracted
+/// directly and deterministically from a `StructuralContext`, never from a
+/// distilled `Handoff`: compaction must stay cheap (one bounded [`jev::
+/// advise`] call, the same budget [`jev_select_optional_handoff_items`]
+/// already spends), so nothing here ever runs a distiller. Mirrors
+/// `OptionalItemKind`'s own shape and the same keep/drop noul machinery
+/// ([`handoff_select_terms`], [`handoff_select_size_bucket`]), just over a
+/// different source and a different default direction: a handoff's optional
+/// sections default to KEPT (a decisive drop narrows them), while a
+/// compaction focus text defaults to carrying NO keep list at all (only a
+/// decisive keep verdict, per candidate, ever adds one).
+#[derive(Debug, Clone, Copy)]
+enum CompactionItemKind {
+    FileModified,
+    FailingTest,
+    Constraint,
+    Plan,
+}
+
+impl CompactionItemKind {
+    /// The `item type` fact cell -- see [`COMPACTION_SELECT_INSTRUCTIONS`].
+    fn type_id(self) -> u32 {
+        match self {
+            CompactionItemKind::FileModified => 0,
+            CompactionItemKind::FailingTest => 1,
+            CompactionItemKind::Constraint => 2,
+            CompactionItemKind::Plan => 3,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompactionCandidate {
+    kind: CompactionItemKind,
+    /// 0-based position within its own extraction group (see
+    /// [`compaction_candidates`]), in that group's own order.
+    position: usize,
+    /// How many items its own group carries -- used only to derive `age` in
+    /// [`compaction_select_facts_row`]; never itself sent.
+    group_len: usize,
+    /// Already rendered and length-capped -- the path verbatim for
+    /// `FileModified`, or a one-line, already-truncated quote for every
+    /// other kind. What a surviving candidate contributes to the keep list
+    /// is exactly this text, unchanged.
+    text: String,
+}
+
+/// Per-item render cap (issue #798): applied BEFORE the keep list's own
+/// overall [`COMPACTION_KEEP_LIST_MAX_CHARS`] budget, so one very long
+/// candidate can never crowd out every other one on its own.
+const COMPACTION_ITEM_CHAR_CAP: usize = 120;
+
+/// Truncates `text` to at most `cap` characters (on a char boundary), the
+/// same shape [`quote_partial_text`] already uses for a partial-text quote,
+/// generalised to a caller-chosen cap. Every control character (`\r`, `\n`,
+/// `\t`, and any other `char::is_control` codepoint that might survive in
+/// raw tool output) is replaced with a single space FIRST (review of
+/// 6bdd7675, defect #2): `wrap::inject_compact` writes the whole rendered
+/// focus text followed by one trailing `\r` into the PTY, so a stray `\r`/
+/// `\n` surviving into a candidate's own text would submit the injected
+/// `/compact ...` prompt mid-string and leave stray keystrokes queued behind
+/// it.
+fn truncate_chars(text: &str, cap: usize) -> String {
+    let sanitized: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = sanitized.chars().collect();
+    if chars.len() <= cap {
+        return sanitized;
+    }
+    let truncated: String = chars[..cap.saturating_sub(3)].iter().collect();
+    format!("{truncated}...")
+}
+
+/// At most this many non-empty, trimmed lines of the FIRST user message
+/// (later messages are follow-ups, not the original brief) are ever
+/// considered as separate operator-constraint candidates.
+const COMPACTION_CONSTRAINT_LINE_CAP: usize = 6;
+
+/// Every candidate item [`compaction_focus_text`] may feature, extracted
+/// deterministically from `ctx` in a fixed group order (files, then the
+/// latest failing verification, then operator constraints, then the latest
+/// plan) -- never reordered afterward, so a surviving candidate's position
+/// in the final keep list always reflects this order.
+fn compaction_candidates(ctx: &StructuralContext) -> Vec<CompactionCandidate> {
+    let mut out = Vec::new();
+
+    // Files edited, or read then edited: every path `ctx.files_modified`
+    // already carries, in the adapter's own order. A path seen only through
+    // `files_read` (never edited) is deliberately never a candidate here --
+    // it was consulted, not changed, and the base `COMPACT_FOCUS` text
+    // already asks to preserve "the file paths touched so far" in general.
+    let group_len = ctx.files_modified.len();
+    for (position, path) in ctx.files_modified.iter().enumerate() {
+        out.push(CompactionCandidate {
+            kind: CompactionItemKind::FileModified,
+            position,
+            group_len,
+            text: truncate_chars(path, COMPACTION_ITEM_CHAR_CAP),
+        });
+    }
+
+    // The session's last build/test/lint run, only when it is the one
+    // `VerificationStatus::Failed` case: `last_verification` already reports
+    // the LAST verification-shaped command `ctx` saw, so a later successful
+    // rerun of the same check naturally reports `Passed` here instead --
+    // "no later success" is exactly what `VerificationOutcome` already
+    // encodes, with no extra bookkeeping needed on top of it.
+    if let Some(verification) = &ctx.last_verification
+        && verification.status == VerificationStatus::Failed
+    {
+        let detail = verification
+            .error_excerpt
+            .first()
+            .map(String::as_str)
+            .unwrap_or(verification.command.as_str());
+        out.push(CompactionCandidate {
+            kind: CompactionItemKind::FailingTest,
+            position: 0,
+            group_len: 1,
+            text: truncate_chars(
+                &format!("{}: {detail}", verification.command),
+                COMPACTION_ITEM_CHAR_CAP,
+            ),
+        });
+    }
+
+    // Operator-stated constraints/acceptance criteria: non-empty, trimmed
+    // lines of the first user message only.
+    if let Some(first_prompt) = ctx.user_messages.first() {
+        let lines: Vec<&str> = first_prompt
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(COMPACTION_CONSTRAINT_LINE_CAP)
+            .collect();
+        let group_len = lines.len();
+        for (position, line) in lines.into_iter().enumerate() {
+            out.push(CompactionCandidate {
+                kind: CompactionItemKind::Constraint,
+                position,
+                group_len,
+                text: truncate_chars(line, COMPACTION_ITEM_CHAR_CAP),
+            });
+        }
+    }
+
+    // The latest plan/next step: the last assistant reply's own first line.
+    if let Some(last_reply) = ctx.assistant_texts.last() {
+        let line = last_reply.lines().next().unwrap_or(last_reply).trim();
+        if !line.is_empty() {
+            out.push(CompactionCandidate {
+                kind: CompactionItemKind::Plan,
+                position: 0,
+                group_len: 1,
+                text: truncate_chars(line, COMPACTION_ITEM_CHAR_CAP),
+            });
+        }
+    }
+
+    out
+}
+
+/// At most this many candidates are ever SENT to Jev in one
+/// [`compaction_focus_text`] call -- deliberately smaller than
+/// [`HANDOFF_SELECT_MAX_CANDIDATES`]: compaction's own keep list caps out at
+/// [`COMPACTION_KEEP_LIST_MAX_ITEMS`] anyway, so there is no value in a
+/// wider candidate set, only a wider one-call payload. Still well inside
+/// `jev::safe_metadata_request`'s own 32-row ceiling.
+const COMPACTION_SELECT_MAX_CANDIDATES: usize = 16;
+
+/// Reused from `memory::MEMORY_RELEVANCE_FLOOR`, the same floor
+/// [`HANDOFF_SELECT_DROP_FLOOR`] already reuses it as: validated by the
+/// 2026-09-18 memory-relevance probe. Here it gates the OPPOSITE direction
+/// (a decisive value at or above this floor is a decisive KEEP, not a
+/// decisive drop), since a compaction focus text starts from no keep list at
+/// all rather than from every candidate.
+const COMPACTION_SELECT_KEEP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+
+/// Static instructions naming the facts row order -- see
+/// [`CompactionItemKind::type_id`] for the item-type cell, and
+/// [`compaction_select_facts_row`] for every other one. Kept at or under
+/// `jev::safe_metadata_request`'s own 512-byte instructions ceiling (issue
+/// #798 regression: an earlier, wordier draft of this string ran over that
+/// ceiling, which made every real call silently fail closed as
+/// `JevError::UnsafeState` -- caught by
+/// [`tests::compaction_select_request_passes_safe_metadata_request`]).
+const COMPACTION_SELECT_INSTRUCTIONS: &str = "Facts row N (id cN) is [type: 0 file edited, 1 \
+    failing test/error with no later success, 2 operator-stated constraint from the first \
+    prompt, 3 latest plan/next step; age within its own group (0 = newest); byte size bucket \
+    0-4; count of other transcript excerpts mentioning it again; 1 if adjacent to a tool \
+    failure else 0; position in its group]. One candidate a compaction's focus text may name, \
+    among several. Feature it in the keep list?";
+
+/// One [`compaction_focus_text`] fact row for `candidate` -- see
+/// [`COMPACTION_SELECT_INSTRUCTIONS`] for the field order Jev is told. Every
+/// cell is a locally computed, bounded, non-negative integer; `candidate`'s
+/// own text and `ctx`'s own transcript excerpts are read here only to derive
+/// counts, never serialized.
+fn compaction_select_facts_row(
+    candidate: &CompactionCandidate,
+    ctx: &StructuralContext,
+) -> Vec<u32> {
+    let age = (candidate.group_len - 1 - candidate.position) as u32;
+    let terms = handoff_select_terms(&candidate.text);
+    let referenced_again = ctx
+        .assistant_texts
+        .iter()
+        .chain(ctx.user_messages.iter())
+        .filter(|text| !handoff_select_terms(text).is_disjoint(&terms))
+        .count()
+        .min(31) as u32;
+    let tool_failure_adjacent = u32::from(
+        ctx.tool_errors
+            .iter()
+            .any(|error| !handoff_select_terms(error).is_disjoint(&terms)),
+    );
+    vec![
+        candidate.kind.type_id(),
+        age,
+        handoff_select_size_bucket(candidate.text.len()),
+        referenced_again,
+        tool_failure_adjacent,
+        candidate.position as u32,
+    ]
+}
+
+/// Bounded numeric-only metadata state (`jev::safe_metadata_request`'s own
+/// egress boundary): one fact row per candidate sent, in [`compaction_
+/// candidates`]'s own order. Never the item's own text.
+#[derive(Debug, serde::Serialize)]
+struct CompactionSelectState {
+    _zirv_metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// Builds the exact `(state, questions)` pair [`compaction_focus_text`]
+/// sends to `jev::advise` -- factored out so a test can assert directly that
+/// this pair passes `jev::safe_metadata_request`, the same way
+/// [`handoff_select_request_passes_safe_metadata_request`] proves it for
+/// `[jev] handoff_select`.
+fn compaction_select_request(
+    ids: &[String],
+    candidates: &[CompactionCandidate],
+    ctx: &StructuralContext,
+) -> (CompactionSelectState, Vec<jev::Question>) {
+    let facts: Vec<Vec<u32>> = candidates
+        .iter()
+        .map(|candidate| compaction_select_facts_row(candidate, ctx))
+        .collect();
+    let questions: Vec<jev::Question> = ids
+        .iter()
+        .map(|id| {
+            jev::Question::metadata_noul(
+                id,
+                COMPACTION_SELECT_INSTRUCTIONS,
+                "feature this item in the keep list",
+                "leave this item out of the keep list",
+            )
+        })
+        .collect();
+    (
+        CompactionSelectState {
+            _zirv_metadata_only: true,
+            facts,
+        },
+        questions,
+    )
+}
+
+/// Cap on how many items [`compaction_focus_text`]'s own keep list may name.
+const COMPACTION_KEEP_LIST_MAX_ITEMS: usize = 8;
+
+/// Cap, in bytes, on the keep list's own rendered suffix -- the `"Keep in
+/// particular: ...".` text this appends to `base_focus`, not counting
+/// `base_focus` itself.
+const COMPACTION_KEEP_LIST_MAX_CHARS: usize = 600;
+
+/// Issue #798 (`[jev] compaction_select`): appends a short, Jev-chosen keep
+/// list to `base_focus` (`supervise::COMPACT_FOCUS` at every call site
+/// today) when the gate is on, Jev is available, and at least one candidate
+/// clears a decisive keep verdict. Gate off, no credential, no candidates,
+/// or an indecisive/failed call all return `base_focus` completely
+/// unchanged -- byte-identical to today, the same best-effort fallback
+/// shape every other `[jev]`-gated site uses. Spends exactly one bounded
+/// [`jev::advise`] call, the same budget [`jev_select_optional_handoff_
+/// items`] already spends -- never a distiller call, never a second round
+/// trip.
+///
+/// A surviving item keeps [`compaction_candidates`]'s own extraction order
+/// (files, then a failing verification, then operator constraints, then the
+/// latest plan); the result is capped at [`COMPACTION_KEEP_LIST_MAX_ITEMS`]
+/// items and [`COMPACTION_KEEP_LIST_MAX_CHARS`] rendered characters, an item
+/// that would cross either cap simply stopping the list rather than being
+/// truncated itself.
+pub(crate) fn compaction_focus_text(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    ctx: &StructuralContext,
+    base_focus: &str,
+) -> String {
+    let candidates = compaction_candidates(ctx);
+    if candidates.is_empty() {
+        return base_focus.to_string();
+    }
+    let sent_len = candidates.len().min(COMPACTION_SELECT_MAX_CANDIDATES);
+    let sent = &candidates[..sent_len];
+    let ids: Vec<String> = (0..sent_len).map(|i| format!("k{i}")).collect();
+    let (advise_state, questions) = compaction_select_request(&ids, sent, ctx);
+    let Some(answers) = jev::advise(
+        cfg,
+        state,
+        "compaction_select",
+        cfg.jev.compaction_select,
+        &advise_state,
+        &questions,
+    ) else {
+        return base_focus.to_string();
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    for (candidate, id) in sent.iter().zip(ids.iter()) {
+        // Only a decisive (margin at or above `jev::DEFAULT_MIN_MARGIN`) KEEP
+        // verdict ever adds an item -- missing, unparseable, indecisive, or
+        // below-floor answers all leave it out, the mirror image of
+        // `jev_select_optional_handoff_items`'s own "only a decisive drop
+        // removes" rule.
+        let Some(answer) = answers.get(id) else {
+            continue;
+        };
+        if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+            continue;
+        }
+        if matches!(answer.as_noul(), Some(value) if value >= COMPACTION_SELECT_KEEP_FLOOR) {
+            kept.push(candidate.text.as_str());
+        }
+    }
+    if kept.is_empty() {
+        return base_focus.to_string();
+    }
+
+    let mut items: Vec<&str> = Vec::new();
+    let mut budget = COMPACTION_KEEP_LIST_MAX_CHARS;
+    for item in kept {
+        if items.len() >= COMPACTION_KEEP_LIST_MAX_ITEMS {
+            break;
+        }
+        let separator_cost = if items.is_empty() { 0 } else { 2 };
+        if item.len() + separator_cost > budget {
+            break;
+        }
+        budget -= item.len() + separator_cost;
+        items.push(item);
+    }
+    if items.is_empty() {
+        return base_focus.to_string();
+    }
+
+    let mut effect = jev::JevEffect::new("compaction_select", "items_kept");
+    effect.baseline_count = u32::try_from(sent_len).ok();
+    effect.actual_count = u32::try_from(items.len()).ok();
+    jev::record_effect(cfg, state, cfg.jev.compaction_select, &effect);
+
+    format!("{base_focus} Keep in particular: {}.", items.join("; "))
+}
+
+/// Ceiling on the `[jev] compaction_select` call's own connect/receive
+/// timeout (review of 6bdd7675, defect #1): unlike every other `[jev]`-gated
+/// site, this one call sits inline in `wrap.rs`'s PTY pump loop and inside
+/// `exec.rs`/`run_loop.rs`'s own `compact_in_place` `compact_timeout_ms`
+/// budget -- neither can afford to block for a full, operator-configured
+/// `proxy.typesafe.timeout_secs` on top of its own budget. Never raises the
+/// configured timeout, only ever lowers it.
+const COMPACTION_SELECT_TIMEOUT_SECS: u64 = 2;
+
+/// The one seam all three compaction call sites (`exec.rs`'s `zirv ctx exec`,
+/// `run_loop.rs`'s `zirv ctx loop`, `wrap.rs`'s headless-pump compaction
+/// inject) share for turning `base_focus` into a possibly keep-list-carrying
+/// focus text -- factored out (review of 6bdd7675, defect #1) so the gate
+/// check happens BEFORE any filesystem read or transcript parse, not after:
+/// with `[jev] compaction_select` off (the default) or no credential
+/// available, this returns `base_focus` completely untouched, with zero
+/// filesystem access and zero allocation beyond the one `to_string()` --
+/// byte-identical and zero-cost versus before issue #798, exactly like every
+/// other `[jev]`-gated site's own off-by-default contract. Only once the
+/// gate and credential both check out does this read `transcript`, parse it
+/// into a [`StructuralContext`], and hand off to [`compaction_focus_text`]
+/// with the typesafe timeout capped at [`COMPACTION_SELECT_TIMEOUT_SECS`].
+pub(crate) fn compaction_focus_for_transcript(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    adapter: &dyn AgentAdapter,
+    transcript: Option<&Path>,
+    tail_items: usize,
+    base_focus: &str,
+) -> String {
+    if !cfg.jev.compaction_select || !jev::available(&cfg.proxy.typesafe) {
+        return base_focus.to_string();
+    }
+    let Some(transcript) = transcript else {
+        return base_focus.to_string();
+    };
+    let Ok(jsonl) = std::fs::read_to_string(transcript) else {
+        return base_focus.to_string();
+    };
+    let ctx = adapter.structural_context(&jsonl, tail_items);
+    let mut bounded_cfg = cfg.clone();
+    bounded_cfg.proxy.typesafe.timeout_secs = bounded_cfg
+        .proxy
+        .typesafe
+        .timeout_secs
+        .min(COMPACTION_SELECT_TIMEOUT_SECS);
+    compaction_focus_text(&bounded_cfg, state, &ctx, base_focus)
+}
+
 #[derive(Debug, clap::Args)]
 pub struct HandoffArgs {
     /// Transcript to distill.
@@ -2821,6 +3240,387 @@ mod tests {
         assert!(
             crate::commands::ctx::jev::safe_metadata_request(&value, &questions, &model),
             "got state {value}"
+        );
+    }
+
+    // -- compaction_focus_text / compaction_candidates (issue #798) ---------
+
+    const COMPACTION_TEST_BASE_FOCUS: &str = "BASE FOCUS TEXT";
+
+    fn compaction_select_test_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.compaction_select = true;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// Four candidates in a fixed, known order: two files modified (-> `k0`,
+    /// `k1`), one operator constraint line from the (single-line) first
+    /// prompt (-> `k2`), and the latest plan/next step (-> `k3`) -- so a mock
+    /// answer can target specific ones for a decisive keep while the rest
+    /// stay indecisive or decisively dropped.
+    fn compaction_select_ctx_sample() -> StructuralContext {
+        StructuralContext {
+            user_messages: vec!["Ship the webhook without breaking v1 clients".to_string()],
+            assistant_texts: vec!["wrote the handler".to_string()],
+            files_modified: vec![
+                "src/config.rs".to_string(),
+                "src/routes/webhook.rs".to_string(),
+            ],
+            ..StructuralContext::default()
+        }
+    }
+
+    /// The gate off must never even attempt a call, despite a credential
+    /// that looks available and candidates that exist -- `base_focus`
+    /// returned byte-identical, and no decision/effect file created.
+    #[test]
+    fn compaction_focus_text_is_a_pass_through_when_the_gate_is_off() {
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_GATE_OFF";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.compaction_select, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = compaction_focus_text(
+            &cfg,
+            &state,
+            &compaction_select_ctx_sample(),
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+        assert!(!state.root().join("jev-decisions.jsonl").exists());
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// A decisive KEEP verdict on `k0` ("src/config.rs") and `k2` (the
+    /// constraint line), `k1` left indecisive and `k3` a decisive DROP,
+    /// appends exactly the two kept items to `base_focus`, in their own
+    /// extraction order (files before constraints) -- never `k1`/`k3`.
+    #[test]
+    fn compaction_focus_text_enabled_appends_a_decisive_keep_list_in_order() {
+        let ctx = compaction_select_ctx_sample();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "k0": {"type": "noul", "noul": 0.95},
+            "k1": {"type": "noul", "noul": 0.5},
+            "k2": {"type": "noul", "noul": 0.9},
+            "k3": {"type": "noul", "noul": 0.05}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_ENABLED";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = compaction_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = compaction_focus_text(&cfg, &state, &ctx, COMPACTION_TEST_BASE_FOCUS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(
+            result,
+            format!(
+                "{COMPACTION_TEST_BASE_FOCUS} Keep in particular: src/config.rs; Ship the \
+                 webhook without breaking v1 clients.",
+            ),
+            "got {result:?}"
+        );
+
+        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
+            .expect("jev-effects.jsonl must exist after a successful keep");
+        let line = effects.lines().next().expect("one effect line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse effect line");
+        assert_eq!(value["site"], "compaction_select");
+        assert_eq!(value["action"], "items_kept");
+        assert_eq!(value["actual_count"].as_u64(), Some(2));
+    }
+
+    /// A uniformly indecisive (near-`0.5`) answer set must leave `base_focus`
+    /// completely unchanged -- the mirror of `jev_select_optional_handoff_
+    /// items_never_drops_on_a_decisive_keep_answer`, but for the direction
+    /// this pass actually narrows FROM (no keep list at all).
+    #[test]
+    fn compaction_focus_text_all_indecisive_answers_leave_focus_unchanged() {
+        let ctx = compaction_select_ctx_sample();
+        let body = r#"{"model": "jev-latest", "answers": {
+            "k0": {"type": "noul", "noul": 0.51},
+            "k1": {"type": "noul", "noul": 0.49},
+            "k2": {"type": "noul", "noul": 0.52}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_INDECISIVE";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = compaction_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = compaction_focus_text(&cfg, &state, &ctx, COMPACTION_TEST_BASE_FOCUS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// A failed call (5xx) must leave `base_focus` completely untouched, same
+    /// as every other `[jev]`-gated site's own fallback.
+    #[test]
+    fn compaction_focus_text_falls_back_to_base_focus_on_a_500() {
+        let ctx = compaction_select_ctx_sample();
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(500, "{}");
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_500";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = compaction_select_test_cfg(url, credential_env);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = compaction_focus_text(&cfg, &state, &ctx, COMPACTION_TEST_BASE_FOCUS);
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        handle.join().expect("server thread must not panic");
+
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+        assert!(!state.root().join("jev-effects.jsonl").exists());
+    }
+
+    /// No candidates at all (an empty `StructuralContext`) must never call
+    /// Jev -- there is nothing to ask about.
+    #[test]
+    fn compaction_focus_text_with_no_candidates_never_calls_jev() {
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_NO_CANDIDATES";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let cfg = compaction_select_test_cfg(
+            "http://127.0.0.1:1".to_string(), // unreachable -- a real call would hang/err
+            credential_env,
+        );
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let result = compaction_focus_text(
+            &cfg,
+            &state,
+            &StructuralContext::default(),
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+    }
+
+    /// Review of 6bdd7675, defect #1: with the gate off,
+    /// [`compaction_focus_for_transcript`] must return `base_focus`
+    /// byte-identical WITHOUT ever touching `transcript` -- proved here by
+    /// pointing it at a path that does not exist at all. A version that read
+    /// the transcript before checking the gate would still pass this
+    /// particular assertion (a missing file just yields an empty string
+    /// today), so this also stands as the regression guard for the ordering
+    /// itself, not only for the fallback value.
+    #[test]
+    fn compaction_focus_for_transcript_is_a_pass_through_when_the_gate_is_off_and_never_reads_a_missing_transcript()
+     {
+        let credential_env = "COMPACTION_TEST_JEV_SELECT_789_FOR_TRANSCRIPT_GATE_OFF";
+        unsafe {
+            std::env::set_var(credential_env, "secret");
+        }
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.compaction_select, "the gate defaults off");
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None);
+        let missing = Path::new("Z:/definitely/does/not/exist/nope.jsonl");
+
+        let result = compaction_focus_for_transcript(
+            &cfg,
+            &state,
+            &adapter,
+            Some(missing),
+            cfg.handoff.tail_items,
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        unsafe {
+            std::env::remove_var(credential_env);
+        }
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+    }
+
+    /// The other half of the same guard: no credential at all, gate ON,
+    /// still no read.
+    #[test]
+    fn compaction_focus_for_transcript_never_reads_a_missing_transcript_without_a_credential() {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.compaction_select = true;
+        cfg.proxy.typesafe.credential_env =
+            "COMPACTION_TEST_JEV_SELECT_789_FOR_TRANSCRIPT_NO_CRED".to_string();
+        unsafe {
+            std::env::remove_var(&cfg.proxy.typesafe.credential_env);
+        }
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let adapter = ClaudeAdapter::new(None);
+        let missing = Path::new("Z:/definitely/does/not/exist/nope.jsonl");
+
+        let result = compaction_focus_for_transcript(
+            &cfg,
+            &state,
+            &adapter,
+            Some(missing),
+            cfg.handoff.tail_items,
+            COMPACTION_TEST_BASE_FOCUS,
+        );
+
+        assert_eq!(result, COMPACTION_TEST_BASE_FOCUS);
+    }
+
+    /// Direct proof that the exact `(state, questions)` pair
+    /// [`compaction_focus_text`] sends via [`compaction_select_request`]
+    /// passes `jev::safe_metadata_request`, the same way [`handoff_select_
+    /// request_passes_safe_metadata_request`] proves it for `[jev] handoff_
+    /// select`.
+    #[test]
+    fn compaction_select_request_passes_safe_metadata_request() {
+        let ctx = compaction_select_ctx_sample();
+        let candidates = compaction_candidates(&ctx);
+        let ids: Vec<String> = (0..candidates.len()).map(|i| format!("k{i}")).collect();
+        let (state, questions) = compaction_select_request(&ids, &candidates, &ctx);
+        let value = serde_json::to_value(&state).expect("CompactionSelectState always serializes");
+        let model = CtxConfig::default().proxy.typesafe.model;
+        assert!(
+            crate::commands::ctx::jev::safe_metadata_request(&value, &questions, &model),
+            "got state {value}"
+        );
+    }
+
+    /// Candidate extraction (issue #798): an edited file and a failing
+    /// verification with no later success both become candidates; a plain
+    /// `tool_errors` entry that predates a LATER successful verification run
+    /// must not resurrect a failing-test candidate -- `last_verification`
+    /// already reports the outcome of the LAST verification-shaped command,
+    /// so a later success is exactly what makes it `Passed`.
+    #[test]
+    fn compaction_candidates_flags_an_unresolved_failing_test_and_an_edited_file() {
+        let ctx = StructuralContext {
+            files_modified: vec!["src/webhook.rs".to_string()],
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                status: VerificationStatus::Failed,
+                error_excerpt: vec!["assertion `left == right` failed".to_string()],
+            }),
+            ..StructuralContext::default()
+        };
+        let candidates = compaction_candidates(&ctx);
+
+        let file_candidate = candidates
+            .iter()
+            .find(|c| matches!(c.kind, CompactionItemKind::FileModified))
+            .expect("an edited file must be a candidate");
+        assert_eq!(file_candidate.text, "src/webhook.rs");
+
+        let failing_test = candidates
+            .iter()
+            .find(|c| matches!(c.kind, CompactionItemKind::FailingTest))
+            .expect("an unresolved failing test must be a candidate");
+        assert!(
+            failing_test.text.contains("cargo test"),
+            "{}",
+            failing_test.text
+        );
+        assert!(
+            failing_test.text.contains("assertion"),
+            "{}",
+            failing_test.text
+        );
+    }
+
+    /// The mirror case: the SAME command later passed, so `last_verification`
+    /// reports `Passed` -- the stale `tool_errors` entry from earlier in the
+    /// transcript must never resurrect a failing-test candidate on its own.
+    #[test]
+    fn compaction_candidates_skips_an_error_that_later_succeeded() {
+        let ctx = StructuralContext {
+            tool_errors: vec!["cargo test: assertion failed on the first attempt".to_string()],
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                status: VerificationStatus::Passed,
+                error_excerpt: Vec::new(),
+            }),
+            ..StructuralContext::default()
+        };
+        let candidates = compaction_candidates(&ctx);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| matches!(c.kind, CompactionItemKind::FailingTest)),
+            "a later-passing verification must never surface a failing-test candidate: \
+             {candidates:?}"
+        );
+    }
+
+    /// Review of 6bdd7675, defect #2: raw tool output can carry an embedded
+    /// `\r`/`\n`/`\t` (or any other control character) in the middle of a
+    /// line, not just at its edges where `.trim()`/`.lines()` would already
+    /// remove or split it. `wrap::inject_compact` writes the whole rendered
+    /// focus text followed by one trailing `\r` into the PTY, so a stray
+    /// mid-string `\r` there would submit the injected `/compact ...` prompt
+    /// early and leave stray keystrokes queued behind it -- every candidate's
+    /// own rendered `text` must never carry one through to that point.
+    #[test]
+    fn compaction_candidates_scrubs_control_characters_from_a_failing_test_excerpt() {
+        let ctx = StructuralContext {
+            last_verification: Some(VerificationOutcome {
+                command: "cargo test".to_string(),
+                status: VerificationStatus::Failed,
+                error_excerpt: vec![
+                    "assertion failed\r\x1b[31mleft\t== right\x1b[0m\nmore".to_string(),
+                ],
+            }),
+            ..StructuralContext::default()
+        };
+        let candidates = compaction_candidates(&ctx);
+
+        let failing_test = candidates
+            .iter()
+            .find(|c| matches!(c.kind, CompactionItemKind::FailingTest))
+            .expect("an unresolved failing test must be a candidate");
+        assert!(
+            !failing_test.text.contains(['\r', '\n', '\t']),
+            "no raw control character may reach the rendered text: {:?}",
+            failing_test.text
+        );
+        assert!(
+            !failing_test.text.chars().any(|c| c.is_control()),
+            "no control character at all may reach the rendered text: {:?}",
+            failing_test.text
         );
     }
 

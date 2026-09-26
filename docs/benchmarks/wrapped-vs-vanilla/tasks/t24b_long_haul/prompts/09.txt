@@ -1,0 +1,22 @@
+My bank also offers OFX exports, which are more reliable than the CSV
+downloads for one of my accounts. Let's support those too.
+
+Real OFX is a big spec; only support this common subset: a `<CURDEF>`
+tag anywhere before the transactions giving the file's currency, and any
+number of `<STMTTRN>...</STMTTRN>` blocks, each containing (one per line,
+tag order not guaranteed) `<DTPOSTED>` (date as `YYYYMMDD`, possibly
+followed by more digits/a timezone you should ignore), `<TRNAMT>` (a plain
+signed decimal -- no `$`, no parentheses), `<NAME>` (the payee), and
+optionally `<MEMO>`. No `<CURDEF>` in the file means USD unless overridden
+(see below). Uncategorized rows still get auto-categorized the same way
+CSV imports already do.
+
+Add `read_ofx(path, default_currency="USD", start_id=1)` to a new
+`ledgerlite/ofx.py` -- same `start_id` convention as `read_csv` (ids
+assigned sequentially starting there), so `import-ofx --append` can
+continue the id sequence the same way `import --append` already does --
+and `python -m ledgerlite import-ofx PATH --store PATH [--currency CODE]
+[--append]` -- same flags, same semantics, same "add to the ledger, never
+replace it" rule under `--append` as everywhere else you've already added
+that this session, and the same `Imported N transactions into PATH`
+message.

@@ -19,14 +19,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{NormalizedEvent, SessionId, SessionRef, TranscriptUsage};
+use super::event::{NormalizedEvent, SessionId, SessionRef, TranscriptUsage, input_hash};
 use super::pace;
 use super::rot::Verdict;
 use super::signal::{self, TurnSignal};
 use super::state::{StateDir, now_secs};
 use super::supervise::{self, Outcome, Tick};
-use super::{CtxResult, adapters, agent, handoff, log, objective, score};
+use super::{CtxResult, adapters, agent, handoff, jev, jev_relay, log, objective, score};
+use crate::commands::workflow::classify::Complexity;
 
 /// The restart budget is spent and the session is still rotting. Callers apply
 /// their own policy from here.
@@ -354,6 +357,51 @@ fn is_joined_form(arg: &str, flags: &[&str]) -> bool {
         .is_some_and(|(name, _)| flags.contains(&name))
 }
 
+/// Issue #778: the resume-pinning tokens already in `command` (a
+/// [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`] flag, either spelling),
+/// verbatim, plus the explicit conversation id when the flag names one
+/// directly. `(Vec::new(), None)` when nothing pins a conversation, or the
+/// adapter does not recognise these flags at all (`adapter_has_resume_
+/// flags`) -- codex mints its own session id and has no verified pin flag,
+/// so this is always a no-op for it. The id is `None` for a bare pin (`-c`/
+/// `--continue`/`--fork-session`, which resumes "whichever conversation is
+/// most recent" with no id readable off argv) even though the tokens
+/// themselves are still returned.
+///
+/// The single source of truth `run_with_clock_inner`'s very first launch
+/// reads to honour an operator's own `-- --resume <id>`/`--continue`
+/// instead of silently minting an unrelated fresh session -- see that
+/// function's own `resume_pin` call site and `ClaudeAdapter::headless_cmd`,
+/// which skips its own `--session-id` injection whenever the tokens this
+/// returns (or any equivalent already on `extra`) are present. At most one
+/// flag is ever returned: claude itself refuses more than one
+/// conversation-pinning flag per launch.
+fn resume_pin(command: &[String], adapter_name: &str) -> (Vec<String>, Option<String>) {
+    if !adapter_has_resume_flags(adapter_name) {
+        return (Vec::new(), None);
+    }
+    for (index, arg) in command.iter().enumerate() {
+        if let Some((name, value)) = arg.split_once('=') {
+            if RESUME_FLAGS_WITH_VALUE.contains(&name) {
+                return (vec![arg.clone()], Some(value.to_string()));
+            }
+            if RESUME_FLAGS_BARE.contains(&name) {
+                return (vec![arg.clone()], None);
+            }
+        }
+        if RESUME_FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+            return match command.get(index + 1).filter(|next| !next.starts_with('-')) {
+                Some(value) => (vec![arg.clone(), value.clone()], Some(value.clone())),
+                None => (vec![arg.clone()], None),
+            };
+        }
+        if RESUME_FLAGS_BARE.contains(&arg.as_str()) {
+            return (vec![arg.clone()], None);
+        }
+    }
+    (Vec::new(), None)
+}
+
 /// Locates the token that carries the prompt in a headless agent command, and
 /// the prompt itself when that token is followed by one.
 ///
@@ -559,6 +607,7 @@ struct CompactPlan<'a> {
 fn compact_plan<'a>(
     adapter: &dyn adapters::AgentAdapter,
     transcript: Option<&'a Path>,
+    focus: &str,
 ) -> Result<CompactPlan<'a>, String> {
     let command = adapter.compact_command().ok_or_else(|| {
         format!(
@@ -570,7 +619,7 @@ fn compact_plan<'a>(
         .filter(|path| path.is_file())
         .ok_or_else(|| "no transcript reported, compaction unverifiable".to_string())?;
     Ok(CompactPlan {
-        prompt: supervise::compact_prompt(command),
+        prompt: supervise::compact_prompt(command, focus),
         transcript,
     })
 }
@@ -623,14 +672,15 @@ fn protect_compaction_continuation(
 pub(crate) fn compact_in_place<F>(
     adapter: &dyn adapters::AgentAdapter,
     transcript: Option<&Path>,
-    timeout: Duration,
+    hard_timeout: Duration,
     poll: Duration,
+    focus: &str,
     build: F,
 ) -> Result<(), String>
 where
     F: FnOnce(&str) -> Option<(Command, Option<String>)>,
 {
-    let plan = compact_plan(adapter, transcript)?;
+    let plan = compact_plan(adapter, transcript, focus)?;
     let mut watcher = supervise::Watcher::new(plan.transcript.to_path_buf());
     watcher
         .read_appended()
@@ -644,24 +694,53 @@ where
     })?;
     let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)
         .map_err(|error| format!("compact command failed to start: {error}"))?;
-    let outcome = supervise::supervise_child(
-        &mut child,
-        Instant::now() + timeout,
-        poll.max(Duration::from_millis(10)),
-        &mut || Tick::Continue,
-    )
-    .map_err(|error| format!("compact command failed: {error}"))?;
+    let poll = poll.max(Duration::from_millis(10));
+    // Round 4 bug 2: a real ~150k-token compaction ran past the single flat
+    // deadline `compact_in_place` used to wait on the compact child's exit
+    // (20s, `cfg.wrap.inject_timeout_ms` -- a value meant for `wrap`'s
+    // interactive nudge injection, not for a whole model turn's worth of
+    // headless compute), so zirv killed a compaction that was actively making
+    // progress.
+    //
+    // The fix used to be a transcript-growth "stall" clock reset on every
+    // observed byte -- but a single headless compaction turn appends NOTHING
+    // to the transcript until the whole turn completes, so that clock could
+    // just as easily kill a real, healthy compaction that simply has not
+    // written anything back yet. There is no reliable mid-turn liveness
+    // signal for a single headless child, so the child's exit is bounded by
+    // `hard_timeout` alone (`SuperviseConfig::compact_timeout_ms`, default 10
+    // minutes, REPO_FORBIDDEN so a repo cannot weaken it) and `on_tick` never
+    // asks to stop early.
+    // F4 (codex review fix): one deadline covers the whole call -- the
+    // compact child's own exit AND the verification that follows -- rather
+    // than each phase getting its own fresh `Instant::now() + hard_timeout`.
+    // A compact child that takes close to the full `hard_timeout` to exit
+    // used to hand verification an entirely new, equally long window on top
+    // of that, so a real (if slow) compaction could block this call for
+    // close to twice `hard_timeout`. `verify_compaction`'s own loop already
+    // treats a deadline that has already passed as "not verified" rather
+    // than erroring, so a child that consumed nearly the whole budget just
+    // exiting correctly leaves little to no time to verify, instead of a
+    // second full window.
+    let deadline = Instant::now() + hard_timeout;
+    let outcome = supervise::supervise_child(&mut child, deadline, poll, &mut || Tick::Continue)
+        .map_err(|error| format!("compact command failed: {error}"))?;
     let _ = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
     match outcome {
         Outcome::Exited(0) => {}
         Outcome::Exited(code) => return Err(format!("compact command exited with code {code}")),
-        Outcome::TimedOut => return Err("compact command timed out".to_string()),
+        Outcome::TimedOut => {
+            return Err(format!(
+                "compact command exceeded its {}s hard timeout",
+                hard_timeout.as_secs()
+            ));
+        }
         Outcome::StoppedByTick(reason) => {
             return Err(format!("compact command stopped unexpectedly: {reason}"));
         }
     }
 
-    let verified = supervise::verify_compaction(&mut watcher, adapter, Instant::now() + timeout)
+    let verified = supervise::verify_compaction(&mut watcher, adapter, deadline)
         .map_err(|error| format!("compaction verification failed: {error}"))?;
     if !verified {
         return Err("compaction not verified".to_string());
@@ -760,6 +839,286 @@ fn headless_argv_len(command: &Command) -> usize {
         total += arg.len() + quotes + backslashes + 2;
     }
     total
+}
+
+/// Issue #788: the operator-only `[headless]` cost levers, applied to a
+/// CLAUDE headless launch `command` right after it is built. A no-op for
+/// every other adapter and for every unset key, so an unconfigured launch
+/// stays byte-identical to one built before this table existed.
+///
+/// `prompt` is `None` only when this run's own prompt text is genuinely
+/// unknown here (a bare resume with no new text). `state`/`session` key the
+/// sticky effort decision -- see [`sticky_headless_effort`] -- and are
+/// otherwise unused by the TTL lever.
+fn apply_headless_cost_levers(
+    command: &mut Command,
+    cfg: &CtxConfig,
+    adapter_name: &str,
+    prompt: Option<&str>,
+    state: &StateDir,
+    session: &SessionId,
+) {
+    if adapter_name != "claude" {
+        return;
+    }
+    let headless = &cfg.headless;
+    if let Some(ttl) = headless.prompt_cache_ttl.as_deref() {
+        let operator_env_wins = [
+            "CLAUDE_CODE_PROMPT_CACHE_TTL",
+            "FORCE_PROMPT_CACHING_5M",
+            "ENABLE_PROMPT_CACHING_1H",
+        ]
+        .iter()
+        .any(|name| std::env::var(name).is_ok());
+        if !operator_env_wins {
+            command.env("CLAUDE_CODE_PROMPT_CACHE_TTL", ttl);
+        }
+    }
+    if std::env::var("CLAUDE_CODE_EFFORT_LEVEL").is_ok() {
+        return;
+    }
+    let argv_has_effort = command.get_args().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--effort" || arg.starts_with("--effort=")
+    });
+    if argv_has_effort || headless.effort == super::config::HeadlessEffortConfig::default() {
+        return;
+    }
+    if let Some(effort) = sticky_headless_effort(state, cfg, session, prompt) {
+        command.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
+    }
+}
+
+/// Issue #788 follow-up (benchmark-verified): the effort lever's decision for
+/// `session`'s WHOLE conversation, decided ONCE -- at its first headless
+/// launch -- and replayed byte-identically for every later launch of the SAME
+/// session id (a `--resume` relaunch, an in-place compaction, any other
+/// relaunch that keeps the id), regardless of that later launch's own prompt
+/// text, and even when it has none (`prompt == None`, a bare resume with
+/// nothing new to say). A benchmarked 9-step resume chain that let effort
+/// flip between turns wrote 164k prompt-cache tokens; pinned to the first
+/// turn's decision, the same chain wrote 49k -- flipping `CLAUDE_CODE_
+/// EFFORT_LEVEL` mid-conversation invalidates Claude's WHOLE prompt cache,
+/// not just this turn's own addition to it.
+///
+/// Both the read and the write are best-effort: any state-dir I/O doubt --
+/// missing, corrupt, unwritable -- falls back to today's behaviour, classify
+/// THIS launch from its own prompt and record nothing, since supervision
+/// must stay a pure passthrough on failure here (never `unwrap`/`expect`).
+///
+/// `[jev] launch_effort` (off by default): when the deterministic classifier
+/// produces a `Classification` from a real prompt, [`jev_launch_effort`] gets
+/// a chance to steer the pick toward `headless.effort.trivial`/`substantial`
+/// instead, from local numeric facts only -- see its own doc comment. Its
+/// `None` (gate off, no credential, indecisive, or the chosen tier itself has
+/// no configured value) falls through to the same deterministic value this
+/// function computed before the gate existed, so a fully off-by-default
+/// operator sees byte-identical behaviour. Either way the result goes through
+/// the SAME sticky record below: a Jev-steered pick, like a deterministic
+/// one, is decided once and replayed for every later launch of this session.
+fn sticky_headless_effort(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    session: &SessionId,
+    prompt: Option<&str>,
+) -> Option<String> {
+    let headless = &cfg.headless;
+    let record_path = headless_effort_record_path(state, session);
+    if let Some(record) = load_headless_effort_record(&record_path) {
+        return record.effort;
+    }
+    let classification = prompt.and_then(super::proxy::decision::try_classify_request);
+    let deterministic = classification
+        .as_ref()
+        .and_then(|classification| headless_effort_for(&headless.effort, classification.complexity))
+        .map(str::to_string);
+    let effort = match (prompt, &classification) {
+        (Some(prompt), Some(classification)) => {
+            jev_launch_effort(state, cfg, prompt, classification.complexity).or(deterministic)
+        }
+        _ => deterministic,
+    };
+    save_headless_effort_record(
+        state,
+        &record_path,
+        &HeadlessEffortRecord {
+            effort: effort.clone(),
+        },
+    );
+    effort
+}
+
+/// The metadata-only envelope [`jev_launch_effort`] sends: no prompt text, no
+/// classifier reasons, only the bounded numeric row [`launch_effort_facts`]
+/// computes locally -- the same `_zirv_metadata_only` contract every other
+/// `[jev]`-gated site uses (see `hook.rs`'s `DispatchAdviseState`).
+#[derive(Debug, Serialize)]
+struct LaunchEffortAdviseState {
+    #[serde(rename = "_zirv_metadata_only")]
+    metadata_only: bool,
+    facts: Vec<Vec<u32>>,
+}
+
+/// One Noul: is this launch's request unusually hard, or a small,
+/// low-deliberation follow-up? Answered from [`launch_effort_facts`] alone.
+fn launch_effort_question() -> [jev::Question; 1] {
+    [jev::Question::metadata_noul(
+        "launch_effort_high",
+        "Facts [word-count bucket (0<10,1<50,2<200,3>=200), enumerated-item count, deterministic \
+complexity index (0 trivial..3 architectural), reads as a question (1) or not (0)] describe one \
+request at a headless launch's first turn. Is it unusually hard, deliberate work needing HIGH \
+reasoning effort (not just long)? False for an ordinary/small follow-up. False if unsure.",
+        "unusually hard, deliberate work warranting high effort",
+        "a small, low-deliberation follow-up warranting low effort",
+    )]
+}
+
+/// Local, numeric-only facts for [`launch_effort_question`] -- never the
+/// prompt text itself crosses the Jev boundary. Item detection mirrors
+/// `proxy::decision`'s own `request_size_floor` (bullets `- `/`* `, or a
+/// `N.`/`N)` line marker), kept as its own small copy here rather than
+/// widening that function's visibility for a fact-gathering caller.
+fn launch_effort_facts(prompt: &str, complexity: Complexity) -> Vec<u32> {
+    let words = prompt.split_whitespace().count();
+    let word_bucket: u32 = match words {
+        0..10 => 0,
+        10..50 => 1,
+        50..200 => 2,
+        _ => 3,
+    };
+    let items: u32 = prompt
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.split_once(['.', ')']).is_some_and(|(n, rest)| {
+                    (1..=2).contains(&n.len())
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && rest.starts_with(' ')
+                })
+        })
+        .count()
+        .min(20) as u32;
+    let complexity_index: u32 = match complexity {
+        Complexity::Trivial => 0,
+        Complexity::Bounded => 1,
+        Complexity::Substantial => 2,
+        Complexity::Architectural => 3,
+    };
+    let looks_like_a_question = u32::from(prompt.trim_end().ends_with('?'));
+    vec![word_bucket, items, complexity_index, looks_like_a_question]
+}
+
+/// Issue #802 (`[jev] launch_effort`): may steer `sticky_headless_effort`'s
+/// pick toward `headless.effort.trivial` (a decisive low-effort answer) or
+/// `headless.effort.substantial` (a decisive high-effort answer) instead of
+/// the plain classifier's own class, from local numeric facts only -- never
+/// the prompt text. `None` -- meaning "use the deterministic value instead",
+/// exactly as if the gate were off -- on gate-off, a missing `[proxy.
+/// typesafe]` credential, an indecisive answer, or a decisive answer whose
+/// chosen tier has no configured `headless.effort` value at all: every one of
+/// those already has the same deterministic fallback available at the call
+/// site, so this never needs to invent one.
+fn jev_launch_effort(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    prompt: &str,
+    complexity: Complexity,
+) -> Option<String> {
+    if !cfg.jev.launch_effort || !jev::available(&cfg.proxy.typesafe) {
+        return None;
+    }
+    let advise_state = LaunchEffortAdviseState {
+        metadata_only: true,
+        facts: vec![launch_effort_facts(prompt, complexity)],
+    };
+    let answers = jev::advise(
+        cfg,
+        state,
+        "launch_effort",
+        cfg.jev.launch_effort,
+        &advise_state,
+        &launch_effort_question(),
+    )?;
+    let answer = answers.get("launch_effort_high")?;
+    if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+        return None;
+    }
+    let is_high = answer.as_noul()? >= 0.5;
+    let chosen = if is_high {
+        cfg.headless.effort.substantial.clone()
+    } else {
+        cfg.headless.effort.trivial.clone()
+    }?;
+    let effect = jev::JevEffect::new(
+        "launch_effort",
+        if is_high { "effort_high" } else { "effort_low" },
+    );
+    jev::record_effect(cfg, state, cfg.jev.launch_effort, &effect);
+    Some(chosen)
+}
+
+/// The persisted record [`sticky_headless_effort`] reads and writes.
+/// `effort` is `None` when the first launch's own classification produced no
+/// configured value for its complexity class -- still a real, sticky
+/// decision ("no effort" for this whole conversation), not a signal to
+/// reclassify on the next launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HeadlessEffortRecord {
+    effort: Option<String>,
+}
+
+/// `<state>/headless-effort/<hash of session id>.json`, mirroring `hook.rs`'s
+/// `adoption_record_path`/`status.rs`'s `status_snapshot_path` exactly.
+fn headless_effort_record_path(state: &StateDir, session: &SessionId) -> PathBuf {
+    state
+        .headless_effort()
+        .join(format!("{:016x}.json", input_hash(session.as_str())))
+}
+
+/// Best-effort, like `hook.rs`'s `load_adoption_record`: missing, corrupt, or
+/// otherwise unreadable all read as "no decision recorded yet" (`None`)
+/// rather than an error.
+fn load_headless_effort_record(path: &Path) -> Option<HeadlessEffortRecord> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Best-effort, like `hook.rs`'s `save_adoption_record`: a record that fails
+/// to write costs the NEXT launch of this session a re-classification (the
+/// pre-fix behaviour), never this launch's own success. Prunes the directory
+/// to `KEEP_NEWEST` after a successful write, the same retention `adoption()`/
+/// `intake()` get (`hook.rs::claim_first_prompt`).
+fn save_headless_effort_record(state: &StateDir, path: &Path, record: &HeadlessEffortRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = super::state::create_private_dir_all(dir);
+    }
+    if super::state::write_private(path, &json).is_ok() {
+        super::state::prune_to_newest(&state.headless_effort(), super::state::KEEP_NEWEST);
+    }
+}
+
+/// The configured `CLAUDE_CODE_EFFORT_LEVEL` for a classified `complexity`,
+/// or `None` when that class has no configured value. `Complexity::
+/// Architectural` reads the SAME `substantial` value: `try_classify_request`
+/// (the only caller that ever produces a `Classification` here) is
+/// text-only, and `infer_complexity`/its own request-size floor can never
+/// return `Architectural` from text alone, so there is no separate
+/// `headless.effort.architectural` key -- this arm exists only so the match
+/// stays exhaustive against a future caller that does pass real diff data.
+fn headless_effort_for(
+    effort: &super::config::HeadlessEffortConfig,
+    complexity: Complexity,
+) -> Option<&str> {
+    match complexity {
+        Complexity::Trivial => effort.trivial.as_deref(),
+        Complexity::Bounded => effort.bounded.as_deref(),
+        Complexity::Substantial | Complexity::Architectural => effort.substantial.as_deref(),
+    }
 }
 
 /// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
@@ -1247,13 +1606,28 @@ fn run_with_clock_inner<W: Write>(
     let prompt_value_at = locate_prompt(&args.command, prefix, prompt.as_deref())
         .and_then(|(index, value)| value.map(|_| index + 1));
 
+    // Issue #778: the operator's own trailing args may already name an
+    // existing conversation to resume (`-- --resume <id>`), for zirv to
+    // track under that SAME id -- transcript derivation, the registry short
+    // id and every decision-log entry below -- rather than a fresh, unrelated
+    // one that has nothing to do with the conversation actually being
+    // resumed. `resume_pin` reads the same `RESUME_FLAGS_WITH_VALUE`/
+    // `RESUME_FLAGS_BARE` list `pins_an_existing_conversation`/`extra_launch_
+    // flags` already use; `resume_pin_tokens` (its other half) is consulted
+    // further down, only for the very first launch's own `extra`, once
+    // `user_extra` below has already stripped them the same way it would for
+    // a restart.
+    let (resume_pin_tokens, resumed_session_id) = resume_pin(&args.command, adapter.name());
     // Determined before mail is listed (N3: delivery is scoped to this
     // session's own short id, so the id has to exist first) and before
     // `prompt_args` (M7 needs a session id to name the private prompt file
-    // after) rather than after, as this used to be.
+    // after) rather than after, as this used to be. `args.session_id` --
+    // zirv's own flag -- still wins outright over a resumed id: an operator
+    // who names both gets what they explicitly pinned.
     let session_raw = args
         .session_id
         .clone()
+        .or(resumed_session_id)
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
 
@@ -1470,6 +1844,7 @@ fn run_with_clock_inner<W: Write>(
             adapter.as_ref(),
             &user_extra,
             adapters::LaunchMode::Headless,
+            super::prompt::PromptRole::Worker,
         )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
@@ -1688,7 +2063,26 @@ fn run_with_clock_inner<W: Write>(
     // supervisor. A worker legitimately runs inside a session (that is what
     // `zirv ctx agent` is), but it must still speak with its own identity or
     // none at all.
-    let apply_session_env = |command: &mut Command, session: &SessionId| {
+    // Issue jev-relay: the relay is (re)hosted from inside this same closure
+    // rather than at each of its own call sites, since this is already "the
+    // one place a launch's session identity is applied" for every relaunch
+    // path -- see this closure's own doc comment above. Rebinding only when
+    // `session` actually changed since the last call (`jev_relay_session`)
+    // keeps a same-session re-application (the in-place compaction arms
+    // below) from tearing down and rebuilding a perfectly live relay for no
+    // reason.
+    let mut jev_relay_handle: Option<jev_relay::Handle> = None;
+    let mut jev_relay_session: Option<String> = None;
+    let mut apply_session_env = |command: &mut Command, session: &SessionId| {
+        if jev_relay_session.as_deref() != Some(session.as_str()) {
+            jev_relay_handle = jev_relay::start(
+                &cfg.proxy.typesafe,
+                jev::any_gate_enabled(&cfg.jev),
+                &state,
+                session.as_str(),
+            );
+            jev_relay_session = Some(session.as_str().to_string());
+        }
         super::sessions::scrub_supervision_env_cmd(command);
         for (key, value) in turn_env_for(session) {
             command.env(key, value);
@@ -1771,10 +2165,27 @@ fn run_with_clock_inner<W: Write>(
         let probe = adapter.headless_cmd(&prompt_text, session, extra);
         let argv_total_len = headless_argv_len(&probe);
         if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
-            && let Some(command) = adapter.headless_cmd_stdin(session, extra)
+            && let Some(mut command) = adapter.headless_cmd_stdin(session, extra)
         {
+            apply_headless_cost_levers(
+                &mut command,
+                &cfg,
+                adapter.name(),
+                Some(&prompt_text),
+                &state,
+                session,
+            );
             return Ok((command, Some(prompt_text)));
         }
+        let mut probe = probe;
+        apply_headless_cost_levers(
+            &mut probe,
+            &cfg,
+            adapter.name(),
+            Some(&prompt_text),
+            &state,
+            session,
+        );
         Ok((probe, None))
     };
 
@@ -1802,10 +2213,19 @@ fn run_with_clock_inner<W: Write>(
             cfg.mail.max_delivered_bytes,
             parent_short.as_deref(),
         );
+        // Issue #778: `resume_pin_tokens` re-adds, for this very first launch
+        // only, exactly the resume-pinning flag `user_extra` above already
+        // stripped out (`extra_launch_flags`'s own resume-flag handling,
+        // unchanged, still governs every relaunch below via the same
+        // `user_extra` binding) -- so an operator's own `-- --resume <id>`/
+        // `--continue` reaches the adapter's argv here, and `ClaudeAdapter::
+        // headless_cmd` sees it and skips minting its own conflicting
+        // `--session-id`.
         let extra: Vec<String> = policy_extra
             .iter()
             .cloned()
             .chain(user_extra.iter().cloned())
+            .chain(resume_pin_tokens.iter().cloned())
             .chain(prompt_args.iter().cloned())
             .collect();
         let (mut command, stdin_prompt) = build_headless(&prompt_text, &session, &extra)?;
@@ -1828,7 +2248,15 @@ fn run_with_clock_inner<W: Write>(
                 .cloned()
                 .collect(),
         );
-        let command = build_command(&argv, repo)?;
+        let mut command = build_command(&argv, repo)?;
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            adapter.name(),
+            prompt.as_deref(),
+            &state,
+            &session,
+        );
         (command, None)
     };
     apply_session_env(&mut command, &session);
@@ -2123,6 +2551,23 @@ fn run_with_clock_inner<W: Write>(
             account_pattern = None;
         } else {
             let final_lines = tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET);
+            // Round 4 bug 4a: a `--output-format json` result's own
+            // `modelUsage.<model>.contextWindow` is the real window for the
+            // model that actually ran -- learned here, once, the moment it
+            // is seen, rather than trusting the catalogue's possibly-stale
+            // number forever. Best-effort and silent: most launches print
+            // no such result at all (interactive sessions, `--output-format
+            // text`), which reads as "nothing observed", never an error.
+            if let Some((model_id, window)) =
+                super::model_window::parse_observed_window(&final_lines.join("\n"))
+                && let Ok(home) = crate::utils::home_dir()
+            {
+                super::model_window::record(
+                    &home,
+                    &[model_id.as_str(), execution_model.as_deref().unwrap_or("")],
+                    window,
+                );
+            }
             let limit_text_seen = pace::scan_for_limit(
                 &final_lines,
                 &state,
@@ -2213,11 +2658,25 @@ fn run_with_clock_inner<W: Write>(
                 .chain(user_extra.iter().cloned())
                 .chain(prompt_args.iter().cloned())
                 .collect();
+            // Issue #798 (`[jev] compaction_select`): best-effort, off by
+            // default -- `compaction_focus_for_transcript` checks the gate
+            // and credential BEFORE touching the transcript at all (review
+            // of 6bdd7675, defect #1), so this costs nothing observable on
+            // that (today's default) path.
+            let compact_focus = handoff::compaction_focus_for_transcript(
+                &cfg,
+                &state,
+                adapter.as_ref(),
+                Some(&transcript),
+                cfg.handoff.tail_items,
+                supervise::COMPACT_FOCUS,
+            );
             let compact_result = compact_in_place(
                 adapter.as_ref(),
                 Some(&transcript),
-                Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                Duration::from_millis(cfg.supervise.compact_timeout_ms),
                 poll,
+                &compact_focus,
                 |compact_prompt| {
                     let session_ref = SessionRef {
                         id: session.clone(),
@@ -2231,6 +2690,14 @@ fn run_with_clock_inner<W: Write>(
                         prompt_via_stdin,
                     )?;
                     compact.current_dir(repo);
+                    apply_headless_cost_levers(
+                        &mut compact,
+                        &cfg,
+                        adapter.name(),
+                        Some(compact_prompt),
+                        &state,
+                        &session,
+                    );
                     apply_session_env(&mut compact, &session);
                     Some((compact, stdin_prompt))
                 },
@@ -2259,6 +2726,14 @@ fn run_with_clock_inner<W: Write>(
                     )
                 })?;
                 command.current_dir(repo);
+                apply_headless_cost_levers(
+                    &mut command,
+                    &cfg,
+                    adapter.name(),
+                    Some(&continuation),
+                    &state,
+                    &session,
+                );
                 apply_session_env(&mut command, &session);
                 Ok((command, stdin_prompt))
             });
@@ -4143,7 +4618,43 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     }
     let mut args = args.clone();
     args.runtime = choice.kind.as_str().to_string();
-    run_with(&args, w, &repo, &env)
+    // Round 4B (stdout/stderr separation): a harness launch's child inherits
+    // nothing of its own -- `supervise::forward` echoes the CHILD's stdout
+    // line by line straight to this process's own real `std::io::stdout()`,
+    // on its own thread, entirely independent of `w`. Every "zirv ctx exec:
+    // ..." notice the harness path (`run_with_clock`/`run_with_clock_inner`)
+    // writes to `w` used to go to that SAME real stdout too -- on this, the
+    // one production call site (`mod.rs`'s `CtxVerb::Exec` dispatch), `w` IS
+    // `std::io::Stdout` -- racing the forwarding thread and landing a notice
+    // (`pace::wait_for_window`'s usage-limit line, a restart/nudge/backoff
+    // line, and so on) in front of a child's own `--output-format json`
+    // stream, which a machine consumer piping this process's stdout cannot
+    // recover from. `--runtime native`'s `w` argument IS the contract
+    // instead (`--view json/plain`'s structured result, `run_native`'s own
+    // `writeln!(w, ...)` calls), so only the harness branch is redirected --
+    // this mirrors `run_with`'s own branch exactly, just choosing the writer
+    // per arm rather than sharing one across both. `run_with` itself (and
+    // every other caller -- `script_runner::agent_command`, every test that
+    // still passes its own buffer) is untouched: this function alone owns
+    // the real-process CLI entry, so redirecting here cannot perturb a test
+    // that asserts on a harness notice via its own `Vec<u8>` writer through
+    // `run_with`/`run_with_clock` directly.
+    match choice.kind {
+        super::runtime::RuntimeKind::Native => run_native(&args, w, &repo, &env),
+        super::runtime::RuntimeKind::Harness => run_with_clock(
+            &args,
+            &mut std::io::stderr(),
+            &repo,
+            &env,
+            &super::state::now_secs,
+            &|d: Duration| std::thread::sleep(d),
+        ),
+        super::runtime::RuntimeKind::Unknown => Err(format!(
+            "--runtime '{}': expected `harness` or `native`",
+            args.runtime
+        )
+        .into()),
+    }
 }
 
 /// Issue #491: the `[runtime]` resolution `run` applies before anything
@@ -4524,6 +5035,534 @@ mod tests {
             headless_prompt_via_stdin(false, total),
             "a prompt safely under budget on its own must still route to stdin once the other \
              arguments on the same command line push the WHOLE argv over budget"
+        );
+    }
+
+    /// Issue #788: with every `[headless]` key unset (the shipped default),
+    /// a headless launch stays byte-identical to one built before this
+    /// table existed -- no `CLAUDE_CODE_PROMPT_CACHE_TTL`/`CLAUDE_CODE_
+    /// EFFORT_LEVEL` env is added, whatever prompt text is passed.
+    #[test]
+    fn apply_headless_cost_levers_is_a_noop_with_unset_config() {
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+            ("CLAUDE_CODE_EFFORT_LEVEL", None),
+        ]);
+        let cfg = CtxConfig::default();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+        let mut command = Command::new("claude");
+        command.arg("-p").arg("do a small thing");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("do a small thing"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "an unconfigured [headless] table must add no env"
+        );
+    }
+
+    /// Issue #788: `headless.prompt_cache_ttl` sets `CLAUDE_CODE_PROMPT_
+    /// CACHE_TTL` when configured, and the operator's own process env --
+    /// `CLAUDE_CODE_PROMPT_CACHE_TTL` itself, or either alias the vendor
+    /// docs name -- wins over it.
+    #[test]
+    fn apply_headless_cost_levers_sets_prompt_cache_ttl_and_operator_env_wins() {
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+        ]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.prompt_cache_ttl = Some("1h".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            None,
+            &state,
+            &SessionId::new_v4(),
+        );
+        let ttl = command
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_PROMPT_CACHE_TTL")
+            .and_then(|(_, value)| value);
+        assert_eq!(ttl, Some(std::ffi::OsStr::new("1h")));
+
+        let _operator_env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("FORCE_PROMPT_CACHING_5M", Some("1"))]);
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            None,
+            &state,
+            &SessionId::new_v4(),
+        );
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "the operator's own FORCE_PROMPT_CACHING_5M must win over a configured ttl"
+        );
+    }
+
+    /// Issue #788: `headless.effort.<class>` sets `CLAUDE_CODE_EFFORT_LEVEL`
+    /// for a request that classifies into a CONFIGURED class, and adds
+    /// nothing for one that classifies into an UNCONFIGURED class -- the
+    /// deterministic size-floor classifier (`proxy::decision::
+    /// try_classify_request`) is text-only, never a Jev call.
+    #[test]
+    fn apply_headless_cost_levers_sets_effort_for_a_configured_class_and_skips_an_unset_one() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        // `bounded` is deliberately left unset.
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
+        let effort = command
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            effort,
+            Some(std::ffi::OsStr::new("low")),
+            "a short, unenumerated request classifies Trivial"
+        );
+
+        // A different session id, so this is a fresh classification and not
+        // the first call's record being replayed.
+        let bounded_request = "word ".repeat(150);
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &SessionId::new_v4(),
+        );
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "a 150-word request floors to Bounded, which has no configured effort"
+        );
+    }
+
+    /// Issue #788 review finding L3: the text-only classifier
+    /// (`try_classify_request`) can never produce `Complexity::
+    /// Architectural`, so there is no separate `headless.effort.
+    /// architectural` key -- `Architectural` reads the SAME `substantial`
+    /// value instead of silently doing nothing.
+    #[test]
+    fn headless_effort_for_maps_architectural_to_the_substantial_value() {
+        let effort = crate::commands::ctx::config::HeadlessEffortConfig {
+            substantial: Some("high".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            headless_effort_for(&effort, Complexity::Architectural),
+            Some("high")
+        );
+        assert_eq!(
+            headless_effort_for(&effort, Complexity::Substantial),
+            Some("high")
+        );
+    }
+
+    /// Issue #788: the operator's own `CLAUDE_CODE_EFFORT_LEVEL` process env,
+    /// and an operator argv that already carries `--effort`, each independently
+    /// win over a configured `headless.effort.*` value.
+    #[test]
+    fn apply_headless_cost_levers_skips_effort_when_the_operator_env_or_argv_already_wins() {
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        {
+            let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+                "CLAUDE_CODE_EFFORT_LEVEL",
+                Some("high"),
+            )]);
+            let mut command = Command::new("claude");
+            apply_headless_cost_levers(
+                &mut command,
+                &cfg,
+                "claude",
+                Some("fix the typo"),
+                &state,
+                &SessionId::new_v4(),
+            );
+            assert_eq!(
+                command.get_envs().count(),
+                0,
+                "the operator's own CLAUDE_CODE_EFFORT_LEVEL must win"
+            );
+        }
+
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut command = Command::new("claude");
+        command.arg("--effort").arg("max");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "an argv that already carries --effort must win"
+        );
+    }
+
+    /// Issue #788 follow-up: a second launch of the SAME session, whose own
+    /// prompt would classify to a DIFFERENT configured effort than the first
+    /// launch's, keeps the first launch's decision -- a resume must never
+    /// flip `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation, since that
+    /// invalidates the whole prompt cache.
+    #[test]
+    fn apply_headless_cost_levers_keeps_the_first_launchs_effort_across_a_differently_classified_resume()
+     {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.bounded = Some("medium".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "the first launch classifies Trivial"
+        );
+
+        // A resume of the SAME session, with a prompt that on its own would
+        // classify Bounded.
+        let bounded_request = "word ".repeat(150);
+        let mut resumed = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut resumed,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            resumed
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "a resume of the SAME session must replay the first launch's effort, not reclassify \
+             its own differently-sized prompt"
+        );
+    }
+
+    /// Issue #788 follow-up: a bare resume with no new prompt text
+    /// (`prompt == None`) of an ALREADY-decided session must still get that
+    /// session's recorded effort -- not silently skip the lever, which would
+    /// itself be a flip (configured effort, then none).
+    #[test]
+    fn apply_headless_cost_levers_reuses_the_recorded_effort_when_a_resume_has_no_new_prompt() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low"))
+        );
+
+        let mut resumed = Command::new("claude");
+        apply_headless_cost_levers(&mut resumed, &cfg, "claude", None, &state, &session);
+        assert_eq!(
+            resumed
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "prompt == None on a resume of the SAME session must reuse the recorded effort, not \
+             skip the lever"
+        );
+    }
+
+    /// Issue #788 follow-up: a DIFFERENT session id has no recorded decision
+    /// yet, so it classifies its own prompt fresh rather than inheriting
+    /// another, unrelated session's record.
+    #[test]
+    fn apply_headless_cost_levers_classifies_fresh_for_a_different_session_id() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let mut cfg = CtxConfig::default();
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.bounded = Some("medium".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let session_a = SessionId::new_v4();
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session_a,
+        );
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low"))
+        );
+
+        let session_b = SessionId::new_v4();
+        let bounded_request = "word ".repeat(150);
+        let mut second = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut second,
+            &cfg,
+            "claude",
+            Some(&bounded_request),
+            &state,
+            &session_b,
+        );
+        assert_eq!(
+            second
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("medium")),
+            "a DIFFERENT session id must classify its own prompt fresh, not inherit another \
+             session's record"
+        );
+    }
+
+    /// `[jev] launch_effort` test config: the same shape `hook.rs`'s own
+    /// `stop_verify_cfg` uses for its Jev-gated tests, pointed at a caller-
+    /// supplied base URL so a one-shot local server (or a deliberately
+    /// unreachable port) stands in for the network.
+    fn launch_effort_cfg(base_url: String, credential_env: &str) -> CtxConfig {
+        let mut cfg = CtxConfig::default();
+        cfg.jev.launch_effort = true;
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe.base_url = base_url;
+        cfg.proxy.typesafe.credential_env = credential_env.to_string();
+        cfg.proxy.typesafe.timeout_secs = 5;
+        cfg
+    }
+
+    /// `[jev] launch_effort` gate off: byte-identical to today, even with a
+    /// reachable Jev endpoint and a fully configured `[headless.effort]` --
+    /// `sticky_headless_effort` never reaches `jev_launch_effort` at all, so
+    /// no `jev-decisions.jsonl` row is ever written.
+    #[test]
+    fn apply_headless_cost_levers_jev_launch_effort_gate_off_is_byte_identical() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let env = "EXEC_TEST_LAUNCH_EFFORT_OFF";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        // Port 9 ("discard") refuses every connection -- if the gate being
+        // off did not actually skip the call, this would time out or error,
+        // never silently succeed.
+        let mut cfg = launch_effort_cfg("http://127.0.0.1:9".to_string(), env);
+        cfg.jev.launch_effort = false;
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.substantial = Some("high".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "gate off must fall back to the plain deterministic classification"
+        );
+        assert!(
+            !state.root().join("jev-decisions.jsonl").exists(),
+            "gate off must never even attempt the call"
+        );
+    }
+
+    /// `[jev] launch_effort` gate on with a decisive HIGH answer: overrides
+    /// the deterministic pick (a short, unenumerated request classifies
+    /// Trivial -> `headless.effort.trivial`) with `headless.effort.
+    /// substantial` instead. A resumed launch of the SAME session, with no
+    /// server listening at all, still replays that exact recorded value --
+    /// the Jev choice goes through the identical sticky record the
+    /// deterministic path always used.
+    #[test]
+    fn apply_headless_cost_levers_jev_launch_effort_decisive_high_overrides_and_stays_sticky() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let body = r#"{"model": "jev-latest", "answers": {
+            "launch_effort_high": {"type": "noul", "noul": 0.93}},
+            "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let env = "EXEC_TEST_LAUNCH_EFFORT_HIGH";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let mut cfg = launch_effort_cfg(url, env);
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.substantial = Some("high".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let session = SessionId::new_v4();
+
+        let mut first = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut first,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &session,
+        );
+        handle.join().expect("server thread");
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(
+            first
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("high")),
+            "a decisive high answer must override the Trivial classification's own low pick"
+        );
+
+        // The resume: no server bound at all (a second request would hang
+        // forever waiting for a connection that never comes), proving the
+        // sticky record -- not a second Jev call -- is what answers this.
+        let mut resumed = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut resumed,
+            &cfg,
+            "claude",
+            Some("do something else entirely"),
+            &state,
+            &session,
+        );
+        assert_eq!(
+            resumed
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("high")),
+            "a resume of the SAME session must replay the recorded Jev choice, never re-ask"
+        );
+    }
+
+    /// `[jev] launch_effort` gate on with an indecisive answer (margin below
+    /// `DEFAULT_MIN_MARGIN`): falls back to the plain deterministic
+    /// classification, exactly as an unavailable or failed call would.
+    #[test]
+    fn apply_headless_cost_levers_jev_launch_effort_indecisive_falls_back_to_deterministic() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let body = r#"{"model": "jev-latest", "answers": {
+            "launch_effort_high": {"type": "noul", "noul": 0.55}},
+            "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let env = "EXEC_TEST_LAUNCH_EFFORT_INDECISIVE";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let mut cfg = launch_effort_cfg(url, env);
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.substantial = Some("high".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some("fix the typo"),
+            &state,
+            &SessionId::new_v4(),
+        );
+        handle.join().expect("server thread");
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("low")),
+            "an indecisive answer must fall back to the deterministic Trivial -> low pick"
         );
     }
 
@@ -4950,6 +5989,82 @@ mod tests {
             "approval_policy=never".to_string(),
         ];
         assert!(!pins_an_existing_conversation(&argv, "codex"));
+    }
+
+    /// Issue #778: `resume_pin` is what `run_with_clock_inner`'s very first
+    /// launch reads to honour an operator's own `-- --resume <id>` instead of
+    /// silently minting an unrelated fresh session -- both the flag(s) to put
+    /// back on `extra` and, when the flag names one directly, the id itself
+    /// for zirv's own bookkeeping (`session_raw`). Both spellings of the
+    /// value-carrying flags recover the id; the bare pins carry no id at all,
+    /// same as `pins_an_existing_conversation` already treats them, but still
+    /// return their own token so the launch still tells claude to resume.
+    #[test]
+    fn resume_pin_recovers_the_flag_and_the_id_when_one_is_named() {
+        let with_id = [
+            (
+                vec!["--resume".to_string(), "abc".to_string()],
+                vec!["--resume".to_string(), "abc".to_string()],
+            ),
+            (
+                vec!["--resume=abc".to_string()],
+                vec!["--resume=abc".to_string()],
+            ),
+            (
+                vec!["--session-id".to_string(), "abc".to_string()],
+                vec!["--session-id".to_string(), "abc".to_string()],
+            ),
+        ];
+        for (command, expected_tokens) in with_id {
+            assert_eq!(
+                resume_pin(&command, "claude"),
+                (expected_tokens, Some("abc".to_string())),
+                "got a mismatch for {command:?}"
+            );
+        }
+
+        for bare in [["-c"], ["--continue"], ["--fork-session"]] {
+            let command = vec![bare[0].to_string()];
+            assert_eq!(
+                resume_pin(&command, "claude"),
+                (vec![bare[0].to_string()], None),
+                "a bare pin carries the token but no id: {bare:?}"
+            );
+        }
+
+        assert_eq!(
+            resume_pin(&["--model".to_string(), "opus".to_string()], "claude"),
+            (Vec::new(), None),
+            "no pinning flag at all means nothing to report"
+        );
+    }
+
+    /// Codex mints its own session id and has no verified pin flag -- see
+    /// `pins_an_existing_conversation_is_always_false_for_an_adapter_with_
+    /// no_resume_flags`'s identical reasoning. `resume_pin` must be an
+    /// equally total no-op for it, or a codex launch would start forwarding
+    /// claude-shaped flags it never asked for.
+    #[test]
+    fn resume_pin_is_always_a_no_op_for_an_adapter_with_no_resume_flags() {
+        let command = vec!["--resume".to_string(), "abc".to_string()];
+        assert_eq!(resume_pin(&command, "codex"), (Vec::new(), None));
+    }
+
+    /// `--resume` with a flag after it took no value (same shape `a_valueless_
+    /// resume_does_not_swallow_the_next_flag` already pins for `extra_launch_
+    /// flags`): the next token belongs to the operator, so `resume_pin` must
+    /// not report it as the id or swallow it into the returned tokens.
+    #[test]
+    fn resume_pin_does_not_swallow_the_next_flag_after_a_valueless_resume() {
+        let command = vec![
+            "--resume".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        assert_eq!(
+            resume_pin(&command, "claude"),
+            (vec!["--resume".to_string()], None)
+        );
     }
 
     /// `--resume` with a flag after it took no value, so swallowing the next
@@ -5915,6 +7030,7 @@ mod tests {
                 Some(&transcript),
                 Duration::ZERO,
                 Duration::ZERO,
+                supervise::COMPACT_FOCUS,
                 |_| {
                     attempts.set(attempts.get() + 1);
                     None
@@ -5928,14 +7044,120 @@ mod tests {
         let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
         let attempts = Cell::new(0);
         assert_eq!(
-            compact_in_place(&claude, None, Duration::ZERO, Duration::ZERO, |_| {
-                attempts.set(attempts.get() + 1);
-                None
-            },)
+            compact_in_place(
+                &claude,
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                supervise::COMPACT_FOCUS,
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    None
+                },
+            )
             .expect_err("missing transcript must fail closed"),
             "no transcript reported, compaction unverifiable"
         );
         assert_eq!(attempts.get(), 0, "missing transcript must not launch");
+    }
+
+    /// Compaction stall-detection correction: `compact_in_place` used to reset
+    /// a "stall" clock on every observed byte of transcript growth and kill
+    /// the child once that clock ran out with NO growth at all. But a single
+    /// headless compaction turn appends nothing to the transcript until the
+    /// whole turn completes, so that clock could just as easily kill a real,
+    /// healthy compaction as a genuine hang -- exactly the production
+    /// incident this reproduces at unit-test scale (a real ~150k-token
+    /// compaction can run well past what any short stall grace would
+    /// tolerate while writing nothing back). The fake compact command here
+    /// appends NOTHING to the transcript for several poll intervals, then
+    /// finally emits `compact_boundary` and exits 0, well inside the hard
+    /// timeout. It must not be killed: `compact_in_place` no longer uses
+    /// transcript growth to decide liveness at all, relying on
+    /// `supervise.compact_timeout_ms`'s hard bound alone. Durations are kept
+    /// short (milliseconds) so the test never sleeps anywhere near the old
+    /// 60s grace.
+    #[test]
+    fn a_compaction_with_no_transcript_growth_at_all_finishes_inside_the_hard_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("seed transcript");
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+
+        // No writes to the transcript at all until the very end -- exactly
+        // what a real headless compaction turn does while still computing.
+        let script = format!(
+            "sleep 0.3; printf '{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"c\"}}\\n' >> '{path}'",
+            path = transcript.display()
+        );
+        let build = |_: &str| -> Option<(Command, Option<String>)> {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(&script);
+            Some((cmd, None))
+        };
+
+        let result = compact_in_place(
+            &claude,
+            Some(&transcript),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            supervise::COMPACT_FOCUS,
+            build,
+        );
+        assert!(
+            result.is_ok(),
+            "a compaction that appends nothing until it completes must not be killed for lack \
+             of transcript growth, as long as it finishes inside the hard timeout: {result:?}"
+        );
+    }
+
+    /// F4 (codex review, cff7ff57 follow-up): `compact_in_place` used to hand
+    /// the post-exit verification step an entirely fresh `Instant::now() +
+    /// hard_timeout` deadline, independent of how long the compact child
+    /// itself had already taken to exit -- so a slow compaction could block
+    /// this call for close to TWO full `hard_timeout` periods instead of
+    /// one. The fake compact command sleeps most of the budget away, then
+    /// exits 0 without ever appending a compaction marker, so verification
+    /// can never find one and is guaranteed to spin out its own full
+    /// window rather than returning early -- the one scenario that actually
+    /// measures whether that window is bounded by the SAME deadline as the
+    /// child's own exit wait, rather than a second one.
+    #[test]
+    fn compact_in_place_bounds_total_wait_to_one_hard_timeout_not_two() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("seed transcript");
+        let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+
+        let script = "sleep 0.7";
+        let build = |_: &str| -> Option<(Command, Option<String>)> {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            Some((cmd, None))
+        };
+
+        let hard_timeout = Duration::from_millis(1000);
+        let started = Instant::now();
+        let result = compact_in_place(
+            &claude,
+            Some(&transcript),
+            hard_timeout,
+            Duration::from_millis(20),
+            supervise::COMPACT_FOCUS,
+            build,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "the child never writes a compaction marker, so this must report unverified, not \
+             success: {result:?}"
+        );
+        assert!(
+            elapsed < hard_timeout * 3 / 2,
+            "one hard_timeout must cover the child's exit AND verification together, not two \
+             separate full windows: elapsed {elapsed:?}, hard_timeout {hard_timeout:?}"
+        );
     }
 
     #[test]
@@ -5998,7 +7220,10 @@ mod tests {
         let argv_log = tmp.path().join("argv.log");
         std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
         let mut env = base_env(&state);
-        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "2000".to_string());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -6057,6 +7282,60 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_compaction_keeps_the_sessions_headless_effort() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "abababab-3333-4333-8444-555555555555";
+        let modes = tmp.path().join("modes.txt");
+        let effort_log = tmp.path().join("effort.log");
+        std::fs::write(
+            &modes,
+            "compact-tier
+healthy
+",
+        )
+        .expect("write modes");
+        let mut env = base_env(&state);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "2000".to_string(),
+        );
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+        env.insert(
+            "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL".to_string(),
+            "low".to_string(),
+        );
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("30")),
+            ("FAKE_AGENT_EFFORT_ENV_LOG", effort_log.to_str()),
+        ]);
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            command: fake_agent_command(session),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
+        assert_eq!(code.expect("runs"), 0);
+
+        let efforts = std::fs::read_to_string(&effort_log).expect("effort log");
+        assert_eq!(
+            efforts.lines().collect::<Vec<_>>(),
+            ["low", "low", "low"],
+            "the first, compact and continuation launches share one effort"
+        );
+    }
+
+    #[test]
     fn an_unverified_compaction_falls_through_to_restart_with_the_reason() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -6065,7 +7344,10 @@ mod tests {
         let modes = tmp.path().join("modes.txt");
         std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
         let mut env = base_env(&state);
-        env.insert("ZIRV_CTX_INJECT_TIMEOUT_MS".to_string(), "300".to_string());
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "300".to_string(),
+        );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8281,6 +9563,66 @@ mod tests {
             "",
             "must not export the inherited parent onward to the launched child: \
              {logged_parent:?}"
+        );
+    }
+
+    /// Round 4B (stdout/stderr separation): a real harness launch's child
+    /// forwards its OWN stdout independently, line by line, straight to this
+    /// process's real `std::io::stdout()` (`supervise::forward`) -- entirely
+    /// apart from whatever `w` this function was handed. `run()`'s one
+    /// production caller (`mod.rs`'s `CtxVerb::Exec` dispatch) hands it that
+    /// SAME real stdout, so any supervisor notice ("zirv ctx exec: ...")
+    /// still written to `w` used to race the forwarding thread on the
+    /// identical stream -- landing in front of, or inside, a child's own
+    /// `--output-format json` output, which a downstream consumer piping
+    /// this process's stdout could never recover from. Triggers the
+    /// cheapest deterministic notice: `command` carries no `-p`/`--print`/
+    /// `exec` token and `prompt` is unset, so `extract_prompt` finds nothing
+    /// and the "no prompt could be found" notice fires unconditionally, with
+    /// no pacing, timing or usage history involved.
+    #[test]
+    fn direct_exec_entry_never_leaks_a_harness_notice_into_its_own_writer() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        let session = "dedededd-2222-4333-8444-555555555555";
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _cwd = crate::commands::ctx::testenv::CwdGuard::enter(tmp.path()).expect("enter repo");
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::state::STATE_ENV, state_dir.to_str()),
+            ("ZIRV_CTX_PACE", Some("false")),
+            ("FAKE_AGENT_MODE", Some("healthy")),
+            ("ZIRV_CTX_PROMPT_SKILL_INDEX", Some("false")),
+        ]);
+
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            max_restarts: Some(0),
+            timeout_secs: Some(60),
+            simple: false,
+            // Deliberately no `--prompt`, and `command` carries no `-p`/
+            // `--print`/`exec` token either -- fake-agent.sh's own argv
+            // parser (a `case` loop with `*) shift ;;`) tolerates the
+            // missing flag fine, but `extract_prompt` has nothing to find.
+            command: vec![
+                "sh".to_string(),
+                fixture("fake-agent.sh").display().to_string(),
+                "--session-id".to_string(),
+                session.to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run(&args, &mut out);
+        assert_eq!(code.expect("runs"), 0);
+
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(
+            !rendered.contains("zirv ctx exec:"),
+            "a supervisor notice reached the caller's own writer instead of stderr: {rendered}"
         );
     }
 

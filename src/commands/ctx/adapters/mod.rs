@@ -1492,6 +1492,19 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = chat;
     }
 
+    /// Issue #788 (operator-only headless cost levers): attaches
+    /// `cfg.headless` to this adapter INSTANCE, mirroring `apply_chat_config`
+    /// immediately above -- `select`/`resolve_default` call this exactly
+    /// once, right after constructing the adapter, so `ClaudeAdapter::
+    /// default_sandbox_args`/`launch_settings_path`'s HEADLESS-only
+    /// `--disallowedTools`/lean-settings additions read the same resolved
+    /// `[headless]` table every other read of this adapter instance does.
+    /// Default no-op: only `ClaudeAdapter` overrides it today; codex has no
+    /// equivalent lever.
+    fn apply_headless_config(&mut self, headless: &super::config::HeadlessConfig) {
+        let _ = headless;
+    }
+
     /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
     /// attached endpoint override, or `None` when it has none -- what
     /// `harness_prompt_lines`'s roster line and `zirv ctx status` render as
@@ -1631,7 +1644,13 @@ pub trait AgentAdapter: std::fmt::Debug {
             }
         }
 
-        let mut extra = policy_launch_args(&cfg, self, &[], LaunchMode::Headless);
+        let mut extra = policy_launch_args(
+            &cfg,
+            self,
+            &[],
+            LaunchMode::Headless,
+            super::prompt::PromptRole::Worker,
+        );
         // Resolution order (issue #699): an explicit per-invocation pin always
         // wins; otherwise consult the operator's tier map for this adapter,
         // never a guess of zirv's own. Neither branch ever narrows or widens
@@ -2266,8 +2285,18 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// launch whose own trailing `flags` are given (so an adapter can back
     /// off when those flags already disable its plugin surface). Default
     /// empty; only `ClaudeAdapter` overrides it.
-    fn plugin_dir_args(&self, flags: &[String]) -> Vec<String> {
-        let _ = flags;
+    ///
+    /// Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// `role` is the compiled prompt role this launch actually gets --
+    /// `PromptRole::Worker`/`PromptRole::Single` already carry the one-line
+    /// `SKILL_POINTER_LAYER` telling them to load a skill on demand via `zirv
+    /// skill load <id>`, so registering ~46 zirv skills as a native plugin on
+    /// top of that only inflates every worker/single launch's init `Skill`
+    /// tool listing (measured 79 skills vs vanilla's 33) for no benefit.
+    /// `PromptRole::Orchestrator`/`PromptRole::SubOrchestrator` still decide
+    /// which harnesses run and so still need the plugin.
+    fn plugin_dir_args(&self, flags: &[String], role: super::prompt::PromptRole) -> Vec<String> {
+        let _ = (flags, role);
         Vec::new()
     }
 
@@ -3455,6 +3484,14 @@ fn apply_chat_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
     adapter.apply_chat_config(&cfg.chat);
 }
 
+/// Issue #788: attaches `cfg.headless` (via [`AgentAdapter::
+/// apply_headless_config`]) the same way [`apply_chat_override`] attaches
+/// `cfg.chat` immediately above -- called at each of that function's own
+/// call sites, right after constructing the adapter.
+fn apply_headless_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
+    adapter.apply_headless_config(&cfg.headless);
+}
+
 /// Issue #395: the credential-presence check both `ClaudeAdapter::ready`
 /// and `CodexAdapter::ready` apply when an operator endpoint override is
 /// configured. Named by the environment variable's own NAME only, never its
@@ -3875,6 +3912,7 @@ pub(crate) fn adapter_liveness(
     let mut adapter = if names_other { ctor(None) } else { ctor(bin) };
     apply_endpoint_override(&mut adapter, cfg);
     apply_chat_override(&mut adapter, cfg);
+    apply_headless_override(&mut adapter, cfg);
     adapter.ready().map_err(|err| err.to_string())?;
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
@@ -4101,7 +4139,10 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// `chat.rs::dash_orchestrator_pane`, `dash::mod::fulfill_spawn_request`,
 /// `handover.rs::resolve_swap_launch`) -- the one function all seven call,
 /// so "operator's own choice always wins" and the shipped-default posture
-/// can never drift between seams.
+/// can never drift between seams. Every one of those seams also already
+/// knows or derives its own compiled [`super::prompt::PromptRole`] (see
+/// each caller's own `role`/`spawnreq::role_of`/`Pane::role` source), which
+/// is why `role` threads through here rather than needing a new lookup.
 ///
 /// `Vec::new()` when `flags_pin_policy(flags)`: the operator's own explicit
 /// flag wins outright, nothing of zirv's own is prepended at all. Otherwise:
@@ -4111,13 +4152,19 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// restriction an explicit `[policy]` `Deny` stance asks for on top of the
 /// baseline. Codex's restrictive policy replaces the baseline because its
 /// sandbox and approval options reject duplicate occurrences.
+///
+/// `role` is the compiled prompt role this launch actually gets, forwarded
+/// to [`AgentAdapter::plugin_dir_args`] alone (see that method's own doc
+/// comment, skill-listing overhead fix) -- it changes nothing else this
+/// function computes.
 pub fn policy_launch_args(
     cfg: &CtxConfig,
     adapter: &(impl AgentAdapter + ?Sized),
     flags: &[String],
     mode: LaunchMode,
+    role: super::prompt::PromptRole,
 ) -> Vec<String> {
-    policy_launch_args_for_surface(cfg, adapter, flags, mode, mode)
+    policy_launch_args_for_surface(cfg, adapter, flags, mode, mode, role)
 }
 
 /// The general form of [`policy_launch_args`] above, for the one caller
@@ -4163,9 +4210,10 @@ pub fn policy_launch_args_for_surface(
     flags: &[String],
     approval_mode: LaunchMode,
     surface_mode: LaunchMode,
+    role: super::prompt::PromptRole,
 ) -> Vec<String> {
     if flags_pin_policy(flags) {
-        return adapter.plugin_dir_args(flags);
+        return adapter.plugin_dir_args(flags, role);
     }
     let policy = adapter.policy_args(&cfg.policy, surface_mode);
     // Codex's restrictive policy already supplies sandbox and approval.
@@ -4182,7 +4230,7 @@ pub fn policy_launch_args_for_surface(
         Vec::new()
     };
     out.extend(policy);
-    out.extend(adapter.plugin_dir_args(flags));
+    out.extend(adapter.plugin_dir_args(flags, role));
     out
 }
 
@@ -4548,6 +4596,7 @@ pub(crate) fn resolve_default_with_presence(
             })?;
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4570,6 +4619,7 @@ pub(crate) fn resolve_default_with_presence(
         let mut adapter = ctor(bin);
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(name) {
             // Final wave item 3: the same cross-adapter skip Medium 2 gave
             // the enabled-and-ready arm below, applied here too. Without
@@ -4819,6 +4869,7 @@ pub(crate) fn select_with_presence(
         })?;
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4830,6 +4881,7 @@ pub(crate) fn select_with_presence(
     if let Some(mut adapter) = adapters.into_iter().find(|a| a.detect(command)) {
         apply_endpoint_override(&mut adapter, cfg);
         apply_chat_override(&mut adapter, cfg);
+        apply_headless_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4994,7 +5046,13 @@ mod tests {
             .with_ignore_flags_forced(true)
             .with_exec_ask_for_approval_forced(true);
         for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
-            let flags = policy_launch_args(&cfg, &adapter, &[], mode);
+            let flags = policy_launch_args(
+                &cfg,
+                &adapter,
+                &[],
+                mode,
+                crate::commands::ctx::prompt::PromptRole::Orchestrator,
+            );
             let sandbox: Vec<_> = flags
                 .windows(2)
                 .filter(|w| w[0] == "--sandbox")
@@ -5150,7 +5208,14 @@ mod tests {
             .with_on_request_approval_forced(true)
             .with_exec_ask_for_approval_forced(true);
         assert!(
-            policy_launch_args(&cfg, &codex, &flags, LaunchMode::Headless).is_empty(),
+            policy_launch_args(
+                &cfg,
+                &codex,
+                &flags,
+                LaunchMode::Headless,
+                crate::commands::ctx::prompt::PromptRole::Orchestrator,
+            )
+            .is_empty(),
             "an operator's own -c approval_policy=... override must suppress zirv's entire \
              computed prefix, not just the approval flag"
         );
@@ -5176,8 +5241,20 @@ mod tests {
     fn launch_mode_projects_the_two_postures_differently() {
         let cfg = CtxConfig::default();
         let claude = claude::ClaudeAdapter::new(None);
-        let interactive = policy_launch_args(&cfg, &claude, &[], LaunchMode::Interactive);
-        let headless = policy_launch_args(&cfg, &claude, &[], LaunchMode::Headless);
+        let interactive = policy_launch_args(
+            &cfg,
+            &claude,
+            &[],
+            LaunchMode::Interactive,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        );
+        let headless = policy_launch_args(
+            &cfg,
+            &claude,
+            &[],
+            LaunchMode::Headless,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        );
         assert_ne!(interactive, headless);
         // Issue #504 revision (2026-09-20): with no `chat.claude_permission_mode`
         // configured, the interactive projection omits `--permission-mode`
@@ -5199,8 +5276,20 @@ mod tests {
             .with_on_request_approval_forced(true)
             .with_auto_review_forced(false)
             .with_exec_ask_for_approval_forced(true);
-        let interactive = policy_launch_args(&cfg, &codex, &[], LaunchMode::Interactive);
-        let headless = policy_launch_args(&cfg, &codex, &[], LaunchMode::Headless);
+        let interactive = policy_launch_args(
+            &cfg,
+            &codex,
+            &[],
+            LaunchMode::Interactive,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        );
+        let headless = policy_launch_args(
+            &cfg,
+            &codex,
+            &[],
+            LaunchMode::Headless,
+            crate::commands::ctx::prompt::PromptRole::Orchestrator,
+        );
         assert_ne!(interactive, headless);
         assert!(
             interactive

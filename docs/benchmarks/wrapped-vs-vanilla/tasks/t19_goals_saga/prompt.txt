@@ -1,0 +1,72 @@
+I'd like to track savings/spending goals against my categories -- like "save
+$500 toward vacation" or "keep dining under some running total". This is a
+fairly big feature, so here's the whole thing, phase by phase; please build
+it in this order since later phases build on earlier ones, and each phase
+should work correctly on its own once you reach it.
+
+**Phase 1 -- the model.** New module `ledgerlite/goals.py`:
+- A `Goal` type with fields `name` (str), `target` (a `Decimal`, always
+  meant to be positive), `categories` (a list of category strings -- a
+  transaction counts toward this goal if its `category` is any one of
+  them), `target_date` (an optional `date`, default `None`), and
+  `milestones` (a list of ints, default an empty list -- built out in
+  Phase 4).
+- A function `progress(goal, txns)` that returns a `Decimal`: the sum of
+  `abs(amount)` over every transaction in `txns` whose `category` is in
+  `goal.categories`.
+
+**Phase 2 -- persistence and basic CLI.** Goals are saved under a top-level
+`"goals"` key in the same JSON store file used by `--store` (a sibling of
+`"transactions"`), each serialized with its fields (`target` as a string,
+`target_date` as an ISO date string or `null`, `milestones` as a list of
+ints).
+- `python -m ledgerlite goal add --name NAME --target AMOUNT --category CAT
+  [--category CAT2 ...] [--target-date YYYY-MM-DD] --store PATH` appends a
+  new goal (categories kept in the order given) and prints `Added goal
+  <name>`.
+- `python -m ledgerlite goal list --store PATH` prints one line per saved
+  goal, in the order they were saved:
+  `<name>: target <target> categories <cat1>,<cat2>[ by <target-date>]`
+  (categories comma-joined in the order stored; the trailing
+  `by <target-date>` part appears only when that goal has one). If there
+  are no saved goals, print exactly `No goals.`.
+
+**Phase 3 -- checking progress.** `python -m ledgerlite goal progress NAME
+--store PATH` (a positional goal name) prints
+`f"{name}: {progress:.2f}/{target:.2f} ({percent:.1f}%)"`, where `percent`
+is `progress / target * 100` (`0` if `target` is `0`). If `NAME` doesn't
+match any saved goal, print an error to stderr and exit with status 2.
+
+**Phase 4 -- milestones.** `goal add` accepts a repeatable `--milestone N`
+(integer percentage); store the given milestones deduplicated and sorted
+ascending on the goal. Add `reached_milestones(goal, txns)` to
+`ledgerlite/goals.py`: returns the sorted list of milestones from
+`goal.milestones` whose threshold is `<=` the goal's exact (unrounded)
+percent complete. `goal progress`'s output gains a suffix: if the goal has
+any milestones defined, append
+`" milestones reached: 25,50"` (comma-joined ascending, or the literal word
+`none` if none are reached yet); a goal with no milestones defined at all
+gets no suffix, exactly as in Phase 3.
+
+**Phase 5 -- an overview report.** `python -m ledgerlite goal report --store
+PATH` prints a header line `Goal            Progress` followed by one row
+per goal, **sorted by percent complete descending, ties broken
+alphabetically by name ascending**:
+`f"{name:<16}{percent:>6.1f}%  {progress:.2f}/{target:.2f}"`. If there are
+no saved goals, print just the header line.
+
+**Phase 6 -- an overall total.** Add `--overall` to `goal report`. When
+given, print one more line after everything else:
+`f"TOTAL: {percent:.1f}%"` where `percent` is
+`sum(progress across all goals) / sum(target across all goals) * 100`
+(`0` if that total target is `0`, including when there are no goals at
+all -- in which case the output is just the header line followed by
+`TOTAL: 0.0%`).
+
+**Phase 7 -- validation and removal.** `goal add` rejects (prints an error
+to stderr, exits 2, saves nothing) a `--target` that is not strictly
+positive, and rejects adding a goal whose `--name` exactly matches a
+goal that's already saved. Add `python -m ledgerlite goal remove NAME
+--store PATH` (positional name): removes the matching goal and prints
+`Removed goal <name>`; if `NAME` isn't found, print an error to stderr and
+exit with status 2 (no changes).

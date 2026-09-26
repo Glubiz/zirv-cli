@@ -1,0 +1,28 @@
+Hey, I want to start tracking which merchants are "really" the same place
+under different statement names -- e.g. my bank sometimes prints
+"WHOLE FOODS MKT 221" and sometimes "WHOLEFOODS.COM", and I'd like to be
+able to map both to one canonical name.
+
+Please add a new module `ledgerlite/aliases.py`:
+
+- `resolve_alias(name, aliases)`: `aliases` is a list of `(pattern,
+  canonical)` pairs, checked in order. Returns the `canonical` of the FIRST
+  pair whose `pattern` appears as a substring of `name` (plain substring
+  match, case-sensitive, like the existing rule engine's "substring" kind
+  in `rules.py` -- but without the case-folding: keep this one exact-case
+  for now). Returns `name` unchanged if nothing matches.
+- Aliases are persisted under a new top-level `"aliases"` key in the same
+  JSON store file `--store` already points at (a sibling of
+  `"transactions"`), each as a `[pattern, canonical]` pair, in the order
+  they were added. Note that `ledgerlite/store.py`'s `save()` currently
+  overwrites the whole file with only `{"transactions": [...]}` -- you'll
+  need to fix that so saving transactions doesn't wipe out the aliases key
+  (and vice versa).
+
+Add a CLI family under `python -m ledgerlite alias ...`:
+
+- `alias add --pattern PATTERN --canonical NAME --store PATH` appends a new
+  alias and prints `Added alias PATTERN -> NAME`.
+- `alias list --store PATH` prints one line per saved alias, in the order
+  added: `PATTERN -> NAME`. If there are no saved aliases, print exactly
+  `No aliases.`.

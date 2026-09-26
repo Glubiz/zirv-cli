@@ -1,0 +1,17 @@
+One more feature: I'd like to see which merchants (by canonical name) I'm
+spending the most at in a given month.
+
+Add `top_merchants(txns, aliases, year, month, limit=None)` to
+`ledgerlite/report.py`: filters `txns` to that calendar year/month, resolves
+each transaction's payee to its canonical merchant name via
+`ledgerlite.aliases.resolve_alias`, sums `abs(amount)` per canonical name,
+and returns a list of `(canonical_name, total)` sorted by total
+descending, ties broken alphabetically by name. `limit`, when given, caps
+the length of the returned list to the top N; `None` (the default) means
+no cap.
+
+CLI: `python -m ledgerlite merchants --year Y --month M [--limit N] --store
+PATH` prints one line per merchant, in the same order `top_merchants`
+returns: `<canonical name>: <total:.2f>`. If there were no transactions
+that month, print exactly `No transactions for <YYYY>-<MM>.` (zero-padded,
+e.g. `2024-03`).

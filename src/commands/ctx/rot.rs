@@ -1345,12 +1345,16 @@ mod tests {
         );
     }
 
-    /// The shipped default weight is 0: this signal must never move an
-    /// existing verdict fixture until an operator raises it deliberately.
+    /// Issue #763: `same_error_weight` shipped `0.0` (fully inert) before
+    /// this issue; an operator who explicitly restores that value must still
+    /// get the old, fully inert behaviour -- the opt-out this signal has
+    /// always offered survives the new nonzero shipped default.
     #[test]
-    fn default_same_error_weight_is_zero_and_does_not_move_the_score() {
-        let cfg = ScoreConfig::default();
-        assert_eq!(cfg.same_error_weight, 0.0, "shipped default");
+    fn an_explicit_zero_same_error_weight_still_leaves_the_signal_inert() {
+        let cfg = ScoreConfig {
+            same_error_weight: 0.0,
+            ..ScoreConfig::default()
+        };
 
         let base = Signals {
             turns: 12,
@@ -1370,7 +1374,44 @@ mod tests {
         let b = score_from(heavy_repeat, 120_000, &cfg, full_caps());
         assert_eq!(
             a.score, b.score,
-            "same_error_repeats must not move the score until an operator sets a weight"
+            "same_error_repeats must not move the score once an operator sets the weight back \
+             to zero"
+        );
+    }
+
+    /// Issue #763: the shipped default (`120.0`, `same_error_threshold` at
+    /// its own default `3`) is chosen so a same-error streak that has JUST
+    /// crossed the threshold -- `rot::repetition_component`'s ramp at its
+    /// lowest nonzero point, `1 / 3` -- raises an otherwise healthy session's
+    /// score to exactly `advise_at`'s default (`40`), never past it into
+    /// `compact_at`/`restart_at`. The first action a previously-inert signal
+    /// can now ever cause is an advisory, matching `DEFAULT_PROMPT`'s own
+    /// "stuck twice on the same error: change approach" bullet -- not a
+    /// restart, which would throw the conversation away instead of nudging
+    /// it.
+    #[test]
+    fn the_shipped_default_escalates_a_freshly_tripped_same_error_streak_to_advise_not_restart() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(cfg.same_error_weight, 120.0, "shipped default");
+        assert_eq!(cfg.same_error_threshold, 3, "shipped default");
+
+        let signals = Signals {
+            turns: 12,
+            tool_failure_rate: 0.0,
+            repetition_hits: 0,
+            max_repeat: 1,
+            same_error_repeats: cfg.same_error_threshold,
+            provider_overflows: 0,
+            marker_miss_rate: Some(0.0),
+        };
+
+        let result = score_from(signals, 120_000, &cfg, full_caps());
+        assert_eq!(result.score, 40, "got {result:?}");
+        assert_eq!(
+            result.verdict,
+            Verdict::Advise,
+            "a freshly-tripped streak must advise, never jump straight to compact/restart: \
+             {result:?}"
         );
     }
 

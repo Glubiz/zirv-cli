@@ -185,10 +185,24 @@ mod win {
 
     const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
     /// How long `send` keeps retrying a pipe that exists but has no free
-    /// instance (the accept loop is between connections). Microseconds in
-    /// practice; the budget only matters when there is no server at all, and
-    /// every caller of `send` already ignores the error.
-    const CONNECT_RETRY: Duration = Duration::from_secs(1);
+    /// instance (the accept loop is between connections) -- microseconds in
+    /// practice, since `bind` posts the next instance's connect before it
+    /// even hands the accepted one off for draining (see `SignalServer::
+    /// bind`'s own comment on that ordering).
+    ///
+    /// Issue #770: every caller of `send` is fire-and-forget (`let _ =
+    /// send(...)`, every call site) and NONE needs guaranteed delivery, so
+    /// this is a short bound rather than the 1-second one it used to be.
+    /// `connect` retries on `ERROR_FILE_NOT_FOUND` too -- there being no such
+    /// pipe at all, which is exactly the stale/orphaned-supervisor case --
+    /// and that retry can never succeed by waiting, since nothing is ever
+    /// going to create the pipe underneath it. The Windows Stop hook
+    /// (`hook::run_stop`) calls `send` on every single turn, so paying out
+    /// this whole budget once per turn against a dead endpoint was a real,
+    /// measured stall; 50ms is generous for the live, momentarily-busy case
+    /// this constant actually exists for, while bounding the dead-endpoint
+    /// cost to near nothing instead of a full second.
+    const CONNECT_RETRY: Duration = Duration::from_millis(50);
     const POLL: Duration = Duration::from_millis(10);
 
     /// The pipe a socket path names. A path that is already a pipe name is
@@ -1042,6 +1056,13 @@ mod tests {
             );
         }
 
+        /// Issue #770: `send` used to retry a nonexistent pipe for the full
+        /// (old) 1-second `CONNECT_RETRY` budget before giving up -- exactly
+        /// the stale-supervisor-endpoint case the Windows Stop hook pays on
+        /// every single turn. Bounded to well under a second now, with
+        /// generous headroom over the new 50ms budget for a loaded CI box,
+        /// but still a small enough ceiling that a regression back to the
+        /// old 1-second retry (or worse) would fail this test.
         #[test]
         fn sending_to_a_dead_socket_is_an_error_not_a_hang() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1049,7 +1070,7 @@ mod tests {
             let err = send(&socket_path(dir.path()), &sample(1)).expect_err("no listener");
             assert!(!err.to_string().is_empty());
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < Duration::from_millis(500),
                 "send should give up quickly, took {:?}",
                 started.elapsed()
             );

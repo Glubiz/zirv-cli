@@ -1,0 +1,281 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..7810681 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,10 +3,15 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
++import sys
++from datetime import date as date_cls
+ from decimal import Decimal
++from pathlib import Path
+ from typing import Optional, Sequence
+ 
+ from . import report
++from .goals import Goal, progress as goal_progress, reached_milestones
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+ from .store import load, save
+@@ -47,6 +52,42 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_goal = sub.add_parser("goal", help="track savings/spending goals")
++    goal_sub = p_goal.add_subparsers(dest="goal_command", required=True)
++
++    p_goal_add = goal_sub.add_parser("add", help="add a new goal")
++    p_goal_add.add_argument("--name", required=True)
++    p_goal_add.add_argument("--target", required=True)
++    p_goal_add.add_argument("--category", action="append", required=True, dest="categories")
++    p_goal_add.add_argument("--target-date", default=None, dest="target_date")
++    p_goal_add.add_argument("--milestone", action="append", type=int, default=[], dest="milestones")
++    p_goal_add.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++    p_goal_list = goal_sub.add_parser("list", help="list saved goals")
++    p_goal_list.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++
++    p_goal_progress = goal_sub.add_parser("progress", help="show progress toward one goal")
++    p_goal_progress.add_argument("name")
++    p_goal_progress.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++
++    p_goal_report = goal_sub.add_parser("report", help="show progress toward all goals")
++    p_goal_report.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to read (default: %(default)s)"
++    )
++    p_goal_report.add_argument("--overall", action="store_true")
++
++    p_goal_remove = goal_sub.add_parser("remove", help="remove a goal")
++    p_goal_remove.add_argument("name")
++    p_goal_remove.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
+     return parser
+ 
+ 
+@@ -106,11 +147,168 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _load_raw(path) -> dict:
++    p = Path(path)
++    if not p.exists():
++        return {}
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def _save_raw(path, raw) -> None:
++    Path(path).write_text(json.dumps(raw, indent=2), encoding="utf-8")
++
++
++def _goal_to_dict(goal: Goal) -> dict:
++    return {
++        "name": goal.name,
++        "target": str(goal.target),
++        "categories": list(goal.categories),
++        "target_date": goal.target_date.isoformat() if goal.target_date else None,
++        "milestones": list(goal.milestones),
++    }
++
++
++def _goal_from_dict(data: dict) -> Goal:
++    target_date = data.get("target_date")
++    return Goal(
++        name=data["name"],
++        target=Decimal(data["target"]),
++        categories=list(data.get("categories") or []),
++        target_date=date_cls.fromisoformat(target_date) if target_date else None,
++        milestones=list(data.get("milestones") or []),
++    )
++
++
++def _load_goals(path) -> list:
++    raw = _load_raw(path)
++    return [_goal_from_dict(g) for g in raw.get("goals", [])]
++
++
++def _save_goals(path, goals) -> None:
++    raw = _load_raw(path)
++    raw["goals"] = [_goal_to_dict(g) for g in goals]
++    _save_raw(path, raw)
++
++
++def _load_txns_for_goals(path):
++    try:
++        return load(path)
++    except FileNotFoundError:
++        return []
++
++
++def _cmd_goal_add(args: argparse.Namespace) -> int:
++    target = Decimal(args.target)
++    if target <= 0:
++        print("error: --target must be strictly positive", file=sys.stderr)
++        return 2
++    goals = _load_goals(args.store)
++    if any(g.name == args.name for g in goals):
++        print(f"error: a goal named {args.name!r} already exists", file=sys.stderr)
++        return 2
++    goal = Goal(
++        name=args.name,
++        target=target,
++        categories=list(args.categories),
++        target_date=date_cls.fromisoformat(args.target_date) if args.target_date else None,
++        milestones=sorted(set(args.milestones)),
++    )
++    goals.append(goal)
++    _save_goals(args.store, goals)
++    print(f"Added goal {goal.name}")
++    return 0
++
++
++def _cmd_goal_list(args: argparse.Namespace) -> int:
++    goals = _load_goals(args.store)
++    if not goals:
++        print("No goals.")
++        return 0
++    for goal in goals:
++        line = f"{goal.name}: target {goal.target} categories {','.join(goal.categories)}"
++        if goal.target_date:
++            line += f" by {goal.target_date.isoformat()}"
++        print(line)
++    return 0
++
++
++def _find_goal(goals, name):
++    for goal in goals:
++        if goal.name == name:
++            return goal
++    return None
++
++
++def _cmd_goal_progress(args: argparse.Namespace) -> int:
++    goals = _load_goals(args.store)
++    goal = _find_goal(goals, args.name)
++    if goal is None:
++        print(f"error: no goal named {args.name!r}", file=sys.stderr)
++        return 2
++    txns = _load_txns_for_goals(args.store)
++    amount = goal_progress(goal, txns)
++    percent = (amount / goal.target * 100) if goal.target else Decimal("0")
++    line = f"{goal.name}: {amount:.2f}/{goal.target:.2f} ({percent:.1f}%)"
++    if goal.milestones:
++        reached = reached_milestones(goal, txns)
++        reached_str = ",".join(str(m) for m in reached) if reached else "none"
++        line += f" milestones reached: {reached_str}"
++    print(line)
++    return 0
++
++
++def _cmd_goal_report(args: argparse.Namespace) -> int:
++    goals = _load_goals(args.store)
++    txns = _load_txns_for_goals(args.store)
++
++    rows = []
++    for goal in goals:
++        amount = goal_progress(goal, txns)
++        percent = (amount / goal.target * 100) if goal.target else Decimal("0")
++        rows.append((goal, amount, percent))
++    rows.sort(key=lambda r: (-r[2], r[0].name))
++
++    print(f"{'Goal':<16}Progress")
++    for goal, amount, percent in rows:
++        print(f"{goal.name:<16}{percent:>6.1f}%  {amount:.2f}/{goal.target:.2f}")
++
++    if args.overall:
++        total_progress = sum((r[1] for r in rows), Decimal("0"))
++        total_target = sum((r[0].target for r in rows), Decimal("0"))
++        overall_percent = (total_progress / total_target * 100) if total_target else Decimal("0")
++        print(f"TOTAL: {overall_percent:.1f}%")
++    return 0
++
++
++def _cmd_goal_remove(args: argparse.Namespace) -> int:
++    goals = _load_goals(args.store)
++    goal = _find_goal(goals, args.name)
++    if goal is None:
++        print(f"error: no goal named {args.name!r}", file=sys.stderr)
++        return 2
++    goals = [g for g in goals if g.name != args.name]
++    _save_goals(args.store, goals)
++    print(f"Removed goal {goal.name}")
++    return 0
++
++
++def _cmd_goal(args: argparse.Namespace) -> int:
++    handler = {
++        "add": _cmd_goal_add,
++        "list": _cmd_goal_list,
++        "progress": _cmd_goal_progress,
++        "report": _cmd_goal_report,
++        "remove": _cmd_goal_remove,
++    }[args.goal_command]
++    return handler(args)
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "goal": _cmd_goal,
+ }
+ 
+ 
+diff --git a/ledgerlite/goals.py b/ledgerlite/goals.py
+new file mode 100644
+index 0000000..741c24e
+--- /dev/null
++++ b/ledgerlite/goals.py
+@@ -0,0 +1,43 @@
++"""Savings/spending goals for ledgerlite."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import date
++from decimal import Decimal
++from typing import List, Optional
++
++from .models import Transaction
++
++
++@dataclass
++class Goal:
++    """A savings/spending goal tracked against one or more categories."""
++
++    name: str
++    target: Decimal
++    categories: List[str]
++    target_date: Optional[date] = None
++    milestones: List[int] = field(default_factory=list)
++
++
++def progress(goal: Goal, txns: List[Transaction]) -> Decimal:
++    """Sum of `abs(amount)` over every transaction matching `goal.categories`."""
++    total = Decimal("0")
++    wanted = set(goal.categories)
++    for txn in txns:
++        if txn.category in wanted:
++            total += abs(txn.amount)
++    return total
++
++
++def _percent(goal: Goal, txns: List[Transaction]) -> Decimal:
++    if goal.target == 0:
++        return Decimal("0")
++    return progress(goal, txns) / goal.target * 100
++
++
++def reached_milestones(goal: Goal, txns: List[Transaction]) -> List[int]:
++    """Milestones from `goal.milestones` whose threshold has been reached."""
++    percent = _percent(goal, txns)
++    return sorted(m for m in goal.milestones if percent >= m)

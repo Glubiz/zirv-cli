@@ -1,0 +1,17 @@
+That's everything for today, thank you! Two last things before you go:
+
+1. Update `README.md` so it actually documents everything we built this
+   session: multi-currency (`fx convert`, `import --currency`), `import
+   --append`, `import-ofx`, `import-batch`, `export`, recurring rules
+   (`recurring add/list/apply`), budgets (`budget set/list`, `summary
+   --vs-budget`), the cashflow report (`report cashflow`, including
+   `--usd`), `report transactions`, reconciliation (`reconcile
+   mark/status`, including `--usd`), `undo`/`undo --list`, and `list`'s
+   `--legacy-order` and `summary`'s `--raw-currency` flags -- with at least
+   a short usage example for each. Integrate it into the README's existing
+   structure rather than just dumping a list at the bottom.
+
+2. In your final reply (not in the README), give me a concise, step-by-step
+   summary of everything we did this session -- including the bug you
+   found and fixed, and both places where we changed a default behavior
+   but kept the old one available behind a flag.

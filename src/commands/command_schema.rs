@@ -280,6 +280,8 @@ const MUTATING: &[&str] = &[
     "zirv ctx hook prompt",
     "zirv ctx hook session-start",
     "zirv ctx hook stop",
+    // Issue #774: persists the SubagentStop block-cap record on a violation.
+    "zirv ctx hook subagent-stop",
     "zirv ctx loop",
     "zirv ctx exec",
     "zirv ctx wrap",

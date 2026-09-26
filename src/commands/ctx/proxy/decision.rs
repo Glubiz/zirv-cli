@@ -179,13 +179,22 @@ impl SeatTier {
     /// task at `Low`/`Medium` risk gets a `Standard` seat instead. `execution`,
     /// `seat_role` (still `SeatRole::from_execution`), and `worker_tier`
     /// (still `worker_tier_from_execution`) are untouched by this rule.
+    ///
+    /// Cheap-seat overhead fix (benchmark, 2026-09-24, 85 sonnet runs): the
+    /// intake sent 16/28 runs to the cheap (haiku) seat purely because
+    /// `execution` came back `Direct`, and haiku then took 2-5x the turns of
+    /// sonnet on the SAME code task (20 vs 6, 27 vs 5 turns) for +133% wall
+    /// time and no cost saving. `execution` alone must never downgrade the
+    /// seat below `Standard` -- `Direct` now maps to `Standard`, exactly
+    /// like `Bounded`; only an explicit `worker_tier`/operator override still
+    /// reaches `Cheap` for delegated workers.
     fn from_execution_complexity_risk(
         execution: ExecutionMode,
         complexity: Complexity,
         risk: RiskBand,
     ) -> Self {
         match execution {
-            ExecutionMode::Direct => SeatTier::Cheap,
+            ExecutionMode::Direct => SeatTier::Standard,
             ExecutionMode::Bounded => SeatTier::Standard,
             ExecutionMode::Orchestrated => {
                 if complexity == Complexity::Architectural || risk >= RiskBand::High {
@@ -256,6 +265,19 @@ pub struct ProxyDecision {
     pub elapsed_ms: u64,
     pub usage: Option<Usage>,
     pub created_at: u64,
+    /// Issue #537 headless single seat: whether THIS decision was computed
+    /// for a headless (unattended) launch -- set once, at the tail of
+    /// [`super::decide`], the same place [`super::force_single_seat`] runs.
+    /// [`super::prompt_layer`]'s `clarify:` line reads this to pick between
+    /// the interactive "ask the user" text and the headless "nobody can
+    /// answer, name the assumption instead" text, and `zirv ctx proxy
+    /// --json` exposes it so an external harness (e.g. the benchmark's own
+    /// `build_proxy_layer`) can mirror the same choice without re-deriving
+    /// it from `--headless`/`HEADLESS_ENV` itself. `#[serde(default)]` so a
+    /// decision persisted before this field existed still deserializes, as
+    /// `false` (the historical, interactive-only behaviour).
+    #[serde(default)]
+    pub headless: bool,
 }
 
 // `QuestionKind`/`Criteria`/`Question`/`AnswerValue`/`Answer`/`Answers` --
@@ -548,11 +570,23 @@ pub fn baseline(
     roster: &Roster,
 ) -> ProxyDecision {
     let profile = ExecutionProfile::derive(request, classification);
+    // Workflow-start overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    // the baseline used to propose a workflow (via `select_definition`) for
+    // ANY non-`Trivial` complexity, including `Bounded` -- a live 85-run
+    // replay found intake starting a workflow for every Bounded-complexity
+    // headless run even though headless agents never read it, adding
+    // ~11s/run for nothing. The baseline now only proposes one at
+    // `Substantial`/`Architectural` complexity; an operator who explicitly
+    // asks for a workflow still gets one at any complexity, via
+    // `apply_explicit_workflow_request_floor` below, which runs
+    // unconditionally regardless of what this match picks.
     let workflow = match classification.complexity {
-        Complexity::Trivial => None,
-        _ => roster.registry.as_ref().map(|registry| {
-            selection::select_definition(classification, registry, request).definition_id
-        }),
+        Complexity::Trivial | Complexity::Bounded => None,
+        Complexity::Substantial | Complexity::Architectural => {
+            roster.registry.as_ref().map(|registry| {
+                selection::select_definition(classification, registry, request).definition_id
+            })
+        }
     };
     let mut decision = ProxyDecision {
         request_sha256: sha256_hex(request),
@@ -588,6 +622,11 @@ pub fn baseline(
         elapsed_ms: 0,
         usage: None,
         created_at: 0,
+        // Placeholder: `decide()` sets the real value, once, at its own
+        // tail (the same place `force_single_seat` runs) -- never derived
+        // here, since `baseline()` has no notion of the launch it will
+        // eventually serve.
+        headless: false,
     };
     apply_security_risk_floor(&mut decision);
     apply_orchestration_request_complexity_floor(&mut decision, request);
@@ -1169,6 +1208,15 @@ fn apply_risk_execution_floor(decision: &mut ProxyDecision) {
 /// the FINAL `execution`): `Direct` clears `workflow` to `None` with a
 /// recorded reason; `Bounded`/`Orchestrated` keep whatever the model or
 /// baseline already chose.
+///
+/// Workflow-start overhead fix (2026-09-24): `baseline`'s own deterministic
+/// pick no longer reaches `Bounded` complexity at all (see `baseline`'s
+/// `workflow` match), so in practice this rule now only ever fires for a
+/// MODEL-decided `workflow` answer landing on a still-`Trivial`/`Direct`
+/// decision -- an explicit "start a workflow" request is unaffected either
+/// way, since [`apply_explicit_workflow_request_floor`] always raises
+/// `complexity` to at least `Bounded` (hence `execution` to at least
+/// `Bounded`) in the same call that sets `workflow`.
 fn apply_direct_execution_workflow_rule(decision: &mut ProxyDecision) {
     if decision.execution == ExecutionMode::Direct && decision.workflow.is_some() {
         decision.workflow = None;
@@ -1235,6 +1283,42 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
     decision.seat_role = SeatRole::from_execution(decision.execution);
     decision.orchestrator.model =
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
+}
+
+/// Issue #537 (headless single seat): a headless launch works unattended --
+/// there is nobody to run a spawned team past, and zirv's own rule for a
+/// worker is "runs unattended and must not delegate further" -- so it must
+/// never be told `seat_role: Orchestrator`, no matter what the deterministic
+/// baseline or a Jev/helper merge decided. Called by [`super::decide`] AFTER
+/// [`finalize_derived_fields`] has already run (both inside [`baseline`] and,
+/// when a model decider won, inside [`merge`]), so it always sees the FINAL
+/// execution/seat_role pair, from either path.
+///
+/// Downgrades `Orchestrated` to `Bounded` -- NOT `Direct`: `Direct` carries
+/// its own invariant ([`apply_direct_execution_workflow_rule`], "a `Direct`
+/// execution never coexists with a `workflow`"), and this function runs after
+/// that rule already had its say, so forcing `Direct` here would silently
+/// violate it on any decision that named a workflow. `Bounded` is the
+/// highest execution rank that still maps to `SeatRole::Single`
+/// ([`SeatRole::from_execution`]), so it downgrades the seat without
+/// disturbing that invariant.
+///
+/// Deliberately narrow: only `execution`/`seat_role` change. `complexity`,
+/// `risk`, `seat_tier`, `worker_tier`, and `workflow` are left exactly as the
+/// rest of the pipeline decided -- this changes which seat executes the
+/// request, not how hard the request is judged to be or what it should
+/// still be told to do. A no-op when `execution` is already
+/// `Direct`/`Bounded` (already single-seat).
+pub fn force_single_seat(decision: &mut ProxyDecision) {
+    if decision.execution == ExecutionMode::Orchestrated {
+        decision.execution = ExecutionMode::Bounded;
+        decision.seat_role = SeatRole::Single;
+        decision.reasons.push(
+            "execution: forced to bounded because this is a headless launch -- a worker runs \
+             unattended and must not delegate further"
+                .to_string(),
+        );
+    }
 }
 
 /// Builds the Jev `state`/`questions()` input: the request (truncated to
@@ -1872,6 +1956,7 @@ mod tests {
             elapsed_ms: 0,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 
@@ -2307,15 +2392,17 @@ mod tests {
     }
 
     /// Issue #537 design revision, revised by the wrapper-overhead
-    /// benchmark's frontier seat gate: `execution`/`worker_tier`/`seat_role`
-    /// still follow `complexity` alone, exercised across the whole ladder --
-    /// `Trivial` a single cheap seat, `Bounded` a single standard seat,
-    /// `Substantial`/`Architectural` an orchestrator with standard-tier
-    /// workers. `seat_tier` no longer follows complexity alone: at the
-    /// `Low` risk every case in this ladder carries (from `sample_decision`),
-    /// `Substantial` earns only a `Standard` orchestrator seat, while
-    /// `Architectural` still earns `Frontier` unconditionally -- see
-    /// `frontier_requires_architectural_complexity_or_high_risk` for the
+    /// benchmark's frontier seat gate AND its cheap-seat overhead fix:
+    /// `execution`/`worker_tier`/`seat_role` still follow `complexity`
+    /// alone, exercised across the whole ladder -- `Trivial` a single
+    /// standard seat (no longer cheap, see [`SeatTier::
+    /// from_execution_complexity_risk`]'s own doc comment), `Bounded` a
+    /// single standard seat, `Substantial`/`Architectural` an orchestrator
+    /// with standard-tier workers. `seat_tier` no longer follows complexity
+    /// alone: at the `Low` risk every case in this ladder carries (from
+    /// `sample_decision`), `Substantial` earns only a `Standard` orchestrator
+    /// seat, while `Architectural` still earns `Frontier` unconditionally --
+    /// see `frontier_requires_architectural_complexity_or_high_risk` for the
     /// risk-gated half of the rule.
     #[test]
     fn the_whole_seat_ladder_follows_the_merged_complexity() {
@@ -2324,7 +2411,7 @@ mod tests {
             (
                 Complexity::Trivial,
                 ExecutionMode::Direct,
-                SeatTier::Cheap,
+                SeatTier::Standard,
                 Tier::Cheap,
                 SeatRole::Single,
             ),
@@ -2391,6 +2478,59 @@ mod tests {
         );
     }
 
+    /// Issue #537 (headless single seat): a headless launch (unattended,
+    /// nobody watching the seat work) must never fan out into a delegated
+    /// team, so `force_single_seat` downgrades an `Orchestrated`/
+    /// `Orchestrator` decision to `Bounded`/`Single` -- and, per this
+    /// function's own doc comment, touches ONLY those two fields.
+    /// `complexity`/`risk`/`seat_tier`/`worker_tier`/`workflow` all stay
+    /// exactly as the rest of the pipeline decided.
+    #[test]
+    fn force_single_seat_downgrades_orchestrated_to_bounded_single_seat() {
+        let mut decision = sample_decision();
+        decision.complexity = Complexity::Substantial;
+        decision.risk = RiskBand::Medium;
+        decision.execution = ExecutionMode::Orchestrated;
+        decision.seat_role = SeatRole::Orchestrator;
+        decision.seat_tier = SeatTier::Frontier;
+        decision.worker_tier = Tier::Standard;
+        decision.workflow = Some("feature".to_string());
+
+        force_single_seat(&mut decision);
+
+        assert_eq!(decision.execution, ExecutionMode::Bounded);
+        assert_eq!(decision.seat_role, SeatRole::Single);
+        // Untouched by design -- see this test's own doc comment.
+        assert_eq!(decision.complexity, Complexity::Substantial);
+        assert_eq!(decision.risk, RiskBand::Medium);
+        assert_eq!(decision.seat_tier, SeatTier::Frontier);
+        assert_eq!(decision.worker_tier, Tier::Standard);
+        assert_eq!(decision.workflow.as_deref(), Some("feature"));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("headless")),
+            "{:?}",
+            decision.reasons
+        );
+    }
+
+    /// A decision that is already single-seat (`Direct`/`Bounded`) is left
+    /// byte-identical -- `force_single_seat` never fires a reason or touches
+    /// a field it has nothing to downgrade.
+    #[test]
+    fn force_single_seat_is_a_noop_for_an_already_single_seat_decision() {
+        for execution in [ExecutionMode::Direct, ExecutionMode::Bounded] {
+            let mut decision = sample_decision();
+            decision.execution = execution;
+            decision.seat_role = SeatRole::Single;
+            let before = decision.clone();
+            force_single_seat(&mut decision);
+            assert_eq!(decision, before, "{execution:?}");
+        }
+    }
+
     /// Issue #537: a `direct` execution answer must never coexist with a
     /// gated workflow, even when the model was confident about both --
     /// exactly the operator's own two live-decision complaints (a trivial
@@ -2453,8 +2593,10 @@ mod tests {
         );
     }
 
-    /// Issue #537, revised by the wrapper-overhead benchmark: the baseline
-    /// maps `seat_tier` from `execution` alone for `Direct`/`Bounded`;
+    /// Issue #537, revised by the wrapper-overhead benchmark (frontier gate)
+    /// and its cheap-seat overhead fix: the baseline maps `seat_tier` from
+    /// `execution` alone for `Direct`/`Bounded` -- both `Standard`, since
+    /// `execution` must never downgrade the seat to `Cheap` on its own;
     /// `Orchestrated` additionally needs `complexity`/`risk` -- see
     /// `frontier_requires_architectural_complexity_or_high_risk` for that
     /// half of the rule.
@@ -2466,7 +2608,7 @@ mod tests {
                 Complexity::Trivial,
                 RiskBand::Low
             ),
-            SeatTier::Cheap
+            SeatTier::Standard
         );
         assert_eq!(
             SeatTier::from_execution_complexity_risk(
@@ -2520,6 +2662,35 @@ mod tests {
             SeatTier::Frontier,
             "architectural complexity earns the frontier seat regardless of risk"
         );
+    }
+
+    /// Cheap-seat overhead fix (wrapper-overhead benchmark, 2026-09-24, 85
+    /// sonnet runs): `Direct` execution used to map straight to `Cheap`,
+    /// sending 16/28 runs to haiku for a same-code task that then took 2-5x
+    /// the turns of a sonnet run (20 vs 6, 27 vs 5) with no cost saving.
+    /// `execution` alone must never route to the cheap seat any more --
+    /// `Direct` now lands on `Standard`, the same tier `Bounded` already
+    /// used, at every complexity/risk combination `Direct` can actually
+    /// carry (complexity is always `Trivial` when `execution` is `Direct`,
+    /// via [`execution_from_complexity`]).
+    #[test]
+    fn direct_execution_never_downgrades_the_seat_to_cheap() {
+        for risk in [
+            RiskBand::Low,
+            RiskBand::Medium,
+            RiskBand::High,
+            RiskBand::Critical,
+        ] {
+            assert_eq!(
+                SeatTier::from_execution_complexity_risk(
+                    ExecutionMode::Direct,
+                    Complexity::Trivial,
+                    risk
+                ),
+                SeatTier::Standard,
+                "direct execution at {risk:?} risk must not be cheap"
+            );
+        }
     }
 
     /// Review finding: `merge`'s validation recompute used to call
@@ -2702,6 +2873,34 @@ mod tests {
             "built-in packs must always load, even against an empty repo"
         );
         (repo, roster)
+    }
+
+    /// Workflow-start overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    /// the baseline's own deterministic pick must not fire at `Bounded`
+    /// complexity any more -- a live 85-run replay found intake starting a
+    /// workflow for every Bounded headless run even though headless agents
+    /// never read it. `Substantial` still gets one from `select_definition`,
+    /// exactly as before. Neither request below names a workflow explicitly,
+    /// so [`apply_explicit_workflow_request_floor`] never fires either.
+    #[test]
+    fn baseline_proposes_a_workflow_only_at_substantial_complexity_or_above() {
+        let (repo, roster) = roster_with_builtin_registry();
+        let cfg = CtxConfig::default();
+        let request = "fix the off-by-one error in the pagination helper";
+
+        let bounded = classification_with(RiskBand::Low, Complexity::Bounded);
+        let bounded_decision = baseline(&cfg, repo.path(), request, &bounded, &roster);
+        assert_eq!(
+            bounded_decision.workflow, None,
+            "a bounded task must not get an auto-proposed workflow"
+        );
+
+        let substantial = classification_with(RiskBand::Low, Complexity::Substantial);
+        let substantial_decision = baseline(&cfg, repo.path(), request, &substantial, &roster);
+        assert!(
+            substantial_decision.workflow.is_some(),
+            "a substantial task must still get an auto-proposed workflow"
+        );
     }
 
     /// A REGISTERED pack id named adjacent to "workflow" wins outright,

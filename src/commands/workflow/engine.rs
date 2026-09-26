@@ -1494,6 +1494,20 @@ fn workflow_artifact_path(state: &WorkflowState, stage: ArtifactStage) -> CtxRes
     Ok(path)
 }
 
+/// F6 (blind-review finding, 2026-09-24): no production path calls this any
+/// more -- `zirv workflow start`/advance/resume/render used to call it to
+/// pre-create an unfilled template file in the worktree, which a downstream
+/// `git add .`/`git commit -a` then swept in as a stray addition (16/20
+/// runs in a blind review) despite nobody having written anything into it.
+/// The path and template text stay discoverable without writing anything
+/// (`render_current_context`'s own doc comment), and every reader of the
+/// artifact (`pin_current_artifact_with_config`, `artifact_drift`,
+/// `read_accepted_artifact`, `workflow_artifact_statuses`) already treats a
+/// missing file as "not filled"/"not accepted", not an error. Kept
+/// `#[cfg(test)]`-only as a fixture-setup helper: a test that wants to
+/// exercise the ACCEPT/ADVANCE paths against a real on-disk artifact still
+/// needs a quick way to materialize the untouched template first.
+#[cfg(test)]
 fn ensure_current_artifact_template(state: &WorkflowState) -> CtxResult<()> {
     let Some(stage) = state.current().and_then(|step| step.artifact) else {
         return Ok(());
@@ -1562,9 +1576,13 @@ fn pin_current_artifact_with_config(
         .current()
         .and_then(|step| step.artifact)
         .ok_or("current workflow step has no artifact to approve")?;
-    ensure_current_artifact_template(state)?;
     let path = workflow_artifact_path(state, stage)?;
-    let body = std::fs::read_to_string(&path)?;
+    // F6 (blind-review finding, 2026-09-24): the artifact is never
+    // pre-created any more (see `start_workflow`'s own doc comment on the
+    // point) -- a file that has not been written at all reads exactly like
+    // the untouched template it would otherwise contain, so the refusal
+    // below fires identically either way, never a missing-file I/O error.
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|_| stage.template().to_string());
     if body.trim() == stage.template().trim() {
         return Err(format!(
             "{stage} artifact is still the untouched template: {}",
@@ -1689,7 +1707,6 @@ fn reopen_artifact_gate(state: &mut WorkflowState, stage: ArtifactStage) -> CtxR
         record.accepted_hash = None;
         record.accepted_at = None;
     }
-    ensure_current_artifact_template(state)?;
     Ok(())
 }
 
@@ -2856,7 +2873,6 @@ pub fn advance_with_evidence(
             };
             reclassify_at_gate(state_dir, &mut state, jev_cfg.as_ref());
             sync_artifact_records(&mut state);
-            ensure_current_artifact_template(&state)?;
             state.status = match state.current() {
                 None => WorkflowStatus::Completed,
                 Some(step) if state.step_requires_approval(step) => {
@@ -3059,7 +3075,6 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         state.current_step += 1;
         reclassify_at_gate(state_dir, &mut state, jev_cfg.as_ref());
         sync_artifact_records(&mut state);
-        ensure_current_artifact_template(&state)?;
         state.status = match state.current() {
             None => WorkflowStatus::Completed,
             Some(step) if state.step_requires_approval(step) => WorkflowStatus::AwaitingApproval,
@@ -3608,15 +3623,31 @@ pub fn render_current_context(
         rendered.push_str(&format!("agent-seat: {agent}\n"));
     }
     if let Some(stage) = step.artifact {
-        ensure_current_artifact_template(state)?;
         let record = state
             .artifacts
             .get(stage.key())
             .ok_or("current workflow artifact record is missing")?;
-        rendered.push_str(&format!(
-            "artifact: {} ({stage}; fill this committed work product, then wait for acceptance)\n",
-            record.rel_path
-        ));
+        // F6 (blind-review finding, 2026-09-24): the artifact is never
+        // pre-created on disk any more (see `start_workflow`'s own doc
+        // comment), so an unfilled step names its own template text here
+        // instead -- the path and the starting content stay discoverable
+        // through `zirv workflow status`/`context` either way, but nothing
+        // writes to the worktree, or touches the git index, until the agent
+        // actually fills it.
+        let path = workflow_artifact_path(state, stage)?;
+        if path.exists() {
+            rendered.push_str(&format!(
+                "artifact: {} ({stage}; fill this committed work product, then wait for acceptance)\n",
+                record.rel_path
+            ));
+        } else {
+            rendered.push_str(&format!(
+                "artifact: {} ({stage}; not yet created -- write it yourself with this starting \
+                 template, then wait for acceptance)\n--- {stage} template ---\n{}\n--- end {stage} template ---\n",
+                record.rel_path,
+                stage.template(),
+            ));
+        }
     }
     append_accepted_artifacts(state, &mut rendered)?;
     if state.profile == WorkflowProfile::Frontend {
@@ -4888,7 +4919,17 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     if let Some(frontend_root) = &args.frontend_root {
         state.frontend_target_root = Some(resolve_frontend_root(frontend_root)?);
     }
-    ensure_current_artifact_template(&state)?;
+    // F6 (blind-review finding, 2026-09-24): `zirv workflow start` used to
+    // pre-create the first artifact-bearing step's own unfilled template
+    // file here -- an untouched, empty-looking file a `git add .`/`git
+    // commit -a` downstream then swept in as a stray addition (16/20 runs
+    // in a blind review). Start now leaves the worktree and the git index
+    // exactly as they were: the path and the template text are still
+    // discoverable (`render_current_context`, used by `zirv workflow
+    // status`/`context`, prints both for a step whose artifact does not
+    // exist yet), and the agent creates the real file itself when it fills
+    // it in. `pin_current_artifact_with_config` (the approval path) already
+    // treats a still-missing file exactly like an untouched template.
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
     save(state_dir, &state, true)?;
     if let Some(old) = previously_active
@@ -5057,7 +5098,6 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 return Err(format!("cannot resume workflow in {:?} state", state.status).into());
             }
             refresh_deploy_tier(&mut state)?;
-            ensure_current_artifact_template(&state)?;
             save(&state_dir, &state, true)?;
             write_state(writer, &state, false)?;
         }
@@ -8404,6 +8444,90 @@ mod tests {
         assert_eq!(
             state.definition.as_ref().map(|d| d.id.as_str()),
             Some("bugfix")
+        );
+    }
+
+    /// F6 (blind-review finding, 2026-09-24): `zirv workflow start` must
+    /// never pre-create the first step's artifact file in the worktree, or
+    /// touch the git index -- a blind reviewer flagged the untouched
+    /// `.zirv/work/<id>/intent.md` as a stray addition in 16/20 benchmark
+    /// runs. `architecture-discovery`'s first step ("scope") carries
+    /// `ArtifactStage::Intent`, so this exercises the exact shape the
+    /// finding reported. The path and template text stay discoverable
+    /// through `render_current_context` (what `zirv workflow context`
+    /// prints) without the file existing at all.
+    #[test]
+    fn start_never_pre_creates_the_first_steps_artifact_or_touches_the_index() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        git_init_with_commit(repo.path());
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_STATE_DIR",
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Start(StartArgs {
+                id: Some("architecture-discovery".into()),
+                task: "map the architecture of the billing subsystem".into(),
+                agent: None,
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+                paths: Vec::new(),
+                changed_lines: None,
+                tests_changed: false,
+                complexity: None,
+                risk: None,
+                branch: None,
+                frontend_root: None,
+                brainstorm: false,
+                no_brainstorm: false,
+                profile: None,
+                json: false,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).expect("start");
+
+        let state_dir = resolve_state().unwrap();
+        let state = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        let stage = state
+            .current()
+            .and_then(|step| step.artifact)
+            .expect("architecture-discovery's first step carries an artifact");
+        assert_eq!(stage, ArtifactStage::Intent);
+        let path = workflow_artifact_path(&state, stage).unwrap();
+        assert!(
+            !path.exists(),
+            "start must not pre-create the artifact file: {}",
+            path.display()
+        );
+
+        // No git-visible change: the worktree and the index are both
+        // exactly as `git_init_with_commit` left them.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.is_empty(),
+            "start must leave the worktree and index untouched: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        // The path and the template text are still discoverable without the
+        // file existing.
+        let rendered = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .expect("a running workflow has step context");
+        assert!(
+            rendered.contains("not yet created"),
+            "context must say the artifact is not yet created: {rendered}"
+        );
+        assert!(
+            rendered.contains(stage.template()),
+            "context must carry the template text so the agent knows what to write: {rendered}"
         );
     }
 

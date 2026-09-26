@@ -1,0 +1,10 @@
+Plain `summary` (no flags) still has the currency-mixing problem too --
+only `--vs-budget` got fixed. I use plain `summary` far more often, so
+let's flip the default: from now on, `summary` converts every transaction
+to its USD equivalent (same conversion rule as always) before totalling
+and computing each category's share, by default. Keep the old,
+unconverted, raw-per-currency behavior available behind a new
+`--raw-currency` flag, for anyone who wants to see the numbers as-entered.
+
+`--vs-budget` already always converts to USD and is unaffected by this
+(no change needed there).

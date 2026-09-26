@@ -1023,12 +1023,35 @@ impl StateDir {
         self.0.join("intake")
     }
 
+    /// Issue #788 follow-up: the `[headless.effort]` lever's decision, made
+    /// ONCE at a session's first headless launch and replayed for every later
+    /// launch of the SAME session id (`--resume`, in-place compaction) --
+    /// one record per session id (`<state>/headless-effort/<hash>.json`),
+    /// mirroring `adoption()`'s own per-session layout. Flipping the
+    /// classified effort mid-conversation invalidates Claude's whole prompt
+    /// cache, so this exists to make the decision sticky rather than
+    /// re-derived from each relaunch's own, possibly differently classified,
+    /// prompt text. See `exec.rs`'s `sticky_headless_effort`.
+    pub fn headless_effort(&self) -> PathBuf {
+        self.0.join("headless-effort")
+    }
+
     /// Issue #246: `status --diff`'s per-session snapshot of the previous
     /// `--diff` call's rendered sections, one file per session id
     /// (`<state>/status-snapshots/<session-id>.json`), mirroring
     /// `adoption()`'s own per-session layout above.
     pub fn status_snapshots(&self) -> PathBuf {
         self.0.join("status-snapshots")
+    }
+
+    /// Scope-guard bookkeeping (`zirv skill`-adjacent scope-creep guard on
+    /// the Claude hooks): one small per-session record
+    /// (`<state>/scope-guard/<hash>.json`), keyed the same way `adoption()`
+    /// is -- a hash of the session id, refreshed on every `UserPromptSubmit`
+    /// and read back (never re-derived) by the `PreToolUse` checkpoint and
+    /// the `Stop` backstop. Mirrors `adoption()`'s own per-session layout.
+    pub fn scope_guard(&self) -> PathBuf {
+        self.0.join("scope-guard")
     }
 
     /// Autonomous frontend profiles and visual evidence. Profiles are local
@@ -1108,6 +1131,17 @@ impl StateDir {
     /// every turn, so the only place it can leave its parse position is a file.
     pub fn scoring(&self) -> PathBuf {
         self.0.join("scoring")
+    }
+
+    /// Per-transcript usage-scan cache (issue #779): `<state>/usage-scan/
+    /// <hash>.json`, one file per transcript, keyed the same way
+    /// `scoring()`'s checkpoints are -- a hash of the transcript's own path,
+    /// since the path itself is far too long for a filename. Lets
+    /// `window::session_spend`/`sum_transcripts` answer from the cache alone
+    /// in steady state instead of re-reading and re-parsing every transcript
+    /// on the machine on every `zirv ctx usage`/`status` call.
+    pub fn usage_scan_cache(&self) -> PathBuf {
+        self.0.join("usage-scan")
     }
 
     /// Session registry: `<state>/sessions/<short8>.json`, one file per live

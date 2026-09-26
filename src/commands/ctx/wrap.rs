@@ -40,6 +40,8 @@ use super::adapters::AgentAdapter;
 use super::announce::{Announcer, Event};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::handoff::{self, Handoff};
+use super::jev;
+use super::jev_relay;
 use super::pace;
 use super::prompt::PromptRole;
 use super::rot::Verdict;
@@ -1238,6 +1240,26 @@ fn rollover_eval_due(
     })
 }
 
+/// Issue #780: [`rollover_eval_due`], but also advances `*last` whenever the
+/// cadence comes due -- regardless of whether the caller goes on to find the
+/// switch disabled. Without this, a disabled `fallback.auto_orchestrator_
+/// rollover` would leave `*last` stale forever, so this cheap check alone
+/// would keep reporting "due" on every subsequent tick and the caller's
+/// `auto_rollover.is_enabled()` (two `stat`s) would run every tick again --
+/// exactly the syscall storm this issue is about avoiding.
+fn rollover_eval_due_advancing(
+    last: &mut Option<Instant>,
+    now: Instant,
+    cfg: &CtxConfig,
+    reactive_pending: bool,
+) -> bool {
+    let due = rollover_eval_due(*last, now, cfg, reactive_pending);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
 /// Whether this session was launched interactively, read back from the
 /// durable launch-mode pin its own `turn_env` carries -- the same derivation
 /// `dash::pane::Pane::spawn` makes from the identical vector, rather than a
@@ -1355,14 +1377,19 @@ fn unread_mail_counts(
 /// same-burst trailing `\r` correctly, so `defer` is `false` there; a
 /// codex successor needs the same paste-fold protection
 /// `write_mail_advisory` already gives its mail advisory.
-pub fn inject_compact(sink: &mut dyn Write, compact_command: &str, defer: bool) -> CtxResult<()> {
+pub fn inject_compact(
+    sink: &mut dyn Write,
+    compact_command: &str,
+    focus: &str,
+    defer: bool,
+) -> CtxResult<()> {
     // A TUI submits on carriage return, not newline. Built as a full string
     // first and written in one `write_all` call, the same convention
     // `mail_advisory_bytes`/`write_mail_advisory_phase1` use -- `write!`
     // directly on a generic sink can fragment one format string across
     // several `write_all` calls, which would blur the phase boundary this
     // function depends on.
-    let text = compact_prompt(compact_command);
+    let text = compact_prompt(compact_command, focus);
     if !defer {
         sink.write_all(format!("{text}\r").as_bytes())?;
         sink.flush()?;
@@ -1957,6 +1984,22 @@ pub fn run_with(
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
 
+    // Issue jev-relay: unlike `exec`, `wrap`'s own `session` never gets
+    // reminted mid-run (a harness handover keeps the same id, see
+    // `relaunch`'s own doc comment), so the relay is started exactly once
+    // here and held for this whole interactive supervisor's lifetime --
+    // `_jev_relay_handle`'s drop (at `run_with`'s return, whichever arm)
+    // stops it. `start` itself is a no-op `None` (no bind at all) whenever
+    // no `[jev]` gate is on or there is no credential, and never blocks this
+    // function's own startup: binding is fast local filesystem/pipe setup,
+    // and the accept loop moves to its own thread before `start` returns.
+    let _jev_relay_handle = jev_relay::start(
+        &cfg.proxy.typesafe,
+        jev::any_gate_enabled(&cfg.jev),
+        &state_dir,
+        session.as_str(),
+    );
+
     // T10: the launch-time pacing gate -- before this fix, `wrap` (and, by
     // extension, `zirv ctx chat`'s orchestrator and every dashboard pane,
     // which launch through this same function) never consulted `pace` at
@@ -2105,6 +2148,7 @@ pub fn run_with(
             adapter.as_ref(),
             rest,
             launch_mode_from_interactive(interactive_launch),
+            role,
         )
     };
     // Visible, not silent: the shipped-default posture (or the operator's
@@ -2659,6 +2703,7 @@ pub fn run_with(
         debounce,
         inject_timeout,
         repo,
+        env,
         cfg.handoff.tail_items,
         &mut distiller_model,
         Duration::from_secs(cfg.handoff.timeout_secs),
@@ -3331,7 +3376,8 @@ fn perform_handover_swap(
     // `relaunch` below always hands the successor the handoff packet as its
     // initial prompt, so this launch can only resume a conversation on a
     // harness that accepts both.
-    let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req, true)?;
+    let (new_adapter, new_extra_flags) =
+        super::handover::resolve_swap_launch(cfg, req, true, role)?;
     // Finding #10 (issue #358 review): the successor must carry a fencing
     // generation of its own. `req.generation` is the PREPARED generation an
     // automatic swap's `seat::commit` is about to promote to `Seat::
@@ -3467,6 +3513,9 @@ fn pump(
     debounce: Duration,
     inject_timeout: Duration,
     repo: &Path,
+    // Issue #780: needed for `LiveAutoRollover`'s own fresh, layered
+    // `CtxConfig::load` -- see the seat-rollover-enabled gate below.
+    env: EnvLookup<'_>,
     tail_items: usize,
     // T84: `&mut String`, not `&str` -- a handover swap recomputes this for
     // the new adapter's own distiller default, so a rot-triggered restart
@@ -3518,8 +3567,20 @@ fn pump(
         .and_then(|seat| seat.pending)
         .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
     let mut pending_rollover: Option<PendingRollover> = None;
-    let seat_rollover_enabled =
-        cfg.auto_orchestrator_rollover() && role == PromptRole::Orchestrator;
+    let is_orchestrator = role == PromptRole::Orchestrator;
+    // Issue #780: `cfg` above is loaded once at this session's launch and
+    // held for the whole (potentially very long) wrapped session, so a gate
+    // reading `cfg.auto_orchestrator_rollover()` never sees a later `zirv ctx
+    // config set fallback.auto_orchestrator_rollover false` -- see
+    // `rollover::LiveAutoRollover`'s own doc comment. Seeded from `cfg`'s own
+    // value so the very first tick (before either `ctx.toml` could possibly
+    // have changed) matches what launch already decided. The readiness watch
+    // for an already-open transaction (below, gated only on `pending_rollover
+    // .is_some()`) is deliberately NOT behind this switch either -- a live
+    // disable must stop a NEW rollover from being prepared, but a
+    // transaction already open must still reach commit or abort.
+    let mut auto_rollover =
+        super::rollover::LiveAutoRollover::new(repo, env, cfg.auto_orchestrator_rollover());
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -3690,27 +3751,50 @@ fn pump(
                 reactive_pending = false;
                 Some(req)
             }
-            None if seat_rollover_enabled
-                && pending_rollover.is_none()
-                && rollover_eval_due(last_rollover_eval, now, cfg, reactive_pending) =>
-            {
-                last_rollover_eval = Some(now);
-                let request = automatic_rollover_request(
-                    state_dir,
+            // Issue #780: `pending_rollover.is_none()` and `is_orchestrator`
+            // come first so nothing below runs when there is nothing to
+            // prepare or this is not the orchestrator seat at all. The
+            // cadence check (`rollover_eval_due`, a cheap `Instant`
+            // comparison) runs BEFORE `auto_rollover.is_enabled()` (two
+            // `stat`s), so the live reload only ever costs a syscall once
+            // per interval, not on every tick. `last_rollover_eval` advances
+            // whenever the cadence comes due, whether or not the switch is
+            // enabled: otherwise a disabled switch would leave `due()`
+            // permanently true and `is_enabled()` would run every tick again
+            // anyway. `auto_rollover.is_enabled()` re-derives the switch from
+            // a fresh layered load rather than this session's stale start-up
+            // `cfg`, so a live operator disable takes effect on the very next
+            // check -- no restart required. A failed reload never enables it
+            // (see `LiveAutoRollover`'s own doc comment), and a disable
+            // always wins over an eval that came due.
+            None if pending_rollover.is_none() && is_orchestrator => {
+                let eval_due = rollover_eval_due_advancing(
+                    &mut last_rollover_eval,
+                    now,
                     cfg,
-                    session.as_str(),
-                    &seat_short,
-                    adapter.provider_for_model(seat_model_from_turn_env(turn_env)),
-                    supervision,
-                    debounce,
-                    interactive_from_turn_env(turn_env),
+                    reactive_pending,
                 );
-                reactive_pending = super::seat::load(state_dir, &seat_short)
-                    .and_then(|seat| seat.pending)
-                    .is_some_and(|pending| {
-                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
-                    });
-                request
+                if eval_due && auto_rollover.is_enabled() {
+                    let live_cfg = auto_rollover.patched(cfg);
+                    let request = automatic_rollover_request(
+                        state_dir,
+                        &live_cfg,
+                        session.as_str(),
+                        &seat_short,
+                        adapter.provider_for_model(seat_model_from_turn_env(turn_env)),
+                        supervision,
+                        debounce,
+                        interactive_from_turn_env(turn_env),
+                    );
+                    reactive_pending = super::seat::load(state_dir, &seat_short)
+                        .and_then(|seat| seat.pending)
+                        .is_some_and(|pending| {
+                            matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                        });
+                    request
+                } else {
+                    None
+                }
             }
             None => None,
         };
@@ -4044,12 +4128,29 @@ fn pump(
                     supervision.signals_seen,
                 );
                 let defer = adapter.capabilities().defer_injection_submit;
+                // Issue #798 (`[jev] compaction_select`): best-effort, off by
+                // default -- `compaction_focus_for_transcript` checks the
+                // gate and credential BEFORE touching the transcript at all
+                // (review of 6bdd7675, defect #1), so with the gate off
+                // (today's default) this never reads or parses the
+                // transcript inline in the pump loop, and with the gate on
+                // it bounds the Jev call so it cannot stall the pump for the
+                // full configured typesafe timeout.
+                let compact_focus = handoff::compaction_focus_for_transcript(
+                    cfg,
+                    state_dir,
+                    adapter.as_ref(),
+                    transcript.path(),
+                    tail_items,
+                    super::supervise::COMPACT_FOCUS,
+                );
                 let injected = writer
                     .lock()
                     .map_err(|_| "pty writer poisoned".to_string())
                     .and_then(|mut sink| {
                         let command = adapter.compact_command().unwrap_or("/compact");
-                        inject_compact(&mut *sink, command, defer).map_err(|e| e.to_string())
+                        inject_compact(&mut *sink, command, &compact_focus, defer)
+                            .map_err(|e| e.to_string())
                     });
 
                 // Arm the cooldown before verifying so a failed verification
@@ -4793,6 +4894,44 @@ mod tests {
             &cfg,
             false
         ));
+    }
+
+    #[test]
+    fn rollover_eval_due_advancing_advances_last_only_when_due_regardless_of_what_the_caller_does_next()
+     {
+        // Issue #780: a disabled `auto_orchestrator_rollover` must not leave
+        // `last` stale -- otherwise the cheap cadence check alone keeps
+        // reporting "due" every tick, forcing the caller's expensive
+        // `is_enabled()` (two `stat`s) to run every tick too.
+        let mut cfg = CtxConfig::default();
+        cfg.pace.collector_max_age_secs = 900;
+        let start = Instant::now();
+        let mut last = Some(start);
+
+        // Not yet due: no advance.
+        assert!(!rollover_eval_due_advancing(
+            &mut last,
+            start + Duration::from_secs(59),
+            &cfg,
+            true
+        ));
+        assert_eq!(last, Some(start));
+
+        // Due: advances, whether or not the caller ends up finding the
+        // switch disabled.
+        let tick = start + Duration::from_secs(60);
+        assert!(rollover_eval_due_advancing(&mut last, tick, &cfg, true));
+        assert_eq!(last, Some(tick));
+
+        // Immediately after, the cadence is not due again -- `is_enabled()`
+        // is not called again on the very next tick.
+        assert!(!rollover_eval_due_advancing(
+            &mut last,
+            tick + Duration::from_millis(100),
+            &cfg,
+            true
+        ));
+        assert_eq!(last, Some(tick));
     }
 
     #[test]
@@ -7432,7 +7571,7 @@ mod tests {
     #[test]
     fn the_injected_command_carries_focus_instructions_and_ends_with_a_carriage_return() {
         let mut sink: Vec<u8> = Vec::new();
-        inject_compact(&mut sink, "/compact", false).expect("inject");
+        inject_compact(&mut sink, "/compact", COMPACT_FOCUS, false).expect("inject");
         let text = String::from_utf8(sink).expect("utf8");
         assert!(text.starts_with("/compact "), "got {text:?}");
         assert!(text.contains(COMPACT_FOCUS));
@@ -7452,7 +7591,7 @@ mod tests {
     #[test]
     fn inject_compact_stays_single_burst_for_a_non_deferring_adapter() {
         let mut writer = RecordingWriter::default();
-        inject_compact(&mut writer, "/compact", false).expect("inject");
+        inject_compact(&mut writer, "/compact", COMPACT_FOCUS, false).expect("inject");
         let chunks = writer.chunks.lock().expect("lock");
         assert_eq!(chunks.len(), 1, "one write, not two: {chunks:?}");
         assert_eq!(
@@ -7472,7 +7611,7 @@ mod tests {
     fn inject_compact_defers_the_submitting_cr_for_a_deferring_adapter() {
         let mut writer = RecordingWriter::default();
         let started = std::time::Instant::now();
-        inject_compact(&mut writer, "/compact", true).expect("inject");
+        inject_compact(&mut writer, "/compact", COMPACT_FOCUS, true).expect("inject");
         assert!(
             started.elapsed() >= INJECTION_SUBMIT_DELAY,
             "the CR must not land before the submit delay has passed"
@@ -9698,8 +9837,24 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut sockets = Vec::new();
             while Instant::now() < deadline && sockets.is_empty() {
+                // Issue jev-relay: `state/s/` can now also hold this
+                // session's own Jev relay endpoint (`jev_relay::start`,
+                // whenever the OPERATOR's real config has a `[jev]` gate on
+                // and a credential present -- this test spawns the real
+                // `zirv` binary against the real `~/.zirv/ctx.toml`, not an
+                // isolated one), an extensionless file `is_endpoint_file`
+                // already excludes -- the same discriminator `status.rs`'s
+                // own `orphan_sockets` scan of this same directory uses, so
+                // this assertion and that production scan never drift on
+                // what counts as a turn-signal endpoint here.
                 sockets = std::fs::read_dir(state.join("s"))
-                    .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|path| crate::commands::ctx::sessions::is_endpoint_file(path))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if sockets.is_empty() {
                     std::thread::sleep(Duration::from_millis(100));

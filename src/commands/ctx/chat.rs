@@ -862,7 +862,10 @@ fn proxy_intake<E: Write>(
             text: proxy::asking_line(cfg),
         },
     );
-    let decision = proxy::decide(cfg, state.root(), repo, &request);
+    // `zirv chat` is always interactive (TTY-gated before this is ever
+    // reached) -- never a headless launch, so `headless` is always `false`
+    // here. See `proxy::decide`'s own doc comment for what that flag does.
+    let decision = proxy::decide(cfg, state.root(), repo, &request, false);
     let (decision, request) = maybe_clarify(cfg, state, repo, decision, request, reader, stderr)?;
     Ok(ProxyIntakeOutcome::Decided {
         decision: Box::new(decision),
@@ -939,7 +942,7 @@ fn maybe_clarify<E: Write>(
     }
     record_clarification("answered");
     let combined_request = format!("{request}\n\n{addition}");
-    let combined_decision = proxy::decide(cfg, state.root(), repo, &combined_request);
+    let combined_decision = proxy::decide(cfg, state.root(), repo, &combined_request, false);
     Ok((combined_decision, combined_request))
 }
 
@@ -2024,8 +2027,18 @@ fn dash_orchestrator_pane_with_task(
     // args`) scans the argv built so far, so an operator's own explicit
     // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
     // `--disallowedTools` (passed after `--` on `zirv chat`) still wins.
-    let sandbox_extra =
-        adapters::policy_launch_args(cfg, adapter, &argv, adapters::LaunchMode::Interactive);
+    // Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
+    // `launch.role` (not a hardcoded `Orchestrator`) -- this shared pane
+    // builder also launches `PromptRole::Single` sessions (the proxy's own
+    // direct/bounded decision), which must skip the native skill plugin the
+    // same as a headless Worker does.
+    let sandbox_extra = adapters::policy_launch_args(
+        cfg,
+        adapter,
+        &argv,
+        adapters::LaunchMode::Interactive,
+        launch.role,
+    );
     // Visible, not silent: the one interactive pane a human is actually
     // watching gets the same announcement every headless seam does. `Chrome
     // events`/`--quiet` govern it identically (`cfg.chrome.events`); no
@@ -4617,6 +4630,7 @@ mod tests {
             elapsed_ms: 0,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 
@@ -5142,7 +5156,7 @@ fix the flaky retry test
         // `elapsed_ms`/`created_at` legitimately differ between two separate
         // `decide()` calls; every other field must match exactly.
         let mut new_decision = new_decision;
-        let mut expected = proxy::decide(&cfg, state.root(), repo.path(), &new_request);
+        let mut expected = proxy::decide(&cfg, state.root(), repo.path(), &new_request, false);
         new_decision.elapsed_ms = 0;
         expected.elapsed_ms = 0;
         new_decision.created_at = 0;

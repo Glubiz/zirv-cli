@@ -1,0 +1,15 @@
+Before we add anything else: `cli.py` has turned into a wall of argparse
+setup and handlers for every feature we've bolted on today (currency,
+recurring, budgets, cashflow, reconciliation...). Please split it up
+before it gets any worse.
+
+Move each command FAMILY into its own module under a new
+`ledgerlite/commands/` package (e.g. `core.py` for the original
+import/list/summary/categorize, plus one module each for the `fx`,
+`recurring`, `budget`, `report`, and `reconcile` families -- organize
+however makes sense, naming is your call). `cli.py` itself should end up
+thin: build the top-level parser, wire each module's subcommands into it,
+and dispatch to the right handler.
+
+This is a pure refactor -- every command, flag, output string, and exit
+code must behave exactly as it does right now. No functional changes.

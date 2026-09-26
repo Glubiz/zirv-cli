@@ -2758,6 +2758,11 @@ impl<'a> NativeLoop<'a> {
             incomplete_tools: incomplete.iter().cloned().collect(),
             verification: lifecycle::VerificationDecision::NotRequired,
             workflow_gate,
+            // Q1's missing-tests gate is `hook::run_stop`'s own concern (it
+            // needs a persisted per-session marker and the headless/config
+            // gating hook.rs already owns); a native session's completion
+            // path is untouched by this task.
+            missing_tests_gate: None,
         });
         let blocked_reason = match &stop {
             lifecycle::StopDecision::Block(reason) => Some(reason.clone()),
@@ -5346,7 +5351,10 @@ fn apply_proxy_first_turn(
     if super::super::proxy::activation(cfg).is_err() {
         return;
     }
-    let decision = super::super::proxy::decide(cfg, state.root(), repo, request);
+    // `apply_proxy_first_turn` only ever runs from `spawn_interactive`'s own
+    // worker thread (a `UiSurface::DashboardPane`) -- an interactive native
+    // pane, never a headless launch -- so `headless` is always `false` here.
+    let decision = super::super::proxy::decide(cfg, state.root(), repo, request, false);
     match super::super::proxy::launch::start_workflow_for(&decision, state.root(), repo, request) {
         Ok(super::super::proxy::launch::WorkflowStart::Skipped { reason }) => {
             let _ = progress_tx.send(InteractiveProgress::Notice(format!("proxy: {reason}")));

@@ -1,0 +1,199 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..341bf0d 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,12 +3,18 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
++import shutil
++from datetime import date as date_cls
+ from decimal import Decimal
++from pathlib import Path
+ from typing import Optional, Sequence
+ 
+ from . import report
++from .models import Transaction, parse_money
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
++from .schema import CURRENT_VERSION
+ from .store import load, save
+ 
+ DEFAULT_STORE = "ledger.json"
+@@ -47,6 +53,22 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_add = sub.add_parser("add", help="manually add a single transaction")
++    p_add.add_argument("--date", required=True, help="YYYY-MM-DD")
++    p_add.add_argument("--amount", required=True, help="signed money amount")
++    p_add.add_argument("--payee", required=True)
++    p_add.add_argument("--memo", default="")
++    p_add.add_argument("--category", default=None)
++    p_add.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
++    )
++
++    p_migrate = sub.add_parser("migrate", help="upgrade a ledger file to the current schema")
++    p_migrate.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file to upgrade (default: %(default)s)"
++    )
++    p_migrate.add_argument("--backup", action="store_true", help="write a .bak copy before migrating")
++
+     return parser
+ 
+ 
+@@ -106,11 +128,48 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _cmd_add(args: argparse.Namespace) -> int:
++    try:
++        txns = load(args.store)
++    except FileNotFoundError:
++        txns = []
++    next_id = (max((t.id for t in txns), default=0)) + 1
++    txn = Transaction(
++        id=next_id,
++        date=date_cls.fromisoformat(args.date),
++        amount=parse_money(args.amount),
++        payee=args.payee,
++        memo=args.memo,
++        category=args.category,
++        source="manual",
++    )
++    txns.append(txn)
++    save(args.store, txns)
++    print(f"Added transaction {txn.id}")
++    return 0
++
++
++def _cmd_migrate(args: argparse.Namespace) -> int:
++    path = Path(args.store)
++    raw = json.loads(path.read_text(encoding="utf-8"))
++    if raw.get("schema_version") == CURRENT_VERSION:
++        print("Already up to date.")
++        return 0
++    if args.backup:
++        shutil.copyfile(str(path), str(path) + ".bak")
++    txns = load(args.store)
++    save(args.store, txns)
++    print(f"Migrated {len(txns)} transactions to schema version {CURRENT_VERSION}")
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "add": _cmd_add,
++    "migrate": _cmd_migrate,
+ }
+ 
+ 
+diff --git a/ledgerlite/models.py b/ledgerlite/models.py
+index 4cfa174..956a063 100644
+--- a/ledgerlite/models.py
++++ b/ledgerlite/models.py
+@@ -28,6 +28,7 @@ class Transaction:
+     payee: str
+     memo: str
+     category: Optional[str] = None
++    source: str = "manual"
+ 
+ 
+ def parse_money(text: str) -> Decimal:
+diff --git a/ledgerlite/parse.py b/ledgerlite/parse.py
+index 65717e0..9929312 100644
+--- a/ledgerlite/parse.py
++++ b/ledgerlite/parse.py
+@@ -47,6 +47,7 @@ def read_csv(path: Union[str, Path]) -> List[Transaction]:
+                     payee=(row.get("payee") or "").strip(),
+                     memo=(row.get("memo") or "").strip(),
+                     category=category,
++                    source="import",
+                 )
+             )
+     return txns
+diff --git a/ledgerlite/schema.py b/ledgerlite/schema.py
+new file mode 100644
+index 0000000..790dbc2
+--- /dev/null
++++ b/ledgerlite/schema.py
+@@ -0,0 +1,25 @@
++"""Store JSON schema versioning and migration for ledgerlite."""
++
++from __future__ import annotations
++
++CURRENT_VERSION = 2
++
++
++def migrate_payload(payload: dict) -> dict:
++    """Return `payload` upgraded to `CURRENT_VERSION`, without mutating it.
++
++    Any transaction dict missing a `"source"` key is given
++    `source="import"` (the only way a transaction could have entered an
++    older, pre-versioned ledger file). An existing `"source"` value is left
++    untouched.
++    """
++    transactions = []
++    for txn in payload.get("transactions", []):
++        txn = dict(txn)
++        txn.setdefault("source", "import")
++        transactions.append(txn)
++
++    result = dict(payload)
++    result["schema_version"] = CURRENT_VERSION
++    result["transactions"] = transactions
++    return result
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..950c7e5 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -9,6 +9,7 @@ from pathlib import Path
+ from typing import List, Union
+ 
+ from .models import Transaction
++from .schema import CURRENT_VERSION, migrate_payload
+ 
+ 
+ def _txn_to_dict(txn: Transaction) -> dict:
+@@ -19,6 +20,7 @@ def _txn_to_dict(txn: Transaction) -> dict:
+         "payee": txn.payee,
+         "memo": txn.memo,
+         "category": txn.category,
++        "source": txn.source,
+     }
+ 
+ 
+@@ -30,16 +32,24 @@ def _txn_from_dict(data: dict) -> Transaction:
+         payee=data["payee"],
+         memo=data["memo"],
+         category=data.get("category"),
++        source=data.get("source", "import"),
+     )
+ 
+ 
+ def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
++    """Write `txns` to `path` as JSON, overwriting any existing file.
++
++    Always writes the current schema version.
++    """
++    payload = {"schema_version": CURRENT_VERSION, "transactions": [_txn_to_dict(t) for t in txns]}
+     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
+ def load(path: Union[str, Path]) -> List[Transaction]:
+-    """Read a list of `Transaction` from a JSON file written by `save`."""
+-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
++    """Read a list of `Transaction` from a JSON file written by `save`.
++
++    Transparently migrates an older (pre-schema-version) file in memory;
++    the file on disk is left untouched by `load()` itself.
++    """
++    payload = migrate_payload(json.loads(Path(path).read_text(encoding="utf-8")))
+     return [_txn_from_dict(d) for d in payload.get("transactions", [])]

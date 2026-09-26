@@ -42,6 +42,22 @@ const CLARIFICATION_CATEGORY_ID: &str = "clarification_category";
 /// ambiguous" is the more likely reading than "clear enough".
 pub(crate) const CLARIFY_THRESHOLD: f32 = 0.5;
 
+/// [`prompt_layer`]'s `clarify:` line for an interactive (non-headless)
+/// decision -- unchanged from before the headless override existed.
+pub(crate) const INTERACTIVE_CLARIFY_LINE: &str =
+    "clarify: ask the user one precise question before acting";
+
+/// [`prompt_layer`]'s `clarify:` line for a headless decision (issue #537
+/// headless follow-up): a headless launch works unattended, so telling it to
+/// "ask the user" only tells it to stall -- nobody is there to answer. This
+/// tells it to make its own reasonable call and record the assumption
+/// instead, the same discipline `zirv ctx proxy --json`'s own `headless`
+/// field lets an external harness (`run.py::build_proxy_layer`) mirror
+/// without re-deriving the condition itself.
+pub(crate) const HEADLESS_CLARIFY_LINE: &str = "clarify: nobody can answer in this run -- pick \
+                                                 the most reasonable reading and name the \
+                                                 assumption in your final report";
+
 #[derive(Debug, Args)]
 pub struct ProxyArgs {
     /// Print the full `ProxyDecision` as JSON instead of the human summary.
@@ -50,6 +66,20 @@ pub struct ProxyArgs {
     /// The request to decide on. Read from stdin (multi-line, until a blank
     /// line or EOF) when omitted and stdin is not a terminal.
     pub request: Option<String>,
+    /// This decision is for a HEADLESS launch (unattended, nobody watching
+    /// the seat work): forces `execution`/`seat_role` to their single-seat
+    /// equivalents -- see [`decision::force_single_seat`] -- regardless of
+    /// what the deterministic baseline or a Jev/helper merge would otherwise
+    /// have decided. `complexity`/`risk`/`seat_tier`/`worker_tier`/
+    /// `workflow` are unaffected. An external harness that launches zirv
+    /// headlessly (a benchmark, CI, or any caller outside an interactive
+    /// session) should always pass this. Falls back to honouring
+    /// `adapters::HEADLESS_ENV` (`ZIRV_CTX_HEADLESS=1`, the same marker zirv
+    /// itself sets on a headless launch's own environment) when this flag is
+    /// absent, so a process that already knows it is headless from its own
+    /// environment does not have to repeat that on the command line too.
+    #[arg(long)]
+    pub headless: bool,
 }
 
 fn tier_str(tier: super::catalogue::Tier) -> &'static str {
@@ -250,7 +280,22 @@ fn clarification_category(answers: &Answers, cfg: &CtxConfig) -> Option<String> 
 /// deterministic baseline is always a valid answer on its own. Persists the
 /// decision (and a spend row, when a model call reported usage) to
 /// `<state_dir>/proxy-decisions.jsonl` before returning.
-pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> ProxyDecision {
+///
+/// `headless` (issue #537 headless single seat): when `true`,
+/// [`decision::force_single_seat`] runs LAST, after every other step below
+/// (baseline, the deterministic path, a Jev/helper merge, and `validate`),
+/// so a headless launch always ends up on a single seat regardless of which
+/// decider actually won. An interactive launch (`zirv chat`, a dashboard
+/// pane) always passes `false` here; a truly unattended launch -- including
+/// `zirv ctx proxy --json` itself, when its own `--headless`/`HEADLESS_ENV`
+/// check says so -- passes `true`.
+pub fn decide(
+    cfg: &CtxConfig,
+    state_dir: &Path,
+    repo: &Path,
+    request: &str,
+    headless: bool,
+) -> ProxyDecision {
     let started = Instant::now();
     let classification = decision::classify_request(request);
     let roster = decision::Roster::gather(cfg, repo);
@@ -356,6 +401,10 @@ pub fn decide(cfg: &CtxConfig, state_dir: &Path, repo: &Path, request: &str) -> 
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     result.usage = usage;
     result.created_at = state::now_secs();
+    result.headless = headless;
+    if headless {
+        decision::force_single_seat(&mut result);
+    }
 
     let _ = persist(state_dir, &result);
     result
@@ -448,6 +497,14 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
 /// and a clarify instruction, and (`Single` only) one line telling the
 /// session plainly that it is the one doing the work, not an orchestrator.
 ///
+/// The clarify line (issue #537 headless follow-up) reads `decision.
+/// headless` to pick its text: [`INTERACTIVE_CLARIFY_LINE`] ("ask the user")
+/// for an ordinary decision, [`HEADLESS_CLARIFY_LINE`] ("nobody can answer
+/// in this run") for one `decide()` computed with `headless: true` -- an
+/// unattended launch telling itself to "ask the user" would just stall.
+/// Gating (the `needs_clarification`/`needs_clarification_decisive`
+/// threshold check) is identical either way; only the wording changes.
+///
 /// `started_workflow_id` (wrapper-overhead benchmark, 2026-09-22 change 2):
 /// the instance id `proxy::launch::start_workflow_for` actually started for
 /// this launch, when it did -- `chat.rs` threads it through from the SAME
@@ -496,7 +553,11 @@ pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>)
         lines.push(format!("domains: {}", decision.domains.join(", ")));
     }
     if decision.needs_clarification >= CLARIFY_THRESHOLD && decision.needs_clarification_decisive {
-        lines.push("clarify: ask the user one precise question before acting".to_string());
+        lines.push(if decision.headless {
+            HEADLESS_CLARIFY_LINE.to_string()
+        } else {
+            INTERACTIVE_CLARIFY_LINE.to_string()
+        });
     }
     if decision.seat_role == SeatRole::Single {
         lines.push(
@@ -660,13 +721,25 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
     ]
 }
 
-/// `zirv ctx proxy [--json] [REQUEST]`: decides and prints, never launches.
+/// `zirv ctx proxy [--json] [--headless] [REQUEST]`: decides and prints,
+/// never launches.
 pub fn run<W: Write>(args: &ProxyArgs, w: &mut W) -> CtxResult<i32> {
     let env = config::env_from_process();
     let repo = std::env::current_dir()?;
     let cfg = CtxConfig::load(&repo, &env)?;
     let state = state::StateDir::resolve(&env)?;
-    run_with(&cfg, state.root(), &repo, args, w)
+    run_with(&cfg, state.root(), &repo, args, &env, w)
+}
+
+/// Whether THIS decision is for a headless launch: `args.headless` (an
+/// external caller's explicit `--headless`) OR `adapters::HEADLESS_ENV`
+/// (`ZIRV_CTX_HEADLESS=1`, the same marker zirv sets on a headless launch's
+/// own process environment -- see `adapters::headless_marker_env`) read
+/// through `env`, never `std::env::var` directly, so a test never has to
+/// mutate the real process environment to exercise this. Either one is
+/// enough; see [`ProxyArgs::headless`]'s own doc comment for why both exist.
+fn headless_from(args: &ProxyArgs, env: config::EnvLookup<'_>) -> bool {
+    args.headless || env(adapters::HEADLESS_ENV).as_deref() == Some("1")
 }
 
 pub fn run_with<W: Write>(
@@ -674,8 +747,10 @@ pub fn run_with<W: Write>(
     state_dir: &Path,
     repo: &Path,
     args: &ProxyArgs,
+    env: config::EnvLookup<'_>,
     w: &mut W,
 ) -> CtxResult<i32> {
+    let headless = headless_from(args, env);
     let request = match &args.request {
         Some(request) => request.clone(),
         None => {
@@ -698,7 +773,7 @@ pub fn run_with<W: Write>(
     if !args.json {
         eprintln!("{}", asking_line(cfg));
     }
-    let decision = decide(cfg, state_dir, repo, &request);
+    let decision = decide(cfg, state_dir, repo, &request, headless);
 
     if args.json {
         writeln!(w, "{}", serde_json::to_string_pretty(&decision)?)?;
@@ -755,6 +830,7 @@ mod tests {
             elapsed_ms: 12,
             usage: None,
             created_at: 0,
+            headless: false,
         }
     }
 
@@ -771,7 +847,13 @@ mod tests {
         let (base_url, server) = jev::tests::one_shot_server(200, body);
         cfg.proxy.typesafe.base_url = base_url;
         unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_CATEGORY", "test-key") };
-        let decision = decide(&cfg, state_tmp.path(), repo.path(), "change the service");
+        let decision = decide(
+            &cfg,
+            state_tmp.path(),
+            repo.path(),
+            "change the service",
+            false,
+        );
         unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_CATEGORY") };
         server.join().expect("one batched request");
         assert_eq!(decision.clarification_category.as_deref(), Some("target"));
@@ -790,7 +872,13 @@ mod tests {
         let (base_url, server) = jev::tests::one_shot_server(503, "unavailable");
         cfg.proxy.typesafe.base_url = base_url;
         unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_ERROR", "test-key") };
-        let decision = decide(&cfg, state_tmp.path(), repo.path(), "change the service");
+        let decision = decide(
+            &cfg,
+            state_tmp.path(),
+            repo.path(),
+            "change the service",
+            false,
+        );
         unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_ERROR") };
         server.join().expect("one request");
         assert_eq!(decision.decider, Decider::Deterministic);
@@ -960,6 +1048,44 @@ mod tests {
         assert!(!layer.contains("clarify:"), "{layer}");
     }
 
+    /// Issue #537 headless follow-up: a headless launch has nobody to answer
+    /// a clarifying question, so its `clarify:` line must never tell it to
+    /// "ask the user" -- only the headless "name the assumption" wording,
+    /// under the identical decisive-only gating `prompt_layer_shows_domains_
+    /// and_a_clarify_instruction_when_present`/`prompt_layer_omits_clarify_
+    /// when_needs_clarification_is_not_decisive` already cover for the
+    /// interactive case.
+    #[test]
+    fn prompt_layer_uses_the_headless_clarify_line_for_a_headless_decision() {
+        let mut decision = sample_decision();
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
+        decision.headless = true;
+        let layer = prompt_layer(&decision, None);
+        assert!(
+            layer.contains(
+                "clarify: nobody can answer in this run -- pick the most reasonable reading \
+                 and name the assumption in your final report"
+            ),
+            "{layer}"
+        );
+        assert!(
+            !layer.contains("clarify: ask the user one precise question before acting"),
+            "{layer}"
+        );
+
+        decision.headless = false;
+        let interactive_layer = prompt_layer(&decision, None);
+        assert!(
+            interactive_layer.contains("clarify: ask the user one precise question before acting"),
+            "{interactive_layer}"
+        );
+        assert!(
+            !interactive_layer.contains("nobody can answer in this run"),
+            "{interactive_layer}"
+        );
+    }
+
     #[test]
     fn prompt_layer_tells_a_single_seat_not_to_delegate() {
         let mut decision = sample_decision();
@@ -973,6 +1099,104 @@ mod tests {
         decision.execution = ExecutionMode::Orchestrated;
         decision.seat_role = SeatRole::Orchestrator;
         assert!(!prompt_layer(&decision, None).contains("You are the single seat"));
+    }
+
+    /// Issue #537 (headless single seat), end to end through `decide()`
+    /// itself, not just `force_single_seat` in isolation: a substantial
+    /// request that the deterministic baseline alone would route to
+    /// `orchestrated`/`Orchestrator` (8 enumerated requirements floors
+    /// `complexity` to `Substantial` on request text alone -- see
+    /// `decision::request_size_floor`) instead lands on a single seat when
+    /// `decide` is told this launch is headless, and the rendered
+    /// `[zirv proxy]` layer carries the single-seat "do not delegate"
+    /// instruction line -- the whole point of the flag: a headless worker
+    /// must never be told it is an orchestrator. The SAME request with
+    /// `headless: false` is untouched -- still `orchestrated`/`Orchestrator`,
+    /// with no single-seat line.
+    #[test]
+    fn decide_forces_a_single_seat_for_a_headless_substantial_request() {
+        const SUBSTANTIAL_REQUEST: &str = "Build the importer:\n1. parse csv\n2. validate rows\n\
+            3. dedupe keys\n4. map columns\n5. write rows\n6. report errors\n7. add a cli flag\n\
+            8. document it";
+        let repo = crate::commands::ctx::testenv::repo();
+        let mut cfg = CtxConfig::default();
+        // Deterministic keeps this test offline: `force_single_seat` is
+        // applied unconditionally by `decide`, after whichever decider won,
+        // so exercising it against the (always-available) baseline proves
+        // the same thing a Jev-won decision would, without a mock server.
+        cfg.proxy.decider = ProxyDecider::Deterministic;
+
+        let headless_state = tempfile::tempdir().expect("state");
+        let headless = decide(
+            &cfg,
+            headless_state.path(),
+            repo.path(),
+            SUBSTANTIAL_REQUEST,
+            true,
+        );
+        assert_eq!(headless.complexity, Complexity::Substantial, "{headless:?}");
+        assert_eq!(headless.execution, ExecutionMode::Bounded, "{headless:?}");
+        assert_eq!(headless.seat_role, SeatRole::Single, "{headless:?}");
+        let headless_layer = prompt_layer(&headless, None);
+        assert!(
+            headless_layer
+                .contains("You are the single seat for this request: do the work here yourself"),
+            "{headless_layer}"
+        );
+
+        let interactive_state = tempfile::tempdir().expect("state");
+        let interactive = decide(
+            &cfg,
+            interactive_state.path(),
+            repo.path(),
+            SUBSTANTIAL_REQUEST,
+            false,
+        );
+        assert_eq!(
+            interactive.complexity,
+            Complexity::Substantial,
+            "{interactive:?}"
+        );
+        assert_eq!(
+            interactive.execution,
+            ExecutionMode::Orchestrated,
+            "{interactive:?}"
+        );
+        assert_eq!(
+            interactive.seat_role,
+            SeatRole::Orchestrator,
+            "{interactive:?}"
+        );
+        let interactive_layer = prompt_layer(&interactive, None);
+        assert!(
+            !interactive_layer.contains("You are the single seat"),
+            "{interactive_layer}"
+        );
+    }
+
+    /// `zirv ctx proxy --json`'s own CLI surface: `--headless` and
+    /// `ZIRV_CTX_HEADLESS=1` (the marker zirv itself sets on a headless
+    /// launch's environment) each independently force the single seat, and
+    /// neither present leaves the launch as an ordinary (interactive)
+    /// decision.
+    #[test]
+    fn headless_from_honours_either_the_flag_or_the_env_marker() {
+        let flagged = ProxyArgs {
+            json: false,
+            request: None,
+            headless: true,
+        };
+        assert!(headless_from(&flagged, &|_| None));
+
+        let unflagged = ProxyArgs {
+            json: false,
+            request: None,
+            headless: false,
+        };
+        assert!(headless_from(&unflagged, &|key| {
+            (key == adapters::HEADLESS_ENV).then(|| "1".to_string())
+        }));
+        assert!(!headless_from(&unflagged, &|_| None));
     }
 
     /// Change 2 (started workflow reaches the seat): a decision that named a
@@ -1219,6 +1443,7 @@ mod tests {
             state_dir.path(),
             repo.path(),
             "fix the typo in README",
+            false,
         );
         assert_eq!(decision.decider, Decider::Deterministic);
         assert!(
@@ -1295,6 +1520,7 @@ mod tests {
             &state_dir,
             repo.path(),
             "review ghp_abcdefghijklmnopqrstuvwxyz123456",
+            false,
         );
 
         assert_eq!(decision.decider, Decider::Deterministic);
@@ -1463,7 +1689,7 @@ mod tests {
 
         for case in &battery.cases {
             let repo = shaped_repo(&case.files);
-            let decision = decide(&cfg, state_dir.path(), repo.path(), &case.request);
+            let decision = decide(&cfg, state_dir.path(), repo.path(), &case.request, false);
             assert_eq!(
                 decision.decider,
                 Decider::Deterministic,
@@ -1507,7 +1733,7 @@ mod tests {
                 case.name
             );
             let expected_seat_tier = match decision.execution {
-                ExecutionMode::Direct => decision::SeatTier::Cheap,
+                ExecutionMode::Direct => decision::SeatTier::Standard,
                 ExecutionMode::Bounded => decision::SeatTier::Standard,
                 ExecutionMode::Orchestrated => {
                     if decision.complexity == Complexity::Architectural
@@ -1565,7 +1791,7 @@ mod tests {
         };
         let request = "rotate the shared credential constant used by session auth";
 
-        let decision = decide(&cfg, state_dir.path(), repo.path(), request);
+        let decision = decide(&cfg, state_dir.path(), repo.path(), request, false);
 
         unsafe {
             match had_mode {
@@ -1714,8 +1940,8 @@ mod tests {
         let mut instabilities = Vec::new();
         let mut mismatches = Vec::new();
         for case in &cases {
-            let first = decide(&cfg, state_dir.path(), repo, &case.request);
-            let second = decide(&cfg, state_dir.path(), repo, &case.request);
+            let first = decide(&cfg, state_dir.path(), repo, &case.request, false);
+            let second = decide(&cfg, state_dir.path(), repo, &case.request, false);
 
             if first.decider != Decider::Typesafe {
                 mismatches.push(format!(

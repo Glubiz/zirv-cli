@@ -1,0 +1,5 @@
+One more spot with the same currency-mixing problem: `reconcile status`.
+Add a `--usd` flag: when passed, convert each cleared transaction to its
+USD equivalent (same conversion rule as always) before summing the
+cleared total and comparing it to `--statement-balance`. Without `--usd`,
+behavior is unchanged -- raw amounts, as today.

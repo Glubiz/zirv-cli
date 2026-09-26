@@ -1,0 +1,7 @@
+Actually, thinking about it more -- I changed my mind on the last one.
+`summary` folding categories together automatically surprised me once when
+I'd only meant to try it out. Please go back to raw categories by default
+in `summary`, and only apply category aliases when I explicitly pass a new
+`--canonical-category` flag. Keep everything else from category aliases
+(the `category-alias add`/`list` commands and the stored data) exactly as
+it is -- this is only about `summary`'s default behaviour.

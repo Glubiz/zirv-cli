@@ -305,6 +305,24 @@ mod tests {
         );
     }
 
+    /// Round 4 bug 3 (confirmation only, breaker unchanged): a single
+    /// genuine rot respawn -- exactly what `exec.rs` records via `chain::
+    /// record_boot_and_evaluate` ONLY on the "about to restart" path, never
+    /// on an ordinary healthy completion -- can never trip the breaker on
+    /// its own. `need` (`max_restarts`) is checked against `relevant.len()`
+    /// before anything else, and a healthy step in between never adds a
+    /// boot at all, so no number of healthy steps interleaved with it can
+    /// ever push a lone rot event over the threshold either.
+    #[test]
+    fn a_single_genuine_rot_boot_never_trips() {
+        let record = record_of(vec![boot(0, FailureClass::Crash)]);
+        assert_eq!(
+            evaluate(&record, FailureClass::Crash, 3, 300),
+            ChainVerdict::Ok,
+            "one genuine rot respawn, on its own, must never trip the breaker"
+        );
+    }
+
     #[test]
     fn fewer_than_max_restarts_never_trips() {
         let record = record_of(vec![

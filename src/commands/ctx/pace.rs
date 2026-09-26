@@ -1155,7 +1155,7 @@ pub fn current_windows(
 
     let estimated = usage_window::projects_root()
         .ok()
-        .map(|root| usage_window::sum_transcripts(&root, now, cfg.count_cache_reads))
+        .map(|root| usage_window::sum_transcripts(state, &root, now, cfg.count_cache_reads))
         .map(|sums| {
             usage_window::estimate_windows(
                 &sums,
