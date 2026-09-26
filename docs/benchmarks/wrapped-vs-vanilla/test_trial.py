@@ -118,6 +118,17 @@ class ReceiptsFromResultTests(unittest.TestCase):
         receipts = run_module.receipts_from_result(result)
         self.assertEqual([r["source"] for r in receipts], [])
 
+    def test_single_shot_timeout_still_emits_an_unknown_agent_receipt(self):
+        # Review finding P1: a killed run has session_id/agent_cost_usd both
+        # None, but real (unknown-amount) spend may already have happened
+        # before the kill -- it must never vanish from receipts.jsonl.
+        result = _base_single_result(session_id=None, agent_cost_usd=None, timed_out=True)
+        receipts = run_module.receipts_from_result(result)
+        self.assertEqual([r["source"] for r in receipts], ["agent"])
+        self.assertIsNone(receipts[0]["reported_usd"])
+        self.assertEqual(receipts[0]["billing"], "unknown")
+        self.assertIsNone(receipts[0]["session"])
+
     def test_chain_one_agent_receipt_per_step_plus_quality(self):
         result = {
             "kind": "chain", "model_used": "sonnet", "wall_s": 30.0,
@@ -148,6 +159,42 @@ class ReceiptsFromResultTests(unittest.TestCase):
         self.assertAlmostEqual(receipts[0]["reported_usd"], 0.10)
         self.assertAlmostEqual(receipts[1]["reported_usd"], 0.07)
 
+    def test_chain_step_killed_by_timeout_still_emits_an_unknown_agent_receipt(self):
+        # Review finding P2: a chain step killed by timeout has
+        # session_id=None and (after the P2 fix) cost_usd=None too -- it
+        # must still produce a receipt, and that receipt must be unknown,
+        # never a confirmed $0.00.
+        result = {
+            "kind": "chain", "model_used": "sonnet", "wall_s": 30.0,
+            "steps": [
+                {"session_id": "s1", "cost_usd": 0.10, "input_tokens": 50, "output_tokens": 20,
+                 "judge_receipts": []},
+                {"session_id": None, "cost_usd": None, "input_tokens": 0, "output_tokens": 0,
+                 "judge_receipts": [], "timed_out": True},
+            ],
+            "quality_receipts": [],
+        }
+        receipts = run_module.receipts_from_result(result)
+        agent_receipts = [r for r in receipts if r["source"] == "agent"]
+        self.assertEqual(len(agent_receipts), 2)
+        self.assertAlmostEqual(agent_receipts[0]["reported_usd"], 0.10)
+        self.assertIsNone(agent_receipts[1]["reported_usd"])
+        self.assertEqual(agent_receipts[1]["billing"], "unknown")
+
+    def test_chain_step_not_reached_and_not_timed_out_emits_no_receipt(self):
+        # A step never even attempted (e.g. the chain broke on an earlier
+        # step) must not fabricate a receipt for it.
+        result = {
+            "kind": "chain", "model_used": "sonnet", "wall_s": 1.0,
+            "steps": [
+                {"session_id": None, "cost_usd": None, "input_tokens": 0, "output_tokens": 0,
+                 "judge_receipts": [], "timed_out": False},
+            ],
+            "quality_receipts": [],
+        }
+        receipts = run_module.receipts_from_result(result)
+        self.assertEqual(receipts, [])
+
     def test_escalate_two_attempts_two_agent_receipts(self):
         result = {
             "model_used": "opus", "wall_s": 40.0, "escalated": True,
@@ -164,6 +211,25 @@ class ReceiptsFromResultTests(unittest.TestCase):
         self.assertEqual(agent_receipts[1]["model"], "opus")
         self.assertEqual(agent_receipts[0]["reported_usd"], 0.20)
         self.assertEqual(agent_receipts[1]["reported_usd"], 0.55)
+
+    def test_escalate_attempt_killed_by_timeout_still_emits_an_unknown_agent_receipt(self):
+        # Review finding P1: run_escalate_trial's do_attempt already leaves
+        # a timed-out attempt's session_id/cost_usd at None but DOES append
+        # it to result["attempts"] with timed_out=True -- receipts_from_
+        # result must not drop it just because both are None.
+        result = {
+            "model_used": "sonnet", "wall_s": 20.0, "escalated": False,
+            "attempts": [
+                {"model": "sonnet", "session_id": None, "cost_usd": None, "timed_out": True},
+            ],
+            "judge_receipts": [], "quality_receipts": [],
+        }
+        receipts = run_module.receipts_from_result(result)
+        agent_receipts = [r for r in receipts if r["source"] == "agent"]
+        self.assertEqual(len(agent_receipts), 1)
+        self.assertIsNone(agent_receipts[0]["reported_usd"])
+        self.assertEqual(agent_receipts[0]["billing"], "unknown")
+        self.assertEqual(agent_receipts[0]["model"], "sonnet")
 
 
 class MapResultToTrialTests(unittest.TestCase):
