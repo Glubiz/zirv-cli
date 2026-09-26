@@ -11,8 +11,11 @@ pub mod ledger;
 pub mod manifest;
 pub mod plan;
 pub mod promote;
+pub mod proposer;
+pub mod reconcile;
 pub mod report;
 pub mod run;
+pub mod schedule;
 pub mod stats;
 pub mod status;
 

@@ -12,7 +12,7 @@ use serde::Serialize;
 use super::corpus::Corpus;
 use super::guard;
 use super::manifest::{self, Manifest};
-use super::run::resolve_protected_paths;
+use super::reconcile::resolve_protected_paths;
 use crate::commands::ctx::CtxResult;
 
 #[derive(Debug, Clone, Serialize)]
