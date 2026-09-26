@@ -278,14 +278,37 @@ pub const HARD_DENY_PATCH_PATTERNS: &[&str] = &[
 /// `pattern` matches `path` exactly, or (for a `dir/**` pattern) `path` is
 /// `dir` itself or lives under it. Both sides are normalized to forward
 /// slashes first so a Windows-style numstat path still matches a Unix-style
-/// glob.
+/// glob, and case-folded so a case-insensitive filesystem (Windows, default
+/// macOS) can never be used to slip a path past `HARD_DENY_PATCH_PATTERNS`
+/// or the protected-evaluator set by spelling it with different case (e.g.
+/// `src/commands/ctx/Safety.rs`) -- `allowed_paths` membership is folded the
+/// same way for consistency, so a differently-cased but genuinely in-scope
+/// path is never spuriously rejected either.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let path = path.replace('\\', "/");
+    let pattern = pattern.replace('\\', "/").to_lowercase();
+    let path = path.replace('\\', "/").to_lowercase();
     if let Some(prefix) = pattern.strip_suffix("/**") {
         return path == prefix || path.starts_with(&format!("{prefix}/"));
     }
     pattern == path
+}
+
+/// True when `path` could escape the repository entirely: an absolute path,
+/// a Windows drive-letter path, or one with a `..` segment anywhere. Checked
+/// before any pattern matching -- a traversal path must never be judged
+/// solely on whether it happens to match (or fail to match) `allowed_paths`,
+/// the hard-deny list, or the protected set, since `..` can make a path's
+/// literal text look harmless while it resolves somewhere else entirely.
+pub fn is_traversal_or_absolute(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return true;
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return true;
+    }
+    normalized.split('/').any(|segment| segment == "..")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +329,13 @@ pub fn validate_patch_scope(
 ) -> Vec<PatchScopeViolation> {
     let mut violations = Vec::new();
     for path in paths {
+        if is_traversal_or_absolute(path) {
+            violations.push(PatchScopeViolation {
+                path: path.clone(),
+                reason: "path is absolute or escapes the repository with '..'".to_string(),
+            });
+            continue;
+        }
         if HARD_DENY_PATCH_PATTERNS
             .iter()
             .any(|pattern| path_matches(pattern, path))
@@ -589,6 +619,72 @@ mod tests {
         assert!(violations[0].reason.contains("hard-denied"));
         assert_eq!(violations[1].path, "src/main.rs");
         assert!(violations[1].reason.contains("outside"));
+    }
+
+    /// Regression for issue-review finding R4: a case-sensitive comparison
+    /// let a differently-cased spelling of a hard-denied/protected file
+    /// (e.g. `Safety.rs` for `safety.rs`) slip past `validate_patch_scope`
+    /// on a case-insensitive filesystem (Windows, default macOS), because
+    /// neither `HARD_DENY_PATCH_PATTERNS` nor the protected set would
+    /// literally byte-match it.
+    #[test]
+    fn patch_scope_matching_is_case_insensitive_for_deny_and_protected() {
+        let numstat =
+            "1\t1\tsrc/commands/ctx/Safety.rs\n1\t1\tSRC/COMMANDS/CTX/PROXY/decision.rs\n";
+        let paths = parse_numstat(numstat);
+        let protected = vec!["src/commands/ctx/proxy/decision.rs".to_string()];
+        let violations = validate_patch_scope(&paths, &[], &protected);
+        assert_eq!(
+            violations.len(),
+            2,
+            "both the differently-cased hard-deny and protected paths must still be flagged: {violations:?}"
+        );
+        assert!(
+            violations[0].reason.contains("hard-denied"),
+            "got: {violations:?}"
+        );
+        assert!(
+            violations[1].reason.contains("protected"),
+            "got: {violations:?}"
+        );
+    }
+
+    /// Regression for issue-review finding R4: `allowed_paths` matching must
+    /// fold case the same way the deny/protected checks now do, or hardening
+    /// those alone would make an in-scope path spuriously fail to match its
+    /// own allowlist entry purely over case.
+    #[test]
+    fn patch_scope_allowed_paths_matching_is_also_case_insensitive() {
+        let numstat = "1\t1\tSrc/Foo.rs\n";
+        let paths = parse_numstat(numstat);
+        let allowed = vec!["src/foo.rs".to_string()];
+        let violations = validate_patch_scope(&paths, &allowed, &[]);
+        assert!(
+            violations.is_empty(),
+            "a differently-cased but genuinely allowed path must not be rejected: {violations:?}"
+        );
+    }
+
+    /// Regression for issue-review finding R4: a patch path containing a
+    /// `..` segment, or spelled as an absolute/drive path, must be refused
+    /// outright -- it must never be judged solely on whether its literal
+    /// text happens to match (or dodge) the hard-deny/protected/allowed
+    /// pattern lists, since `..` can make a dangerous path look harmless.
+    #[test]
+    fn patch_scope_refuses_traversal_and_absolute_paths_regardless_of_allowlist() {
+        let numstat =
+            "1\t1\tsrc/../../../etc/passwd\n1\t1\t/etc/passwd\n1\t1\tC:/Windows/System32/drivers\n";
+        let paths = parse_numstat(numstat);
+        // A permissive allowlist that would otherwise not object.
+        let allowed = vec!["**".to_string()];
+        let violations = validate_patch_scope(&paths, &allowed, &[]);
+        assert_eq!(violations.len(), 3, "got: {violations:?}");
+        for violation in &violations {
+            assert!(
+                violation.reason.contains("escapes") || violation.reason.contains("absolute"),
+                "got: {violations:?}"
+            );
+        }
     }
 
     #[test]
