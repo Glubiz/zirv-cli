@@ -6550,6 +6550,8 @@ mod tests {
             task_class: None,
             principal: "root".to_string(),
             envelope_sha256: None,
+            attribution: Default::default(),
+            cached: false,
         }
     }
 

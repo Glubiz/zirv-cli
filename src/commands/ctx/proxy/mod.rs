@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use self::decision::{Answers, Decider, ProxyDecision, Question, SeatRole};
+use super::attribution::Attribution;
 use super::config::{self, CtxConfig, ProxyDecider};
 use super::{CtxResult, adapters, helper, jev, log, state};
 
@@ -582,10 +583,28 @@ pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>)
 /// spend-adjacent recorders never drift on what an absent value means.
 /// Best-effort like every other append in this crate's flat logs: the
 /// caller (`decide`) never propagates a write failure.
+/// The JSON [`persist`] actually writes: `d`'s own fields, flattened, plus
+/// this process's own attribution (issue #800) -- computed here rather than
+/// on `ProxyDecision` itself, which is constructed and asserted on at many
+/// call sites (`decide`, every decision test) that must not all learn a new
+/// mandatory field. Skipped when empty, so an existing decision's JSON stays
+/// byte-identical.
+#[derive(serde::Serialize)]
+struct ProxyDecisionWire<'a> {
+    #[serde(flatten)]
+    inner: &'a ProxyDecision,
+    #[serde(default, skip_serializing_if = "Attribution::is_empty")]
+    attribution: Attribution,
+}
+
 pub fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
     state::create_private_dir_all(state_dir)?;
     let mut file = state::open_private_append(&state_dir.join(PROXY_DECISIONS_FILE))?;
-    writeln!(file, "{}", serde_json::to_string(d)?)?;
+    let wire = ProxyDecisionWire {
+        inner: d,
+        attribution: Attribution::from_env(),
+    };
+    writeln!(file, "{}", serde_json::to_string(&wire)?)?;
 
     if let Some(usage) = &d.usage {
         let wrapped = state::StateDir::from_path(state_dir.to_path_buf());

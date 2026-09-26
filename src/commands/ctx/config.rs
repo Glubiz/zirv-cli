@@ -2018,7 +2018,10 @@ impl Default for ProxyTypesafeConfig {
 /// entry per key, same trust asymmetry as `[proxy]` above: a repository
 /// checkout must not be able to turn on a Jev-backed decision path for
 /// itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// Issue #803: no longer `Eq` -- `floors` (below) carries `f32` fields, which
+/// has no total order.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevConfig {
     pub memory: bool,
@@ -2086,6 +2089,7 @@ pub struct JevConfig {
     /// `[jev]`-gated site and the harness proxy's own `typesafe` decider,
     /// since both go through the same `jev::ask`.
     pub cache_ttl_secs: u64,
+    pub floors: JevFloorsConfig,
 }
 
 impl Default for JevConfig {
@@ -2112,8 +2116,49 @@ impl Default for JevConfig {
             missing_tests: false,
             launch_effort: false,
             cache_ttl_secs: 86_400,
+            floors: JevFloorsConfig::default(),
         }
     }
+}
+
+/// One tunable site's confidence/margin floor override -- `None` in either
+/// field means "use that call site's own compiled default", so an operator
+/// may raise (or lower) just the one number they care about without pinning
+/// the other. Both, when set, are validated to `[0.0, 1.0]` at load time
+/// (`CtxConfig::load`), the same "loud rather than silent" convention
+/// `proxy.min_confidence`/`proxy.min_margin` already hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevSiteFloor {
+    pub min_confidence: Option<f32>,
+    pub min_margin: Option<f32>,
+}
+
+/// Issue #803: `[jev.floors.<site>]` -- tunable per-site overrides for the
+/// confidence/margin floors nine advisory sites already check via
+/// `jev::Answer::decisive`. Unset (the shipped default) is BYTE-IDENTICAL to
+/// today's behaviour: every site keeps calling `decisive` with its own
+/// existing compiled constant (see `jev::floor`). Only these nine sites are
+/// tunable at all -- a safety/verification site (`approve`, `approve_allow`,
+/// `inject_screen`, `stop_verify`, `missing_tests`, and the deterministic
+/// `review`/`gates` checks) keeps its compiled floor no matter what a
+/// `[jev.floors]` table says, because none of those keys exist here to set.
+/// `REPO_FORBIDDEN` as the WHOLE `[jev.floors]` table, one entry (like
+/// `[capabilities]`/`[runtime]` above) rather than one per leaf: every key
+/// under it loosens or tightens which advisory answers a session acts on,
+/// the same trust asymmetry as `[jev]` itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevFloorsConfig {
+    pub memory: JevSiteFloor,
+    pub context: JevSiteFloor,
+    pub harvest_screen: JevSiteFloor,
+    pub handoff_select: JevSiteFloor,
+    pub compaction_select: JevSiteFloor,
+    pub dispatch: JevSiteFloor,
+    pub launch_effort: JevSiteFloor,
+    pub classify: JevSiteFloor,
+    pub inject: JevSiteFloor,
 }
 
 /// Issue #788: operator-only, off-by-default cost levers for the Claude Code
@@ -4310,6 +4355,99 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
     ),
+    // Issue #803: the operator's own override for each tunable site's own
+    // `[jev.floors.<site>]` confidence/margin -- see that same const's own
+    // `[jev, "floors"]` whole-table entry in `REPO_FORBIDDEN`, below.
+    (
+        "ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE",
+        &["jev", "floors", "memory", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_MARGIN",
+        &["jev", "floors", "memory", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_CONTEXT_MIN_CONFIDENCE",
+        &["jev", "floors", "context", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_CONTEXT_MIN_MARGIN",
+        &["jev", "floors", "context", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_HARVEST_SCREEN_MIN_CONFIDENCE",
+        &["jev", "floors", "harvest_screen", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_HARVEST_SCREEN_MIN_MARGIN",
+        &["jev", "floors", "harvest_screen", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE",
+        &["jev", "floors", "handoff_select", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_MARGIN",
+        &["jev", "floors", "handoff_select", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_CONFIDENCE",
+        &["jev", "floors", "compaction_select", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_COMPACTION_SELECT_MIN_MARGIN",
+        &["jev", "floors", "compaction_select", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_DISPATCH_MIN_CONFIDENCE",
+        &["jev", "floors", "dispatch", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_DISPATCH_MIN_MARGIN",
+        &["jev", "floors", "dispatch", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE",
+        &["jev", "floors", "launch_effort", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN",
+        &["jev", "floors", "launch_effort", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_CLASSIFY_MIN_CONFIDENCE",
+        &["jev", "floors", "classify", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_CLASSIFY_MIN_MARGIN",
+        &["jev", "floors", "classify", "min_margin"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_INJECT_MIN_CONFIDENCE",
+        &["jev", "floors", "inject", "min_confidence"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_JEV_FLOOR_INJECT_MIN_MARGIN",
+        &["jev", "floors", "inject", "min_margin"],
+        EnvKind::Float,
+    ),
     // Issue #788: the operator's own override for every `[headless]` cost
     // lever -- see that same const's own entries in `REPO_FORBIDDEN`, below.
     // `headless.disallowed_tools` has no `ENV_MAP` entry: like `sandbox.
@@ -5721,6 +5859,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
     (&["jev", "launch_effort"], "ZIRV_CTX_JEV_LAUNCH_EFFORT"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
+    // Issue #803: the WHOLE `[jev.floors]` table, as one prefix entry (like
+    // `[capabilities]`/`[runtime]` above) rather than one leaf per site x
+    // field -- every key under it loosens or tightens which advisory answers
+    // a session acts on, the same trust asymmetry as `[jev]` itself.
+    (
+        &["jev", "floors"],
+        "ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN",
+    ),
     // Issue #788: `[headless]` cost levers for a headless Claude Code
     // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
     // reasoning as `[jev]` right above.
@@ -7568,6 +7714,40 @@ impl CtxConfig {
                 )
                 .into(),
             ));
+        }
+        // Issue #803: `[jev.floors.<site>]` bounds, same load-time-error
+        // convention as `proxy.min_confidence`/`proxy.min_margin` right above.
+        for (site, floor) in [
+            ("memory", &cfg.jev.floors.memory),
+            ("context", &cfg.jev.floors.context),
+            ("harvest_screen", &cfg.jev.floors.harvest_screen),
+            ("handoff_select", &cfg.jev.floors.handoff_select),
+            ("compaction_select", &cfg.jev.floors.compaction_select),
+            ("dispatch", &cfg.jev.floors.dispatch),
+            ("launch_effort", &cfg.jev.floors.launch_effort),
+            ("classify", &cfg.jev.floors.classify),
+            ("inject", &cfg.jev.floors.inject),
+        ] {
+            if let Some(min_confidence) = floor.min_confidence
+                && !(0.0..=1.0).contains(&min_confidence)
+            {
+                return Err(add_config_error_prefix(
+                    format!(
+                        "jev.floors.{site}.min_confidence must be between 0.0 and 1.0, got {min_confidence}"
+                    )
+                    .into(),
+                ));
+            }
+            if let Some(min_margin) = floor.min_margin
+                && !(0.0..=1.0).contains(&min_margin)
+            {
+                return Err(add_config_error_prefix(
+                    format!(
+                        "jev.floors.{site}.min_margin must be between 0.0 and 1.0, got {min_margin}"
+                    )
+                    .into(),
+                ));
+            }
         }
         if cfg.proxy.typesafe.timeout_secs < 1 {
             return Err(add_config_error_prefix(

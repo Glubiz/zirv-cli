@@ -193,7 +193,9 @@ pub(crate) fn task_context_with_selected_reports(
         let Some(answer) = answers.get(&format!("p{index}")) else {
             continue;
         };
-        if answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+        let (min_confidence, min_margin) =
+            jev::floor(cfg, jev::FloorSite::Context, 0.0, jev::DEFAULT_MIN_MARGIN);
+        if answer.decisive(min_confidence, min_margin)
             && answer
                 .as_noul()
                 .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
@@ -301,12 +303,14 @@ pub(super) fn selected_skill_index_text(
         return Some((baseline, String::new(), 0, None));
     };
     let mut omitted = 0usize;
+    let (context_min_confidence, context_min_margin) =
+        jev::floor(cfg, jev::FloorSite::Context, 0.0, jev::DEFAULT_MIN_MARGIN);
     let descriptions = entries
         .iter()
         .enumerate()
         .filter_map(|(index, (id, summary, repository))| {
             let omit = answers.get(&format!("s{index}")).is_some_and(|answer| {
-                answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+                answer.decisive(context_min_confidence, context_min_margin)
                     && answer
                         .as_noul()
                         .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
@@ -928,6 +932,8 @@ fn rerank_memory_candidates<'a>(
     let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
     let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
     let mut retained_body_bytes = 0usize;
+    let (memory_min_confidence, memory_min_margin) =
+        jev::floor(cfg, jev::FloorSite::Memory, 0.0, jev::DEFAULT_MIN_MARGIN);
     for ((index, ranked), id) in sent.into_iter().enumerate().zip(ids.iter()) {
         // Jev determinism fix: a noul answer that is not `decisive` (margin
         // below `jev::DEFAULT_MIN_MARGIN`; a noul has no separate confidence
@@ -935,7 +941,7 @@ fn rerank_memory_candidates<'a>(
         // missing one -- kept, original position -- rather than trusted to
         // score or prune the candidate.
         match answers.get(id) {
-            Some(answer) if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) => {
+            Some(answer) if !answer.decisive(memory_min_confidence, memory_min_margin) => {
                 retained_body_bytes += sent_body_bytes[index];
                 unanswered.push(ranked);
             }

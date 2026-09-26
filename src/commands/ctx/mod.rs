@@ -8,6 +8,7 @@ pub mod announce;
 pub mod api;
 pub mod ask;
 pub mod attention;
+pub mod attribution;
 pub mod breakdown;
 pub mod capabilities_cmd;
 pub mod catalogue;

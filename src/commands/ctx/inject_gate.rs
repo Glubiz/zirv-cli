@@ -247,8 +247,10 @@ fn decide(cfg: &CtxConfig, state: &StateDir, kind: InjectKind, facts: &InjectFac
     ) else {
         return Decision::InjectNow;
     };
+    let (min_confidence, min_margin) =
+        jev::floor(cfg, jev::FloorSite::Inject, 0.0, jev::DEFAULT_MIN_MARGIN);
     let decisive = answers.get("defer").is_some_and(|answer| {
-        answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+        answer.decisive(min_confidence, min_margin)
             && answer.as_noul().is_some_and(|p| p >= DEFER_MIN_PROBABILITY)
     });
     if !decisive {

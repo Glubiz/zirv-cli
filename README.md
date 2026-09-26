@@ -1821,6 +1821,8 @@ zirv workflow review package <id> | run <id> --agent <name> | add | record <id> 
 zirv workflow maintain scan [--repo <path>] [--json]
 zirv workflow stats                               # local bounded telemetry: per-phase timing, the implement/validate wall-clock split, approval wait, and fix-round causes (issue #699 Phase 0)
 zirv workflow calibrate [--json] [--min-samples N] # read-only: outcome buckets and routing proposals (issue #757)
+zirv workflow spend --state-dir <dir> [--receipts <file.jsonl>] [--campaign <id>] [--candidate <id>] [--trial <id>] [--task <id>] [--json]
+                                                    # read-only: reconciles delegations.jsonl/jev-decisions.jsonl/jev-effects.jsonl/proxy-decisions.jsonl into one SpendReport (issue #800)
 ```
 
 ### Outcome calibration
@@ -1849,6 +1851,30 @@ The step moves the seat tier (`cheap` -> `standard` -> `deep` -> `frontier`)
 when the bucket knows it, otherwise the complexity class the `classify.rs`
 thresholds assign. The command is read-only: it never writes config or
 changes routing; an operator decides whether to act on a proposal.
+
+### Attribution and cost accounting (issue #800)
+
+`ZIRV_ATTR_CAMPAIGN`/`ZIRV_ATTR_CANDIDATE`/`ZIRV_ATTR_TRIAL`/`ZIRV_ATTR_TASK`
+(each a `[A-Za-z0-9._:-]{1,64}` opaque id; anything else is dropped) ride
+along on `delegations.jsonl`, `jev-decisions.jsonl`, `jev-effects.jsonl`, and
+`proxy-decisions.jsonl` rows, and on `workflow-outcomes` rows (schema v2, see
+below) -- never a new billing ledger. The headless launch seam
+(`zirv ctx exec`'s own child-env builder) additionally exports
+`ZIRV_ROUTE_HARNESS`/`ZIRV_ROUTE_MODEL`/`ZIRV_ROUTE_TIER` (the actual, resolved
+values; unset when unknown) so a downstream reader never has to re-derive them
+from argv.
+
+`zirv workflow spend --state-dir <dir> [--receipts <file.jsonl>] [--campaign
+<id>] [--candidate <id>] [--trial <id>] [--task <id>] [--json]` folds every
+existing spend-adjacent log under `--state-dir` (plus, optionally, externally
+supplied receipt rows) into one `SpendReport`: `execution` (agent + intake +
+jev + helper + worker spend) and `overhead` (proposer/judge spend, for a
+future autoresearch campaign) as separate totals, a `by_source` breakdown,
+token totals, and a `completeness` verdict (`complete`/`partial`/`unknown`) --
+unpriced usage is never reported as free. Filtering by `--campaign`/
+`--candidate`/`--trial`/`--task` means two campaigns sharing one state
+directory can never cross-attribute. Exits `0` even when the report is
+incomplete; a filter or missing price table is not an error.
 
 ### Workflow definitions v2 (issue #542)
 
@@ -4368,6 +4394,18 @@ mid-conversation, and this can never override an explicit `--effort` or the
 operator's own `CLAUDE_CODE_EFFORT_LEVEL` (both checks happen before the
 sticky decision is even reached).
 
+**`[jev.floors.<site>]`** (issue #803, off by default -- unset is
+byte-identical to today's compiled constants) tunes `min_confidence`/
+`min_margin` per site for the nine TUNABLE sites above: `memory`, `context`,
+`harvest_screen`, `handoff_select`, `compaction_select`, `dispatch`,
+`launch_effort`, `classify`, `inject`. Every safety/verification site
+(`approve`, `approve_allow`, `inject_screen`, `stop_verify`, `missing_tests`,
+`review`, `gates`) and the harness proxy's own intake thresholds
+(`proxy.min_confidence`/`proxy.min_margin`) are NOT configurable here and keep
+their own compiled floors. `[jev.floors]` is `REPO_FORBIDDEN` as a whole
+table, the same trust asymmetry as `[jev]` itself -- see the config reference
+table above.
+
 #### Tool-output compaction
 
 `zirv setup` installs the claude `PostToolUse` hook: a large `Bash` result is
@@ -4695,6 +4733,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.missing_tests` | `ZIRV_CTX_JEV_MISSING_TESTS` |
 | `jev.launch_effort` | `ZIRV_CTX_JEV_LAUNCH_EFFORT` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
+| `jev.floors` | `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE`\|`_MIN_MARGIN` |
 | `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
 | `headless.effort.trivial` | `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL` |
 | `headless.effort.bounded` | `ZIRV_CTX_HEADLESS_EFFORT_BOUNDED` |

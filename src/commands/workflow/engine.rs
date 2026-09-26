@@ -3808,6 +3808,10 @@ pub enum WorkflowSubcommand {
     /// Read-only: aggregate recorded workflow outcomes and propose one-step
     /// heavier/lighter routing per bucket (issue #757). Never changes config.
     Calibrate(super::outcomes::CalibrateArgs),
+    /// Read-only: reconciles `delegations.jsonl`/`jev-decisions.jsonl`/
+    /// `jev-effects.jsonl`/`proxy-decisions.jsonl` under `--state-dir` into
+    /// one attributable `SpendReport` (issue #800). Never a new ledger.
+    Spend(crate::commands::ctx::attribution::SpendArgs),
 }
 
 #[derive(Debug, Args)]
@@ -5324,6 +5328,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Calibrate(args) => {
             return super::outcomes::run_calibrate(args, writer);
+        }
+        WorkflowSubcommand::Spend(args) => {
+            return crate::commands::ctx::attribution::run_spend(args, writer);
         }
     }
     Ok(0)

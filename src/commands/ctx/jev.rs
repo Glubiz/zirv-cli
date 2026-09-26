@@ -52,7 +52,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::ctx::adapters;
 use crate::commands::ctx::agent;
-use crate::commands::ctx::config::{CtxConfig, JevConfig, ProxyTypesafeConfig};
+use crate::commands::ctx::attribution::Attribution;
+use crate::commands::ctx::config::{CtxConfig, JevConfig, JevSiteFloor, ProxyTypesafeConfig};
 use crate::commands::ctx::jev_relay;
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{self, StateDir};
@@ -86,6 +87,53 @@ const _: () = assert!(
     DEFAULT_MIN_MARGIN > 0.14,
     "must clear every general-field flip margin (<= 0.14)"
 );
+
+/// Issue #803: the nine sites [`JevFloorsConfig`](crate::commands::ctx::
+/// config::JevFloorsConfig) makes tunable -- every other `decisive()` call
+/// site in this crate (safety/verification gates, the harness proxy's own
+/// intake thresholds) keeps its compiled constant and has no [`floor`] call
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloorSite {
+    Memory,
+    Context,
+    HarvestScreen,
+    HandoffSelect,
+    CompactionSelect,
+    Dispatch,
+    LaunchEffort,
+    Classify,
+    Inject,
+}
+
+/// Resolves `site`'s effective `(min_confidence, min_margin)`: the operator's
+/// own `[jev.floors.<site>]` override when set, falling back field-by-field to
+/// `default_confidence`/`default_margin` -- the exact constant that call site
+/// already used before this task -- when unset. With every `[jev.floors]` key
+/// unset (the shipped default), every caller gets back exactly the pair it
+/// passed in, so behaviour is byte-identical to before this task existed.
+pub(crate) fn floor(
+    cfg: &CtxConfig,
+    site: FloorSite,
+    default_confidence: f32,
+    default_margin: f32,
+) -> (f32, f32) {
+    let configured: &JevSiteFloor = match site {
+        FloorSite::Memory => &cfg.jev.floors.memory,
+        FloorSite::Context => &cfg.jev.floors.context,
+        FloorSite::HarvestScreen => &cfg.jev.floors.harvest_screen,
+        FloorSite::HandoffSelect => &cfg.jev.floors.handoff_select,
+        FloorSite::CompactionSelect => &cfg.jev.floors.compaction_select,
+        FloorSite::Dispatch => &cfg.jev.floors.dispatch,
+        FloorSite::LaunchEffort => &cfg.jev.floors.launch_effort,
+        FloorSite::Classify => &cfg.jev.floors.classify,
+        FloorSite::Inject => &cfg.jev.floors.inject,
+    };
+    (
+        configured.min_confidence.unwrap_or(default_confidence),
+        configured.min_margin.unwrap_or(default_margin),
+    )
+}
 
 /// The three question shapes the Jev API speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1095,6 +1143,11 @@ struct DecisionRecord<'a> {
     /// Whether these answers were served from [`ask`]'s own decision cache
     /// rather than a real call -- `usage` is `0`/`0` whenever this is `true`.
     cached: bool,
+    /// Issue #800: this process's own campaign/candidate/trial/task ids, so
+    /// `zirv workflow spend --campaign <id>` can count this decision. Never
+    /// serialized when unset -- an existing row's JSON is byte-identical.
+    #[serde(default, skip_serializing_if = "Attribution::is_empty")]
+    attribution: Attribution,
 }
 
 /// Appends one JSON line -- `site`, a timestamp, every answer's value/
@@ -1146,6 +1199,7 @@ pub(crate) fn record(
         wall_ms,
         fallbacks,
         cached,
+        attribution: Attribution::from_env(),
     };
     if let Ok(line) = serde_json::to_string(&record)
         && state::create_private_dir_all(state.root()).is_ok()
@@ -1155,7 +1209,7 @@ pub(crate) fn record(
     }
 
     let (session, principal) = session_and_principal();
-    let _ = log::append_delegation(
+    let _ = log::append_delegation_cached(
         state,
         &log::Delegation {
             ts,
@@ -1176,6 +1230,7 @@ pub(crate) fn record(
             principal: &principal,
             envelope_sha256: None,
         },
+        cached,
     );
 }
 
@@ -1241,6 +1296,8 @@ struct EffectRecord<'a> {
     principal: &'a str,
     #[serde(flatten)]
     effect: &'a JevEffect<'a>,
+    #[serde(default, skip_serializing_if = "Attribution::is_empty")]
+    attribution: Attribution,
 }
 
 /// Appends an effect only for an active site, without reading an answer cache.
@@ -1259,6 +1316,7 @@ pub(crate) fn record_effect(
         session: &session,
         principal: &principal,
         effect,
+        attribution: Attribution::from_env(),
     };
     if let Ok(line) = serde_json::to_string(&record)
         && state::create_private_dir_all(state.root()).is_ok()

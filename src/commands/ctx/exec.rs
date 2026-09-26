@@ -1042,7 +1042,13 @@ fn jev_launch_effort(
         &launch_effort_question(),
     )?;
     let answer = answers.get("launch_effort_high")?;
-    if !answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN) {
+    let (min_confidence, min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::LaunchEffort,
+        0.0,
+        jev::DEFAULT_MIN_MARGIN,
+    );
+    if !answer.decisive(min_confidence, min_margin) {
         return None;
     }
     let is_high = answer.as_noul()? >= 0.5;
