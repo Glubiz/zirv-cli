@@ -244,7 +244,10 @@ def wait_until_unpaused():
 
 
 def wait_for_launch_slot():
+    """Blocks until this launch's stagger slot; returns the seconds spent
+    waiting, so a chain step can keep that pacing out of its measured wall."""
     global _next_launch_at
+    t0 = time.time()
     wait_until_unpaused()
     with _stagger_lock:
         now = time.time()
@@ -252,6 +255,7 @@ def wait_for_launch_slot():
         _next_launch_at = max(now, _next_launch_at) + STAGGER_S
     if wait:
         time.sleep(wait)
+    return time.time() - t0
 
 
 def zirv_exe():
@@ -1483,7 +1487,6 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
     session_id = None
     model_used = model
     remaining_budget = timeout_s
-    chain_start = time.time()
     step_prompts_all = []
     step_texts_all = []
     step_scores = []
@@ -1588,7 +1591,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
         proc = stdout_f = stderr_f = stdin_f = None
         exit_code = None
         timed_out = False
-        wait_for_launch_slot()
+        step_t0 += wait_for_launch_slot()
         try:
             proc, argv, stdout_f, stderr_f, stdin_f = launch(
                 cond, model_used, prompt_for_launch, step_prompt_path, repo_dir,
@@ -1756,7 +1759,9 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
                 f"chain budget ({timeout_s:.0f}s) exhausted after step {step['label']}"
             break
 
-    result["wall_s"] = time.time() - chain_start
+    # Step walls only: grading, judges and stagger pacing between steps are
+    # harness time, not the agent's.
+    result["wall_s"] = sum(s["wall_s"] for s in result["steps"])
 
     tool_calls, zirv_cmds, transcript_note = scan_transcript(session_id)
     result["tool_calls"] = tool_calls

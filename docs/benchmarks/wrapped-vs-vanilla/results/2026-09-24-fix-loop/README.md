@@ -2,7 +2,15 @@
 
 **Target (operator):** zirv with Jev **off** and zirv with Jev **on** must each be at least **20% cheaper**, at least **20% faster**, and at least **1% better in work quality** than vanilla Claude Code with the superpowers plugin (v6.4.1). Tasks should be large or long-running. Beating the target is welcome.
 
-**Status: not met overall.** Round 5 (4.30.0 with the operator's `[headless]` levers and every Jev gate on) has Jev off at −15% cost / −12% time / +1% judge and Jev on at −16% / −8% / +1% on the subset + t23. After the effort-flip and approve fixes (r5b), the t23 chain clears the target in both conditions (−24%/−25%/+23% and −47%/−36%/+23%, 2 reps), and t24 clears it on cost only (−27%/−15% and −29%/−16%, judge tied).
+**Status: not met. Round 7 was the full and final benchmark** (4.30.0 at ff4fc885, all 20 Jev gates on in `zirv-jev-full`, same headless levers and intake in both zirv conditions). Cost and work quality clear the bar on the large tasks; time does not, in any condition, on any task group:
+
+| r7, vs vanilla + superpowers | Jev off: cost / time / judge | Jev on: cost / time / judge |
+|---|---|---|
+| XL t13–t22 (2 reps, 60 runs) | **−20% sig** / +19% worse / **+9% sig** | **−22% sig** / −3% / **+11% sig** |
+| t23 9-step chain (3 reps) | **−42%** / −32%* / +0% | −19% / −14%* / +0% |
+| t24b 22-step chain (3 reps) | −16% / −11%* / **+9%** (+2 test pts) | −3% / −8%* / **+9%** (+3 test pts) |
+
+\* Chain time is the agent's own time (sum of Claude's per-step `duration_ms`). The measured chain wall included the harness's stagger wait (see Round 7 results), so it is ~equal for every condition and not usable. Claude's `duration_ms` leaves out zirv's wrapper time: about 2 s per launch more than vanilla, plus a one-time intake on step 1.
 
 Every round directory here holds one `<task>__<cond>__rN.json` per run (the harness's `result.json`) and a `report.md` regenerated with the current `compare.py`. To recompute a report, copy a round's JSON files back into `<dir>/<name>/result.json` and run `compare.py --runs <dir>`.
 
@@ -24,6 +32,9 @@ Changes are relative to vanilla + superpowers. "sig" means the paired-bootstrap 
 | r5b-t24 | same as r5b | t24 22-step chain (6) | **−27%** / −15% / +0% | **−29%** / −16% / +0% | Valid; no compaction or restart fired (1M window) |
 | r6 | aee6d976: + read-only approve skip, Jev keep-alive relay, scope guard | subset + t23 (30) | **−28% / −12% / +10% sig** | −22% / −6% / +4% | Valid; t17 Jev on r1 was handed to codex at the session limit and re-run (harness fix a1617d4b) |
 | r6-t24 | same as r6 | t24 22-step chain (6) | **−33% / −20% / +7%** (+5 score pts) | **−33%** / −13% / +7% (+4 pts) | Valid; Jev off meets the target on t24 |
+| r7 | ff4fc885: + shell-edit checkpoint, tests owed at first edit, stated-details list, headless single seat and nojev intake parity, `[jev] missing_tests`/`launch_effort`/`compaction_select` | XL t13–t22 (60) | **−20% sig** / +19% (worse, sig) / **+9% sig** | **−22% sig** / −3% / **+11% sig** | Valid; Jev off time is a 15 s intake timeout; t14 grader zeroes an additive test (see Round 7) |
+| r7-t23 | same as r7 | t23 chain (9) | **−42%** / −32%* / +0% | −19% / −14%* / +0% | Valid; *agent time, measured wall is stagger-bound |
+| r7-t24b | same as r7 | t24b 22-step chain (9) | −16% / −11%* / +9% (+2 pts) | −3% / −8%* / +9% (+3 pts) | Valid; *agent time, measured wall is stagger-bound |
 
 About r1–r3: from fc59babb on, the harness ran zirv with `--setting-sources project,local`, which drops `~/.claude/settings.json`, where zirv's own hooks live. Fixed in d256124e. From r3b on, zirv keeps the user layer and vanilla receives the same `enabledPlugins` through `--settings`.
 
@@ -86,6 +97,14 @@ Before any rot event (steps 1–14) the runs compare as follows:
 - **A usage limit contaminated one run.** At the 16:40 session limit, `zirv ctx exec` handed t17 Jev on r1 to codex, which finished it; run.py then crashed on codex's prose. Since a1617d4b, zirv conditions run with `ZIRV_CTX_FALLBACK=false`, a zirv run that parks on a limit is killed and retried like vanilla's, and `parse_last_json` keeps JSON objects only. No earlier round was affected.
 - **The cold cache after a pause is an artifact.** t18 Jev off r1 wrote 28.8k cache tokens on its first request after the one-hour pause, because the 5m-TTL prefix had expired while vanilla's 1h prefix survived. Back-to-back zirv runs read 20.4k of cached prefix.
 
+## Round 7 results (r7, r7-t23, r7-t24b)
+
+- **Jev off's XL time is one intake timeout.** Without a Jev credential, `proxy::decide` falls through to `try_helper` (the handoff distiller model), which runs into its ~15 s timeout and then uses the deterministic baseline anyway (`decider: deterministic`, `elapsed_ms` ≈ 15,200). Per XL run, wall minus Claude's own `duration_ms` is 18.3 s for Jev off, 4.0 s for Jev on (Jev intake 216 ms) and 2.2 s for vanilla. Jev off's Claude time is −7% vs vanilla; without the helper attempt its wall would be about −3%. Any operator running headless without a Jev credential pays this on every launch. Fix candidate: skip the helper model for headless intake (headless already forces the single seat, so the helper cannot change the routing that matters), or bound it far below 15 s.
+- **The XL hidden-test gap is a grading artifact.** All of it (99 vs 88/89) is t14: both zirv conditions scored 0 in both reps because `grade.py` zeroes any change to `tests/test_rules.py`. The rule exists to stop an agent editing the known-failing `test_regex_rule_case_insensitive` into passing. zirv's agents left that test untouched and appended a new regression test class (6 added lines, 0 removed). Re-graded with an intent-preserving check (fail only if existing lines in the file changed), all four zirv runs pass 20/20, and the XL test score is a tie (98.7 vanilla, 98.1 Jev off, 98.6 Jev on). The appended test duplicates the existing one. That is a real side effect of the round-7 "tests owed at the first edit" line, which does not ask whether a test already covers the change.
+- **Chain wall time measured the stagger, not the agent.** `run.py` started each chain step's clock before `wait_for_launch_slot()`, so with 3 parallel chains and `--stagger-s 30` every step waited up to ~60 s inside its own wall. Every condition lands at ~13 min (t23) and ~33 min (t24b). Fixed after the run: the slot wait is kept out of the step wall, and a chain's wall is the sum of its step walls. The table above uses Claude's per-step `duration_ms` instead (read from each run's `stdout_step_*.json`, not archived).
+- **t24b vs r6's t24.** Vanilla got cheaper once steps 9 and 14 stated what their hidden tests check ($3.87 vs $4.77), so zirv's cost lead on the long haul shrank from −33% to −16% (Jev off). The +9% judge lead held.
+- **Sizing.** The full grid (78 runs, $51.6 of agent spend plus opus judging) used about 73% of one 5h window (2% → 75% over 3.1 h, ~24%/h at `--parallel 2–3`), inside the 55–84% predicted from the 2026-09-25 dollar calibration.
+
 ## Round 5 (implementation notes)
 
 Operator decision: compaction should fire when the context actually rots, not at a token count far below the model's window. Let the session gather context until it starts to rot.
@@ -102,16 +121,12 @@ Operator decision: compaction should fire when the context actually rots, not at
 
 ## Next steps for the next agent
 
-1. **Benchmark round 5 on long sessions.** Run t24 and t23 with 3 conditions × 2 reps (commands below). The questions:
-   - Does zirv now let context grow until real rot?
-   - Does compaction complete when rot does fire?
-   - How do steps 15–22 compare with vanilla?
-2. **Scope discipline without losing tests.** zirv's extra turns come partly from unrequested changes (finding 4). Look at the worker prompt and the gates, keep the "one focused test per behaviour change", and measure the effect on t24 and the subset.
-3. **The intake nudge (finding 5).** A/B the intake-discipline text, especially "run the full test suite" and "tests first", against a lighter variant on the subset and t24. It is the most direct lever on zirv's extra turns.
-4. **Parked by the operator:** Jev-ranked keep/drop instructions for compaction. It is a side quest; do not pursue it unless the operator reopens it.
-5. **Before merge:**
+1. **Time is the unmet target.** No condition is 20% faster on any task group; ~88% of wall is model time, so the lever is fewer or shorter turns, not wrapper overhead. First remove the 15 s helper intake timeout for headless Jev-off launches (Round 7 results).
+2. **Make the tests-owed line ask whether a test already covers the change** before requesting a new one (the t14 duplicate test).
+3. **Decide the t14 grader rule.** The operator should choose whether to switch `t14_bugsweep/grade.py` to the intent-preserving check. It changes the published XL test score, so it should not be switched silently.
+4. **Before merge:**
    - the full four checks (failure-name diff against main);
-   - CI on Linux (covers the cfg(unix) wrap tests touched by #780);
+   - CI on Linux (covers the cfg(unix) wrap tests);
    - the Docker AI-feature matrix for harness-facing changes;
    - README reference rows are updated per commit.
 
