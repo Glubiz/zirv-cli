@@ -60,6 +60,7 @@ import argparse
 import concurrent.futures
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -718,11 +720,21 @@ def parse_judge_json(text):
 
 def call_judge(prompt_text, model="sonnet"):
     """One judge call, retried once when the reply has no usable score: a
-    transient bad reply must not be recorded as a 0 against any condition."""
-    judge_obj, text = _call_judge_once(prompt_text, model)
+    transient bad reply must not be recorded as a 0 against any condition.
+
+    Returns (judge_obj, text, raw_objs) -- `raw_objs` is the list of the
+    underlying `-p --output-format json` envelope(s) actually returned (one
+    per attempt, in order; an attempt whose call failed outright contributes
+    no entry), used by callers to build a judge receipt per attempt so a
+    retried call's cost is never dropped (issue #800/#801: judge/quality-
+    judge cost was not captured before).
+    """
+    judge_obj, text, raw_objs = _call_judge_once(prompt_text, model)
     if not _has_numeric_score(judge_obj):
-        judge_obj, text = _call_judge_once(prompt_text, model)
-    return judge_obj, text
+        judge_obj2, text2, raw_objs2 = _call_judge_once(prompt_text, model)
+        judge_obj, text = judge_obj2, text2
+        raw_objs = raw_objs + raw_objs2
+    return judge_obj, text, raw_objs
 
 
 def _has_numeric_score(judge_obj):
@@ -734,6 +746,12 @@ def _has_numeric_score(judge_obj):
 
 
 def _call_judge_once(prompt_text, model):
+    """Returns (judge_obj, result_text, raw_objs): `raw_objs` is `[obj]` (the
+    top-level `-p --output-format json` envelope, which carries
+    `total_cost_usd`/`usage`/`model`/`session_id`) when the call produced a
+    parsable envelope at all, else `[]` -- so a call that failed before
+    producing any JSON contributes no receipt (nothing was billed to
+    capture) rather than a bogus zero-cost one."""
     argv = [CLAUDE_EXE, "-p", "--output-format", "json", "--model", model,
             "--settings", json.dumps({"disableAllHooks": True}, separators=(",", ":")),
             "--max-turns", "1",
@@ -742,14 +760,14 @@ def _call_judge_once(prompt_text, model):
         proc = subprocess.run(argv, input=prompt_text.encode("utf-8"),
                                capture_output=True, timeout=300)
     except Exception:
-        return None, None
+        return None, None, []
     stdout_text = proc.stdout.decode("utf-8", errors="replace")
     obj = parse_last_json(stdout_text)
     if obj is None:
-        return None, stdout_text
+        return None, stdout_text, []
     result_text = obj.get("result", "")
     judge_obj = parse_judge_json(result_text)
-    return judge_obj, result_text
+    return judge_obj, result_text, [obj]
 
 
 _QUALITY_RUBRIC_PATH = Path(__file__).resolve().parent / "quality_rubric.md"
@@ -763,7 +781,9 @@ def call_quality_judge(prompt_text, repo_dir, result_text):
     `QUALITY_JUDGE_MODEL` ("opus") instead of "sonnet", and a diff that
     excludes `tests_hidden/` (the grader's own copied files, never the
     agent's work -- see `get_capped_diff`'s doc comment). Returns
-    (quality_score 0..1 or None, quality_reasoning str).
+    (quality_score 0..1 or None, quality_reasoning str, receipts list) --
+    `receipts` (issue #800/#801) captures this call's own cost/usage, one
+    entry per attempt (`call_judge`'s retry-on-no-score included).
     """
     rubric = read_text(_QUALITY_RUBRIC_PATH) if _QUALITY_RUBRIC_PATH.exists() else ""
     diff_text = get_capped_diff(repo_dir, cap_bytes=QUALITY_DIFF_CAP_BYTES, exclude=["tests_hidden"])
@@ -775,14 +795,15 @@ def call_quality_judge(prompt_text, repo_dir, result_text):
         "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
         "No prose before or after it, no code fence."
     )
-    judge_obj, raw_judge_text = call_judge(judge_prompt, model=QUALITY_JUDGE_MODEL)
+    judge_obj, raw_judge_text, raw_objs = call_judge(judge_prompt, model=QUALITY_JUDGE_MODEL)
+    receipts = [judge_receipt_from_result(o, source="judge") for o in raw_objs]
     if judge_obj is None:
-        return None, raw_judge_text or "quality judge call failed / no parsable output"
+        return None, raw_judge_text or "quality judge call failed / no parsable output", receipts
     try:
         score = float(judge_obj.get("score", 0))
     except Exception:
-        return None, "quality judge returned an unparsable score"
-    return score / 10.0, judge_obj.get("reasoning", "")
+        return None, "quality judge returned an unparsable score", receipts
+    return score / 10.0, judge_obj.get("reasoning", ""), receipts
 
 
 def call_quality_judge_chain(step_prompts, repo_dir, step_texts):
@@ -790,7 +811,8 @@ def call_quality_judge_chain(step_prompts, repo_dir, step_texts):
     `call_quality_judge`, but over the WHOLE chain -- every step's prompt
     shown, every step's final response concatenated, one diff of the
     repo's final state against the pristine template. Runs once, after the
-    last step, never per step."""
+    last step, never per step. Returns (quality_score, quality_reasoning,
+    receipts list) -- see `call_quality_judge`'s docstring for `receipts`."""
     rubric = read_text(_QUALITY_RUBRIC_PATH) if _QUALITY_RUBRIC_PATH.exists() else ""
     diff_text = get_capped_diff(repo_dir, cap_bytes=QUALITY_DIFF_CAP_BYTES, exclude=["tests_hidden"])
     prompts_block = "\n\n".join(f"### Step {i+1}\n{p}" for i, p in enumerate(step_prompts))
@@ -803,14 +825,15 @@ def call_quality_judge_chain(step_prompts, repo_dir, step_texts):
         "object on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
         "No prose before or after it, no code fence."
     )
-    judge_obj, raw_judge_text = call_judge(judge_prompt, model=QUALITY_JUDGE_MODEL)
+    judge_obj, raw_judge_text, raw_objs = call_judge(judge_prompt, model=QUALITY_JUDGE_MODEL)
+    receipts = [judge_receipt_from_result(o, source="judge") for o in raw_objs]
     if judge_obj is None:
-        return None, raw_judge_text or "quality judge call failed / no parsable output"
+        return None, raw_judge_text or "quality judge call failed / no parsable output", receipts
     try:
         score = float(judge_obj.get("score", 0))
     except Exception:
-        return None, "quality judge returned an unparsable score"
-    return score / 10.0, judge_obj.get("reasoning", "")
+        return None, "quality judge returned an unparsable score", receipts
+    return score / 10.0, judge_obj.get("reasoning", ""), receipts
 
 
 def run_unittest_discover(repo_dir, start_dir, timeout_s=UNITTEST_TIMEOUT_S):
@@ -906,17 +929,19 @@ def grade_step_judge(rubric_path, step_prompt_text, repo_dir, step_result_text):
         "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
         "No prose before or after it, no code fence."
     )
-    judge_obj, raw_judge_text = call_judge(judge_prompt, model="sonnet")
+    judge_obj, raw_judge_text, raw_objs = call_judge(judge_prompt, model="sonnet")
+    receipts = [judge_receipt_from_result(o, source="judge") for o in raw_objs]
     if judge_obj is None:
         return {"score": 0.0, "passed": None, "total": None, "visible_ok": True,
-                "details": raw_judge_text or "judge call failed / no parsable output"}
+                "details": raw_judge_text or "judge call failed / no parsable output",
+                "receipts": receipts}
     try:
         js = float(judge_obj.get("score", 0))
     except Exception:
         return {"score": 0.0, "passed": None, "total": None, "visible_ok": True,
-                "details": "judge returned an unparsable score"}
+                "details": "judge returned an unparsable score", "receipts": receipts}
     return {"score": js / 10.0, "passed": None, "total": None, "visible_ok": True,
-            "details": judge_obj.get("reasoning", "")}
+            "details": judge_obj.get("reasoning", ""), "receipts": receipts}
 
 
 def run_grade_py(grade_py, repo_dir, result_txt_path):
@@ -929,68 +954,94 @@ def run_grade_py(grade_py, repo_dir, result_txt_path):
 
 
 def grade(task_dir, kind, repo_dir, result_txt_path, prompt_text):
+    """Grade one single-shot run. Issue #801 leakage fix: whichever branch
+    runs, `tests_hidden/` (a `tests`/`answer` task's own grade.py copies
+    hidden tests there to run them, and never removed it again before this
+    fix) is removed from `repo_dir` before returning -- the trial repo must
+    never keep a copy of hidden tests lying around after grading, same
+    guarantee `grade_step_tests` already gave a chain step."""
     out = {"score": 0.0, "passed": 0, "total": 0, "visible_ok": False, "details": "",
-           "judge_score": None, "judge_reasoning": None}
+           "judge_score": None, "judge_reasoning": None, "judge_receipts": []}
     grade_py = task_dir / "grade.py"
-    if kind in ("tests", "answer"):
-        if not grade_py.exists():
-            out["details"] = "grade.py missing"
+    try:
+        if kind in ("tests", "answer"):
+            if not grade_py.exists():
+                out["details"] = "grade.py missing"
+                return out
+            obj, proc = run_grade_py(grade_py, repo_dir, result_txt_path)
+            if obj is None:
+                out["details"] = "grade.py produced no parsable JSON"
+                return out
+            for k in ("score", "passed", "total", "visible_ok", "details"):
+                if k in obj:
+                    out[k] = obj[k]
             return out
-        obj, proc = run_grade_py(grade_py, repo_dir, result_txt_path)
-        if obj is None:
-            out["details"] = "grade.py produced no parsable JSON"
-            return out
-        for k in ("score", "passed", "total", "visible_ok", "details"):
-            if k in obj:
-                out[k] = obj[k]
-        return out
-    elif kind == "judge":
-        rubric = read_text(task_dir / "rubric.md") if (task_dir / "rubric.md").exists() else ""
-        diff_text = get_capped_diff(repo_dir)
-        try:
-            result_text = Path(result_txt_path).read_text(encoding="utf-8")
-        except Exception:
-            result_text = ""
-        judge_prompt = (
-            rubric + "\n\n## Task prompt\n" + prompt_text +
-            "\n\n## Diff (git diff HEAD, may be truncated)\n" + diff_text +
-            "\n\n## Agent's final message\n" + result_text +
-            "\n\n## Your answer\nScore the change against the rubric. Reply with ONLY a JSON object "
-            "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
-            "No prose before or after it, no code fence."
-        )
-        judge_obj, raw_judge_text = call_judge(judge_prompt)
-        if judge_obj is None:
-            out["judge_score"] = 0
-            out["judge_reasoning"] = raw_judge_text or "judge call failed / no parsable output"
-            out["score"] = 0.0
-        else:
+        elif kind == "judge":
+            rubric = read_text(task_dir / "rubric.md") if (task_dir / "rubric.md").exists() else ""
+            diff_text = get_capped_diff(repo_dir)
             try:
-                js = float(judge_obj.get("score", 0))
+                result_text = Path(result_txt_path).read_text(encoding="utf-8")
             except Exception:
-                js = 0.0
-            out["judge_score"] = js
-            out["judge_reasoning"] = judge_obj.get("reasoning", "")
-            out["score"] = js / 10.0
-        if grade_py.exists():
-            gobj, _ = run_grade_py(grade_py, repo_dir, result_txt_path)
-            if gobj is not None:
-                out["visible_ok"] = gobj.get("visible_ok", False)
-                if "passed" in gobj:
-                    out["passed"] = gobj["passed"]
-                if "total" in gobj:
-                    out["total"] = gobj["total"]
-        return out
-    else:
-        out["details"] = f"unknown kind: {kind}"
-        return out
+                result_text = ""
+            judge_prompt = (
+                rubric + "\n\n## Task prompt\n" + prompt_text +
+                "\n\n## Diff (git diff HEAD, may be truncated)\n" + diff_text +
+                "\n\n## Agent's final message\n" + result_text +
+                "\n\n## Your answer\nScore the change against the rubric. Reply with ONLY a JSON object "
+                "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
+                "No prose before or after it, no code fence."
+            )
+            judge_obj, raw_judge_text, raw_objs = call_judge(judge_prompt)
+            out["judge_receipts"] = [judge_receipt_from_result(o, source="judge") for o in raw_objs]
+            if judge_obj is None:
+                out["judge_score"] = 0
+                out["judge_reasoning"] = raw_judge_text or "judge call failed / no parsable output"
+                out["score"] = 0.0
+            else:
+                try:
+                    js = float(judge_obj.get("score", 0))
+                except Exception:
+                    js = 0.0
+                out["judge_score"] = js
+                out["judge_reasoning"] = judge_obj.get("reasoning", "")
+                out["score"] = js / 10.0
+            if grade_py.exists():
+                gobj, _ = run_grade_py(grade_py, repo_dir, result_txt_path)
+                if gobj is not None:
+                    out["visible_ok"] = gobj.get("visible_ok", False)
+                    if "passed" in gobj:
+                        out["passed"] = gobj["passed"]
+                    if "total" in gobj:
+                        out["total"] = gobj["total"]
+            return out
+        else:
+            out["details"] = f"unknown kind: {kind}"
+            return out
+    finally:
+        cleanup_hidden_tests(repo_dir)
+
+
+def cleanup_hidden_tests(repo_dir):
+    """Issue #801 leakage fix: remove `<repo_dir>/tests_hidden` if present.
+    A chain task already did this between steps (`grade_step_tests`); a
+    single-shot `tests`/`answer` task's own per-task `grade.py` copies
+    hidden tests in to run them but historically left the directory behind
+    for the rest of the run (including any later diff/quality-judge step,
+    which already path-excluded it but the files themselves stayed
+    reachable). Idempotent and safe to call when the directory never
+    existed (nothing to clean up, e.g. a `kind=judge` task with no
+    grade.py)."""
+    repo_dir = Path(repo_dir)
+    hidden_dst = repo_dir / "tests_hidden"
+    if hidden_dst.exists():
+        rmtree_robust(hidden_dst)
 
 
 def default_proxy_meta():
     return {
         "complexity": None, "risk": None, "execution": None, "seat_role": None,
         "seat_tier": None, "worker_tier": None, "workflow": None, "workflow_id": None, "domains": [],
-        "decider": None, "elapsed_ms": None, "input_tokens": 0, "output_tokens": 0,
+        "decider": None, "effort": None, "elapsed_ms": None, "input_tokens": 0, "output_tokens": 0,
         "cost_usd": 0.0, "wall_s": 0.0,
     }
 
@@ -1167,11 +1218,20 @@ def finish_line(k, total, task, cond, rep, result):
     return f"[{k}/{total}] {task} {cond} r{rep} -> score {score:.2f} cost ${cost:.2f} wall {wall:.0f}s"
 
 
-def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
+def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total,
+                run_dir_override=None, spec_env=None):
+    """`run_dir_override` (issue #802 trial mode): use this directory
+    verbatim instead of the grid's own `<bench_root>/runs/<task>__<cond>__
+    r<rep>` naming -- lets a single `--trial`/`--out` invocation write into
+    the trial directory the runner already created, reusing every existing
+    proxy/workflow/judge code path unmodified. `spec_env` (issue #800/#802):
+    a candidate's env overlay, applied LAST over `cond_env_for(cond)` (spec
+    keys win) -- `None` (every pre-#802 call site) reproduces today's
+    `env_extra = cond_env_for(cond)` byte-for-byte."""
     bench_root = Path(bench_root)
     task_dir = bench_root / "tasks" / task
     template_dir = bench_root / "template"
-    run_dir = run_dir_for(bench_root, task, cond, rep)
+    run_dir = Path(run_dir_override) if run_dir_override is not None else run_dir_for(bench_root, task, cond, rep)
     prompt_path = task_dir / "prompt.txt"
     prompt_text = read_text(prompt_path)
     kind = read_text(task_dir / "kind.txt").strip()
@@ -1215,7 +1275,8 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         "judge_score": None, "judge_reasoning": None,
         "quality_score": None, "quality_reasoning": None,
         "proxy": default_proxy_meta(), "workflow_started": False, "workflow_note": None,
-        "model_used": model,
+        "model_used": model, "session_id": None,
+        "judge_receipts": [], "quality_receipts": [],
     }
 
     wait_for_launch_slot()
@@ -1227,6 +1288,8 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
     # launch below so a lever or gate is on for the whole run, not just part
     # of it.
     env_extra = cond_env_for(cond)
+    if spec_env:
+        env_extra = merge_spec_env(env_extra, spec_env)
 
     if cond in JEV_PROXY_LIKE_CONDS:
         proxy_obj, proxy_elapsed, proxy_err, _raw = call_proxy(
@@ -1285,6 +1348,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
             "workflow_id": started_workflow_id,
             "domains": proxy_obj.get("domains") or [],
             "decider": proxy_obj.get("decider"),
+            "effort": proxy_obj.get("effort"),
             "elapsed_ms": proxy_obj.get("elapsed_ms"),
             "input_tokens": proxy_input_tokens,
             "output_tokens": proxy_output_tokens,
@@ -1332,6 +1396,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
 
     if timed_out:
         result["is_error"] = True
+        result["timed_out"] = True
         result["score"] = 0.0
         note = f"timeout after {timeout_s:.0f}s total budget"
         result["details"] = (result["details"] + "; " if result["details"] else "") + note
@@ -1379,6 +1444,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         result_text = obj.get("result", "") or ""
         session_id = obj.get("session_id")
 
+    result["session_id"] = session_id
     (run_dir / "result.txt").write_text(result_text, encoding="utf-8")
 
     tool_calls, zirv_cmds, transcript_note = scan_transcript(session_id)
@@ -1396,6 +1462,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         result["details"] = (result["details"] + "; " if result["details"] else "") + str(grading["details"])
     result["judge_score"] = grading.get("judge_score")
     result["judge_reasoning"] = grading.get("judge_reasoning")
+    result["judge_receipts"] = grading.get("judge_receipts") or []
 
     if kind == "tests":
         # Second, independent blind judge on every tests-kind run: the
@@ -1403,9 +1470,11 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
         # it good work" -- see quality_rubric.md. Runs regardless of the
         # hidden-test score (a 0-score attempt can still get useful
         # feedback, e.g. "no changes were made at all").
-        quality_score, quality_reasoning = call_quality_judge(prompt_text, repo_dir, result_text)
+        quality_score, quality_reasoning, quality_receipts = call_quality_judge(
+            prompt_text, repo_dir, result_text)
         result["quality_score"] = quality_score
         result["quality_reasoning"] = quality_reasoning
+        result["quality_receipts"] = quality_receipts
 
     write_result(run_dir, result)
     print(finish_line(k, total, task, cond, rep, result))
@@ -1421,9 +1490,13 @@ def chain_finish_line(k, total, task, cond, rep, result):
             f"cost ${cost:.2f} wall {wall:.0f}s")
 
 
-def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total):
+def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total,
+                      run_dir_override=None, spec_env=None):
     """A `kind=chain` task: `read_chain_steps` in order, sent one after
     another to the SAME agent session (see README's "Long-session chain").
+
+    `run_dir_override`/`spec_env`: see `do_one_run`'s docstring -- same
+    meaning, `None` reproduces today's behaviour byte-for-byte.
 
     Session continuation (see `build_argv`'s docstring): step 1 launches
     exactly like a normal run and its `session_id` is read back from
@@ -1446,7 +1519,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
     bench_root = Path(bench_root)
     task_dir = bench_root / "tasks" / task
     template_dir = bench_root / "template"
-    run_dir = run_dir_for(bench_root, task, cond, rep)
+    run_dir = Path(run_dir_override) if run_dir_override is not None else run_dir_for(bench_root, task, cond, rep)
 
     if resume and result_is_valid(run_dir):
         print(f"[{k}/{total}] {task} {cond} r{rep} -> skip (resume, already ok)")
@@ -1480,10 +1553,12 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
         "judge_score": None, "judge_reasoning": None,
         "quality_score": None, "quality_reasoning": None,
         "proxy": default_proxy_meta(), "workflow_started": False, "workflow_note": None,
-        "model_used": model, "steps": [], "session_switches": [],
+        "model_used": model, "steps": [], "session_switches": [], "quality_receipts": [],
     }
 
     env_extra = cond_env_for(cond)
+    if spec_env:
+        env_extra = merge_spec_env(env_extra, spec_env)
     session_id = None
     model_used = model
     remaining_budget = timeout_s
@@ -1524,6 +1599,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
             "num_turns": None, "input_tokens": 0, "output_tokens": 0,
             "score": None, "passed": None, "total": None, "visible_ok": None,
             "details": "", "is_error": False, "cost_estimated_part_usd": 0.0,
+            "session_id": None, "judge_receipts": [],
         }
         step_t0 = time.time()
 
@@ -1572,6 +1648,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
                 "seat_tier": seat_tier, "worker_tier": proxy_obj.get("worker_tier"),
                 "workflow": workflow, "workflow_id": started_workflow_id,
                 "domains": proxy_obj.get("domains") or [], "decider": proxy_obj.get("decider"),
+                "effort": proxy_obj.get("effort"),
                 "elapsed_ms": proxy_obj.get("elapsed_ms"), "input_tokens": proxy_input_tokens,
                 "output_tokens": proxy_output_tokens, "cost_usd": proxy_cost,
                 "wall_s": proxy_elapsed + workflow_elapsed,
@@ -1626,6 +1703,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
                 f"timeout after chain budget exhausted (~{timeout_s:.0f}s total)"
             result["steps"].append(step_record)
             result["is_error"] = True
+            result["timed_out"] = True
             result["details"] = (result["details"] + "; " if result["details"] else "") + step_record["details"]
             break
 
@@ -1740,6 +1818,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
             step_record["visible_ok"] = grading.get("visible_ok")
             step_record["details"] = (step_record["details"] + "; " if step_record["details"] else "") + \
                 str(grading.get("details") or "")
+            step_record["judge_receipts"] = grading.get("receipts") or []
             step_scores.append(grading["score"])
             if grading.get("visible_ok") is False:
                 result["visible_ok"] = False
@@ -1748,6 +1827,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
             if grading.get("total") is not None:
                 result["total"] += grading["total"]
 
+        step_record["session_id"] = session_id
         result["steps"].append(step_record)
         print(f"    step {step['label']} ({step['kind']}) -> "
               f"score {step_record['score']}, cost ${step_record['cost_usd']:.2f}, "
@@ -1775,8 +1855,9 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
         # Spec item 2: the end-of-chain work-quality judge runs once, over
         # the WHOLE session -- every prompt shown, every step's final
         # response concatenated, one diff of the repo's final state.
-        quality_score, quality_reasoning = call_quality_judge_chain(
+        quality_score, quality_reasoning, quality_receipts = call_quality_judge_chain(
             step_prompts_all, repo_dir, step_texts_all)
+        result["quality_receipts"] = quality_receipts
         result["quality_score"] = quality_score
         result["quality_reasoning"] = quality_reasoning
 
@@ -1831,13 +1912,836 @@ def first_prompt_text(task_dir):
     raise FileNotFoundError(f"no prompt.txt or prompts/*.txt under {task_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Autoresearch (#799-#805) Lane C: spec-driven single-trial mode.
+#
+# `run.py --trial <spec.json> --out <dir> [--cond <cond>]` runs exactly one
+# (task, rep) -- same machinery as the grid above -- into a directory the
+# runner (`zirv workflow research run`, Rust) already owns, then writes
+# `receipts.jsonl` (one line per provider call: agent + judge + quality
+# judge) and `trial.json` there. See CONTRACT.md and
+# docs/superpowers/specs/2026-09-26-autoresearch-design.md. Every existing
+# CLI mode above this point is untouched in behaviour; the `run_dir_override`/
+# `spec_env` parameters `do_one_run`/`do_one_chain_run` gained are additive
+# (default `None` reproduces the old call shape exactly) so this section
+# reuses them instead of re-implementing the proxy/workflow/judge pipeline.
+# ---------------------------------------------------------------------------
+
+def merge_spec_env(base_env, overlay_env):
+    """A candidate's `spec.env` applied LAST over a condition's own env
+    (`cond_env_for`) -- overlay keys win outright, including a `None` value
+    (removes that variable from the child env, same convention `child_env`
+    already uses). `base_env`/`overlay_env` may each be `None` or `{}`."""
+    merged = dict(base_env or {})
+    merged.update(overlay_env or {})
+    return merged
+
+
+def load_spec(spec_path):
+    return json.loads(Path(spec_path).read_text(encoding="utf-8"))
+
+
+def make_receipt(source, receipt_id, session=None, cumulative=False, reported_usd=None,
+                  model=None, input_tokens=0, output_tokens=0,
+                  cache_creation_input_tokens=0, cache_read_input_tokens=0,
+                  cached=False, billing="unknown"):
+    """One `receipts.jsonl` line, per CONTRACT's receipt shape."""
+    return {
+        "source": source, "session": session, "receipt_id": receipt_id,
+        "cumulative": bool(cumulative), "reported_usd": reported_usd, "model": model,
+        "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0,
+        "cache_creation_input_tokens": cache_creation_input_tokens or 0,
+        "cache_read_input_tokens": cache_read_input_tokens or 0,
+        "cached": bool(cached), "billing": billing,
+    }
+
+
+def judge_receipt_from_result(obj, source="judge", receipt_id=None):
+    """A judge/quality-judge call's own `-p --output-format json` envelope
+    (`obj`, as `_call_judge_once` returns it) turned into a receipt. Never
+    cumulative: each judge call is its own fresh `--max-turns 1` session, so
+    its `total_cost_usd` is already that one call's whole cost, not a
+    running session total."""
+    obj = obj or {}
+    usage = obj.get("usage") or {}
+    cost = obj.get("total_cost_usd")
+    return make_receipt(
+        source=source, receipt_id=receipt_id, session=obj.get("session_id"),
+        cumulative=False, reported_usd=cost, model=obj.get("model"),
+        input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
+        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
+        cached=False, billing="metered" if cost is not None else "unknown",
+    )
+
+
+def agent_receipt_from_result(session, cost_usd, model, receipt_id=None, cumulative=False,
+                               input_tokens=0, output_tokens=0,
+                               cache_creation_input_tokens=0, cache_read_input_tokens=0):
+    """An agent invocation's cost turned into a receipt.
+
+    `cumulative`: whether `cost_usd` is still the RAW `total_cost_usd` a
+    resumed session reported (the whole conversation's cost so far, not yet
+    delta-corrected against the previous call for that session --
+    `cumulative=True`, left for the downstream reconciler to convert to an
+    increment) or already a single invocation's own cost (a fresh,
+    non-resumed launch, OR a resumed launch whose delta THIS caller already
+    computed -- `cumulative=False`).
+
+    Evidence that `claude --resume` reports a CUMULATIVE total, not an
+    incremental one: this file's own pre-existing chain-stepping code
+    (`do_one_chain_run`, well before this trial-mode addition) already had
+    to divide it out --  "`claude --resume` reports total_cost_usd for the
+    whole session so far, so a step's own cost is the delta from the
+    previous step" -- `agent_cost = max(0.0, session_cost -
+    prev_session_cost)`. `receipts_from_result` below always calls this
+    with the ALREADY-delta-corrected `step_record["cost_usd"]` for a chain
+    step, hence `cumulative=False` there -- run.py does the diffing itself
+    before a receipt is ever built, per
+    docs/superpowers/specs/2026-09-26-autoresearch-design.md #800's own
+    "cumulative receipts (resume) are converted to increments per session"
+    (that conversion already happened, here, in Python, not left for the
+    Rust reconciler to redo). `cumulative=True` is exposed for a future
+    caller that wants to hand a raw resumed total straight through instead.
+    """
+    return make_receipt(
+        source="agent", receipt_id=receipt_id, session=session, cumulative=cumulative,
+        reported_usd=cost_usd, model=model, input_tokens=input_tokens, output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        cached=False, billing="metered" if cost_usd is not None else "unknown",
+    )
+
+
+def receipts_from_result(result):
+    """Every receipt (agent + judge + quality-judge) a completed run.py
+    `result` dict implies -- single-shot, `escalate`-strategy (has an
+    `attempts` list), or chain shape alike -- with fresh `receipt_id`s
+    assigned in call order. Pure function of `result`: no filesystem or
+    subprocess access."""
+    receipts = []
+    counter = {"n": 0}
+
+    def next_id(prefix):
+        counter["n"] += 1
+        return f"{prefix}:{counter['n']}"
+
+    def take_judge_receipts(raw_list):
+        for jr in raw_list or []:
+            jr = dict(jr)
+            jr["receipt_id"] = next_id("judge")
+            receipts.append(jr)
+
+    if result.get("kind") == "chain":
+        for step in result.get("steps") or []:
+            if step.get("session_id") is not None or step.get("cost_usd") is not None:
+                receipts.append(agent_receipt_from_result(
+                    session=step.get("session_id"), cost_usd=step.get("cost_usd"),
+                    model=result.get("model_used"), receipt_id=next_id("agent"),
+                    cumulative=False,  # already delta-corrected by the chain stepper itself
+                    input_tokens=step.get("input_tokens", 0), output_tokens=step.get("output_tokens", 0),
+                ))
+            take_judge_receipts(step.get("judge_receipts"))
+        take_judge_receipts(result.get("quality_receipts"))
+    elif result.get("attempts"):
+        # escalate strategy (#804): one agent receipt per attempt.
+        for att in result["attempts"]:
+            if att.get("session_id") is not None or att.get("cost_usd") is not None:
+                receipts.append(agent_receipt_from_result(
+                    session=att.get("session_id"), cost_usd=att.get("cost_usd"),
+                    model=att.get("model"), receipt_id=next_id("agent"), cumulative=False,
+                ))
+        take_judge_receipts(result.get("judge_receipts"))
+        take_judge_receipts(result.get("quality_receipts"))
+    else:
+        if result.get("session_id") is not None or result.get("agent_cost_usd") is not None:
+            receipts.append(agent_receipt_from_result(
+                session=result.get("session_id"), cost_usd=result.get("agent_cost_usd"),
+                model=result.get("model_used"), receipt_id=next_id("agent"), cumulative=False,
+                input_tokens=result.get("input_tokens", 0), output_tokens=result.get("output_tokens", 0),
+                cache_creation_input_tokens=result.get("cache_creation_input_tokens", 0),
+                cache_read_input_tokens=result.get("cache_read_input_tokens", 0),
+            ))
+        take_judge_receipts(result.get("judge_receipts"))
+        take_judge_receipts(result.get("quality_receipts"))
+    return receipts
+
+
+def map_result_to_trial(result, task_kind_, trial_id, status, spend, route, env_fp,
+                         details_path="result.json"):
+    """CONTRACT's trial.json score mapping: `tests` -> (score, quality_score);
+    `answer` -> (score, null); `judge` -> (judge_score/10, null); `chain` ->
+    (the chain's mean-of-steps score, already computed into `result["score"]`
+    by `do_one_chain_run`; quality is the single end-of-chain quality-judge
+    score -- run.py's chain implementation runs the work-quality judge ONCE
+    over the whole session, never per step, so there is no per-step quality
+    figure to average; the one chain-level `quality_score`, already scaled
+    0..1 like every other kind's, is used directly)."""
+    if task_kind_ in ("chain", "tests"):
+        correctness = result.get("score")
+        quality = result.get("quality_score")
+    elif task_kind_ == "answer":
+        correctness = result.get("score")
+        quality = None
+    elif task_kind_ == "judge":
+        js = result.get("judge_score")
+        correctness = (js / 10.0) if js is not None else None
+        quality = None
+    else:
+        correctness = result.get("score")
+        quality = result.get("quality_score")
+
+    wall_ms = int(round((result.get("wall_s") or 0.0) * 1000))
+    trial = {
+        "schema": 1, "trial_id": trial_id, "status": status,
+        "correctness": correctness, "quality": quality, "wall_ms": wall_ms,
+        "spend": spend, "route": route, "env_fingerprint": env_fp, "details": details_path,
+    }
+    if result.get("escalated"):
+        trial["escalated"] = True
+        trial["escalate_reason"] = result.get("escalate_reason")
+    return trial
+
+
+def _empty_money(unknown_count=0):
+    return {"reported_usd": None, "estimated_usd": None, "unknown_count": unknown_count,
+            "price_as_of": None, "calls": 0}
+
+
+def _add_to_money(bucket, reported_usd):
+    if reported_usd is None:
+        bucket["unknown_count"] += 1
+    else:
+        bucket["reported_usd"] = (bucket["reported_usd"] or 0.0) + reported_usd
+    bucket["calls"] += 1
+
+
+_EXECUTION_SOURCES = {"agent", "intake", "jev", "helper", "worker"}
+_OVERHEAD_SOURCES = {"judge", "proposer"}
+
+
+def fallback_spend_report(receipts):
+    """Built purely from `receipts.jsonl` when `zirv workflow spend` is
+    missing or fails -- `completeness` is always `"partial"`, and
+    `execution.unknown_count` is NEVER 0, even when every agent/judge
+    receipt we DO have carries a `reported_usd`: this run.py process only
+    ever sees its own agent+judge calls, never the intake/Jev decision spend
+    the Rust side's own delegation/effect records hold, so at least that
+    much of `execution` is always unaccounted for here (contract: "never
+    report unknown as 0")."""
+    by_source = {}
+    tokens_total = {"input_tokens": 0, "output_tokens": 0,
+                     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    execution = _empty_money(unknown_count=1)
+    overhead = _empty_money(unknown_count=0)
+    calls = 0
+    cached_calls = 0
+    duplicates_dropped = 0
+    seen_ids = set()
+    receipt_counts = {}
+    billing_values = set()
+    for r in receipts or []:
+        rid = r.get("receipt_id")
+        if rid is not None:
+            if rid in seen_ids:
+                duplicates_dropped += 1
+                continue
+            seen_ids.add(rid)
+        calls += 1
+        if r.get("cached"):
+            cached_calls += 1
+        src = r.get("source") or "unknown"
+        bucket = by_source.setdefault(src, _empty_money())
+        usd = r.get("reported_usd")
+        _add_to_money(bucket, usd)
+        for k in tokens_total:
+            tokens_total[k] += r.get(k, 0) or 0
+        b = r.get("billing")
+        if b:
+            billing_values.add(b)
+        receipt_counts[src] = receipt_counts.get(src, 0) + 1
+        target = overhead if src in _OVERHEAD_SOURCES else execution
+        _add_to_money(target, usd)
+    billing = next(iter(billing_values)) if len(billing_values) == 1 else "unknown"
+    return {
+        "schema": 1, "execution": execution, "overhead": overhead, "by_source": by_source,
+        "calls": calls, "cached_calls": cached_calls, "duplicates_dropped": duplicates_dropped,
+        "completeness": "partial", "billing": billing, "tokens": tokens_total,
+        "receipts": receipt_counts,
+    }
+
+
+def call_spend_command(state_dir, receipts_path, campaign, trial_id):
+    """`zirv workflow spend --state-dir ... --receipts ... --campaign ...
+    --trial ... --json` -- the one reconciler (issue #800). Returns the
+    parsed SpendReport dict, or `None` when the command is missing or fails,
+    so the caller falls back to `fallback_spend_report` instead of ever
+    reporting unknown spend as 0."""
+    argv = [zirv_exe(), "workflow", "spend", "--state-dir", str(state_dir),
+            "--receipts", str(receipts_path), "--campaign", str(campaign),
+            "--trial", str(trial_id), "--json"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    obj = parse_last_json(proc.stdout)
+    return obj if isinstance(obj, dict) else None
+
+
+def compute_env_fingerprint(claude_version, zirv_version, python_version, dir_names):
+    """sha256, first 16 hex chars, over the four ingredients CONTRACT names:
+    `claude --version`, the zirv version actually resolved off PATH, the
+    Python version, and the sorted names in the vanilla/plugin dirs the
+    condition uses. Pure and deterministic -- the actual version/dir probing
+    lives in `env_fingerprint_for_trial` below."""
+    material = "\n".join([
+        f"claude:{claude_version or ''}",
+        f"zirv:{zirv_version or ''}",
+        f"python:{python_version or ''}",
+        "dirs:" + ",".join(sorted(dir_names or [])),
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _tool_version_line(argv):
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        text = (proc.stdout or proc.stderr or "").strip()
+        return text.splitlines()[0] if text else ""
+    except Exception:
+        return ""
+
+
+def env_fingerprint_for_trial(spec):
+    """The live inputs to `compute_env_fingerprint` for one trial: resolved
+    `claude --version`, the zirv version actually on PATH (after
+    `spec.zirv_dir` has already been prepended by the caller), this
+    process's own Python version, and the sorted file names under
+    `spec.zirv_dir` and the vanilla plugin dir (`VANILLA_PLUGIN_DIR`), if
+    either is set for this run."""
+    claude_version = _tool_version_line([CLAUDE_EXE, "--version"])
+    zirv_version = _tool_version_line([zirv_exe(), "--version"])
+    python_version = sys.version.split()[0]
+    dir_names = []
+    for d in (spec.get("zirv_dir"), VANILLA_PLUGIN_DIR):
+        if d and Path(d).is_dir():
+            dir_names.extend(p.name for p in Path(d).iterdir())
+    return compute_env_fingerprint(claude_version, zirv_version, python_version, dir_names)
+
+
+BASELINE_VISIBLE_FAILURE_NAMES = BASELINE_VISIBLE_FAILURES  # alias -- see escalate_should_trigger
+ESCALATE_CONTINUATION_PROMPT = (
+    "Your previous attempt on this repository did not fully succeed: either "
+    "it errored, or it left more visible test failures than this template's "
+    "own known baseline (tests/test_rules.py::test_regex_rule_case_insensitive). "
+    "Continue from the CURRENT state of this repository -- do not start over "
+    "from scratch unless the existing state is unusable -- diagnose what is "
+    "still wrong, and finish the task correctly."
+)
+
+
+def escalate_should_trigger(is_error, visible_fail_names, baseline_failures=BASELINE_VISIBLE_FAILURES):
+    """#804 `escalate` strategy's trigger: the first attempt errored
+    outright, OR the VISIBLE test suite (never a hidden one -- the agent
+    must never be escalated based on information it could not see) has more
+    failures than the template's own known baseline. Any visible failure
+    name not already in the known baseline set trips this; the known
+    baseline failure itself (already red on a pristine template) never
+    does, on its own."""
+    if is_error:
+        return True
+    return bool(set(visible_fail_names or []) - set(baseline_failures))
+
+
+def run_escalate_trial(bench_root, spec, cond, out_dir, model, timeout_s, spec_env):
+    """#804 `escalate` strategy: attempt 1 on `spec.route.model`; if it
+    errors or the VISIBLE suite regresses beyond the template's known
+    baseline (`escalate_should_trigger`), attempt 2 runs in the SAME repo
+    (never a fresh template copy -- the point is to continue, not restart)
+    on `spec.strategy.to_model` with `ESCALATE_CONTINUATION_PROMPT`. Both
+    attempts are agent receipts (`result["attempts"]`, consumed by
+    `receipts_from_result`); the final grade reflects the repo's state after
+    whichever attempt ran last, and its own full cost (including a failed
+    first attempt) is always included."""
+    bench_root = Path(bench_root)
+    out_dir = Path(out_dir)
+    task = spec["task"]
+    task_dir = bench_root / "tasks" / task
+    template_dir = bench_root / "template"
+    to_model = (spec.get("strategy") or {}).get("to_model")
+    if not to_model:
+        raise ValueError("escalate strategy requires strategy.to_model")
+    kind = read_text(task_dir / "kind.txt").strip()
+    prompt_text = read_text(task_dir / "prompt.txt")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    repo_dir = out_dir / "repo"
+    dirty = subprocess.run([GIT_EXE, "-C", str(template_dir), "status", "--porcelain"],
+                           capture_output=True, text=True).stdout.strip()
+    if dirty:
+        raise RuntimeError(f"template is not pristine, refusing to copy:\n{dirty}")
+    shutil.copytree(template_dir, repo_dir)
+
+    env_extra = merge_spec_env(cond_env_for(cond), spec_env)
+
+    result = {
+        "task": task, "cond": cond, "rep": spec.get("rep", 1), "model": model,
+        "wall_s": 0.0, "duration_ms": None, "duration_api_ms": None, "num_turns": 0,
+        "total_cost_usd": 0.0, "agent_cost_usd": 0.0,
+        "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_ephemeral_1h_input_tokens": None, "cache_creation_ephemeral_5m_input_tokens": None,
+        "subagents_spawned": 0, "permission_denials": 0, "is_error": False, "exit_code": None,
+        "zirv_cmds": {"workflow": 0, "skill": 0, "agent": 0, "ctx": 0, "other": 0}, "tool_calls": 0,
+        "score": 0.0, "passed": 0, "total": 0, "visible_ok": False, "details": "",
+        "judge_score": None, "judge_reasoning": None, "quality_score": None, "quality_reasoning": None,
+        "proxy": default_proxy_meta(), "workflow_started": False, "workflow_note": None,
+        "model_used": model, "session_id": None, "judge_receipts": [], "quality_receipts": [],
+        "escalated": False, "escalate_reason": None, "attempts": [],
+    }
+
+    start = time.time()
+    prompt_for_launch = prompt_text
+    remaining_budget = timeout_s
+    model_used = model
+
+    if cond in JEV_PROXY_LIKE_CONDS:
+        proxy_obj, proxy_elapsed, proxy_err, _raw = call_proxy(
+            repo_dir, prompt_text, timeout_s=min(PROXY_CALL_TIMEOUT_S, timeout_s), env_extra=env_extra)
+        if proxy_obj is None:
+            result["is_error"] = True
+            result["wall_s"] = time.time() - start
+            result["details"] = f"proxy failure: {proxy_err}"
+            write_result(out_dir, result)
+            return result
+        seat_tier = proxy_obj.get("seat_tier")
+        model_used = SEAT_MODEL_MAP.get(seat_tier) or model
+        workflow = proxy_obj.get("workflow")
+        workflow_elapsed = 0.0
+        started_workflow_id = None
+        if workflow:
+            workflow_started, workflow_note, workflow_elapsed, workflow_id = start_workflow(
+                repo_dir, workflow, prompt_text, proxy_obj.get("complexity"), proxy_obj.get("risk"),
+                env_extra=env_extra)
+            result["workflow_started"] = workflow_started
+            result["workflow_note"] = workflow_note
+            started_workflow_id = workflow_id if workflow_started else None
+        layer_text = build_proxy_layer(proxy_obj, model_used, started_workflow_id)
+        prompt_for_launch = layer_text + "\n\n" + prompt_text
+        usage = proxy_obj.get("usage", {}) or {}
+        proxy_cost = (usage.get("input_tokens", 0) or 0) * PROXY_COST_PER_INPUT_TOKEN
+        result["proxy"] = {
+            "complexity": proxy_obj.get("complexity"), "risk": proxy_obj.get("risk"),
+            "execution": proxy_obj.get("execution"), "seat_role": proxy_obj.get("seat_role"),
+            "seat_tier": seat_tier, "worker_tier": proxy_obj.get("worker_tier"),
+            "workflow": workflow, "workflow_id": started_workflow_id,
+            "domains": proxy_obj.get("domains") or [], "decider": proxy_obj.get("decider"),
+            "effort": proxy_obj.get("effort"), "elapsed_ms": proxy_obj.get("elapsed_ms"),
+            "input_tokens": usage.get("input_tokens", 0) or 0,
+            "output_tokens": usage.get("output_tokens", 0) or 0,
+            "cost_usd": proxy_cost, "wall_s": proxy_elapsed + workflow_elapsed,
+        }
+        result["total_cost_usd"] += proxy_cost
+        remaining_budget = max(30.0, timeout_s - (proxy_elapsed + workflow_elapsed))
+    result["model_used"] = model_used
+
+    def do_attempt(attempt_model, attempt_prompt, budget):
+        n = len(result["attempts"]) + 1
+        stdout_path = out_dir / f"stdout_attempt_{n}.json"
+        stderr_path = out_dir / f"stderr_attempt_{n}.txt"
+        prompt_path = out_dir / f"prompt_attempt_{n}.txt"
+        prompt_path.write_text(attempt_prompt, encoding="utf-8")
+        proc = stdout_f = stderr_f = stdin_f = None
+        exit_code = None
+        timed_out = False
+        t0 = time.time()
+        try:
+            proc, argv, stdout_f, stderr_f, stdin_f = launch(
+                cond, attempt_model, attempt_prompt, prompt_path, repo_dir, stdout_path, stderr_path,
+                env_extra=env_extra)
+            try:
+                exit_code = wait_run(proc, budget, stderr_path)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                kill_tree(proc.pid)
+                try:
+                    exit_code = proc.wait(timeout=15)
+                except Exception:
+                    exit_code = -1
+        except Exception:
+            exit_code = -1
+        finally:
+            for f in (stdout_f, stderr_f, stdin_f):
+                if f:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+        wall = time.time() - t0
+        attempt_record = {"model": attempt_model, "wall_s": wall, "timed_out": timed_out,
+                           "exit_code": exit_code, "is_error": timed_out, "session_id": None,
+                           "cost_usd": None, "num_turns": None}
+        if timed_out:
+            result["attempts"].append(attempt_record)
+            return None, "", True
+        stdout_text = ""
+        try:
+            stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        obj = parse_last_json(stdout_text)
+        if obj is None:
+            attempt_record["is_error"] = True
+            result["attempts"].append(attempt_record)
+            return None, "", False
+        usage = obj.get("usage") or {}
+        attempt_record["is_error"] = bool(obj.get("is_error", False))
+        attempt_record["session_id"] = obj.get("session_id")
+        attempt_record["cost_usd"] = obj.get("total_cost_usd")
+        attempt_record["num_turns"] = obj.get("num_turns")
+        result["attempts"].append(attempt_record)
+        result["agent_cost_usd"] = (result["agent_cost_usd"] or 0.0) + (obj.get("total_cost_usd") or 0.0)
+        result["total_cost_usd"] += (obj.get("total_cost_usd") or 0.0)
+        result["input_tokens"] += usage.get("input_tokens", 0) or 0
+        result["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0) or 0
+        result["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0) or 0
+        result["output_tokens"] += usage.get("output_tokens", 0) or 0
+        result["subagents_spawned"] += (obj.get("subagent_stats", {}) or {}).get("spawned", 0) or 0
+        result["num_turns"] = (result["num_turns"] or 0) + (obj.get("num_turns") or 0)
+        result["session_id"] = obj.get("session_id")
+        return obj, obj.get("result", "") or "", False
+
+    obj1, result_text, timed_out1 = do_attempt(model_used, prompt_for_launch, remaining_budget)
+    remaining_budget = max(0.0, remaining_budget - result["attempts"][-1]["wall_s"])
+
+    if timed_out1:
+        result["is_error"] = True
+        result["timed_out"] = True
+        result["wall_s"] = time.time() - start
+        result["details"] = f"timeout after {timeout_s:.0f}s total budget (attempt 1)"
+        write_result(out_dir, result)
+        return result
+
+    attempt1_is_error = obj1 is None or bool(obj1.get("is_error", False))
+    result["is_error"] = obj1 is None
+    _v_passed, _v_total, v_fail_names, _v_out = run_unittest_discover(repo_dir, "tests")
+    v_fail_short = {n.rsplit(".", 1)[-1] for n in v_fail_names}
+    trigger = escalate_should_trigger(attempt1_is_error, v_fail_short)
+
+    final_result_text = result_text
+    if trigger and remaining_budget > 0:
+        result["escalated"] = True
+        result["escalate_reason"] = "error" if attempt1_is_error else "visible_regression"
+        obj2, result_text2, timed_out2 = do_attempt(to_model, ESCALATE_CONTINUATION_PROMPT, remaining_budget)
+        if timed_out2:
+            result["is_error"] = True
+            result["timed_out"] = True
+            result["wall_s"] = time.time() - start
+            result["details"] = f"timeout after {timeout_s:.0f}s total budget (escalated attempt)"
+            write_result(out_dir, result)
+            return result
+        if obj2 is not None:
+            result["model_used"] = to_model
+            final_result_text = result_text2
+            result["is_error"] = bool(obj2.get("is_error", False))
+        else:
+            result["is_error"] = True
+
+    result["wall_s"] = time.time() - start
+    (out_dir / "result.txt").write_text(final_result_text, encoding="utf-8")
+    tool_calls, zirv_cmds, transcript_note = scan_transcript(result.get("session_id"))
+    result["tool_calls"] = tool_calls
+    result["zirv_cmds"] = zirv_cmds
+    if transcript_note:
+        result["details"] = (result["details"] + "; " if result["details"] else "") + transcript_note
+
+    grading = grade(task_dir, kind, repo_dir, out_dir / "result.txt", prompt_text)
+    result["score"] = grading.get("score", 0.0)
+    result["passed"] = grading.get("passed", 0)
+    result["total"] = grading.get("total", 0)
+    result["visible_ok"] = grading.get("visible_ok", False)
+    if grading.get("details"):
+        result["details"] = (result["details"] + "; " if result["details"] else "") + str(grading["details"])
+    result["judge_score"] = grading.get("judge_score")
+    result["judge_reasoning"] = grading.get("judge_reasoning")
+    result["judge_receipts"] = grading.get("judge_receipts") or []
+
+    if kind == "tests":
+        quality_score, quality_reasoning, quality_receipts = call_quality_judge(
+            prompt_text, repo_dir, final_result_text)
+        result["quality_score"] = quality_score
+        result["quality_reasoning"] = quality_reasoning
+        result["quality_receipts"] = quality_receipts
+
+    write_result(out_dir, result)
+    return result
+
+
+def run_trial(spec_path, out_dir, cond):
+    """`--trial <spec.json> --out <dir> [--cond <cond>]`: run exactly the
+    one (task, rep) `spec` names, then write `<out>/receipts.jsonl` and
+    `<out>/trial.json`. Deliberately does NOT catch a broad exception: a
+    genuine harness failure (bad spec, dirty template, disk error, ...) must
+    propagate to a non-zero exit with NO trial.json written, exactly as
+    CONTRACT specifies ("If the harness itself fails, write no trial.json
+    and exit nonzero") -- the caller (the Rust runner) records that as
+    `crash`."""
+    spec = load_spec(spec_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dir = spec.get("state_dir")
+    if state_dir:
+        os.environ["ZIRV_CTX_STATE_DIR"] = str(state_dir)
+    for env_key, spec_key in (
+        ("ZIRV_ATTR_CAMPAIGN", "campaign"), ("ZIRV_ATTR_CANDIDATE", "candidate"),
+        ("ZIRV_ATTR_TRIAL", "trial_id"), ("ZIRV_ATTR_TASK", "task"),
+    ):
+        val = spec.get(spec_key)
+        if val:
+            os.environ[env_key] = str(val)
+
+    zirv_dir = spec.get("zirv_dir")
+    if zirv_dir:
+        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + ";" + os.environ["PATH"]
+
+    bench_root = Path(__file__).resolve().parent
+    task = spec["task"]
+    kind = task_kind(bench_root, task)
+    model = (spec.get("route") or {}).get("model") or "sonnet"
+    timeout_s = spec.get("timeout_secs") or (DEFAULT_TIMEOUT_MIN * 60)
+    spec_env = spec.get("env") or {}
+    rep = spec.get("rep", 1)
+    strategy = spec.get("strategy") or {}
+
+    if kind == "chain":
+        result = do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, False,
+                                   1, 1, run_dir_override=out_dir, spec_env=spec_env)
+    elif strategy.get("kind") == "escalate":
+        result = run_escalate_trial(bench_root, spec, cond, out_dir, model, timeout_s, spec_env)
+    else:
+        result = do_one_run(bench_root, task, cond, rep, model, timeout_s, False,
+                             1, 1, run_dir_override=out_dir, spec_env=spec_env)
+
+    status = "timeout" if result.get("timed_out") else ("error" if result.get("is_error") else "ok")
+
+    receipts = receipts_from_result(result)
+    receipts_path = out_dir / "receipts.jsonl"
+    with open(receipts_path, "w", encoding="utf-8") as f:
+        for r in receipts:
+            f.write(json.dumps(r) + "\n")
+
+    campaign = spec.get("campaign") or ""
+    trial_id = spec.get("trial_id") or ""
+    spend = call_spend_command(state_dir, receipts_path, campaign, trial_id) if state_dir else None
+    if spend is None:
+        spend = fallback_spend_report(receipts)
+
+    route = {
+        "harness": (spec.get("route") or {}).get("harness") or "claude",
+        "model": result.get("model_used") or model,
+        "tier": (result.get("proxy") or {}).get("seat_tier"),
+        "effort": (result.get("proxy") or {}).get("effort"),
+    }
+    env_fp = env_fingerprint_for_trial(spec)
+
+    trial = map_result_to_trial(result, kind, trial_id, status, spend, route, env_fp)
+    (out_dir / "trial.json").write_text(json.dumps(trial, indent=2), encoding="utf-8")
+    print(f"trial {trial_id or '(no id)'} -> status={status} correctness={trial['correctness']} "
+          f"quality={trial['quality']} wall_ms={trial['wall_ms']}")
+    return trial
+
+
+# ---------------------------------------------------------------------------
+# `--check-graders` (#801): no provider call anywhere in this section --
+# applying a reference patch and running unittest discovery are both local.
+# ---------------------------------------------------------------------------
+
+def _apply_patch_copy(template_dir, dest_dir, patch_path):
+    """Copy `template_dir` to `dest_dir` and `git apply` `patch_path` into
+    it. Returns (ok, stderr) -- never raises, so one broken reference patch
+    doesn't abort checking the rest."""
+    shutil.copytree(template_dir, dest_dir)
+    if patch_path is None:
+        return True, ""
+    proc = subprocess.run([GIT_EXE, "apply", str(patch_path)], cwd=str(dest_dir),
+                           capture_output=True, text=True)
+    return proc.returncode == 0, proc.stderr.strip()
+
+
+def _check_one_reference(template_dir, patch_path, grade_fn, label):
+    """One grader self-check: the reference-patched template must score
+    full; the untouched template must score BELOW full. Returns a result
+    row dict; never raises (a git-apply failure is recorded as a failed
+    check, not an exception, so `--check-graders` finishes the whole
+    table)."""
+    with tempfile.TemporaryDirectory(prefix="checkgraders-") as tmp:
+        tmp = Path(tmp)
+        ref_repo = tmp / "ref"
+        ok_apply, apply_err = _apply_patch_copy(template_dir, ref_repo, patch_path)
+        if not ok_apply:
+            return {"label": label, "ok": False, "ref_score": None, "template_score": None,
+                    "note": f"git apply failed: {apply_err[:300]}"}
+        ref_grading = grade_fn(ref_repo)
+        ref_score = ref_grading.get("score", 0.0) or 0.0
+
+        plain_repo = tmp / "plain"
+        _apply_patch_copy(template_dir, plain_repo, None)
+        plain_grading = grade_fn(plain_repo)
+        plain_score = plain_grading.get("score", 0.0) or 0.0
+
+    notes = []
+    ok = True
+    if ref_score < 0.999:
+        ok = False
+        notes.append(f"reference solution scored {ref_score} (expected full)")
+    if plain_score >= 0.999:
+        ok = False
+        notes.append(f"untouched template scored {plain_score} (expected below full)")
+    return {"label": label, "ok": ok, "ref_score": ref_score, "template_score": plain_score,
+            "note": "; ".join(notes) if notes else "ok"}
+
+
+def check_graders(bench_root, tasks=None):
+    """For every task (or the given subset) that ships a reference
+    solution: applying it to a pristine template copy must score full
+    marks, and grading an untouched pristine copy must score below full --
+    proof the grader can actually tell "solved" from "not solved", without
+    ever calling a model. Chain tasks are checked per step
+    (`reference/step_NN.patch` against that step's own hidden tests, mirrored
+    with `grade_step_tests`); non-chain `tests`-kind tasks via a single
+    `reference.patch` run through that task's own `grade.py`. A task with
+    neither (an `answer`/`judge`-kind task, or a `tests`-kind task that
+    never got a committed reference.patch) is skipped, not failed -- shipping
+    one is optional today.
+
+    Returns (rows, ok): `rows` is the per-check list for the printed table;
+    `ok` is False if any check that DID run failed.
+    """
+    bench_root = Path(bench_root)
+    tasks_dir = bench_root / "tasks"
+    template_dir = bench_root / "template"
+    all_tasks = sorted(p.name for p in tasks_dir.iterdir() if p.is_dir())
+    selected = tasks if tasks else all_tasks
+    rows = []
+    ok = True
+    for task in selected:
+        task_dir = tasks_dir / task
+        kind_path = task_dir / "kind.txt"
+        if not kind_path.exists():
+            continue
+        kind = read_text(kind_path).strip()
+        if kind == "chain":
+            for step in read_chain_steps(task_dir):
+                if step["kind"] != "tests":
+                    continue
+                patch = task_dir / "reference" / f"step_{step['label']}.patch"
+                if not patch.exists():
+                    continue
+                hidden_dir = step["hidden_dir"]
+                row = _check_one_reference(
+                    template_dir, patch, lambda repo, hd=hidden_dir: grade_step_tests(repo, hd),
+                    f"{task}/step_{step['label']}")
+                rows.append(row)
+                ok = ok and row["ok"]
+        elif kind == "tests":
+            patch = task_dir / "reference.patch"
+            if not patch.exists():
+                continue
+            grade_py = task_dir / "grade.py"
+            if not grade_py.exists():
+                continue
+
+            def grade_fn(repo, grade_py=grade_py):
+                obj, _proc = run_grade_py(grade_py, repo, repo / "NONEXISTENT_RESULT.txt")
+                return obj or {"score": 0.0, "total": 0}
+
+            row = _check_one_reference(template_dir, patch, grade_fn, task)
+            rows.append(row)
+            ok = ok and row["ok"]
+        # answer/judge-kind tasks: no reference.patch to check here (their
+        # ground truth is a fixed answer/rubric, not a code diff).
+    return rows, ok
+
+
+def print_check_graders_report(rows):
+    print(f"{'check':40} {'ref':>6} {'template':>9}  result")
+    for row in rows:
+        ref = "n/a" if row["ref_score"] is None else f"{row['ref_score']:.3f}"
+        tpl = "n/a" if row["template_score"] is None else f"{row['template_score']:.3f}"
+        status = "OK" if row["ok"] else "FAIL"
+        print(f"{row['label']:40} {ref:>6} {tpl:>9}  {status} -- {row['note']}")
+    n_fail = sum(1 for r in rows if not r["ok"])
+    print(f"\n{len(rows)} checks, {n_fail} failed.")
+
+
+# ---------------------------------------------------------------------------
+# corpus.toml (#801): versioned task-corpus loader/validator, stdlib `tomllib`
+# only (Python 3.11+).
+# ---------------------------------------------------------------------------
+
+VALID_SPLITS = {"dev", "validation", "holdout"}
+VALID_TASK_CLASSES = {
+    "mechanical", "bounded", "bug", "feature", "architecture", "ambiguous",
+    "sensitive", "long_session",
+}
+
+
+def load_corpus_toml(path):
+    import tomllib
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def validate_corpus(corpus, all_task_ids):
+    """corpus.toml must declare `schema = 1`, a `version`, and every id in
+    `all_task_ids` (the task directories actually on disk) exactly once
+    under `[[task]]`, each with a valid `split`/`class`/`family`/`kind`.
+    Returns a list of problem strings; empty means valid. Pure function of
+    the parsed TOML dict and the task-id list -- no filesystem access of its
+    own."""
+    problems = []
+    if corpus.get("schema") != 1:
+        problems.append(f"schema must be 1, got {corpus.get('schema')!r}")
+    if not corpus.get("version"):
+        problems.append("version is required")
+    tasks = corpus.get("task") or []
+    seen = {}
+    for entry in tasks:
+        tid = entry.get("id")
+        if not tid:
+            problems.append(f"task entry missing id: {entry!r}")
+            continue
+        seen[tid] = seen.get(tid, 0) + 1
+        if entry.get("split") not in VALID_SPLITS:
+            problems.append(f"{tid}: invalid split {entry.get('split')!r}")
+        if entry.get("class") not in VALID_TASK_CLASSES:
+            problems.append(f"{tid}: invalid class {entry.get('class')!r}")
+        if not entry.get("family"):
+            problems.append(f"{tid}: missing family")
+        if not entry.get("kind"):
+            problems.append(f"{tid}: missing kind")
+    for tid, count in seen.items():
+        if count > 1:
+            problems.append(f"{tid}: appears {count} times (must be exactly once)")
+    missing = set(all_task_ids) - set(seen)
+    extra = set(seen) - set(all_task_ids)
+    if missing:
+        problems.append(f"missing tasks (on disk but not in corpus.toml): {sorted(missing)}")
+    if extra:
+        problems.append(f"unknown tasks (in corpus.toml but no task dir): {sorted(extra)}")
+    return problems
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tasks", required=True, help="'all' or comma-separated task ids")
-    ap.add_argument("--conds", required=True,
+    ap.add_argument("--tasks", default=None, help="'all' or comma-separated task ids")
+    ap.add_argument("--conds", default=None,
                      help="comma-separated subset of " + ",".join(CANONICAL_CONDS))
-    ap.add_argument("--reps", type=int, required=True)
-    ap.add_argument("--model", required=True,
+    ap.add_argument("--reps", type=int, default=None)
+    ap.add_argument("--model", default=None,
                      help="model for vanilla/zirv; ignored for zirv-proxy (seat_tier decides)")
     ap.add_argument("--parallel", type=int, default=1)
     ap.add_argument("--timeout-min", type=float, default=DEFAULT_TIMEOUT_MIN)
@@ -1850,17 +2754,46 @@ def main():
                      help="defaults to this script's directory ($BENCH)")
     ap.add_argument("--stagger-s", type=float, default=0.0, help="minimum seconds between two run starts")
     ap.add_argument("--noninteractive", action="store_true", help="prefix every condition's prompt with NONINTERACTIVE_NOTE")
+    # Issue #802 (autoresearch Lane C): a single runner-driven trial.
+    ap.add_argument("--trial", default=None, help="spec.json path -- run exactly the one (task, rep) it names")
+    ap.add_argument("--out", default=None, help="trial output directory (with --trial)")
+    ap.add_argument("--cond", default="zirv-proxy", help="condition for --trial (default zirv-proxy)")
+    # Issue #801: grader self-check, no provider call.
+    ap.add_argument("--check-graders", action="store_true", help="verify reference-patch graders locally, no provider call")
     args = ap.parse_args()
 
     global RUNS_SUBDIR, VANILLA_PLUGIN_DIR, NONINTERACTIVE, STAGGER_S
-    STAGGER_S = args.stagger_s
     RUNS_SUBDIR = args.runs_subdir
     NONINTERACTIVE = args.noninteractive
     VANILLA_PLUGIN_DIR = args.vanilla_plugin_dir
+    bench_root = Path(args.bench_root) if args.bench_root else Path(__file__).resolve().parent
+
+    if args.check_graders:
+        tasks = None
+        if args.tasks and args.tasks != "all":
+            tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        rows, ok = check_graders(bench_root, tasks)
+        print_check_graders_report(rows)
+        sys.exit(0 if ok else 1)
+
+    if args.trial:
+        if not args.out:
+            print("--trial requires --out", file=sys.stderr)
+            sys.exit(2)
+        if args.zirv_dir:
+            os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        run_trial(args.trial, args.out, args.cond)
+        return
+
+    if not (args.tasks and args.conds and args.reps and args.model):
+        print("--tasks/--conds/--reps/--model are required unless --trial or --check-graders is given",
+              file=sys.stderr)
+        sys.exit(2)
+
+    STAGGER_S = args.stagger_s
     if args.zirv_dir:
         os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
         print("zirv under test:", shutil.which("zirv"))
-    bench_root = Path(args.bench_root) if args.bench_root else Path(__file__).resolve().parent
     tasks_dir = bench_root / "tasks"
 
     if args.tasks == "all":

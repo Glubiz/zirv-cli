@@ -1,0 +1,15 @@
+Picking this back up after a handoff, so a quick recap of where the notes
+feature stands: note ids are always negative (-1, -2, -3, ... in creation
+order, never reused, never colliding with a transaction id), `note-add`
+rejects text over 200 characters, and `note-list`/`note-add` both support
+`--pinned`.
+
+Two things left:
+
+1. Actually fix the note-ordering issue we deferred earlier: `note-list`
+   (with or without `--pinned`) must now always return notes in the order
+   they were created (oldest first), regardless of what order they happen
+   to be stored in.
+2. Add a `notes_summary(notes)` function to `report.py` that returns counts
+   of pinned vs. unpinned notes, and have the `summary` command's
+   pinned-notes line use it instead of counting inline.

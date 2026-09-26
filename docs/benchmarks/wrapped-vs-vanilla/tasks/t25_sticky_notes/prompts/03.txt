@@ -1,0 +1,4 @@
+A user reported there's no way to delete a note once it's added. Add
+`note-remove NOTE_ID [--notes-store PATH]` that removes the note with that
+id. If no note has that id, don't change anything -- print a clear message
+and exit with status code 2.

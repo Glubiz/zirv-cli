@@ -1,0 +1,206 @@
+# wrapped-vs-vanilla task corpus (issue #801).
+#
+# Every task directory under tasks/ must appear here exactly once. `split`
+# partitions tasks by GROUP so near-duplicates never straddle a split
+# boundary: t24_long_haul and t24b_long_haul are byte-identical except for
+# two step prompts (see tasks/README.md's "t24b_long_haul" note), so both
+# sit in `holdout` together -- using one for screening and the other as the
+# "unseen" holdout would leak almost the whole task into iterative candidate
+# selection. `dev` is the cheap small-task set used for autoresearch
+# screening (#802); `validation`/`holdout` each cover several `class`
+# values and at least one `long_session` chain task, per #801's evaluation
+# contract. See CONTRACT.md's "Task corpus and splits" section for the full
+# rule this file follows.
+#
+# Today there is exactly one project family (`ledgerlite`); every report
+# built from this corpus must flag `single_family` per the design spec's
+# non-goals ("no new benchmark project families").
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "t01_tiebreak"
+family = "ledgerlite"
+class = "bounded"
+split = "dev"
+kind = "answer"
+
+[[task]]
+id = "t02_pagination"
+family = "ledgerlite"
+class = "bug"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t03_money"
+family = "ledgerlite"
+class = "bug"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t04_budget"
+family = "ledgerlite"
+class = "feature"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t05_dedupe"
+family = "ledgerlite"
+class = "architecture"
+split = "dev"
+kind = "judge"
+
+[[task]]
+id = "t06_currency"
+family = "ledgerlite"
+class = "feature"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t07_redtest"
+family = "ledgerlite"
+class = "bug"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t08_usage_doc"
+family = "ledgerlite"
+class = "mechanical"
+split = "dev"
+kind = "judge"
+
+[[task]]
+id = "t09_count"
+family = "ledgerlite"
+class = "mechanical"
+split = "dev"
+kind = "answer"
+
+[[task]]
+id = "t10_shares"
+family = "ledgerlite"
+class = "feature"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t11_export"
+family = "ledgerlite"
+class = "feature"
+split = "dev"
+kind = "tests"
+
+[[task]]
+id = "t12_deadcode"
+family = "ledgerlite"
+class = "mechanical"
+split = "dev"
+kind = "answer"
+
+[[task]]
+id = "t13_recurring"
+family = "ledgerlite"
+class = "feature"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t14_bugsweep"
+family = "ledgerlite"
+class = "bug"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t15_reports"
+family = "ledgerlite"
+class = "feature"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t16_tags"
+family = "ledgerlite"
+class = "feature"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t17_schema_migration"
+family = "ledgerlite"
+class = "architecture"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t18_ledger_layer"
+family = "ledgerlite"
+class = "architecture"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t19_goals_saga"
+family = "ledgerlite"
+class = "feature"
+split = "validation"
+kind = "tests"
+
+[[task]]
+id = "t23_afternoon"
+family = "ledgerlite"
+class = "long_session"
+split = "validation"
+kind = "chain"
+
+[[task]]
+id = "t25_sticky_notes"
+family = "ledgerlite"
+class = "long_session"
+split = "validation"
+kind = "chain"
+
+[[task]]
+id = "t20_audit_log"
+family = "ledgerlite"
+class = "architecture"
+split = "holdout"
+kind = "tests"
+
+[[task]]
+id = "t21_search"
+family = "ledgerlite"
+class = "ambiguous"
+split = "holdout"
+kind = "tests"
+
+[[task]]
+id = "t22_envelopes"
+family = "ledgerlite"
+class = "architecture"
+split = "holdout"
+kind = "tests"
+
+# t24_long_haul and t24b_long_haul are the SAME task group (see the file
+# header) -- both belong in holdout together, never split across
+# validation/holdout, so neither run is a "seen" near-duplicate of the
+# other's holdout use.
+[[task]]
+id = "t24_long_haul"
+family = "ledgerlite"
+class = "long_session"
+split = "holdout"
+kind = "chain"
+
+[[task]]
+id = "t24b_long_haul"
+family = "ledgerlite"
+class = "long_session"
+split = "holdout"
+kind = "chain"
