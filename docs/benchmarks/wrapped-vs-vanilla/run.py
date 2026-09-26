@@ -1595,11 +1595,17 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
 
         prompt_for_launch = raw_prompt
         step_record = {
-            "label": step["label"], "kind": step["kind"], "wall_s": 0.0, "cost_usd": 0.0,
+            "label": step["label"], "kind": step["kind"], "wall_s": 0.0,
+            # cost_usd stays None (unknown) until a real `-p --output-format
+            # json` envelope is actually parsed below -- issue #802 review
+            # (P2): defaulting this to 0.0 made a step killed by timeout (or
+            # any other break-before-parse path) look like a confirmed,
+            # zero-cost metered receipt instead of an unknown one.
+            "cost_usd": None,
             "num_turns": None, "input_tokens": 0, "output_tokens": 0,
             "score": None, "passed": None, "total": None, "visible_ok": None,
             "details": "", "is_error": False, "cost_estimated_part_usd": 0.0,
-            "session_id": None, "judge_receipts": [],
+            "session_id": None, "judge_receipts": [], "timed_out": False,
         }
         step_t0 = time.time()
 
@@ -1699,6 +1705,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
 
         if timed_out:
             step_record["is_error"] = True
+            step_record["timed_out"] = True
             step_record["details"] = (step_record["details"] + "; " if step_record["details"] else "") + \
                 f"timeout after chain budget exhausted (~{timeout_s:.0f}s total)"
             result["steps"].append(step_record)
@@ -2032,9 +2039,17 @@ def receipts_from_result(result):
             jr["receipt_id"] = next_id("judge")
             receipts.append(jr)
 
+    # issue #801/#802 review (P1/P2): a killed agent run has NO session_id
+    # and NO cost -- both None -- but real (unknown-amount) spend may
+    # already have happened before it was killed. Each branch below also
+    # emits a receipt on its own `timed_out` flag alone, so that spend is
+    # never silently dropped; `agent_receipt_from_result`/`make_receipt`
+    # already turn a `None` cost into `reported_usd: null, billing:
+    # "unknown"` on their own, so nothing else has to change for that part.
     if result.get("kind") == "chain":
         for step in result.get("steps") or []:
-            if step.get("session_id") is not None or step.get("cost_usd") is not None:
+            if (step.get("session_id") is not None or step.get("cost_usd") is not None
+                    or step.get("timed_out")):
                 receipts.append(agent_receipt_from_result(
                     session=step.get("session_id"), cost_usd=step.get("cost_usd"),
                     model=result.get("model_used"), receipt_id=next_id("agent"),
@@ -2046,7 +2061,8 @@ def receipts_from_result(result):
     elif result.get("attempts"):
         # escalate strategy (#804): one agent receipt per attempt.
         for att in result["attempts"]:
-            if att.get("session_id") is not None or att.get("cost_usd") is not None:
+            if (att.get("session_id") is not None or att.get("cost_usd") is not None
+                    or att.get("timed_out")):
                 receipts.append(agent_receipt_from_result(
                     session=att.get("session_id"), cost_usd=att.get("cost_usd"),
                     model=att.get("model"), receipt_id=next_id("agent"), cumulative=False,
@@ -2054,7 +2070,8 @@ def receipts_from_result(result):
         take_judge_receipts(result.get("judge_receipts"))
         take_judge_receipts(result.get("quality_receipts"))
     else:
-        if result.get("session_id") is not None or result.get("agent_cost_usd") is not None:
+        if (result.get("session_id") is not None or result.get("agent_cost_usd") is not None
+                or result.get("timed_out")):
             receipts.append(agent_receipt_from_result(
                 session=result.get("session_id"), cost_usd=result.get("agent_cost_usd"),
                 model=result.get("model_used"), receipt_id=next_id("agent"), cumulative=False,
