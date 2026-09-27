@@ -658,3 +658,103 @@ pub(crate) fn dispatch_batch(
     }
     Ok(stop_reason)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_for_is_deterministic_and_differs_by_stage_and_candidate() {
+        let a = seed_for("campaign-1", "cand-a", "screen");
+        let b = seed_for("campaign-1", "cand-a", "screen");
+        assert_eq!(a, b, "the same inputs must hash to the same seed");
+
+        let different_stage = seed_for("campaign-1", "cand-a", "validate");
+        let different_candidate = seed_for("campaign-1", "cand-b", "screen");
+        assert_ne!(a, different_stage);
+        assert_ne!(a, different_candidate);
+    }
+
+    #[test]
+    fn shuffled_is_a_permutation_of_the_input_and_deterministic_for_a_seed() {
+        let tasks: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+
+        let once = shuffled(&tasks, 42);
+        let twice = shuffled(&tasks, 42);
+        assert_eq!(once, twice, "the same seed must produce the same order");
+
+        let mut sorted_once = once.clone();
+        sorted_once.sort();
+        let mut sorted_input = tasks.clone();
+        sorted_input.sort();
+        assert_eq!(
+            sorted_once, sorted_input,
+            "shuffling must reorder, never add or drop tasks"
+        );
+
+        let other_seed = shuffled(&tasks, 7);
+        assert_ne!(
+            once, other_seed,
+            "a different seed should (for this input) produce a different order"
+        );
+    }
+
+    fn corpus_with_split_and_class_tasks() -> Corpus {
+        Corpus::parse(
+            r#"
+schema = 1
+version = "1"
+
+[[task]]
+id = "t-dev-bounded"
+family = "f"
+class = "bounded"
+split = "dev"
+
+[[task]]
+id = "t-dev-architecture"
+family = "f"
+class = "architecture"
+split = "dev"
+
+[[task]]
+id = "t-validation-bounded"
+family = "f"
+class = "bounded"
+split = "validation"
+"#,
+        )
+        .expect("corpus fixture must parse")
+    }
+
+    #[test]
+    fn task_ids_filters_by_split_and_then_by_classes() {
+        let corpus = corpus_with_split_and_class_tasks();
+
+        let all_dev = task_ids(&corpus, Split::Dev, &[]);
+        assert_eq!(all_dev, vec!["t-dev-bounded", "t-dev-architecture"]);
+
+        let bounded_dev = task_ids(&corpus, Split::Dev, &["bounded".to_string()]);
+        assert_eq!(bounded_dev, vec!["t-dev-bounded"]);
+
+        let validation = task_ids(&corpus, Split::Validation, &[]);
+        assert_eq!(validation, vec!["t-validation-bounded"]);
+    }
+
+    #[test]
+    fn sanitize_keeps_alphanumeric_dash_underscore_and_dot_and_replaces_the_rest() {
+        assert_eq!(sanitize("screen/cand a:r#1.log"), "screen_cand_a_r_1.log");
+        assert_eq!(sanitize("already-fine_1.0"), "already-fine_1.0");
+    }
+
+    #[test]
+    fn parse_status_maps_known_text_and_falls_back_to_crash_for_unknown_text() {
+        assert_eq!(parse_status("ok"), backend::TrialStatus::Ok);
+        assert_eq!(parse_status("error"), backend::TrialStatus::Error);
+        assert_eq!(parse_status("timeout"), backend::TrialStatus::Timeout);
+        assert_eq!(
+            parse_status("something-unrecognized"),
+            backend::TrialStatus::Crash
+        );
+    }
+}
