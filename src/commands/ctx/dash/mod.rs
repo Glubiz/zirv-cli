@@ -1995,8 +1995,8 @@ fn rollover_committed_toast(
 /// OTHER session's rows in too, which is why the section could look like it
 /// was not moving even though the calling session's own calls were landing:
 /// a handful of new rows barely shift a total already carrying a whole
-/// machine's unrelated history. `sessions` is `dashboard_session_set`'s own
-/// result -- this dashboard's own panes plus their descendants -- so the
+/// machine's unrelated history. `sessions` is `jev_session_snapshot`'s own
+/// result -- every pane this dashboard has ever hosted, this run -- so the
 /// section now reads as this session's own total.
 fn jev_section_fact(
     cfg: &CtxConfig,
@@ -2075,29 +2075,37 @@ fn jev_section_fact(
     })
 }
 
-/// Session-scoped total follow-up: the JEV sidebar's own session set --
-/// every pane this dashboard currently hosts (the orchestrator's own
-/// `Verb::Chat` pane included; a native in-process subagent shares its
-/// parent's session id outright, so it needs no separate entry), plus every
-/// session `sessions::session_closure` can reach from there through the
-/// delegation ledger's own parent chain (a `zirv agent` worker spawned by a
-/// worker, and so on). Read once per JEV refresh (`JEV_THROTTLE`, 10s) --
-/// never per frame -- alongside `jev_section_fact`'s own read.
+/// Session-scoped total, review round: folds this tick's live pane session
+/// ids into `sessions` (the dashboard's own grow-only running set -- see its
+/// own doc comment where it is declared) and hands back a snapshot for
+/// `jev::usage_rollup`'s own filter. Read once per JEV refresh
+/// (`JEV_THROTTLE`, 10s) -- never per frame -- alongside `jev_section_
+/// fact`'s own read.
 ///
-/// A reaped/ended pane's session is NOT included: this dashboard keeps no
-/// full session id for a retained ended row today (only its short id and a
-/// few display fields, see `EndedRow`), so an ended pane's own JEV activity
-/// stops counting toward the total the instant it is reaped. Documented
-/// gap, not a silent one -- the common case this section is watched for
-/// (an operator following live progress) is unaffected.
-fn dashboard_session_set(panes: &[Pane], state: &StateDir) -> BTreeSet<String> {
-    let roots: BTreeSet<String> = panes.iter().map(|p| p.session_id().to_string()).collect();
-    let delegations = super::log::read_delegations(state, usize::MAX);
-    let pairs: Vec<(String, String)> = delegations
-        .into_iter()
-        .map(|row| (row.session, row.parent_session))
-        .collect();
-    sessions::session_closure(&roots, &pairs)
+/// A prior shape of this closed the set over `log::read_delegations`' own
+/// parent chain (a `zirv agent` worker spawned by a worker, and so on) --
+/// review round found that this could never actually grow the set past a
+/// dashboard's own panes: a pane's `session_id()` is the FULL id
+/// `jev::session_and_principal` reads back off `ZIRV_CTX_SESSION`
+/// (confirmed identical for both adapters -- `claude.rs`'s own `register_
+/// turn_signal` sets it from `session.id.to_string()`, and `build_turn_env`'s
+/// own signal-less fallback pushes the same `session_id` string verbatim),
+/// while `DelegationRow::parent_session` is stamped from `mail::
+/// session_identity` (`sessions::short_id`, an 8-character prefix) -- so the
+/// two could never match, and every worker this dashboard itself spawns is
+/// already one of its own panes regardless, which is exactly what makes the
+/// simpler grow-only set below sufficient on its own. Reading the
+/// never-rotated delegation ledger in full every 10s was also needless
+/// cost this removes.
+///
+/// A reaped/ended pane's session id, once added, is never removed -- its
+/// own JEV rows keep counting toward the total after it finishes. What is
+/// NOT covered: a quit/restore round trip starts a fresh, empty set (a
+/// prior launch's session is not carried forward), and a headless worker
+/// that never became a pane of THIS dashboard is never added at all.
+fn jev_session_snapshot(sessions: &mut BTreeSet<String>, panes: &[Pane]) -> BTreeSet<String> {
+    sessions.extend(panes.iter().map(|p| p.session_id().to_string()));
+    sessions.clone()
 }
 
 /// One step of the footer rot track's own eased fill -- `prev` is `None`
@@ -12667,6 +12675,16 @@ fn run_dashboard_inner(
     // which call it names -- the flash-start clock for that line.
     let mut jev_last_flash_started: Option<Instant> = None;
     let mut jev_last_seen: Option<(String, u64)> = None;
+    // Session-scoped total, review round: every pane `session_id()` this
+    // dashboard has ever hosted, this run -- grow-only, NEVER pruned on
+    // reap, so a worker's own JEV rows keep counting toward the total after
+    // it finishes (see `jev_session_snapshot`'s own doc comment for why a
+    // delegation-ledger closure could not do this safely). Known gaps: a
+    // quit/restore round trip starts a fresh, empty set (an ended pane's
+    // session from a PRIOR dash launch is not carried forward), and a
+    // headless worker that never became a pane of this dashboard is never
+    // added at all.
+    let mut jev_dashboard_sessions: BTreeSet<String> = BTreeSet::new();
     // Coordinator follow-up: the footer's own rollover distance/soon must
     // show the exact `source_headroom_pct` the last real `rollover::
     // evaluate` call computed for this dashboard's orchestrator seat, not
@@ -13047,7 +13065,7 @@ fn run_dashboard_inner(
         // (the section only ever needs 24h-rollup freshness).
         if due(last_jev_refresh, sweep_now, JEV_THROTTLE) {
             last_jev_refresh = sweep_now;
-            let jev_sessions = dashboard_session_set(&panes, state);
+            let jev_sessions = jev_session_snapshot(&mut jev_dashboard_sessions, &panes);
             facts_cache.disk.jev = jev_section_fact(cfg, state, &jev_sessions);
             let last_now = facts_cache.disk.jev.as_ref().and_then(|fact| match fact {
                 ui::JevSectionFact::Active { last, .. } => {
@@ -20448,6 +20466,59 @@ mod tests {
         assert_eq!(seat.session, session_id);
 
         panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Session-scoped total, review round: `jev_session_snapshot`'s own set
+    /// is grow-only -- a pane's session id, once seen, stays in the JEV
+    /// filter even after that pane is reaped and no longer in `panes` at
+    /// all, so its own JEV rows keep counting toward the dashboard's total.
+    #[test]
+    fn a_panes_session_id_stays_in_the_jev_set_after_it_is_reaped() {
+        use super::pane::tests::long_lived_argv;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "88888888-3333-4444-8888-555555555555";
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let mut sessions: BTreeSet<String> = BTreeSet::new();
+        let seen_while_live = jev_session_snapshot(&mut sessions, std::slice::from_ref(&pane));
+        assert!(
+            seen_while_live.contains(session_id),
+            "the live pane's own session id is in the set"
+        );
+
+        // Reaped: the pane no longer exists in the slice the caller passes
+        // (the same shape a real `panes.retain`/removal leaves behind), but
+        // the running set it already grew into must not shrink back.
+        let seen_after_reap = jev_session_snapshot(&mut sessions, &[]);
+        assert!(
+            seen_after_reap.contains(session_id),
+            "a reaped pane's session id must still count: {seen_after_reap:?}"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
     }
 
     /// Issue #440: the incident itself. A rollover's successor dies right
