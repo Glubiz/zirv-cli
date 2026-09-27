@@ -1504,12 +1504,16 @@ fn evaluate_objective_after_cycle<W: Write>(
                 "{}\n\n---\nRecent transcript (tail):\n{transcript_tail}{JUDGE_OUTPUT_CONTRACT}",
                 objective::layer_text(&record),
             );
-            let answer = handoff::helper_answer(
+            // `env`, not the process env: `state` and `cfg` above were
+            // resolved through it, and the judge must see the same ones --
+            // see `helper_answer_with_env`.
+            let answer = handoff::helper_answer_with_env(
                 super::helper::ROLE_DISTILLER,
                 adapter,
                 &model,
                 &prompt,
                 Duration::from_secs(cfg.handoff.timeout_secs),
+                env,
             );
             let mut effect = jev::JevEffect::new("judge", "helper_invoked");
             effect.subject_id = Some(&key);
