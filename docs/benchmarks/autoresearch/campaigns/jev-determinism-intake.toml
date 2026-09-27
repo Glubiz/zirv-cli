@@ -66,7 +66,7 @@ file = "docs/benchmarks/autoresearch/decision-cases/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/autoresearch/decision_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "5"]
-per_trial_ceiling_usd = 0.005
+per_trial_ceiling_usd = 0.001
 calls_per_trial = 5
 timeout_secs = 180
 
@@ -77,8 +77,8 @@ model = "sonnet"
 [budgets]
 max_spend_usd = 0.40
 max_wall_secs = 3600
-max_calls = 1000
-max_trials = 200
+max_calls = 2000
+max_trials = 400
 max_retries = 1
 concurrency = 3
 
