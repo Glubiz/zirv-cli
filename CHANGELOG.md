@@ -15,6 +15,280 @@ the type/scope is the only breaking-change signal this script reads -- a
 `BREAKING CHANGE:` footer in the commit body is not parsed. Full-rebuild
 command: `scripts/generate-changelog.sh --full`.
 
+## v4.39.0 (2026-09-27)
+
+### Features
+
+- pre-registered larger handoff-thin confirmation (validate/holdout reps 6)
+- confirmatory handoff-thin cases and trimmed candidates
+- keep cached Jev answers for a week by default
+- wire the remaining six jev probe sites (missing-tests, stop-verify, review-disposition, review-dedup, artifact-substance, gate-reclass)
+- confirmatory approve-escalate cases and trimmed candidates
+- conservative-direction approve-escalate floor candidates
+- add crash, judge, approve, intake-plan, inject-screen to jev probe; probe-only floor override
+- determinism corpora and campaigns for the remaining twelve Jev sites
+- size determinism criteria to detect small stability wins; targeted handoff-thin and intake candidates
+- record the screen stage's quality point estimate
+- finer intake margin candidates around the 0.2 default
+- show d_quality in the candidate summary and results.tsv
+- measure intake stability over every acted decision field
+- round-2 handoff-thin determinism corpus and campaign
+- add `zirv ctx jev probe` floor-determinism measurement verb
+- promote on a quality objective
+- jev determinism probe backend and corpora
+- pair every code review round with a simplify pass
+- make the JEV sidebar errors line clickable
+- make report.rs cover the issues' definition of done
+- stage class filter, split discipline, and a min_pairs plan check
+- implement the warm cache mode's uncounted warm-up trial
+- implement the optional proposer, testable spawn path
+- cohort stratification by corpus task class (#804)
+- proxy:decider receipt proof for the Jev intake path (#803)
+- bounded, resumable autoresearch campaign runner (#802)
+- add pure statistical promotion gate for autoresearch (#801)
+- OutcomeRow schema v2 -- direct rows, route metadata
+- campaign attribution, spend reconciler, per-site Jev floors
+- rot track, rollover distance, Jev section and clock-driven motion
+- inline intake plan card replaces the stderr proxy prompts
+- wrapped-session dashboard refresh -- 28-col sessions, pane header, limits, per-session workflow (#807)
+- [jev] compaction_select keep list for compaction focus (#789)
+- [jev] launch_effort gate for the headless effort lever
+- force single seat for headless launches
+- scope guard fires on shell edits, owes tests up front, lists stated details
+- scope-creep guard -- a checkpoint before the first edit, a backstop at Stop
+- operator-only headless cost levers -- prompt-cache TTL, effort by intake class, lean launch
+- Jev advisory gates for approve, classify, handoff, screening, inject and stop-verify
+- usage rollup in jev status (#758)
+- zirv-jev-full condition for wrapped-vs-vanilla (#758)
+- record outcomes and propose routing recalibration (#757)
+- relevance-ranked core memory selection (#760)
+- server-side context editing for native Anthropic sessions (#756)
+- measure and repo-filter the skill index (#755)
+- sync --check CI gate (#754)
+- warn on duplicate remember writes (#773)
+- intake classification and discipline for wrapped sessions (#753)
+- closed-set admin dispatch on the UserPromptSubmit hook
+- re-project dispatch-tier advisory onto the metadata-only contract
+- re-project memory rerank to the metadata-only contract
+- screen memory harvest before the generative helper (#742)
+- add harvest_screen and admin_dispatch operator gates
+- add private Jev token-saving decisions
+- reuse a warm worktree pool for --worktree-reuse (#718)
+- honest Claude Code egress allowlist reporting (#727)
+- typed per-worker Conditions with reason codes (#723)
+- resume workspace setup and gate workers on goal bootstrap
+- add declarative worker workspace binding (#729)
+- ctx watch, ctx reconcile, worker post-mortem, MCP self tool, agent --manifest (google/ax batch 1) (#730)
+- portable cross-model skill library with integration-aware activation (#539) (#708)
+- mask sensitive data before model egress (#706)
+- choose the default harness by what is installed, and say so (#690)
+- route a seat's model tier, and say "configuration error" once
+- reuse a passing check whose inputs did not change (#699)
+- shift the review rubric and test-first loop into implement (#699)
+- cover the script runner and workflow
+- make the implement-vs-validate split measurable (#699 phase 0)
+- finish the first-run wizard and classify the new commands
+- add zirv tour and zirv ctx jev status
+- make Jev decisions deterministic: margin gate, frozen intake state, pinned model, decision cache
+- gated Jev advisory for review triage, gate reclassification and artifact substance
+- Jev supervisor pre-filters and dispatch model tiering, off by default
+- proxy clarification and domain tags, leaner intake state, Jev-ranked memory retrieval and harvest gate
+- jev::advise as the single gated advisory entry point
+- shared Jev decision client and operator-only [jev] config table
+- harness proxy -- intake decision via TypeSafe Jev with helper and deterministic fallback
+- surface blocked commands in the delegation receipt
+- extend the shipped allow list and escape_allow for the worker capability set
+- blocked-command observability (Change 5a/b/d, reduced 5c)
+
+### Fixes
+
+- compact the launch posture announcement; seat the orchestrator on Opus 5.5
+- compare the acted clarify decision, not its raw probability
+- drop the probe's no-op --json flag and harden the probe trial
+- harden decision_trial exit codes, rep stability and state isolation
+- align jev-case labels with the probe's production action names
+- keep execute-plan out of the simplify step; scope gate wording
+- replace the broken delegation-ledger JEV session closure
+- scope the JEV sidebar total to this dashboard's own session
+- keep the intake cursor inside the box at an exact-width wrap
+- wrap the intake prompt/clarify boxes and restore empty-Enter
+- clean report paths, reproduction --dir, and per-stage noise
+- classify the research/spend verbs and document the new proposer call site
+- accept run.py's cache-token field spelling on a Receipt
+- a resumed headless session no longer appends a second Direct outcome row
+- case-fold patch-scope matching and refuse traversal/absolute paths
+- reject a proposed candidate id that collides or is malformed
+- an orphaned retryable crash retry no longer vanishes or gets treated as resolved
+- re-hash evaluator drift before every dispatch, not just at stage boundaries
+- explicit child env + jev_ran from the production receipt (P3, P4)
+- timeout paths never drop or misreport an agent receipt (P1, P2)
+- integrate against the real promote gate, fix path/budget/dispatch bugs
+- SpendReport Money fields always present, never omitted
+- compaction_select costs nothing when off and never stalls the pump
+- scope-guard shell checkpoint skips read-only commands, staged new files, sub-second rewrites
+- headless clarify line stops telling unattended runs to ask the user
+- read-only approve skip excludes git remote/reflog writes and --output
+- the Jev approve gate makes no call under dontAsk
+- headless effort is sticky per conversation, and compaction launches get the levers
+- review findings on the headless levers and the missing-tests gate key
+- PR #788 review findings -- headless allow, usage cache, compaction deadline, missing-tests gate key
+- never launch a real browser from the unit-test suite
+- address release review findings (#754 #756 #757 #759 #773)
+- native-parity row for workflow calibrate (#757)
+- classify prompt.intake_discipline as narrow-only (#753)
+- re-project handoff and harvest gates onto metadata-only facts (#759)
+- review findings for the intake floor and staged rollover sockets
+- probe Windows Program Files/LocalAppData for Chrome and Edge (#678)
+- stage rollover successor socket under the seat short (#681)
+- floor intake complexity by request size; v7 stated-detail check
+- match punctuated remember markers; bump 4.25.0
+- launch headless browsers with a disposable profile; stop probe argv races
+- apply the proxy's decided seat model to the native pane (#703)
+- discover launchable browsers, including macOS bundles (#678, #676)
+- record native-subagent review runs toward the gate (#685)
+- record measured native Jev context savings
+- keep the proxy workflow live for the launch that actually runs, close credential asks properly
+- give headless Worker/Single seats a skill pointer instead of the full index
+- gate the frontier proxy seat on complexity/risk, name the started workflow
+- keep supervisor notices out of JSON receipts
+- keep review dispatch private and preserve evidence
+- share goal budgets and keep workflow reviews inline
+- classify the worktree pool keys as narrow-only (#718)
+- scope WebFetch/WebSearch to the egress allowlist in the launch argv (#727)
+- claim a reusable worktree under a lock and age it from idled_at (#718)
+- resume a ghost-parked seat without opening a handover (#721)
+- validate and report the egress allowlist honestly (#727)
+- drop unwired condition reasons and test the condition surfaces (#723)
+- recognize a ghost-parked seat on mail/nudge addressing (#721)
+- migrate workspace setup progress with repository state
+- remove unsupported GPT-5.4 mini (#732)
+- deterministic workflow triggering; steer wrapped sessions and subagents to skills (#714)
+- resolve thin-margin complexity/risk answers upward in the proxy intake (#709)
+- stop repeated wrapped-session permission prompts (#712)
+- preserve source sessions when automatic rollover fails (#711)
+- address review findings on the three terminal and intake fixes
+- floor complexity for an explicit parallel/multi-agent delegation request
+- keep a drag-selection highlight across ticks, and give the proxy intake prompt a real cursor
+- re-prompt instead of skipping the proxy on a blank first line
+- stop overriding the operator's own claude permission mode
+- run the proxy intake on the native runtime too
+- fail fast when the harness is not installed (#690)
+- pin the hook-install fallback test to an injected machine
+- select and scroll together, and copy only the pane (#697)
+- collapse the first-run harness storm and stop claiming success without one
+- name the harness, the config layer, and the package manager
+- accept --version, mark the machine configured, repair a partial .zirv
+- correct package metadata and make release templating robust
+- dispatch tier override carries the whole tool input in updatedInput
+- keep the deterministic frontend trigger byte-identical when the Jev gate is off
+- approvals never become findings, no auto-dismiss of Critical/Major, wider test-runner safety net
+- drop the removed harnesses field from the typesafe wrapper test
+- memory reranking never truncates or drops candidates when Jev is off or silent
+- keep Question::noul allowed as dead code until its intake caller lands
+- append Jev decisions atomically and re-point the parity matrix at the moved tests
+- proxy derives execution from complexity and launches a single seat
+- narrow launchctl SSH agent access
+- silence safe command permission prompts
+- preserve pipe structure across a keyword-stripped segment head
+- keyword-aware segment candidates and docker/kubectl exec decoding
+
+### Performance
+
+- skip the attention lock round trip when no Approval is pending
+- session supervisors relay Jev calls over one keep-alive connection
+- the Jev approve gate skips read-only local commands
+- benchmark-to-fix loop rounds 1-5 and long-session rot fixes (4.30.0)
+- skip the adapter readiness probe unless help renders; widen recursive-delete of own temp scratch
+
+### Documentation
+
+- final Jev determinism reports and findings
+- record the Jev determinism noise finding
+- Jev determinism campaign results and findings
+- state when the screen d_quality point matches the gate's own comparison
+- list the research and spend verbs under Features
+- document the built runner and add a sample report
+- drop leftover internal-process wording from plan.rs
+- document [stages.*] classes, split discipline, and the min_pairs check
+- document zirv workflow research next to workflow spend
+- spend reconciler is zirv workflow spend
+- autoresearch design for #799-#805
+- README tagline and measured-cost section from the round-7 benchmark
+- compaction_select references its own issue #798
+- round 7 full-grid results; chain wall excludes stagger pacing
+- round 6 and r6-t24 results and findings
+- round 5, 5b and 5b-t24 results and findings
+- drop the 4.24.0 handover now that verification is done
+- split the 4.24.0 handover under the entry size cap
+- handover for the unfinished 4.24.0 release verification
+- drop the last pointer to removed result files
+- drop the committed result reports and CSVs
+- summarise the benchmark as a headline claim
+- rerun against superpowers vanilla with zirv 4.21.0 and large tasks
+- plan Jev savings implementation and validation
+- separate review convergence facts from reuse eligibility
+- preserve accepted intent artifact
+- specify optional Jev savings and fallback contracts
+- define optional Jev savings scope
+- measure what wrapping a session costs (zirv vs vanilla claude)
+- note that extra_allow can re-widen the egress allowlist (#727)
+- document tour and ctx jev status where the gates require it
+- spec for built-in safe-command policy and blocked-command observability
+- disclaimer, ctx module boundaries, latency targets, generated changelog (#430, #431, #432, #433)
+
+### Chores
+
+- cover gate-reclass per-item floors on an answered probe rep
+- drop campaigns for the two text-bearing gates sites Jev never answers
+- size determinism campaign ceilings and caps from observed per-trial cost
+- extract shared jev question/action fns for crash, judge, approve, intake-plan, inject-screen
+- extract hook/review/engine Jev site questions, floors and action rules
+- bump version to 4.38.0
+- size the intake campaign's ceiling and caps for six candidates
+- cover the jev-determinism campaign manifests in the plan sweep
+- size the handoff-thin round-2 per-trial ceiling to fit its budget
+- extract shared question/floor/action fns for probe reuse
+- keep the Jev description fixture under the inline argv budget
+- bump version to 4.36.0
+- drop redundant ubuntu legs and a wasted CD release build
+- inline unit tests for schedule and reconcile
+- stop the proposer tests shelling out to python
+- split run.rs's three natural seams into sibling files
+- jev::floor unit tests, jev.floors env/repo-forbidden tests
+- regenerate CLAUDE.md from canonical context (#754)
+- bump 4.27.0
+- bump 4.26.0
+- provider live-evidence manifest tooling and the frontend acceptance scenario (#592, #610) (#675)
+- release 4.24.0
+- remove load-sensitive timing and repo-root leaks (#669, #713, #450)
+- bump to 4.22.0
+- bump to 4.21.0, document the proxy seat tiers, skill pointer and temp-dir deletes
+- bump version to 4.20.0
+- use the shared lock guard for the worktree store (#718, #728)
+- share one advisory-lock guard across ctx state stores (#728)
+- prove the nudge path resumes a due ghost park in place (#721)
+- isolate Claude score fixture from operator adapter settings
+- bump version to 4.11.0
+- bump version to 4.8.0
+- drop the dead-code allow on Question::noul now that intake calls it
+- cover the typesafe wrapper's delegation to jev::ask
+- 4.4.0
+
+### Other
+
+- bench(autoresearch): retune the 4 real campaigns so plan says valid
+- bench(wrapped-vs-vanilla): give every split a long_session task
+- bench(autoresearch): docs, README, and a real do_one_run integration test
+- bench(autoresearch): campaign manifests for #803/#804/#805
+- bench(autoresearch): intake decision-case corpus and decision_trial.py (#803)
+- bench(autoresearch): run.py trial mode, corpus.toml, t25 long-session chain (#801 #802 #804 #805)
+- bench: run.py comment for the round-7 gate keys
+- bench(jev-3way): give zirv-nojev the same headless proxy intake as zirv-jev-full
+- bench: t24b_long_haul states what steps 9 and 14 test
+- bench: a usage limit ends a zirv run like a vanilla one
+- bench: zirv-jev-full turns on the #781-#786 Jev gates; zirv conditions get the headless levers
+- bench: wrapped-vs-vanilla harness, tasks t16-t24 and 2026-09-24/25 fix-loop results
+
 ## v4.0.2 (2026-09-16)
 
 ### Fixes
