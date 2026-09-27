@@ -82,6 +82,21 @@ pub const BUILTIN_HEAVY_PATTERNS: &[&str] = &[
     "cargo clippy*",
     "cargo package*",
     "cargo publish*",
+    // Motion-graphics: a Hyperframes `render` drives headless Chrome plus
+    // FFmpeg end to end, so it must queue under the same budget as a cargo
+    // build. `lint`, `check`, `snapshot`, `doctor`, `tts`, `beats` and
+    // `normalize-audio` are deliberately absent -- they are cheap and must
+    // stay unlisted for the same reason `cargo fmt`/`cargo --version` are.
+    // Three anchored forms cover the ways the built-in `motion-graphics`
+    // skill and an operator both invoke it: pinned via `npx --yes
+    // hyperframes@<version>` (the skill's own spelling), plain `npx
+    // hyperframes`, and a locally installed `hyperframes` binary directly.
+    // Each pattern's `*` before ` render` still requires that literal
+    // substring to actually follow the package name -- `lint`/`snapshot`/
+    // `tts` candidates have no ` render` anywhere in them and never match.
+    "npx --yes hyperframes@* render*",
+    "npx hyperframes render*",
+    "hyperframes render*",
 ];
 
 /// Whether `command` should hold a permit for its whole run.
@@ -1086,6 +1101,27 @@ mod tests {
             "ls",
             "rg TODO src/",
             "echo cargo build",
+        ] {
+            assert!(!is_heavy(light, &none), "{light} must not hold a permit");
+        }
+    }
+
+    /// A Hyperframes render holds a permit like a cargo build; the cheap
+    /// preflight/inspection/audio commands it also exposes must not.
+    #[test]
+    fn hyperframes_render_is_heavy_but_its_other_commands_are_not() {
+        let none: Vec<String> = Vec::new();
+        for heavy in [
+            "npx --yes hyperframes@0.8.80 render --format gif --fps 15 --output renders/demo.gif",
+            "npx hyperframes render",
+            "hyperframes render -o a.mp4",
+        ] {
+            assert!(is_heavy(heavy, &none), "{heavy} must hold a permit");
+        }
+        for light in [
+            "npx hyperframes lint",
+            "npx --yes hyperframes@0.8.80 snapshot",
+            "npx --yes hyperframes@0.8.80 tts \"hi\" --output vo.wav",
         ] {
             assert!(!is_heavy(light, &none), "{light} must not hold a permit");
         }
