@@ -141,3 +141,19 @@ hypothesis = "Raising the confidence floor above its compiled default (0.5 -> 0.
 mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE=0.6, margin left at the compiled default (0.2)."
 env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.6" }
 requires_receipts = ["proxy:decider:typesafe"]
+
+# Finer resolution around the 0.2 default (added after round 1 showed the
+# clarify answer's margins clustering near 0.3).
+[[candidates]]
+id = "margin-015"
+hypothesis = "A slightly lower margin floor keeps every acted field stable while acting on more Jev answers."
+mechanism = "ZIRV_CTX_PROXY_MIN_MARGIN=0.15, confidence left at the compiled default (0.5)."
+env = { ZIRV_CTX_PROXY_MIN_MARGIN = "0.15" }
+requires_receipts = ["proxy:decider:typesafe"]
+
+[[candidates]]
+id = "margin-025"
+hypothesis = "A slightly higher margin floor removes the residual clarify flips without entering the ~0.3 margin cluster."
+mechanism = "ZIRV_CTX_PROXY_MIN_MARGIN=0.25, confidence left at the compiled default (0.5)."
+env = { ZIRV_CTX_PROXY_MIN_MARGIN = "0.25" }
+requires_receipts = ["proxy:decider:typesafe"]
