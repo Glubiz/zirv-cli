@@ -495,6 +495,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::workflow::research::promote::Objective;
 
     fn minimal_toml(extra: &str) -> String {
         format!(
@@ -561,6 +562,28 @@ max_uses = 1
         let text = minimal_toml("\nnot_a_real_field = true\n");
         let err = Manifest::parse(&text).expect_err("unknown field must be refused");
         assert!(err.to_string().contains("not_a_real_field"), "got: {err}");
+    }
+
+    /// Absent `[criteria] objective` must keep today's behaviour --
+    /// the promotion gate stays tuned to cost/wall efficiency.
+    #[test]
+    fn criteria_objective_defaults_to_efficiency_when_absent() {
+        let manifest = Manifest::parse(&minimal_toml("")).expect("minimal manifest must parse");
+        assert_eq!(manifest.criteria.objective, Objective::Efficiency);
+    }
+
+    #[test]
+    fn an_unknown_criteria_objective_is_refused() {
+        let text = minimal_toml("\n[criteria]\nobjective = \"speed\"\n");
+        let err = Manifest::parse(&text).expect_err("an unrecognized objective must be refused");
+        assert!(err.to_string().contains("objective"), "got: {err}");
+    }
+
+    #[test]
+    fn criteria_objective_quality_is_accepted() {
+        let text = minimal_toml("\n[criteria]\nobjective = \"quality\"\n");
+        let manifest = Manifest::parse(&text).expect("objective = \"quality\" must parse");
+        assert_eq!(manifest.criteria.objective, Objective::Quality);
     }
 
     #[test]

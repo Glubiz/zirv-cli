@@ -809,7 +809,7 @@ pub fn execute(
             )
         })
         .collect();
-    let winner = promote::simplest(&accepted).map(str::to_string);
+    let winner = promote::simplest(&accepted, manifest.criteria.objective).map(str::to_string);
 
     let mut promoted = None;
     let mut final_verdict = Verdict::Inconclusive;

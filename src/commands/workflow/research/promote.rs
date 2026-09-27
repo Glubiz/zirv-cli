@@ -50,6 +50,28 @@ pub enum TrialStatus {
     Crash,
 }
 
+/// The campaign-level axis a candidate must win on to be promoted
+/// (`[criteria] objective`): `Efficiency` (the default) requires a
+/// material cost-or-wall win, exactly as before this key existed;
+/// `Quality` requires a material answer-stability (`quality`) win instead,
+/// for campaigns tuning a floor where cost and wall time never change.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Objective {
+    #[default]
+    Efficiency,
+    Quality,
+}
+
+impl Objective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Objective::Efficiency => "efficiency",
+            Objective::Quality => "quality",
+        }
+    }
+}
+
 /// A manifest's `[criteria]` TOML table.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -63,6 +85,10 @@ pub struct Criteria {
     pub min_effect: f64,
     pub confidence: f64,
     pub bootstrap_resamples: usize,
+    /// Which axis a material win must be measured on to promote a
+    /// candidate. Defaults to `Efficiency`, matching every manifest written
+    /// before this key existed.
+    pub objective: Objective,
 }
 
 impl Default for Criteria {
@@ -76,6 +102,7 @@ impl Default for Criteria {
             min_effect: 0.05,
             confidence: 0.95,
             bootstrap_resamples: 4000,
+            objective: Objective::Efficiency,
         }
     }
 }
@@ -333,12 +360,21 @@ fn summarize_arm(obs: &[&Observation]) -> ArmSummary {
 /// 4. non-inferiority on correctness, then quality: a delta-CI whose upper
 ///    bound is still below `-margin` -> [`Verdict::Reject`]; whose lower
 ///    bound dips below `-margin` (but not the upper) -> [`Verdict::Inconclusive`].
-/// 5. benefit on cost (only when every pair's cost is complete) and wall
-///    time: a material win (CI upper below `-min_effect`) on one axis with a
-///    material loss (CI lower above `+min_effect`) on the other ->
-///    [`Verdict::Tradeoff`]; a win with no loss -> [`Verdict::Accept`]; no
-///    win at all -> [`Verdict::Inconclusive`], or [`Verdict::Reject`] when
-///    both usable point estimates are worse than baseline.
+/// 5. the material-benefit check, which the campaign's `criteria.objective`
+///    selects between:
+///    - `Objective::Efficiency` (the default): benefit on cost (only when
+///      every pair's cost is complete) and wall time: a material win (CI
+///      upper below `-min_effect`) on one axis with a material loss (CI
+///      lower above `+min_effect`) on the other -> [`Verdict::Tradeoff`]; a
+///      win with no loss -> [`Verdict::Accept`]; no win at all ->
+///      [`Verdict::Inconclusive`], or [`Verdict::Reject`] when both usable
+///      point estimates are worse than baseline.
+///    - `Objective::Quality`: a material win on `d_quality` (CI lower above
+///      `+min_effect`) offset by a material cost or wall loss (the same
+///      `cost_loss`/`wall_loss` checks as `Efficiency`) -> [`Verdict::Tradeoff`];
+///      a quality win with no such loss -> [`Verdict::Accept`]; no quality
+///      win, or quality never measured for this cohort (`d_quality` is
+///      `None`) -> [`Verdict::Inconclusive`].
 fn evaluate_cohort(
     all_obs: &[Observation],
     cohort: &str,
@@ -606,41 +642,71 @@ fn evaluate_cohort(
         seed_for(seed, cohort, 3),
     );
 
-    let cost_win = rel_cost
-        .as_ref()
-        .is_some_and(|iv| iv.hi < -criteria.min_effect);
+    // `cost_loss`/`wall_loss` are used unchanged by both objectives (a
+    // quality win offset by a material cost or wall loss is still a
+    // Tradeoff); `cost_win`/`wall_win` only drive the `Efficiency` verdict.
     let cost_loss = rel_cost
         .as_ref()
         .is_some_and(|iv| iv.lo > criteria.min_effect);
-    let wall_win = rel_wall
-        .as_ref()
-        .is_some_and(|iv| iv.hi < -criteria.min_effect);
     let wall_loss = rel_wall
         .as_ref()
         .is_some_and(|iv| iv.lo > criteria.min_effect);
 
-    let verdict = if (cost_win && wall_loss) || (wall_win && cost_loss) {
-        reasons.push(format!(
-            "{cohort}: material win on one axis offset by a material loss on the other"
-        ));
-        Verdict::Tradeoff
-    } else if cost_win || wall_win {
-        reasons.push(format!(
-            "{cohort}: material improvement with no offsetting loss"
-        ));
-        Verdict::Accept
-    } else {
-        let cost_worse = rel_cost.as_ref().is_some_and(|iv| iv.point > 0.0);
-        let wall_worse = rel_wall.as_ref().is_some_and(|iv| iv.point > 0.0);
-        if cost_usable && rel_wall.is_some() && cost_worse && wall_worse {
-            reasons.push(format!(
-                "{cohort}: no improvement on cost or wall, both worse than baseline"
-            ));
-            Verdict::Reject
-        } else {
-            reasons.push(format!("{cohort}: no material win on cost or wall"));
-            Verdict::Inconclusive
+    let verdict = match criteria.objective {
+        Objective::Efficiency => {
+            let cost_win = rel_cost
+                .as_ref()
+                .is_some_and(|iv| iv.hi < -criteria.min_effect);
+            let wall_win = rel_wall
+                .as_ref()
+                .is_some_and(|iv| iv.hi < -criteria.min_effect);
+            if (cost_win && wall_loss) || (wall_win && cost_loss) {
+                reasons.push(format!(
+                    "{cohort}: material win on one axis offset by a material loss on the other"
+                ));
+                Verdict::Tradeoff
+            } else if cost_win || wall_win {
+                reasons.push(format!(
+                    "{cohort}: material improvement with no offsetting loss"
+                ));
+                Verdict::Accept
+            } else {
+                let cost_worse = rel_cost.as_ref().is_some_and(|iv| iv.point > 0.0);
+                let wall_worse = rel_wall.as_ref().is_some_and(|iv| iv.point > 0.0);
+                if cost_usable && rel_wall.is_some() && cost_worse && wall_worse {
+                    reasons.push(format!(
+                        "{cohort}: no improvement on cost or wall, both worse than baseline"
+                    ));
+                    Verdict::Reject
+                } else {
+                    reasons.push(format!("{cohort}: no material win on cost or wall"));
+                    Verdict::Inconclusive
+                }
+            }
         }
+        Objective::Quality => match &d_quality {
+            None => {
+                reasons.push(format!("{cohort}: quality was never measured"));
+                Verdict::Inconclusive
+            }
+            Some(iv) => {
+                let quality_win = iv.lo > criteria.min_effect;
+                if quality_win && (cost_loss || wall_loss) {
+                    reasons.push(format!(
+                        "{cohort}: material quality win offset by a material loss on cost or wall"
+                    ));
+                    Verdict::Tradeoff
+                } else if quality_win {
+                    reasons.push(format!(
+                        "{cohort}: material quality win with no offsetting loss"
+                    ));
+                    Verdict::Accept
+                } else {
+                    reasons.push(format!("{cohort}: no material quality win"));
+                    Verdict::Inconclusive
+                }
+            }
+        },
     };
 
     cohort_decision(
@@ -719,9 +785,12 @@ pub fn adjusted_confidence(base: f64, k: usize) -> f64 {
 /// it can only discard one before the more expensive validated run.
 /// Discards when every candidate observation is excluded ("untriggered"),
 /// when candidate correctness is below its floor or has regressed past
-/// `max_correctness_regression` against baseline, or when neither cost (if
-/// every pair's cost is complete) nor wall time improves by at least half
-/// of `min_effect`.
+/// `max_correctness_regression` against baseline, or -- under
+/// `criteria.objective`: `Efficiency` (the default) discards when neither
+/// cost (if every pair's cost is complete) nor wall time improves by at
+/// least half of `min_effect`; `Quality` discards instead when either arm
+/// has no quality values, or when the candidate's quality mean does not
+/// exceed the baseline's by at least half of `min_effect`.
 pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
     let candidate_obs: Vec<&Observation> = obs.iter().filter(|o| o.arm == Arm::Candidate).collect();
     if candidate_obs.is_empty() || candidate_obs.iter().all(|o| o.excluded.is_some()) {
@@ -761,6 +830,25 @@ pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
                 reason: "correctness regression vs baseline".to_string(),
             };
         }
+    }
+
+    if matches!(criteria.objective, Objective::Quality) {
+        let candidate_quality: Vec<f64> =
+            candidate_active.iter().filter_map(|o| o.quality).collect();
+        let baseline_quality: Vec<f64> = baseline_active.iter().filter_map(|o| o.quality).collect();
+        if candidate_quality.is_empty() || baseline_quality.is_empty() {
+            return ScreenVerdict::Discard {
+                reason: "no quality values".to_string(),
+            };
+        }
+        let candidate_quality_mean = stats::mean(&candidate_quality);
+        let baseline_quality_mean = stats::mean(&baseline_quality);
+        if candidate_quality_mean - baseline_quality_mean < criteria.min_effect / 2.0 {
+            return ScreenVerdict::Discard {
+                reason: "no material quality point-estimate improvement".to_string(),
+            };
+        }
+        return ScreenVerdict::Survive;
     }
 
     let all_refs: Vec<&Observation> = obs.iter().collect();
@@ -874,14 +962,25 @@ pub fn excluded_by_reason(obs: &[Observation]) -> BTreeMap<String, usize> {
 }
 
 /// The representative benefit axis and interval for a Decision, used by
-/// [`simplest`]: the first cohort with a usable `rel_cost`, else the first
-/// cohort with a usable `rel_wall`. A `Decision` in practice represents one
-/// candidate's result for the promotion gate it was built from, which
-/// commonly holds a single reported cohort; when it holds several, the
-/// first cohort's primary axis stands in for the whole decision rather than
-/// attempting to merge distinct cohorts' intervals (cohorts are never
-/// pooled elsewhere in this module either).
-fn primary_interval(decision: &Decision) -> Option<(&'static str, &Interval)> {
+/// [`simplest`]. Under `Objective::Efficiency`: the first cohort with a
+/// usable `rel_cost`, else the first cohort with a usable `rel_wall`. Under
+/// `Objective::Quality`: the first cohort with a usable `d_quality` -- the
+/// axis the quality objective actually promotes on. A `Decision`
+/// in practice represents one candidate's result for the promotion gate it
+/// was built from, which commonly holds a single reported cohort; when it
+/// holds several, the first cohort's primary axis stands in for the whole
+/// decision rather than attempting to merge distinct cohorts' intervals
+/// (cohorts are never pooled elsewhere in this module either).
+fn primary_interval(
+    decision: &Decision,
+    objective: Objective,
+) -> Option<(&'static str, &Interval)> {
+    if matches!(objective, Objective::Quality) {
+        return decision
+            .cohorts
+            .iter()
+            .find_map(|c| c.d_quality.as_ref().map(|iv| ("quality", iv)));
+    }
     for c in &decision.cohorts {
         if let Some(iv) = &c.rel_cost {
             return Some(("cost", iv));
@@ -899,31 +998,44 @@ fn intervals_overlap(a: &Interval, b: &Interval) -> bool {
     a.lo <= b.hi && b.lo <= a.hi
 }
 
-/// Among the `Accept` decisions, finds the best primary benefit (the lowest
-/// `rel_cost` point estimate, falling back to `rel_wall` when a decision has
-/// no usable cost axis -- see [`primary_interval`]), then returns the
-/// lowest-complexity id among every winner whose same-axis interval
-/// overlaps the best one's (an "equivalent" win, per the design's
+/// Among the `Accept` decisions, finds the best primary benefit -- under
+/// `Objective::Efficiency` the lowest `rel_cost` point estimate, falling
+/// back to `rel_wall` when a decision has no usable cost axis; under
+/// `Objective::Quality` the highest `d_quality` point estimate (more
+/// positive is a bigger quality win) -- see [`primary_interval`]. Then
+/// returns the lowest-complexity id among every winner whose same-axis
+/// interval overlaps the best one's (an "equivalent" win, per the design's
 /// simplicity criterion -- a marginally better number is not worth extra
 /// complexity when the intervals cannot actually be told apart). Ties in
 /// complexity keep the first winner in input order. `None` when there are
 /// no `Accept` decisions.
-pub fn simplest<'a>(winners: &[(&'a str, usize, &Decision)]) -> Option<&'a str> {
+pub fn simplest<'a>(
+    winners: &[(&'a str, usize, &Decision)],
+    objective: Objective,
+) -> Option<&'a str> {
     let accepted: Vec<(&'a str, usize, &Interval, &'static str)> = winners
         .iter()
         .filter(|(_, _, d)| d.verdict == Verdict::Accept)
         .filter_map(|(id, complexity, decision)| {
-            primary_interval(decision).map(|(axis, interval)| (*id, *complexity, interval, axis))
+            primary_interval(decision, objective)
+                .map(|(axis, interval)| (*id, *complexity, interval, axis))
         })
         .collect();
     if accepted.is_empty() {
         return None;
     }
 
-    let best = accepted
-        .iter()
-        .min_by(|a, b| a.2.point.partial_cmp(&b.2.point).unwrap())
-        .unwrap();
+    let best = if matches!(objective, Objective::Quality) {
+        accepted
+            .iter()
+            .max_by(|a, b| a.2.point.partial_cmp(&b.2.point).unwrap())
+            .unwrap()
+    } else {
+        accepted
+            .iter()
+            .min_by(|a, b| a.2.point.partial_cmp(&b.2.point).unwrap())
+            .unwrap()
+    };
     let best_axis = best.3;
     let best_interval = best.2;
 
@@ -1021,6 +1133,59 @@ mod tests {
         out
     }
 
+    /// Like [`matched_pairs`], but also sets `quality` on both arms (left
+    /// `None` there) -- for the `Objective::Quality` tests, which need a
+    /// judge present to get a `d_quality` interval at all.
+    #[allow(clippy::too_many_arguments)]
+    fn matched_pairs_with_quality(
+        cohort: &str,
+        n: u32,
+        correctness: f64,
+        base_quality: f64,
+        cand_quality: f64,
+        base_cost: f64,
+        cand_cost: f64,
+        base_wall: u64,
+        cand_wall: u64,
+    ) -> Vec<Observation> {
+        let mut out = Vec::new();
+        for rep in 0..n {
+            let task = format!("task-{rep}");
+            out.push(obs(
+                &task,
+                rep,
+                cohort,
+                Arm::Baseline,
+                TrialStatus::Ok,
+                Some(correctness),
+                Some(base_quality),
+                Some(base_cost),
+                true,
+                base_wall,
+            ));
+            out.push(obs(
+                &task,
+                rep,
+                cohort,
+                Arm::Candidate,
+                TrialStatus::Ok,
+                Some(correctness),
+                Some(cand_quality),
+                Some(cand_cost),
+                true,
+                cand_wall,
+            ));
+        }
+        out
+    }
+
+    fn quality_criteria() -> Criteria {
+        Criteria {
+            objective: Objective::Quality,
+            ..fast_criteria()
+        }
+    }
+
     #[test]
     fn cheaper_but_incorrect_candidate_is_rejected() {
         let obs = matched_pairs("cohort-a", 6, 1.0, 0.5, 1.0, 0.2, 1000, 900);
@@ -1079,6 +1244,28 @@ mod tests {
     fn cost_win_and_wall_loss_is_a_tradeoff() {
         let obs = matched_pairs("cohort-a", 8, 0.9, 0.9, 1.0, 0.2, 1000, 2000);
         let decision = evaluate(&obs, &fast_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Tradeoff);
+    }
+
+    /// (a) Under `Objective::Quality`, a material `d_quality` win with
+    /// flat cost and wall time is an Accept -- cost/wall no longer gate
+    /// promotion at all under this objective.
+    #[test]
+    fn quality_objective_accepts_a_stability_win_with_flat_cost_and_wall() {
+        let obs = matched_pairs_with_quality("cohort-a", 8, 0.9, 0.5, 0.9, 1.0, 1.0, 1000, 1000);
+        let decision = evaluate(&obs, &quality_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Accept);
+        assert_eq!(decision.cohorts[0].verdict, Verdict::Accept);
+        assert!(decision.cohorts[0].d_quality.is_some());
+    }
+
+    /// (b) A material quality win offset by a material cost loss is
+    /// still a Tradeoff under `Objective::Quality`, exactly as a cost win
+    /// offset by a wall loss is under `Objective::Efficiency`.
+    #[test]
+    fn quality_win_with_material_cost_loss_is_a_tradeoff() {
+        let obs = matched_pairs_with_quality("cohort-a", 8, 0.9, 0.5, 0.9, 1.0, 1.5, 1000, 1000);
+        let decision = evaluate(&obs, &quality_criteria(), 0.95, 1);
         assert_eq!(decision.verdict, Verdict::Tradeoff);
     }
 
@@ -1219,6 +1406,26 @@ mod tests {
         assert_eq!(verdict, ScreenVerdict::Survive);
     }
 
+    /// (c) Under `Objective::Quality`, `screen` discards a candidate
+    /// with no quality gain and survives one that clears half of
+    /// `min_effect` -- cost/wall are never consulted for this objective.
+    #[test]
+    fn screen_under_quality_discards_a_no_gain_candidate_and_keeps_a_gaining_one() {
+        let criteria = quality_criteria();
+
+        let no_gain =
+            matched_pairs_with_quality("cohort-a", 6, 0.9, 0.7, 0.7, 1.0, 1.0, 1000, 1000);
+        assert_eq!(
+            screen(&no_gain, &criteria),
+            ScreenVerdict::Discard {
+                reason: "no material quality point-estimate improvement".to_string()
+            }
+        );
+
+        let gains = matched_pairs_with_quality("cohort-a", 6, 0.9, 0.5, 0.9, 1.0, 1.0, 1000, 1000);
+        assert_eq!(screen(&gains, &criteria), ScreenVerdict::Survive);
+    }
+
     /// Regression for report-completeness item 1: a screen `StageDecision`
     /// used to record only its verdict/reason, leaving a report's
     /// rel_cost/rel_wall/d_correctness columns blank for every screen row.
@@ -1334,12 +1541,12 @@ mod tests {
         let c = accept_decision(-0.19);
         let winners: Vec<(&str, usize, &Decision)> =
             vec![("complex", 3, &a), ("simple", 1, &b), ("medium", 2, &c)];
-        assert_eq!(simplest(&winners), Some("simple"));
+        assert_eq!(simplest(&winners, Objective::Efficiency), Some("simple"));
     }
 
     #[test]
     fn simplest_is_none_without_any_accept() {
         let winners: Vec<(&str, usize, &Decision)> = vec![];
-        assert_eq!(simplest(&winners), None);
+        assert_eq!(simplest(&winners, Objective::Efficiency), None);
     }
 }

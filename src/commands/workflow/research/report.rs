@@ -61,6 +61,10 @@ pub struct ReportSummary {
     pub finished_at: Option<u64>,
     pub promoted: Option<String>,
     pub verdict: String,
+    /// The campaign's `[criteria] objective` that decided `verdict`
+    /// -- `"efficiency"` (cost/wall win) or `"quality"` (answer-stability
+    /// win).
+    pub objective: String,
     pub rows: Vec<CandidateReportRow>,
     pub stopped_reason: Option<String>,
     pub spend: SpendSummary,
@@ -466,6 +470,7 @@ fn write_criteria(file: &mut std::fs::File, lock: &Lock) -> CtxResult<()> {
         "| max_quality_regression | {:.3} |",
         c.max_quality_regression
     )?;
+    writeln!(file, "| objective | {} |", c.objective.as_str())?;
     writeln!(file, "| min_effect | {:.3} |", c.min_effect)?;
     writeln!(file, "| confidence (base) | {:.3} |", c.confidence)?;
     writeln!(file, "| bootstrap_resamples | {} |", c.bootstrap_resamples)?;
@@ -969,6 +974,7 @@ pub fn generate(campaign_dir: &Path) -> CtxResult<ReportSummary> {
         finished_at: finished_at(&events),
         promoted: promoted.clone(),
         verdict,
+        objective: lock.manifest.criteria.objective.as_str().to_string(),
         rows,
         stopped_reason,
         spend,
