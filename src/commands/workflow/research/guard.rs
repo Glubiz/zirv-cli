@@ -125,6 +125,13 @@ pub fn classify_env_key(key: &str) -> Result<EnvValueKind, String> {
         "ZIRV_CTX_PROXY_MIN_CONFIDENCE" | "ZIRV_CTX_PROXY_MIN_MARGIN" => {
             return Ok(EnvValueKind::Ratio01Closed);
         }
+        // `zirv ctx jev probe`'s own measurement-only floor override
+        // (jev_probe.rs's own module doc comment): production code never
+        // reads these two keys, so allowlisting them here only ever
+        // changes what a probe run measures, never a live decision.
+        "ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE" | "ZIRV_CTX_JEV_PROBE_MIN_MARGIN" => {
+            return Ok(EnvValueKind::Ratio01Closed);
+        }
         "ZIRV_CTX_SCORE_TOKEN_FLOOR_RATIO" | "ZIRV_CTX_SCORE_TOKEN_CEILING_RATIO" => {
             return Ok(EnvValueKind::Ratio01HalfOpen);
         }
@@ -544,6 +551,25 @@ mod tests {
         assert!(validate_env_value(kind, "ZIRV_CTX_JEV_MEMORY", "true", &[]).is_ok());
         assert!(validate_env_value(kind, "ZIRV_CTX_JEV_MEMORY", "false", &[]).is_ok());
         assert!(validate_env_value(kind, "ZIRV_CTX_JEV_MEMORY", "yes", &[]).is_err());
+    }
+
+    #[test]
+    fn probe_only_floor_override_keys_are_allowlisted_but_jev_approve_still_is_not() {
+        let kind =
+            classify_env_key("ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE").expect("must be allowlisted");
+        assert_eq!(kind, EnvValueKind::Ratio01Closed);
+        assert!(validate_env_value(kind, "ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE", "0.5", &[]).is_ok());
+        assert!(validate_env_value(kind, "ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE", "1.5", &[]).is_err());
+
+        let kind = classify_env_key("ZIRV_CTX_JEV_PROBE_MIN_MARGIN").expect("must be allowlisted");
+        assert_eq!(kind, EnvValueKind::Ratio01Closed);
+
+        let err = classify_env_key("ZIRV_CTX_JEV_APPROVE")
+            .expect_err("a fixed safety gate must still be refused");
+        assert!(
+            err.contains("fixed safety/verification control"),
+            "got: {err}"
+        );
     }
 
     #[test]
