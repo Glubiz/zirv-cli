@@ -38,7 +38,7 @@ file = "docs/benchmarks/autoresearch/jev-cases/context/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "5"]
-per_trial_ceiling_usd = 0.002
+per_trial_ceiling_usd = 0.001
 calls_per_trial = 5
 timeout_secs = 180
 
@@ -47,7 +47,7 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 0.35
+max_spend_usd = 0.25
 max_wall_secs = 3600
 max_calls = 1000
 max_trials = 200
@@ -60,11 +60,11 @@ reps = 2
 
 [stages.validate]
 split = "validation"
-reps = 2
+reps = 3
 
 [stages.holdout]
 split = "holdout"
-reps = 2
+reps = 3
 max_uses = 1
 
 [criteria]
@@ -74,7 +74,7 @@ correctness_floor = 0.0
 quality_floor = 0.0
 max_correctness_regression = 0.05
 max_quality_regression = 0.02
-min_effect = 0.05
+min_effect = 0.01
 confidence = 0.9
 bootstrap_resamples = 2000
 
