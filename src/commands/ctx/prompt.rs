@@ -565,7 +565,7 @@ self-contained brief naming the diff and asking for confirmed, concrete findings
 roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
 what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
-a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
 rounds, reporting what remains as residual findings.
@@ -619,7 +619,7 @@ self-contained brief naming the diff and asking for confirmed, concrete findings
 roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
 what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
-a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
 rounds, reporting what remains as residual findings.
@@ -671,7 +671,7 @@ self-contained brief naming the diff and asking for confirmed, concrete findings
 roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
 what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
-a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
 rounds, reporting what remains as residual findings.";

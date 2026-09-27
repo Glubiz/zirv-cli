@@ -2067,10 +2067,9 @@ Every pack that pairs a `test` step with a `review` step (`feature`, `bugfix`,
 `performance-investigation`, `schema-data-migration`, `security-remediation`)
 also carries a `simplify` step between them, depending on `test` and gated by
 the same `condition` as `review` (`review` depends on `simplify` in turn): a
-review round is always preceded by a reuse pass on the review model, so
-zirv-wrapped agents reuse existing code instead of re-implementing it.
-`documentation-runbook-change` and `spike` have no `test`/reviewed-code step
-pair and so carry no `simplify` step.
+code review round is always preceded by a `simplify` pass, so zirv-wrapped
+agents reuse existing code instead of re-implementing it. Packs without a
+`test` step carry none.
 
 Every pack's `effects` is `none` or `repository`, except
 `devops-infrastructure-change` and `sre-deploy-or-rollback` (issue #542
