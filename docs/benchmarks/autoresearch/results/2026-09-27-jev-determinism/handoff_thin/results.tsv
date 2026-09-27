@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+conf-050	screen	discard	0.0738	-0.6925	0.0687	-0.0312	A confidence floor of 0.5 (handoff_select) starts to filter round 1's tiny-cluster answers (0.82-0.95) without touching the untested intermediate range.
+conf-060	screen	discard	0.0738	-0.7063	0.0938	-0.0312	A confidence floor of 0.6 (handoff_select) sits inside round 1's observed intermediate/medium cluster (0.0-0.37 to 0.82-0.95 gap) and may start admitting some of those rows.
+conf-070	screen	discard	0.0738	-0.7038	-0.0313	-0.0312	A confidence floor of 0.7 (handoff_select) trades more admitted rows for stability, testing the upper half of the 0.4-0.8 gap this corpus was built to probe.
+conf-080	screen	discard	0.0738	-0.7041	-0.0562	-0.0063	A confidence floor of 0.8 (handoff_select) stays close to the compiled HANDOFF_THIN_FLOOR (0.9), checking whether a slightly lower floor still captures the tiny-cluster wins at less correctness cost.

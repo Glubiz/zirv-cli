@@ -1,0 +1,7 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	-0.2768	0.0083	0.0167	A much lower margin floor trades away stability for more decisive Jev/helper answers.
+margin-030	screen	discard	0.0000	-0.2781	-0.0083	-0.2167	A moderately higher margin floor buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	-0.3161	0.0083	0.0167	A high margin floor maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	-0.2684	0.0042	0.0083	Raising the confidence floor above its compiled default (0.5 -> 0.6) improves stability without an unacceptable correctness cost.
+margin-015	screen	discard	0.0000	-0.2454	0.0083	0.0167	A slightly lower margin floor keeps every acted field stable while acting on more Jev answers.
+margin-025	screen	discard	0.0000	-0.2733	-0.0000	-0.0667	A slightly higher margin floor removes the residual clarify flips without entering the ~0.3 margin cluster.

@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-compaction_select",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
+  "started_at": 1790507282,
+  "finished_at": 1790507330,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor (compaction_select) trades away stability for more decisive Jev answers.",
+      "d_correctness": [
+        -0.2375
+      ],
+      "d_quality": [
+        -0.05458333333333333
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.013530601922104198
+      ],
+      "reasons": [
+        "correctness regression vs baseline"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor (compaction_select) buys some stability without much lost coverage.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.004889563311414601
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor (compaction_select) maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.03776766143989209
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor (compaction_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.004931714719271623
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.018149999999999996,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

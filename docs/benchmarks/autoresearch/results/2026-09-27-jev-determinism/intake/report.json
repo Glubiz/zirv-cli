@@ -1,0 +1,168 @@
+{
+  "campaign_id": "jev-determinism-intake",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
+  "started_at": 1790507516,
+  "finished_at": 1790507714,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor trades away stability for more decisive Jev/helper answers.",
+      "d_correctness": [
+        0.008333333333333331
+      ],
+      "d_quality": [
+        0.016666666666666663
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.2768394799480327
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor buys some stability without much lost coverage.",
+      "d_correctness": [
+        -0.008333333333333352
+      ],
+      "d_quality": [
+        -0.21666666666666676
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.2780533138614143
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.00833333333333334
+      ],
+      "d_quality": [
+        0.016666666666666663
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.3160614882741747
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor above its compiled default (0.5 -> 0.6) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.004166666666666666
+      ],
+      "d_quality": [
+        0.008333333333333331
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.26844695640629296
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-015",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A slightly lower margin floor keeps every acted field stable while acting on more Jev answers.",
+      "d_correctness": [
+        0.008333333333333331
+      ],
+      "d_quality": [
+        0.016666666666666663
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.24542204436183623
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-025",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A slightly higher margin floor removes the residual clarify flips without entering the ~0.3 margin cluster.",
+      "d_correctness": [
+        -4.625929269271485e-18
+      ],
+      "d_quality": [
+        -0.06666666666666667
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.27327384282747436
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.019320000000000042,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

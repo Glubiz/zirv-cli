@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-handoff_thin",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "43999822a3bf6f816bdd80949ceb22466b7a0cb8",
+  "started_at": 1790507158,
+  "finished_at": 1790507282,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "conf-050",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A confidence floor of 0.5 (handoff_select) starts to filter round 1's tiny-cluster answers (0.82-0.95) without touching the untested intermediate range.",
+      "d_correctness": [
+        0.06874999999999998
+      ],
+      "d_quality": [
+        -0.03125
+      ],
+      "rel_cost": [
+        0.0738255033557047
+      ],
+      "rel_wall": [
+        -0.6924836385271369
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "conf-060",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A confidence floor of 0.6 (handoff_select) sits inside round 1's observed intermediate/medium cluster (0.0-0.37 to 0.82-0.95 gap) and may start admitting some of those rows.",
+      "d_correctness": [
+        0.09375
+      ],
+      "d_quality": [
+        -0.031249999999999983
+      ],
+      "rel_cost": [
+        0.0738255033557047
+      ],
+      "rel_wall": [
+        -0.7063132147815165
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "conf-070",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A confidence floor of 0.7 (handoff_select) trades more admitted rows for stability, testing the upper half of the 0.4-0.8 gap this corpus was built to probe.",
+      "d_correctness": [
+        -0.03125000000000001
+      ],
+      "d_quality": [
+        -0.031249999999999993
+      ],
+      "rel_cost": [
+        0.0738255033557047
+      ],
+      "rel_wall": [
+        -0.7037747074766973
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "conf-080",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A confidence floor of 0.8 (handoff_select) stays close to the compiled HANDOFF_THIN_FLOOR (0.9), checking whether a slightly lower floor still captures the tiny-cluster wins at less correctness cost.",
+      "d_correctness": [
+        -0.056249999999999994
+      ],
+      "d_quality": [
+        -0.0062500000000000056
+      ],
+      "rel_cost": [
+        0.0738255033557047
+      ],
+      "rel_wall": [
+        -0.7040523567131619
+      ],
+      "reasons": [
+        "correctness regression vs baseline"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.014201999999999979,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-classify",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
+  "started_at": 1790507423,
+  "finished_at": 1790507469,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor (classify) trades away stability for more decisive Jev answers.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.020369555653321603
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor (classify) buys some stability without much lost coverage.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.008139023317201935
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor (classify) maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.019841619005719315
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor (classify) above its compiled default (0.0) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.01768587769467664
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.014399999999999977,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}
