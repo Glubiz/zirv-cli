@@ -435,6 +435,10 @@ struct SetupStatus {
     profile: EffectiveProfileStatus,
     claude: HarnessStatus,
     codex: HarnessStatus,
+    /// Optional motion-graphics (Hyperframes) prerequisites. Added in
+    /// schema_version 4; never blocks setup or changes its exit code -- see
+    /// [`motion_graphics_status`]'s own doc comment.
+    motion_graphics: MotionGraphicsStatus,
 }
 
 fn home_dir() -> SetupResult<PathBuf> {
@@ -614,6 +618,187 @@ fn report_claude_cli_health() {
         None => {
             println!("claude CLI: `claude auth status` did not run; skipping the login check")
         }
+    }
+}
+
+/// Bounds every motion-graphics prerequisite probe below (`node --version`,
+/// a Python interpreter's `--version`, its narration-module check) -- the
+/// same non-negotiable requirement `CLAUDE_PROBE_TIMEOUT` holds for the
+/// claude CLI health probes: a stalled or hanging child must never wedge
+/// `zirv setup`.
+const MOTION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs `program args...` and returns its stdout only on a successful exit
+/// within [`MOTION_PROBE_TIMEOUT`] -- `None` on a spawn failure, non-UTF-8
+/// output, a non-zero exit, or a timeout. The program-generic sibling of
+/// `run_claude_probe`: motion-graphics prerequisites (`node`, a candidate
+/// Python interpreter) are a different binary per call, so the claude-only
+/// probe above cannot be reused directly, but the bounded
+/// spawn-pipe-then-poll shape is identical.
+fn run_bounded_probe(program: &str, args: &[&str]) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe.take() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = std::time::Instant::now() + MOTION_PROBE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let bytes = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
+                return String::from_utf8(bytes).ok();
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    // Timed out: kill the child rather than leaking it.
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Parses `node --version`'s own `"v22.9.0\n"` into a comparable (major,
+/// minor, patch) tuple -- the same shape [`parse_claude_version`] produces
+/// for `claude --version`, just with node's leading `v` stripped first. Pure
+/// and total: any shape this cannot recognize (no leading `v`, a missing or
+/// non-numeric segment, empty input) is `None` rather than a guess, since a
+/// best-effort preflight must never claim a floor comparison it cannot
+/// actually make.
+fn parse_node_version(output: &str) -> Option<(u64, u64, u64)> {
+    let first = output.lines().next()?.trim().strip_prefix('v')?;
+    let mut parts = first.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Hyperframes' own `engines.node` floor (`packages/cli/package.json`,
+/// `research.md`); below this, `zirv setup` flags node rather than letting a
+/// wrapped agent discover the mismatch mid-render.
+const MOTION_NODE_MIN_MAJOR: u64 = 22;
+
+/// The narration-module probe script handed to a candidate Python
+/// interpreter's `-c`, mirroring Hyperframes' own `hasPythonModules`
+/// (`packages/cli/src/tts/python.ts`): `importlib.util.find_spec` for each
+/// module rather than an actual `import`, so neither this probe nor
+/// Hyperframes' own preflight ever pays the cost of loading `kokoro_onnx`'s
+/// heavier dependencies just to check presence.
+const MOTION_NARRATION_MODULES_PROBE: &str =
+    "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in \
+     ['kokoro_onnx','soundfile']) else 1)";
+
+/// True if `program` is a real Python 3 interpreter -- `--version` runs and
+/// its output names major version 3. Used both to validate `HYPERFRAMES_
+/// PYTHON` and to confirm a PATH candidate before trusting it, the same
+/// validation Hyperframes' own `findPython` performs before accepting either
+/// source.
+fn is_python_three(program: &str) -> bool {
+    run_bounded_probe(program, &["--version"]).is_some_and(|output| output.contains("Python 3"))
+}
+
+/// Resolves a Python 3 interpreter the way Hyperframes' own `findPython`
+/// does (`packages/cli/src/tts/python.ts`): the `HYPERFRAMES_PYTHON`
+/// override first (only if it actually validates as Python 3), then
+/// `python3`, then `python` on `PATH`. Best-effort like every other probe
+/// here -- a rejected override or a missing/broken PATH candidate simply
+/// falls through to the next one rather than erroring.
+///
+/// On Windows, `python3`/`python` can resolve to the `WindowsApps` alias
+/// stub Microsoft ships in place of a real interpreter, which either opens
+/// the Store or exits without a usable `--version`; either way `is_python_
+/// three` rejects it and this falls through exactly as it would for any
+/// other broken candidate, rather than reporting a false "found."
+fn find_motion_python() -> Option<String> {
+    if let Ok(override_path) = std::env::var("HYPERFRAMES_PYTHON")
+        && is_python_three(&override_path)
+    {
+        return Some(override_path);
+    }
+    ["python3", "python"]
+        .into_iter()
+        .find(|name| executable_exists(name) && is_python_three(name))
+        .map(str::to_string)
+}
+
+/// Optional narration prerequisites for the built-in `motion-graphics`
+/// skill's Kokoro path (README's "Audio policy" section): without these, the
+/// skill still renders, just without narration, so `zirv setup` reports this
+/// as informational rather than a warning.
+#[derive(Debug, Serialize)]
+struct MotionNarrationStatus {
+    python_found: bool,
+    /// `false` whenever `python_found` is `false` -- there is no interpreter
+    /// to check modules against.
+    modules_present: bool,
+}
+
+/// Optional motion-graphics (Hyperframes) prerequisites (README, `research.
+/// md`): node, ffmpeg, and Kokoro narration. None of these gate `zirv
+/// setup`'s own exit code -- see [`status`]'s doc comment on this field.
+#[derive(Debug, Serialize)]
+struct MotionGraphicsStatus {
+    node_installed: bool,
+    /// `None` when `node` was not found, or `node --version` did not run,
+    /// finish within [`MOTION_PROBE_TIMEOUT`], or parse -- an unknown
+    /// version is never reported as unsupported.
+    node_version: Option<(u64, u64, u64)>,
+    /// `true` when `node_version` is `None` (unknown is never flagged) or at
+    /// least [`MOTION_NODE_MIN_MAJOR`]; `false` only on a confirmed older
+    /// major version.
+    node_supported: bool,
+    ffmpeg_installed: bool,
+    narration: MotionNarrationStatus,
+}
+
+/// Best-effort motion-graphics preflight (issue: motion-graphics plumbing,
+/// `.zirv/work/6a1aa876-84fc-40d0-9790-04ee8f70b705`): reuses
+/// [`executable_exists`] for simple presence checks the same way the
+/// claude/codex harness checks in [`status`] do, and never fails or changes
+/// `zirv setup`'s exit code -- every probe here resolves to a plain bool or
+/// `Option`, with no `?` anywhere in this function.
+fn motion_graphics_status() -> MotionGraphicsStatus {
+    let node_installed = executable_exists("node");
+    let node_version = node_installed
+        .then(|| run_bounded_probe("node", &["--version"]))
+        .flatten()
+        .and_then(|output| parse_node_version(&output));
+    let node_supported = node_version.is_none_or(|(major, _, _)| major >= MOTION_NODE_MIN_MAJOR);
+    let ffmpeg_installed = executable_exists("ffmpeg");
+    let python = find_motion_python();
+    let modules_present = python.as_deref().is_some_and(|python| {
+        run_bounded_probe(python, &["-c", MOTION_NARRATION_MODULES_PROBE]).is_some()
+    });
+    MotionGraphicsStatus {
+        node_installed,
+        node_version,
+        node_supported,
+        ffmpeg_installed,
+        narration: MotionNarrationStatus {
+            python_found: python.is_some(),
+            modules_present,
+        },
     }
 }
 
@@ -2822,7 +3007,7 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         .unwrap_or(0);
     let cfg = ctx::config::CtxConfig::load(repo, &ctx::config::env_from_process())?;
     Ok(SetupStatus {
-        schema_version: 3,
+        schema_version: 4,
         repo: repo.to_path_buf(),
         zirv_initialized: repo.join(".zirv").is_dir(),
         context_common: ctx::context::common_path(repo).is_file(),
@@ -2859,6 +3044,7 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
                 || codex_dir.join("hooks.json").is_file(),
             config_dir: codex_dir,
         },
+        motion_graphics: motion_graphics_status(),
     })
 }
 
@@ -2930,6 +3116,38 @@ fn run_status<W: Write>(args: &StatusArgs, writer: &mut W) -> SetupResult<i32> {
         status.profile.worker_codex.as_deref().unwrap_or("default"),
         status.profile.review_claude.as_deref().unwrap_or("default"),
         status.profile.review_codex.as_deref().unwrap_or("default")
+    )?;
+    writeln!(
+        writer,
+        "  motion-graphics (optional): node={}, ffmpeg={}, narration={}",
+        match (
+            status.motion_graphics.node_installed,
+            status.motion_graphics.node_version,
+            status.motion_graphics.node_supported,
+        ) {
+            (false, _, _) => "not found".to_string(),
+            (true, None, _) => "found (version unknown)".to_string(),
+            (true, Some((major, minor, patch)), true) => format!("{major}.{minor}.{patch}"),
+            (true, Some((major, minor, patch)), false) => format!(
+                "{major}.{minor}.{patch} (Hyperframes needs Node {}+)",
+                MOTION_NODE_MIN_MAJOR
+            ),
+        },
+        if status.motion_graphics.ffmpeg_installed {
+            "found"
+        } else {
+            "not found"
+        },
+        match (
+            status.motion_graphics.narration.python_found,
+            status.motion_graphics.narration.modules_present,
+        ) {
+            (false, _) => "unavailable (no Python 3 found)".to_string(),
+            (true, false) => {
+                "unavailable (run `pip install kokoro-onnx soundfile`)".to_string()
+            }
+            (true, true) => "available (Kokoro)".to_string(),
+        }
     )?;
     // Provide next step guidance based on current state
     writeln!(writer)?; // blank line for clarity
@@ -4417,6 +4635,24 @@ mod tests {
         assert!((2, 1, 273) >= CLAUDE_VERIFIED_VERSION);
     }
 
+    /// The motion-graphics preflight's floor check (`node_supported`) rests
+    /// entirely on this parse being right -- a wrong major version here
+    /// would either wave through a Node too old for Hyperframes or flag a
+    /// perfectly good one, so this covers the real `node --version` shape
+    /// plus the unparseable inputs the probe must fall back to "unknown" on.
+    #[test]
+    fn node_version_output_parses_major_minor_patch() {
+        assert_eq!(parse_node_version("v22.9.0\n"), Some((22, 9, 0)));
+        assert_eq!(parse_node_version("v18.20.4\n"), Some((18, 20, 4)));
+        assert_eq!(parse_node_version(""), None);
+        assert_eq!(parse_node_version("not a version\n"), None);
+        assert_eq!(parse_node_version("22.9.0\n"), None, "missing leading v");
+        assert_eq!(parse_node_version("v22\n"), None, "missing minor/patch");
+
+        assert!(22 >= MOTION_NODE_MIN_MAJOR);
+        assert!(18 < MOTION_NODE_MIN_MAJOR);
+    }
+
     #[test]
     fn parses_status_apply_and_guarded_reset() {
         let status = SetupCli::try_parse_from(["zirv setup", "status", "--json"]).expect("status");
@@ -4559,7 +4795,7 @@ mod tests {
         assert_eq!(all_runs(std::slice::from_ref(&backup_root)).len(), 1);
 
         let setup_status = status(repo.path()).expect("status");
-        assert_eq!(setup_status.schema_version, 3);
+        assert_eq!(setup_status.schema_version, 4);
         assert_eq!(setup_status.profile.agent.as_deref(), Some("claude"));
         assert_eq!(setup_status.profile.chat_model.as_deref(), Some("fable"));
         assert_eq!(
@@ -5561,7 +5797,7 @@ mod tests {
         )
         .expect("status");
         let value: Value = serde_json::from_slice(&output).expect("status json");
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         for key in [
             "repo",
             "zirv_initialized",
@@ -5573,6 +5809,7 @@ mod tests {
             "profile",
             "claude",
             "codex",
+            "motion_graphics",
         ] {
             assert!(value.get(key).is_some(), "missing stable status key {key}");
         }
