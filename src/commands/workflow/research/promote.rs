@@ -941,9 +941,9 @@ pub fn screen_points(obs: &[Observation]) -> ScreenPoints {
         Some(stats::mean(&d_correctness_pairs))
     };
 
-    // Mirrors `screen`'s own quality comparison: raw `quality` values only
-    // (no failed-trial-as-0 substitution), and only pairs where both sides
-    // actually carry one.
+    // Raw `quality` values only (no failed-trial-as-0 substitution), over
+    // pairs where both sides carry one. `screen` itself compares unpaired
+    // arm means, so the two agree only when every observation is paired.
     let d_quality_pairs: Vec<f64> = pairs
         .iter()
         .filter_map(|(b, c)| match (b.quality, c.quality) {
