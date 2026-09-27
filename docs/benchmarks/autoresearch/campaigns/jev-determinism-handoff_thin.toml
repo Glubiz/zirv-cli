@@ -27,8 +27,22 @@
 # env var -- this corpus is handoff-thin only, so a single requires_receipts
 # entry covers every case in it.
 #
-# Pair counts: validate = 10 tasks * 2 reps = 20 pairs, holdout = 6 tasks *
-# 2 reps = 12 pairs, both >= criteria.min_pairs = 6.
+# CONFIRMATORY ROUND: conf-085 (0.85 against the compiled 0.9) improved both
+# stability and correctness on validation in two separate round-2 runs, but
+# the bootstrap CI lower bound stayed at 0 with only 10 validation cases --
+# not enough evidence to promote. conf-045, conf-060, and conf-082 were
+# already rejected in round 2 on correctness or stability grounds and are
+# NOT re-run here (see docs/benchmarks/autoresearch/results/ for that
+# report). jev-cases/handoff_thin/ now carries 16 more cases (ht-025..040,
+# 10 validation / 6 holdout): 8 tiny (task_len 5-30, zero constraints,
+# measured "thin" at confidence 0.82-0.95 -> demote), 5 small (task_len
+# 30-90 with some constraints, measured 0.3-0.9 -> unstable, kept
+# `ambiguous`, labelled `keep`), and 3 medium/rich controls (measured
+# adequate/thin at <=0.44, well under either floor -> keep). This campaign
+# now runs ONLY conf-085.
+#
+# Pair counts: validate = 20 tasks * 2 reps = 40 pairs, holdout = 12 tasks *
+# 2 reps = 24 pairs, both >= criteria.min_pairs = 6.
 
 schema = 1
 id = "jev-determinism-handoff_thin"
@@ -61,10 +75,14 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 0.45
-max_wall_secs = 3600
-max_calls = 3000
-max_trials = 300
+# Worst case with 1 candidate and the grown corpus (dev 8, validation 20,
+# holdout 12): screen 8*2=16, validate 20*3=60, holdout 12*3=36 -> baseline
+# 112; candidate_worst_case = 1*(16+60)+36 = 112 -> worst_case_trials = 224,
+# worst_case_calls = 224*10 = 2240, worst_case_spend = 224*0.0015 = $0.336.
+max_spend_usd = 0.40
+max_wall_secs = 14400
+max_calls = 2500
+max_trials = 250
 max_retries = 1
 concurrency = 3
 
@@ -100,27 +118,9 @@ env = {}
 allow_env = ["ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE"]
 allowed_models = ["sonnet"]
 
-[[candidates]]
-id = "conf-045"
-hypothesis = "A 0.45 floor sits below every small handoff's 'thin' confidence band (0.46+) and above medium ones (<= 0.44): small handoffs demote deterministically."
-mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.45, margin left at the compiled default."
-env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.45" }
-requires_receipts = ["jev:handoff"]
-
-[[candidates]]
-id = "conf-060"
-hypothesis = "A confidence floor of 0.6 (handoff_select) sits inside round 1's observed intermediate/medium cluster (0.0-0.37 to 0.82-0.95 gap) and may start admitting some of those rows."
-mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.6, margin left at the compiled default."
-env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.6" }
-requires_receipts = ["jev:handoff"]
-
-[[candidates]]
-id = "conf-082"
-hypothesis = "A 0.82 floor sits in the gap between small handoffs' bands (<= 0.81) and tiny ones' (>= 0.84): tiny handoffs demote deterministically, small ones never do."
-mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.82, margin left at the compiled default."
-env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.82" }
-requires_receipts = ["jev:handoff"]
-
+# Only conf-085 survives into this confirmatory round: conf-045/060/082
+# were already rejected in round 2 (correctness or stability), so they are
+# not re-run here.
 [[candidates]]
 id = "conf-085"
 hypothesis = "A 0.85 floor probes the lower edge of the tiny-handoff band (0.84-0.95); expected to flip more than 0.82 (control for the gap's position)."

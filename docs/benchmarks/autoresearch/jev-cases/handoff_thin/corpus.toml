@@ -183,3 +183,126 @@ family = "jev-handoff_thin"
 class = "bounded"
 split = "holdout"
 kind = "decision"
+
+# Confirmatory round (conf-085, probe confidence floor 0.85 against the
+# compiled 0.9): conf-085 improved both stability and correctness on
+# validation in two separate runs, but the 5-case validation split left the
+# gate's CI lower bound at 0. Measured bands: tiny handoffs answer "thin" at
+# confidence 0.82-0.95, small ones at 0.3-0.9 (unstable -- kept `ambiguous`
+# here), medium ones answer adequate/thin at <=0.44 (well under either
+# floor, so `keep` either way). ht-025..040 add 8 tiny (task_len 5-30, zero
+# constraints -> demote), 5 small (task_len 30-90, some constraints ->
+# keep), and 3 medium/rich controls (keep), 10 validation / 6 holdout, to
+# give the gate enough validation-stage evidence.
+
+[[task]]
+id = "ht-025"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-026"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-027"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-028"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-029"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-030"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-031"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-032"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-033"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-034"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-035"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-036"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-037"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-038"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-039"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-040"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
