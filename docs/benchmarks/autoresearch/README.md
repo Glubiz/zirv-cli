@@ -276,8 +276,10 @@ trade-off directly, per floor site, using two axes:
 - **`quality`** = acted-decision *stability*: for `jev_probe_trial.py`, the
   mean, across a case's items, of "how often does the plurality action
   recur across `K` uncached repetitions" (`jev_probe_trial.py --reps 5`);
-  for `decision_trial.py --reps K` (the intake campaign), the modal share
-  of the `(seat_tier, clarify)` decision tuple across `K` uncached reps.
+  for `decision_trial.py --reps K` (the intake campaign), the modal share of
+  the full production-acted decision tuple (`ACTED_DECISION_FIELDS` in
+  `decision_trial.py` -- every intake-decided field production actually
+  reads, not just `(seat_tier, clarify)`) across `K` uncached reps.
   `K` uncached means every rep is a genuinely fresh Jev/proxy call --
   `zirv ctx jev probe` forces its own cache off, and the intake campaign
   sets `ZIRV_CTX_JEV_CACHE_TTL_SECS=0` in `[cohort] env`.

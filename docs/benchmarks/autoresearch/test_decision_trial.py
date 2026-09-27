@@ -628,6 +628,46 @@ class RunTrialRepsTests(unittest.TestCase):
             self.assertIsNotNone(trial["correctness"])
             self.assertAlmostEqual(trial["quality"], 1.0)
 
+    def test_quality_sees_a_field_the_old_seat_tier_clarify_metric_could_not(self):
+        # Issue: the old K>1 quality metric was the modal share of just
+        # (seat_tier, clarify) -- it would have read quality=1.0 here, since
+        # every rep agrees on both. But `intent` (a real production-acted
+        # decision.rs field -- see ACTED_DECISION_FIELDS) flips on the third
+        # rep; the full acted-decision tuple must see that instability.
+        calls = {"n": 0}
+
+        def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
+            calls["n"] += 1
+            d = decision(seat_tier="standard", needs_clarification=0.9, decisive=True)
+            d["intent"] = "feature" if calls["n"] <= 2 else "bugfix"
+            return d, 10, "", None
+
+        decision_trial.call_proxy_decision = fake_call
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = self._spec(tmp)
+            out_dir = Path(tmp) / "out"
+            trial = decision_trial.run_trial(str(spec_path), str(out_dir), reps=3)
+
+            self.assertEqual(trial["status"], "ok")
+            self.assertEqual(calls["n"], 3)
+            # seat_tier and clarify agree on all 3 reps; only intent flips --
+            # the old metric would have scored this 1.0.
+            self.assertAlmostEqual(trial["quality"], 2 / 3)
+
+            details = json.loads((out_dir / "details.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(details["reps"]), 3)
+            intents = [r["acted_decision"]["intent"] for r in details["reps"]]
+            self.assertEqual(intents, ["feature", "feature", "bugfix"])
+            # Every rep's acted_decision also carries the other acted fields
+            # (from decision()'s own defaults), not just seat_tier/clarify.
+            self.assertEqual(
+                details["reps"][0]["acted_decision"]["seat_tier"], "standard"
+            )
+            self.assertEqual(
+                details["reps"][0]["acted_decision"]["orchestrator_model"], "sonnet"
+            )
+
     def test_reps_all_calls_return_none_is_error_status(self):
         def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
             return None, 5, "", "proxy call failed"

@@ -38,6 +38,81 @@ CLARIFY_THRESHOLD = 0.5
 
 SEAT_TIER_RANK = {"cheap": 0, "standard": 1, "deep": 2, "frontier": 3}
 
+# The exact `ProxyDecision` fields (src/commands/ctx/proxy/decision.rs) that
+# PRODUCTION actually reads to launch, clarify, gate review, or pick a
+# model/workflow -- what `--reps K`'s `quality` (modal share) is computed
+# over. The old K>1 metric only looked at `(seat_tier, clarify)`, which
+# hides instability in every other field the intake proxy decides from Jev
+# answers -- a prior measurement found intent/workflow/architecture flipping
+# at margins <= 0.14 that metric could not see. `orchestrator.{harness,model}`
+# and `validation.{independent_review,independent_test,security_review}` are
+# nested under those keys in the raw decision and flattened in
+# `canonical_acted_decision` below, so they are covered too even though they
+# aren't listed as top-level field names here.
+#
+# Deliberately excludes: `request_sha256`/`repo` (identifiers/inputs, not
+# decided); `confidence`/`reasons`/`fallbacks` (introspection and free-text
+# rationale -- no downstream consumer branches on them, see decision.rs's
+# `ProxyDecision` doc comment); `elapsed_ms`/`usage`/`created_at` (timing/
+# cost, nondeterministic by construction and never acted on); `headless`
+# (an input flag echoed back, constant for the whole trial, not something
+# Jev/intake decided).
+ACTED_DECISION_FIELDS = (
+    "intent",  # decision.rs:228; set in merge() decision.rs:1802-1809
+    "complexity",  # decision.rs:229; set/raised in merge() decision.rs:1812-1829
+    "risk",  # decision.rs:230; set/raised in merge() decision.rs:1831-1848
+    "execution",  # decision.rs:231; derived in finalize_derived_fields()
+    # decision.rs:1360-1377, floored by apply_risk_execution_floor()
+    # decision.rs:1282-1291, forced single-seat for headless launches by
+    # force_single_seat() decision.rs:1403-1413
+    "seat_role",  # decision.rs:232; derived decision.rs:1374 (single seat vs
+    # a compiled orchestrator team)
+    "workflow",  # decision.rs:234; set in merge() decision.rs:1850-1868
+    "seat_tier",  # decision.rs:236; derived decision.rs:1368-1372, drives
+    # orchestrator.model via model_for_tier() decision.rs:1375-1376
+    "worker_tier",  # decision.rs:237; derived decision.rs:1373
+    "needs_clarification",  # decision.rs:238; set in merge()
+    # decision.rs:1878-1883, gates the clarify line (proxy/mod.rs:556)
+    "needs_clarification_decisive",  # decision.rs:249; set in merge()
+    # decision.rs:1882
+    "clarification_category",  # decision.rs:253; set by
+    # clarification_category() proxy/mod.rs:268-365, read by
+    # chat/intake.rs:238,917
+    "domains",  # decision.rs:260; additive tags set in merge()
+    # decision.rs:1893-1904, gate validation flags and shape the announce/
+    # prompt-layer lines (proxy/mod.rs:458-459,553-554)
+    "decider",  # decision.rs:261; which decider (typesafe/helper/
+    # deterministic) actually produced the decision
+)
+
+
+def canonical_acted_decision(decision):
+    """The canonical, JSON-comparable snapshot of every field in
+    `ACTED_DECISION_FIELDS` (plus the nested `orchestrator.{harness,model}`/
+    `validation.{independent_review,independent_test,security_review}`
+    fields, flattened) -- what one rep's `zirv ctx proxy --json` call
+    actually decided that PRODUCTION reads back. `None` for a `None`
+    decision (a failed rep, never counted in the stability set -- see
+    `run_trial`); a missing individual key reads as `None` too (an older
+    build, or a key `merge`/`finalize_derived_fields` never set for this
+    decision) rather than raising. `domains` is sorted so two decisions that
+    added the same tags in a different order still compare equal -- `merge`
+    only ever appends to it (never reorders), so this never hides real
+    instability, only an artifact of build order."""
+    if decision is None:
+        return None
+    snapshot = {field: decision.get(field) for field in ACTED_DECISION_FIELDS}
+    if isinstance(snapshot.get("domains"), list):
+        snapshot["domains"] = sorted(snapshot["domains"])
+    orchestrator = decision.get("orchestrator") or {}
+    snapshot["orchestrator_harness"] = orchestrator.get("harness")
+    snapshot["orchestrator_model"] = orchestrator.get("model")
+    validation = decision.get("validation") or {}
+    snapshot["validation_independent_review"] = validation.get("independent_review")
+    snapshot["validation_independent_test"] = validation.get("independent_test")
+    snapshot["validation_security_review"] = validation.get("security_review")
+    return snapshot
+
 
 def zirv_exe(explicit=None):
     if explicit:
@@ -369,14 +444,20 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
     SAME trial state dir and folds them into one trial: `correctness` is the
     mean of each rep's own `grade_decision` score (an errored rep grades
     `None` against the label, same as today, and still counts); `quality` is
-    the modal share of the (predicted_seat_tier, predicted_clarify) tuple --
-    the exact fields `grade_decision` itself compares against the label --
-    across ONLY the reps whose decision came back (a failed rep never counts
-    as "agreeing" with another failed rep; if every rep failed, `status` is
-    `"error"` and `quality`/`correctness` are both `None`, same as today)
-    (the same "how often does the modal answer recur" stability measure
-    `jev_probe_trial.py` uses, applied here to the intake decision instead
-    of a Jev site's per-item actions). Raises `ValueError` if the spec's own
+    the modal share of the FULL production-acted decision tuple
+    (`ACTED_DECISION_FIELDS`/`canonical_acted_decision`, covering every
+    field the intake proxy decides from Jev answers that production actually
+    acts on -- not just `(seat_tier, clarify)`, which hid instability in
+    `intent`/`workflow`/`architecture` and the rest) across ONLY the reps
+    whose decision came back (a failed rep never counts as "agreeing" with
+    another failed rep; if every rep failed, `status` is `"error"` and
+    `quality`/`correctness` are both `None`, same as today) (the same "how
+    often does the modal answer recur" stability measure `jev_probe_trial.py`
+    uses, applied here to the intake decision instead of a Jev site's
+    per-item actions). Each rep's own canonical acted-decision snapshot is
+    recorded in `details.json` (`details["reps"][i]["acted_decision"]`) so
+    an analyst can see exactly which field flipped between reps. Raises
+    `ValueError` if the spec's own
     `state_dir` is missing or empty, so a child `zirv` can never silently
     fall back to the operator's real state dir."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
@@ -436,6 +517,11 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
             rep_grade["latency_ms"] = elapsed_ms
             if error_note:
                 rep_grade["error"] = error_note
+            # Per-rep canonical acted-decision snapshot, recorded regardless
+            # of whether this rep's decision came back (None for a failed
+            # rep) so an analyst reading details.json can see exactly which
+            # field flipped between reps.
+            rep_grade["acted_decision"] = canonical_acted_decision(decision)
             total_elapsed += elapsed_ms
             any_decision = any_decision or decision is not None
             rep_details.append({
@@ -446,13 +532,15 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
         status = "ok" if any_decision else "error"
         if any_decision:
             trial_correctness = sum(r["correctness"] for r in rep_details) / len(rep_details)
-            # Stability (quality) is the modal share over reps whose decision
-            # actually came back -- a failed rep (predicted_seat_tier/
-            # predicted_clarify both None) must never count as "agreeing"
+            # Stability (quality) is the modal share of the FULL acted
+            # decision over reps whose decision actually came back -- a
+            # failed rep (acted_decision None) must never count as "agreeing"
             # with another failed rep; correctness above still folds in every
-            # rep, failed or not, same as before.
+            # rep, failed or not, same as before. `json.dumps(..., sort_keys=
+            # True)` gives each acted-decision dict a stable, hashable,
+            # order-independent key for Counter.
             tuples = [
-                (r["grade"]["predicted_seat_tier"], r["grade"]["predicted_clarify"])
+                json.dumps(r["grade"]["acted_decision"], sort_keys=True)
                 for r in rep_details if r["decision_ok"]
             ]
             top_count = Counter(tuples).most_common(1)[0][1]
