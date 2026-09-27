@@ -894,13 +894,14 @@ pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
 /// for the same paired baseline/candidate observations `screen` itself
 /// judged, recorded alongside a screen `StageDecision` so a report generated
 /// later (purely from the ledger) can show a number instead of leaving the
-/// screen row's rel_cost/rel_wall/d_correctness columns blank. Reuses
-/// exactly the same pairing and cost-usability rule `screen` uses, so the
+/// screen row's rel_cost/rel_wall/d_correctness/d_quality columns blank.
+/// Reuses exactly the same pairing and cost-usability rule `screen` uses, so the
 /// numbers shown are the ones the gate actually looked at, not a
 /// re-derivation that could disagree with it.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScreenPoints {
     pub d_correctness: Option<f64>,
+    pub d_quality: Option<f64>,
     pub rel_cost: Option<f64>,
     pub rel_wall: Option<f64>,
 }
@@ -940,8 +941,25 @@ pub fn screen_points(obs: &[Observation]) -> ScreenPoints {
         Some(stats::mean(&d_correctness_pairs))
     };
 
+    // Mirrors `screen`'s own quality comparison: raw `quality` values only
+    // (no failed-trial-as-0 substitution), and only pairs where both sides
+    // actually carry one.
+    let d_quality_pairs: Vec<f64> = pairs
+        .iter()
+        .filter_map(|(b, c)| match (b.quality, c.quality) {
+            (Some(qb), Some(qc)) => Some(qc - qb),
+            _ => None,
+        })
+        .collect();
+    let d_quality = if d_quality_pairs.is_empty() {
+        None
+    } else {
+        Some(stats::mean(&d_quality_pairs))
+    };
+
     ScreenPoints {
         d_correctness,
+        d_quality,
         rel_cost,
         rel_wall,
     }
@@ -1450,6 +1468,27 @@ mod tests {
             "got {:?}",
             points.rel_wall
         );
+    }
+
+    /// `screen_points` must report `d_quality` as the mean per-pair
+    /// (candidate - baseline) quality delta when every pair carries a
+    /// quality value on both sides, and leave it `None` when no observation
+    /// carries a quality value at all -- the same "no quality values" case
+    /// `screen` itself discards on under `Objective::Quality`.
+    #[test]
+    fn screen_points_reports_d_quality_when_present_and_none_when_absent() {
+        let with_quality =
+            matched_pairs_with_quality("cohort-a", 6, 0.9, 0.5, 0.8, 1.0, 1.0, 1000, 1000);
+        let points = screen_points(&with_quality);
+        assert!(
+            (points.d_quality.unwrap() - 0.3).abs() < 1e-9,
+            "got {:?}",
+            points.d_quality
+        );
+
+        let without_quality = matched_pairs("cohort-a", 6, 0.9, 0.9, 1.0, 1.0, 1000, 1000);
+        let points = screen_points(&without_quality);
+        assert!(points.d_quality.is_none());
     }
 
     /// An incomplete cost on any pair must leave `rel_cost` unset, the same
