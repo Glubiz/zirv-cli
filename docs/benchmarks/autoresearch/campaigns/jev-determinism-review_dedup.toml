@@ -44,7 +44,7 @@ file = "docs/benchmarks/autoresearch/jev-cases/review_dedup/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "5"]
-per_trial_ceiling_usd = 0.001
+per_trial_ceiling_usd = 0.0005
 calls_per_trial = 5
 timeout_secs = 180
 
@@ -53,10 +53,10 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 0.05
+max_spend_usd = 0.10
 max_wall_secs = 3600
-max_calls = 250
-max_trials = 50
+max_calls = 1000
+max_trials = 200
 max_retries = 1
 concurrency = 3
 
