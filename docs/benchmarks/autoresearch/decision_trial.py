@@ -71,10 +71,9 @@ ACTED_DECISION_FIELDS = (
     "seat_tier",  # decision.rs:236; derived decision.rs:1368-1372, drives
     # orchestrator.model via model_for_tier() decision.rs:1375-1376
     "worker_tier",  # decision.rs:237; derived decision.rs:1373
-    "needs_clarification",  # decision.rs:238; set in merge()
-    # decision.rs:1878-1883, gates the clarify line (proxy/mod.rs:556)
-    "needs_clarification_decisive",  # decision.rs:249; set in merge()
-    # decision.rs:1882
+    # needs_clarification (decision.rs:238) is a raw probability that differs
+    # on every call; production acts only on the derived clarify boolean,
+    # which canonical_acted_decision adds as "clarify" (see decision_clarify).
     "clarification_category",  # decision.rs:253; set by
     # clarification_category() proxy/mod.rs:268-365, read by
     # chat/intake.rs:238,917
@@ -102,6 +101,7 @@ def canonical_acted_decision(decision):
     if decision is None:
         return None
     snapshot = {field: decision.get(field) for field in ACTED_DECISION_FIELDS}
+    snapshot["clarify"] = decision_clarify(decision)
     if isinstance(snapshot.get("domains"), list):
         snapshot["domains"] = sorted(snapshot["domains"])
     orchestrator = decision.get("orchestrator") or {}
