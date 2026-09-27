@@ -46,9 +46,24 @@ const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
 const MAX_JEV_FINDINGS_PER_BATCH: usize = 20;
 const MAX_JEV_PREVIOUS_FINDINGS: usize = 10;
 /// Minimum disposition confidence from the 2026-09-18 probe.
-const JEV_DISPOSITION_CONFIDENCE: f32 = 0.7;
+pub(crate) const JEV_DISPOSITION_CONFIDENCE: f32 = 0.7;
 /// Minimum duplicate probability from the 2026-09-18 probe.
-const JEV_DEDUP_PROBABILITY: f64 = 0.9;
+pub(crate) const JEV_DEDUP_PROBABILITY: f64 = 0.9;
+/// [`advise_dispositions`]'s own default `(min_confidence, min_margin)`
+/// `decisive()` floor -- named (issue: `zirv ctx jev probe`) so a later
+/// retune targets exactly this constant.
+pub(crate) const REVIEW_DISPOSITION_DEFAULT_FLOOR: (f32, f32) =
+    (JEV_DISPOSITION_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
+/// [`advise_duplicates`]'s own default `(min_confidence, min_margin)`
+/// `decisive()` floor -- named (issue: `zirv ctx jev probe`) so a later
+/// retune targets exactly this constant. Not routed through `jev::floor`/
+/// `[jev.floors]` today: this stays the same fixed pair production has
+/// always used.
+pub(crate) const REVIEW_DEDUP_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+/// [`advise_dispositions`]'s own production advise-site LABEL.
+pub(crate) const REVIEW_DISPOSITION_LABEL: &str = "workflow-review-disposition";
+/// [`advise_duplicates`]'s own production advise-site LABEL.
+pub(crate) const REVIEW_DEDUP_LABEL: &str = "workflow-review-dedup";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -237,6 +252,65 @@ fn sort_findings_by_advisory(findings: &mut [ReviewFinding]) {
     findings.sort_by_key(advisory_rank);
 }
 
+/// [`advise_dispositions`]'s own per-batch Choice question set, factored out
+/// so `zirv ctx jev probe` can ask the exact same questions from a fixture's
+/// own finding count, without rebuilding `ReviewFinding`s it has no way to
+/// construct.
+pub(crate) fn review_disposition_questions(n: usize) -> Vec<Question> {
+    (0..n)
+        .map(|index| {
+            Question::metadata_choice(
+                &format!("f{index}"),
+                "Classify this review finding's advisory disposition.",
+                &[
+                    ("fix_now", "a confirmed defect worth fixing in this change"),
+                    ("defer", "real but out of scope or cosmetic"),
+                    (
+                        "reject",
+                        "not a defect, false positive or contradicts the stated context",
+                    ),
+                    (
+                        "verify",
+                        "plausible but the evidence shown does not prove it",
+                    ),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// [`advise_dispositions`]'s own per-finding decision: the chosen disposition
+/// (`"fix_now"`/`"defer"`/`"reject"`/`"verify"`) for a decisive, recognised
+/// choice, `"unchanged"` otherwise (missing answer, indecisive, or an
+/// unrecognised choice) -- `advise_dispositions`'s own fallback outcome
+/// (the finding's `advisory_disposition` stays untouched). Does NOT include
+/// the deterministic `finding_category(&finding.summary) != 0` pre-check
+/// production applies before ever consulting this fn -- that reads a fact
+/// about the finding itself, not the Jev answer. Shared with `zirv ctx jev
+/// probe`, which reports exactly this outcome per finding id.
+pub(crate) fn review_disposition_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "unchanged";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "unchanged";
+    }
+    let AnswerValue::Choice(choice) = &answer.value else {
+        return "unchanged";
+    };
+    match choice.as_str() {
+        "fix_now" => "fix_now",
+        "defer" => "defer",
+        "reject" => "reject",
+        "verify" => "verify",
+        _ => "unchanged",
+    }
+}
+
 fn advise_dispositions(
     cfg: &CtxConfig,
     state_dir: &StateDir,
@@ -252,51 +326,29 @@ fn advise_dispositions(
         if states.iter().all(|finding| finding.category == 0) {
             continue;
         }
-        let questions: Vec<Question> = batch
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                Question::metadata_choice(
-                    &format!("f{index}"),
-                    "Classify this review finding's advisory disposition.",
-                    &[
-                        ("fix_now", "a confirmed defect worth fixing in this change"),
-                        ("defer", "real but out of scope or cosmetic"),
-                        (
-                            "reject",
-                            "not a defect, false positive or contradicts the stated context",
-                        ),
-                        (
-                            "verify",
-                            "plausible but the evidence shown does not prove it",
-                        ),
-                    ],
-                )
-            })
-            .collect();
+        let questions = review_disposition_questions(batch.len());
         let Some(answers) = jev::advise(
             cfg,
             state_dir,
-            "workflow-review-disposition",
+            REVIEW_DISPOSITION_LABEL,
             cfg.jev.review,
             &state,
             &questions,
         ) else {
             continue;
         };
+        let (min_confidence, min_margin) = REVIEW_DISPOSITION_DEFAULT_FLOOR;
         for (index, finding) in batch.iter_mut().enumerate() {
-            let Some(answer) = answers.get(&format!("f{index}")) else {
+            if finding_category(&finding.summary) == 0 {
                 continue;
-            };
-            let AnswerValue::Choice(choice) = &answer.value else {
-                continue;
-            };
-            if finding_category(&finding.summary) != 0
-                && answer.decisive(JEV_DISPOSITION_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
-                && matches!(choice.as_str(), "fix_now" | "verify" | "defer" | "reject")
-            {
-                finding.advisory_disposition = Some(choice.clone());
-                finding.advisory_confidence = Some(answer.confidence);
+            }
+            let answer = answers.get(&format!("f{index}"));
+            match review_disposition_action(answer, min_confidence, min_margin) {
+                "unchanged" => {}
+                choice => {
+                    finding.advisory_disposition = Some(choice.to_string());
+                    finding.advisory_confidence = answer.map(|answer| answer.confidence);
+                }
             }
         }
     }
@@ -357,6 +409,49 @@ fn duplicate_comparison(incoming: &ReviewFinding, previous: &ReviewFinding) -> [
     ]
 }
 
+/// [`advise_duplicates`]'s own per-candidate Noul question, factored out so
+/// `zirv ctx jev probe` can ask the exact same question set from a fixture's
+/// own candidate ids, without rebuilding `ReviewFinding` candidates it has no
+/// way to construct.
+pub(crate) fn review_dedup_questions(ids: &[String]) -> Vec<Question> {
+    ids.iter()
+        .map(|id| {
+            Question::metadata_noul(
+                id,
+                "Is this the same underlying issue as the new finding?",
+                "the same underlying issue",
+                "a different issue",
+            )
+        })
+        .collect()
+}
+
+/// [`advise_duplicates`]'s own per-candidate decision: `"duplicate"` for a
+/// decisive noul at or above [`JEV_DEDUP_PROBABILITY`], `"distinct"`
+/// otherwise (missing, indecisive, or below the threshold) -- `advise_
+/// duplicates`'s own fallback outcome. Does NOT include the deterministic
+/// pre-checks production applies before ever acting on this outcome (the
+/// incoming finding's own severity, and `duplicate_comparison(..)[4] == 1`)
+/// -- both read facts already sent in the state, not the Jev answer itself.
+/// Shared with `zirv ctx jev probe`, which reports exactly this outcome per
+/// candidate id.
+pub(crate) fn review_dedup_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "distinct";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "distinct";
+    }
+    match answer.as_noul() {
+        Some(probability) if probability >= JEV_DEDUP_PROBABILITY => "duplicate",
+        _ => "distinct",
+    }
+}
+
 fn advise_duplicates(
     cfg: &CtxConfig,
     state_dir: &StateDir,
@@ -405,22 +500,14 @@ fn advise_duplicates(
             metadata_only: true,
             facts,
         };
-        let questions: Vec<Question> = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                Question::metadata_noul(
-                    &format!("p{index}"),
-                    "Is this the same underlying issue as the new finding?",
-                    "the same underlying issue",
-                    "a different issue",
-                )
-            })
+        let ids: Vec<String> = (0..candidates.len())
+            .map(|index| format!("p{index}"))
             .collect();
+        let questions = review_dedup_questions(&ids);
         let Some(answers) = jev::advise(
             cfg,
             state_dir,
-            "workflow-review-dedup",
+            REVIEW_DEDUP_LABEL,
             cfg.jev.review,
             &state,
             &questions,
@@ -451,8 +538,9 @@ fn advise_duplicates(
         // value already has margin `>= 0.8`, well clear of the default --
         // structurally a no-op at this floor, same reasoning `memory.rs`'s
         // harvest gate documents for its own floor.
+        let (min_confidence, min_margin) = REVIEW_DEDUP_DEFAULT_FLOOR;
         if let Some((candidate, probability, answer)) = best
-            && answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
+            && review_dedup_action(Some(answer), min_confidence, min_margin) == "duplicate"
             && duplicate_comparison(finding, candidate)[4] == 1
         {
             apply_duplicate_answer(finding, candidate, probability);
@@ -5825,6 +5913,71 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
 
         assert_eq!(incoming.duplicate_of, Some(finding_key(&previous)));
         assert_eq!(new_finding_count(&[previous], &[incoming]), 0);
+    }
+
+    fn disposition_choice_answer(choice: &str, confidence: f32) -> jev::Answer {
+        jev::Answer {
+            value: AnswerValue::Choice(choice.to_string()),
+            confidence,
+            probabilities: BTreeMap::from([
+                (choice.to_string(), 0.95_f32),
+                ("other".to_string(), 0.05_f32),
+            ]),
+        }
+    }
+
+    /// A decisive answer at or above `JEV_DISPOSITION_CONFIDENCE` annotates;
+    /// the same answer one step below the confidence threshold falls back to
+    /// "unchanged" -- proves the `>=` edge, not just a comfortably-clear
+    /// case.
+    #[test]
+    fn review_disposition_action_decides_on_the_confidence_edge() {
+        let (_, min_margin) = REVIEW_DISPOSITION_DEFAULT_FLOOR;
+        let at_floor = disposition_choice_answer("fix_now", JEV_DISPOSITION_CONFIDENCE);
+        assert_eq!(
+            review_disposition_action(Some(&at_floor), JEV_DISPOSITION_CONFIDENCE, min_margin),
+            "fix_now"
+        );
+        let just_below = disposition_choice_answer("fix_now", JEV_DISPOSITION_CONFIDENCE - 0.01);
+        assert_eq!(
+            review_disposition_action(Some(&just_below), JEV_DISPOSITION_CONFIDENCE, min_margin),
+            "unchanged"
+        );
+        assert_eq!(
+            review_disposition_action(None, JEV_DISPOSITION_CONFIDENCE, min_margin),
+            "unchanged"
+        );
+    }
+
+    fn dedup_noul_answer(probability: f64) -> jev::Answer {
+        jev::Answer {
+            value: AnswerValue::Noul(probability),
+            confidence: probability as f32,
+            probabilities: BTreeMap::new(),
+        }
+    }
+
+    /// A decisive answer at or above `JEV_DEDUP_PROBABILITY` reports
+    /// "duplicate"; the same answer one step below the probability threshold
+    /// falls back to "distinct" -- proves the `>=` edge, not just a
+    /// comfortably-clear case.
+    #[test]
+    fn review_dedup_action_decides_on_the_probability_edge() {
+        let (min_confidence, min_margin) = REVIEW_DEDUP_DEFAULT_FLOOR;
+        let at_floor = dedup_noul_answer(JEV_DEDUP_PROBABILITY);
+        assert_eq!(
+            review_dedup_action(Some(&at_floor), min_confidence, min_margin),
+            "duplicate"
+        );
+        let just_below = dedup_noul_answer(JEV_DEDUP_PROBABILITY - 0.01);
+        assert_eq!(
+            review_dedup_action(Some(&just_below), min_confidence, min_margin),
+            "distinct"
+        );
+        assert_eq!(
+            review_dedup_action(None, min_confidence, min_margin),
+            "distinct"
+        );
     }
 
     #[test]
