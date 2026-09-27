@@ -61,6 +61,7 @@
   - [Maintain loop](#maintain-loop)
   - [Frontend quality](#frontend-quality)
   - [The skill library](#the-skill-library)
+  - [The motion-graphics skill](#the-motion-graphics-skill)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
   - [MCP bridge](#mcp-bridge)
   - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
@@ -2749,6 +2750,45 @@ An orchestrator seat is refused from `review run --agent <its own harness>`
 record the completed run with `zirv workflow review record <id> --model
 <name> [--finding <id>]...` so it counts toward the review step's fresh
 independent review run gate exactly like a `review run` invocation.
+
+### The motion-graphics skill
+
+The built-in `motion-graphics` skill drives a wrapped agent through
+producing a rendered MP4 and GIF (a launch video, a README demo clip, ...)
+from HTML/CSS/JS "video as code," backed by HeyGen Hyperframes
+(`npx --yes hyperframes@0.8.80 <command>`). The version is pinned in the
+skill's own instructions and bumped deliberately with a zirv release --
+`npx` runs prompt-free, so an unpinned invocation would execute whatever npm
+serves that day. The skill never calls `ffmpeg` directly, never installs
+packages, and never downloads music.
+
+**Prerequisites.** Node 22+ and FFmpeg on `PATH` are required; `zirv setup`
+reports both (flagging a Node below 22) alongside optional narration
+prerequisites -- Python 3 plus `pip install kokoro-onnx soundfile` -- since
+the skill still renders, silently without narration, when they are absent.
+
+**First-run downloads.** Hyperframes manages its own headless Chrome the
+first time it renders. If Kokoro narration is used, its first call downloads
+a 310 MiB model plus 26 MiB of voices into `~/.cache/hyperframes/tts`.
+
+**Output layout.** The Hyperframes project lives at `<repo>/motion/<slug>/`
+and is committed; its `renders/` subdirectory (the actual MP4/GIF output) is
+git-ignored there.
+
+**Audio policy.** Narration comes from Kokoro (local, Apache-2.0 weights, no
+account) or the operator's own ElevenLabs key when one is already set in the
+environment. Music and sound effects are used only from files the operator
+places under `<repo>/motion/assets/audio/` -- the skill never downloads or
+generates them: every generative music engine either needs a HeyGen or
+Google account, or (MusicGen) ships weights under CC-BY-NC-4.0, which is
+non-commercial and therefore not a default.
+
+**Governance.** A Hyperframes `render` (not `lint`/`check`/`snapshot`/
+`doctor`/the audio subcommands) is a heavy operation
+(`permit::BUILTIN_HEAVY_PATTERNS`), so it queues under
+`supervise.max_heavy_operations` the same as a `cargo build`. Its outputs
+register with `zirv artifact render` as `video` (`mp4`/`webm`/`mov`) or
+`image` (`gif`) artifacts, the same artifact pipeline any other skill uses.
 
 ## Context Management (zirv ctx)
 
