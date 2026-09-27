@@ -4282,24 +4282,34 @@ Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zi
 <case.json> --reps <K> [--repo <dir>]` (stdout is always JSON) asks one Jev
 site's real production question(s) for a fixture input `K` times (`1..=20`) with the
 cache disabled, applies that site's production floor (honouring
-`[jev.floors.<site>]`/`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`)
+`[jev.floors.<site>]`/`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`
+for the nine sites that have one -- the rest carry a fixed compiled
+constant, exactly as production does)
 and production answer-to-action rule, and prints what production would have
 DONE on each rep -- `SITE` is one of `memory-rerank`, `memory-harvest`,
 `context-report`, `context-skill`, `harvest-screen`, `handoff-thin`,
 `handoff-select`, `compaction-select`, `dispatch`, `launch-effort`,
-`classify-domain`, `inject`. `case.json` is `{"id": "<case id>", "state":
-<the exact JSON state object production sends>, "n": <candidate count,
-required only for a per-candidate site>}`; `state` is sent verbatim (still
-subject to `jev::safe_metadata_request`). An unknown site, `--reps` outside
-`1..=20`, a missing candidate count, or a missing Jev credential all exit 2.
-Output is one JSON object: `{"site", "floor_site", "label", "floor":
-{"min_confidence", "min_margin"}, "reps": [{"actions": {"<item id>":
-"<action>"}, "error": "<string or null>"}], "calls", "errors"}` -- a rep
-whose call failed carries every item's fallback action (what production
-does on failure) plus its error text. Measurement only: it calls the exact
-same `jev::advise_detailed` entry point production calls (so
-`jev-decisions.jsonl`/`jev-effects.jsonl` and the spend ledger see real
-calls, spent for real), and has no other side effect. An autoresearch
+`classify-domain`, `inject`, `crash`, `judge`, `approve-escalate`,
+`approve-lower`, `intake-plan`, `inject-screen`. `case.json` is `{"id":
+"<case id>", "state": <the exact JSON state object production sends>, "n":
+<candidate count, required only for a per-candidate site>}`; `state` is
+sent verbatim (still subject to `jev::safe_metadata_request`). An unknown
+site, `--reps` outside `1..=20`, a missing candidate count, a missing Jev
+credential, or an invalid `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/
+`ZIRV_CTX_JEV_PROBE_MIN_MARGIN` (below) all exit 2. Output is one JSON
+object: `{"site", "floor_site", "label", "floor": {"min_confidence",
+"min_margin"}, "reps": [{"actions": {"<item id>": "<action>"}, "error":
+"<string or null>"}], "calls", "errors"}` -- a rep whose call failed
+carries every item's fallback action (what production does on failure)
+plus its error text. Measurement only: it calls the exact same
+`jev::advise_detailed` entry point production calls (so `jev-decisions.jsonl`
+/`jev-effects.jsonl` and the spend ledger see real calls, spent for real),
+and has no other side effect. Two env vars are read ONLY by this probe,
+never by production: `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/
+`ZIRV_CTX_JEV_PROBE_MIN_MARGIN`, each a float in `[0, 1]`, which REPLACE the
+resolved floor's matching field for whichever site is being probed (any
+`[jev.floors]` overlay is applied first); the output's `floor` object
+always reports the post-override effective values. An autoresearch
 campaign uses this to measure how deterministic each Jev feature's acted
 decision is under candidate floors.
 
