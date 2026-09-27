@@ -2670,7 +2670,7 @@ shell -- records one `SkillActivated` event: `skill_id`, `skill_version`,
 `skill_content_hash`, `skill_source`, and `skill_surface` (`native-tool`,
 `mcp`, or `cli`). A refusal records nothing.
 
-**Catalogue.** 27 professional-domain skills ship as portable bundles under
+**Catalogue.** 28 professional-domain skills ship as portable bundles under
 `src/commands/workflow/skills/`, parsed through the identical loader a
 custom bundle uses, alongside the original 24 flat, in-binary built-ins
 (`brainstorm`, `write-plan`, `review`, the `frontend-*` family, and so on)
@@ -2687,6 +2687,7 @@ this README's earlier paragraphs already describe.
 | Observability | `saved-object-change-management` | kibana | yes |
 | Docs | `technical-documentation` | none | no |
 | Code quality | `dependency-risk-review`, `simplify` | none | no |
+| Media | `motion-graphics` | none | no |
 
 **Contributing a built-in skill.** The catalogue's tests and the loader's own
 parse-time checks enforce:
@@ -2784,8 +2785,10 @@ which is non-commercial and therefore not a default.
 
 **Governance.** A Hyperframes `render` (not `lint`/`check`/`snapshot`/
 `doctor`/the audio subcommands) is a heavy operation
-(`permit::BUILTIN_HEAVY_PATTERNS`), so it queues under
-`supervise.max_heavy_operations` the same as a `cargo build`. Its outputs
+(`permit::BUILTIN_HEAVY_PATTERNS`) when zirv runs the command itself -- a
+`.zirv/commands` script step or the native runtime -- so it queues under
+`supervise.max_heavy_operations` the same as a `cargo build`. A render a
+wrapped host runs through its own shell tool is not metered. Its outputs
 register with `zirv artifact render` as `video` (`mp4`/`webm`/`mov`) or
 `image` (`gif`) artifacts, the same artifact pipeline any other skill uses.
 

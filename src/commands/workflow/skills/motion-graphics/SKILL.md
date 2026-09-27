@@ -72,8 +72,8 @@ run inside the project folder -- never an unpinned or global `hyperframes`.
    renders/<slug>.mp4`, then `render --format gif --fps 15 --gif-loop 0
    --output renders/<slug>.gif`. Always through the renderer's own render
    command -- never call an encoder directly, since an unattended worker
-   cannot approve that call. The render is heavy and may queue behind other
-   work; that is expected, not a failure.
+   cannot approve that call. A render takes minutes; let it finish rather
+   than retrying it.
 9. Register both files with `zirv artifact render <path>` (the kind is
    inferred: the MP4 as video, the GIF as image) and present the result with
    `zirv artifact present <id> --agent <your harness>`. Report both rendered
