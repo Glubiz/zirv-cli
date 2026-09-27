@@ -164,8 +164,7 @@ share is skill text plus one optional preflight probe.
   MusicGen local (`transformers torch`, several GB; `facebook/musicgen-*`
   weights are **CC-BY-NC-4.0, non-commercial**). Not a default.
 
-Scope for zirv: narration via Kokoro (or the operator's own ElevenLabs key
-from the environment, never echoed); music and SFX only from files the
+Scope for zirv: narration via Kokoro (`hyperframes tts` has no other engine); music and SFX only from files the
 operator puts in `<repo>/motion/assets/audio/`, never downloaded by the agent;
 no music track when none is supplied. Setup reports Python 3 + the Kokoro
 modules as optional ("narration unavailable"), and the skill renders without
