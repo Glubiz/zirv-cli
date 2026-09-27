@@ -2775,13 +2775,12 @@ a 310 MiB model plus 26 MiB of voices into `~/.cache/hyperframes/tts`.
 and is committed; its `renders/` subdirectory (the actual MP4/GIF output) is
 git-ignored there.
 
-**Audio policy.** Narration comes from Kokoro (local, Apache-2.0 weights, no
-account) or the operator's own ElevenLabs key when one is already set in the
-environment. Music and sound effects are used only from files the operator
-places under `<repo>/motion/assets/audio/` -- the skill never downloads or
-generates them: every generative music engine either needs a HeyGen or
-Google account, or (MusicGen) ships weights under CC-BY-NC-4.0, which is
-non-commercial and therefore not a default.
+**Audio policy.** Narration comes from Kokoro -- local, Apache-2.0 weights,
+no account needed. Music and sound effects are used only from files the
+operator places under `<repo>/motion/assets/audio/` -- the skill never
+downloads or generates them: every generative music engine either needs a
+HeyGen or Google account, or (MusicGen) ships weights under CC-BY-NC-4.0,
+which is non-commercial and therefore not a default.
 
 **Governance.** A Hyperframes `render` (not `lint`/`check`/`snapshot`/
 `doctor`/the audio subcommands) is a heavy operation
