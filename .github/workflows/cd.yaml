@@ -52,7 +52,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Only Windows ships this build; macOS and Linux build their own
+      # targets in "Package artifact".
       - name: Build release
+        if: matrix.os == 'windows-latest'
         run: cargo build --release
 
       - name: Package artifact
