@@ -394,9 +394,10 @@ mod native_tree {
         PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
-    /// Snapshots taken below the root before giving up. Each one reaches a
-    /// whole further level of the tree, and a snapshot that finds nothing new
-    /// ends the walk, so a plain `cmd.exe` -> `node` tree costs two.
+    /// Snapshots taken after the root dies before giving up. The first one
+    /// adopts every live descendant at once; each later one only catches a
+    /// process spawned before its parent was killed. A snapshot that finds
+    /// nothing new ends the walk, so a plain `cmd.exe` -> `node` tree costs two.
     const MAX_SNAPSHOTS: usize = 4;
 
     /// How long one level waits, in total, for its kills to land before the
