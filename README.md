@@ -2867,6 +2867,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
 | `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
+| `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo <dir>] --json` | Measurement only: asks one Jev site's real production question(s) for a fixture input `K` times (1..=20) with the cache disabled, applies that site's production floor and answer-to-action rule, and prints what production would have DONE on each rep — spends real Jev calls and writes the normal decision/spend log rows, never any other side effect — see [Measuring floor determinism](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
@@ -4276,6 +4277,31 @@ cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
+
+**Measuring floor determinism.** `zirv ctx jev probe --site <SITE> --case
+<case.json> --reps <K> [--repo <dir>] --json` asks one Jev site's real
+production question(s) for a fixture input `K` times (`1..=20`) with the
+cache disabled, applies that site's production floor (honouring
+`[jev.floors.<site>]`/`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`)
+and production answer-to-action rule, and prints what production would have
+DONE on each rep -- `SITE` is one of `memory-rerank`, `memory-harvest`,
+`context-report`, `context-skill`, `harvest-screen`, `handoff-thin`,
+`handoff-select`, `compaction-select`, `dispatch`, `launch-effort`,
+`classify-domain`, `inject`. `case.json` is `{"id": "<case id>", "state":
+<the exact JSON state object production sends>, "n": <candidate count,
+required only for a per-candidate site>}`; `state` is sent verbatim (still
+subject to `jev::safe_metadata_request`). An unknown site, `--reps` outside
+`1..=20`, a missing candidate count, or a missing Jev credential all exit 2.
+Output is one JSON object: `{"site", "floor_site", "label", "floor":
+{"min_confidence", "min_margin"}, "reps": [{"actions": {"<item id>":
+"<action>"}, "error": "<string or null>"}], "calls", "errors"}` -- a rep
+whose call failed carries every item's fallback action (what production
+does on failure) plus its error text. Measurement only: it calls the exact
+same `jev::advise_detailed` entry point production calls (so
+`jev-decisions.jsonl`/`jev-effects.jsonl` and the spend ledger see real
+calls, spent for real), and has no other side effect. An autoresearch
+campaign uses this to measure how deterministic each Jev feature's acted
+decision is under candidate floors.
 
 **Session relay.** Every Jev call now goes through a process-wide keep-alive
 `ureq::Agent` instead of opening a fresh connection each time, which already

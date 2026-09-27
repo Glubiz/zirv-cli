@@ -151,6 +151,11 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx discover",
     "zirv ctx explain-status",
     "zirv ctx jev status",
+    // Measurement only: spends real Jev calls and writes the normal
+    // decision/spend log rows, the same "internal record, not a repo/
+    // process mutation" class `zirv ctx proxy`'s own comment above already
+    // covers -- never any repository, memory, handoff, or context write.
+    "zirv ctx jev probe",
     "zirv ctx wait",
     "zirv ctx watch",
     "zirv ctx worktree list",
