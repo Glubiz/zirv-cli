@@ -1,0 +1,143 @@
+# jev-determinism-intake: sweeps the intake proxy's own confidence/margin
+# floors (ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN -- src/commands/ctx/
+# proxy/mod.rs's `cfg.proxy.min_confidence`/`min_margin`, config.rs's
+# `ProxyConfig::default()`) for DETERMINISM against the labelled intake
+# decision-cases corpus, using decision_trial.py's new `--reps K` (this
+# repo's #803 review finding: `ProxyConfig::default()` is `min_confidence =
+# 0.5, min_margin = DEFAULT_MIN_MARGIN = 0.2` -- NOT "0.6/0.15" as an older
+# comment in ../campaigns/jev-intake-floors.toml suggested; that file is
+# untouched here, this is a separate campaign). `correctness` is the mean of
+# each rep's own `grade_decision` score; `quality` is the modal share of the
+# (seat_tier, clarify) decision tuple across the 5 uncached reps --
+# decision_trial.py's own determinism axis, the same "how often does the
+# same answer recur" measure jev_probe_trial.py applies to Jev site actions.
+# Costs real money (every trial is `calls_per_trial` live `zirv ctx proxy`
+# calls) and is NEVER run in CI.
+#
+# `ZIRV_CTX_JEV_CACHE_TTL_SECS=0` forces every rep to be a genuinely fresh,
+# uncached decision -- src/commands/workflow/research/guard.rs's
+# `validate_cohort_env` checks `[cohort] env` against the compiled allowlist
+# directly and does NOT also require the key to appear in a candidate's own
+# `allow_env` (that requirement is `validate_candidate_env`'s, for
+# `[[candidates]].env` only), so this key is set once here for both arms
+# and does not need to be repeated in `[candidate_space] allow_env` below.
+#
+# `zirv ctx proxy --json --headless` CAN call a non-Jev-typesafe path: the
+# `[proxy] decider` config (env `ZIRV_CTX_PROXY_DECIDER`, `"typesafe"`
+# (default) or `"helper"` -- src/commands/ctx/config.rs's `ProxyDecider`
+# enum) picks which decider runs first, and `helper` is a separate model
+# call, not the Jev typesafe path. There is NO way to pin this from a
+# campaign manifest: `ZIRV_CTX_PROXY_DECIDER` is `REPO_FORBIDDEN`
+# (config.rs's forbidden-env table) and is not in guard.rs's compiled
+# autoresearch allowlist at all, so neither `[cohort] env` nor a
+# candidate's `env` may set it -- guard.rs refuses it outright. This
+# campaign relies entirely on the operator's own ambient config already
+# defaulting to `typesafe` (`ProxyDecider::default()`); if an operator's
+# `~/.zirv/ctx.toml`/env has set `decider = "helper"`, this campaign cannot
+# override that back to typesafe, and its results would then be measuring
+# the helper path's determinism instead. `requires_receipts =
+# ["proxy:decider:typesafe"]` at least EXCLUDES any trial that didn't
+# actually go through the typesafe decider, so a helper-pinned environment
+# would show as `unmeasured` here rather than silently mislabelled.
+#
+# Pair counts: validate = 12 tasks ("validation" split of decision-cases) *
+# 2 reps = 24 pairs, holdout = 12 tasks * 1 rep (max_uses=1) = 12 pairs,
+# both >= criteria.min_pairs = 6.
+
+schema = 1
+id = "jev-determinism-intake"
+description = "Sweep ZIRV_CTX_PROXY_MIN_CONFIDENCE/MIN_MARGIN for determinism (stability) against decision-cases via decision_trial.py --reps 5. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["docs/benchmarks/autoresearch/decision-cases/labels.jsonl", "docs/benchmarks/autoresearch/decision-cases/corpus.toml", "docs/benchmarks/autoresearch/decision_trial.py"]
+self_check = []
+
+[corpus]
+file = "docs/benchmarks/autoresearch/decision-cases/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "docs/benchmarks/autoresearch/decision_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "5"]
+per_trial_ceiling_usd = 0.005
+calls_per_trial = 5
+timeout_secs = 180
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 0.40
+max_wall_secs = 3600
+max_calls = 1000
+max_trials = 200
+max_retries = 1
+concurrency = 3
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[criteria]
+objective = "quality"
+min_pairs = 6
+correctness_floor = 0.0
+quality_floor = 0.0
+max_correctness_regression = 0.05
+max_quality_regression = 0.02
+min_effect = 0.05
+confidence = 0.9
+bootstrap_resamples = 2000
+
+[cohort]
+pressure = "natural"
+env = { ZIRV_CTX_JEV_CACHE_TTL_SECS = "0" }
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_PROXY_MIN_CONFIDENCE", "ZIRV_CTX_PROXY_MIN_MARGIN"]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "margin-010"
+hypothesis = "A much lower margin floor trades away stability for more decisive Jev/helper answers."
+mechanism = "ZIRV_CTX_PROXY_MIN_MARGIN=0.10, confidence left at the compiled default (0.5)."
+env = { ZIRV_CTX_PROXY_MIN_MARGIN = "0.10" }
+requires_receipts = ["proxy:decider:typesafe"]
+
+[[candidates]]
+id = "margin-030"
+hypothesis = "A moderately higher margin floor buys some stability without much lost coverage."
+mechanism = "ZIRV_CTX_PROXY_MIN_MARGIN=0.30, confidence left at the compiled default (0.5)."
+env = { ZIRV_CTX_PROXY_MIN_MARGIN = "0.30" }
+requires_receipts = ["proxy:decider:typesafe"]
+
+[[candidates]]
+id = "margin-040"
+hypothesis = "A high margin floor maximizes stability at the cost of coverage/correctness."
+mechanism = "ZIRV_CTX_PROXY_MIN_MARGIN=0.40, confidence left at the compiled default (0.5)."
+env = { ZIRV_CTX_PROXY_MIN_MARGIN = "0.40" }
+requires_receipts = ["proxy:decider:typesafe"]
+
+[[candidates]]
+id = "confidence-raised"
+hypothesis = "Raising the confidence floor above its compiled default (0.5 -> 0.6) improves stability without an unacceptable correctness cost."
+mechanism = "ZIRV_CTX_PROXY_MIN_CONFIDENCE=0.6, margin left at the compiled default (0.2)."
+env = { ZIRV_CTX_PROXY_MIN_CONFIDENCE = "0.6" }
+requires_receipts = ["proxy:decider:typesafe"]

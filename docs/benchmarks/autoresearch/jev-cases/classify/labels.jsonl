@@ -1,0 +1,16 @@
+{"id": "cls-001", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "tag", "frontend": "none"}}
+{"id": "cls-002", "labels": {"security": "none", "data": "tag", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-003", "labels": {"security": "tag", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-004", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-005", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-006", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "tag", "architecture": "none", "frontend": "none"}}
+{"id": "cls-007", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-008", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "tag", "frontend": "none"}}
+{"id": "cls-009", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-010", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-011", "labels": {"security": "tag", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-012", "labels": {"security": "tag", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-013", "labels": {"security": "none", "data": "none", "docs_only": "tag", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-014", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "none", "frontend": "none"}}
+{"id": "cls-015", "labels": {"security": "none", "data": "none", "docs_only": "none", "devops": "none", "architecture": "tag", "frontend": "none"}}
+{"id": "cls-016", "labels": {"security": "none", "data": "none", "docs_only": "tag", "devops": "none", "architecture": "none", "frontend": "none"}}

@@ -1,0 +1,16 @@
+{"id": "disp-001", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[498, 8, 4, 2, 2, 1, 1]]}}
+{"id": "disp-002", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1421, 24, 6, 5, 0, 2, 2]]}}
+{"id": "disp-003", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[103, 4, 0, 0, 5, 0, 0]]}}
+{"id": "disp-004", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[412, 8, 1, 1, 1, 1, 1]]}}
+{"id": "disp-005", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[514, 10, 2, 2, 2, 0, 1]]}}
+{"id": "disp-006", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[472, 12, 3, 2, 2, 1, 1]]}}
+{"id": "disp-007", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[366, 9, 1, 1, 1, 1, 1]]}}
+{"id": "disp-008", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1351, 25, 6, 3, 0, 4, 2]]}}
+{"id": "disp-009", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[130, 4, 1, 0, 4, 0, 0]]}}
+{"id": "disp-010", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[363, 7, 1, 1, 1, 2, 1]]}}
+{"id": "disp-011", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[504, 9, 4, 2, 2, 0, 1]]}}
+{"id": "disp-012", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[114, 3, 2, 0, 3, 0, 0]]}}
+{"id": "disp-013", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[529, 10, 2, 2, 2, 2, 1]]}}
+{"id": "disp-014", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[1462, 25, 5, 3, 0, 2, 2]]}}
+{"id": "disp-015", "site": "dispatch", "floor_site": "dispatch", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[119, 4, 0, 0, 5, 0, 0]]}}
+{"id": "disp-016", "site": "dispatch", "floor_site": "dispatch", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[498, 8, 2, 2, 2, 1, 1]]}}

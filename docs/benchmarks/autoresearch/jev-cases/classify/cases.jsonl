@@ -1,0 +1,16 @@
+{"id": "cls-001", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 2, 1, 0, 4, 0, 1, 0, 0, 0, 0, 4, 0]]}}
+{"id": "cls-002", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 2, 2, 3, 1, 4, 1, 1, 0, 4, 0, 0, 0, 0]]}}
+{"id": "cls-003", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 1, 3, 1, 3, 3, 0, 0, 4, 0, 0, 0, 0, 0]]}}
+{"id": "cls-004", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 0, 2, 1, 3, 1, 0, 0, 1, 1, 2, 2, 2, 1]]}}
+{"id": "cls-005", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 2, 0, 3, 0, 4, 0, 1, 1, 1, 2, 2, 1, 1]]}}
+{"id": "cls-006", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 0, 3, 2, 3, 0, 0, 0, 0, 0, 0, 4, 0, 0]]}}
+{"id": "cls-007", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 1, 2, 3, 3, 1, 0, 1, 2, 2, 2, 1, 2]]}}
+{"id": "cls-008", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 4, 0, 0, 3, 2, 0, 1, 0, 0, 0, 0, 6, 0]]}}
+{"id": "cls-009", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 2, 0, 3, 3, 3, 1, 0, 2, 1, 1, 1, 2, 2]]}}
+{"id": "cls-010", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 1, 2, 0, 0, 3, 1, 1, 1, 1, 2, 2, 2, 1]]}}
+{"id": "cls-011", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 1, 1, 3, 5, 0, 0, 5, 0, 0, 0, 0, 0]]}}
+{"id": "cls-012", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 2, 3, 3, 0, 5, 0, 0, 6, 0, 0, 0, 0, 0]]}}
+{"id": "cls-013", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 0, 3, 1, 1, 0, 1, 0, 0, 5, 0, 0, 0]]}}
+{"id": "cls-014", "site": "classify-domain", "floor_site": "classify", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[3, 1, 3, 1, 1, 0, 1, 1, 2, 1, 2, 1, 1, 2]]}}
+{"id": "cls-015", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[3, 1, 2, 2, 2, 4, 1, 0, 0, 0, 0, 0, 6, 0]]}}
+{"id": "cls-016", "site": "classify-domain", "floor_site": "classify", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 0, 1, 0, 3, 1, 0, 0, 0, 6, 0, 0, 0]]}}

@@ -1,0 +1,118 @@
+# Jev determinism probe corpus for floor site "classify" (docs/superpowers
+# work: jev-determinism campaigns). Every case in cases.jsonl/labels.jsonl
+# appears here exactly once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "cls-001"
+family = "jev-classify"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-002"
+family = "jev-classify"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-003"
+family = "jev-classify"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-004"
+family = "jev-classify"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-005"
+family = "jev-classify"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-006"
+family = "jev-classify"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-007"
+family = "jev-classify"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-008"
+family = "jev-classify"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "cls-009"
+family = "jev-classify"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "cls-010"
+family = "jev-classify"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "cls-011"
+family = "jev-classify"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "cls-012"
+family = "jev-classify"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "cls-013"
+family = "jev-classify"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "cls-014"
+family = "jev-classify"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "cls-015"
+family = "jev-classify"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "cls-016"
+family = "jev-classify"
+class = "bounded"
+split = "holdout"
+kind = "decision"

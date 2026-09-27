@@ -1,0 +1,16 @@
+{"id": "hs-001", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 976, 165, 0, 0]]}}
+{"id": "hs-002", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 415, 51, 0, 2]]}}
+{"id": "hs-003", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 974, 190, 0, 0]]}}
+{"id": "hs-004", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 4, 63, 13, 2, 2]]}}
+{"id": "hs-005", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 978, 184, 0, 0]]}}
+{"id": "hs-006", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 413, 67, 0, 0]]}}
+{"id": "hs-007", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 945, 182, 0, 0]]}}
+{"id": "hs-008", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 418, 60, 0, 1]]}}
+{"id": "hs-009", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 936, 233, 0, 0]]}}
+{"id": "hs-010", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 401, 66, 1, 0]]}}
+{"id": "hs-011", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 411, 69, 1, 1]]}}
+{"id": "hs-012", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[4, 4, 53, 10, 4, 2]]}}
+{"id": "hs-013", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 974, 208, 0, 0]]}}
+{"id": "hs-014", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[2, 4, 66, 8, 3, 4]]}}
+{"id": "hs-015", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 958, 160, 0, 0]]}}
+{"id": "hs-016", "site": "harvest-screen", "floor_site": "harvest_screen", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 393, 70, 2, 1]]}}

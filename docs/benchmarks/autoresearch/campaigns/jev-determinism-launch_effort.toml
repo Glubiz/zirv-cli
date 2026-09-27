@@ -1,0 +1,113 @@
+# jev-determinism-launch_effort: sweeps the "launch_effort" Jev floor
+# (ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE/ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN) against the labelled jev-cases/launch_effort/
+# corpus, measuring per-site DETERMINISM (`quality` = acted-decision
+# stability across K uncached repetitions of the same case, via
+# jev_probe_trial.py --reps 5) alongside `correctness` (agreement with each
+# item's labelled expected action). Backend drives the real `zirv ctx jev
+# probe` verb (issue: Jev floor determinism tuning) -- this campaign spends
+# real money (every trial is `calls_per_trial` live Jev decision calls) and
+# is NEVER run in CI. `[criteria] objective = "quality"` promotes a
+# candidate on a material STABILITY win (a higher floor trades Jev
+# influence for stability -- this is the axis this campaign exists to
+# measure), not on cost/wall as the default "efficiency" objective would.
+#
+# Pair counts: validate = 5 tasks * 2 reps = 10 pairs, holdout = 3 tasks *
+# 2 reps = 6 pairs, both >= criteria.min_pairs = 6.
+
+schema = 1
+id = "jev-determinism-launch_effort"
+description = "Sweep ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE/ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN for determinism (stability) against jev-cases/launch_effort. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["docs/benchmarks/autoresearch/jev-cases/launch_effort/cases.jsonl", "docs/benchmarks/autoresearch/jev-cases/launch_effort/labels.jsonl", "docs/benchmarks/autoresearch/jev-cases/launch_effort/corpus.toml", "docs/benchmarks/autoresearch/jev_probe_trial.py"]
+self_check = []
+
+[corpus]
+file = "docs/benchmarks/autoresearch/jev-cases/launch_effort/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "5"]
+per_trial_ceiling_usd = 0.002
+calls_per_trial = 5
+timeout_secs = 180
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 0.35
+max_wall_secs = 3600
+max_calls = 1000
+max_trials = 200
+max_retries = 1
+concurrency = 3
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 2
+max_uses = 1
+
+[criteria]
+objective = "quality"
+min_pairs = 6
+correctness_floor = 0.0
+quality_floor = 0.0
+max_correctness_regression = 0.05
+max_quality_regression = 0.02
+min_effect = 0.05
+confidence = 0.9
+bootstrap_resamples = 2000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE", "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN"]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "margin-010"
+hypothesis = "A much lower margin floor (launch_effort) trades away stability for more decisive Jev answers."
+mechanism = "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN=0.10, confidence left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN = "0.10" }
+requires_receipts = ["jev:launch_effort"]
+
+[[candidates]]
+id = "margin-030"
+hypothesis = "A moderately higher margin floor (launch_effort) buys some stability without much lost coverage."
+mechanism = "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN=0.30, confidence left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN = "0.30" }
+requires_receipts = ["jev:launch_effort"]
+
+[[candidates]]
+id = "margin-040"
+hypothesis = "A high margin floor (launch_effort) maximizes stability at the cost of coverage/correctness."
+mechanism = "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN=0.40, confidence left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_MARGIN = "0.40" }
+requires_receipts = ["jev:launch_effort"]
+
+[[candidates]]
+id = "confidence-raised"
+hypothesis = "Raising the confidence floor (launch_effort) above its compiled default (0.0) improves stability without an unacceptable correctness cost."
+mechanism = "ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE=0.6, margin left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_LAUNCH_EFFORT_MIN_CONFIDENCE = "0.6" }
+requires_receipts = ["jev:launch_effort"]

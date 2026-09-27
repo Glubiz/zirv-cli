@@ -449,5 +449,94 @@ class RunTrialJevRanIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(trial["correctness"])
 
 
+class RunTrialRepsTests(unittest.TestCase):
+    """`--reps K` (Jev determinism tuning): K=1 must stay byte-identical to
+    the original single-call behaviour; K>1 folds K intake calls into one
+    trial with a mean correctness and a modal-share quality."""
+
+    def setUp(self):
+        self._orig_call_proxy = decision_trial.call_proxy_decision
+        self._orig_spend = decision_trial.call_spend_command
+        decision_trial.call_spend_command = lambda *a, **k: None
+
+    def tearDown(self):
+        decision_trial.call_proxy_decision = self._orig_call_proxy
+        decision_trial.call_spend_command = self._orig_spend
+
+    def _spec(self, tmp):
+        spec_path = Path(tmp) / "spec.json"
+        spec = {"campaign": "c1", "candidate": "cand-1", "trial_id": "t1", "task": "ic001",
+                "state_dir": str(Path(tmp) / "state")}
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        return spec_path
+
+    def test_reps_1_output_is_byte_identical_to_default(self):
+        decision_trial.call_proxy_decision = (
+            lambda prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None: (
+                decision(seat_tier="standard", needs_clarification=0.9, decisive=True),
+                42, "", None,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
+            spec1 = self._spec(tmp1)
+            out1 = Path(tmp1) / "out"
+            decision_trial.run_trial(str(spec1), str(out1))  # default reps
+            spec2 = self._spec(tmp2)
+            out2 = Path(tmp2) / "out"
+            decision_trial.run_trial(str(spec2), str(out2), reps=1)  # explicit reps=1
+
+            trial1 = (out1 / "trial.json").read_text(encoding="utf-8")
+            trial2 = (out2 / "trial.json").read_text(encoding="utf-8")
+            # trial_id differs only via spec's own trial_id (same here); strip
+            # nothing -- both specs are identical apart from tmp dir paths
+            # baked into spend/state, which fallback_spend_report doesn't carry.
+            self.assertEqual(trial1, trial2)
+            details1 = (out1 / "details.json").read_text(encoding="utf-8")
+            details2 = (out2 / "details.json").read_text(encoding="utf-8")
+            self.assertEqual(details1, details2)
+
+    def test_reps_greater_than_1_averages_correctness_and_computes_modal_quality(self):
+        calls = {"n": 0}
+
+        def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
+            calls["n"] += 1
+            # First two reps agree (standard, clarify), third disagrees (deep).
+            if calls["n"] <= 2:
+                return decision(seat_tier="standard", needs_clarification=0.9, decisive=True), 10, "", None
+            return decision(seat_tier="deep", needs_clarification=0.9, decisive=True), 10, "", None
+
+        decision_trial.call_proxy_decision = fake_call
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = self._spec(tmp)
+            out_dir = Path(tmp) / "out"
+            trial = decision_trial.run_trial(str(spec_path), str(out_dir), reps=3)
+
+            self.assertEqual(trial["status"], "ok")
+            self.assertEqual(calls["n"], 3)
+            # ic001's label seat_tier/clarify (see decision-cases/labels.jsonl):
+            # correctness is the mean of the 3 reps' own grade_decision scores.
+            self.assertIsNotNone(trial["correctness"])
+            # 2 of 3 reps share the same (seat_tier, clarify) tuple -> modal share 2/3.
+            self.assertAlmostEqual(trial["quality"], 2 / 3)
+            details = json.loads((out_dir / "details.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(details["reps"]), 3)
+            self.assertIn("jev_ran", details)
+
+    def test_reps_all_calls_return_none_is_error_status(self):
+        def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
+            return None, 5, "", "proxy call failed"
+
+        decision_trial.call_proxy_decision = fake_call
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = self._spec(tmp)
+            out_dir = Path(tmp) / "out"
+            trial = decision_trial.run_trial(str(spec_path), str(out_dir), reps=3)
+            self.assertEqual(trial["status"], "error")
+            self.assertIsNone(trial["correctness"])
+            self.assertIsNone(trial["quality"])
+
+
 if __name__ == "__main__":
     unittest.main()
