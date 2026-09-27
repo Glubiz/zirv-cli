@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-harvest_screen",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "43999822a3bf6f816bdd80949ceb22466b7a0cb8",
+  "started_at": 1790507040,
+  "finished_at": 1790507087,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor (harvest_screen) trades away stability for more decisive Jev answers.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.053137672979639616
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor (harvest_screen) buys some stability without much lost coverage.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.03373886868180108
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor (harvest_screen) maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.06120657218111125
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor (harvest_screen) above its compiled default (0.8) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.04214223002633889
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.006400000000000012,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

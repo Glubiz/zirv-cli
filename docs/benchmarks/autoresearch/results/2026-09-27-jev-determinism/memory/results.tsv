@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	-0.0362	0.0000	0.0000	A much lower margin floor (memory) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	-0.0526	0.0000	0.0000	A moderately higher margin floor (memory) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	0.0067	0.0000	0.0000	A high margin floor (memory) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	-0.0004	0.0000	0.0000	Raising the confidence floor (memory) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-dispatch",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
+  "started_at": 1790507330,
+  "finished_at": 1790507377,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor (dispatch) trades away stability for more decisive Jev answers.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.004845777852688353
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor (dispatch) buys some stability without much lost coverage.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.09265969998314512
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor (dispatch) maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.06729310635428956
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor (dispatch) above its compiled default (0.6) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.07416146974549132
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.006400000000000012,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

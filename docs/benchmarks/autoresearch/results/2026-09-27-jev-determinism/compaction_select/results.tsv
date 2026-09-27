@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	-0.0135	-0.2375	-0.0546	A much lower margin floor (compaction_select) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	-0.0049	0.0000	0.0000	A moderately higher margin floor (compaction_select) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	0.0378	0.0000	0.0000	A high margin floor (compaction_select) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	0.0049	0.0000	0.0000	Raising the confidence floor (compaction_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

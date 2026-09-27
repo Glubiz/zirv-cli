@@ -40,13 +40,14 @@ CLI agent harness with real dollar costs and safety floors:
   `--check-graders` (#801, #802, #804).
 - `decision_trial.py` and the labelled intake decision-case corpus (#803),
   including its `--reps K` determinism mode.
-- `jev_probe_trial.py` and the nine per-floor-site `jev-cases/` corpora --
+- `jev_probe_trial.py` and the per-floor-site `jev-cases/` corpora (plus the round-2 `handoff_thin` corpus) --
   the Jev determinism probe backend; see "Jev determinism campaigns" below.
 - `../wrapped-vs-vanilla/corpus.toml` (the versioned task/split list, #801)
   and `t25_sticky_notes` (#805's long-session chain task).
 - The campaign manifests under `campaigns/`; `plan` accepts every one of
-  them (the ten `jev-determinism-*.toml` manifests have not themselves been
-  run through `plan` here -- see "Limitations").
+  them.
+- `results/2026-09-27-jev-determinism/`: the Jev determinism campaigns'
+  reports and findings.
 - `sample-report.md`: the `report.md` the free fixture campaign produces.
 
 The full contract is in
@@ -259,9 +260,10 @@ that.
 See `campaigns/*.toml` for sixteen worked examples: `fixture-demo.toml`
 (free, scripted, safe to run any time); five real campaigns
 (`jev-intake-floors.toml`, `jev-gates-e2e.toml`, `routing-ladder.toml`,
-`context-compaction.toml` + its forced-pressure variant); and ten more real
+`context-compaction.toml` + its forced-pressure variant); and eleven more real
 campaigns for Jev *determinism* tuning (`jev-determinism-<floor_site>.toml`
-for each of the nine tunable floor sites, plus `jev-determinism-intake.toml`
+for each of the nine tunable floor sites, `jev-determinism-handoff_thin.toml`
+for the handoff-thin confidence floor, plus `jev-determinism-intake.toml`
 for the intake proxy) -- see "Jev determinism campaigns" below. All the real
 campaigns spend money and are never run in CI.
 
@@ -270,7 +272,7 @@ campaigns spend money and are never run in CI.
 Every Jev-gated feature acts on a sampled answer only when it clears a
 `(min_confidence, min_margin)` floor; below the floor it falls back to a
 fixed deterministic default. Raising a floor trades Jev's influence for
-stability. The ten `jev-determinism-*.toml` campaigns measure that
+stability. The eleven `jev-determinism-*.toml` campaigns measure that
 trade-off directly, per floor site, using two axes:
 
 - **`quality`** = acted-decision *stability*: for `jev_probe_trial.py`, the
@@ -289,7 +291,7 @@ trade-off directly, per floor site, using two axes:
   for the intake campaign, the mean of `decision_trial.py`'s existing
   per-rep `grade_decision` score.
 
-`[criteria] objective = "quality"` on all ten manifests: a candidate is
+`[criteria] objective = "quality"` on all eleven manifests: a candidate is
 promoted only on a *material* stability win (bootstrap CI lower bound on
 the quality delta strictly above `min_effect`), with correctness held to a
 non-inferiority floor -- a floor change that only saves cost/wall time
@@ -350,11 +352,13 @@ cheap|standard|frontier, fallback `deny`; `launch-effort`: high|low,
 fallback `classifier`; `classify-domain`: tag|none per domain tag id,
 fallback `none`; `inject`: defer|inject_now, fallback `inject_now`.
 
-### The ten manifests
+### The eleven manifests
 
 `campaigns/jev-determinism-<floor_site>.toml` for each of the nine tunable
-floor sites, plus `campaigns/jev-determinism-intake.toml` for the intake
-proxy's own floors. Each varies its floor's env var(s)
+floor sites, `campaigns/jev-determinism-handoff_thin.toml` (a round-2
+campaign over handoff-thin cases only, sweeping its confidence floor with
+`--reps 10`), plus `campaigns/jev-determinism-intake.toml` for the intake
+proxy's own floors (which also has 0.15 and 0.25 margin candidates). Each varies its floor's env var(s)
 (`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`, or
 `ZIRV_CTX_PROXY_MIN_CONFIDENCE|_MIN_MARGIN` for intake) across four
 candidates: three margin values (0.10, 0.30, 0.40, confidence left at the
@@ -447,14 +451,11 @@ explicit, operator-taken action.
 - **Single project family**: every task is `ledgerlite`. A report built
   from this corpus is flagged `single_family`; it is not evidence a
   candidate generalizes to a different codebase or language.
-- **No paid campaign has been run** yet -- none of the non-fixture
-  manifests here has been executed, so no gain is claimed. The five
-  campaigns predating the jev-determinism batch have each passed `plan`;
-  the ten `jev-determinism-*.toml` manifests parse as TOML and their
-  corpora self-check (ids/labels/split counts), but `zirv workflow
-  research plan` has not been run against them here -- they also depend on
-  the separately-built `zirv ctx jev probe` verb, which does not exist in
-  this worktree yet.
+- **Only the Jev determinism campaigns have been run.** The eleven
+  `jev-determinism-*.toml` campaigns ran on 2026-09-27 and promoted nothing.
+  See `results/2026-09-27-jev-determinism/README.md` for the findings and
+  every campaign's report. The five campaigns predating them have passed
+  `plan` but have never been executed, so they claim no gain.
 - **Orchestration is unmeasured**: no multi-seat suite exists; every result
   here is single-seat.
 - **#762 owns rot-threshold calibration**; this campaign framework only

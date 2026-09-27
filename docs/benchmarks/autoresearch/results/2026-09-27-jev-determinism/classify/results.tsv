@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	0.0204	0.0000	0.0000	A much lower margin floor (classify) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	0.0081	0.0000	0.0000	A moderately higher margin floor (classify) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	-0.0198	0.0000	0.0000	A high margin floor (classify) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	0.0177	0.0000	0.0000	Raising the confidence floor (classify) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

@@ -1,0 +1,118 @@
+{
+  "campaign_id": "jev-determinism-memory",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "43999822a3bf6f816bdd80949ceb22466b7a0cb8",
+  "started_at": 1790506946,
+  "finished_at": 1790506993,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "margin-010",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A much lower margin floor (memory) trades away stability for more decisive Jev answers.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.03617712862510026
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-030",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A moderately higher margin floor (memory) buys some stability without much lost coverage.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.05255603866773608
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A high margin floor (memory) maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.006669762336949639
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "confidence-raised",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "Raising the confidence floor (memory) above its compiled default (0.0) improves stability without an unacceptable correctness cost.",
+      "d_correctness": [
+        0.0
+      ],
+      "d_quality": [
+        0.0
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        -0.0004221368567689645
+      ],
+      "reasons": [
+        "no material quality point-estimate improvement"
+      ],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.013300000000000018,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}
