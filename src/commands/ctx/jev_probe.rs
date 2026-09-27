@@ -49,6 +49,11 @@
 //! `gate-reclass` additionally has PER-QUESTION floors (`work_domain` uses
 //! a different default than its other six items) -- the output's optional
 //! `item_floors` field (below) reports each item's own effective floor.
+//! `work_domain`'s reported action is the per-item rule's own outcome only
+//! -- unlike production (`engine.rs`'s `apply_jev_gate_advice`, ~line
+//! 2578), it is not additionally gated on the measured domain being
+//! General, so it does not print exactly what production would have done
+//! for that one item.
 //!
 //! CLI contract (an external worker's backend depends on this exactly):
 //! `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo
@@ -676,6 +681,42 @@ fn probe_floor_override(
     Ok(Some(value))
 }
 
+/// One ANSWERED rep's per-item actions: each `report_ids` entry's OWN
+/// resolved floor (`item_floors.get(id)`, falling back to the site-level
+/// `(min_confidence, min_margin)` only when that item has none of its own --
+/// true for every site but `gate-reclass`) applied to that item's answer via
+/// [`Site::action`]. Factored out of [`run_probe`]'s reps loop so a test can
+/// drive it directly against a hand-built [`jev::Answers`]: `gate-reclass`'s
+/// own real questions (`engine::gate_reclass_questions`) never carry a
+/// `metadata_signature` (its production state is freeform text, never
+/// metadata-only -- see this module's own doc comment), so no fake HTTP
+/// response can ever drive an ANSWERED rep for it through [`run_probe`]
+/// itself; this is the only seam that still exercises the real per-item
+/// floor lookup for that site.
+fn answered_rep_actions(
+    site: Site,
+    case: &Case,
+    report_ids: &[String],
+    item_floors: &BTreeMap<String, (f32, f32)>,
+    min_confidence: f32,
+    min_margin: f32,
+    answers: &jev::Answers,
+) -> BTreeMap<String, String> {
+    report_ids
+        .iter()
+        .map(|id| {
+            let (item_confidence, item_margin) = item_floors
+                .get(id)
+                .copied()
+                .unwrap_or((min_confidence, min_margin));
+            (
+                id.clone(),
+                site.action(case, id, answers.get(id), item_confidence, item_margin),
+            )
+        })
+        .collect()
+}
+
 /// `zirv ctx jev probe`'s entry point -- see this module's own doc comment
 /// for the full CLI contract. Prints one JSON object to `writer` and returns
 /// the process exit code (`0` on success, `2` on any validation refusal).
@@ -827,17 +868,15 @@ pub(crate) fn run_probe(
         let status = jev::advise_detailed(&cfg, &state, label, true, &case.state, &questions);
         match status {
             jev::AdvisoryStatus::Answered(answers) => {
-                let mut actions = BTreeMap::new();
-                for id in &report_ids {
-                    let (item_confidence, item_margin) = item_floors
-                        .get(id)
-                        .copied()
-                        .unwrap_or((min_confidence, min_margin));
-                    actions.insert(
-                        id.clone(),
-                        site.action(&case, id, answers.get(id), item_confidence, item_margin),
-                    );
-                }
+                let actions = answered_rep_actions(
+                    site,
+                    &case,
+                    &report_ids,
+                    &item_floors,
+                    min_confidence,
+                    min_margin,
+                    &answers,
+                );
                 reps_out.push(serde_json::json!({ "actions": actions, "error": null }));
             }
             jev::AdvisoryStatus::Failed
@@ -1925,5 +1964,80 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// The two gate-reclass tests above only ever send gate-reclass's own
+    /// real (freeform) production state, which the metadata-only boundary
+    /// always refuses -- every rep takes the FAILED/fallback branch, so the
+    /// per-item floor lookup at each rep's ANSWERED branch (the
+    /// `item_floors.get(id)` read that picks `work_domain`'s own floor
+    /// instead of the six-item site default) is never actually exercised: a
+    /// regression that swapped it back to the site-level `(min_confidence,
+    /// min_margin)` would still pass every existing gate-reclass test.
+    /// Sending a metadata-only-shaped `case.state` does not open this up
+    /// through [`run_probe`] itself -- `engine::gate_reclass_questions`'s own
+    /// questions carry no `metadata_signature`, so `jev::safe_metadata_
+    /// request` refuses them regardless of state (see this module's own doc
+    /// comment) -- so this drives [`answered_rep_actions`] (the exact code
+    /// [`run_probe`]'s reps loop calls on every ANSWERED rep) directly
+    /// against a hand-built [`jev::Answers`], with no HTTP call at all.
+    #[test]
+    fn gate_reclass_answered_rep_applies_each_items_own_floor_not_the_site_default() {
+        let case: Case = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "state": serde_json::Value::Null,
+        }))
+        .expect("case");
+        let report_ids: Vec<String> = vec!["work_domain".to_string(), "security".to_string()];
+        let item_floors: BTreeMap<String, (f32, f32)> = report_ids
+            .iter()
+            .map(|id| (id.clone(), Site::GateReclass.item_default_floor(id)))
+            .collect();
+        let (min_confidence, min_margin) = Site::GateReclass.default_floor();
+
+        let mut answers: jev::Answers = jev::Answers::new();
+        // `work_domain`'s "frontend" choice at confidence 0.6 clears the
+        // six-item site default floor (0.0) but sits below `work_domain`'s
+        // own 0.9 floor.
+        answers.insert(
+            "work_domain".to_string(),
+            jev::Answer {
+                value: jev::AnswerValue::Choice("frontend".to_string()),
+                confidence: 0.6,
+                probabilities: BTreeMap::from([
+                    ("frontend".to_string(), 0.6),
+                    ("backend".to_string(), 0.2),
+                    ("mixed".to_string(), 0.1),
+                    ("docs".to_string(), 0.1),
+                ]),
+            },
+        );
+        // `security`'s noul at 0.75 clears `JEV_TAG_PROBABILITY` (0.7) with
+        // a wide margin, decisive under the (0.0, 0.2) default floor every
+        // other item uses.
+        answers.insert(
+            "security".to_string(),
+            jev::Answer {
+                value: jev::AnswerValue::Noul(0.75),
+                confidence: 0.75,
+                probabilities: BTreeMap::new(),
+            },
+        );
+
+        let actions = answered_rep_actions(
+            Site::GateReclass,
+            &case,
+            &report_ids,
+            &item_floors,
+            min_confidence,
+            min_margin,
+            &answers,
+        );
+        // Decisive under the shared noul floor: reported "tag".
+        assert_eq!(actions["security"], "tag");
+        // Confidence 0.6 clears the site default but not `work_domain`'s own
+        // 0.9 floor, so it stays "none" -- the per-item floor, not the site
+        // default, gates this item.
+        assert_eq!(actions["work_domain"], "none");
     }
 }
