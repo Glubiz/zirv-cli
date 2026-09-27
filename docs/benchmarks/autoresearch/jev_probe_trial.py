@@ -8,8 +8,9 @@ cases.jsonl` for a matching id (the case row itself names its production
 probe `site`, e.g. `"memory-rerank"`), writes a scratch `case.json` (the
 `{"id","state","n"}` shape the probe CLI contract expects) into the trial's
 own state dir, and runs `zirv ctx jev probe --site <site> --case <case.json>
---reps <K> --json` -- the SAME production facts/decision path a real Jev
-call would use, forced uncached by the probe itself. Scores per-item
+--reps <K>` (stdout is always JSON) -- the SAME production facts/decision
+path a real Jev call would use, forced uncached by the probe itself. Scores
+per-item
 *stability* (how often the modal action recurs across K reps -> `quality`)
 and *correctness* (agreement with the case's labelled expected action per
 item, averaged over every (rep, item) pair).
@@ -86,16 +87,17 @@ def write_case_file(case_row, dest_path):
 
 def call_jev_probe(site, case_path, reps, zirv_bin, state_dir, env_extra,
                     timeout_s=DEFAULT_TIMEOUT_S, attribution=None):
-    """Runs `zirv ctx jev probe --site <site> --case <case_path> --reps <K>
-    --json`. Returns (result dict or None, elapsed_ms, raw_stdout, error_note
-    or None, returncode or None). The child's environment is built by
-    `decision_trial.build_child_env` -- the candidate's floor-override env
+    """Runs `zirv ctx jev probe --site <site> --case <case_path> --reps <K>`
+    (stdout is always JSON -- the verb has no `--json` flag). Returns (result
+    dict or None, elapsed_ms, raw_stdout, error_note or None, returncode or
+    None). The child's environment is built by `decision_trial.
+    build_child_env` -- the candidate's floor-override env
     (`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`) rides in via
     `env_extra`, same as any other candidate overlay."""
     import subprocess
 
     argv = [zirv_bin, "ctx", "jev", "probe", "--site", site, "--case", str(case_path),
-            "--reps", str(reps), "--json"]
+            "--reps", str(reps)]
     env = decision_trial.build_child_env(state_dir, attribution, env_extra)
     t0 = time.time()
     try:
@@ -107,6 +109,11 @@ def call_jev_probe(site, case_path, reps, zirv_bin, state_dir, env_extra,
     elapsed_ms = int((time.time() - t0) * 1000)
     stdout_text = proc.stdout.decode("utf-8", errors="replace")
     result = decision_trial.parse_last_json(stdout_text)
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        return None, elapsed_ms, stdout_text + stderr_text, (
+            f"jev probe exited non-zero (exit={proc.returncode})"
+        ), proc.returncode
     if result is None:
         stderr_text = proc.stderr.decode("utf-8", errors="replace")
         return None, elapsed_ms, stdout_text + stderr_text, (
@@ -168,6 +175,11 @@ def run_trial(spec_path, out_dir, reps, zirv_bin=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     state_dir = spec.get("state_dir")
+    if not state_dir:
+        raise ValueError(
+            "trial spec is missing state_dir -- refusing to let a child zirv "
+            "fall back to the operator's real state dir"
+        )
     attribution = decision_trial.attribution_env_for(spec)
 
     case_id = spec["task"]

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_probe_trial  # noqa: E402
@@ -143,6 +144,59 @@ class ScoreProbeResultTests(unittest.TestCase):
         self.assertEqual(len(per_item["novel"]["actions"]), 2)
 
 
+class CallJevProbeTests(unittest.TestCase):
+    """`subprocess.run` itself stubbed -- proves `call_jev_probe`'s exit code
+    handling and argv shape without invoking `zirv`."""
+
+    def setUp(self):
+        self._orig_run = jev_probe_trial.decision_trial.subprocess.run
+
+    def tearDown(self):
+        jev_probe_trial.decision_trial.subprocess.run = self._orig_run
+
+    def test_nonzero_exit_with_parsable_stdout_is_treated_as_failed(self):
+        # Review finding: a non-zero exit must be a failed call even when
+        # stdout happens to parse as JSON.
+        stdout = json.dumps(probe_result()).encode("utf-8")
+
+        def fake_run(argv, capture_output, timeout, env):
+            return SimpleNamespace(stdout=stdout, stderr=b"boom", returncode=1)
+
+        jev_probe_trial.decision_trial.subprocess.run = fake_run
+        result, _elapsed_ms, _raw, error_note, returncode = jev_probe_trial.call_jev_probe(
+            "memory-rerank", "case.json", 3, "zirv", None, {})
+        self.assertIsNone(result)
+        self.assertIsNotNone(error_note)
+        self.assertIn("exit=1", error_note)
+        self.assertEqual(returncode, 1)
+
+    def test_zero_exit_with_parsable_stdout_succeeds(self):
+        stdout = json.dumps(probe_result()).encode("utf-8")
+
+        def fake_run(argv, capture_output, timeout, env):
+            return SimpleNamespace(stdout=stdout, stderr=b"", returncode=0)
+
+        jev_probe_trial.decision_trial.subprocess.run = fake_run
+        result, _elapsed_ms, _raw, error_note, returncode = jev_probe_trial.call_jev_probe(
+            "memory-rerank", "case.json", 3, "zirv", None, {})
+        self.assertIsNotNone(result)
+        self.assertIsNone(error_note)
+        self.assertEqual(returncode, 0)
+
+    def test_argv_never_passes_json_flag(self):
+        # zirv ctx jev probe has no --json flag; stdout is always JSON.
+        captured = {}
+
+        def fake_run(argv, capture_output, timeout, env):
+            captured["argv"] = argv
+            return SimpleNamespace(stdout=json.dumps(probe_result()).encode("utf-8"),
+                                    stderr=b"", returncode=0)
+
+        jev_probe_trial.decision_trial.subprocess.run = fake_run
+        jev_probe_trial.call_jev_probe("memory-rerank", "case.json", 3, "zirv", None, {})
+        self.assertNotIn("--json", captured["argv"])
+
+
 class RunTrialStubbedTests(unittest.TestCase):
     def setUp(self):
         self._orig_call = jev_probe_trial.call_jev_probe
@@ -250,8 +304,30 @@ class RunTrialStubbedTests(unittest.TestCase):
     def test_unknown_case_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec_path = Path(tmp) / "spec.json"
-            spec_path.write_text(json.dumps({"task": "nope", "trial_id": "t1", "campaign": "c1"}),
+            spec_path.write_text(json.dumps({
+                "task": "nope", "trial_id": "t1", "campaign": "c1",
+                "state_dir": str(Path(tmp) / "state"),
+            }), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                jev_probe_trial.run_trial(str(spec_path), str(Path(tmp) / "out"), reps=2)
+
+    def test_missing_state_dir_raises(self):
+        # Review finding: a spec with no state_dir (or an empty one) must
+        # never let the child zirv fall back to the operator's real state
+        # dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp) / "spec.json"
+            spec_path.write_text(json.dumps({"task": "mem-001", "trial_id": "t1", "campaign": "c1"}),
                                   encoding="utf-8")
+            with self.assertRaises(ValueError):
+                jev_probe_trial.run_trial(str(spec_path), str(Path(tmp) / "out"), reps=2)
+
+    def test_empty_state_dir_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp) / "spec.json"
+            spec_path.write_text(json.dumps({
+                "task": "mem-001", "trial_id": "t1", "campaign": "c1", "state_dir": "",
+            }), encoding="utf-8")
             with self.assertRaises(ValueError):
                 jev_probe_trial.run_trial(str(spec_path), str(Path(tmp) / "out"), reps=2)
 
