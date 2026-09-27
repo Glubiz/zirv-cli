@@ -1203,13 +1203,34 @@ pub fn helper_answer(
     prompt: &str,
     timeout: Duration,
 ) -> CtxResult<String> {
+    helper_answer_with_env(role, adapter, model, prompt, timeout, &env_from_process())
+}
+
+/// [`helper_answer`], resolved through the caller's own `env` lookup instead
+/// of the process environment. A caller that was itself handed an injected
+/// lookup -- `run_loop::run_with`'s objective judge -- already resolved its
+/// state dir and config through it, and must pass the same lookup here:
+/// re-resolving from the process env is a second answer that can disagree.
+/// On Windows it did, nondeterministically: with no `ZIRV_CTX_STATE_DIR` in
+/// the process env, `StateDir::resolve` falls to `dirs::data_local_dir`
+/// (`SHGetKnownFolderPath`), whose per-process cache any other process
+/// starting under a different `USERPROFILE` invalidates, after which the
+/// lookup re-resolves under this process's own `USERPROFILE` -- so the same
+/// judge call succeeded or failed on what else the machine was running.
+pub fn helper_answer_with_env(
+    role: &str,
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    env: EnvLookup<'_>,
+) -> CtxResult<String> {
     use super::helper::{self, HelperBudget, HelperRequest};
 
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let env = super::config::env_from_process();
     let (protected_prompt, _) =
-        super::obfuscate_store::protect_text_with_env(&repo, prompt, "helper_model_input", &env)?;
-    if helper::available(&repo, role, None, &env) {
+        super::obfuscate_store::protect_text_with_env(&repo, prompt, "helper_model_input", env)?;
+    if helper::available(&repo, role, None, env) {
         match helper::run(
             &HelperRequest {
                 repo: &repo,
@@ -1221,7 +1242,7 @@ pub fn helper_answer(
                 budget: HelperBudget::one_shot(timeout.as_millis().min(u128::from(u64::MAX)) as u64),
                 provider: None,
             },
-            &env,
+            env,
         ) {
             Ok(answer) => return Ok(answer.text),
             Err(helper::HelperError::Unconfigured(_)) => {}
@@ -4016,6 +4037,40 @@ mod tests {
             answer.contains("## Task"),
             "the harness distiller's own raw answer: {answer}"
         );
+    }
+
+    /// `run_loop`'s objective judge hands its own injected lookup through
+    /// `helper_answer_with_env`, so the state dir comes from that lookup and
+    /// never from the process env. The home is redirected FIRST, before
+    /// anything in this process has asked Windows for a known folder: a
+    /// process-env resolution then has no `ZIRV_CTX_STATE_DIR` to find and
+    /// falls to `SHGetKnownFolderPath` under a profile with no
+    /// `AppData\Local`, which fails -- the failure the judge used to hit
+    /// whenever another process invalidated its cached answer. (Linux
+    /// resolves the platform dir from `HOME` either way, so there this only
+    /// pins the happy path.)
+    #[test]
+    fn helper_answer_with_env_resolves_the_state_dir_through_the_given_lookup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+        let adapter = fake_model_adapter();
+        let answer = helper_answer_with_env(
+            super::super::helper::ROLE_DISTILLER,
+            &adapter,
+            "haiku",
+            "anything",
+            Duration::from_secs(30),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("the injected state dir is enough; the process env is never consulted for it");
+        assert!(answer.contains("## Task"), "the harness answer: {answer}");
     }
 
     #[test]

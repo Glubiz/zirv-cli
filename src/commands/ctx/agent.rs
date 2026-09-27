@@ -11859,13 +11859,32 @@ mod tests {
         })
         .expect_err("timed-out bootstrap refuses delegation");
 
-        assert!(started.elapsed() < Duration::from_secs(8));
+        // A bound on "the deadline killed both hang-mode children", which
+        // never exit on their own: the failure this guards is an unbounded
+        // wait. A passing run is ~3-4s on a loaded Windows dev box -- two
+        // msys shell spawns and two tree-kills around the 1s deadline -- so
+        // 8s was a 2x margin that host load alone could eat (the kills used
+        // to cost a WMI-backed `taskkill` each and took this to ~120s). 30s
+        // keeps an order of magnitude between pass and fail.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the whole-run deadline must kill the hanging bootstrap, took {:?}",
+            started.elapsed()
+        );
         assert!(
             error.to_string().contains("goal bootstrap refused"),
             "{error}"
         );
         assert!(error.to_string().contains("diagnostic result:"), "{error}");
-        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+        // Main's `healthy` line is never consumed. The restart launches after
+        // the whole-run deadline has passed and is killed at once, so whether
+        // it read its own `hang` line first is a race either outcome of which
+        // is correct.
+        let remaining = std::fs::read_to_string(modes).expect("modes");
+        assert!(
+            matches!(remaining.as_str(), "healthy\n" | "hang\nhealthy\n"),
+            "main must not run: {remaining:?}"
+        );
     }
 
     #[test]

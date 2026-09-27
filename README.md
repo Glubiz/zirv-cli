@@ -494,10 +494,12 @@ decision's own seat tier; an unknown workflow id falls back to the baseline)
 before it is applied. The committed `tests/fixtures/proxy/jev-battery.json`
 documents the expected ruling (execution, complexity, workflow, seat tier)
 per request class, verified against the real API; `TYPESAFE_API_KEY=...
-cargo nextest run jev_live_battery` replays it against Jev directly, running
-each case TWICE and asserting the two merged decisions are identical to each
-other as well as to the recorded ruling — a flip between the two runs is
-reported as an instability, distinct from an outright mismatch.
+cargo nextest run --run-ignored only jev_live_battery` replays it against Jev
+directly (it is `#[ignore]`d by default, like every other live provider
+contract), running each case TWICE and asserting the two merged decisions are
+identical to each other as well as to the recorded ruling — a flip between
+the two runs is reported as an instability, distinct from an outright
+mismatch.
 
 **Domain tags.** A substring keyword match (the deterministic classifier's
 own security-domain detection) misses phrasing that never uses one of its

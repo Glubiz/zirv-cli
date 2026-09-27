@@ -5417,6 +5417,17 @@ pub(crate) mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
+        // Root cause (not timing): `agent_name` is "claude" below, so
+        // `Pane::spawn`'s MCP autoregistration silently appends
+        // `--mcp-config=...`/`--allowedTools=...` onto the stand-in `cmd /c
+        // ping` argv, which `ping`/`cmd` then reject immediately -- the old
+        // child dies in well under a second instead of surviving the swap's
+        // real `QUIT_GRACE`. Opt out for this test.
+        let _guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_MCP_AUTOREGISTER",
+            Some("0"),
+        )]);
+
         let session_id = "33333333-2222-4333-8444-555555555555";
         let mut spec = test_spec(session_id);
         spec.argv = long_lived_argv();
@@ -7012,32 +7023,42 @@ pub(crate) mod tests {
             "immediately busy after a successful injection"
         );
 
-        // The very next tick, well under idle_quiet later: must NOT have been
-        // cleared by the stale (already-old) output timestamp.
-        std::thread::sleep(Duration::from_millis(50));
-        pane.drain();
-        assert!(
-            !pane.injectable(),
-            "H1: a signal-less pane must not go back to injectable within one \
-             tick of its own injection"
-        );
-        assert!(matches!(pane.state(), PaneState::Working));
+        // `submit_confirmation` is a separate, echo-driven confirmation/retry
+        // lifecycle (covered by `injection_retries_once_then_stops_on_
+        // output_or_operator_input`/`injection_submit_waits_for_echo_quiet_
+        // with_a_ceiling`), not this test's subject; clear it so only
+        // `injected_awaiting_turn`'s idle_quiet windowing (H1) is under test.
+        pane.submit_confirmation = None;
 
-        // Still not injectable only partway through the window.
-        std::thread::sleep(idle_quiet / 2);
-        pane.drain();
+        // On a real Unix pty the kernel echoes the injected bytes, so
+        // `drain()` keeps refreshing `last_output_at` to real "now" for a
+        // little while after the injection -- back-dating just
+        // `last_local_input_at` is not sound there (`signal_less_quiescent`
+        // takes the LATEST of the two). Instead, poll for the observable
+        // state change and check a lower bound that scheduler lateness can
+        // only ever help satisfy, never violate: quiescence is computed from
+        // a fresh `Instant::now()` against the injection's own stamp, so
+        // becoming injectable before a full `idle_quiet` has really elapsed
+        // is impossible regardless of how late this thread runs.
+        let injected_at = pane
+            .last_local_input_at
+            .expect("inject_visible just stamped it");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let first_injectable_at = loop {
+            pane.drain();
+            if pane.injectable() {
+                break std::time::Instant::now();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "must become injectable again within a generous deadline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(
-            !pane.injectable(),
-            "still short of a full idle_quiet window since the injection"
-        );
-
-        // And injectable again once a full idle_quiet has elapsed since the
-        // injection itself.
-        std::thread::sleep(idle_quiet);
-        pane.drain();
-        assert!(
-            pane.injectable(),
-            "reachable again once idle_quiet has elapsed since the injection"
+            first_injectable_at.duration_since(injected_at) >= idle_quiet,
+            "H1: must not become injectable again before a full idle_quiet has elapsed since \
+             the injection"
         );
 
         // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical

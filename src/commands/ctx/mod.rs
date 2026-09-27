@@ -182,6 +182,14 @@ pub(crate) mod testenv {
     /// Points the home directory (and optionally the working directory) at a
     /// test directory, putting every one of them back on drop.
     ///
+    /// On Windows this also pins `ZIRV_CTX_STATE_DIR` to the redirected
+    /// home's own `AppData\Local\zirv\ctx` -- unless a test already set it
+    /// itself -- because `dirs::data_local_dir` resolves `%LOCALAPPDATA%`
+    /// through a per-process cache keyed off `USERPROFILE` at first use, so
+    /// `StateDir::resolve` can otherwise miss the redirected home entirely or
+    /// land back on the operator's real state directory (see `state.rs`'s
+    /// `StateDir::resolve`).
+    ///
     /// All of this is process-wide, so restoring has to survive a panicking
     /// assertion: a test that leaks `HOME` naming a deleted temp dir breaks
     /// every later pty spawn in the same run, because portable-pty starts its
@@ -194,6 +202,8 @@ pub(crate) mod testenv {
         home: Option<OsString>,
         userprofile: Option<OsString>,
         cwd: Option<PathBuf>,
+        #[cfg(windows)]
+        state_dir_set: bool,
     }
 
     impl EnvGuard {
@@ -202,11 +212,20 @@ pub(crate) mod testenv {
                 home: std::env::var_os("HOME"),
                 userprofile: std::env::var_os("USERPROFILE"),
                 cwd: cwd.and(std::env::current_dir().ok()),
+                #[cfg(windows)]
+                state_dir_set: std::env::var_os(super::state::STATE_ENV).is_none(),
             };
             // SAFETY: CI runs tests single-threaded.
             unsafe {
                 std::env::set_var("HOME", home);
                 std::env::set_var("USERPROFILE", home);
+                #[cfg(windows)]
+                if guard.state_dir_set {
+                    std::env::set_var(
+                        super::state::STATE_ENV,
+                        home.join("AppData").join("Local").join("zirv").join("ctx"),
+                    );
+                }
             }
             if let Some(cwd) = cwd {
                 std::env::set_current_dir(cwd).expect("enter the test working directory");
@@ -230,6 +249,10 @@ pub(crate) mod testenv {
                         Some(previous) => std::env::set_var(key, previous),
                         None => std::env::remove_var(key),
                     }
+                }
+                #[cfg(windows)]
+                if self.state_dir_set {
+                    std::env::remove_var(super::state::STATE_ENV);
                 }
             }
         }

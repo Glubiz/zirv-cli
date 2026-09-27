@@ -1525,17 +1525,17 @@ fn wait_for_exit(
 /// not a reason to reach for a console-wide broadcast.
 ///
 /// P1: on Windows the escalation rung is now a **tree**-kill by pid
-/// (`supervise::kill_tree`, the same `taskkill /T /F /PID <n>` `exec`/`loop`
-/// have always used) run *before* the narrow `child.kill()`. `TerminateProcess`
+/// (`supervise::kill_tree`, the same native process-tree walk `exec`/`loop`
+/// use) run *before* the narrow `child.kill()`. `TerminateProcess`
 /// against the direct child is not enough for an npm-installed agent, where
 /// that direct child is `cmd.exe /c claude.cmd` and the agent itself is a
 /// `node` grandchild: quitting a session -- or restarting one on a rot verdict
 /// -- left that grandchild alive, and a freshly spawned replacement then ran
-/// alongside it on the same repo. The tree-kill is by **pid only**, with fixed
-/// flags and a decimal pid, so it is neither a shell invocation nor a console
-/// broadcast; it is not a substitute for the narrow kill (taskkill may not be
-/// on `PATH`) and its result is not evidence of anything. `wait_for_exit`/
-/// `wait` stay the only proof of death. Unix is untouched: portable-pty does
+/// alongside it on the same repo. The tree-kill is by **pid only**, so it is
+/// neither a shell invocation nor a console broadcast; it is not a substitute
+/// for the narrow kill (it can fail to open the process) and its result is
+/// not evidence of anything. `wait_for_exit`/`wait` stay the only proof of
+/// death. Unix is untouched: portable-pty does
 /// `setsid` + `TIOCSCTTY` there, so the child is a session leader and dies
 /// with its pty.
 pub fn quit_child(
