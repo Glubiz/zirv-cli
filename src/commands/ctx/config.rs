@@ -14309,7 +14309,7 @@ intake_discipline = true
         let expected = CtxConfig {
             agents: cfg.agents.clone(),
             chat: ChatConfig {
-                model: Some("fable".to_string()),
+                model: Some("claude-opus-5-5".to_string()),
                 claude_permission_mode: None,
             },
             output: OutputConfig {

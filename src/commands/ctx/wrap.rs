@@ -2165,7 +2165,7 @@ pub fn run_with(
              [sandbox] enabled = false)"
                 .to_string()
         } else {
-            policy_extra.join(" ")
+            super::announce::posture_detail(&policy_extra)
         },
     });
     // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn

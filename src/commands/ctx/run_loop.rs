@@ -451,7 +451,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             detail: if policy_extra.is_empty() {
                 "not applied (operator flags or [sandbox] enabled = false)".to_string()
             } else {
-                policy_extra.join(" ")
+                super::announce::posture_detail(&policy_extra)
             },
         });
         // Issue #420: same seam as every other supervisor-start launch path

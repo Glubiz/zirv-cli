@@ -1892,7 +1892,7 @@ fn run_with_clock_inner<W: Write>(
              [sandbox] enabled = false)"
                 .to_string()
         } else {
-            policy_extra.join(" ")
+            super::announce::posture_detail(&policy_extra)
         },
     });
     if !policy_skip {

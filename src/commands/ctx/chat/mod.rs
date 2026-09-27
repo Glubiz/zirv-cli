@@ -1600,7 +1600,7 @@ fn dash_orchestrator_pane_with_task(
         detail: if sandbox_extra.is_empty() {
             "not applied (operator flags or [sandbox] enabled = false)".to_string()
         } else {
-            sandbox_extra.join(" ")
+            super::announce::posture_detail(&sandbox_extra)
         },
     });
     // Issue #420: same seam as every other supervisor-start launch path --

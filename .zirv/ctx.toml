@@ -22,14 +22,15 @@
 
 [chat]
 # Model for the interactive orchestrator session (displayed in the banner/header).
-# User decision 2026-08-13: the orchestrator runs Fable (claude-fable-5).
+# User decision 2026-09-27: the orchestrator runs Opus 5.5 (claude-opus-5-5),
+# replacing the 2026-08-13 Fable pin.
 # Not REPO-FORBIDDEN: this only shapes a session the operator deliberately
 # launched, and the choice is disclosed on the `zirv \u{25b8}` announcement
 # channel rather than spent silently in the background (see ChatConfig's doc
 # comment in config.rs). Commenting this out reverts to the built-in default
 # (unset: leaves the agent's own default model in place). This is the ONLY
 # active key in this file -- every other key below is commented out.
-model = "fable"
+model = "claude-opus-5-5"
 
 # claude_permission_mode = "default"  # REPO-FORBIDDEN (ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE): overrides the INTERACTIVE launch's Claude Code --permission-mode ("default" | "acceptEdits" | "bypassPermissions"). Default: unset (behaves as "default"). Headless launches always stay "dontAsk" regardless of this key.
 
