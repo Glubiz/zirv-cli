@@ -159,6 +159,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # No ubuntu leg in the three native-*-platforms matrices: the `test` job
+  # already runs every one of these tests on ubuntu-latest via nextest.
   native-enforcement-platforms:
     name: Native Enforcement (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -166,7 +168,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -188,7 +190,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -216,7 +218,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
