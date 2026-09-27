@@ -300,8 +300,8 @@ PATH]` looks up the case named by `spec.task` by scanning every
 `jev-cases/<floor_site>/cases.jsonl` (each case row names its own
 production probe `site`, e.g. `"memory-rerank"`), writes a scratch
 `{"id","state","n"}` case file into the trial's state dir, and runs `zirv
-ctx jev probe --site <site> --case <case.json> --reps <K> --json` -- the
-same production facts/decision path a real Jev call at that site would
+ctx jev probe --site <site> --case <case.json> --reps <K>` (stdout is
+always JSON) -- the same production facts/decision path a real Jev call at that site would
 exercise, with the cache forced off by the probe itself and the floor read
 from `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN` (the same env
 a candidate's overlay already sets). It reuses `decision_trial.py`'s zirv

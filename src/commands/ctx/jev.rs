@@ -1791,8 +1791,6 @@ pub enum JevCommand {
         reps: u32,
         #[arg(long)]
         repo: Option<std::path::PathBuf>,
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -1829,7 +1827,6 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
             case,
             reps,
             repo,
-            json: _,
         } => super::jev_probe::run_probe(site, case, *reps, repo.as_deref(), writer),
     }
 }

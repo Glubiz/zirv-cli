@@ -18,7 +18,8 @@
 //!
 //! CLI contract (an external worker's backend depends on this exactly):
 //! `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo
-//! <dir>] --json`. `K` must be in `1..=20`; an unknown `SITE` or a missing
+//! <dir>]` (stdout is always JSON, no `--json` flag). `K` must be in
+//! `1..=20`; an unknown `SITE` or a missing
 //! Jev credential both exit 2 with a message. `case.json` is `{"id": "<case
 //! id>", "state": <the exact JSON state object production sends>, "n":
 //! <candidate count, required only for per-candidate sites>}` -- `state` is
