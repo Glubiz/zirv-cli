@@ -28,8 +28,8 @@ registered as zirv artifacts.
    --gif-loop 0`, then `zirv artifact render` and `zirv artifact present`.
    The skill never calls `ffmpeg` directly, never installs packages, and never
    downloads music.
-2. Audio: narration with `hyperframes tts` (local Kokoro, no account) or the
-   operator's ElevenLabs key when it is set in the environment; music and SFX
+2. Audio: narration with `hyperframes tts` (local Kokoro, no account; the
+   command has no other engine); music and SFX
    only from `<repo>/motion/assets/audio/`; `beats` for cut timing and
    `normalize-audio` for loudness. Without Python/Kokoro the skill renders
    without narration and says so.
