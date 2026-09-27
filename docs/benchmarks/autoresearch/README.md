@@ -257,27 +257,27 @@ specifically fired should use `requires_receipts = ["proxy:decider:
 typesafe"]` (see above), which is the runner's own exclusion mechanism for
 that.
 
-See `campaigns/*.toml` for twenty-nine worked examples: `fixture-demo.toml`
+See `campaigns/*.toml` for twenty-seven worked examples: `fixture-demo.toml`
 (free, scripted, safe to run any time); five real campaigns
 (`jev-intake-floors.toml`, `jev-gates-e2e.toml`, `routing-ladder.toml`,
-`context-compaction.toml` + its forced-pressure variant); and twenty-three
+`context-compaction.toml` + its forced-pressure variant); and twenty-one
 more real campaigns for Jev *determinism* tuning
 (`jev-determinism-<floor_site>.toml` for each of the nine tunable floor
 sites, `jev-determinism-handoff_thin.toml` for the handoff-thin confidence
-floor, `jev-determinism-intake.toml` for the intake proxy, plus twelve
+floor, `jev-determinism-intake.toml` for the intake proxy, plus ten
 `jev-determinism-<site>.toml` probe-only-override campaigns for the sites
 added by the probe contract's second wave -- `crash`, `judge`,
 `approve_escalate`, `approve_lower`, `intake_plan`, `inject_screen`,
-`missing_tests`, `stop_verify`, `review_disposition`, `review_dedup`,
-`artifact_substance`, `gate_reclass`) -- see "Jev determinism campaigns"
-below. All the real campaigns spend money and are never run in CI.
+`missing_tests`, `stop_verify`, `review_disposition`, `review_dedup`) --
+see "Jev determinism campaigns" below. All the real campaigns spend money
+and are never run in CI.
 
 ## Jev determinism campaigns
 
 Every Jev-gated feature acts on a sampled answer only when it clears a
 `(min_confidence, min_margin)` floor; below the floor it falls back to a
 fixed deterministic default. Raising a floor trades Jev's influence for
-stability. The twenty-three `jev-determinism-*.toml` campaigns measure that
+stability. The twenty-one `jev-determinism-*.toml` campaigns measure that
 trade-off directly, per site, using two axes:
 
 - **`quality`** = acted-decision *stability*: for `jev_probe_trial.py`, the
@@ -296,7 +296,7 @@ trade-off directly, per site, using two axes:
   for the intake campaign, the mean of `decision_trial.py`'s existing
   per-rep `grade_decision` score.
 
-`[criteria] objective = "quality"` on all twenty-three manifests: a candidate is
+`[criteria] objective = "quality"` on all twenty-one manifests: a candidate is
 promoted only on a *material* stability win (bootstrap CI lower bound on
 the quality delta strictly above `min_effect`), with correctness held to a
 non-inferiority floor -- a floor change that only saves cost/wall time
@@ -357,24 +357,25 @@ cheap|standard|frontier, fallback `deny`; `launch-effort`: high|low,
 fallback `classifier`; `classify-domain`: tag|none per domain tag id,
 fallback `none`; `inject`: defer|inject_now, fallback `inject_now`.
 
-### `jev-cases/<site>/` -- the probe-only-override corpora (twelve sites)
+### `jev-cases/<site>/` -- the probe-only-override corpora (ten sites)
 
-Twelve more directories (`crash`, `judge`, `approve_escalate`,
+Ten more directories (`crash`, `judge`, `approve_escalate`,
 `approve_lower`, `intake_plan`, `inject_screen`, `missing_tests`,
-`stop_verify`, `review_disposition`, `review_dedup`, `artifact_substance`,
-`gate_reclass`), same `cases.jsonl`/`labels.jsonl`/`corpus.toml` shape (16
-cases: 8 `dev`, 5 `validation`, 3 `holdout`, `family = "jev-<dir>"`, `kind =
-"decision"`) as the nine above, for the second wave of `zirv ctx jev probe`
-sites added by the probe contract. Unlike the nine floor sites above, each
-of these twelve is its own single production SITE (no two-SITE-per-corpus
-mixing) and, critically, has **no per-site production floor env at all**:
-`crash`/`judge`/`approve_escalate`/`approve_lower`/`review_disposition`/
-`artifact_substance` read a named compiled `const` floor
-(`CRASH_TRIAGE_FLOOR`, `JUDGE_CONTINUE_FLOOR`,
-`APPROVE_ESCALATE_MIN_CONFIDENCE`, `APPROVE_ALLOW_MIN_CONFIDENCE`/
-`_MIN_MARGIN`, `JEV_DISPOSITION_CONFIDENCE`, `JEV_ARTIFACT_CONFIDENCE`) and
-`intake_plan`/`inject_screen`/`missing_tests`/`stop_verify`/`review_dedup`/
-`gate_reclass` call `Answer::decisive` with an inline floor -- neither is
+`stop_verify`, `review_disposition`, `review_dedup`), same
+`cases.jsonl`/`labels.jsonl`/`corpus.toml` shape (16 cases: 8 `dev`, 5
+`validation`, 3 `holdout`, `family = "jev-<dir>"`, `kind = "decision"`) as
+the nine above, for the second wave of `zirv ctx jev probe` sites added by
+the probe contract -- except `approve_escalate`, now a confirmatory round
+whose corpus grew to 28 cases (8 `dev` / 13 `validation` / 7 `holdout`; see
+"The ten probe-only-override manifests" below). Unlike the nine floor sites above, each of these ten
+is its own single production SITE (no two-SITE-per-corpus mixing) and,
+critically, has **no per-site production floor env at all**:
+`crash`/`judge`/`approve_escalate`/`approve_lower`/`review_disposition`
+read a named compiled `const` floor (`CRASH_TRIAGE_FLOOR`,
+`JUDGE_CONTINUE_FLOOR`, `APPROVE_ESCALATE_MIN_CONFIDENCE`,
+`APPROVE_ALLOW_MIN_CONFIDENCE`/`_MIN_MARGIN`, `JEV_DISPOSITION_CONFIDENCE`)
+and `intake_plan`/`inject_screen`/`missing_tests`/`stop_verify`/
+`review_dedup` call `Answer::decisive` with an inline floor -- neither is
 ever `ZIRV_CTX_JEV_FLOOR_<SITE>_*`-overridable in production. `zirv ctx jev
 probe` gives these sites its own measurement-only override instead --
 `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/`ZIRV_CTX_JEV_PROBE_MIN_MARGIN`, read
@@ -382,14 +383,13 @@ only by the probe verb itself, which replaces the resolved floor for
 whichever site is being probed; production never reads either key, so no
 campaign here can ever change what production actually does. Same 40%
 borderline / label-policy rules as the nine floor sites above (borderline
-items get that site's own contract fallback, e.g. `crash`'s `baseline`,
-`gate_reclass`'s `none` per sub-question).
+items get that site's own contract fallback, e.g. `crash`'s `baseline`).
 
-`gate_reclass` and `artifact_substance` are the two *text-bearing* sites:
-production sends real (synthetic, non-secret, not copied from any real
-repo) `task`/`changed_paths` or `artifact_text` strings, not a numeric
-`facts` row -- every other one of these twelve, like the nine floor sites,
-sends only `{"_zirv_metadata_only": true, "facts": [...]}`.
+`artifact_substance` and `gate_reclass` have no campaign or corpus here:
+both sites' production state is text-bearing and built with non-metadata
+`Question` constructors, so `jev::safe_metadata_request` refuses every
+call and they always take the deterministic fallback, which the probe
+still supports and reports honestly for both sites.
 
 Action vocabulary per SITE: `crash`: auto_block|baseline, fallback
 `baseline`; `judge`: continue|helper, fallback `helper`;
@@ -399,27 +399,27 @@ fallback `keep_planner`; `inject-screen`: warn|pass, fallback `pass`;
 `missing-tests`: skip|owed, fallback `owed`; `stop-verify`: block|allow,
 fallback `allow`; `review-disposition` (per finding `f<i>`):
 fix_now|defer|reject|verify, fallback `unchanged`; `review-dedup` (per
-candidate `p<i>`): duplicate|distinct, fallback `distinct`;
-`artifact-substance`: refuse (template_copy) | warn (thin) | pass
-(substantive), fallback `pass`; `gate-reclass` (seven fixed item ids per
-case -- `sensitive_surface`, `work_domain`, `security`, `data`,
-`docs_only`, `devops`, `architecture`): `sensitive_surface` ->
-raise|none, `work_domain` -> frontend|none, each tag id -> tag|none,
-fallback `none` for every id.
+candidate `p<i>`): duplicate|distinct, fallback `distinct`.
 
 ### The eleven per-floor-site manifests
 
 `campaigns/jev-determinism-<floor_site>.toml` for each of the nine tunable
-floor sites, `campaigns/jev-determinism-handoff_thin.toml` (a round-2
-campaign over handoff-thin cases only, sweeping its confidence floor with
-`--reps 10`), plus `campaigns/jev-determinism-intake.toml` for the intake
-proxy's own floors (which also has 0.15 and 0.25 margin candidates). Each varies its floor's env var(s)
+floor sites, plus `campaigns/jev-determinism-intake.toml` for the intake
+proxy's own floors (which also has 0.15 and 0.25 margin candidates). Each
+of these ten varies its floor's env var(s)
 (`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`, or
 `ZIRV_CTX_PROXY_MIN_CONFIDENCE|_MIN_MARGIN` for intake) across four
 candidates: three margin values (0.10, 0.30, 0.40, confidence left at the
 compiled default) and one raised-confidence candidate (the compiled
 default's own value, read from source, +0.1 -- or 0.6 where that default is
-0.0). `requires_receipts` is `["jev:<label>"]` only where every case in
+0.0). `campaigns/jev-determinism-handoff_thin.toml` is the eleventh
+manifest: after round 1 (`jev-determinism-handoff_select.toml`) and an
+exploratory round 2 narrowed the field to one surviving candidate, it is
+now a CONFIRMATORY round that sweeps only
+`ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.85` (`conf-085`)
+against a grown, handoff-thin-only corpus (dev 8 / validation 20 / holdout
+12, `--reps 10`, validate and holdout reps doubled to 6 after a near-miss
+confirmatory run). `requires_receipts` is `["jev:<label>"]` only where every case in
 that floor site's corpus shares one production receipt label (`memory`,
 `harvest_screen` -> `"harvest"` -- the harvest-screen call records its
 receipt under site string `"harvest"`, not `"harvest_screen"` --
@@ -439,48 +439,48 @@ already being `typesafe` and uses `requires_receipts =
 ["proxy:decider:typesafe"]` to exclude (not silently mismeasure) any trial
 that ran under an operator-set `helper` decider instead.
 
-### The twelve probe-only-override manifests
+### The ten probe-only-override manifests
 
-`campaigns/jev-determinism-<site>.toml` for each of the twelve sites above
+`campaigns/jev-determinism-<site>.toml` for each of the ten sites above
 (`crash`, `judge`, `approve_escalate`, `approve_lower`, `intake_plan`,
 `inject_screen`, `missing_tests`, `stop_verify`, `review_disposition`,
-`review_dedup`, `artifact_substance`, `gate_reclass`), each with the same
-`[backend] --reps 5` shape as the nine-floor-site manifests above. Since
-none of these sites has a per-site production floor env, every one of the
-twelve shares the identical `[candidate_space] allow_env =
-["ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE", "ZIRV_CTX_JEV_PROBE_MIN_MARGIN"]` and
-the same four-candidate shape as the eleven manifests above: three margin
-values (0.10, 0.30, 0.40, confidence left at the compiled default) and one
+`review_dedup`), each with the same `[backend] --reps 5` shape as the
+nine-floor-site manifests above. Since none of these sites has a per-site
+production floor env, every one of the ten shares the identical
+`[candidate_space] allow_env = ["ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE",
+"ZIRV_CTX_JEV_PROBE_MIN_MARGIN"]`. Nine of the ten use the same
+four-candidate shape as the eleven manifests above: three margin values
+(0.10, 0.30, 0.40, confidence left at the compiled default) and one
 raised-confidence candidate (the compiled default's own value, read from
 source, +0.1, capped at 0.95 -- or 0.6 where that default is 0.0).
-`requires_receipts` is `["jev:<label>"]` using each site's own production
-receipt label read from source (`crash`, `judge`, `intake_plan`,
-`inject_screen`, `missing_tests`, `stop_verify`; `approve_escalate`/
-`approve_lower` both write receipts under `"approve"`;
-`review_disposition`/`review_dedup`/`artifact_substance`/`gate_reclass` use
-their production `jev::advise` site strings verbatim --
-`"workflow-review-disposition"`, `"workflow-review-dedup"`,
-`"workflow-artifact-substance"`, `"workflow-gate-reclassification"`).
-`gate_reclass`'s own manifest documents a known limitation: production
-resolves a DIFFERENT compiled floor per sub-question (`sensitive_surface`
-and the five tag questions share `(0.0, DEFAULT_MIN_MARGIN)`; `work_domain`
-alone uses `(JEV_FRONTEND_CONFIDENCE=0.9, DEFAULT_MIN_MARGIN)`), but the
-probe's measurement override replaces the resolved floor uniformly for
-every question in one call, so this campaign cannot isolate `work_domain`'s
-own floor from the other six.
+`campaigns/jev-determinism-approve_escalate.toml` is the tenth and is now a
+CONFIRMATORY round: its first run found the compiled 0.5 confidence floor
+sitting inside a ~0.2-0.64 spread of Jev's sampled "risky" confidence for
+one identical command, flipping escalation nondeterministically; the
+corpus grew to 8 dev / 13 validation / 7 holdout cases, and this manifest
+now sweeps only the two candidates that first run actually motivated --
+`esc-018` (0.18 confidence / 0.17 margin) and `esc-025` (0.25 confidence,
+margin at the compiled default). `requires_receipts` is `["jev:<label>"]`
+using each site's own production receipt label read from source (`crash`,
+`judge`, `intake_plan`, `inject_screen`, `missing_tests`, `stop_verify`;
+`approve_escalate`/`approve_lower` both write receipts under `"approve"`;
+`review_disposition`/`review_dedup` use their production `jev::advise`
+site strings verbatim -- `"workflow-review-disposition"`,
+`"workflow-review-dedup"`).
 
-Seven of the twelve safety-critical sites (`crash`, `approve_escalate`,
-`approve_lower`, `missing_tests`, `stop_verify`, `artifact_substance`,
-`gate_reclass`) carry a header comment on their manifest: any floor change
-actually shipped from evidence these campaigns produce may only move the
-floor in the CONSERVATIVE direction (more fallback), and only ever as a
-reviewed source edit to the compiled `const` itself -- never by shipping an
-env override, since `ZIRV_CTX_JEV_PROBE_MIN_*` is measurement-only and
-production never reads it regardless.
+Five of the ten safety-critical sites (`crash`, `approve_escalate`,
+`approve_lower`, `missing_tests`, `stop_verify`) carry a header comment on
+their manifest: any floor change actually shipped from evidence these
+campaigns produce may only move the floor in the CONSERVATIVE direction
+(more fallback), and only ever as a reviewed source edit to the compiled
+`const` itself -- never by shipping an env override, since
+`ZIRV_CTX_JEV_PROBE_MIN_*` is measurement-only and production never reads
+it regardless.
 
-Each of the twelve caps `max_spend_usd` at $0.05 (they sum to $0.60); every
-`jev-determinism-*.toml` manifest (all twenty-three) sums to $3.90, under
-the $4.00 operator cap on Jev spend.
+Nine of the ten cap `max_spend_usd` at $0.10; `approve_escalate`'s
+confirmatory round raises its cap to $0.12 for the grown corpus (the ten
+sum to $1.02). Every `jev-determinism-*.toml` manifest (all twenty-one)
+sums to $2.67, under the $4.00 operator cap on Jev spend.
 
 ## Budgets
 
@@ -546,11 +546,14 @@ explicit, operator-taken action.
 - **Single project family**: every task is `ledgerlite`. A report built
   from this corpus is flagged `single_family`; it is not evidence a
   candidate generalizes to a different codebase or language.
-- **Only the Jev determinism campaigns have been run.** The eleven
-  `jev-determinism-*.toml` campaigns ran on 2026-09-27 and promoted nothing.
-  See `results/2026-09-27-jev-determinism/README.md` for the findings and
-  every campaign's report. The five campaigns predating them have passed
-  `plan` but have never been executed, so they claim no gain.
+- **Only the Jev determinism campaigns have been run.** All twenty-one
+  `jev-determinism-*.toml` campaigns ran on 2026-09-27; no floor default
+  changed. The one change that did ship is the Jev answer cache TTL,
+  raised from a day to a week (`[jev] cache_ttl_secs` default 86,400 ->
+  604,800). See `results/2026-09-27-jev-determinism/README.md` for the
+  full findings, every campaign's report, and the reasoning behind both
+  calls. The five campaigns predating them have passed `plan` but have
+  never been executed, so they claim no gain.
 - **Orchestration is unmeasured**: no multi-seat suite exists; every result
   here is single-seat.
 - **#762 owns rot-threshold calibration**; this campaign framework only

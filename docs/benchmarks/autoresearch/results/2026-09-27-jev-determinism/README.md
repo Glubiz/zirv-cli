@@ -1,107 +1,85 @@
 # Jev determinism campaigns, 2026-09-27
 
-**Outcome: no floor default changes.** Every tunable Jev floor was swept with
-the autoresearch runner under `[criteria] objective = "quality"` (quality =
-how often K uncached repetitions of the same request lead production to the
-same action). No candidate cleared the promotion gate. For 8 of the 11
-measured sites the compiled floors are already fully deterministic on this
-corpus. The two sites that still flip, handoff-thin and the intake clarify
-decision, flip because Jev's own confidence/margin varies from call to call
-on an identical request. No floor removes that without switching the feature
-off or regressing correctness.
+**Outcome.** Every production Jev decision site was measured for determinism: the same request, repeated uncached, should lead production to the same action. The autoresearch runner then swept each site's floors.
 
-Total Jev spend for the final run: **$0.137** (11 campaigns, 1,008 trials, all
-uncached). Development runs brought the total for the whole exercise to
-about $0.31.
+- **No floor default changed.** Seventeen of the 21 measured sites are fully deterministic at their compiled floors on these corpora. For the other four, every candidate that gains stability either loses correctness or failed its confirmation.
+- **Cache TTL raised.** The one change that adds determinism without trading correctness ships in this release: the Jev answer cache now keeps an identical request's answer for a week (`[jev] cache_ttl_secs` default 86,400 → 604,800). The model, questions and state are all part of the cache key.
+- **Two gates sites never reach Jev.** artifact-substance and gate-reclass are refused by the metadata guard on every call (see below), so they always take the deterministic fallback.
+
+Committed reports: 21 campaigns, 2,018 uncached trials, $0.229 of Jev spend. Across all 60 campaign runs of this exercise, including exploration and confirmation rounds, Jev spend was about $0.79.
 
 ## How it was measured
 
-- `zirv ctx jev probe` sends one site's production question(s) for a fixture
-  input K times with the cache off. It applies that site's production floor
-  and answer-to-action rule, and reports what production would have done on
-  each repetition.
-- `jev_probe_trial.py` (K=5, K=10 for handoff-thin) scores `quality` as the
-  mean per-item modal share of those actions, and `correctness` as agreement
-  with the labelled action in `jev-cases/<site>/labels.jsonl`.
-- `decision_trial.py --reps 5` does the same for intake. It compares every
-  field production acts on (`ACTED_DECISION_FIELDS` plus the derived
-  `clarify` boolean), never the raw probabilities.
-- Candidates are env overlays of `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|
-  _MIN_MARGIN` or `ZIRV_CTX_PROXY_MIN_CONFIDENCE|_MIN_MARGIN`. Safety and
-  verification sites (approve, stop_verify, inject_screen, missing_tests,
-  review) keep compiled floors by design and were not swept.
-- Model: `jev-1.13.0` (the pinned `[proxy.typesafe] model`).
+- **The probe.** `zirv ctx jev probe --site <SITE> --case <case.json> --reps K` sends one site's production question(s) K times with the cache off. It applies the site's production floor and answer-to-action rule, and prints the action production would take on each repetition. It covers 24 sites. The probe-only env keys `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE|_MIN_MARGIN` let a campaign vary any site's floor, including safety sites, without production ever reading an override.
+- **Probe metrics.** `jev_probe_trial.py` (K=5, or K=10 for handoff-thin) scores `quality` as the mean per-item modal share of those actions. `correctness` is agreement with `jev-cases/<site>/labels.jsonl`.
+- **Intake metrics.** `decision_trial.py --reps 5` does the same for intake, comparing every production-acted decision field (`ACTED_DECISION_FIELDS` plus the derived `clarify` boolean).
+- **Promotion.** Every campaign uses `[criteria] objective = "quality"` with `min_effect = 0.01`: a candidate is promoted only if the lower bound of its paired-bootstrap stability CI clears 0.01, correctness does not regress past 0.05, and a holdout confirms.
+- **Model:** `jev-1.13.0`, the pinned `[proxy.typesafe] model`.
 
-## Results (final run, dev split screen; stability / correctness)
+## Results (committed reports; baseline = compiled floors; stability / correctness)
 
-| campaign | baseline (compiled floors) | best candidate | verdict |
-|---|---|---|---|
-| memory | 1.000 / 0.71 | all equal | no change |
-| context | 1.000 / 0.73 | all equal | no change |
-| harvest_screen | 1.000 / 0.50 | all equal | no change |
-| compaction_select | 1.000 / 0.65 | margin 0.10 is worse (0.945 / 0.42) | no change |
-| dispatch | 1.000 / 0.12 | all equal | no change |
-| launch_effort | 1.000 / 0.25 | all equal | no change |
-| classify (domain tags) | 1.000 / 0.90 | all equal | no change |
-| inject | 1.000 / 0.62 | all equal | no change |
-| handoff_select (select + thin) | 0.908 / 0.78 | confidence 0.6: 1.000 / 0.90 | inconclusive at validate (see below) |
-| handoff_thin (round 2) | 0.969 / 0.72 | none better | no change |
-| intake | 0.983 / 0.62 | margin 0.10/0.15/0.40: 1.000 / 0.62 | discarded at screen (gain < min_effect/2) |
+| site | baseline | outcome |
+|---|---|---|
+| memory, context, harvest_screen, compaction_select, dispatch, launch_effort, classify, inject | 1.000 / (0.12 to 0.90) | deterministic; no candidate better |
+| crash, judge, approve_lower, intake_plan, inject_screen, missing_tests, stop_verify, review_disposition, review_dedup | 1.000 / (0.38 to 0.75) | deterministic; no candidate better |
+| handoff_select (select + thin) | 0.935 / 0.78 | inconclusive at validate |
+| handoff_thin (confirmatory) | 1.000 / 0.75 on dev | conf-085 discarded at screen |
+| intake | 0.963 / 0.64 | inconclusive at validate (correctness CI) |
+| approve_escalate (confirmatory) | 0.971 / 0.48 | inconclusive at validate (stability CI) |
+| artifact-substance, gate-reclass | fallback on every call | not campaigned (see below) |
 
-Each campaign's `report.md`, `report.json` and `results.tsv` are in its own
-directory here. Low correctness values (dispatch, launch_effort) mean the
-hand-written labels disagree with Jev's consistent answer. They are not
-instability, and correctness only guards against regression here.
+Deterministic does not mean active. For most of the deterministic sites, Jev's answers on these corpora sit well away from the site's thresholds. Two examples are memory relevance at 0.44–0.73 against a 0.3 prune threshold, and stop-verify at 0.16–0.24 against 0.9. So the same action recurs, often the fallback. Low correctness values (dispatch, launch_effort, crash, review_disposition) mean the hand-written labels disagree with Jev's consistent answer; correctness only guards against regression here.
 
-## handoff-thin: noisy confidence, no deterministic floor
+## Where Jev still flips, and why no floor fixes it
 
-`HANDOFF_THIN_FLOOR` (0.9) demotes a distilled handoff when Jev answers
-`thin` with confidence at or above it. Jev's answer value is stable for
-small handoffs, but its confidence on the identical request spreads widely:
+In every remaining case, Jev samples a noticeably different confidence or margin on each identical uncached request, and the site's floor sits inside that band.
 
-| case | facts [task, next_step, constraints, files, blocked] | answers | `thin` confidence range |
-|---|---|---|---|
-| hsel-007 | [11, 5, 0, 0, 0] | 50/50 thin | 0.84-0.94 |
-| hsel-003 | [14, 5, 0, 0, 0] | 50/50 thin | 0.84-0.93 |
-| ht-001 | [18, 6, 0, 1, 0] | 100/100 thin | 0.46-0.79 |
-| ht-002 | [25, 9, 5, 0, 1] | 93/93 thin | 0.30-0.67 |
-| ht-003 | [35, 12, 0, 0, 0] | 100/100 thin | 0.85-0.95 |
-| ht-004 | [35, 12, 0, 4, 0] | 96/96 thin | 0.46-0.81 |
-| ht-005 | [85, 25, 0, 0, 0] | 100/100 thin | 0.60-0.90 |
-| ht-007 | [190, 65, 20, 1, 0] | 43/100 thin | 0.00-0.19 |
-| hsel-004 | [1205, 242, 190, 5, 0] | 14/50 thin | 0.00-0.18 |
+**handoff-thin** (`HANDOFF_THIN_FLOOR` 0.9). The answer value is stable, but its confidence for one identical request spans a wide band that depends on handoff size:
 
-Any floor between about 0.3 and 0.95 cuts through at least one case's band.
-The 0.9 default flips the tiniest handoffs; 0.5-0.8 stabilise those but
-destabilise small ones. The `handoff_select` campaign's apparent win for
-confidence 0.6 came from its thin cases all being tiny. The focused
-`handoff_thin` round, which spans the size range, refuted it: every lower
-floor was less stable than 0.9. A floor above Jev's observed ceiling (0.95)
-would be deterministic only because demotion would never happen.
+| case | facts [task, next_step, constraints, files, blocked] | `thin` confidence range |
+|---|---|---|
+| hsel-003 | [14, 5, 0, 0, 0] | 0.84–0.93 |
+| ht-001 | [18, 6, 0, 1, 0] | 0.46–0.79 |
+| ht-002 | [25, 9, 5, 0, 1] | 0.30–0.67 |
+| ht-005 | [85, 25, 0, 0, 0] | 0.60–0.90 |
+| ht-007 | [190, 65, 20, 1, 0] | 0.00–0.19 |
 
-## Intake: the clarify decision's margin sits near 0.2-0.3
+- Floors of 0.45–0.8 stabilise tiny handoffs but destabilise small ones. 0.45 cost 0.17–0.18 correctness.
+- conf-085 looked best, and one confirmatory run (n=60) was significant on both axes: stability +0.028, CI [0.008, 0.052]; correctness +0.035, CI [0.013, 0.060]. But the stability CI lower bound stayed below the pre-declared 0.01.
+- The pre-registered follow-up with doubled reps was declared final. It discarded conf-085 at screen, because that run's dev split showed no instability to remove. So the 0.9 floor stays.
 
-Every flip in the intake campaigns was the `clarify` decision; intent,
-workflow, complexity, risk, tiers and domains never flipped. Stability by
-`ZIRV_CTX_PROXY_MIN_MARGIN`: 0.10 → 1.000, 0.15 → 1.000, **0.20 (default)
-→ 0.983**, 0.25 → 0.917, 0.30 → 0.767, 0.40 → 1.000. Jev's clarify margins
-cluster around 0.3, so 0.3 is the worst possible floor. An earlier run
-(`intake` round 3, validate split) showed the same shape: default 0.954,
-0.10 and 0.40 both 1.000, with the correctness-regression CI lower bound at
--0.058 against the 0.05 limit, so inconclusive. Lowering the shared margin
-is also ruled out independently: `jev::DEFAULT_MIN_MARGIN` has a
-compile-time bound (> 0.14) from the 2026-09-18 measurement of intent,
-workflow and architecture flips. Raising it to 0.4 would make most
-Jev-driven intake fields fall back.
+**Intake clarify.** Only the `clarify` decision ever flipped; intent, workflow, complexity, risk, tiers and domains never did.
 
-## What would change these conclusions
+| `ZIRV_CTX_PROXY_MIN_MARGIN` | stability |
+|---|---|
+| 0.10 | 1.000 |
+| 0.15 | 0.99 |
+| **0.20 (default)** | 0.95–0.98 |
+| 0.25 | 0.92 |
+| 0.30 | 0.75–0.77 |
+| 0.40 | 0.99 |
 
-- A clarify-specific margin floor (a source change, not an env knob) could
-  move clarify off its 0.2-0.3 cluster without touching the other intake
-  fields. It can be evaluated as a `[candidate_space.source_patch]` campaign.
-- handoff-thin needs a different signal, not a different floor: for
-  example, acting on the answer value when it is unanimous, or a majority of
-  N calls. Both need source changes.
-- Corpora are hand-written, metadata-only fixtures (16-24 cases per site).
-  A site that is stable here can still flip on inputs near its own
-  thresholds that this corpus does not cover.
+Every more-stable margin fails the correctness guard. The residual flips at 0.2 come mostly from "Audit and fix the authentication bypass…", which lower margins make ask for clarification every time, though its label says not to. 0.10 would also break the `DEFAULT_MIN_MARGIN > 0.14` bound that protects intent and workflow, and 0.40 makes most Jev-driven intake fields fall back.
+
+**approve-escalate** (`APPROVE_ESCALATE_MIN_CONFIDENCE` 0.5). Jev's "risky" confidence for one identical command spans about 0.2–0.64, and 19% of your real uncached approve answers (09-25) land within ±0.05 of 0.5. Lowering the floor (the conservative direction, more Allow→Ask) raised correctness sharply: esc-018 +0.22, CI [0.11, 0.34], on 13 confirmatory validation cases. But it did not raise stability (−0.03, CI [−0.07, +0.02]), because new straddles appear. So it is not a determinism change, and this campaign does not ship it (see follow-ups).
+
+**What removes these flips:** memoization. With the one-week TTL, a repeated identical request always gets the answer it got the first time. approve's production cache-hit rate is 65%, so a large share of real approve decisions are repeats that this makes consistent.
+
+## Sites that never reach Jev
+
+`artifact-substance` and `gate-reclass` (the `[jev] gates` sites in `workflow/engine.rs`) send text-bearing state (`{artifact_kind, artifact_text}`, `{task, changed_paths, …}`) built with plain, non-metadata `Question` constructors. `jev::safe_metadata_request` refuses both on every call, and production's own tests assert the network is never dialled. Their acted decision is therefore always the deterministic fallback. The probe reports exactly that, so no campaign was run for them.
+
+## Real-data cross-check
+
+Your uncached production answers in `jev-decisions.jsonl` (181 of 929 rows) confirm the campaign picture:
+
+- **approve** is the only site with a dense near-floor region today.
+- **memory** has an older low cluster (noul 0.15–0.30) near its 0.3 threshold, but it appears only in 09-20 to 09-23 rows. Every memory answer since has been ≥ 0.45, matching a live sweep of 140 random memory fact states.
+
+## Follow-ups (not determinism changes; not in this release)
+
+- **approve-escalate accuracy:** the 0.5 floor lets through many mid-risk commands that a careful operator would want asked about. esc-018 raised correctness by 0.22, but that is an accuracy/safety decision for the operator.
+- **gates sites:** artifact-substance and gate-reclass cannot ask Jev at all today. Either give them a metadata projection or remove the Jev leg.
+- **Cache growth:** the Jev cache is never pruned (`jev-cache/` grows without bound); this was already true before the TTL change.
+- **handoff-thin and intake clarify:** remaining per-call noise would need source changes, such as majority-of-N sampling or a clarify-specific margin, evaluated as `[candidate_space.source_patch]` campaigns.
+- **Corpus limits:** corpora are hand-written metadata fixtures (16–40 cases per site). A site that is stable here can still flip on real inputs near its own thresholds that no corpus case covers.

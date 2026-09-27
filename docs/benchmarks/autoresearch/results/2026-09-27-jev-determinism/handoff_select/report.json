@@ -1,9 +1,9 @@
 {
   "campaign_id": "jev-determinism-handoff_select",
   "zirv_version": "4.38.0",
-  "baseline_sha": "43999822a3bf6f816bdd80949ceb22466b7a0cb8",
-  "started_at": 1790507087,
-  "finished_at": 1790507158,
+  "baseline_sha": "7978bf6bbe853d83ce280759eb859f6c21b35120",
+  "started_at": 1790511845,
+  "finished_at": 1790511917,
   "promoted": null,
   "verdict": "no_improvement",
   "objective": "quality",
@@ -14,19 +14,19 @@
       "verdict": "discard",
       "hypothesis": "A much lower margin floor (handoff_select) trades away stability for more decisive Jev answers.",
       "d_correctness": [
-        -0.012500000000000004
+        -0.075
       ],
       "d_quality": [
-        -0.012500000000000004
+        -0.012499999999999995
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.009399299324959412
+        -0.01214540148491481
       ],
       "reasons": [
-        "no material quality point-estimate improvement"
+        "correctness regression vs baseline"
       ],
       "confidence": null,
       "seed": null,
@@ -36,86 +36,27 @@
     {
       "candidate": "margin-030",
       "stage": "screen",
-      "verdict": "survive",
+      "verdict": "discard",
       "hypothesis": "A moderately higher margin floor (handoff_select) buys some stability without much lost coverage.",
       "d_correctness": [
-        0.025
+        -0.07500000000000001
       ],
       "d_quality": [
-        0.05
+        -0.07500000000000001
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.0030334102366914467
+        0.009012488734389082
       ],
-      "reasons": [],
+      "reasons": [
+        "correctness regression vs baseline"
+      ],
       "confidence": null,
       "seed": null,
       "excluded_by_reason": {},
       "cohorts": []
-    },
-    {
-      "candidate": "margin-030",
-      "stage": "validate",
-      "verdict": "inconclusive",
-      "hypothesis": "A moderately higher margin floor (handoff_select) buys some stability without much lost coverage.",
-      "d_correctness": [
-        -0.039999999999999994
-      ],
-      "d_quality": [],
-      "rel_cost": [],
-      "rel_wall": [],
-      "reasons": [
-        "meta:sonnet:cold:natural: correctness regression CI lower -0.100 below margin 0.050"
-      ],
-      "confidence": 0.9666666666666668,
-      "seed": 14568811002132146706,
-      "excluded_by_reason": {},
-      "cohorts": [
-        {
-          "cohort": "meta:sonnet:cold:natural",
-          "verdict": "inconclusive",
-          "reasons": [
-            "meta:sonnet:cold:natural: correctness regression CI lower -0.100 below margin 0.050"
-          ],
-          "n_pairs": 10,
-          "excluded": 0,
-          "baseline": {
-            "n": 10,
-            "success_rate": 1.0,
-            "timeout_rate": 0.0,
-            "error_rate": 0.0,
-            "correctness_mean": 0.7933333333333333,
-            "quality_mean": 0.96,
-            "cost_per_success_usd": 0.000172,
-            "cost_complete": true,
-            "wall_median_ms": 1460,
-            "wall_p90_ms": 1662
-          },
-          "candidate": {
-            "n": 10,
-            "success_rate": 1.0,
-            "timeout_rate": 0.0,
-            "error_rate": 0.0,
-            "correctness_mean": 0.7533333333333333,
-            "quality_mean": 0.94,
-            "cost_per_success_usd": 0.000172,
-            "cost_complete": true,
-            "wall_median_ms": 1440,
-            "wall_p90_ms": 1570
-          },
-          "d_correctness": {
-            "point": -0.039999999999999994,
-            "lo": -0.09999999999999998,
-            "hi": 0.0
-          },
-          "d_quality": null,
-          "rel_cost": null,
-          "rel_wall": null
-        }
-      ]
     },
     {
       "candidate": "margin-040",
@@ -123,16 +64,16 @@
       "verdict": "survive",
       "hypothesis": "A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.",
       "d_correctness": [
-        0.0375
+        -0.025
       ],
       "d_quality": [
-        0.025
+        0.012499999999999995
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.001068102196018115
+        0.0032616625895884295
       ],
       "reasons": [],
       "confidence": null,
@@ -146,15 +87,17 @@
       "verdict": "inconclusive",
       "hypothesis": "A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.",
       "d_correctness": [
-        -0.019999999999999997
+        0.013333333333333334
       ],
-      "d_quality": [],
+      "d_quality": [
+        -0.013333333333333338
+      ],
       "rel_cost": [],
       "rel_wall": [],
       "reasons": [
-        "meta:sonnet:cold:natural: correctness regression CI lower -0.060 below margin 0.050"
+        "meta:sonnet:cold:natural: quality regression CI lower -0.040 below margin 0.020"
       ],
-      "confidence": 0.9666666666666668,
+      "confidence": 0.95,
       "seed": 3991896325322661592,
       "excluded_by_reason": {},
       "cohorts": [
@@ -162,40 +105,44 @@
           "cohort": "meta:sonnet:cold:natural",
           "verdict": "inconclusive",
           "reasons": [
-            "meta:sonnet:cold:natural: correctness regression CI lower -0.060 below margin 0.050"
+            "meta:sonnet:cold:natural: quality regression CI lower -0.040 below margin 0.020"
           ],
-          "n_pairs": 10,
+          "n_pairs": 15,
           "excluded": 0,
           "baseline": {
-            "n": 10,
+            "n": 15,
             "success_rate": 1.0,
             "timeout_rate": 0.0,
             "error_rate": 0.0,
-            "correctness_mean": 0.7933333333333333,
-            "quality_mean": 0.96,
-            "cost_per_success_usd": 0.000172,
+            "correctness_mean": 0.7400000000000001,
+            "quality_mean": 0.9466666666666668,
+            "cost_per_success_usd": 0.00017199999999999998,
             "cost_complete": true,
-            "wall_median_ms": 1460,
-            "wall_p90_ms": 1662
+            "wall_median_ms": 1438,
+            "wall_p90_ms": 1506
           },
           "candidate": {
-            "n": 10,
+            "n": 15,
             "success_rate": 1.0,
             "timeout_rate": 0.0,
             "error_rate": 0.0,
-            "correctness_mean": 0.7733333333333333,
-            "quality_mean": 0.94,
-            "cost_per_success_usd": 0.000172,
+            "correctness_mean": 0.7533333333333334,
+            "quality_mean": 0.9333333333333332,
+            "cost_per_success_usd": 0.00017199999999999998,
             "cost_complete": true,
-            "wall_median_ms": 1489,
-            "wall_p90_ms": 1557
+            "wall_median_ms": 1399,
+            "wall_p90_ms": 1512
           },
           "d_correctness": {
-            "point": -0.019999999999999997,
-            "lo": -0.059999999999999984,
+            "point": 0.013333333333333334,
+            "lo": 0.0,
+            "hi": 0.04000000000000001
+          },
+          "d_quality": {
+            "point": -0.013333333333333338,
+            "lo": -0.040000000000000015,
             "hi": 0.0
           },
-          "d_quality": null,
           "rel_cost": null,
           "rel_wall": null
         }
@@ -207,16 +154,16 @@
       "verdict": "survive",
       "hypothesis": "Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.",
       "d_correctness": [
-        0.1625
+        0.1125
       ],
       "d_quality": [
-        0.125
+        0.075
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        0.0011108262838588395
+        0.02308913780524441
       ],
       "reasons": [],
       "confidence": null,
@@ -230,21 +177,21 @@
       "verdict": "inconclusive",
       "hypothesis": "Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.",
       "d_correctness": [
-        0.04
+        0.09333333333333332
       ],
       "d_quality": [
-        0.04
+        0.05333333333333333
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.04966641957005189
+        0.02749860413176996
       ],
       "reasons": [
         "meta:sonnet:cold:natural: no material quality win"
       ],
-      "confidence": 0.9666666666666668,
+      "confidence": 0.95,
       "seed": 3815352144415053972,
       "excluded_by_reason": {},
       "cohorts": [
@@ -254,41 +201,41 @@
           "reasons": [
             "meta:sonnet:cold:natural: no material quality win"
           ],
-          "n_pairs": 10,
+          "n_pairs": 15,
           "excluded": 0,
           "baseline": {
-            "n": 10,
+            "n": 15,
             "success_rate": 1.0,
             "timeout_rate": 0.0,
             "error_rate": 0.0,
-            "correctness_mean": 0.7933333333333333,
-            "quality_mean": 0.96,
-            "cost_per_success_usd": 0.000172,
+            "correctness_mean": 0.7400000000000001,
+            "quality_mean": 0.9466666666666668,
+            "cost_per_success_usd": 0.00017199999999999998,
             "cost_complete": true,
-            "wall_median_ms": 1460,
-            "wall_p90_ms": 1662
+            "wall_median_ms": 1438,
+            "wall_p90_ms": 1506
           },
           "candidate": {
-            "n": 10,
+            "n": 15,
             "success_rate": 1.0,
             "timeout_rate": 0.0,
             "error_rate": 0.0,
             "correctness_mean": 0.8333333333333334,
             "quality_mean": 1.0,
-            "cost_per_success_usd": 0.000172,
+            "cost_per_success_usd": 0.00017199999999999998,
             "cost_complete": true,
-            "wall_median_ms": 1403,
-            "wall_p90_ms": 1477
+            "wall_median_ms": 1459,
+            "wall_p90_ms": 1604
           },
           "d_correctness": {
-            "point": 0.04,
+            "point": 0.09333333333333332,
             "lo": 0.0,
-            "hi": 0.12000000000000002
+            "hi": 0.22666666666666663
           },
           "d_quality": {
-            "point": 0.04,
+            "point": 0.05333333333333333,
             "lo": 0.0,
-            "hi": 0.12000000000000002
+            "hi": 0.11999999999999998
           },
           "rel_cost": {
             "point": 0.0,
@@ -296,9 +243,9 @@
             "hi": 0.0
           },
           "rel_wall": {
-            "point": -0.04966641957005189,
-            "lo": -0.08600902643455835,
-            "hi": -0.0100481761871989
+            "point": 0.02749860413176996,
+            "lo": -0.008205739433391401,
+            "hi": 0.06920514040932889
           }
         }
       ]
@@ -306,7 +253,7 @@
   ],
   "stopped_reason": null,
   "spend": {
-    "execution_usd": 0.017429999999999987,
+    "execution_usd": 0.018289999999999987,
     "overhead_usd": 0.0,
     "completeness": "complete"
   }

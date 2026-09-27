@@ -1,5 +1,5 @@
 candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
-margin-010	screen	discard	0.0000	-0.0531	0.0000	0.0000	A much lower margin floor (harvest_screen) trades away stability for more decisive Jev answers.
-margin-030	screen	discard	0.0000	-0.0337	0.0000	0.0000	A moderately higher margin floor (harvest_screen) buys some stability without much lost coverage.
-margin-040	screen	discard	0.0000	-0.0612	0.0000	0.0000	A high margin floor (harvest_screen) maximizes stability at the cost of coverage/correctness.
-confidence-raised	screen	discard	0.0000	-0.0421	0.0000	0.0000	Raising the confidence floor (harvest_screen) above its compiled default (0.8) improves stability without an unacceptable correctness cost.
+margin-010	screen	discard	0.0000	-0.0062	0.0000	0.0000	A much lower margin floor (harvest_screen) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	-0.0155	0.0000	0.0000	A moderately higher margin floor (harvest_screen) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	-0.0042	0.0000	0.0000	A high margin floor (harvest_screen) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	0.0111	0.0000	0.0000	Raising the confidence floor (harvest_screen) above its compiled default (0.8) improves stability without an unacceptable correctness cost.

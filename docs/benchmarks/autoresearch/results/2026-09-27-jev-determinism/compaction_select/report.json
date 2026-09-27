@@ -1,9 +1,9 @@
 {
   "campaign_id": "jev-determinism-compaction_select",
   "zirv_version": "4.38.0",
-  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
-  "started_at": 1790507282,
-  "finished_at": 1790507330,
+  "baseline_sha": "7978bf6bbe853d83ce280759eb859f6c21b35120",
+  "started_at": 1790512098,
+  "finished_at": 1790512146,
   "promoted": null,
   "verdict": "no_improvement",
   "objective": "quality",
@@ -14,16 +14,16 @@
       "verdict": "discard",
       "hypothesis": "A much lower margin floor (compaction_select) trades away stability for more decisive Jev answers.",
       "d_correctness": [
-        -0.2375
+        -0.26249999999999996
       ],
       "d_quality": [
-        -0.05458333333333333
+        -0.05333333333333334
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.013530601922104198
+        0.0026934587430525866
       ],
       "reasons": [
         "correctness regression vs baseline"
@@ -48,7 +48,7 @@
         0.0
       ],
       "rel_wall": [
-        -0.004889563311414601
+        -0.0032920051303976057
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -73,7 +73,7 @@
         0.0
       ],
       "rel_wall": [
-        0.03776766143989209
+        -0.031209918768704575
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -98,7 +98,7 @@
         0.0
       ],
       "rel_wall": [
-        0.004931714719271623
+        0.014450619923044037
       ],
       "reasons": [
         "no material quality point-estimate improvement"
