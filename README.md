@@ -550,7 +550,12 @@ immediately:
 
 1. A boxed prompt (`⏎ plan and start · shift+⏎ new line · esc start without a
    plan`) reads the task description; `Alt+⏎`/`Ctrl+J` also insert a
-   newline.
+   newline. Long lines soft-wrap inside the box, which grows with the
+   content (capped at the inline region's own height, scrolling to keep the
+   cursor's own line visible once content exceeds that). While the box is
+   empty the hint instead reads `⏎/esc start the full orchestrator ·
+   shift+⏎ new line` — Enter on nothing typed starts the harness the same
+   way Esc always has.
 2. `✻ Sizing the task… Ns · esc to start without a plan` — a spinner while
    `decide()` runs on a worker thread; Esc or Ctrl+C abandons it (the
    thread's result is then just discarded) and starts the harness without a

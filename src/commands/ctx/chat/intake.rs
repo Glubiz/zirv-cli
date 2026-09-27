@@ -14,7 +14,11 @@
 //! round of clarification, only when the decision asks (`CLARIFY_THRESHOLD`,
 //! decisively) -> a plan card in plain words with four numbered choices.
 //! `Esc` at ANY point starts the harness without a plan, keeping whatever
-//! task text was already typed. Every plan card waits for Enter -- no
+//! task text was already typed. Enter on an EMPTY prompt reaches that same
+//! ending (see [`prompt_submit`]) -- restoring the pre-8c8fc9b7 stderr
+//! editor's own "press Enter with nothing typed to start the full
+//! orchestrator harness" -- and the hint line names it while the buffer is
+//! empty (see [`prompt_hint`]). Every plan card waits for Enter -- no
 //! countdown (operator decision, dash-refresh design doc).
 //!
 //! Kept pure where the design doc asks for it: the key-to-action mappings
@@ -37,7 +41,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::{TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
@@ -246,12 +250,15 @@ fn record_clarification(
 
 /// A multi-line text buffer with an interior cursor, tracked as codepoints
 /// (not bytes) with an embedded `'\n'` for a hard line break -- the prompt
-/// and clarify boxes both edit one of these. Deliberately does not soft-wrap
-/// long lines the way the old single-line `EditLine`/`redraw_edit_line` did
-/// (PR3 scope decision, see the PR report): rendering splits on `'\n'` only,
-/// and a line longer than the box is simply clipped by the terminal rather
-/// than reflowed -- multi-line input here is the rare, deliberate case
-/// (Shift+Enter/Alt+Enter/Ctrl+J), not the common one.
+/// and clarify boxes both edit one of these. `TextBuf` itself only ever
+/// knows about hard breaks; a long line's own soft-wrap (operator report:
+/// PR3 shipped without one, so a long request simply overflowed the box
+/// instead of reflowing inside it -- the earlier "deliberately does not
+/// soft-wrap" scope decision is reversed) is computed separately, at render
+/// time, by [`wrap_display`]/[`wrapped_position`] -- both plain functions of
+/// a display string and a width, so the wrap and the cursor's own wrapped
+/// position can never drift apart from each other, and neither needs a
+/// terminal to test.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct TextBuf {
     chars: Vec<char>,
@@ -322,23 +329,99 @@ impl TextBuf {
         self.cursor = self.chars.len();
         moved
     }
+}
 
-    /// `(row, col)` of the cursor, splitting only on `'\n'` (see this type's
-    /// own doc comment on why there is no soft wrap to account for). `col`
-    /// is in terminal cells, not codepoints -- the same CJK/combining-mark
-    /// distinction the old `EditLine::cells_upto` made.
-    fn cursor_row_col(&self) -> (u16, u16) {
-        let upto = &self.chars[..self.cursor];
-        let row = upto.iter().filter(|c| **c == '\n').count();
-        let col: usize = upto
-            .rsplit(|c| *c == '\n')
-            .next()
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
-            .sum();
-        (row as u16, col as u16)
+/// Soft-wraps `text` (which may already hold hard `'\n'` breaks) into rows
+/// that each fit within `width` display cells -- never splitting a
+/// codepoint, and never splitting a hard break across rows either (each
+/// `'\n'`-separated line gets its own run of one or more wrapped rows, even
+/// an empty one). Character-cell wrapping, not ratatui's own word-wrapping
+/// `Wrap`: a library's word-wrap has no public API this could ask "where did
+/// row 2 start", so a self-computed wrap is what keeps this in exact
+/// lockstep with [`wrapped_position`]'s own accounting of where the cursor
+/// then lands -- the two would silently drift apart the moment a real word
+/// wrapped somewhere this did not expect. `width` of 0 is treated as 1 (a
+/// zero-width box would otherwise divide by nothing rather than simply wrap
+/// one codepoint per row).
+pub(crate) fn wrap_display(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut rows = Vec::new();
+    for hard_line in text.split('\n') {
+        let mut row = String::new();
+        let mut cells = 0usize;
+        for c in hard_line.chars() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if cells > 0 && cells + w > width {
+                rows.push(std::mem::take(&mut row));
+                cells = 0;
+            }
+            row.push(c);
+            cells += w;
+        }
+        rows.push(row);
     }
+    rows
+}
+
+/// Where codepoint index `pos` of `text` lands once [`wrap_display`] wraps
+/// it at the same `width`: `(row, col)`, `col` in display cells (same
+/// CJK/combining-mark distinction the old `EditLine::cells_upto` made,
+/// carried over verbatim). `row`/`col` are both absolute, i.e. before any
+/// scrolling -- see [`scroll_offset`] for making a tall result fit a capped
+/// box.
+pub(crate) fn wrapped_position(text: &str, width: u16, pos: usize) -> (u16, u16) {
+    let width = usize::from(width.max(1));
+    let mut row: u16 = 0;
+    let mut cells = 0usize;
+    let mut seen = 0usize;
+    for (line_idx, hard_line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            row += 1;
+            cells = 0;
+        }
+        for c in hard_line.chars() {
+            if seen == pos {
+                return (row, cells as u16);
+            }
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if cells > 0 && cells + w > width {
+                row += 1;
+                cells = 0;
+            }
+            cells += w;
+            seen += 1;
+        }
+        if seen == pos {
+            return (row, cells as u16);
+        }
+        seen += 1; // the '\n' `split` itself consumed
+    }
+    (row, cells as u16)
+}
+
+/// The first visual row to show when `total_rows` wrapped rows need to fit
+/// in `visible_rows` and the cursor sits on absolute row `cursor_row`: `0`
+/// when everything already fits, otherwise however far down keeps
+/// `cursor_row` the LAST visible row rather than letting it scroll off the
+/// bottom unseen (operator report: the box used to stay a fixed 3 rows and
+/// simply clip anything past it, hiding the cursor entirely on a long or
+/// heavily wrapped buffer).
+pub(crate) fn scroll_offset(total_rows: u16, visible_rows: u16, cursor_row: u16) -> u16 {
+    if visible_rows == 0 || total_rows <= visible_rows {
+        return 0;
+    }
+    let max_offset = total_rows - visible_rows;
+    cursor_row.saturating_sub(visible_rows - 1).min(max_offset)
+}
+
+/// How many content rows the box actually shows: every wrapped row when
+/// they all fit within `max_inner_rows` (the inline region's own remaining
+/// height, minus the hint row and the two borders), capped there otherwise
+/// -- this is what makes the box grow with the buffer instead of staying a
+/// fixed 3 rows (operator report), while never growing past what the inline
+/// region actually has room for.
+pub(crate) fn visible_row_count(total_rows: u16, max_inner_rows: u16) -> u16 {
+    total_rows.max(1).min(max_inner_rows.max(1))
 }
 
 /// What one raw key does to a [`TextBuf`] in the prompt/clarify boxes.
@@ -416,6 +499,46 @@ pub(crate) fn apply_text_key(buf: &mut TextBuf, action: TextKeyAction) -> bool {
         TextKeyAction::Home => buf.move_home(),
         TextKeyAction::End => buf.move_end(),
         TextKeyAction::Submit | TextKeyAction::Abandon | TextKeyAction::Ignored => false,
+    }
+}
+
+/// What pressing Submit (Enter) does at the top-level prompt: sends `buf`'s
+/// text when it holds any, or -- regression fix -- ends the prompt with
+/// nothing typed, exactly like `Abandon`, when it is empty. The pre-8c8fc9b7
+/// stderr line editor's own `apply_key` submitted an EMPTY line unconditionally
+/// (`KeyCode::Enter => return EditAction::Submit`, no emptiness check), which
+/// `proxy_intake` there read as no request given after a second blank Enter
+/// (its own re-prompt) and started the harness without the proxy -- the
+/// "press Enter repeatedly to start the full orchestrator harness" the
+/// operator reported losing. This inline view has only the one screen (no
+/// re-prompt to ask twice through), so one empty Enter reaches the same
+/// ending Esc already does: `run_prompt` returns `None`, `run_flow` turns
+/// that into `IntakeOutcome::Unplanned { request: None }`, and `proxy_intake`
+/// in `mod.rs` maps THAT to `ProxyIntakeOutcome::Inactive { advisory: None,
+/// request: None }` -- the same silent, no-request path a disabled proxy or
+/// `--simple` already takes, which is what starts the orchestrator harness.
+/// Esc at an empty prompt was never broken (`Abandon` returns `None`
+/// unconditionally) and already reached this identical outcome -- restoring
+/// Submit's own case makes Enter reach it too, rather than adding a second,
+/// differently-worded path to the same place.
+pub(crate) fn prompt_submit(buf: &TextBuf) -> Option<String> {
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf.text())
+    }
+}
+
+/// The prompt box's own hint line: while `buf` is empty, Enter and Esc both
+/// end the prompt the same way (see [`prompt_submit`]), so the hint says
+/// that instead of promising a plan that an empty submit never produces;
+/// once anything is typed it reverts to the ordinary "plan and start"
+/// wording.
+fn prompt_hint(buf: &TextBuf) -> &'static str {
+    if buf.is_empty() {
+        "  \u{23ce}/esc start the full orchestrator \u{b7} shift+\u{23ce} new line"
+    } else {
+        "  \u{23ce} plan and start \u{b7} shift+\u{23ce} new line \u{b7} esc start without a plan"
     }
 }
 
@@ -868,11 +991,7 @@ fn run_prompt(terminal: &mut Term, buf: &mut TextBuf) -> io::Result<Option<Strin
             && key.kind == KeyEventKind::Press
         {
             match text_key_action(key.code, key.modifiers) {
-                TextKeyAction::Submit => {
-                    if !buf.is_empty() {
-                        return Ok(Some(buf.text()));
-                    }
-                }
+                TextKeyAction::Submit => return Ok(prompt_submit(buf)),
                 TextKeyAction::Abandon => return Ok(None),
                 action => {
                     apply_text_key(buf, action);
@@ -882,15 +1001,40 @@ fn run_prompt(terminal: &mut Term, buf: &mut TextBuf) -> io::Result<Option<Strin
     }
 }
 
+/// Renders the boxed prompt: `"> {text}"` soft-wrapped to the box's own
+/// inner width (bug: it used to overflow past the border instead), and a
+/// box that grows with the number of visual rows that text needs -- capped
+/// at whatever `area` (the inline region, minus the hint row this itself
+/// reserves) has room for, scrolling so the cursor's own row always stays
+/// visible rather than clipping it off (bug: it used to stay a fixed 3 rows
+/// and simply clip anything past it). See [`wrap_display`]/
+/// [`wrapped_position`]/[`scroll_offset`]/[`visible_row_count`] for the pure
+/// arithmetic this only ever renders the result of.
 fn draw_prompt(area: Rect, buf: &mut Buffer, line: &TextBuf) {
-    let box_area = Rect::new(area.x, area.y, area.width, 3.min(area.height));
+    let content = format!("> {}", line.text());
+    // The `"> "` marker is 2 codepoints, both ASCII (1 cell each), so the
+    // cursor's own position in `content` is always the buffer's cursor plus
+    // that fixed offset.
+    let cursor_pos = 2 + line.cursor;
+    let inner_width = area.width.saturating_sub(2);
+    let rows = wrap_display(&content, inner_width);
+    let total_rows = rows.len() as u16;
+    let (cursor_row, cursor_col) = wrapped_position(&content, inner_width, cursor_pos);
+
+    // Reserve the hint row below the box, then the box's own two borders.
+    let max_inner_rows = area.height.saturating_sub(1).saturating_sub(2);
+    let inner_rows = visible_row_count(total_rows, max_inner_rows);
+    let offset = scroll_offset(total_rows, inner_rows, cursor_row);
+    let visible = &rows[offset as usize..(offset + inner_rows) as usize];
+
+    let box_height = (inner_rows + 2).min(area.height);
+    let box_area = Rect::new(area.x, area.y, area.width, box_height);
     let block = text_box("", BOX_STYLE);
-    let content = Paragraph::new(format!("> {}", line.text()));
+    let content = Paragraph::new(visible.join("\n"));
     let inner = render_boxed(block, content, box_area, buf);
     if inner.height > 0 {
-        let (row, col) = line.cursor_row_col();
-        let x = inner.x + 2 + col;
-        let y = inner.y + row;
+        let x = inner.x + cursor_col;
+        let y = inner.y + (cursor_row - offset);
         if x < area.x + area.width && y < area.y + area.height {
             buf[(x, y)].set_style(Style::default().add_modifier(Modifier::REVERSED));
         }
@@ -898,11 +1042,7 @@ fn draw_prompt(area: Rect, buf: &mut Buffer, line: &TextBuf) {
     let hint_y = box_area.y + box_area.height;
     if hint_y < area.y + area.height {
         render(
-            Paragraph::new(Line::from(Span::styled(
-                "  \u{23ce} plan and start \u{b7} shift+\u{23ce} new line \u{b7} esc start \
-                 without a plan",
-                HINT_STYLE,
-            ))),
+            Paragraph::new(Line::from(Span::styled(prompt_hint(line), HINT_STYLE))),
             Rect::new(area.x, hint_y, area.width, 1),
             buf,
         );
@@ -1026,16 +1166,31 @@ fn run_clarify(terminal: &mut Term, decision: &ProxyDecision) -> io::Result<Clar
     }
 }
 
+/// Renders the clarify box: the question and the boxed `"> {text}"` answer
+/// both soft-wrapped as one unit, same growth/scroll rules as
+/// [`draw_prompt`] (see its own doc comment) -- the question wraps too, not
+/// just the answer, since both share the same box.
 fn draw_clarify(area: Rect, buf: &mut Buffer, question: &str, line: &TextBuf) {
-    let box_area = Rect::new(area.x, area.y, area.width, 4.min(area.height));
+    let content = format!("{question}\n> {}", line.text());
+    let cursor_pos = question.chars().count() + 1 + 2 + line.cursor;
+    let inner_width = area.width.saturating_sub(2);
+    let rows = wrap_display(&content, inner_width);
+    let total_rows = rows.len() as u16;
+    let (cursor_row, cursor_col) = wrapped_position(&content, inner_width, cursor_pos);
+
+    let max_inner_rows = area.height.saturating_sub(1).saturating_sub(2);
+    let inner_rows = visible_row_count(total_rows, max_inner_rows);
+    let offset = scroll_offset(total_rows, inner_rows, cursor_row);
+    let visible = &rows[offset as usize..(offset + inner_rows) as usize];
+
+    let box_height = (inner_rows + 2).min(area.height);
+    let box_area = Rect::new(area.x, area.y, area.width, box_height);
     let block = text_box("One question", WARN_STYLE);
-    let text = format!("{question}\n> {}", line.text());
-    let content = Paragraph::new(text).wrap(Wrap { trim: false });
+    let content = Paragraph::new(visible.join("\n"));
     let inner = render_boxed(block, content, box_area, buf);
     if inner.height > 0 {
-        let (row, col) = line.cursor_row_col();
-        let x = inner.x + 2 + col;
-        let y = inner.y + 1 + row;
+        let x = inner.x + cursor_col;
+        let y = inner.y + (cursor_row - offset);
         if x < area.x + area.width && y < area.y + area.height {
             buf[(x, y)].set_style(Style::default().add_modifier(Modifier::REVERSED));
         }
@@ -1760,31 +1915,117 @@ mod tests {
     /// The other half of the same review finding as the old `EditLine`'s
     /// `cursor_position_counts_display_cells_not_codepoints`: a CJK glyph is
     /// two cells wide, so counting codepoints instead of cells would put the
-    /// cursor a whole column out on any non-ASCII line. `cursor_row_col`
-    /// splits on `'\n'` only (this type never soft-wraps -- see its own doc
-    /// comment), so this also covers the row half: a multi-byte `char` (CJK
-    /// or otherwise) is still exactly one element of `chars`, never split.
+    /// cursor a whole column out on any non-ASCII line. A width wide enough
+    /// that nothing actually wraps isolates this from `wrapped_position`'s
+    /// OWN wrapping behaviour (covered separately below): a multi-byte
+    /// `char` (CJK or otherwise) is still exactly one codepoint, never
+    /// split.
     #[test]
-    fn text_buf_cursor_row_col_counts_display_cells_for_wide_chars() {
-        let mut buf = TextBuf::from_text("日本\na");
-        // After "日本\n" (3 chars: 日, 本, '\n'), cursor sits at the start
-        // of row 1, column 0.
-        buf.cursor = 3;
-        assert_eq!(buf.cursor_row_col(), (1, 0));
-        // Cursor after just "日" (one CJK glyph, two cells) on row 0.
-        buf.cursor = 1;
+    fn wrapped_position_counts_display_cells_for_wide_chars_when_nothing_wraps() {
+        let text = "\u{65e5}\u{672c}\na"; // "日本\na"
+        // After "日本\n" (3 codepoints), the cursor sits at the start of
+        // row 1, column 0.
+        assert_eq!(wrapped_position(text, 80, 3), (1, 0));
+        // After just "日" (one CJK glyph, two cells) on row 0.
         assert_eq!(
-            buf.cursor_row_col(),
+            wrapped_position(text, 80, 1),
             (0, 2),
             "one CJK glyph occupies two columns"
         );
-        // Cursor after "日本" (four cells) still on row 0.
-        buf.cursor = 2;
-        assert_eq!(buf.cursor_row_col(), (0, 4));
-        // Cursor at the very end, row 1 (after the newline), one ASCII
-        // column in.
-        buf.cursor = 4;
-        assert_eq!(buf.cursor_row_col(), (1, 1));
+        // After "日本" (four cells) still on row 0.
+        assert_eq!(wrapped_position(text, 80, 2), (0, 4));
+        // At the very end, row 1 (after the newline), one ASCII column in.
+        assert_eq!(wrapped_position(text, 80, 4), (1, 1));
+    }
+
+    // -- bug 1: soft-wrap inside the box --
+
+    #[test]
+    fn wrap_display_wraps_a_long_line_at_the_given_width() {
+        let rows = wrap_display("abcdefghij", 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_display_keeps_a_hard_newline_as_its_own_row_even_when_short() {
+        let rows = wrap_display("ab\ncd", 4);
+        assert_eq!(rows, vec!["ab", "cd"], "no false-merge across '\\n'");
+    }
+
+    #[test]
+    fn wrapped_position_lands_on_the_correct_wrapped_row_and_column() {
+        // "abcdefghij" wrapped at 4 is "abcd"/"efgh"/"ij" (see the wrap_display
+        // test above); codepoint index 6 ('g') sits on the second row
+        // ("efgh"), column 2.
+        assert_eq!(wrapped_position("abcdefghij", 4, 6), (1, 2));
+        // Index 9 ('j') sits on the third row ("ij"), column 1.
+        assert_eq!(wrapped_position("abcdefghij", 4, 9), (2, 1));
+        // The position right after the last char (index 10) sits at the end
+        // of that same third row.
+        assert_eq!(wrapped_position("abcdefghij", 4, 10), (2, 2));
+    }
+
+    // -- bug 2: the box grows with the content, capped and scrolled --
+
+    #[test]
+    fn visible_row_count_grows_with_more_rows_and_caps_at_the_max() {
+        assert_eq!(visible_row_count(1, 10), 1, "one line needs only one row");
+        assert_eq!(visible_row_count(5, 10), 5, "grows with the content");
+        assert_eq!(
+            visible_row_count(20, 10),
+            10,
+            "capped at the region's own remaining height"
+        );
+    }
+
+    #[test]
+    fn scroll_offset_is_zero_when_everything_already_fits() {
+        assert_eq!(scroll_offset(3, 10, 2), 0);
+    }
+
+    #[test]
+    fn scroll_offset_keeps_the_cursor_row_visible_when_content_exceeds_the_cap() {
+        // 20 total rows, only 5 visible, cursor on row 12: scrolling so the
+        // cursor is the LAST visible row means an offset of 12 - (5 - 1) = 8,
+        // i.e. rows 8..13 are shown and the cursor never clips off the
+        // bottom.
+        assert_eq!(scroll_offset(20, 5, 12), 8);
+        // The cursor on the very first row still shows row 0 first, not an
+        // offset that would scroll it out of view the other way.
+        assert_eq!(scroll_offset(20, 5, 0), 0);
+        // The cursor on the very last row is clamped to the max offset
+        // rather than pushed past the content that exists.
+        assert_eq!(scroll_offset(20, 5, 19), 15);
+    }
+
+    // -- bug 3: Enter at an empty prompt --
+
+    #[test]
+    fn prompt_submit_ends_the_prompt_with_nothing_on_an_empty_buffer() {
+        assert_eq!(
+            prompt_submit(&TextBuf::default()),
+            None,
+            "regression: an empty Enter used to be silently ignored instead \
+             of reaching the same 'start the full orchestrator harness' \
+             ending Esc already does"
+        );
+    }
+
+    #[test]
+    fn prompt_submit_sends_the_text_on_a_non_empty_buffer() {
+        let buf = TextBuf::from_text("fix the flaky retry test");
+        assert_eq!(
+            prompt_submit(&buf),
+            Some("fix the flaky retry test".to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_hint_names_the_full_orchestrator_only_while_the_buffer_is_empty() {
+        assert!(prompt_hint(&TextBuf::default()).contains("full orchestrator"));
+        let typed = TextBuf::from_text("x");
+        assert!(prompt_hint(&typed).contains("plan and start"));
+        assert!(!prompt_hint(&typed).contains("full orchestrator"));
     }
 
     // -- panic-hook reset bytes --
@@ -1829,6 +2070,47 @@ mod tests {
         });
         assert!(lines[1].contains("fix the flaky retry test"), "{lines:?}");
         assert!(lines[3].contains("esc start without a plan"), "{lines:?}");
+    }
+
+    /// Bug 1 (operator report): a long line used to overflow past the
+    /// border instead of wrapping. Bug 2: the box used to stay a fixed 3
+    /// rows regardless. A narrow box forces "fix the flaky retry test" to
+    /// wrap onto a second row, and the box grows to 4 rows (2 content + 2
+    /// borders) to fit it, pushing the hint down to row 4 instead of row 3.
+    #[test]
+    fn prompt_screen_wraps_a_long_line_and_grows_the_box() {
+        let lines = render_to_lines(20, 8, |area, buf| {
+            let line = TextBuf::from_text("fix the flaky retry test");
+            draw_prompt(area, buf, &line);
+        });
+        assert!(lines[1].contains("fix the flaky"), "{lines:?}");
+        assert!(
+            !lines[1].contains("test"),
+            "the tail must have wrapped onto the next row: {lines:?}"
+        );
+        assert!(lines[2].contains("test"), "{lines:?}");
+        assert!(lines[4].contains("plan and start"), "{lines:?}");
+    }
+
+    /// Bug 2's other half: when the wrapped/hard-broken content is taller
+    /// than the region has room for, the box caps at that height and
+    /// SCROLLS so the cursor's own line -- here the end of "l5", the last
+    /// hard line typed -- always stays visible, instead of the old fixed
+    /// box silently clipping it off.
+    #[test]
+    fn prompt_screen_scrolls_so_the_cursor_line_never_clips_off() {
+        let lines = render_to_lines(20, 6, |area, buf| {
+            let line = TextBuf::from_text("l1\nl2\nl3\nl4\nl5");
+            draw_prompt(area, buf, &line);
+        });
+        let text = lines.join("\n");
+        assert!(!text.contains("l1"), "earliest lines scroll out: {lines:?}");
+        assert!(!text.contains("l2"), "{lines:?}");
+        assert!(text.contains("l3"), "{lines:?}");
+        assert!(text.contains("l5"), "the cursor's own line: {lines:?}");
+        // Capped at the region's own height (3 content rows + 2 borders),
+        // not grown to fit all 5 hard lines.
+        assert!(lines[5].contains("plan and start"), "{lines:?}");
     }
 
     #[test]
@@ -1908,5 +2190,33 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("Which part should change"), "{text}");
         assert!(text.contains("tab skip and plan anyway"), "{text}");
+    }
+
+    /// The clarify box shares `draw_prompt`'s own wrap/grow logic (bugs 1
+    /// and 2): a long answer wraps onto a second row inside the box, and
+    /// the box grows past the old fixed 4 rows to fit it -- width 44 is
+    /// chosen wide enough that the hint line itself (`  \u{23ce} answer \u{b7}
+    /// tab skip and plan anyway`, 38 cells) is never the thing truncated,
+    /// so a narrow-width false failure there can't be confused with the
+    /// wrap this test actually checks.
+    #[test]
+    fn clarify_screen_wraps_long_content_and_grows_past_the_old_fixed_height() {
+        let decision = sample_single(None);
+        let question = clarify_question(&decision); // 36 cells: fits one row at width 44
+        let line = TextBuf::from_text(&"x".repeat(50)); // "> " + 50 = 52 cells: wraps
+        let lines = render_to_lines(44, 10, |area, buf| draw_clarify(area, buf, question, &line));
+        assert!(lines[1].contains("missing"), "{lines:?}");
+        assert!(lines[2].contains('x'), "{lines:?}");
+        assert!(
+            lines[3].contains('x'),
+            "the answer must wrap onto a second row: {lines:?}"
+        );
+        // Old fixed height was 4 rows total; this content needs 3 (question
+        // + 2 wrapped answer rows) + 2 borders = 5, pushing the hint from
+        // row 3 down to row 5.
+        assert!(
+            lines[5].contains("tab skip and plan anyway"),
+            "box must have grown past the old fixed 4 rows: {lines:?}"
+        );
     }
 }
