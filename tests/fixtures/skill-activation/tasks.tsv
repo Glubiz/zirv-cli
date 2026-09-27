@@ -18,6 +18,7 @@ infrastructure-review	-	Look over this terraform plan before I apply it; it touc
 kibana-log-investigation	-	Search the Kibana logs for the 502s the gateway returned between 02:00 and 03:00 and tell me which upstream caused them.
 linear-issue-management	-	File a bug in Linear for the broken CSV export, and check first that nobody has reported it already.
 migration-planning	-	We need to move user sessions from Redis to Postgres without downtime. Plan the migration, including backfill and cutover.
+motion-graphics	-	We need a 15-second launch video and a matching GIF for the product page; make the motion graphics for it.
 postmortem	-	Last night's outage is resolved. Write the postmortem.
 project-cycle-planning	-	Help me with sprint planning for the next two weeks; we have four engineers and one is on call.
 runbook-authoring	-	Write a runbook for failing over the primary database that someone on call can follow at 3am.

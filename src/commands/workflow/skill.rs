@@ -1690,6 +1690,10 @@ const CATALOGUE: &[(&str, &str)] = &[
         include_str!("skills/migration-planning/SKILL.md"),
     ),
     (
+        "src/commands/workflow/skills/motion-graphics/SKILL.md",
+        include_str!("skills/motion-graphics/SKILL.md"),
+    ),
+    (
         "src/commands/workflow/skills/postmortem/SKILL.md",
         include_str!("skills/postmortem/SKILL.md"),
     ),
@@ -2497,7 +2501,7 @@ mod tests {
     /// original 24 never did, so this is no longer "no built-in should
     /// require an integration yet" -- see the discipline test below for the
     /// real invariant (external writes always name an integration).
-    const CATALOGUE_LEN: usize = 27;
+    const CATALOGUE_LEN: usize = 28;
     const BUILTIN_LEN: usize = 24 + CATALOGUE_LEN;
 
     #[test]
