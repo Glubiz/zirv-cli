@@ -2087,7 +2087,12 @@ pub struct JevConfig {
     /// usable, in seconds. `0` disables the cache entirely: every call
     /// reaches the network, and none is ever written. Shared by every
     /// `[jev]`-gated site and the harness proxy's own `typesafe` decider,
-    /// since both go through the same `jev::ask`.
+    /// since both go through the same `jev::ask`. Defaults to a week: Jev
+    /// samples a fresh confidence on every uncached call, so for an input
+    /// whose confidence straddles a site's floor the cache is the only thing
+    /// that keeps the acted decision identical (2026-09-27 determinism
+    /// campaigns); the model is part of the key, so a longer TTL never
+    /// serves an answer from a different model.
     pub cache_ttl_secs: u64,
     pub floors: JevFloorsConfig,
 }
@@ -2115,7 +2120,7 @@ impl Default for JevConfig {
             stop_verify: false,
             missing_tests: false,
             launch_effort: false,
-            cache_ttl_secs: 86_400,
+            cache_ttl_secs: 604_800,
             floors: JevFloorsConfig::default(),
         }
     }
@@ -9317,7 +9322,7 @@ mod tests {
         assert!(!cfg.inject);
         assert!(!cfg.stop_verify);
         assert!(!cfg.launch_effort);
-        assert_eq!(cfg.cache_ttl_secs, 86_400);
+        assert_eq!(cfg.cache_ttl_secs, 604_800);
     }
 
     /// The operator's own home layer may still set `[jev]` keys directly in
