@@ -28,8 +28,10 @@ with the environment variable `HYPERFRAMES_SKIP_SKILLS=1` set; without it
 
 1. Preflight once: `hyperframes doctor --json`. It always exits 0, and its
    top-level `ok` is also false when optional checks (Docker, MusicGen,
-   whisper) fail -- gate only on the Node 22+, FFmpeg, FFprobe, and Chrome
-   checks. Any of those missing: stop and report exactly what is missing. Never install anything on the
+   whisper) fail -- gate only on the Node 22+, FFmpeg, and FFprobe checks.
+   Any of those missing: stop and report exactly what is missing. A missing
+   Chrome is not a blocker: `hyperframes browser ensure` downloads the
+   renderer's own headless copy into its cache. Never install anything on the
    renderer's behalf.
 2. Scaffold at `<repo>/motion/<slug>/` with `hyperframes
    init <slug> --non-interactive`, run from `<repo>/motion/`, so it can never
