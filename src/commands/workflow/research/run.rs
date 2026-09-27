@@ -2001,7 +2001,7 @@ crash_first = 5
         let header = data_lines.next().unwrap();
         assert_eq!(
             header,
-            "candidate\tstage\tverdict\trel_cost\trel_wall\td_correctness\thypothesis"
+            "candidate\tstage\tverdict\trel_cost\trel_wall\td_correctness\td_quality\thypothesis"
         );
         let mut saw_a_row = false;
         for line in data_lines {
@@ -2010,7 +2010,7 @@ crash_first = 5
             }
             saw_a_row = true;
             let fields: Vec<&str> = line.split('\t').collect();
-            assert_eq!(fields.len(), 7, "row must have all 7 columns: {line}");
+            assert_eq!(fields.len(), 8, "row must have all 8 columns: {line}");
             for (name, value) in ["rel_cost", "rel_wall", "d_correctness"]
                 .iter()
                 .zip(&fields[3..6])

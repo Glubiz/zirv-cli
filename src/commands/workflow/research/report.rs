@@ -36,6 +36,10 @@ pub struct CandidateReportRow {
     /// Empty when unusable (e.g. no pairs at all); one entry per cohort
     /// otherwise -- cohorts are never pooled into one number.
     pub d_correctness: Vec<f64>,
+    /// Same shape as `d_correctness`; always present (not only under
+    /// `[criteria] objective = "quality"`) since a campaign's own objective
+    /// can differ from what a reader is judging it by.
+    pub d_quality: Vec<f64>,
     pub rel_cost: Vec<f64>,
     pub rel_wall: Vec<f64>,
     pub reasons: Vec<String>,
@@ -213,6 +217,7 @@ fn parse_screen_detail(
         verdict: verdict.to_string(),
         hypothesis: candidate.hypothesis.clone(),
         d_correctness: metric("d_correctness"),
+        d_quality: metric("d_quality"),
         rel_cost: metric("rel_cost"),
         rel_wall: metric("rel_wall"),
         reasons: reason.into_iter().collect(),
@@ -241,6 +246,12 @@ fn parse_decision_detail(
         .filter_map(|c| c.d_correctness.as_ref())
         .map(|iv| iv.point)
         .collect();
+    let d_quality = decision
+        .cohorts
+        .iter()
+        .filter_map(|c| c.d_quality.as_ref())
+        .map(|iv| iv.point)
+        .collect();
     let rel_cost = decision
         .cohorts
         .iter()
@@ -260,6 +271,7 @@ fn parse_decision_detail(
         verdict: verdict.to_string(),
         hypothesis: candidate.hypothesis.clone(),
         d_correctness,
+        d_quality,
         rel_cost,
         rel_wall,
         reasons: decision.reasons.clone(),
@@ -334,18 +346,19 @@ fn write_results_tsv(path: &Path, rows: &[CandidateReportRow]) -> CtxResult<()> 
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "candidate\tstage\tverdict\trel_cost\trel_wall\td_correctness\thypothesis"
+        "candidate\tstage\tverdict\trel_cost\trel_wall\td_correctness\td_quality\thypothesis"
     )?;
     for row in rows {
         writeln!(
             file,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.candidate,
             row.stage,
             row.verdict,
             format_metric(&row.rel_cost),
             format_metric(&row.rel_wall),
             format_metric(&row.d_correctness),
+            format_metric(&row.d_quality),
             row.hypothesis
         )?;
     }
@@ -627,19 +640,20 @@ fn write_candidates(
     writeln!(file, "## Candidates")?;
     writeln!(
         file,
-        "| candidate | stage | verdict | rel_cost | rel_wall | d_correctness |"
+        "| candidate | stage | verdict | rel_cost | rel_wall | d_correctness | d_quality |"
     )?;
-    writeln!(file, "|---|---|---|---|---|---|")?;
+    writeln!(file, "|---|---|---|---|---|---|---|")?;
     for row in &summary.rows {
         writeln!(
             file,
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             row.candidate,
             row.stage,
             row.verdict,
             format_metric(&row.rel_cost),
             format_metric(&row.rel_wall),
-            format_metric(&row.d_correctness)
+            format_metric(&row.d_correctness),
+            format_metric(&row.d_quality)
         )?;
     }
     writeln!(file)?;
@@ -1180,5 +1194,182 @@ allow_env = ["ZIRV_CTX_JEV_MEMORY"]
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
         // The "Unix billennium" -- a well-known round-number timestamp.
         assert_eq!(format_utc(1_000_000_000), "2001-09-09 01:46:40 UTC");
+    }
+
+    /// Same shape as `write_minimal_lock`, but with `[criteria] objective =
+    /// "quality"` set -- `d_quality`, not `d_correctness`, is the axis that
+    /// decides promotion for this campaign, so the report must still carry
+    /// it even though the column is unconditional for every objective.
+    fn write_quality_objective_lock(campaign_dir: &Path, candidate_id: &str) {
+        let manifest_text = format!(
+            r#"
+schema = 1
+id = "demo"
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "subscription"
+
+[baseline]
+commit = "HEAD"
+
+[corpus]
+file = "corpus.toml"
+
+[backend]
+kind = "fixture"
+file = "fixture.toml"
+per_trial_ceiling_usd = 1.0
+calls_per_trial = 1
+timeout_secs = 30
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 10.0
+max_wall_secs = 600
+max_calls = 10
+max_trials = 10
+max_retries = 0
+concurrency = 1
+
+[criteria]
+objective = "quality"
+
+[stages.screen]
+split = "dev"
+reps = 1
+
+[stages.validate]
+split = "validation"
+reps = 1
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_JEV_MEMORY"]
+
+[[candidates]]
+id = "{candidate_id}"
+hypothesis = "h"
+env = {{ ZIRV_CTX_JEV_MEMORY = "true" }}
+"#
+        );
+        let manifest = Manifest::parse(&manifest_text).unwrap();
+        let lock = Lock {
+            manifest,
+            manifest_path: campaign_dir.join("manifest.toml"),
+            repo: campaign_dir.join("repo"),
+            manifest_sha256: "abc".to_string(),
+            baseline_sha: "deadbeef".to_string(),
+            corpus_version: "1".to_string(),
+            corpus_families: vec!["ledgerlite".to_string()],
+            evaluator_version: Some("v1".to_string()),
+            evaluator_files: BTreeMap::new(),
+            evaluator_fingerprint: "fp".to_string(),
+            zirv_version: "test".to_string(),
+            price_as_of: None,
+            started_at: 1,
+        };
+        lock.write(campaign_dir).unwrap();
+    }
+
+    /// A `validate` `StageDecision` detail is a `promote::Decision` --
+    /// `parse_decision_detail` must pull `d_quality` out of its cohorts the
+    /// same way it already pulls `d_correctness`, and `results.tsv` must
+    /// carry that value through, not just leave the column blank because
+    /// the campaign's own objective happens to be quality rather than
+    /// efficiency.
+    #[test]
+    fn results_tsv_carries_d_quality_for_a_quality_objective_campaign() {
+        use crate::commands::workflow::research::promote::{ArmSummary, Decision, Verdict};
+        use crate::commands::workflow::research::stats::Interval;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_quality_objective_lock(dir.path(), "cand-a");
+        let (ledger_handle, _) = Ledger::open(dir.path()).unwrap();
+
+        let arm = ArmSummary {
+            n: 8,
+            success_rate: 1.0,
+            timeout_rate: 0.0,
+            error_rate: 0.0,
+            correctness_mean: Some(0.9),
+            quality_mean: Some(0.7),
+            cost_per_success_usd: Some(1.0),
+            cost_complete: true,
+            wall_median_ms: Some(1000),
+            wall_p90_ms: None,
+        };
+        let decision = Decision {
+            verdict: Verdict::Accept,
+            reasons: vec!["material d_quality win".to_string()],
+            cohorts: vec![CohortDecision {
+                cohort: "cohort-a".to_string(),
+                verdict: Verdict::Accept,
+                reasons: vec![],
+                n_pairs: 8,
+                excluded: 0,
+                baseline: arm.clone(),
+                candidate: arm,
+                d_correctness: None,
+                d_quality: Some(Interval {
+                    point: 0.1234,
+                    lo: 0.05,
+                    hi: 0.2,
+                }),
+                rel_cost: None,
+                rel_wall: None,
+            }],
+            confidence: 0.95,
+        };
+
+        ledger_handle
+            .append(&LedgerEvent::StageDecision {
+                seq: 0,
+                ts: 1,
+                candidate: "cand-a".to_string(),
+                stage: "validate".to_string(),
+                verdict: "accept".to_string(),
+                detail: serde_json::to_value(&decision).unwrap(),
+            })
+            .unwrap();
+        ledger_handle
+            .append(&LedgerEvent::CampaignFinished {
+                seq: 1,
+                ts: 2,
+                promoted: Some("cand-a".to_string()),
+            })
+            .unwrap();
+
+        let summary = generate(dir.path()).unwrap();
+        assert_eq!(summary.objective, "quality");
+        let row = summary
+            .rows
+            .iter()
+            .find(|r| r.candidate == "cand-a" && r.stage == "validate")
+            .expect("a validate row for cand-a");
+        assert_eq!(row.d_quality, vec![0.1234]);
+
+        let results_tsv = std::fs::read_to_string(dir.path().join("results.tsv")).unwrap();
+        let validate_line = results_tsv
+            .lines()
+            .find(|l| l.starts_with("cand-a\tvalidate\t"))
+            .expect("results.tsv must have a validate row for cand-a");
+        let fields: Vec<&str> = validate_line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            8,
+            "row must have all 8 columns: {validate_line}"
+        );
+        assert_eq!(
+            fields[6], "0.1234",
+            "the d_quality column must carry the cohort's d_quality point estimate: {validate_line}"
+        );
     }
 }
