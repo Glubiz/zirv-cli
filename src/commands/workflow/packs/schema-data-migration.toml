@@ -63,12 +63,23 @@ depends_on = ["implement"]
 condition = "always"
 
 [[steps]]
+id = "simplify"
+title = "Simplify"
+phase = "implement"
+skills = ["simplify"]
+agent_role = "implementer"
+depends_on = ["test"]
+condition = "always"
+effect = "repository"
+reason = "every review round is paired with a simplify pass, so reuse of existing code is applied before the diff is reviewed"
+
+[[steps]]
 id = "review"
 title = "Independent review"
 phase = "review"
 skills = ["review"]
 agent_role = "reviewer"
-depends_on = ["test"]
+depends_on = ["simplify"]
 condition = "always"
 reason = "a schema/data migration always gets an independent review, never proportionally skipped"
 

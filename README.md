@@ -2062,6 +2062,16 @@ longer hashes the same.
 | `performance-investigation` | software | repository | `change` |
 | `documentation-runbook-change` | software | repository | `change` |
 
+Every pack that pairs a `test` step with a `review` step (`feature`, `bugfix`,
+`refactor`, `dependency-upgrade`, `devops-ci-cd-change`,
+`performance-investigation`, `schema-data-migration`, `security-remediation`)
+also carries a `simplify` step between them, depending on `test` and gated by
+the same `condition` as `review` (`review` depends on `simplify` in turn): a
+review round is always preceded by a reuse pass on the review model, so
+zirv-wrapped agents reuse existing code instead of re-implementing it.
+`documentation-runbook-change` and `spike` have no `test`/reviewed-code step
+pair and so carry no `simplify` step.
+
 Every pack's `effects` is `none` or `repository`, except
 `devops-infrastructure-change` and `sre-deploy-or-rollback` (issue #542
 chunk 5), which declare `external` as their ceiling for the day #539 ships

@@ -448,6 +448,14 @@ pub fn default_prompt_for(role: PromptRole) -> &'static str {
 /// packs included), so the default is the id-less form; a registry id from
 /// `zirv workflow list` is named only to force a specific one.
 ///
+/// v20: the review bullet pairs every review round with a `simplify` pass --
+/// one worker on the review model runs the `simplify` skill over the same
+/// diff (a fix round's own re-review scopes it to what the fixes touched)
+/// before the round proper, so reuse of existing code is applied before the
+/// diff is judged. The workflow-gate deferral sentence now names the gate's
+/// own `simplify` step alongside `zirv workflow review run` as what the gate
+/// replaces.
+///
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_
 /// HEADER` and the workflow/memory headers, so `compile.rs`'s `CompiledContext::
@@ -520,7 +528,7 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool
 }
 
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v19)
+zirv meta-harness (v20)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
@@ -554,11 +562,13 @@ work with no design dimension proceeds without asking.
 independent review of the diff on the review model named in the roster. Substantial or risky: \
 that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
 self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. If a `zirv workflow` review gate \
-is active for the change, `zirv workflow review run` IS the round and nothing else runs. Fix \
-what is real, re-review only what the fixes touched, stop as soon as a round yields no new \
-confirmed findings, and hard-stop after 2 fix rounds, reporting what remains as residual \
-findings.
+roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
+what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
+touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
+rounds, reporting what remains as residual findings.
 - The harness roster below (when present) lists the harnesses this session can initiate; `zirv \
 ctx status` shows the same plus live sessions and unread mail. Availability is the operator's \
 choice in `.zirv/.settings.toml`.
@@ -606,11 +616,13 @@ work with no design dimension proceeds without asking.
 independent review of the diff on the review model named in the roster. Substantial or risky: \
 that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
 self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. If a `zirv workflow` review gate \
-is active for the change, `zirv workflow review run` IS the round and nothing else runs. Fix \
-what is real, re-review only what the fixes touched, stop as soon as a round yields no new \
-confirmed findings, and hard-stop after 2 fix rounds, reporting what remains as residual \
-findings.
+roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
+what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
+touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
+rounds, reporting what remains as residual findings.
 - The harness roster below (when present) lists the harnesses this session can initiate; `zirv \
 ctx status` shows the same plus live sessions and unread mail. Availability is the operator's \
 choice in `.zirv/.settings.toml`.";
@@ -656,11 +668,13 @@ work with no design dimension proceeds without asking.
 independent review of the diff on the review model named in the roster. Substantial or risky: \
 that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
 self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. If a `zirv workflow` review gate \
-is active for the change, `zirv workflow review run` IS the round and nothing else runs. Fix \
-what is real, re-review only what the fixes touched, stop as soon as a round yields no new \
-confirmed findings, and hard-stop after 2 fix rounds, reporting what remains as residual \
-findings.";
+roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
+what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+a `zirv workflow` review gate is active for the change, its `simplify` step and `zirv workflow \
+review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
+touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
+rounds, reporting what remains as residual findings.";
 
 /// Issue #427: selects the tiered [`HARNESS_PROMPT`] variant for `verbosity`
 /// -- the single call site `compose` (and `compile.rs`'s own byte-accounting
@@ -6228,7 +6242,7 @@ mod tests {
             composed.text
         );
         assert!(
-            !composed.text.contains("zirv meta-harness (v19)"),
+            !composed.text.contains("zirv meta-harness (v20)"),
             "must not carry the verbose header too:\n{}",
             composed.text
         );
@@ -6283,7 +6297,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v20)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -6343,7 +6357,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v20)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -6381,7 +6395,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v19)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v20)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -6418,13 +6432,35 @@ mod tests {
         }
     }
 
+    /// The `simplify` skill must be named in every tier's own review bullet,
+    /// not only the verbose default -- a session running at `Standard` or
+    /// `Minimal` verbosity still needs to know a review round is paired with
+    /// a reuse pass, and which workflow-gate step covers it.
+    #[test]
+    fn every_harness_prompt_tier_names_the_simplify_skill_in_its_review_bullet() {
+        for (name, tier) in [
+            ("HARNESS_PROMPT", HARNESS_PROMPT),
+            ("HARNESS_PROMPT_STANDARD", HARNESS_PROMPT_STANDARD),
+            ("HARNESS_PROMPT_MINIMAL", HARNESS_PROMPT_MINIMAL),
+        ] {
+            assert!(
+                tier.contains("`simplify` skill"),
+                "{name} must name the simplify skill in its review bullet:\n{tier}"
+            );
+            assert!(
+                tier.contains("`simplify` step"),
+                "{name} must name the simplify step in its workflow-gate sentence:\n{tier}"
+            );
+        }
+    }
+
     /// Issue #155, Phase 4(a): three sources independently demanded a review
     /// round -- this layer, the claude adapter's orchestrator layer, and the
     /// workflow engine's risk-based reviewer count -- and the claude layer
     /// explicitly stacked itself ON TOP of this one. A Medium-risk change was
     /// therefore reviewed three times over the same full diff. Where a
-    /// `zirv workflow` gate is active, `zirv workflow review run` IS the
-    /// round and nothing else runs.
+    /// `zirv workflow` gate is active, its `simplify` step and `zirv workflow
+    /// review run` ARE the round and nothing else runs.
     #[test]
     fn the_harness_layer_defers_to_an_active_workflow_review_gate() {
         assert!(
@@ -6432,11 +6468,11 @@ mod tests {
             "must name the gate"
         );
         assert!(
-            HARNESS_PROMPT.contains("IS the round and nothing else runs"),
+            HARNESS_PROMPT.contains("ARE the round and nothing else runs"),
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v19)"),
+            HARNESS_PROMPT.contains("(v20)"),
             "a changed instruction layer must bump its own version token"
         );
     }
@@ -6552,7 +6588,10 @@ mod tests {
 
     #[test]
     fn harness_prompt_verbose_stays_under_its_byte_budget() {
-        const MAX_BYTES: usize = 3_800;
+        // Raised 3_800 -> 3_900 (simplify-paired-with-review): the review
+        // bullet's new simplify-pairing sentence and gate wording pushed
+        // this tier to 3_853 bytes even after tightening the added text.
+        const MAX_BYTES: usize = 3_900;
         let len = HARNESS_PROMPT.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
@@ -6565,7 +6604,9 @@ mod tests {
 
     #[test]
     fn harness_prompt_standard_stays_under_its_byte_budget() {
-        const MAX_BYTES: usize = 3_400;
+        // Raised 3_400 -> 3_500 (simplify-paired-with-review): same review-
+        // bullet addition as the verbose tier's own budget comment.
+        const MAX_BYTES: usize = 3_500;
         let len = HARNESS_PROMPT_STANDARD.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
@@ -6578,7 +6619,9 @@ mod tests {
 
     #[test]
     fn harness_prompt_minimal_stays_under_its_byte_budget() {
-        const MAX_BYTES: usize = 2_850;
+        // Raised 2_850 -> 2_950 (simplify-paired-with-review): same review-
+        // bullet addition as the verbose tier's own budget comment.
+        const MAX_BYTES: usize = 2_950;
         let len = HARNESS_PROMPT_MINIMAL.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
