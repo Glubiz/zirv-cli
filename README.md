@@ -4286,22 +4286,31 @@ cache disabled, applies that site's production floor (honouring
 for the nine sites that have one -- the rest carry a fixed compiled
 constant, exactly as production does)
 and production answer-to-action rule, and prints what production would have
-DONE on each rep -- `SITE` is one of `memory-rerank`, `memory-harvest`,
-`context-report`, `context-skill`, `harvest-screen`, `handoff-thin`,
-`handoff-select`, `compaction-select`, `dispatch`, `launch-effort`,
-`classify-domain`, `inject`, `crash`, `judge`, `approve-escalate`,
-`approve-lower`, `intake-plan`, `inject-screen`. `case.json` is `{"id":
-"<case id>", "state": <the exact JSON state object production sends>, "n":
-<candidate count, required only for a per-candidate site>}`; `state` is
-sent verbatim (still subject to `jev::safe_metadata_request`). An unknown
-site, `--reps` outside `1..=20`, a missing candidate count, a missing Jev
-credential, or an invalid `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/
-`ZIRV_CTX_JEV_PROBE_MIN_MARGIN` (below) all exit 2. Output is one JSON
-object: `{"site", "floor_site", "label", "floor": {"min_confidence",
-"min_margin"}, "reps": [{"actions": {"<item id>": "<action>"}, "error":
-"<string or null>"}], "calls", "errors"}` -- a rep whose call failed
-carries every item's fallback action (what production does on failure)
-plus its error text. Measurement only: it calls the exact same
+DONE on each rep -- `SITE` is one of all twenty-four the probe contract
+names: `memory-rerank`, `memory-harvest`, `context-report`, `context-skill`,
+`harvest-screen`, `handoff-thin`, `handoff-select`, `compaction-select`,
+`dispatch`, `launch-effort`, `classify-domain`, `inject`, `crash`, `judge`,
+`approve-escalate`, `approve-lower`, `intake-plan`, `inject-screen`,
+`missing-tests`, `stop-verify`, `review-disposition`, `review-dedup`,
+`artifact-substance`, `gate-reclass`. `case.json` is `{"id": "<case id>",
+"state": <the exact JSON state object production sends>, "n": <candidate
+count, required only for a per-candidate site>}`; `state` is sent verbatim
+(still subject to `jev::safe_metadata_request` -- except `artifact-substance`
+/`gate-reclass`, whose production state is text-bearing and so never clears
+that boundary either; every rep for these two reports its fallback action
+with an "unsafe Jev metadata projection" error, mirroring production
+exactly). An unknown site, `--reps` outside `1..=20`, a missing candidate
+count, a missing Jev credential, or an invalid
+`ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/`ZIRV_CTX_JEV_PROBE_MIN_MARGIN` (below)
+all exit 2. Output is one JSON object: `{"site", "floor_site", "label",
+"floor": {"min_confidence", "min_margin"}, "item_floors": {"<item id>":
+{"min_confidence", "min_margin"}} (present only when a site's items do not
+all share one floor -- today only `gate-reclass`, whose `work_domain`
+question has its own default floor), "reps": [{"actions": {"<item id>":
+"<action>"}, "error": "<string or null>"}], "calls", "errors"}` -- a rep
+whose call failed carries every item's fallback action (what production
+does on failure) plus its error text. Measurement only: it calls the exact
+same
 `jev::advise_detailed` entry point production calls (so `jev-decisions.jsonl`
 /`jev-effects.jsonl` and the spend ledger see real calls, spent for real),
 and has no other side effect. Two env vars are read ONLY by this probe,

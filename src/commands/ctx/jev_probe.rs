@@ -23,11 +23,32 @@
 //! `probe_floor_override`'s own doc comment): `ZIRV_CTX_JEV_PROBE_MIN_
 //! CONFIDENCE`/`ZIRV_CTX_JEV_PROBE_MIN_MARGIN`, each a float in `[0, 1]`.
 //! When set, each REPLACES the corresponding field of whatever site's
-//! resolved floor is being probed (every site this module measures) after
-//! any `[jev.floors]`/`ZIRV_CTX_JEV_FLOOR_*` overlay is already applied; an
-//! invalid value (not a float, or outside `[0, 1]`) exits 2 before any Jev
-//! call is made. The output's own `floor` object always reports the
-//! post-override effective values.
+//! resolved floor is being probed (every site this module measures, and
+//! every ITEM for a site with more than one floor -- see `gate-reclass`
+//! below) after any `[jev.floors]`/`ZIRV_CTX_JEV_FLOOR_*` overlay is already
+//! applied; an invalid value (not a float, or outside `[0, 1]`) exits 2
+//! before any Jev call is made. The output's own `floor` object always
+//! reports the post-override effective values.
+//!
+//! Six more sites complete the probe contract: `missing-tests`,
+//! `stop-verify`, `review-disposition`, `review-dedup`, `artifact-substance`,
+//! `gate-reclass`. The last two send a TEXT-bearing state (an artifact's own
+//! body, or a task description and changed paths) that `jev::
+//! safe_metadata_request` -- the same metadata-only egress boundary every
+//! other site's state must also clear -- permanently refuses today (see
+//! `engine.rs`'s own `gate_freeform_state_*`/`artifact_freeform_state_*`
+//! tests): production's own call for these two sites never leaves the
+//! process either. This probe applies that exact same boundary (never
+//! bypasses it), so every rep for these two sites reports its fallback
+//! action with a `"unsafe Jev metadata projection"` error -- an accurate
+//! measurement, not a probe defect. Because that refusal is certain in
+//! advance, [`Site::metadata_only`] skips the probe's OWN upfront exit-2
+//! pre-check for just these two (that pre-check exists only to fail fast on
+//! a malformed case for a site that COULD otherwise succeed); the boundary
+//! itself still runs, once per rep, exactly where production runs it.
+//! `gate-reclass` additionally has PER-QUESTION floors (`work_domain` uses
+//! a different default than its other six items) -- the output's optional
+//! `item_floors` field (below) reports each item's own effective floor.
 //!
 //! CLI contract (an external worker's backend depends on this exactly):
 //! `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo
@@ -36,12 +57,15 @@
 //! Jev credential both exit 2 with a message. `case.json` is `{"id": "<case
 //! id>", "state": <the exact JSON state object production sends>, "n":
 //! <candidate count, required only for per-candidate sites>}` -- `state` is
-//! sent verbatim (still subject to `jev::safe_metadata_request`; a refusal
-//! exits 2). stdout is one JSON object: `{"site", "floor_site", "label",
-//! "floor": {"min_confidence", "min_margin"}, "reps": [{"actions": {"<item
-//! id>": "<action>"}, "error": "<string or null>"}], "calls", "errors"}`. A
-//! rep whose call failed gets every item's FALLBACK action (what production
-//! does on failure) plus its error string.
+//! sent verbatim (still subject to `jev::safe_metadata_request` for every
+//! site except the two named above; a refusal exits 2). stdout is one JSON
+//! object: `{"site", "floor_site", "label", "floor": {"min_confidence",
+//! "min_margin"}, "item_floors": {"<item id>": {"min_confidence",
+//! "min_margin"}} (present only when a site's items do not all share
+//! `floor`'s own values -- today only `gate-reclass`), "reps": [{"actions":
+//! {"<item id>": "<action>"}, "error": "<string or null>"}], "calls",
+//! "errors"}`. A rep whose call failed gets every item's FALLBACK action
+//! (what production does on failure) plus its error string.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -56,18 +80,16 @@ use super::{
     compile, exec, handoff, hook, inject_gate, inject_screen, jev, memory, run_loop, safety, task,
 };
 use crate::commands::ctx::CtxResult;
-use crate::commands::workflow::{profile, team};
+use crate::commands::workflow::{engine, profile, review, team};
 
-/// One measurable site. The first twelve variants (`MemoryRerank` through
-/// `Inject`) are the original twelve named in the probe's own CLI contract;
-/// `Crash` through `InjectScreen` are six more added by the autoresearch
-/// probe-contract extension (six further sites -- `missing-tests`,
-/// `stop-verify`, `review-disposition`, `review-dedup`,
-/// `artifact-substance`, `gate-reclass` -- are wired in by a later change).
-/// `MemoryRerank`/`MemoryHarvest` and `ContextReport`/`ContextSkill` share a
-/// production advise-site LABEL and/or `jev::FloorSite`, but are distinct
-/// SITEs here: each has its own default floor constant a later retune
-/// targets independently.
+/// One measurable site, all twenty-four the probe contract names. The first
+/// twelve variants (`MemoryRerank` through `Inject`) were the original
+/// twelve; `Crash` through `InjectScreen` and `MissingTests` through
+/// `GateReclass` are the twelve added by the autoresearch probe-contract
+/// extension. `MemoryRerank`/`MemoryHarvest` and `ContextReport`/
+/// `ContextSkill` share a production advise-site LABEL and/or `jev::
+/// FloorSite`, but are distinct SITEs here: each has its own default floor
+/// constant a later retune targets independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Site {
     MemoryRerank,
@@ -88,6 +110,12 @@ enum Site {
     ApproveLower,
     IntakePlan,
     InjectScreen,
+    MissingTests,
+    StopVerify,
+    ReviewDisposition,
+    ReviewDedup,
+    ArtifactSubstance,
+    GateReclass,
 }
 
 impl Site {
@@ -111,6 +139,12 @@ impl Site {
             "approve-lower" => Self::ApproveLower,
             "intake-plan" => Self::IntakePlan,
             "inject-screen" => Self::InjectScreen,
+            "missing-tests" => Self::MissingTests,
+            "stop-verify" => Self::StopVerify,
+            "review-disposition" => Self::ReviewDisposition,
+            "review-dedup" => Self::ReviewDedup,
+            "artifact-substance" => Self::ArtifactSubstance,
+            "gate-reclass" => Self::GateReclass,
             _ => return None,
         })
     }
@@ -137,6 +171,12 @@ impl Site {
             Self::ApproveEscalate | Self::ApproveLower => "approve",
             Self::IntakePlan => "intake_plan",
             Self::InjectScreen => "inject_screen",
+            Self::MissingTests => "missing_tests",
+            Self::StopVerify => "stop_verify",
+            Self::ReviewDisposition => review::REVIEW_DISPOSITION_LABEL,
+            Self::ReviewDedup => review::REVIEW_DEDUP_LABEL,
+            Self::ArtifactSubstance => engine::ARTIFACT_SUBSTANCE_LABEL,
+            Self::GateReclass => engine::GATE_RECLASS_LABEL,
         }
     }
 
@@ -166,6 +206,12 @@ impl Site {
             Self::ApproveLower => (None, "approve_lower"),
             Self::IntakePlan => (None, "intake_plan"),
             Self::InjectScreen => (None, "inject_screen"),
+            Self::MissingTests => (None, "missing_tests"),
+            Self::StopVerify => (None, "stop_verify"),
+            Self::ReviewDisposition => (None, "review_disposition"),
+            Self::ReviewDedup => (None, "review_dedup"),
+            Self::ArtifactSubstance => (None, "artifact_substance"),
+            Self::GateReclass => (None, "gate_reclass"),
         }
     }
 
@@ -207,7 +253,46 @@ impl Site {
                 inject_screen::INJECT_SCREEN_MIN_CONFIDENCE,
                 jev::DEFAULT_MIN_MARGIN,
             ),
+            Self::MissingTests => hook::MISSING_TESTS_DEFAULT_FLOOR,
+            Self::StopVerify => hook::STOP_VERIFY_DEFAULT_FLOOR,
+            Self::ReviewDisposition => review::REVIEW_DISPOSITION_DEFAULT_FLOOR,
+            Self::ReviewDedup => review::REVIEW_DEDUP_DEFAULT_FLOOR,
+            Self::ArtifactSubstance => engine::ARTIFACT_SUBSTANCE_DEFAULT_FLOOR,
+            // The representative/majority default: six of `gate-reclass`'s
+            // seven items (every item but `work_domain`) use this floor --
+            // see [`Site::item_default_floor`] for the per-item picture.
+            Self::GateReclass => engine::GATE_RECLASS_NOUL_DEFAULT_FLOOR,
         }
+    }
+
+    /// The default `(min_confidence, min_margin)` for ONE item of this
+    /// site's request -- identical to [`Site::default_floor`] for every site
+    /// except [`Site::GateReclass`], whose `work_domain` Choice question
+    /// uses a different default floor (`engine::
+    /// GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR`) than its other six Noul
+    /// items (`engine::GATE_RECLASS_NOUL_DEFAULT_FLOOR`, matching
+    /// `apply_jev_gate_advice`'s own per-question floor resolution exactly).
+    fn item_default_floor(self, item_id: &str) -> (f32, f32) {
+        match self {
+            Self::GateReclass if item_id == "work_domain" => {
+                engine::GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR
+            }
+            Self::GateReclass => engine::GATE_RECLASS_NOUL_DEFAULT_FLOOR,
+            _ => self.default_floor(),
+        }
+    }
+
+    /// Whether this site's state must clear `jev::safe_metadata_request` --
+    /// `false` only for [`Site::ArtifactSubstance`]/[`Site::GateReclass`],
+    /// whose production state is text-bearing and so can never clear that
+    /// boundary (see this module's own doc comment). `true` for every other
+    /// site skips the probe's own redundant upfront copy of that check for
+    /// those two -- the boundary itself still runs inside `jev::
+    /// advise_detailed` for every site, every rep, exactly where production
+    /// runs it; this only decides whether the probe ALSO fails fast before
+    /// the loop starts.
+    fn metadata_only(self) -> bool {
+        !matches!(self, Self::ArtifactSubstance | Self::GateReclass)
     }
 
     /// Whether `case.json` must set `"n"` (the per-candidate item count) for
@@ -221,6 +306,8 @@ impl Site {
                 | Self::ContextSkill
                 | Self::HandoffSelect
                 | Self::CompactionSelect
+                | Self::ReviewDisposition
+                | Self::ReviewDedup
         )
     }
 
@@ -315,6 +402,37 @@ impl Site {
                 vec![inject_screen::inject_screen_question()],
                 vec!["injection".to_string()],
             )),
+            Self::MissingTests => Ok((
+                hook::missing_tests_questions().to_vec(),
+                vec!["tests_owed".to_string()],
+            )),
+            Self::StopVerify => Ok((
+                hook::stop_verify_questions().to_vec(),
+                vec!["unverified_done".to_string()],
+            )),
+            Self::ReviewDisposition => {
+                let n = require_n(case)?;
+                let ids = numbered_ids("f", n);
+                let questions = review::review_disposition_questions(n);
+                Ok((questions, ids))
+            }
+            Self::ReviewDedup => {
+                let ids = numbered_ids("p", require_n(case)?);
+                let questions = review::review_dedup_questions(&ids);
+                Ok((questions, ids))
+            }
+            Self::ArtifactSubstance => Ok((
+                engine::artifact_substance_questions().to_vec(),
+                vec!["substance".to_string()],
+            )),
+            Self::GateReclass => {
+                let questions = engine::gate_reclass_questions();
+                let ids = questions
+                    .iter()
+                    .map(|question| question.id.clone())
+                    .collect();
+                Ok((questions, ids))
+            }
         }
     }
 
@@ -322,10 +440,14 @@ impl Site {
     /// one item's answer (or `None` when the item id is missing from the
     /// response). `case` is used only by [`Site::Crash`], whose rule also
     /// reads the local `access`/`configuration`/`missing_file` signal facts
-    /// production sends alongside the question -- see [`facts_row0`].
+    /// production sends alongside the question -- see [`facts_row0`]. `id`
+    /// is used only by [`Site::GateReclass`], which shares one `Site` across
+    /// three different per-item action rules (`sensitive_surface`,
+    /// `work_domain`, and the five tag questions).
     fn action(
         self,
         case: &Case,
+        id: &str,
         answer: Option<&jev::Answer>,
         min_confidence: f32,
         min_margin: f32,
@@ -392,6 +514,24 @@ impl Site {
             Self::InjectScreen => {
                 inject_screen::inject_screen_action(answer, min_confidence, min_margin)
             }
+            Self::MissingTests => hook::missing_tests_action(answer, min_confidence, min_margin),
+            Self::StopVerify => hook::stop_verify_action(answer, min_confidence, min_margin),
+            Self::ReviewDisposition => {
+                review::review_disposition_action(answer, min_confidence, min_margin)
+            }
+            Self::ReviewDedup => review::review_dedup_action(answer, min_confidence, min_margin),
+            Self::ArtifactSubstance => {
+                engine::artifact_substance_action(answer, min_confidence, min_margin)
+            }
+            Self::GateReclass => match id {
+                "sensitive_surface" => {
+                    engine::gate_sensitive_surface_action(answer, min_confidence, min_margin)
+                }
+                "work_domain" => {
+                    engine::gate_work_domain_action(answer, min_confidence, min_margin)
+                }
+                _ => engine::gate_tag_action(answer, min_confidence, min_margin),
+            },
         };
         action.to_string()
     }
@@ -421,6 +561,12 @@ impl Site {
             Self::ApproveLower => "ask",
             Self::IntakePlan => "keep_planner",
             Self::InjectScreen => "pass",
+            Self::MissingTests => "owed",
+            Self::StopVerify => "allow",
+            Self::ReviewDisposition => "unchanged",
+            Self::ReviewDedup => "distinct",
+            Self::ArtifactSubstance => "pass",
+            Self::GateReclass => "none",
         }
     }
 }
@@ -619,7 +765,15 @@ pub(crate) fn run_probe(
         }
     };
 
-    if !jev::safe_metadata_request(&case.state, &questions, &cfg.proxy.typesafe.model) {
+    // Skipped for `ArtifactSubstance`/`GateReclass`: their production state
+    // is text-bearing and can never clear this boundary, so refusing here
+    // would misreport a normal, well-formed case as a probe-input error --
+    // see [`Site::metadata_only`] and this module's own doc comment. The
+    // boundary itself still runs, every rep, inside `jev::advise_detailed`
+    // below -- never bypassed, only not ALSO pre-checked here.
+    if site.metadata_only()
+        && !jev::safe_metadata_request(&case.state, &questions, &cfg.proxy.typesafe.model)
+    {
         writeln!(
             writer,
             "jev probe: case \"state\"/question set refused by the metadata-only egress boundary"
@@ -628,17 +782,40 @@ pub(crate) fn run_probe(
     }
 
     let (floor_site, floor_site_name) = site.floor_site();
-    let (default_confidence, default_margin) = site.default_floor();
-    let (mut min_confidence, mut min_margin) = match floor_site {
-        Some(floor_site) => jev::floor(&cfg, floor_site, default_confidence, default_margin),
-        None => (default_confidence, default_margin),
+    // Resolves ONE `(min_confidence, min_margin)`: the operator's
+    // `[jev.floors]`/`ZIRV_CTX_JEV_FLOOR_*` overlay (only for a site with a
+    // `jev::FloorSite`), then this probe's own `ZIRV_CTX_JEV_PROBE_MIN_*`
+    // override on top. Shared by the site-level `floor` (via
+    // `site.default_floor()`) and by each item's own floor (via
+    // `site.item_default_floor(id)`, identical to `default_floor()` for
+    // every site except `GateReclass`) -- see `item_floors` below.
+    let resolve_floor = |default_confidence: f32, default_margin: f32| -> (f32, f32) {
+        let (mut confidence, mut margin) = match floor_site {
+            Some(floor_site) => jev::floor(&cfg, floor_site, default_confidence, default_margin),
+            None => (default_confidence, default_margin),
+        };
+        if let Some(value) = probe_min_confidence {
+            confidence = value;
+        }
+        if let Some(value) = probe_min_margin {
+            margin = value;
+        }
+        (confidence, margin)
     };
-    if let Some(value) = probe_min_confidence {
-        min_confidence = value;
-    }
-    if let Some(value) = probe_min_margin {
-        min_margin = value;
-    }
+    let (min_confidence, min_margin) = {
+        let (default_confidence, default_margin) = site.default_floor();
+        resolve_floor(default_confidence, default_margin)
+    };
+    let item_floors: BTreeMap<String, (f32, f32)> = report_ids
+        .iter()
+        .map(|id| {
+            let (default_confidence, default_margin) = site.item_default_floor(id);
+            (
+                id.clone(),
+                resolve_floor(default_confidence, default_margin),
+            )
+        })
+        .collect();
 
     let label = site.production_label();
     let decisions_path = state.root().join("jev-decisions.jsonl");
@@ -652,9 +829,13 @@ pub(crate) fn run_probe(
             jev::AdvisoryStatus::Answered(answers) => {
                 let mut actions = BTreeMap::new();
                 for id in &report_ids {
+                    let (item_confidence, item_margin) = item_floors
+                        .get(id)
+                        .copied()
+                        .unwrap_or((min_confidence, min_margin));
                     actions.insert(
                         id.clone(),
-                        site.action(&case, answers.get(id), min_confidence, min_margin),
+                        site.action(&case, id, answers.get(id), item_confidence, item_margin),
                     );
                 }
                 reps_out.push(serde_json::json!({ "actions": actions, "error": null }));
@@ -675,7 +856,7 @@ pub(crate) fn run_probe(
         }
     }
 
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "site": site_arg,
         "floor_site": floor_site_name,
         "label": label,
@@ -684,6 +865,26 @@ pub(crate) fn run_probe(
         "calls": reps,
         "errors": errors,
     });
+    // Extra, additive field: only when at least one item's own floor
+    // differs from the site-level `floor` above (today only `gate-reclass`,
+    // whose `work_domain` item has a different default floor than its other
+    // six) -- every other site's `item_floors` values all equal `floor`, so
+    // this key stays absent and the output shape is unchanged for them.
+    if item_floors
+        .values()
+        .any(|&value| value != (min_confidence, min_margin))
+    {
+        let item_floors_json: BTreeMap<String, serde_json::Value> = item_floors
+            .iter()
+            .map(|(id, &(confidence, margin))| {
+                (
+                    id.clone(),
+                    serde_json::json!({ "min_confidence": confidence, "min_margin": margin }),
+                )
+            })
+            .collect();
+        output["item_floors"] = serde_json::json!(item_floors_json);
+    }
     writeln!(writer, "{}", serde_json::to_string(&output)?)?;
     Ok(0)
 }
@@ -1350,5 +1551,379 @@ mod tests {
                 assert!(text.contains("ZIRV_CTX_JEV_PROBE_MIN_MARGIN"), "{text}");
             },
         );
+    }
+
+    // -- Probe-contract extension, remaining six sites: missing-tests,
+    // stop-verify, review-disposition, review-dedup, artifact-substance,
+    // gate-reclass -------------------------------------------------------
+
+    fn noul_case(facts: Vec<u32>) -> serde_json::Value {
+        serde_json::json!({
+            "id": "c1",
+            "state": {
+                "_zirv_metadata_only": true,
+                "facts": [facts],
+            },
+        })
+    }
+
+    #[test]
+    fn missing_tests_reports_skip_for_a_decisive_low_noul_and_owed_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("tests_owed", 0.05);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &noul_case(vec![3, 1, 0, 2, 1]));
+        with_env(
+            &base_env(dir.path(), &url, "MISSING_TESTS_SKIP_1091"),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("missing-tests", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["tests_owed"], "skip");
+            },
+        );
+        handle.join().expect("server thread");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("tests_owed", 0.5);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &noul_case(vec![3, 1, 0, 2, 1]));
+        with_env(
+            &base_env(dir.path(), &url, "MISSING_TESTS_OWED_1091"),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("missing-tests", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["tests_owed"], "owed");
+            },
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn stop_verify_reports_block_for_a_decisive_high_noul_and_allow_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("unverified_done", 0.95);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(
+            dir.path(),
+            "case.json",
+            &noul_case(vec![2, 0, 0, 0, 1, 3, 0]),
+        );
+        with_env(
+            &base_env(dir.path(), &url, "STOP_VERIFY_BLOCK_1091"),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("stop-verify", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["unverified_done"], "block");
+            },
+        );
+        handle.join().expect("server thread");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("unverified_done", 0.5);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(
+            dir.path(),
+            "case.json",
+            &noul_case(vec![2, 0, 0, 0, 1, 3, 0]),
+        );
+        with_env(
+            &base_env(dir.path(), &url, "STOP_VERIFY_ALLOW_1091"),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("stop-verify", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["unverified_done"], "allow");
+            },
+        );
+        handle.join().expect("server thread");
+    }
+
+    fn review_finding_case(n: usize) -> serde_json::Value {
+        serde_json::json!({
+            "id": "c1",
+            "state": {
+                "_zirv_metadata_only": true,
+                "facts": (0..n).map(|_| vec![1u32, 0, 2, 1]).collect::<Vec<_>>(),
+            },
+            "n": n,
+        })
+    }
+
+    #[test]
+    fn review_disposition_reports_the_decisive_choice_and_unchanged_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = choice_response_body(
+            "f0",
+            "fix_now",
+            &[
+                ("fix_now", 0.9),
+                ("defer", 0.05),
+                ("reject", 0.03),
+                ("verify", 0.02),
+            ],
+        );
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &review_finding_case(1));
+        with_env(
+            &base_env(dir.path(), &url, "REVIEW_DISPOSITION_FIX_1091"),
+            || {
+                let mut out = Vec::new();
+                let code = run_probe("review-disposition", &case, 1, Some(dir.path()), &mut out)
+                    .expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["f0"], "fix_now");
+            },
+        );
+        handle.join().expect("server thread");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Confidence 0.5 sits below REVIEW_DISPOSITION_DEFAULT_FLOOR's 0.7 --
+        // indecisive, so the fallback ("unchanged") applies regardless of
+        // choice.
+        let body = choice_response_body(
+            "f0",
+            "fix_now",
+            &[
+                ("fix_now", 0.5),
+                ("defer", 0.3),
+                ("reject", 0.1),
+                ("verify", 0.1),
+            ],
+        );
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &review_finding_case(1));
+        with_env(
+            &base_env(dir.path(), &url, "REVIEW_DISPOSITION_UNCHANGED_1091"),
+            || {
+                let mut out = Vec::new();
+                let code = run_probe("review-disposition", &case, 1, Some(dir.path()), &mut out)
+                    .expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["f0"], "unchanged");
+            },
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn review_dedup_reports_duplicate_for_a_decisive_high_noul_and_distinct_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("p0", 0.95);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &review_finding_case(1));
+        with_env(&base_env(dir.path(), &url, "REVIEW_DEDUP_DUP_1091"), || {
+            let mut out = Vec::new();
+            let code =
+                run_probe("review-dedup", &case, 1, Some(dir.path()), &mut out).expect("run");
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+            let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            assert_eq!(value["reps"][0]["actions"]["p0"], "duplicate");
+        });
+        handle.join().expect("server thread");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = noul_response_body("p0", 0.5);
+        let (url, handle) = multi_shot_server(200, Box::leak(body.into_boxed_str()), 1);
+        let case = write_case(dir.path(), "case.json", &review_finding_case(1));
+        with_env(
+            &base_env(dir.path(), &url, "REVIEW_DEDUP_DISTINCT_1091"),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("review-dedup", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["reps"][0]["actions"]["p0"], "distinct");
+            },
+        );
+        handle.join().expect("server thread");
+    }
+
+    /// `artifact-substance`'s production state (`{artifact_kind,
+    /// artifact_text}`) is text-bearing, not metadata-only, so `jev::
+    /// safe_metadata_request` -- the exact same boundary production's own
+    /// `pin_current_artifact_with_config` clears through `ask()` -- refuses
+    /// it every time (see `engine.rs`'s own `artifact_freeform_state_*`
+    /// tests: production never reaches the network for this site either).
+    /// No fake server is spun up at all: `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL`
+    /// points at a closed port, so a regression that started actually
+    /// dialing out would fail loudly instead of silently passing.
+    #[test]
+    fn artifact_substance_always_falls_back_because_its_freeform_state_never_clears_the_metadata_only_boundary()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_state = serde_json::json!({
+            "id": "c1",
+            "state": {"artifact_kind": "intent", "artifact_text": "# Intent\n\nSome text.\n"},
+        });
+        let case = write_case(dir.path(), "case.json", &case_state);
+        with_env(
+            &base_env(dir.path(), "http://127.0.0.1:1", "ARTIFACT_SUBSTANCE_1091"),
+            || {
+                let mut out = Vec::new();
+                let code = run_probe("artifact-substance", &case, 2, Some(dir.path()), &mut out)
+                    .expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["calls"], 2);
+                assert_eq!(value["errors"], 2);
+                for rep in value["reps"].as_array().expect("reps") {
+                    assert_eq!(rep["actions"]["substance"], "pass");
+                    assert_eq!(rep["error"], "unsafe Jev metadata projection");
+                }
+            },
+        );
+    }
+
+    /// Same freeform-state reality as `artifact-substance` (above), but for
+    /// all seven `gate-reclass` items at once -- every item falls back to
+    /// `"none"`, matching `apply_jev_gate_advice`'s own fallback for every
+    /// one of its questions.
+    #[test]
+    fn gate_reclass_always_falls_back_to_none_for_every_item_because_its_freeform_state_never_clears_the_metadata_only_boundary()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case_state = serde_json::json!({
+            "id": "c1",
+            "state": {
+                "task": "touch the auth service",
+                "changed_paths": ["src/auth.rs"],
+                "current_complexity": "bounded",
+                "current_risk": "medium",
+                "current_domain": "general",
+            },
+        });
+        let case = write_case(dir.path(), "case.json", &case_state);
+        with_env(
+            &base_env(
+                dir.path(),
+                "http://127.0.0.1:1",
+                "GATE_RECLASS_FALLBACK_1091",
+            ),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("gate-reclass", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["errors"], 1);
+                let actions = &value["reps"][0]["actions"];
+                for id in [
+                    "sensitive_surface",
+                    "work_domain",
+                    "security",
+                    "data",
+                    "docs_only",
+                    "devops",
+                    "architecture",
+                ] {
+                    assert_eq!(actions[id], "none", "item {id}");
+                }
+            },
+        );
+    }
+
+    /// `gate-reclass` is the one site with a per-question floor:
+    /// `work_domain` defaults to `GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR`
+    /// (confidence 0.9) while every other item defaults to
+    /// `GATE_RECLASS_NOUL_DEFAULT_FLOOR` (confidence 0.0) -- both share the
+    /// same default margin. The top-level `floor` stays the six-item
+    /// (majority) default; `item_floors` carries every item's own effective
+    /// value, present because they are not all equal. The probe-only
+    /// override then replaces the confidence field on EVERY item alike,
+    /// collapsing that distinction.
+    #[test]
+    fn gate_reclass_reports_a_distinct_floor_per_item_and_the_probe_override_replaces_every_ones() {
+        let case_state = serde_json::json!({
+            "id": "c1",
+            "state": {
+                "task": "touch the auth service",
+                "changed_paths": ["src/auth.rs"],
+                "current_complexity": "bounded",
+                "current_risk": "medium",
+                "current_domain": "general",
+            },
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case = write_case(dir.path(), "case.json", &case_state);
+        with_env(
+            &base_env(
+                dir.path(),
+                "http://127.0.0.1:1",
+                "GATE_RECLASS_FLOOR_DEFAULT_1091",
+            ),
+            || {
+                let mut out = Vec::new();
+                let code =
+                    run_probe("gate-reclass", &case, 1, Some(dir.path()), &mut out).expect("run");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                let approx_field = |value: &serde_json::Value, path: &[&str], expected: f64| {
+                    let mut cursor = value;
+                    for key in path {
+                        cursor = &cursor[key];
+                    }
+                    let actual = cursor.as_f64().expect("floor field must be a number");
+                    assert!((actual - expected).abs() < 0.001, "{path:?}: {actual}");
+                };
+                approx_field(&value, &["floor", "min_confidence"], 0.0);
+                let item_floors = &value["item_floors"];
+                assert!(!item_floors.is_null(), "{value}");
+                approx_field(item_floors, &["sensitive_surface", "min_confidence"], 0.0);
+                approx_field(item_floors, &["security", "min_confidence"], 0.0);
+                approx_field(item_floors, &["work_domain", "min_confidence"], 0.9);
+                // Margin is the same default (DEFAULT_MIN_MARGIN) for every
+                // item, so only confidence differs.
+                approx_field(item_floors, &["work_domain", "min_margin"], 0.2);
+                approx_field(item_floors, &["sensitive_surface", "min_margin"], 0.2);
+            },
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let case = write_case(dir.path(), "case.json", &case_state);
+        let mut vars = base_env(
+            dir.path(),
+            "http://127.0.0.1:1",
+            "GATE_RECLASS_FLOOR_OVERRIDE_1091",
+        );
+        vars.push(("ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE", "0.42".to_string()));
+        with_env(&vars, || {
+            let mut out = Vec::new();
+            let code =
+                run_probe("gate-reclass", &case, 1, Some(dir.path()), &mut out).expect("run");
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+            let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            let confidence = value["floor"]["min_confidence"]
+                .as_f64()
+                .expect("min_confidence");
+            assert!((confidence - 0.42).abs() < 0.001, "{confidence}");
+            // Every item, including `work_domain`, must now report the SAME
+            // overridden confidence -- if `item_floors` is present at all
+            // (it may legitimately collapse away once every item matches
+            // the top-level `floor`), every one of its entries must match.
+            if let Some(item_floors) = value.get("item_floors").and_then(|v| v.as_object()) {
+                for (id, floor) in item_floors {
+                    let item_confidence = floor["min_confidence"].as_f64().expect("min_confidence");
+                    assert!(
+                        (item_confidence - 0.42).abs() < 0.001,
+                        "item {id}: {item_confidence}"
+                    );
+                }
+            }
+        });
     }
 }
