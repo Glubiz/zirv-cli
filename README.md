@@ -2770,7 +2770,10 @@ the skill still renders, silently without narration, when they are absent.
 
 **First-run downloads.** Hyperframes manages its own headless Chrome the
 first time it renders. If Kokoro narration is used, its first call downloads
-a 310 MiB model plus 26 MiB of voices into `~/.cache/hyperframes/tts`.
+a 310 MiB model plus 26 MiB of voices into `~/.cache/hyperframes/tts`. The
+skill runs every Hyperframes command with `HYPERFRAMES_SKIP_SKILLS=1`;
+without it, `hyperframes init` installs Hyperframes' own agent skills
+globally into `~/.claude/skills` and `~/.agents/skills`.
 
 **Output layout.** The Hyperframes project lives at `<repo>/motion/<slug>/`
 and is committed; its `renders/` subdirectory (the actual MP4/GIF output) is

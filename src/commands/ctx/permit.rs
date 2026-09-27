@@ -91,10 +91,11 @@ pub const BUILTIN_HEAVY_PATTERNS: &[&str] = &[
     // skill and an operator both invoke it: pinned via `npx --yes
     // hyperframes@<version>` (the skill's own spelling), plain `npx
     // hyperframes`, and a locally installed `hyperframes` binary directly.
-    // Each pattern's `*` before ` render` still requires that literal
-    // substring to actually follow the package name -- `lint`/`snapshot`/
-    // `tts` candidates have no ` render` anywhere in them and never match.
-    "npx --yes hyperframes@* render*",
+    // The pinned form's version `*` can span arguments, so ` render` must end
+    // the command or be followed by a space -- `check --output renders/x`
+    // stays light.
+    "npx --yes hyperframes@* render",
+    "npx --yes hyperframes@* render *",
     "npx hyperframes render*",
     "hyperframes render*",
 ];
@@ -1115,6 +1116,7 @@ mod tests {
             "npx --yes hyperframes@0.8.80 render --format gif --fps 15 --output renders/demo.gif",
             "npx hyperframes render",
             "hyperframes render -o a.mp4",
+            "HYPERFRAMES_SKIP_SKILLS=1 npx --yes hyperframes@0.8.80 render --output renders/demo.mp4",
         ] {
             assert!(is_heavy(heavy, &none), "{heavy} must hold a permit");
         }
@@ -1122,6 +1124,7 @@ mod tests {
             "npx hyperframes lint",
             "npx --yes hyperframes@0.8.80 snapshot",
             "npx --yes hyperframes@0.8.80 tts \"hi\" --output vo.wav",
+            "npx --yes hyperframes@0.8.80 check --output renders/check.json",
         ] {
             assert!(!is_heavy(light, &none), "{light} must not hold a permit");
         }

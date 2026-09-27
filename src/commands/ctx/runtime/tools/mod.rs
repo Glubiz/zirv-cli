@@ -3801,7 +3801,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
                 &["path"],
                 json!({
                     "path":{"type":"string","minLength":1},
-                    "kind":{"type":"string","enum":["image","svg","html","diagram","document","other"]},
+                    "kind":{"type":"string","enum":["image","svg","html","diagram","document","video","other"]},
                     "workflow_id":{"type":"string"}
                 }),
             ),
@@ -6131,6 +6131,16 @@ mod tests {
             )
             .expect_err("an empty label is rejected");
         assert_eq!(empty.code, ToolErrorCode::InvalidArguments);
+    }
+
+    #[test]
+    fn artifact_register_accepts_the_video_kind() {
+        ToolRegistry::native()
+            .parse(
+                ARTIFACT_REGISTER,
+                json!({"path":"renders/demo.mp4","kind":"video"}),
+            )
+            .expect("video is a registrable kind");
     }
 
     #[test]

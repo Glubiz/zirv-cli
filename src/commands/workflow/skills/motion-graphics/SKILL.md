@@ -22,7 +22,9 @@ nobody actually looked at.
 ## Method
 
 Every `hyperframes <cmd>` below means `npx --yes hyperframes@0.8.80 <cmd>`,
-run inside the project folder -- never an unpinned or global `hyperframes`.
+run inside the project folder -- never an unpinned or global `hyperframes` --
+with the environment variable `HYPERFRAMES_SKIP_SKILLS=1` set; without it
+`init` installs the renderer's own agent skills into every host globally.
 
 1. Preflight once: `npx --yes hyperframes@0.8.80 doctor --json`, and read its
    `ok` field yourself -- the command always exits 0 even when environment

@@ -112,6 +112,7 @@ pub(super) enum ArtifactKindArg {
     Html,
     Diagram,
     Document,
+    Video,
     Other,
 }
 
@@ -124,6 +125,7 @@ impl ArtifactKindArg {
             Self::Html => ArtifactKind::Html,
             Self::Diagram => ArtifactKind::Diagram,
             Self::Document => ArtifactKind::Document,
+            Self::Video => ArtifactKind::Video,
             Self::Other => ArtifactKind::Other,
         }
     }
