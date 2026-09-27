@@ -33,39 +33,6 @@ pub fn short_id(session: &str) -> String {
         .collect()
 }
 
-/// Session-scoped dash follow-up (JEV sidebar total): every session in
-/// `roots` (a dashboard's own orchestrator + worker panes), plus every
-/// session whose parent chain -- however many hops, via `delegations`' own
-/// `(session, parent_session)` pairs (`log::DelegationRow`, read by the
-/// caller so this stays pure) -- eventually leads back to one of them.
-///
-/// Pure fixed-point closure: a pass adds every delegation row whose
-/// `parent_session` is already in the set, and repeats until a whole pass
-/// adds nothing. Bounded by `delegations.len()` passes in the worst case
-/// (a maximally deep, in-order chain), which is fine -- both this and the
-/// caller's own bounded `log::read_delegations` read stay small relative to
-/// a dashboard's own lifetime. A native in-process subagent needs no row
-/// here at all: it shares its parent's own session id outright (see
-/// `session_and_principal`), so it is already a member of `roots` under
-/// that same id.
-pub fn session_closure(
-    roots: &std::collections::BTreeSet<String>,
-    delegations: &[(String, String)],
-) -> std::collections::BTreeSet<String> {
-    let mut set = roots.clone();
-    loop {
-        let mut grew = false;
-        for (session, parent_session) in delegations {
-            if set.contains(parent_session) && set.insert(session.clone()) {
-                grew = true;
-            }
-        }
-        if !grew {
-            return set;
-        }
-    }
-}
-
 /// The environment variables that carry one supervised session's *identity*
 /// into everything it spawns: which session id turn signals should claim,
 /// which socket to post them on, and which transcript file the supervisor is
@@ -2640,45 +2607,6 @@ mod tests {
 
     fn record_for(session: &str, repo: &Path, verb: Verb) -> Record {
         Record::new(session, "claude", repo, verb)
-    }
-
-    /// Session-scoped dash follow-up: the closure includes a direct child
-    /// (one hop), a grandchild (two hops, in either delegation order --
-    /// `orch -> mid` before or after `mid -> grand` in the input slice must
-    /// not matter, since a single pass only ever catches what is already in
-    /// the set), and never a session from an unrelated parent chain, even
-    /// one that shares a delegation row with an in-scope session as ITS
-    /// child (that child is in scope; the unrelated sibling branch is not).
-    #[test]
-    fn session_closure_follows_every_hop_but_never_an_unrelated_branch() {
-        let roots: std::collections::BTreeSet<String> = ["orch".to_string()].into();
-        let delegations = vec![
-            ("grand".to_string(), "mid".to_string()),
-            ("mid".to_string(), "orch".to_string()),
-            (
-                "unrelated-child".to_string(),
-                "unrelated-parent".to_string(),
-            ),
-        ];
-        let closure = session_closure(&roots, &delegations);
-        assert_eq!(
-            closure,
-            ["orch", "mid", "grand"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            "orch's whole descendant chain is in scope, the unrelated branch is not"
-        );
-    }
-
-    /// A closure over no roots and no delegations is just empty, and one
-    /// with delegations but no matching root stays exactly the roots given
-    /// -- the fixed point terminates immediately rather than looping.
-    #[test]
-    fn session_closure_is_a_no_op_with_nothing_to_add() {
-        let roots: std::collections::BTreeSet<String> = ["orch".to_string()].into();
-        let delegations = vec![("a".to_string(), "b".to_string())];
-        assert_eq!(session_closure(&roots, &delegations), roots);
     }
 
     /// Issue #470: a session record written before the `runtime` field
