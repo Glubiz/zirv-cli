@@ -11512,19 +11512,16 @@ healthy
             nudge_live_session(&state_for_writer, &repo_for_writer, "first nudge, honored");
 
             // 10s, not 2s: unlike the first wait, this one sits behind a
-            // real `terminate()` of the first hang-mode child -- on Windows
-            // that is a synchronous `taskkill /T /F` spawn, verified (via
-            // temporary timing instrumentation, since removed) to cost
-            // 1.4-1.9s on an ordinarily loaded dev machine even outside this
-            // test, well before the handoff/compile/relaunch work that
-            // follows it. A 2s budget here was never honest against that
-            // cost, and failed deterministically under real host
-            // contention (confirmed independent of any code change: the
-            // same failure reproduces at a commit two revisions before this
-            // one) -- 10s leaves the same order-of-magnitude margin the
-            // sibling `a_nudge_restart_carries_a_handoff_forward_like_
-            // every_other_restart` test already gives its own 20s wait
-            // against the same taskkill cost.
+            // real `terminate()` of the first hang-mode child plus the
+            // handoff/compile/relaunch work that follows it. On Windows that
+            // terminate used to be a synchronous `taskkill /T /F` spawn,
+            // whose WMI round trip cost 1.4-1.9s on an ordinarily loaded dev
+            // machine and 8-40s on a contended one -- which is what failed
+            // this wait. `supervise::kill_tree` now walks the tree natively
+            // (one process snapshot per level, well under a second even
+            // under load), so 10s is an order-of-magnitude margin again,
+            // matching the sibling `a_nudge_restart_carries_a_handoff_
+            // forward_like_every_other_restart` test's own 20s wait.
             let second =
                 wait_for_lines_or_panic(&session_log_for_writer, 2, Duration::from_secs(10));
             nudge_live_session(

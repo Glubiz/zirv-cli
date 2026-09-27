@@ -196,7 +196,7 @@ pub(crate) enum KillOutcome {
     /// changed.
     ///
     /// Only the `#[cfg(unix)]` [`terminate_pid`] ever builds this -- Windows'
-    /// `taskkill` reports no errno to map onto it -- but the enum itself is
+    /// `kill_tree` reports no errno to map onto it -- but the enum itself is
     /// portable so `sessions::report_kill_outcome` stays one match on both
     /// platforms rather than two cfg'd copies.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -271,7 +271,7 @@ pub(crate) fn terminate_pid(pid: u32, grace: Duration) -> KillOutcome {
 
 /// The non-unix counterpart: there is no SIGTERM to escalate from, so this
 /// goes straight to the same tree-kill `terminate`'s own non-unix branch
-/// uses. `taskkill` reports no errno this could map onto a
+/// uses. `kill_tree` reports no errno this could map onto a
 /// [`KillOutcome::Refused`], so its two existing outcomes are the two
 /// remaining variants.
 #[cfg(not(unix))]
@@ -300,8 +300,8 @@ fn taskkill_args(pid: u32) -> Vec<String> {
     ]
 }
 
-/// The `taskkill` command, assembled but not run. Shared by the synchronous
-/// [`kill_tree`] and by the console-close handler's fire-and-poll sweep, so
+/// The `taskkill` command, assembled but not run. The console-close handler's
+/// fire-and-poll sweep (and [`kill_tree`] off Windows) build it here, so
 /// there is exactly one place the argv and the stdio discipline are decided.
 #[cfg(not(unix))]
 fn taskkill_command(pid: u32) -> Command {
@@ -314,10 +314,20 @@ fn taskkill_command(pid: u32) -> Command {
     command
 }
 
-/// Runs `taskkill /T /F /PID <pid>` without a shell, waiting briefly for it to
-/// finish. Returns whether taskkill ran *and* reported success; `false` (it is
-/// not on PATH, or it failed) tells the caller to fall back to a direct
-/// `child.kill()`.
+/// Terminates the process tree rooted at `pid` -- on Windows through the
+/// native walk in [`native_tree`], elsewhere through `taskkill /T /F /PID
+/// <pid>` (without a shell). Returns whether the root itself was terminated;
+/// `false` (it was already gone, or could not be opened or killed) tells the
+/// caller to fall back to a direct `child.kill()`.
+///
+/// Not `taskkill` on Windows: taskkill enumerates processes through WMI, and
+/// a WMI round trip is bounded by nothing this process controls -- measured
+/// on a Windows 11 dev box at 7-10s per invocation even for a pid that does
+/// not exist, and ~15s for four concurrent ones. Every supervisor deadline,
+/// rot-kill, budget stop, nudge restart and distiller timeout paid that in
+/// full on its hot path, blocking the supervisor for tens of seconds under
+/// load. The native walk costs one Toolhelp snapshot per tree level, the
+/// kernel query `Get-Process` answers from.
 ///
 /// `pub(crate)` (P1): the pty seams -- `wrap::quit_child` and
 /// `dash::pane::Pane::finish_shutdown` -- have only ever had portable-pty's
@@ -327,14 +337,210 @@ fn taskkill_command(pid: u32) -> Command {
 /// left a live agent behind holding the repo. This is the same tree-kill
 /// `terminate` (exec/loop) has always used, reachable from those seams too.
 /// Never a substitute for evidence of death: portable-pty 0.9.0's own
-/// `kill()` inverts its success check, and taskkill's exit status says only
-/// that taskkill ran -- `try_wait`/`wait_for_exit` remain the only proof.
+/// `kill()` inverts its success check, and a tree-kill's own report says
+/// only what it attempted -- `try_wait`/`wait_for_exit` remain the only proof.
 #[cfg(not(unix))]
 pub(crate) fn kill_tree(pid: u32) -> bool {
-    taskkill_command(pid)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        native_tree::kill(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        taskkill_command(pid)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// The native tree-kill behind [`kill_tree`]: terminate the root, then level
+/// by level, take a Toolhelp process snapshot and terminate every live
+/// process whose recorded parent is a member already killed, until a snapshot
+/// finds none (or a small pass cap is reached).
+///
+/// Properties `taskkill /T` did not give:
+/// - A handle to every member is opened before it is terminated and held
+///   until the end. A pid cannot be reused while a handle to its process is
+///   open, so a later snapshot's parent link to a killed member still means
+///   what it says.
+/// - Parents die first, and each snapshot is taken only once the level
+///   before it is confirmed dead, so no member can spawn a child after the
+///   walk has looked past it (taskkill kills leaves first, then parents, and
+///   a shell looping on `sleep` re-spawned a child in that window).
+///
+/// A parent link alone is not proof of parentage: Windows never re-parents,
+/// so a process whose real parent died keeps naming that parent's pid after
+/// the pid is recycled. A child is therefore only followed when it was
+/// created no earlier than the member that holds its recorded parent pid.
+///
+/// Out of reach, exactly as for taskkill: a descendant whose own parent had
+/// already exited before the kill, since it names a dead pid no parent walk
+/// leads to. MSYS/Cygwin programs do this routinely -- a forked shell `exec`s
+/// its command as a new Windows process and then exits -- which is why a test
+/// fixture's `sleep 1` loop can outlive a kill by up to a second. The
+/// kill-on-close job ([`JobGuard`]) is the backstop for those.
+#[cfg(windows)]
+mod native_tree {
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    /// Snapshots taken below the root before giving up. Each one reaches a
+    /// whole further level of the tree, and a snapshot that finds nothing new
+    /// ends the walk, so a plain `cmd.exe` -> `node` tree costs two.
+    const MAX_SNAPSHOTS: usize = 4;
+
+    /// How long one level waits, in total, for its kills to land before the
+    /// next snapshot. `TerminateProcess` normally completes within a few
+    /// milliseconds, so this is paid only by a process stuck in the kernel --
+    /// and even then is a small, fixed bound.
+    const SETTLE: Duration = Duration::from_millis(250);
+
+    /// `(pid, parent pid)` for every process in one snapshot, or `None` when
+    /// no snapshot could be taken at all.
+    pub(super) fn parent_links() -> Option<Vec<(u32, u32)>> {
+        // SAFETY: the snapshot handle is checked before use and closed on the
+        // only exit past that check; `entry` is a plain `#[repr(C)]` POD whose
+        // `dwSize` is set before the first call, as the API requires.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut links = Vec::new();
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                links.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            (!links.is_empty()).then_some(links)
+        }
+    }
+
+    /// An open handle to one tree member and its creation time (100ns ticks).
+    struct Member {
+        pid: u32,
+        handle: HANDLE,
+        created: u64,
+    }
+
+    impl Member {
+        /// `None` when the pid is gone, or not ours to terminate.
+        fn open(pid: u32) -> Option<Self> {
+            let access =
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+            // SAFETY: `handle` is checked for null before use and closed on
+            // the failure path; every FILETIME is a live local.
+            unsafe {
+                let handle = OpenProcess(access, 0, pid);
+                if handle.is_null() {
+                    return None;
+                }
+                let mut times: [FILETIME; 4] = std::mem::zeroed();
+                let [created, exited, kernel, user] = &mut times;
+                if GetProcessTimes(handle, created, exited, kernel, user) == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                let created =
+                    (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+                Some(Self {
+                    pid,
+                    handle,
+                    created,
+                })
+            }
+        }
+
+        fn terminate(&self) -> bool {
+            // SAFETY: `handle` is open for as long as `self` lives.
+            unsafe { TerminateProcess(self.handle, 1) != 0 }
+        }
+
+        fn wait_until(&self, deadline: Instant) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: as in `terminate`. The result is not evidence of
+            // anything; the next snapshot is what is trusted.
+            unsafe {
+                WaitForSingleObject(self.handle, millis);
+            }
+        }
+    }
+
+    impl Drop for Member {
+        fn drop(&mut self) {
+            // SAFETY: a handle `open` created and nothing else closes.
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+
+    /// Adds every not-yet-held child of any member, breadth-first, so the
+    /// list stays ordered parents before children.
+    fn adopt_children(members: &mut Vec<Member>, links: &[(u32, u32)]) {
+        let mut next = 0;
+        while next < members.len() {
+            let (parent, parent_created) = (members[next].pid, members[next].created);
+            for &(pid, ppid) in links {
+                if ppid != parent || members.iter().any(|member| member.pid == pid) {
+                    continue;
+                }
+                if let Some(child) = Member::open(pid)
+                    && child.created >= parent_created
+                {
+                    members.push(child);
+                }
+            }
+            next += 1;
+        }
+    }
+
+    /// Whether the root itself was terminated: `false` when it was already
+    /// gone or could not be opened, exactly when `taskkill /T` failed too.
+    pub(super) fn kill(root: u32) -> bool {
+        let Some(root_member) = Member::open(root) else {
+            return false;
+        };
+        let mut members = vec![root_member];
+        let mut root_terminated = None;
+        // `members[..killed]` are terminated and waited on.
+        let mut killed = 0;
+        let mut snapshots = 0;
+        while killed < members.len() {
+            let level = &members[killed..];
+            // In walk order: parents before children.
+            let terminated: Vec<bool> = level.iter().map(Member::terminate).collect();
+            root_terminated.get_or_insert(terminated[0]);
+            let deadline = Instant::now() + SETTLE;
+            for member in level {
+                member.wait_until(deadline);
+            }
+            killed = members.len();
+            if snapshots == MAX_SNAPSHOTS {
+                break;
+            }
+            snapshots += 1;
+            let Some(links) = parent_links() else {
+                break;
+            };
+            adopt_children(&mut members, &links);
+        }
+        root_terminated.unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1387,85 @@ mod tests {
             taskkill_args(4242),
             ["/T", "/F", "/PID", "4242"].map(String::from),
             "the tree flag, the force flag, then the numeric pid -- nothing a shell could reparse"
+        );
+    }
+
+    /// The native walk `kill_tree` now uses must reach a grandchild, the
+    /// case the whole tree-kill exists for (`cmd.exe /c claude.cmd` running
+    /// the real agent as a `node` grandchild). `cmd /c waitfor` has the same
+    /// shape: cmd.exe never execs, so `waitfor` is a real child of it, and it
+    /// exits only when something kills it.
+    ///
+    /// The grandchild's handle is opened *before* the kill and death is read
+    /// from that handle, so a recycled pid cannot fake the result.
+    #[cfg(windows)]
+    #[test]
+    fn kill_tree_stops_the_grandchild_too() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        let signal = format!("zirvTreeKillProbe{}", std::process::id());
+        let Ok(mut child) = Command::new("cmd")
+            .args(["/d", "/c", "waitfor", "/T", "300", &signal])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipping: cmd.exe is not available on this machine");
+            return;
+        };
+        let root = child.id();
+
+        // Wait on an observable state -- the grandchild showing up in a
+        // process snapshot under this root -- not on a sleep.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let grandchildren: Vec<u32> = loop {
+            let links = native_tree::parent_links().expect("process snapshot");
+            let found: Vec<u32> = links
+                .iter()
+                .filter(|(_, ppid)| *ppid == root)
+                .map(|(pid, _)| *pid)
+                .collect();
+            if !found.is_empty() {
+                break found;
+            }
+            if child.try_wait().expect("try_wait").is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("skipping: waitfor.exe never started under cmd.exe here");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // SAFETY: each handle is checked for null, and closed after its wait.
+        let handles: Vec<_> = grandchildren
+            .iter()
+            .map(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, *pid) })
+            .collect();
+        assert!(
+            handles.iter().all(|handle| !handle.is_null()),
+            "open every grandchild before the kill"
+        );
+
+        assert!(kill_tree(root), "the root was terminated");
+        let waited: Vec<u32> = handles
+            .into_iter()
+            .map(|handle| {
+                // SAFETY: `handle` is open until the `CloseHandle` below.
+                unsafe {
+                    let waited = WaitForSingleObject(handle, 60_000);
+                    CloseHandle(handle);
+                    waited
+                }
+            })
+            .collect();
+        let _ = child.wait();
+        assert!(
+            waited.iter().all(|waited| *waited == WAIT_OBJECT_0),
+            "every grandchild must die with its tree, not be orphaned: {waited:?}"
         );
     }
 
