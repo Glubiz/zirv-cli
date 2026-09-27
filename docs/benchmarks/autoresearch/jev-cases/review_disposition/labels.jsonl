@@ -1,0 +1,16 @@
+{"id": "rvd-001", "labels": {"f0": "fix_now", "f1": "fix_now", "f2": "defer"}}
+{"id": "rvd-002", "labels": {"f0": "fix_now", "f1": "defer", "f2": "verify"}}
+{"id": "rvd-003", "labels": {"f0": "reject", "f1": "fix_now"}}
+{"id": "rvd-004", "labels": {"f0": "defer", "f1": "verify", "f2": "fix_now"}}
+{"id": "rvd-005", "labels": {"f0": "defer", "f1": "verify"}}
+{"id": "rvd-006", "labels": {"f0": "unchanged", "f1": "unchanged"}}
+{"id": "rvd-007", "labels": {"f0": "unchanged", "f1": "unchanged", "f2": "unchanged"}}
+{"id": "rvd-008", "labels": {"f0": "unchanged", "f1": "unchanged"}}
+{"id": "rvd-009", "labels": {"f0": "fix_now", "f1": "defer"}}
+{"id": "rvd-010", "labels": {"f0": "fix_now", "f1": "verify", "f2": "reject"}}
+{"id": "rvd-011", "labels": {"f0": "defer", "f1": "fix_now"}}
+{"id": "rvd-012", "labels": {"f0": "unchanged", "f1": "unchanged"}}
+{"id": "rvd-013", "labels": {"f0": "unchanged", "f1": "unchanged", "f2": "unchanged"}}
+{"id": "rvd-014", "labels": {"f0": "fix_now", "f1": "verify"}}
+{"id": "rvd-015", "labels": {"f0": "defer", "f1": "fix_now", "f2": "reject"}}
+{"id": "rvd-016", "labels": {"f0": "unchanged", "f1": "unchanged"}}

@@ -1,0 +1,119 @@
+# Jev determinism probe corpus for the new probe-only floor site "approve_lower"
+# (docs/superpowers work: jev-determinism campaigns, probe-contract
+# extension). Every case in cases.jsonl/labels.jsonl appears here exactly
+# once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "aprl-001"
+family = "jev-approve_lower"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-002"
+family = "jev-approve_lower"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-003"
+family = "jev-approve_lower"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-004"
+family = "jev-approve_lower"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-005"
+family = "jev-approve_lower"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-006"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-007"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-008"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "aprl-009"
+family = "jev-approve_lower"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "aprl-010"
+family = "jev-approve_lower"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "aprl-011"
+family = "jev-approve_lower"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "aprl-012"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "aprl-013"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "aprl-014"
+family = "jev-approve_lower"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "aprl-015"
+family = "jev-approve_lower"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "aprl-016"
+family = "jev-approve_lower"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"

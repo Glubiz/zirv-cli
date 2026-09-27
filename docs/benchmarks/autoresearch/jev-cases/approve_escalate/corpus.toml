@@ -1,0 +1,119 @@
+# Jev determinism probe corpus for the new probe-only floor site "approve_escalate"
+# (docs/superpowers work: jev-determinism campaigns, probe-contract
+# extension). Every case in cases.jsonl/labels.jsonl appears here exactly
+# once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "apre-001"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-002"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-003"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-004"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-005"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-006"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-007"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-008"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "apre-009"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-010"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-011"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-012"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-013"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-014"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "apre-015"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "apre-016"
+family = "jev-approve_escalate"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
