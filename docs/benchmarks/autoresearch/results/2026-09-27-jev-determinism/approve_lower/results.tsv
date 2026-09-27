@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	0.0003	0.0000	0.0000	A much lower margin floor (approve_lower) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	-0.0167	0.0000	0.0000	A moderately higher margin floor (approve_lower) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	-0.0173	0.0000	0.0000	A high margin floor (approve_lower) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	-0.0007	0.0000	0.0000	Raising the measurement confidence floor (approve_lower) above its compiled default (0.9) improves stability without an unacceptable correctness cost.

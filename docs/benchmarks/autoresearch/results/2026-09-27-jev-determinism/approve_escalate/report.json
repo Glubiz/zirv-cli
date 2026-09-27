@@ -1,0 +1,198 @@
+{
+  "campaign_id": "jev-determinism-approve_escalate",
+  "zirv_version": "4.38.0",
+  "baseline_sha": "20341da2ee586e4821522fcf35a7f4505a789564",
+  "started_at": 1790512819,
+  "finished_at": 1790512910,
+  "promoted": null,
+  "verdict": "no_improvement",
+  "objective": "quality",
+  "rows": [
+    {
+      "candidate": "esc-018",
+      "stage": "screen",
+      "verdict": "survive",
+      "hypothesis": "A 0.18 confidence / 0.17 margin floor sits in the gap between near-zero risky answers (<= 0.16) and mid-confidence ones (>= 0.19): escalation becomes deterministic.",
+      "d_correctness": [
+        0.2875
+      ],
+      "d_quality": [
+        0.05
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.04117799241117627
+      ],
+      "reasons": [],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "esc-018",
+      "stage": "validate",
+      "verdict": "inconclusive",
+      "hypothesis": "A 0.18 confidence / 0.17 margin floor sits in the gap between near-zero risky answers (<= 0.16) and mid-confidence ones (>= 0.19): escalation becomes deterministic.",
+      "d_correctness": [
+        0.2153846153846154
+      ],
+      "d_quality": [
+        -0.025641025641025637
+      ],
+      "rel_cost": [],
+      "rel_wall": [],
+      "reasons": [
+        "meta:sonnet:cold:natural: quality regression CI lower -0.072 below margin 0.020"
+      ],
+      "confidence": 0.95,
+      "seed": 3143552233102399253,
+      "excluded_by_reason": {},
+      "cohorts": [
+        {
+          "cohort": "meta:sonnet:cold:natural",
+          "verdict": "inconclusive",
+          "reasons": [
+            "meta:sonnet:cold:natural: quality regression CI lower -0.072 below margin 0.020"
+          ],
+          "n_pairs": 39,
+          "excluded": 0,
+          "baseline": {
+            "n": 39,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.4358974358974359,
+            "quality_mean": 0.9794871794871796,
+            "cost_per_success_usd": 0.00009999999999999992,
+            "cost_complete": true,
+            "wall_median_ms": 1449,
+            "wall_p90_ms": 1626
+          },
+          "candidate": {
+            "n": 39,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6512820512820513,
+            "quality_mean": 0.953846153846154,
+            "cost_per_success_usd": 0.00009999999999999992,
+            "cost_complete": true,
+            "wall_median_ms": 1362,
+            "wall_p90_ms": 1477
+          },
+          "d_correctness": {
+            "point": 0.2153846153846154,
+            "lo": 0.1076923076923077,
+            "hi": 0.3384615384615385
+          },
+          "d_quality": {
+            "point": -0.025641025641025637,
+            "lo": -0.07179487179487179,
+            "hi": 0.020512820512820513
+          },
+          "rel_cost": null,
+          "rel_wall": null
+        }
+      ]
+    },
+    {
+      "candidate": "esc-025",
+      "stage": "screen",
+      "verdict": "survive",
+      "hypothesis": "A 0.25 confidence floor (margin at 0.2) escalates most mid-confidence risky commands deterministically with a wider buffer above the near-zero cluster.",
+      "d_correctness": [
+        0.275
+      ],
+      "d_quality": [
+        0.0375
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.001552259399793032
+      ],
+      "reasons": [],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "esc-025",
+      "stage": "validate",
+      "verdict": "inconclusive",
+      "hypothesis": "A 0.25 confidence floor (margin at 0.2) escalates most mid-confidence risky commands deterministically with a wider buffer above the near-zero cluster.",
+      "d_correctness": [
+        0.1794871794871795
+      ],
+      "d_quality": [
+        -0.010256410256410251
+      ],
+      "rel_cost": [],
+      "rel_wall": [],
+      "reasons": [
+        "meta:sonnet:cold:natural: quality regression CI lower -0.051 below margin 0.020"
+      ],
+      "confidence": 0.95,
+      "seed": 477237767966037966,
+      "excluded_by_reason": {},
+      "cohorts": [
+        {
+          "cohort": "meta:sonnet:cold:natural",
+          "verdict": "inconclusive",
+          "reasons": [
+            "meta:sonnet:cold:natural: quality regression CI lower -0.051 below margin 0.020"
+          ],
+          "n_pairs": 39,
+          "excluded": 0,
+          "baseline": {
+            "n": 39,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.4358974358974359,
+            "quality_mean": 0.9794871794871796,
+            "cost_per_success_usd": 0.00009999999999999992,
+            "cost_complete": true,
+            "wall_median_ms": 1449,
+            "wall_p90_ms": 1626
+          },
+          "candidate": {
+            "n": 39,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6153846153846154,
+            "quality_mean": 0.9692307692307692,
+            "cost_per_success_usd": 0.00009999999999999992,
+            "cost_complete": true,
+            "wall_median_ms": 1385,
+            "wall_p90_ms": 1460
+          },
+          "d_correctness": {
+            "point": 0.1794871794871795,
+            "lo": 0.08205128205128205,
+            "hi": 0.2820512820512821
+          },
+          "d_quality": {
+            "point": -0.010256410256410251,
+            "lo": -0.05128205128205127,
+            "hi": 0.030769230769230774
+          },
+          "rel_cost": null,
+          "rel_wall": null
+        }
+      ]
+    }
+  ],
+  "stopped_reason": null,
+  "spend": {
+    "execution_usd": 0.016499999999999956,
+    "overhead_usd": 0.0,
+    "completeness": "complete"
+  }
+}

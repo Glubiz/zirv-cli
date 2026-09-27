@@ -1,8 +1,7 @@
 candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
-margin-010	screen	discard	0.0000	-0.0094	-0.0125	-0.0125	A much lower margin floor (handoff_select) trades away stability for more decisive Jev answers.
-margin-030	screen	survive	0.0000	-0.0030	0.0250	0.0500	A moderately higher margin floor (handoff_select) buys some stability without much lost coverage.
-margin-030	validate	inconclusive	-	-	-0.0400	-	A moderately higher margin floor (handoff_select) buys some stability without much lost coverage.
-margin-040	screen	survive	0.0000	-0.0011	0.0375	0.0250	A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.
-margin-040	validate	inconclusive	-	-	-0.0200	-	A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.
-confidence-raised	screen	survive	0.0000	0.0011	0.1625	0.1250	Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.
-confidence-raised	validate	inconclusive	0.0000	-0.0497	0.0400	0.0400	Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.
+margin-010	screen	discard	0.0000	-0.0121	-0.0750	-0.0125	A much lower margin floor (handoff_select) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	0.0090	-0.0750	-0.0750	A moderately higher margin floor (handoff_select) buys some stability without much lost coverage.
+margin-040	screen	survive	0.0000	0.0033	-0.0250	0.0125	A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.
+margin-040	validate	inconclusive	-	-	0.0133	-0.0133	A high margin floor (handoff_select) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	survive	0.0000	0.0231	0.1125	0.0750	Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.
+confidence-raised	validate	inconclusive	0.0000	0.0275	0.0933	0.0533	Raising the confidence floor (handoff_select) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

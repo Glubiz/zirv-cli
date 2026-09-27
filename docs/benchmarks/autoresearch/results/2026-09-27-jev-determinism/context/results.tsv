@@ -1,5 +1,5 @@
 candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
-margin-010	screen	discard	0.0000	-0.0442	0.0000	0.0000	A much lower margin floor (context) trades away stability for more decisive Jev answers.
-margin-030	screen	discard	0.0000	-0.0158	0.0000	0.0000	A moderately higher margin floor (context) buys some stability without much lost coverage.
-margin-040	screen	discard	0.0000	-0.0350	0.0000	0.0000	A high margin floor (context) maximizes stability at the cost of coverage/correctness.
-confidence-raised	screen	discard	0.0000	-0.0451	0.0000	0.0000	Raising the confidence floor (context) above its compiled default (0.0) improves stability without an unacceptable correctness cost.
+margin-010	screen	discard	0.0000	0.0282	0.0000	0.0000	A much lower margin floor (context) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	0.0228	0.0000	0.0000	A moderately higher margin floor (context) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	0.0407	0.0000	0.0000	A high margin floor (context) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	0.0183	0.0000	0.0000	Raising the confidence floor (context) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

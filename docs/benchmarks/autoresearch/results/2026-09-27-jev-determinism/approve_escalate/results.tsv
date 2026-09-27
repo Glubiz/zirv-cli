@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+esc-018	screen	survive	0.0000	0.0412	0.2875	0.0500	A 0.18 confidence / 0.17 margin floor sits in the gap between near-zero risky answers (<= 0.16) and mid-confidence ones (>= 0.19): escalation becomes deterministic.
+esc-018	validate	inconclusive	-	-	0.2154	-0.0256	A 0.18 confidence / 0.17 margin floor sits in the gap between near-zero risky answers (<= 0.16) and mid-confidence ones (>= 0.19): escalation becomes deterministic.
+esc-025	screen	survive	0.0000	0.0016	0.2750	0.0375	A 0.25 confidence floor (margin at 0.2) escalates most mid-confidence risky commands deterministically with a wider buffer above the near-zero cluster.
+esc-025	validate	inconclusive	-	-	0.1795	-0.0103	A 0.25 confidence floor (margin at 0.2) escalates most mid-confidence risky commands deterministically with a wider buffer above the near-zero cluster.

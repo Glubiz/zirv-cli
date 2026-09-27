@@ -1,0 +1,5 @@
+candidate	stage	verdict	rel_cost	rel_wall	d_correctness	d_quality	hypothesis
+margin-010	screen	discard	0.0000	0.0018	0.0000	0.0000	A much lower margin floor (stop_verify) trades away stability for more decisive Jev answers.
+margin-030	screen	discard	0.0000	0.0139	0.0000	0.0000	A moderately higher margin floor (stop_verify) buys some stability without much lost coverage.
+margin-040	screen	discard	0.0000	-0.0245	0.0000	0.0000	A high margin floor (stop_verify) maximizes stability at the cost of coverage/correctness.
+confidence-raised	screen	discard	0.0000	-0.0197	0.0000	0.0000	Raising the measurement confidence floor (stop_verify) above its compiled default (0.0) improves stability without an unacceptable correctness cost.

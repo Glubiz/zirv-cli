@@ -1,9 +1,9 @@
 {
   "campaign_id": "jev-determinism-intake",
   "zirv_version": "4.38.0",
-  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
-  "started_at": 1790507516,
-  "finished_at": 1790507714,
+  "baseline_sha": "7978bf6bbe853d83ce280759eb859f6c21b35120",
+  "started_at": 1790512332,
+  "finished_at": 1790512722,
   "promoted": null,
   "verdict": "no_improvement",
   "objective": "quality",
@@ -11,27 +11,86 @@
     {
       "candidate": "margin-010",
       "stage": "screen",
-      "verdict": "discard",
+      "verdict": "survive",
       "hypothesis": "A much lower margin floor trades away stability for more decisive Jev/helper answers.",
       "d_correctness": [
-        0.008333333333333331
+        0.012500000000000002
       ],
       "d_quality": [
-        0.016666666666666663
+        0.016666666666666666
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.2768394799480327
+        0.03695698017714044
       ],
-      "reasons": [
-        "no material quality point-estimate improvement"
-      ],
+      "reasons": [],
       "confidence": null,
       "seed": null,
       "excluded_by_reason": {},
       "cohorts": []
+    },
+    {
+      "candidate": "margin-010",
+      "stage": "validate",
+      "verdict": "inconclusive",
+      "hypothesis": "A much lower margin floor trades away stability for more decisive Jev/helper answers.",
+      "d_correctness": [
+        -0.025000000000000005
+      ],
+      "d_quality": [],
+      "rel_cost": [],
+      "rel_wall": [],
+      "reasons": [
+        "meta:sonnet:cold:natural: correctness regression CI lower -0.072 below margin 0.050"
+      ],
+      "confidence": 0.9666666666666668,
+      "seed": 2718484640359507417,
+      "excluded_by_reason": {},
+      "cohorts": [
+        {
+          "cohort": "meta:sonnet:cold:natural",
+          "verdict": "inconclusive",
+          "reasons": [
+            "meta:sonnet:cold:natural: correctness regression CI lower -0.072 below margin 0.050"
+          ],
+          "n_pairs": 36,
+          "excluded": 0,
+          "baseline": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6499999999999999,
+            "quality_mean": 0.95,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3251,
+            "wall_p90_ms": 3546
+          },
+          "candidate": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.625,
+            "quality_mean": 1.0,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3218,
+            "wall_p90_ms": 3535
+          },
+          "d_correctness": {
+            "point": -0.025000000000000005,
+            "lo": -0.07222222222222223,
+            "hi": 0.013888888888888886
+          },
+          "d_quality": null,
+          "rel_cost": null,
+          "rel_wall": null
+        }
+      ]
     },
     {
       "candidate": "margin-030",
@@ -39,16 +98,16 @@
       "verdict": "discard",
       "hypothesis": "A moderately higher margin floor buys some stability without much lost coverage.",
       "d_correctness": [
-        -0.008333333333333352
+        -0.020833333333333332
       ],
       "d_quality": [
-        -0.21666666666666676
+        -0.2666666666666667
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.2780533138614143
+        0.05377477857444117
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -61,27 +120,86 @@
     {
       "candidate": "margin-040",
       "stage": "screen",
-      "verdict": "discard",
+      "verdict": "survive",
       "hypothesis": "A high margin floor maximizes stability at the cost of coverage/correctness.",
       "d_correctness": [
-        0.00833333333333334
+        0.012499999999999992
       ],
       "d_quality": [
-        0.016666666666666663
+        0.016666666666666666
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.3160614882741747
+        0.04055514550822438
       ],
-      "reasons": [
-        "no material quality point-estimate improvement"
-      ],
+      "reasons": [],
       "confidence": null,
       "seed": null,
       "excluded_by_reason": {},
       "cohorts": []
+    },
+    {
+      "candidate": "margin-040",
+      "stage": "validate",
+      "verdict": "inconclusive",
+      "hypothesis": "A high margin floor maximizes stability at the cost of coverage/correctness.",
+      "d_correctness": [
+        -0.01944444444444444
+      ],
+      "d_quality": [],
+      "rel_cost": [],
+      "rel_wall": [],
+      "reasons": [
+        "meta:sonnet:cold:natural: correctness regression CI lower -0.189 below margin 0.050"
+      ],
+      "confidence": 0.9666666666666668,
+      "seed": 12964310675060901756,
+      "excluded_by_reason": {},
+      "cohorts": [
+        {
+          "cohort": "meta:sonnet:cold:natural",
+          "verdict": "inconclusive",
+          "reasons": [
+            "meta:sonnet:cold:natural: correctness regression CI lower -0.189 below margin 0.050"
+          ],
+          "n_pairs": 36,
+          "excluded": 0,
+          "baseline": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6499999999999999,
+            "quality_mean": 0.95,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3251,
+            "wall_p90_ms": 3546
+          },
+          "candidate": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6305555555555555,
+            "quality_mean": 0.9888888888888888,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3400,
+            "wall_p90_ms": 3906
+          },
+          "d_correctness": {
+            "point": -0.01944444444444444,
+            "lo": -0.18888888888888897,
+            "hi": 0.14722222222222223
+          },
+          "d_quality": null,
+          "rel_cost": null,
+          "rel_wall": null
+        }
+      ]
     },
     {
       "candidate": "confidence-raised",
@@ -89,16 +207,16 @@
       "verdict": "discard",
       "hypothesis": "Raising the confidence floor above its compiled default (0.5 -> 0.6) improves stability without an unacceptable correctness cost.",
       "d_correctness": [
-        0.004166666666666666
+        -0.004166666666666661
       ],
       "d_quality": [
-        0.008333333333333331
+        -0.016666666666666663
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.26844695640629296
+        0.03289751159848165
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -111,19 +229,103 @@
     {
       "candidate": "margin-015",
       "stage": "screen",
-      "verdict": "discard",
+      "verdict": "survive",
       "hypothesis": "A slightly lower margin floor keeps every acted field stable while acting on more Jev answers.",
       "d_correctness": [
-        0.008333333333333331
+        0.012500000000000002
       ],
       "d_quality": [
-        0.016666666666666663
+        0.016666666666666666
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.24542204436183623
+        0.01221794601433994
+      ],
+      "reasons": [],
+      "confidence": null,
+      "seed": null,
+      "excluded_by_reason": {},
+      "cohorts": []
+    },
+    {
+      "candidate": "margin-015",
+      "stage": "validate",
+      "verdict": "inconclusive",
+      "hypothesis": "A slightly lower margin floor keeps every acted field stable while acting on more Jev answers.",
+      "d_correctness": [
+        -0.01666666666666667
+      ],
+      "d_quality": [],
+      "rel_cost": [],
+      "rel_wall": [],
+      "reasons": [
+        "meta:sonnet:cold:natural: correctness regression CI lower -0.058 below margin 0.050"
+      ],
+      "confidence": 0.9666666666666668,
+      "seed": 5082775844212490992,
+      "excluded_by_reason": {},
+      "cohorts": [
+        {
+          "cohort": "meta:sonnet:cold:natural",
+          "verdict": "inconclusive",
+          "reasons": [
+            "meta:sonnet:cold:natural: correctness regression CI lower -0.058 below margin 0.050"
+          ],
+          "n_pairs": 36,
+          "excluded": 0,
+          "baseline": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6499999999999999,
+            "quality_mean": 0.95,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3251,
+            "wall_p90_ms": 3546
+          },
+          "candidate": {
+            "n": 36,
+            "success_rate": 1.0,
+            "timeout_rate": 0.0,
+            "error_rate": 0.0,
+            "correctness_mean": 0.6333333333333333,
+            "quality_mean": 0.9833333333333336,
+            "cost_per_success_usd": 0.00011500000000000004,
+            "cost_complete": true,
+            "wall_median_ms": 3416,
+            "wall_p90_ms": 3695
+          },
+          "d_correctness": {
+            "point": -0.01666666666666667,
+            "lo": -0.058333333333333334,
+            "hi": 0.016666666666666663
+          },
+          "d_quality": null,
+          "rel_cost": null,
+          "rel_wall": null
+        }
+      ]
+    },
+    {
+      "candidate": "margin-025",
+      "stage": "screen",
+      "verdict": "discard",
+      "hypothesis": "A slightly higher margin floor removes the residual clarify flips without entering the ~0.3 margin cluster.",
+      "d_correctness": [
+        -0.025
+      ],
+      "d_quality": [
+        -0.008333333333333326
+      ],
+      "rel_cost": [
+        0.0
+      ],
+      "rel_wall": [
+        0.03774778574441163
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -134,21 +336,21 @@
       "cohorts": []
     },
     {
-      "candidate": "margin-025",
+      "candidate": "margin-017",
       "stage": "screen",
       "verdict": "discard",
-      "hypothesis": "A slightly higher margin floor removes the residual clarify flips without entering the ~0.3 margin cluster.",
+      "hypothesis": "The lowest margin that still clears every stable answer the 2026-09-18 measurement saw (>= 0.17) removes the residual clarify flips.",
       "d_correctness": [
-        -4.625929269271485e-18
+        0.00416666666666667
       ],
       "d_quality": [
-        -0.06666666666666667
+        4.625929269271485e-18
       ],
       "rel_cost": [
         0.0
       ],
       "rel_wall": [
-        -0.27327384282747436
+        0.041240510333192745
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -161,7 +363,7 @@
   ],
   "stopped_reason": null,
   "spend": {
-    "execution_usd": 0.019320000000000042,
+    "execution_usd": 0.038639999999999904,
     "overhead_usd": 0.0,
     "completeness": "complete"
   }

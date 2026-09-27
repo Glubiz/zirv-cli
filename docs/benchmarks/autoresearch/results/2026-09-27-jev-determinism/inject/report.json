@@ -1,9 +1,9 @@
 {
   "campaign_id": "jev-determinism-inject",
   "zirv_version": "4.38.0",
-  "baseline_sha": "b7469607ea5c0ed43285a01952ea0cc1a7414b5d",
-  "started_at": 1790507470,
-  "finished_at": 1790507515,
+  "baseline_sha": "7978bf6bbe853d83ce280759eb859f6c21b35120",
+  "started_at": 1790512286,
+  "finished_at": 1790512332,
   "promoted": null,
   "verdict": "no_improvement",
   "objective": "quality",
@@ -23,7 +23,7 @@
         0.0
       ],
       "rel_wall": [
-        -0.002959722043495046
+        -0.004380279801546507
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -48,7 +48,7 @@
         0.0
       ],
       "rel_wall": [
-        -0.011281259383176768
+        0.008224198811066912
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -73,7 +73,7 @@
         0.0
       ],
       "rel_wall": [
-        -0.0384334920430661
+        0.05082018504447325
       ],
       "reasons": [
         "no material quality point-estimate improvement"
@@ -98,7 +98,7 @@
         0.0
       ],
       "rel_wall": [
-        0.004675502938274782
+        0.006570419702319761
       ],
       "reasons": [
         "no material quality point-estimate improvement"

@@ -5,9 +5,9 @@
 ## Provenance
 - zirv version: 4.38.0
 - manifest: `docs\benchmarks\autoresearch\campaigns\jev-determinism-harvest_screen.toml`
-- manifest sha256: 3abba7787ba86bdc463b14e65161239a581785a8f2624aa76a6bafa26344e6b6
+- manifest sha256: 4e2375c61442645a8fee00de43cddccf082c66c1d2d7927361c2f1c84086b1d3
 - repo: `<repo>`
-- baseline commit: 43999822a3bf6f816bdd80949ceb22466b7a0cb8
+- baseline commit: 7978bf6bbe853d83ce280759eb859f6c21b35120
 - corpus: `docs/benchmarks/autoresearch/jev-cases/harvest_screen/corpus.toml`
 - corpus version: 1
 - billing: `Metered`
@@ -18,8 +18,8 @@
 - evaluator version: 1
 - evaluator fingerprint: eb0a10d1c1012fd08f43ab6c8bfa719aa700af30e27d6434315b055a960b2f05
 - price table as_of: 2026-09-01
-- started at: 1790507040 (2026-09-27 11:04:00 UTC)
-- finished at: 1790507087 (2026-09-27 11:04:47 UTC)
+- started at: 1790511795 (2026-09-27 12:23:15 UTC)
+- finished at: 1790511845 (2026-09-27 12:24:05 UTC)
 
 ## Promotion criteria
 Values actually used, from this manifest's own `[criteria]` table (never a hardcoded default once a manifest sets one):
@@ -31,7 +31,7 @@ Values actually used, from this manifest's own `[criteria]` table (never a hardc
 | max_correctness_regression | 0.050 |
 | max_quality_regression | 0.020 |
 | objective | quality |
-| min_effect | 0.050 |
+| min_effect | 0.010 |
 | confidence (base) | 0.900 |
 | bootstrap_resamples | 2000 |
 
@@ -40,11 +40,11 @@ Values actually used, from this manifest's own `[criteria]` table (never a hardc
 |---|---|---|
 | spend (execution) | (part of total spend, below) | $0.0064 |
 | spend (overhead) | (part of total spend, below) | $0.0000 |
-| spend (total) | $0.35 | $0.0064 |
+| spend (total) | $0.10 | $0.0064 |
 | calls | 1000 | 400 |
 | trials | 200 | 80 |
 | retries (per-trial cap: 1) | max attempt seen: 0 | 0 retry dispatches total |
-| wall | 3600s | 47s |
+| wall | 3600s | 50s |
 
 ## Spend
 - execution: $0.0064 (what the trials' own arms cost -- what a candidate's cost axis is judged on)
@@ -59,10 +59,10 @@ Values actually used, from this manifest's own `[criteria]` table (never a hardc
 ## Candidates
 | candidate | stage | verdict | rel_cost | rel_wall | d_correctness | d_quality |
 |---|---|---|---|---|---|---|
-| margin-010 | screen | discard | 0.0000 | -0.0531 | 0.0000 | 0.0000 |
-| margin-030 | screen | discard | 0.0000 | -0.0337 | 0.0000 | 0.0000 |
-| margin-040 | screen | discard | 0.0000 | -0.0612 | 0.0000 | 0.0000 |
-| confidence-raised | screen | discard | 0.0000 | -0.0421 | 0.0000 | 0.0000 |
+| margin-010 | screen | discard | 0.0000 | -0.0062 | 0.0000 | 0.0000 |
+| margin-030 | screen | discard | 0.0000 | -0.0155 | 0.0000 | 0.0000 |
+| margin-040 | screen | discard | 0.0000 | -0.0042 | 0.0000 | 0.0000 |
+| confidence-raised | screen | discard | 0.0000 | 0.0111 | 0.0000 | 0.0000 |
 
 ### `margin-010`
 A much lower margin floor (harvest_screen) trades away stability for more decisive Jev answers.
@@ -103,7 +103,7 @@ Raising the confidence floor (harvest_screen) above its compiled default (0.8) i
 ## Reproduction
 1. Check out the exact baseline this campaign ran against:
 ```
-git -C "<repo>" checkout 43999822a3bf6f816bdd80949ceb22466b7a0cb8
+git -C "<repo>" checkout 7978bf6bbe853d83ce280759eb859f6c21b35120
 ```
 2. Run the same manifest, resuming this campaign directory if it stopped early (a fresh run without `--resume` starts a new campaign instead):
 ```
