@@ -68,6 +68,60 @@ pub const DEDUP_SKIP_ACTION: &str = "context-dedup-skip";
 // a mismatch; Jev sees these labels and counts, never task or report prose.
 const PARENT_REPORT_OMIT_MAX: f64 = 0.1;
 
+/// [`task_context_with_selected_reports`]'s and [`selected_skill_index_
+/// text`]'s shared floor default -- both call [`jev::floor`] with this exact
+/// pair; named (issue: `zirv ctx jev probe`) so a later retune targets
+/// exactly this constant.
+pub(crate) const CONTEXT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+
+/// [`task_context_with_selected_reports`]'s own one-noul-per-parent
+/// question, factored out so `zirv ctx jev probe` can ask the exact same
+/// question from a fixture's own parent id, without rebuilding a
+/// `task::Card` list it has no way to construct.
+pub(crate) fn context_report_question(id: &str) -> jev::Question {
+    jev::Question::metadata_noul(
+        id,
+        "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each \
+         later row is [candidate index, parent domain, lexical overlap 0-3, report size bucket \
+         0-2]. Is optional prose for this candidate necessary despite the distinct domain and \
+         low overlap? Answer true if uncertain.",
+        "report prose is needed; keep it",
+        "report prose is unrelated; retain only the on-demand task-card pointer",
+    )
+}
+
+/// [`selected_skill_index_text`]'s own one-noul-per-skill question, the
+/// skill-description mirror of [`context_report_question`].
+pub(crate) fn context_skill_question(id: &str) -> jev::Question {
+    jev::Question::metadata_noul(
+        id,
+        "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each \
+         later row is [candidate index, description domain, size bucket 0-2]. Is this optional \
+         skill description needed now despite its distinct domain? Answer true if uncertain; \
+         the skill ID and load route remain available.",
+        "keep optional description",
+        "description can be omitted while retaining discovery ID",
+    )
+}
+
+/// The shared omit/keep decision both [`task_context_with_selected_
+/// reports`] and [`selected_skill_index_text`] apply to their own decisive
+/// noul: omit only when decisive AND the noul is at or below [`PARENT_
+/// REPORT_OMIT_MAX`]. Shared with `zirv ctx jev probe`, which reports
+/// exactly this outcome (`"omit"`/`"keep"`) per candidate id.
+pub(crate) fn parent_report_omit(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> bool {
+    answer.is_some_and(|answer| {
+        answer.decisive(min_confidence, min_margin)
+            && answer
+                .as_noul()
+                .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
+    })
+}
+
 fn context_domain(text: &str) -> Option<&'static str> {
     let words: std::collections::BTreeSet<&str> = text
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -163,12 +217,7 @@ pub(crate) fn task_context_with_selected_reports(
                 _ => 2,
             },
         ]);
-        questions.push(jev::Question::metadata_noul(
-            &format!("p{index}"),
-            "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each later row is [candidate index, parent domain, lexical overlap 0-3, report size bucket 0-2]. Is optional prose for this candidate necessary despite the distinct domain and low overlap? Answer true if uncertain.",
-            "report prose is needed; keep it",
-            "report prose is unrelated; retain only the on-demand task-card pointer",
-        ));
+        questions.push(context_report_question(&format!("p{index}")));
     }
     if questions.is_empty() {
         return baseline;
@@ -193,13 +242,13 @@ pub(crate) fn task_context_with_selected_reports(
         let Some(answer) = answers.get(&format!("p{index}")) else {
             continue;
         };
-        let (min_confidence, min_margin) =
-            jev::floor(cfg, jev::FloorSite::Context, 0.0, jev::DEFAULT_MIN_MARGIN);
-        if answer.decisive(min_confidence, min_margin)
-            && answer
-                .as_noul()
-                .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
-        {
+        let (min_confidence, min_margin) = jev::floor(
+            cfg,
+            jev::FloorSite::Context,
+            CONTEXT_DEFAULT_FLOOR.0,
+            CONTEXT_DEFAULT_FLOOR.1,
+        );
+        if parent_report_omit(Some(answer), min_confidence, min_margin) {
             selected[index].outcome = Some(format!(
                 "[optional report omitted; run zirv ctx task show {} to read it]",
                 selected[index].id
@@ -278,12 +327,7 @@ pub(super) fn selected_skill_index_text(
                 _ => 2,
             },
         ]);
-        questions.push(jev::Question::metadata_noul(
-            &format!("s{index}"),
-            "Facts row 0 is task domain (1 frontend, 2 data, 3 security, 4 docs, 5 devops); each later row is [candidate index, description domain, size bucket 0-2]. Is this optional skill description needed now despite its distinct domain? Answer true if uncertain; the skill ID and load route remain available.",
-            "keep optional description",
-            "description can be omitted while retaining discovery ID",
-        ));
+        questions.push(context_skill_question(&format!("s{index}")));
     }
     if questions.is_empty() {
         return Some((baseline, String::new(), 0, None));
@@ -303,18 +347,21 @@ pub(super) fn selected_skill_index_text(
         return Some((baseline, String::new(), 0, None));
     };
     let mut omitted = 0usize;
-    let (context_min_confidence, context_min_margin) =
-        jev::floor(cfg, jev::FloorSite::Context, 0.0, jev::DEFAULT_MIN_MARGIN);
+    let (context_min_confidence, context_min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::Context,
+        CONTEXT_DEFAULT_FLOOR.0,
+        CONTEXT_DEFAULT_FLOOR.1,
+    );
     let descriptions = entries
         .iter()
         .enumerate()
         .filter_map(|(index, (id, summary, repository))| {
-            let omit = answers.get(&format!("s{index}")).is_some_and(|answer| {
-                answer.decisive(context_min_confidence, context_min_margin)
-                    && answer
-                        .as_noul()
-                        .is_some_and(|value| value <= PARENT_REPORT_OMIT_MAX)
-            });
+            let omit = parent_report_omit(
+                answers.get(&format!("s{index}")),
+                context_min_confidence,
+                context_min_margin,
+            );
             if omit {
                 omitted += 1;
                 None
@@ -771,6 +818,50 @@ const MEMORY_ADVISE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is \
     indicates a less useful one. Is this candidate likely directly useful \
     for carrying out the request? Answer true if uncertain.";
 
+/// [`rerank_memory_candidates`]'s own one-noul-per-candidate question,
+/// factored out so `zirv ctx jev probe` (`jev_probe.rs`) can ask the exact
+/// same question set from a fixture's own candidate ids, without rebuilding
+/// `retrieval::Ranked` candidates it has no way to construct.
+pub(crate) fn memory_rerank_questions(ids: &[String]) -> Vec<jev::Question> {
+    ids.iter()
+        .map(|id| {
+            jev::Question::metadata_noul(
+                id,
+                MEMORY_ADVISE_INSTRUCTIONS,
+                "candidate is useful; keep it",
+                "candidate is not useful; prune it",
+            )
+        })
+        .collect()
+}
+
+/// The [`rerank_memory_candidates`] per-candidate decision: `"keep"` when the
+/// candidate is retained (whether re-scored by a decisive `noul` or kept in
+/// its original position because the answer was missing, indecisive, or
+/// unparseable), `"prune"` only for a decisive noul below [`memory::
+/// MEMORY_RELEVANCE_FLOOR`]. Shared with `zirv ctx jev probe`, which reports
+/// exactly this outcome per candidate id.
+pub(crate) fn memory_rerank_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    match answer {
+        None => "keep",
+        Some(answer) if !answer.decisive(min_confidence, min_margin) => "keep",
+        Some(answer) => match answer.as_noul() {
+            Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => "keep",
+            Some(_) => "prune",
+            None => "keep",
+        },
+    }
+}
+
+/// [`rerank_memory_candidates`]'s own floor default -- named (issue: `zirv
+/// ctx jev probe`) so a later retune targets exactly this constant, the same
+/// way every other tunable site's default floor is now named.
+pub(crate) const MEMORY_RERANK_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+
 /// Lowercased, punctuation-trimmed words of at least 3 characters -- the
 /// same coarse normalization `context_domain` (above) already applies, used
 /// here only to COUNT a lexical overlap locally; no word ever leaves this
@@ -895,17 +986,7 @@ fn rerank_memory_candidates<'a>(
             memory_advise_facts_row(index, ranked, &query_terms, changed_paths_bounded)
         })
         .collect();
-    let questions: Vec<jev::Question> = ids
-        .iter()
-        .map(|id| {
-            jev::Question::metadata_noul(
-                id,
-                MEMORY_ADVISE_INSTRUCTIONS,
-                "candidate is useful; keep it",
-                "candidate is not useful; prune it",
-            )
-        })
-        .collect();
+    let questions = memory_rerank_questions(&ids);
     let advise_state = ParentReportMetadata {
         _zirv_metadata_only: true,
         facts,
@@ -932,34 +1013,33 @@ fn rerank_memory_candidates<'a>(
     let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
     let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
     let mut retained_body_bytes = 0usize;
-    let (memory_min_confidence, memory_min_margin) =
-        jev::floor(cfg, jev::FloorSite::Memory, 0.0, jev::DEFAULT_MIN_MARGIN);
+    let (memory_min_confidence, memory_min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::Memory,
+        MEMORY_RERANK_DEFAULT_FLOOR.0,
+        MEMORY_RERANK_DEFAULT_FLOOR.1,
+    );
     for ((index, ranked), id) in sent.into_iter().enumerate().zip(ids.iter()) {
         // Jev determinism fix: a noul answer that is not `decisive` (margin
         // below `jev::DEFAULT_MIN_MARGIN`; a noul has no separate confidence
         // to check, so this is a margin-only gate) is treated the same as a
         // missing one -- kept, original position -- rather than trusted to
-        // score or prune the candidate.
-        match answers.get(id) {
-            Some(answer) if !answer.decisive(memory_min_confidence, memory_min_margin) => {
-                retained_body_bytes += sent_body_bytes[index];
-                unanswered.push(ranked);
-            }
-            Some(answer) => match answer.as_noul() {
-                Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => {
-                    retained_body_bytes += sent_body_bytes[index];
-                    scored.push((noul, ranked));
-                }
-                Some(_) => {} // a decisive low-relevance verdict prunes the candidate.
-                None => {
-                    retained_body_bytes += sent_body_bytes[index];
-                    unanswered.push(ranked); // unparseable: kept, original position.
-                }
-            },
-            None => {
-                retained_body_bytes += sent_body_bytes[index];
-                unanswered.push(ranked); // missing: kept, original position.
-            }
+        // score or prune the candidate. `memory_rerank_action` is the exact
+        // same keep/prune rule `zirv ctx jev probe` reports.
+        let answer = answers.get(id);
+        if memory_rerank_action(answer, memory_min_confidence, memory_min_margin) == "prune" {
+            continue;
+        }
+        retained_body_bytes += sent_body_bytes[index];
+        let decisive_noul = answer.and_then(|answer| {
+            answer
+                .decisive(memory_min_confidence, memory_min_margin)
+                .then(|| answer.as_noul())
+                .flatten()
+        });
+        match decisive_noul {
+            Some(noul) => scored.push((noul, ranked)),
+            None => unanswered.push(ranked), // missing/indecisive/unparseable: kept, original position.
         }
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

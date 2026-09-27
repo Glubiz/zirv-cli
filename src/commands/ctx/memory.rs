@@ -3030,6 +3030,46 @@ const HARVEST_GATE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is [conten
     Based only on these counts, is this candidate a durable fact a future session cannot \
     derive from the code or git history, rather than transient narration or a status update?";
 
+/// [`apply_jev_harvest_gate`]'s own one-noul-per-candidate question,
+/// factored out so `zirv ctx jev probe` can ask the exact same question set
+/// from a fixture's own candidate ids.
+pub(crate) fn memory_harvest_questions(ids: &[String]) -> Vec<jev::Question> {
+    ids.iter()
+        .map(|id| {
+            jev::Question::metadata_noul(
+                id,
+                HARVEST_GATE_INSTRUCTIONS,
+                "yes, a durable fact",
+                "no, transient narration or a status update",
+            )
+        })
+        .collect()
+}
+
+/// [`apply_jev_harvest_gate`]'s own floor default -- named (issue: `zirv ctx
+/// jev probe`) so a later retune targets exactly this constant.
+pub(crate) const MEMORY_HARVEST_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+
+/// [`apply_jev_harvest_gate`]'s per-candidate decision: `"skip"` only for a
+/// decisive noul below [`MEMORY_RELEVANCE_FLOOR`] (dropped, logged
+/// `"harvest-skipped"`); `"keep"` for a missing, indecisive, unparseable, or
+/// accepting answer -- the keyword filter's own verdict. Shared with `zirv
+/// ctx jev probe`, which reports exactly this outcome per candidate id.
+pub(crate) fn memory_harvest_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    match answer.and_then(|answer| answer.as_noul().map(|noul| (answer, noul))) {
+        Some((answer, value))
+            if value < MEMORY_RELEVANCE_FLOOR && answer.decisive(min_confidence, min_margin) =>
+        {
+            "skip"
+        }
+        _ => "keep",
+    }
+}
+
 /// Issue #537 (A3): re-examines candidates the keyword filter
 /// (`filter_durable_candidates`) already accepted, with one BATCHED Jev
 /// advisory call (site `"memory"`) when `[jev] memory` is on -- one Noul per
@@ -3086,17 +3126,7 @@ fn apply_jev_harvest_gate(
             ]
         })
         .collect();
-    let questions: Vec<jev::Question> = ids
-        .iter()
-        .map(|id| {
-            jev::Question::metadata_noul(
-                id,
-                HARVEST_GATE_INSTRUCTIONS,
-                "yes, a durable fact",
-                "no, transient narration or a status update",
-            )
-        })
-        .collect();
+    let questions = memory_harvest_questions(&ids);
     let advise_state = HarvestGateState {
         _zirv_metadata_only: true,
         facts,
@@ -3111,46 +3141,46 @@ fn apply_jev_harvest_gate(
     ) else {
         return accepted;
     };
-    let (memory_min_confidence, memory_min_margin) =
-        jev::floor(cfg, jev::FloorSite::Memory, 0.0, jev::DEFAULT_MIN_MARGIN);
+    let (memory_min_confidence, memory_min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::Memory,
+        MEMORY_HARVEST_DEFAULT_FLOOR.0,
+        MEMORY_HARVEST_DEFAULT_FLOOR.1,
+    );
     accepted
         .into_iter()
         .zip(ids)
         .filter(|((key, _), id)| {
             let answer = answers.get(id);
-            let noul = answer.and_then(|answer| answer.as_noul());
-            match (answer, noul) {
-                // Jev determinism fix: an explicit rejection only prunes the
-                // candidate when it is also `decisive` (margin at or above
-                // `jev::DEFAULT_MIN_MARGIN` -- a noul has no separate
-                // confidence to check, so this is a margin-only gate). A
-                // below-floor but thin-margin verdict is treated the same as
-                // a missing answer: kept.
-                (Some(answer), Some(value))
-                    if value < MEMORY_RELEVANCE_FLOOR
-                        && answer.decisive(memory_min_confidence, memory_min_margin) =>
-                {
-                    let detail =
-                        format!("'{key}' scored {value:.2} below the Jev durability floor");
-                    let _ = super::log::append(
-                        state,
-                        &super::log::Decision {
-                            ts: now,
-                            session: "n/a",
-                            verb: "memory",
-                            verdict: "n/a",
-                            score: 0,
-                            action: "harvest-skipped",
-                            detail: &detail,
-                            observed_at: None,
-                        },
-                    );
-                    false
-                }
+            // Jev determinism fix: an explicit rejection only prunes the
+            // candidate when it is also `decisive` (margin at or above
+            // `jev::DEFAULT_MIN_MARGIN` -- a noul has no separate
+            // confidence to check, so this is a margin-only gate). A
+            // below-floor but thin-margin verdict is treated the same as a
+            // missing answer: kept. `memory_harvest_action` is the exact
+            // same keep/skip rule `zirv ctx jev probe` reports.
+            if memory_harvest_action(answer, memory_min_confidence, memory_min_margin) == "skip" {
+                let value = answer.and_then(jev::Answer::as_noul).unwrap_or(0.0);
+                let detail = format!("'{key}' scored {value:.2} below the Jev durability floor");
+                let _ = super::log::append(
+                    state,
+                    &super::log::Decision {
+                        ts: now,
+                        session: "n/a",
+                        verb: "memory",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "harvest-skipped",
+                        detail: &detail,
+                        observed_at: None,
+                    },
+                );
+                false
+            } else {
                 // An accepting score, a thin-margin verdict, or a missing/
                 // unparseable answer: keep the keyword filter's own verdict
                 // (accepted).
-                _ => true,
+                true
             }
         })
         .map(|((key, body), _)| (key, body))
@@ -3279,11 +3309,29 @@ fn write_durable(
 /// confidently negative verdict -- stays explicit in the call below rather
 /// than relying on a margin-only check that happens to have the same effect
 /// today.
-const HARVEST_SCREEN_MIN_CONFIDENCE: f32 = 0.8;
+pub(crate) const HARVEST_SCREEN_MIN_CONFIDENCE: f32 = 0.8;
 
 /// The noul probability-of-"true" ceiling a decisive "no" must also clear
 /// before generation may be skipped.
-const HARVEST_SCREEN_MAX_NOUL_FOR_SKIP: f64 = 0.2;
+pub(crate) const HARVEST_SCREEN_MAX_NOUL_FOR_SKIP: f64 = 0.2;
+
+/// [`jev_harvest_prescreen`]'s per-call decision: `true` only for a decisive
+/// (confidence >= [`HARVEST_SCREEN_MIN_CONFIDENCE`]) "no" whose noul is
+/// below [`HARVEST_SCREEN_MAX_NOUL_FOR_SKIP`] -- generation may be skipped.
+/// Shared with `zirv ctx jev probe`, which reports this outcome as
+/// `"skip"`/`"run"`.
+pub(crate) fn harvest_screen_skip(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> bool {
+    answer.is_some_and(|answer| {
+        answer.decisive(min_confidence, min_margin)
+            && answer
+                .as_noul()
+                .is_some_and(|value| value < HARVEST_SCREEN_MAX_NOUL_FOR_SKIP)
+    })
+}
 
 /// Bounded numeric-only metadata state (issue #746's egress boundary): one
 /// fact row, `[content size bucket 0-4, item count, duplicate ratio per
@@ -3293,6 +3341,21 @@ const HARVEST_SCREEN_MAX_NOUL_FOR_SKIP: f64 = 0.2;
 struct HarvestScreenState {
     _zirv_metadata_only: bool,
     facts: Vec<Vec<u32>>,
+}
+
+/// [`jev_harvest_prescreen`]'s own single noul question, factored out so
+/// `zirv ctx jev probe` can ask the exact same question from a fixture's own
+/// facts row.
+pub(crate) fn harvest_screen_question() -> [jev::Question; 1] {
+    [jev::Question::metadata_noul(
+        "novel",
+        "Facts row 0 is [content size bucket 0-4, item count, duplicate ratio per mille against \
+         existing memory, existing memory entry count, path-like token count, durable-fact-shape \
+         line count]. Based only on these counts, does this material likely contain new durable \
+         repository knowledge not already recorded in memory? Answer true if uncertain.",
+        "likely contains new durable knowledge",
+        "unlikely to add anything not already recorded",
+    )]
 }
 
 /// Lowercased, whitespace-collapsed form of `text`, used only for local
@@ -3446,15 +3509,7 @@ fn jev_harvest_prescreen<'a>(
         _zirv_metadata_only: true,
         facts,
     };
-    let questions = [jev::Question::metadata_noul(
-        "novel",
-        "Facts row 0 is [content size bucket 0-4, item count, duplicate ratio per mille against \
-         existing memory, existing memory entry count, path-like token count, durable-fact-shape \
-         line count]. Based only on these counts, does this material likely contain new durable \
-         repository knowledge not already recorded in memory? Answer true if uncertain.",
-        "likely contains new durable knowledge",
-        "unlikely to add anything not already recorded",
-    )];
+    let questions = harvest_screen_question();
     let mut effect = jev::JevEffect::new("harvest", "helper_invoked");
     effect.item_id = Some(item_id);
     effect.baseline_count = Some(1);
@@ -3481,11 +3536,11 @@ fn jev_harvest_prescreen<'a>(
             );
             let decisive =
                 answer.decisive(harvest_screen_min_confidence, harvest_screen_min_margin);
-            if decisive
-                && answer
-                    .as_noul()
-                    .is_some_and(|value| value < HARVEST_SCREEN_MAX_NOUL_FOR_SKIP)
-            {
+            if harvest_screen_skip(
+                Some(answer),
+                harvest_screen_min_confidence,
+                harvest_screen_min_margin,
+            ) {
                 let mut skip_effect = jev::JevEffect::new("harvest", "helper_skipped");
                 skip_effect.item_id = Some(item_id);
                 skip_effect.baseline_count = Some(1);

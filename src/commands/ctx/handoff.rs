@@ -1473,7 +1473,7 @@ fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>)
 }
 
 /// Issue #537 (A4): from a live 2026-09-18 probe.
-const HANDOFF_THIN_FLOOR: f32 = 0.9;
+pub(crate) const HANDOFF_THIN_FLOOR: f32 = 0.9;
 
 /// Bounded numeric-only metadata state (issue #759's re-projection onto the
 /// `jev::safe_metadata_request` egress boundary issue #746 established):
@@ -1526,6 +1526,23 @@ fn bounded_len(len: usize) -> u32 {
 /// test can assert directly that this pair passes `jev::safe_metadata_
 /// request` (the egress boundary issue #746 established), rather than only
 /// exercising that boundary indirectly through a fake-server round-trip.
+/// [`handoff_quality_request`]'s own single Choice question, factored out so
+/// `zirv ctx jev probe` can ask the exact same question without a real
+/// `Handoff` to derive facts from.
+pub(crate) fn handoff_quality_question() -> jev::Question {
+    jev::Question::metadata_choice(
+        "quality",
+        HANDOFF_QUALITY_INSTRUCTIONS,
+        &[
+            (
+                "thin",
+                "a restarted session could not continue from this alone",
+            ),
+            ("adequate", "a restarted session could continue from this"),
+        ],
+    )
+}
+
 fn handoff_quality_request(handoff: &Handoff) -> (HandoffQualityState, [jev::Question; 1]) {
     let facts = vec![vec![
         bounded_len(handoff.task.len()),
@@ -1538,18 +1555,25 @@ fn handoff_quality_request(handoff: &Handoff) -> (HandoffQualityState, [jev::Que
         _zirv_metadata_only: true,
         facts,
     };
-    let questions = [jev::Question::metadata_choice(
-        "quality",
-        HANDOFF_QUALITY_INSTRUCTIONS,
-        &[
-            (
-                "thin",
-                "a restarted session could not continue from this alone",
-            ),
-            ("adequate", "a restarted session could continue from this"),
-        ],
-    )];
-    (advise_state, questions)
+    (advise_state, [handoff_quality_question()])
+}
+
+/// [`jev_handoff_is_thin`]'s per-call decision: `"demote"` only for a
+/// decisive `thin` choice, `"keep"` otherwise (`adequate`, indecisive, or no
+/// answer). Shared with `zirv ctx jev probe`, which reports exactly this
+/// outcome per call.
+pub(crate) fn handoff_thin_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    if answer.is_some_and(|answer| {
+        answer.as_choice() == Some("thin") && answer.decisive(min_confidence, min_margin)
+    }) {
+        "demote"
+    } else {
+        "keep"
+    }
 }
 
 fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
@@ -1570,9 +1594,7 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
         HANDOFF_THIN_FLOOR,
         jev::DEFAULT_MIN_MARGIN,
     );
-    answers.get("quality").is_some_and(|answer| {
-        answer.as_choice() == Some("thin") && answer.decisive(min_confidence, min_margin)
-    })
+    handoff_thin_action(answers.get("quality"), min_confidence, min_margin) == "demote"
 }
 
 /// Issue #537 (A4): the gated wrapper around [`distill_or_structural`] for
@@ -1721,7 +1743,12 @@ const HANDOFF_SELECT_MAX_CANDIDATES: usize = 32;
 /// Reused from `memory::MEMORY_RELEVANCE_FLOOR`: validated by the
 /// 2026-09-18 memory-relevance probe (24/24 candidates cleanly separated at
 /// 0.3); same keep/drop-noul shape, no dedicated handoff-select probe yet.
-const HANDOFF_SELECT_DROP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+pub(crate) const HANDOFF_SELECT_DROP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+
+/// [`jev_select_optional_handoff_items`]'s own floor default -- named
+/// (issue: `zirv ctx jev probe`) so a later retune targets exactly this
+/// constant.
+pub(crate) const HANDOFF_SELECT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
 
 /// Static instructions naming the facts row order -- see
 /// [`OptionalItemKind::type_id`] for the item-type cell, and
@@ -1796,8 +1823,21 @@ fn handoff_select_request(
         .iter()
         .map(|candidate| handoff_select_facts_row(candidate, ctx))
         .collect();
-    let questions: Vec<jev::Question> = ids
-        .iter()
+    (
+        HandoffSelectState {
+            _zirv_metadata_only: true,
+            facts,
+        },
+        handoff_select_questions(ids),
+    )
+}
+
+/// [`handoff_select_request`]'s own per-candidate question, factored out so
+/// `zirv ctx jev probe` can ask the exact same question set from a
+/// fixture's own candidate ids, without rebuilding `OptionalCandidate`s it
+/// has no way to construct.
+pub(crate) fn handoff_select_questions(ids: &[String]) -> Vec<jev::Question> {
+    ids.iter()
         .map(|id| {
             jev::Question::metadata_noul(
                 id,
@@ -1806,14 +1846,29 @@ fn handoff_select_request(
                 "drop this item",
             )
         })
-        .collect();
-    (
-        HandoffSelectState {
-            _zirv_metadata_only: true,
-            facts,
-        },
-        questions,
-    )
+        .collect()
+}
+
+/// [`jev_select_optional_handoff_items`]'s per-candidate decision: `"drop"`
+/// only for a decisive noul below [`HANDOFF_SELECT_DROP_FLOOR`], `"keep"`
+/// otherwise (missing, indecisive, unparseable, or an accepting answer).
+/// Shared with `zirv ctx jev probe`, which reports exactly this outcome per
+/// candidate id.
+pub(crate) fn handoff_select_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "keep";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "keep";
+    }
+    match answer.as_noul() {
+        Some(value) if value < HANDOFF_SELECT_DROP_FLOOR => "drop",
+        _ => "keep",
+    }
 }
 
 /// Issue #783: an off-by-default (`[jev] handoff_select`) keep/drop pass
@@ -1868,21 +1923,22 @@ fn jev_select_optional_handoff_items(
     let (handoff_select_min_confidence, handoff_select_min_margin) = jev::floor(
         cfg,
         jev::FloorSite::HandoffSelect,
-        0.0,
-        jev::DEFAULT_MIN_MARGIN,
+        HANDOFF_SELECT_DEFAULT_FLOOR.0,
+        HANDOFF_SELECT_DEFAULT_FLOOR.1,
     );
     for (candidate, id) in sent.iter().zip(ids.iter()) {
         // Jev determinism fix, matching every other keep/drop noul in this
         // crate: a non-decisive (margin below `jev::DEFAULT_MIN_MARGIN`) or
         // missing/unparseable answer is treated exactly like "keep" -- only
         // a decisive, below-floor verdict may drop an item.
-        let Some(answer) = answers.get(id) else {
-            continue;
-        };
-        if !answer.decisive(handoff_select_min_confidence, handoff_select_min_margin) {
-            continue;
-        }
-        if matches!(answer.as_noul(), Some(value) if value < HANDOFF_SELECT_DROP_FLOOR) {
+        // `handoff_select_action` is the exact same keep/drop rule `zirv
+        // ctx jev probe` reports.
+        if handoff_select_action(
+            answers.get(id),
+            handoff_select_min_confidence,
+            handoff_select_min_margin,
+        ) == "drop"
+        {
             dropped.insert((candidate.kind.type_id(), candidate.position));
             removed_bytes += candidate.text.len() as u64;
         }
@@ -2095,7 +2151,11 @@ const COMPACTION_SELECT_MAX_CANDIDATES: usize = 16;
 /// (a decisive value at or above this floor is a decisive KEEP, not a
 /// decisive drop), since a compaction focus text starts from no keep list at
 /// all rather than from every candidate.
-const COMPACTION_SELECT_KEEP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+pub(crate) const COMPACTION_SELECT_KEEP_FLOOR: f64 = memory::MEMORY_RELEVANCE_FLOOR;
+
+/// [`compaction_focus_text`]'s own floor default -- named (issue: `zirv ctx
+/// jev probe`) so a later retune targets exactly this constant.
+pub(crate) const COMPACTION_SELECT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
 
 /// Static instructions naming the facts row order -- see
 /// [`CompactionItemKind::type_id`] for the item-type cell, and
@@ -2168,8 +2228,21 @@ fn compaction_select_request(
         .iter()
         .map(|candidate| compaction_select_facts_row(candidate, ctx))
         .collect();
-    let questions: Vec<jev::Question> = ids
-        .iter()
+    (
+        CompactionSelectState {
+            _zirv_metadata_only: true,
+            facts,
+        },
+        compaction_select_questions(ids),
+    )
+}
+
+/// [`compaction_select_request`]'s own per-candidate question, factored out
+/// so `zirv ctx jev probe` can ask the exact same question set from a
+/// fixture's own candidate ids, without rebuilding `CompactionCandidate`s it
+/// has no way to construct.
+pub(crate) fn compaction_select_questions(ids: &[String]) -> Vec<jev::Question> {
+    ids.iter()
         .map(|id| {
             jev::Question::metadata_noul(
                 id,
@@ -2178,14 +2251,29 @@ fn compaction_select_request(
                 "leave this item out of the keep list",
             )
         })
-        .collect();
-    (
-        CompactionSelectState {
-            _zirv_metadata_only: true,
-            facts,
-        },
-        questions,
-    )
+        .collect()
+}
+
+/// [`compaction_focus_text`]'s per-candidate decision: `"keep"` only for a
+/// decisive noul at or above [`COMPACTION_SELECT_KEEP_FLOOR`] (added to the
+/// keep list), `"omit"` otherwise (missing, indecisive, unparseable, or a
+/// below-floor answer). Shared with `zirv ctx jev probe`, which reports
+/// exactly this outcome per candidate id.
+pub(crate) fn compaction_select_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "omit";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "omit";
+    }
+    match answer.as_noul() {
+        Some(value) if value >= COMPACTION_SELECT_KEEP_FLOOR => "keep",
+        _ => "omit",
+    }
 }
 
 /// Cap on how many items [`compaction_focus_text`]'s own keep list may name.
@@ -2242,25 +2330,22 @@ pub(crate) fn compaction_focus_text(
     let (compaction_select_min_confidence, compaction_select_min_margin) = jev::floor(
         cfg,
         jev::FloorSite::CompactionSelect,
-        0.0,
-        jev::DEFAULT_MIN_MARGIN,
+        COMPACTION_SELECT_DEFAULT_FLOOR.0,
+        COMPACTION_SELECT_DEFAULT_FLOOR.1,
     );
     for (candidate, id) in sent.iter().zip(ids.iter()) {
         // Only a decisive (margin at or above `jev::DEFAULT_MIN_MARGIN`) KEEP
         // verdict ever adds an item -- missing, unparseable, indecisive, or
         // below-floor answers all leave it out, the mirror image of
         // `jev_select_optional_handoff_items`'s own "only a decisive drop
-        // removes" rule.
-        let Some(answer) = answers.get(id) else {
-            continue;
-        };
-        if !answer.decisive(
+        // removes" rule. `compaction_select_action` is the exact same
+        // keep/omit rule `zirv ctx jev probe` reports.
+        if compaction_select_action(
+            answers.get(id),
             compaction_select_min_confidence,
             compaction_select_min_margin,
-        ) {
-            continue;
-        }
-        if matches!(answer.as_noul(), Some(value) if value >= COMPACTION_SELECT_KEEP_FLOOR) {
+        ) == "keep"
+        {
             kept.push(candidate.text.as_str());
         }
     }
