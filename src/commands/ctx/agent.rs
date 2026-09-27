@@ -11876,7 +11876,15 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("diagnostic result:"), "{error}");
-        assert_eq!(std::fs::read_to_string(modes).expect("modes"), "healthy\n");
+        // Main's `healthy` line is never consumed. The restart launches after
+        // the whole-run deadline has passed and is killed at once, so whether
+        // it read its own `hang` line first is a race either outcome of which
+        // is correct.
+        let remaining = std::fs::read_to_string(modes).expect("modes");
+        assert!(
+            matches!(remaining.as_str(), "healthy\n" | "hang\nhealthy\n"),
+            "main must not run: {remaining:?}"
+        );
     }
 
     #[test]
