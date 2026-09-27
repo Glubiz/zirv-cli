@@ -2142,19 +2142,19 @@ mod tests {
         let descriptions = [
             (
                 "aa-database-helper",
-                "database migration schema alpha ".repeat(28),
+                "database migration schema alpha ".repeat(16),
             ),
             (
                 "ab-security-helper",
-                "security credential audit beta ".repeat(28),
+                "security credential audit beta ".repeat(16),
             ),
             (
                 "ac-database-helper",
-                "database migration schema gamma ".repeat(28),
+                "database migration schema gamma ".repeat(16),
             ),
             (
                 "ad-security-helper",
-                "security credential audit delta ".repeat(28),
+                "security credential audit delta ".repeat(16),
             ),
         ];
         for (id, description) in &descriptions {
@@ -2271,6 +2271,11 @@ mod tests {
         .expect("baseline pane")
         .argv
         .join(" ");
+        assert!(
+            baseline.contains(super::super::prompt::SKILL_INDEX_HEADER),
+            "the baseline launch must fit the inline argv budget untruncated, or the comparison \
+             below measures the budget's layer strip instead of the Jev trim"
+        );
         assert!(delivered.iter().all(|prompt| prompt.len() < baseline.len()));
         assert!(
             !baseline.contains(header),
