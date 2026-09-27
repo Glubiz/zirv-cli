@@ -443,3 +443,267 @@ pub(crate) fn reconcile_unfinished(
     }
     Ok(retries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_manifest() -> Manifest {
+        Manifest::parse(
+            r#"
+schema = 1
+id = "demo"
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "subscription"
+
+[baseline]
+commit = "HEAD"
+
+[corpus]
+file = "corpus.toml"
+
+[backend]
+kind = "fixture"
+file = "fixture.toml"
+per_trial_ceiling_usd = 1.0
+calls_per_trial = 2
+timeout_secs = 30
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 10.0
+max_wall_secs = 3600
+max_calls = 100
+max_trials = 20
+max_retries = 1
+concurrency = 1
+
+[stages.screen]
+split = "dev"
+reps = 1
+
+[stages.validate]
+split = "validation"
+reps = 1
+
+[stages.holdout]
+split = "holdout"
+reps = 1
+max_uses = 1
+"#,
+        )
+        .expect("minimal manifest fixture must parse")
+    }
+
+    fn scheduled(
+        trial_id: &str,
+        seq: u64,
+        reserved_spend_usd: f64,
+        reserved_calls: u64,
+    ) -> LedgerEvent {
+        LedgerEvent::TrialScheduled {
+            seq,
+            ts: 0,
+            trial_id: trial_id.to_string(),
+            candidate: "baseline".to_string(),
+            arm: "baseline".to_string(),
+            stage: "screen".to_string(),
+            task: "t1".to_string(),
+            rep: 0,
+            split: "dev".to_string(),
+            attempt: 0,
+            reserved_spend_usd,
+            reserved_calls,
+        }
+    }
+
+    fn finished(trial_id: &str, seq: u64, cost_usd: Option<f64>, overhead_usd: f64) -> LedgerEvent {
+        LedgerEvent::TrialFinished {
+            seq,
+            ts: 0,
+            trial_id: trial_id.to_string(),
+            status: "ok".to_string(),
+            correctness: Some(1.0),
+            quality: Some(1.0),
+            cost_usd,
+            cost_complete: true,
+            overhead_usd,
+            wall_ms: 10,
+            receipts: BTreeMap::new(),
+        }
+    }
+
+    fn failed(
+        trial_id: &str,
+        seq: u64,
+        charged_usd: f64,
+        attempt: u32,
+        retryable: bool,
+    ) -> LedgerEvent {
+        LedgerEvent::TrialFailed {
+            seq,
+            ts: 0,
+            trial_id: trial_id.to_string(),
+            reason: "boom".to_string(),
+            charged_usd,
+            attempt,
+            retryable,
+        }
+    }
+
+    #[test]
+    fn reconstruct_tracker_rebuilds_spend_and_calls_from_scheduled_finished_and_failed_events() {
+        let events = vec![
+            scheduled("trial-a", 0, 1.0, 2),
+            finished("trial-a", 1, Some(0.4), 0.1),
+            scheduled("trial-b", 2, 2.0, 3),
+            failed("trial-b", 3, 2.0, 0, false),
+        ];
+
+        let tracker = reconstruct_tracker(0, &events);
+
+        assert_eq!(tracker.reserved_usd, 0.0);
+        assert_eq!(tracker.reserved_calls, 0);
+        // trial-a settles its own cost_usd + overhead_usd (0.4 + 0.1); trial-b
+        // is charged its full reservation ceiling (2.0) on failure.
+        assert!(
+            (tracker.spent_usd - 2.5).abs() < 1e-9,
+            "expected 2.5, got {}",
+            tracker.spent_usd
+        );
+        // trial-a's finish charges its reserved_calls (2); a failure charges
+        // zero actual calls.
+        assert_eq!(tracker.calls_used, 2);
+    }
+
+    #[test]
+    fn reconstruct_tracker_leaves_an_unresolved_scheduled_trial_reserved() {
+        let events = vec![scheduled("trial-a", 0, 1.5, 4)];
+
+        let tracker = reconstruct_tracker(0, &events);
+
+        assert_eq!(tracker.reserved_usd, 1.5);
+        assert_eq!(tracker.reserved_calls, 4);
+        assert_eq!(tracker.spent_usd, 0.0);
+        assert_eq!(tracker.calls_used, 0);
+    }
+
+    #[test]
+    fn terminal_trial_ids_includes_finished_and_permanently_failed_but_excludes_started_only() {
+        let campaign_dir = tempfile::tempdir().unwrap();
+        let (ledger, _) = Ledger::open(campaign_dir.path()).unwrap();
+
+        ledger
+            .append(&scheduled("trial-finished", 0, 1.0, 1))
+            .unwrap();
+        ledger
+            .append(&finished("trial-finished", 1, Some(0.1), 0.0))
+            .unwrap();
+
+        ledger.append(&scheduled("trial-dead", 2, 1.0, 1)).unwrap();
+        ledger
+            .append(&failed("trial-dead", 3, 1.0, 1, false))
+            .unwrap();
+
+        ledger
+            .append(&scheduled("trial-retrying", 4, 1.0, 1))
+            .unwrap();
+        ledger
+            .append(&failed("trial-retrying", 5, 1.0, 0, true))
+            .unwrap();
+
+        ledger
+            .append(&scheduled("trial-started-only", 6, 1.0, 1))
+            .unwrap();
+
+        let terminal = terminal_trial_ids(campaign_dir.path()).unwrap();
+
+        assert!(terminal.contains("trial-finished"));
+        assert!(terminal.contains("trial-dead"));
+        assert!(!terminal.contains("trial-retrying"));
+        assert!(!terminal.contains("trial-started-only"));
+    }
+
+    fn write_lock(campaign_dir: &Path, manifest_sha256: &str) {
+        let lock = Lock {
+            manifest: minimal_manifest(),
+            manifest_path: PathBuf::from("manifest.toml"),
+            repo: PathBuf::from("."),
+            manifest_sha256: manifest_sha256.to_string(),
+            baseline_sha: "deadbeef".to_string(),
+            corpus_version: String::new(),
+            corpus_families: Vec::new(),
+            evaluator_version: None,
+            evaluator_files: BTreeMap::new(),
+            evaluator_fingerprint: String::new(),
+            zirv_version: "0.0.0".to_string(),
+            price_as_of: None,
+            started_at: 0,
+        };
+        lock.write(campaign_dir).unwrap();
+    }
+
+    #[test]
+    fn load_or_create_lock_refuses_resume_when_the_manifest_changed() {
+        let campaign_dir = tempfile::tempdir().unwrap();
+        write_lock(campaign_dir.path(), "original-sha");
+        let manifest = minimal_manifest();
+
+        let err = load_or_create_lock(
+            Path::new("."),
+            &manifest,
+            Path::new("manifest.toml"),
+            campaign_dir.path(),
+            "a-different-sha",
+            true,
+        )
+        .expect_err("a changed manifest sha must be refused under --resume");
+
+        assert!(
+            err.to_string().contains("manifest has changed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_or_create_lock_refuses_a_fresh_run_when_a_lock_already_exists() {
+        let campaign_dir = tempfile::tempdir().unwrap();
+        write_lock(campaign_dir.path(), "some-sha");
+        let manifest = minimal_manifest();
+
+        let err = load_or_create_lock(
+            Path::new("."),
+            &manifest,
+            Path::new("manifest.toml"),
+            campaign_dir.path(),
+            "some-sha",
+            false,
+        )
+        .expect_err("an existing lock.json without --resume must be refused");
+
+        assert!(err.to_string().contains("--resume"), "got: {err}");
+    }
+
+    #[test]
+    fn load_or_create_lock_refuses_resume_when_no_lock_exists() {
+        let campaign_dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest();
+
+        let err = load_or_create_lock(
+            Path::new("."),
+            &manifest,
+            Path::new("manifest.toml"),
+            campaign_dir.path(),
+            "any-sha",
+            true,
+        )
+        .expect_err("--resume with no lock.json must be refused");
+
+        assert!(err.to_string().contains("no lock.json"), "got: {err}");
+    }
+}
