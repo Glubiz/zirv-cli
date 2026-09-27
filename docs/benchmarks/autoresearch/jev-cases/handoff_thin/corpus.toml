@@ -1,0 +1,185 @@
+# Jev determinism probe corpus for floor site "handoff_select", round 2 --
+# handoff-thin ONLY (docs/superpowers work: jev-determinism campaigns).
+# Round 1 (jev-cases/handoff_select/) mixed handoff-thin and handoff-select
+# cases and found tiny handoff-thin facts rows answering "thin" at
+# confidence 0.82-0.95, medium rows at 0.0-0.37, and rich rows "adequate" --
+# but never sampled the INTERMEDIATE facts space (task_len 80-180) that sits
+# between those two clusters. This corpus fills that gap: every split
+# sweeps tiny/small/intermediate/medium/rich task_len buckets, plus a few
+# rows with blocked>0 or files_modified 0-vs-many at matched text lengths,
+# so a later confidence-floor pick can see whether intermediate handoffs
+# land in the 0.4-0.8 gap between the two round-1 clusters.
+#
+# Every case in cases.jsonl/labels.jsonl appears here exactly once; graded
+# by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "ht-001"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-002"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-003"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-004"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-005"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-006"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-007"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-008"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ht-009"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-010"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-011"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-012"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-013"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-014"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-015"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-016"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-017"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-018"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ht-019"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-020"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-021"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-022"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-023"
+family = "jev-handoff_thin"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ht-024"
+family = "jev-handoff_thin"
+class = "bounded"
+split = "holdout"
+kind = "decision"

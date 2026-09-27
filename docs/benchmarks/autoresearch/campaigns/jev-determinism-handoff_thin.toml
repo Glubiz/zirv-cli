@@ -1,0 +1,129 @@
+# jev-determinism-handoff_thin: ROUND 2, focused solely on handoff-thin's
+# confidence floor (ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE) --
+# round 1 (jev-determinism-handoff_select.toml) mixed handoff-thin and
+# handoff-select cases and swept the MARGIN floor plus one confidence
+# point; this campaign isolates confidence against a handoff-thin-only
+# corpus (jev-cases/handoff_thin/) that also fills round 1's untested
+# intermediate facts gap (task_len 80-180), so a floor pick can be made
+# with intermediate-range evidence in hand. The corpus holds ONLY
+# handoff-thin cases, so sweeping this key here only moves the thin site's
+# floor even though production shares the same env var / floor_site with
+# handoff-select -- a win here says nothing about handoff-select's own
+# tradeoff, which stays round 1's job.
+#
+# Measures per-site DETERMINISM (`quality` = acted-decision stability
+# across K uncached repetitions of the same case, via jev_probe_trial.py
+# --reps 10) alongside `correctness` (agreement with each item's labelled
+# expected action). Backend drives the real `zirv ctx jev probe` verb --
+# this campaign spends real money (every trial is `calls_per_trial` live
+# Jev decision calls) and is NEVER run in CI. `[criteria] objective =
+# "quality"` promotes a candidate on a material STABILITY win (a higher
+# floor trades Jev influence for stability -- this is the axis this
+# campaign exists to measure), not on cost/wall as the default
+# "efficiency" objective would.
+#
+# handoff-thin writes its own receipt ("jev:handoff"), distinct from
+# handoff-select's ("jev:handoff_select") despite sharing one floor_site/
+# env var -- this corpus is handoff-thin only, so a single requires_receipts
+# entry covers every case in it.
+#
+# Pair counts: validate = 10 tasks * 2 reps = 20 pairs, holdout = 6 tasks *
+# 2 reps = 12 pairs, both >= criteria.min_pairs = 6.
+
+schema = 1
+id = "jev-determinism-handoff_thin"
+description = "Round 2: sweep ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE for determinism (stability) against jev-cases/handoff_thin, a handoff-thin-only corpus filling round 1's untested intermediate facts gap. Costs real money; not run in CI."
+runtime = "meta"
+seat_mode = "single"
+cache_mode = "cold"
+billing = "metered"
+
+[baseline]
+commit = "HEAD"
+
+[evaluator]
+version = "1"
+protected = ["docs/benchmarks/autoresearch/jev-cases/handoff_thin/cases.jsonl", "docs/benchmarks/autoresearch/jev-cases/handoff_thin/labels.jsonl", "docs/benchmarks/autoresearch/jev-cases/handoff_thin/corpus.toml", "docs/benchmarks/autoresearch/jev_probe_trial.py"]
+self_check = []
+
+[corpus]
+file = "docs/benchmarks/autoresearch/jev-cases/handoff_thin/corpus.toml"
+
+[backend]
+kind = "command"
+command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "10"]
+per_trial_ceiling_usd = 0.004
+calls_per_trial = 10
+timeout_secs = 180
+
+[route]
+harness = "claude"
+model = "sonnet"
+
+[budgets]
+max_spend_usd = 0.40
+max_wall_secs = 3600
+max_calls = 2500
+max_trials = 250
+max_retries = 1
+concurrency = 3
+
+[stages.screen]
+split = "dev"
+reps = 2
+
+[stages.validate]
+split = "validation"
+reps = 2
+
+[stages.holdout]
+split = "holdout"
+reps = 2
+max_uses = 1
+
+[criteria]
+objective = "quality"
+min_pairs = 6
+correctness_floor = 0.0
+quality_floor = 0.0
+max_correctness_regression = 0.05
+max_quality_regression = 0.02
+min_effect = 0.05
+confidence = 0.9
+bootstrap_resamples = 2000
+
+[cohort]
+pressure = "natural"
+env = {}
+
+[candidate_space]
+allow_env = ["ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE"]
+allowed_models = ["sonnet"]
+
+[[candidates]]
+id = "conf-050"
+hypothesis = "A confidence floor of 0.5 (handoff_select) starts to filter round 1's tiny-cluster answers (0.82-0.95) without touching the untested intermediate range."
+mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.5, margin left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.5" }
+requires_receipts = ["jev:handoff"]
+
+[[candidates]]
+id = "conf-060"
+hypothesis = "A confidence floor of 0.6 (handoff_select) sits inside round 1's observed intermediate/medium cluster (0.0-0.37 to 0.82-0.95 gap) and may start admitting some of those rows."
+mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.6, margin left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.6" }
+requires_receipts = ["jev:handoff"]
+
+[[candidates]]
+id = "conf-070"
+hypothesis = "A confidence floor of 0.7 (handoff_select) trades more admitted rows for stability, testing the upper half of the 0.4-0.8 gap this corpus was built to probe."
+mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.7, margin left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.7" }
+requires_receipts = ["jev:handoff"]
+
+[[candidates]]
+id = "conf-080"
+hypothesis = "A confidence floor of 0.8 (handoff_select) stays close to the compiled HANDOFF_THIN_FLOOR (0.9), checking whether a slightly lower floor still captures the tiny-cluster wins at less correctness cost."
+mechanism = "ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE=0.8, margin left at the compiled default."
+env = { ZIRV_CTX_JEV_FLOOR_HANDOFF_SELECT_MIN_CONFIDENCE = "0.8" }
+requires_receipts = ["jev:handoff"]
