@@ -378,7 +378,11 @@ system clipboard via OSC 52, with a platform fallback (`pbcopy` on macOS,
 `wl-copy` then `xclip` on Linux, `clip.exe` on Windows) run in the background
 for a terminal that silently ignores OSC 52 (macOS Terminal.app is the one on
 record); if neither lands, the header shows a notice rather than losing the
-copy silently.
+copy silently. The sidebar's own JEV section (see [`[jev]`](#jev) below) is
+click-through too: a left click on its `errors N · <reason>` line opens a
+read-only dialog listing the window's most recent gated-call failures (site,
+reason, age), the same list `zirv ctx jev status` folds from
+`jev-decisions.jsonl`.
 
 Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
