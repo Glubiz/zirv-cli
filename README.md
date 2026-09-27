@@ -461,7 +461,7 @@ genuinely ambiguous prompt still flipped at margin 0.54 — the same request
 body giving the same answer twice is the property this floor buys, not
 correctness. The shared Jev client backs that further with its own decision
 cache: an identical request body (hashed with SHA-256) served twice within
-`[jev] cache_ttl_secs` (default a day, `0` disables it) returns the exact
+`[jev] cache_ttl_secs` (default a week, `0` disables it) returns the exact
 same stored answer instead of asking Jev again, at zero additional cost.
 `complexity` and
 `risk` are always merged with `max(model, baseline)` — a monotonic floor, so
@@ -4273,7 +4273,7 @@ inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot inj
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
 missing_tests = false # when the deterministic `[missing_tests_gate]` is about to block, asks one metadata-only question from local numeric facts and skips that one block on a decisive "not owed" answer; ZIRV_CTX_JEV_MISSING_TESTS
 launch_effort = false # may steer a headless launch's first-turn CLAUDE_CODE_EFFORT_LEVEL pick, from local numeric facts only; see `[headless.effort]` below; ZIRV_CTX_JEV_LAUNCH_EFFORT
-cache_ttl_secs = 86400  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
+cache_ttl_secs = 604800  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
