@@ -1776,6 +1776,24 @@ pub enum JevCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Measurement verb: asks one Jev site's real production question(s) for
+    /// a fixture input K times with the cache disabled, applies that site's
+    /// production floor and answer-to-action rule, and prints what
+    /// production would have DONE on each rep -- see `jev_probe.rs` for the
+    /// full contract. Spends real Jev calls and writes the normal decision/
+    /// spend log rows; never any other side effect.
+    Probe {
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        case: std::path::PathBuf,
+        #[arg(long)]
+        reps: u32,
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Arguments for `zirv ctx jev`.
@@ -1806,6 +1824,13 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
                 Ok(0)
             }
         }
+        JevCommand::Probe {
+            site,
+            case,
+            reps,
+            repo,
+            json: _,
+        } => super::jev_probe::run_probe(site, case, *reps, repo.as_deref(), writer),
     }
 }
 
