@@ -749,14 +749,75 @@ fn exit_kind_code(exit: ExitKind) -> u32 {
 }
 
 /// Issue #537 (A4): from a live 2026-09-18 probe -- 10/12 correct, the
-/// highest-scoring wrong answer at 0.88.
-const CRASH_TRIAGE_FLOOR: f32 = 0.9;
+/// highest-scoring wrong answer at 0.88. Shared with `zirv ctx jev probe
+/// --site crash`, which reports this exact floor unless overridden by its
+/// own `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`.
+pub(crate) const CRASH_TRIAGE_FLOOR: f32 = 0.9;
 
 #[derive(Debug, Serialize)]
 struct CrashAdviseState {
     #[serde(rename = "_zirv_metadata_only")]
     metadata_only: bool,
     facts: Vec<Vec<u32>>,
+}
+
+/// [`jev_crash_cause`]'s own question, `"cause"` -- shared verbatim with
+/// `zirv ctx jev probe --site crash`, which asks the exact same question so
+/// its answer distribution can never drift from what production asks.
+pub(crate) fn crash_cause_question() -> jev::Question {
+    jev::Question::metadata_choice(
+        "cause",
+        "Classify the failure from coarse local signals only; uncertainty means transient.",
+        &[
+            (
+                "transient",
+                "network, timeout, out of memory, crash or rate limit that a fresh attempt may pass",
+            ),
+            (
+                "access",
+                "authentication, authorization, credential, login, quota or permission problem a \
+                 retry cannot fix",
+            ),
+            (
+                "deterministic",
+                "a bug, compile error or missing file that will recur identically",
+            ),
+        ],
+    )
+}
+
+/// [`jev_crash_cause`]'s per-call classification of a decisive `"cause"`
+/// answer against the local `access_signal`/`configuration_signal`/
+/// `missing_file_signal` facts already sent as `facts[0]`: `Some("access")`/
+/// `Some("deterministic")` only when their corroborating local signal is
+/// also set (an uncorroborated match falls through to
+/// `Some("signal_mismatch")`), `Some("transient")` unconditionally,
+/// `None` for a missing or indecisive answer (production keeps its own
+/// "partial_answer" vs. "uncertain" reason distinction around this call --
+/// see [`jev_crash_cause`] -- so `None` alone does not tell them apart).
+/// Shared with `zirv ctx jev probe --site crash`, which re-derives the
+/// three signal bools from `case.json`'s own `facts[0]` (indices 3, 4, 5 --
+/// see this module's own state-layout doc) and collapses
+/// `Some("access")`/`Some("deterministic")` to `"auto_block"`, everything
+/// else to `"baseline"`.
+pub(crate) fn crash_cause_classify(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+    access_signal: bool,
+    configuration_signal: bool,
+    missing_file_signal: bool,
+) -> Option<&'static str> {
+    let answer = answer?;
+    if !answer.decisive(min_confidence, min_margin) {
+        return None;
+    }
+    Some(match answer.as_choice() {
+        Some("access") if access_signal => "access",
+        Some("deterministic") if configuration_signal || missing_file_signal => "deterministic",
+        Some("transient") => "transient",
+        _ => "signal_mismatch",
+    })
 }
 
 enum CrashAdvice {
@@ -841,25 +902,7 @@ fn jev_crash_cause(
             u32::from(transient_signal),
         ]],
     };
-    let questions = [jev::Question::metadata_choice(
-        "cause",
-        "Classify the failure from coarse local signals only; uncertainty means transient.",
-        &[
-            (
-                "transient",
-                "network, timeout, out of memory, crash or rate limit that a fresh attempt may pass",
-            ),
-            (
-                "access",
-                "authentication, authorization, credential, login, quota or permission problem a \
-                 retry cannot fix",
-            ),
-            (
-                "deterministic",
-                "a bug, compile error or missing file that will recur identically",
-            ),
-        ],
-    )];
+    let questions = [crash_cause_question()];
     let answers = match jev::advise_detailed(
         cfg,
         state,
@@ -878,16 +921,19 @@ fn jev_crash_cause(
     let Some(answer) = answers.get("cause") else {
         return CrashAdvice::Baseline("partial_answer");
     };
-    if !answer.decisive(CRASH_TRIAGE_FLOOR, jev::DEFAULT_MIN_MARGIN) {
-        return CrashAdvice::Baseline("uncertain");
-    }
-    match answer.as_choice() {
-        Some("access") if access_signal => CrashAdvice::AutoBlock("access"),
-        Some("deterministic") if configuration_signal || missing_file_signal => {
-            CrashAdvice::AutoBlock("deterministic")
-        }
+    match crash_cause_classify(
+        Some(answer),
+        CRASH_TRIAGE_FLOOR,
+        jev::DEFAULT_MIN_MARGIN,
+        access_signal,
+        configuration_signal,
+        missing_file_signal,
+    ) {
+        None => CrashAdvice::Baseline("uncertain"),
+        Some("access") => CrashAdvice::AutoBlock("access"),
+        Some("deterministic") => CrashAdvice::AutoBlock("deterministic"),
         Some("transient") => CrashAdvice::Baseline("transient"),
-        _ => CrashAdvice::Baseline("signal_mismatch"),
+        Some(_) => CrashAdvice::Baseline("signal_mismatch"),
     }
 }
 
