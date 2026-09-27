@@ -705,8 +705,7 @@ const MOTION_NODE_MIN_MAJOR: u64 = 22;
 /// module rather than an actual `import`, so neither this probe nor
 /// Hyperframes' own preflight ever pays the cost of loading `kokoro_onnx`'s
 /// heavier dependencies just to check presence.
-const MOTION_NARRATION_MODULES_PROBE: &str =
-    "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in \
+const MOTION_NARRATION_MODULES_PROBE: &str = "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in \
      ['kokoro_onnx','soundfile']) else 1)";
 
 /// True if `program` is a real Python 3 interpreter -- `--version` runs and
