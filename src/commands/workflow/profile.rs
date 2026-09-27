@@ -236,14 +236,18 @@ impl ExecutionProfile {
 
 /// Issue #782 site string every `jev-decisions.jsonl`/`jev-effects.jsonl`
 /// row and `cfg.jev.classify` gate share.
-const JEV_CLASSIFY_SITE: &str = "classify";
+pub(crate) const JEV_CLASSIFY_SITE: &str = "classify";
 
 /// Minimum additive-domain-tag probability for the classify site, the same
 /// floor `workflow::engine::JEV_TAG_PROBABILITY` uses for the gate
 /// reclassification site, from the same 2026-09-18 probe -- kept as its own
 /// constant rather than importing `engine` here, since `profile` is the
 /// lower-level module `engine` itself depends on.
-const JEV_CLASSIFY_TAG_PROBABILITY: f64 = 0.7;
+pub(crate) const JEV_CLASSIFY_TAG_PROBABILITY: f64 = 0.7;
+
+/// [`refine_profile_with_jev`]'s own floor default -- named (issue: `zirv
+/// ctx jev probe`) so a later retune targets exactly this constant.
+pub(crate) const CLASSIFY_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
 
 /// Maps one of [`DOMAIN_QUESTION_IDS`]'s six ids onto this module's own
 /// [`WorkDomainTag`]. `None` is unreachable in practice ([`DOMAIN_QUESTION_IDS`]
@@ -364,7 +368,7 @@ fn classify_intent_question() -> Question {
 /// the 2026-09-18 replay found complexity answers stable-but-wrong at margin
 /// 0.18-0.24, routing 1.7-2.2x more spend through Substantial with no
 /// accuracy gain (see `jev::DEFAULT_MIN_MARGIN`'s own doc comment).
-fn classify_jev_questions() -> Vec<Question> {
+pub(crate) fn classify_jev_questions() -> Vec<Question> {
     let mut out = vec![classify_intent_question()];
     for (id, (what, when_true, when_false)) in
         DOMAIN_QUESTION_IDS.into_iter().zip(DOMAIN_NOUL_QUESTIONS)
@@ -397,6 +401,28 @@ fn apply_intent_answer(cfg: &CtxConfig, answers: &Answers, classification: &mut 
     }
 }
 
+/// [`apply_classify_answers`]'s per-domain decision: `"tag"` only for a
+/// decisive noul at or above [`JEV_CLASSIFY_TAG_PROBABILITY`], `"none"`
+/// otherwise (missing, indecisive, or unparseable). Shared with `zirv ctx
+/// jev probe`, which reports exactly this outcome per domain id -- the
+/// `intent` Choice item is out of scope for the probe and this fn alike.
+pub(crate) fn classify_domain_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "none";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "none";
+    }
+    match answer.as_noul() {
+        Some(value) if value >= JEV_CLASSIFY_TAG_PROBABILITY => "tag",
+        _ => "none",
+    }
+}
+
 /// Applies a decisive `answers` set onto `profile` in place, monotonic the
 /// same way `proxy::decision::merge` is: `intent` is replaced outright only
 /// when decisive ([`apply_intent_answer`]); a domain tag is only ever ADDED
@@ -407,25 +433,26 @@ fn apply_intent_answer(cfg: &CtxConfig, answers: &Answers, classification: &mut 
 fn apply_classify_answers(cfg: &CtxConfig, answers: &Answers, profile: &mut ExecutionProfile) {
     apply_intent_answer(cfg, answers, &mut profile.classification);
 
-    let (min_confidence, min_margin) =
-        jev::floor(cfg, jev::FloorSite::Classify, 0.0, jev::DEFAULT_MIN_MARGIN);
+    let (min_confidence, min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::Classify,
+        CLASSIFY_DEFAULT_FLOOR.0,
+        CLASSIFY_DEFAULT_FLOOR.1,
+    );
     let mut added_security = false;
     for id in DOMAIN_QUESTION_IDS {
         let Some(tag) = domain_tag_for(id) else {
             continue;
         };
-        let Some(answer) = answers.get(id) else {
-            continue;
-        };
-        if !answer.decisive(min_confidence, min_margin) {
-            continue;
-        }
-        let Some(probability) = answer.as_noul() else {
-            continue;
-        };
-        if probability < JEV_CLASSIFY_TAG_PROBABILITY {
+        let answer = answers.get(id);
+        // `classify_domain_action` is the exact same tag/none rule `zirv
+        // ctx jev probe` reports.
+        if classify_domain_action(answer, min_confidence, min_margin) != "tag" {
             continue;
         }
+        let Some(probability) = answer.and_then(jev::Answer::as_noul) else {
+            continue;
+        };
         if profile.domains.contains(&tag) {
             continue;
         }

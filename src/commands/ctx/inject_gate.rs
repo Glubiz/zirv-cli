@@ -216,7 +216,7 @@ fn advise_state(kind: InjectKind, facts: &InjectFacts) -> InjectAdviseState {
     }
 }
 
-fn questions() -> [jev::Question; 1] {
+pub(crate) fn questions() -> [jev::Question; 1] {
     [jev::Question::metadata_noul(
         "defer",
         "Facts [kind (0 compact, 1 restart, 2 mail line, 3 mail note, 4 stop advisory), context \
@@ -228,6 +228,30 @@ wait? Answer false if unsure.",
         "agent is mid-unit; wait",
         "inject now, or insufficient evidence",
     )]
+}
+
+/// [`decide`]'s own floor default -- named (issue: `zirv ctx jev probe`) so
+/// a later retune targets exactly this constant.
+pub(crate) const INJECT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+
+/// [`decide`]'s per-call decision: `"defer"` only for a decisive noul at or
+/// above [`DEFER_MIN_PROBABILITY`], `"inject_now"` otherwise (missing,
+/// indecisive, or a below-floor answer). Shared with `zirv ctx jev probe`,
+/// which reports exactly this outcome, never applying [`cap_forces_inject`]
+/// -- the probe measures the Jev leg only.
+pub(crate) fn inject_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    if answer.is_some_and(|answer| {
+        answer.decisive(min_confidence, min_margin)
+            && answer.as_noul().is_some_and(|p| p >= DEFER_MIN_PROBABILITY)
+    }) {
+        "defer"
+    } else {
+        "inject_now"
+    }
 }
 
 /// One blocking decision. The caller has already checked `enabled()`.
@@ -247,13 +271,13 @@ fn decide(cfg: &CtxConfig, state: &StateDir, kind: InjectKind, facts: &InjectFac
     ) else {
         return Decision::InjectNow;
     };
-    let (min_confidence, min_margin) =
-        jev::floor(cfg, jev::FloorSite::Inject, 0.0, jev::DEFAULT_MIN_MARGIN);
-    let decisive = answers.get("defer").is_some_and(|answer| {
-        answer.decisive(min_confidence, min_margin)
-            && answer.as_noul().is_some_and(|p| p >= DEFER_MIN_PROBABILITY)
-    });
-    if !decisive {
+    let (min_confidence, min_margin) = jev::floor(
+        cfg,
+        jev::FloorSite::Inject,
+        INJECT_DEFAULT_FLOOR.0,
+        INJECT_DEFAULT_FLOOR.1,
+    );
+    if inject_action(answers.get("defer"), min_confidence, min_margin) != "defer" {
         return Decision::InjectNow;
     }
     Decision::Defer

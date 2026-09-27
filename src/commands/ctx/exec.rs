@@ -961,7 +961,7 @@ struct LaunchEffortAdviseState {
 
 /// One Noul: is this launch's request unusually hard, or a small,
 /// low-deliberation follow-up? Answered from [`launch_effort_facts`] alone.
-fn launch_effort_question() -> [jev::Question; 1] {
+pub(crate) fn launch_effort_question() -> [jev::Question; 1] {
     [jev::Question::metadata_noul(
         "launch_effort_high",
         "Facts [word-count bucket (0<10,1<50,2<200,3>=200), enumerated-item count, deterministic \
@@ -1010,6 +1010,34 @@ fn launch_effort_facts(prompt: &str, complexity: Complexity) -> Vec<u32> {
     vec![word_bucket, items, complexity_index, looks_like_a_question]
 }
 
+/// [`jev_launch_effort`]'s own floor default -- named (issue: `zirv ctx jev
+/// probe`) so a later retune targets exactly this constant.
+pub(crate) const LAUNCH_EFFORT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+
+/// [`jev_launch_effort`]'s per-call decision: `"high"`/`"low"` for a
+/// decisive answer, `"classifier"` otherwise (missing, indecisive, or
+/// unparseable -- the deterministic classifier's own pick applies). Shared
+/// with `zirv ctx jev probe`, which reports exactly this outcome, never
+/// touching the `[headless.effort]` value lookup that follows in
+/// production.
+pub(crate) fn launch_effort_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "classifier";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "classifier";
+    }
+    match answer.as_noul() {
+        Some(value) if value >= 0.5 => "high",
+        Some(_) => "low",
+        None => "classifier",
+    }
+}
+
 /// Issue #802 (`[jev] launch_effort`): may steer `sticky_headless_effort`'s
 /// pick toward `headless.effort.trivial` (a decisive low-effort answer) or
 /// `headless.effort.substantial` (a decisive high-effort answer) instead of
@@ -1045,13 +1073,14 @@ fn jev_launch_effort(
     let (min_confidence, min_margin) = jev::floor(
         cfg,
         jev::FloorSite::LaunchEffort,
-        0.0,
-        jev::DEFAULT_MIN_MARGIN,
+        LAUNCH_EFFORT_DEFAULT_FLOOR.0,
+        LAUNCH_EFFORT_DEFAULT_FLOOR.1,
     );
-    if !answer.decisive(min_confidence, min_margin) {
-        return None;
-    }
-    let is_high = answer.as_noul()? >= 0.5;
+    let is_high = match launch_effort_action(Some(answer), min_confidence, min_margin) {
+        "high" => true,
+        "low" => false,
+        _ => return None,
+    };
     let chosen = if is_high {
         cfg.headless.effort.substantial.clone()
     } else {

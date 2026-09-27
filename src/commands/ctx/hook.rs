@@ -4848,7 +4848,7 @@ fn resolved_cwd(payload: &PreToolPayload) -> Option<PathBuf> {
 // -- PreToolUse: the dispatch model-tier advisory (issue #537 A5) ----------
 
 /// Issue #537 (A5): from a live 2026-09-18 probe -- 9/10 correct at 0.6.
-const DISPATCH_TIER_FLOOR: f32 = 0.6;
+pub(crate) const DISPATCH_TIER_FLOOR: f32 = 0.6;
 
 /// The metadata-only envelope [`safe_metadata_request`] (`jev.rs`) accepts:
 /// no brief text, only the bounded numeric row [`dispatch_brief_facts`]
@@ -4969,6 +4969,53 @@ fn dispatch_brief_facts(brief: &str, seat: &str) -> Vec<u32> {
         capped_u32(lower.matches("```").count()),
         seat_tier_index(seat),
     ]
+}
+
+/// [`dispatch_tier_advise`]'s own single Choice question, factored out so
+/// `zirv ctx jev probe` can ask the exact same question from a fixture's
+/// own facts row.
+pub(crate) fn dispatch_tier_question() -> super::jev::Question {
+    super::jev::Question::metadata_choice(
+        "tier",
+        "From bounded numeric metadata about a subagent dispatch's brief only (no text), how \
+capable a model does it actually need?",
+        &[
+            (
+                "cheap",
+                "mechanical or bulk edits, formatting, simple lookups",
+            ),
+            ("standard", "ordinary implementation, tests, focused review"),
+            (
+                "frontier",
+                "hard debugging, concurrency, architecture, security design",
+            ),
+        ],
+    )
+}
+
+/// [`dispatch_tier_advise`]'s per-call decision: the chosen tier name
+/// (`"cheap"`/`"standard"`/`"frontier"`) for a decisive, recognised choice,
+/// `"deny"` otherwise (missing, indecisive, or an unrecognised choice) --
+/// the deterministic path's own outcome. Shared with `zirv ctx jev probe`,
+/// which reports exactly this outcome, never touching the catalogue/model
+/// rewrite that follows in production.
+pub(crate) fn dispatch_tier_action(
+    answer: Option<&super::jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "deny";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "deny";
+    }
+    match answer.as_choice() {
+        Some("cheap") => "cheap",
+        Some("standard") => "standard",
+        Some("frontier") => "frontier",
+        _ => "deny",
+    }
 }
 
 /// Conservative, deterministic exclusion for an independent-review
@@ -5117,22 +5164,7 @@ fn dispatch_tier_advise(
         metadata_only: true,
         facts: vec![dispatch_brief_facts(&payload.tool_input.prompt, seat)],
     };
-    let questions = [super::jev::Question::metadata_choice(
-        "tier",
-        "From bounded numeric metadata about a subagent dispatch's brief only (no text), how \
-capable a model does it actually need?",
-        &[
-            (
-                "cheap",
-                "mechanical or bulk edits, formatting, simple lookups",
-            ),
-            ("standard", "ordinary implementation, tests, focused review"),
-            (
-                "frontier",
-                "hard debugging, concurrency, architecture, security design",
-            ),
-        ],
-    )];
+    let questions = [dispatch_tier_question()];
     let answers = super::jev::advise(
         cfg,
         state,
@@ -5148,10 +5180,7 @@ capable a model does it actually need?",
         DISPATCH_TIER_FLOOR,
         super::jev::DEFAULT_MIN_MARGIN,
     );
-    if !answer.decisive(min_confidence, min_margin) {
-        return None;
-    }
-    let (tier, tier_label) = match answer.as_choice()? {
+    let (tier, tier_label) = match dispatch_tier_action(Some(answer), min_confidence, min_margin) {
         "cheap" => (super::catalogue::Tier::Cheap, "cheap"),
         "standard" => (super::catalogue::Tier::Standard, "standard"),
         "frontier" => (super::catalogue::Tier::Deep, "frontier"),
