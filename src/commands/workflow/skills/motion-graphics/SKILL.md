@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "4500"
+  x-zirv-context-budget-bytes: "5000"
 ---
 
 A motion graphics request is a request for output, not for a hand-rolled
@@ -20,6 +20,9 @@ frame-accurate video, and skipping its own gates just ships a first draft
 nobody actually looked at.
 
 ## Method
+
+Every `hyperframes <cmd>` below means `npx --yes hyperframes@0.8.80 <cmd>`,
+run inside the project folder -- never an unpinned or global `hyperframes`.
 
 1. Preflight once: `npx --yes hyperframes@0.8.80 doctor --json`, and read its
    `ok` field yourself -- the command always exits 0 even when environment
@@ -41,20 +44,19 @@ nobody actually looked at.
    renderer can seek them). Give every timed element `class="clip"` and
    every `<audio>` an `id` -- an id-less `<audio>` renders silently with no
    error and no sound.
-4. Gate before any full render: `lint --json` (read `ok`), then `check
-   --json` (contrast, layout, motion, and runtime checks in one pass; add
-   `--strict` to fail on warnings too), then `snapshot` (numbered stills
+4. Gate before any full render: `hyperframes check --json` (lint, runtime,
+   layout, motion, and contrast checks in one pass; add `--strict` to fail on
+   warnings too), then `hyperframes snapshot` (numbered stills
    under `snapshots/`). Actually look at the stills from every scene and
    every mid-transition frame, not only the first and last, and fix
    overflow, element collisions, or contrast failures before rendering
    anything full-length.
 5. Narration: `hyperframes tts "<line>" --voice <id> --output <path>` runs
    Kokoro-82M locally, no account needed; its first use downloads its model
-   and voice data (several hundred MiB total) once. If the operator's own
-   ElevenLabs key is already set in the environment, the renderer may use it
-   instead -- never print or ask for that key. If narration dependencies are
-   missing, render without narration and say so plainly rather than waiting
-   on the download.
+   and voice data (several hundred MiB total) once. Attach the file as an
+   `<audio id="...">` in the composition, timed per `hyperframes docs
+   data-attributes`. If narration dependencies are missing, render without
+   narration and say so plainly.
 6. Music and SFX come only from files already sitting in
    `<repo>/motion/assets/audio/` -- never download or generate audio. Mark
    the track's `<audio>` with `data-timeline-role="music"` (or give it an id
@@ -74,7 +76,8 @@ nobody actually looked at.
    work; that is expected, not a failure.
 9. Register both files with `zirv artifact render <path>` (the kind is
    inferred: the MP4 as video, the GIF as image) and present the result with
-   `zirv artifact present <id>`. Report both rendered paths.
+   `zirv artifact present <id> --agent <your harness>`. Report both rendered
+   paths.
 
 ## Untrusted output
 
