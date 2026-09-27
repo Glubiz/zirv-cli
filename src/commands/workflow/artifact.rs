@@ -22,6 +22,7 @@ pub enum ArtifactKind {
     Html,
     Diagram,
     Document,
+    Video,
     Other,
 }
 
@@ -138,6 +139,7 @@ fn infer_kind(path: &Path) -> ArtifactKind {
         Some("html" | "htm") => ArtifactKind::Html,
         Some("mmd" | "mermaid") => ArtifactKind::Diagram,
         Some("pdf" | "md" | "docx") => ArtifactKind::Document,
+        Some("mp4" | "webm" | "mov") => ArtifactKind::Video,
         _ => ArtifactKind::Other,
     }
 }
@@ -802,6 +804,14 @@ mod tests {
         assert_eq!(record.kind, ArtifactKind::Svg);
         assert_eq!(load(&state, repo.path(), &record.id).unwrap(), record);
         assert!(!state_root.path().join("mock.svg").exists());
+    }
+
+    #[test]
+    fn video_extensions_infer_video_and_gif_stays_image() {
+        for name in ["clip.mp4", "clip.webm", "clip.mov", "clip.MP4"] {
+            assert_eq!(infer_kind(Path::new(name)), ArtifactKind::Video, "{name}");
+        }
+        assert_eq!(infer_kind(Path::new("demo.gif")), ArtifactKind::Image);
     }
 
     #[test]
