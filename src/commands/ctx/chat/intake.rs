@@ -368,9 +368,12 @@ pub(crate) fn wrap_display(text: &str, width: u16) -> Vec<String> {
 /// CJK/combining-mark distinction the old `EditLine::cells_upto` made,
 /// carried over verbatim). `row`/`col` are both absolute, i.e. before any
 /// scrolling -- see [`scroll_offset`] for making a tall result fit a capped
-/// box.
+/// box. A cursor past the last cell of an exactly full row stays on that
+/// row's last column (a terminal's pending-wrap position), since
+/// [`wrap_display`] never produces the empty row after it.
 pub(crate) fn wrapped_position(text: &str, width: u16, pos: usize) -> (u16, u16) {
     let width = usize::from(width.max(1));
+    let at = |row: u16, cells: usize| (row, cells.min(width - 1) as u16);
     let mut row: u16 = 0;
     let mut cells = 0usize;
     let mut seen = 0usize;
@@ -380,23 +383,23 @@ pub(crate) fn wrapped_position(text: &str, width: u16, pos: usize) -> (u16, u16)
             cells = 0;
         }
         for c in hard_line.chars() {
-            if seen == pos {
-                return (row, cells as u16);
-            }
             let w = UnicodeWidthChar::width(c).unwrap_or(0);
             if cells > 0 && cells + w > width {
                 row += 1;
                 cells = 0;
             }
+            if seen == pos {
+                return at(row, cells);
+            }
             cells += w;
             seen += 1;
         }
         if seen == pos {
-            return (row, cells as u16);
+            return at(row, cells);
         }
         seen += 1; // the '\n' `split` itself consumed
     }
-    (row, cells as u16)
+    at(row, cells)
 }
 
 /// The first visual row to show when `total_rows` wrapped rows need to fit
@@ -1963,6 +1966,15 @@ mod tests {
         // The position right after the last char (index 10) sits at the end
         // of that same third row.
         assert_eq!(wrapped_position("abcdefghij", 4, 10), (2, 2));
+    }
+
+    #[test]
+    fn wrapped_position_never_lands_on_the_column_past_a_full_row() {
+        // Before 'e' is the start of row 2, not column 4 of row 1.
+        assert_eq!(wrapped_position("abcdefgh", 4, 4), (1, 0));
+        // At the end of an exactly full row it stays on that row's last cell.
+        assert_eq!(wrapped_position("abcd", 4, 4), (0, 3));
+        assert_eq!(wrapped_position("abcd\nx", 4, 4), (0, 3));
     }
 
     // -- bug 2: the box grows with the content, capped and scrolled --
