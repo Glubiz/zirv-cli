@@ -1,16 +1,16 @@
-{"id": "cs-001", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add", "k5": "omit"}}
+{"id": "cs-001", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep", "k5": "omit"}}
 {"id": "cs-002", "labels": {"k0": "omit", "k1": "omit", "k2": "omit", "k3": "omit", "k4": "omit"}}
-{"id": "cs-003", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add", "k5": "omit"}}
-{"id": "cs-004", "labels": {"k0": "add", "k1": "omit", "k2": "add"}}
+{"id": "cs-003", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep", "k5": "omit"}}
+{"id": "cs-004", "labels": {"k0": "keep", "k1": "omit", "k2": "keep"}}
 {"id": "cs-005", "labels": {"k0": "omit", "k1": "omit", "k2": "omit", "k3": "omit"}}
 {"id": "cs-006", "labels": {"k0": "omit", "k1": "omit", "k2": "omit", "k3": "omit", "k4": "omit"}}
-{"id": "cs-007", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add"}}
-{"id": "cs-008", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add", "k5": "omit"}}
+{"id": "cs-007", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep"}}
+{"id": "cs-008", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep", "k5": "omit"}}
 {"id": "cs-009", "labels": {"k0": "omit", "k1": "omit", "k2": "omit", "k3": "omit", "k4": "omit"}}
-{"id": "cs-010", "labels": {"k0": "add", "k1": "omit", "k2": "add"}}
+{"id": "cs-010", "labels": {"k0": "keep", "k1": "omit", "k2": "keep"}}
 {"id": "cs-011", "labels": {"k0": "omit", "k1": "omit", "k2": "omit"}}
-{"id": "cs-012", "labels": {"k0": "add", "k1": "omit", "k2": "add"}}
-{"id": "cs-013", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add"}}
+{"id": "cs-012", "labels": {"k0": "keep", "k1": "omit", "k2": "keep"}}
+{"id": "cs-013", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep"}}
 {"id": "cs-014", "labels": {"k0": "omit", "k1": "omit", "k2": "omit", "k3": "omit", "k4": "omit", "k5": "omit"}}
-{"id": "cs-015", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit"}}
-{"id": "cs-016", "labels": {"k0": "add", "k1": "omit", "k2": "add", "k3": "omit", "k4": "add"}}
+{"id": "cs-015", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit"}}
+{"id": "cs-016", "labels": {"k0": "keep", "k1": "omit", "k2": "keep", "k3": "omit", "k4": "keep"}}
