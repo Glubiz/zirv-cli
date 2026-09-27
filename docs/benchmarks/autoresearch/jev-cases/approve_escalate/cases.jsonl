@@ -1,0 +1,16 @@
+{"id": "apre-001", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}
+{"id": "apre-002", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[14, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]]}}
+{"id": "apre-003", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[10, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0]]}}
+{"id": "apre-004", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[8, 3, 0, 1, 0, 0, 4, 0, 0, 0, 0, 0]]}}
+{"id": "apre-005", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[7, 0, 0, 0, 1, 0, 4, 0, 0, 0, 1, 0]]}}
+{"id": "apre-006", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[4, 2, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]]}}
+{"id": "apre-007", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[5, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1]]}}
+{"id": "apre-008", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]]}}
+{"id": "apre-009", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}
+{"id": "apre-010", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[8, 3, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0]]}}
+{"id": "apre-011", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[9, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}
+{"id": "apre-012", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[6, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]]}}
+{"id": "apre-013", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[4, 2, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]]}}
+{"id": "apre-014", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}
+{"id": "apre-015", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[7, 0, 0, 0, 1, 0, 4, 0, 0, 0, 1, 0]]}}
+{"id": "apre-016", "site": "approve-escalate", "floor_site": "approve_escalate", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[5, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1]]}}

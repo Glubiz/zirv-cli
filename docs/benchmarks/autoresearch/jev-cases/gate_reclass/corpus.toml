@@ -1,0 +1,119 @@
+# Jev determinism probe corpus for the new probe-only floor site "gate_reclass"
+# (docs/superpowers work: jev-determinism campaigns, probe-contract
+# extension). Every case in cases.jsonl/labels.jsonl appears here exactly
+# once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "gtr-001"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-002"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-003"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-004"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-005"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-006"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-007"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-008"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "gtr-009"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "gtr-010"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "gtr-011"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "gtr-012"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "gtr-013"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "gtr-014"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "gtr-015"
+family = "jev-gate_reclass"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "gtr-016"
+family = "jev-gate_reclass"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"

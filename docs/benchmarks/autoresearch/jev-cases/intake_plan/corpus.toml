@@ -1,0 +1,119 @@
+# Jev determinism probe corpus for the new probe-only floor site "intake_plan"
+# (docs/superpowers work: jev-determinism campaigns, probe-contract
+# extension). Every case in cases.jsonl/labels.jsonl appears here exactly
+# once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "ipl-001"
+family = "jev-intake_plan"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-002"
+family = "jev-intake_plan"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-003"
+family = "jev-intake_plan"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-004"
+family = "jev-intake_plan"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-005"
+family = "jev-intake_plan"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-006"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-007"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-008"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "ipl-009"
+family = "jev-intake_plan"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ipl-010"
+family = "jev-intake_plan"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ipl-011"
+family = "jev-intake_plan"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ipl-012"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ipl-013"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "ipl-014"
+family = "jev-intake_plan"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ipl-015"
+family = "jev-intake_plan"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "ipl-016"
+family = "jev-intake_plan"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"

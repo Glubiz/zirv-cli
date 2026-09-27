@@ -1,0 +1,16 @@
+{"id": "ipl-001", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 2, 1, 1, 0, 1]]}}
+{"id": "ipl-002", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 0, 2, 1, 1, 0, 1]]}}
+{"id": "ipl-003", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 1, 6, 6, 3, 1, 1]]}}
+{"id": "ipl-004", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 1, 5, 5, 3, 1, 1]]}}
+{"id": "ipl-005", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 2, 0, 1, 0, 0]]}}
+{"id": "ipl-006", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 3, 2, 2, 0, 1]]}}
+{"id": "ipl-007", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 1, 3, 2, 2, 0, 1]]}}
+{"id": "ipl-008", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 1, 4, 2, 2, 1, 1]]}}
+{"id": "ipl-009", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 2, 1, 1, 0, 1]]}}
+{"id": "ipl-010", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 1, 6, 6, 3, 1, 1]]}}
+{"id": "ipl-011", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 0, 2, 0, 1, 0, 0]]}}
+{"id": "ipl-012", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 3, 2, 2, 0, 1]]}}
+{"id": "ipl-013", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[1, 2, 1, 3, 3, 2, 0, 1]]}}
+{"id": "ipl-014", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 0, 2, 1, 1, 0, 1]]}}
+{"id": "ipl-015", "site": "intake-plan", "floor_site": "intake_plan", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[1, 0, 1, 5, 5, 3, 1, 1]]}}
+{"id": "ipl-016", "site": "intake-plan", "floor_site": "intake_plan", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[1, 1, 1, 3, 2, 2, 0, 1]]}}
