@@ -26687,14 +26687,14 @@ mod tests {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
-        let now = crate::commands::ctx::state::now_secs();
+        let now_before = crate::commands::ctx::state::now_secs();
         window::store(
             &state,
             &crate::commands::ctx::window::UsageWindows {
                 five_hour: Some(crate::commands::ctx::window::Window {
                     used_percentage: 96.0,
-                    resets_at: now + 600,
-                    observed_at: now,
+                    resets_at: now_before + 600,
+                    observed_at: now_before,
                     overage_covered: false,
                     limit_reached: false,
                 }),
@@ -26733,6 +26733,7 @@ mod tests {
             &tmp.path().join("requests"),
             &mut errors,
         );
+        let now_after = crate::commands::ctx::state::now_secs();
 
         assert!(
             result.is_ok(),
@@ -26743,9 +26744,23 @@ mod tests {
             .iter()
             .find(|e| e.contains("pace.spawn_hard_pct"))
             .unwrap_or_else(|| panic!("no spawn_hard_pct note in {errors:?}"));
+        // Root cause of the flake this pins down (not a shared/stale reading,
+        // as first suspected): the note's age is `fulfill_spawn_request`'s own
+        // internal `now_secs()` call minus `observed_at` (`now_before` above),
+        // and that internal call is a real, second-granularity clock read
+        // that happens strictly between `now_before` and `now_after` -- a real
+        // pty spawn and filesystem work sit in between, so on a loaded runner
+        // it can legitimately land on either side of a wall-clock second
+        // boundary. Asserting the exact string "observed 0s ago" assumed the
+        // call always completes within the same second it started, which
+        // nothing guarantees. Every age in `[0, now_after - now_before]` is a
+        // value the real code could truthfully have reported, so that is what
+        // gets asserted instead of one hardcoded value that only usually
+        // holds.
+        let max_age = now_after.saturating_sub(now_before);
         assert!(
-            note.contains("observed 0s ago"),
-            "names the reading age: {note}"
+            (0..=max_age).any(|age| note.contains(&format!("observed {age}s ago"))),
+            "names a reading age within the {max_age}s this call could have taken: {note}"
         );
 
         for pane in &mut panes {

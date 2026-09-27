@@ -1919,24 +1919,28 @@ mod tests {
     /// is stale; an instability means `[proxy] min_margin` may need
     /// raising, or the question wording sharpening).
     ///
-    /// Skips (passes, printing one line) when `TYPESAFE_API_KEY` is unset:
-    /// this test never touches the Keychain and never fails just because a
-    /// key is absent, so it stays green in CI and on a machine with no
-    /// TypeSafe credential. Run it with a key: `TYPESAFE_API_KEY=... cargo
-    /// nextest run jev_live_battery`. Costs roughly 50 calls (two per case)
-    /// at about 6k input tokens each (TypeSafe's own published $0.042/MTok
-    /// input rate -- about two cents total). `state_dir` points at a temp
-    /// dir, never the real `<state>/proxy-decisions.jsonl`, so a real run's
-    /// own persisted decisions and spend rows are untouched -- it persists
-    /// exactly like any other `decide()` call, just into a throwaway
-    /// directory.
+    /// Calls the real TypeSafe Jev API and asserts on its live answers, so it
+    /// is nondeterministic by design and `#[ignore]`d, per this repo's own
+    /// convention for a live provider contract (see
+    /// `provider::anthropic::tests::live_anthropic_messages_contract`).
+    /// Run it with a key: `TYPESAFE_API_KEY=... cargo nextest run
+    /// --run-ignored only jev_live_battery`. Costs roughly 50 calls (two per
+    /// case) at about 6k input tokens each (TypeSafe's own published
+    /// $0.042/MTok input rate -- about two cents total). `state_dir` points
+    /// at a temp dir, never the real `<state>/proxy-decisions.jsonl`, so a
+    /// real run's own persisted decisions and spend rows are untouched -- it
+    /// persists exactly like any other `decide()` call, just into a
+    /// throwaway directory.
     #[test]
+    #[ignore = "live TypeSafe Jev battery; set TYPESAFE_API_KEY"]
     fn jev_live_battery_matches_recorded_rulings() {
         let key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
-        if key.trim().is_empty() {
-            println!("skipped: TYPESAFE_API_KEY unset");
-            return;
-        }
+        assert!(
+            !key.trim().is_empty(),
+            "TYPESAFE_API_KEY must be set to run this live battery -- it is #[ignore]d by \
+             default, so reaching here without it means it was run explicitly \
+             (--run-ignored/--ignored) with no key exported"
+        );
 
         let text = std::fs::read_to_string(fixture("proxy/jev-battery.json"))
             .expect("jev-battery fixture");
