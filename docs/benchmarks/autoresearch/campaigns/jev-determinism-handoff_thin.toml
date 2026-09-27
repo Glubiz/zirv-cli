@@ -52,7 +52,7 @@ file = "docs/benchmarks/autoresearch/jev-cases/handoff_thin/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "10"]
-per_trial_ceiling_usd = 0.004
+per_trial_ceiling_usd = 0.0015
 calls_per_trial = 10
 timeout_secs = 180
 
