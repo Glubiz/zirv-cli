@@ -336,9 +336,9 @@ impl StdioTransport {
         }
     }
 
-    /// Waits, bounded by `budget`, for the child to exit, then joins the
-    /// stderr-draining thread so the tail it collected is complete before an
-    /// error message is built from it.
+    /// Waits, bounded by a single overall `budget`, for the child to exit and
+    /// then for the stderr-draining thread to finish, so the tail it
+    /// collected is complete before an error message is built from it.
     ///
     /// A write-side EPIPE or the stdout reader hitting EOF each mean the
     /// corresponding pipe's other end is gone, which for a child process
@@ -347,14 +347,20 @@ impl StdioTransport {
     /// background reader (`pump_stderr`) has been scheduled to observe and
     /// buffer the child's stderr by then -- a real race under CI load that
     /// used to surface as a bare "Broken pipe" with no diagnostic -- this
-    /// waits for the actual exit and then joins the reader thread, which can
-    /// only return after it has seen EOF on stderr. EOF on stderr is only
-    /// possible once every handle to the write end is closed, which is
-    /// guaranteed once the child has exited. So once the join returns, the
-    /// tail is complete, not a guess. `budget` only guards the (essentially
-    /// theoretical, for a process whose stdin/stdout pipe already broke)
-    /// case of a child that keeps running indefinitely without exiting; it
-    /// is not what makes the wait correct.
+    /// waits for the actual exit, which normally means the reader has also
+    /// already seen EOF on stderr (guaranteed once every handle to the write
+    /// end is closed) and finished.
+    ///
+    /// It is only "normally" because a grandchild (a wrapper or launcher
+    /// that forked its own server) can inherit the stderr handle and keep it
+    /// open after the direct child we spawned has exited; the reader would
+    /// then never see EOF. So this polls `is_finished` rather than blocking
+    /// on `join`, under the SAME deadline that bounds the exit wait, and
+    /// only joins once the thread has actually finished -- a transport error
+    /// path must never be able to hang forever. If the deadline passes
+    /// first, the (still-running) handle is put back so a later call can
+    /// still pick up its result, and the tail is used as-is, possibly
+    /// incomplete.
     fn drain_stderr_after_exit(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {
@@ -370,7 +376,17 @@ impl StdioTransport {
             }
         }
         if let Some(handle) = self.stderr_pump.take() {
-            let _ = handle.join();
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    self.stderr_pump = Some(handle);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
