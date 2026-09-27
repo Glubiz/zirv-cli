@@ -1108,7 +1108,10 @@ fn resolve_builtin_or_registry(
 /// task), so the cross-module visibility is no longer needed.
 fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
     let mut ids = Vec::new();
+    // `simplify` shares the Implement phase but is a reuse pass over a
+    // finished diff, not a plan to execute.
     if step.phase == WorkflowPhase::Implement
+        && step.skill != "simplify"
         && classification.complexity >= Complexity::Substantial
     {
         ids.push("execute-plan".to_string());
@@ -10896,6 +10899,33 @@ mod tests {
         assert!(context.contains("[skill worktree@1"));
         assert!(context.contains("[skill implement@1"));
         assert!(context.contains("[skill execute-plan@1"));
+    }
+
+    #[test]
+    fn the_simplify_step_does_not_inherit_execute_plan_context() {
+        let repo = tempdir().unwrap();
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        classification.risk = RiskBand::Medium;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        state.current_step = state
+            .steps
+            .iter()
+            .position(|step| step.id == "simplify")
+            .expect("medium-risk feature carries a simplify step");
+        state.status = WorkflowStatus::Running;
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(context.contains("[skill simplify@1"), "got: {context}");
+        assert!(!context.contains("[skill execute-plan@1"), "got: {context}");
     }
 
     #[test]
