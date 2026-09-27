@@ -66,7 +66,7 @@ file = "docs/benchmarks/autoresearch/jev-cases/handoff_thin/corpus.toml"
 [backend]
 kind = "command"
 command = ["python", "docs/benchmarks/autoresearch/jev_probe_trial.py", "--trial", "{spec}", "--out", "{out}", "--reps", "10"]
-per_trial_ceiling_usd = 0.0015
+per_trial_ceiling_usd = 0.001
 calls_per_trial = 10
 timeout_secs = 180
 
@@ -79,10 +79,10 @@ model = "sonnet"
 # holdout 12): screen 8*2=16, validate 20*3=60, holdout 12*3=36 -> baseline
 # 112; candidate_worst_case = 1*(16+60)+36 = 112 -> worst_case_trials = 224,
 # worst_case_calls = 224*10 = 2240, worst_case_spend = 224*0.0015 = $0.336.
-max_spend_usd = 0.40
+max_spend_usd = 0.45
 max_wall_secs = 14400
-max_calls = 2500
-max_trials = 250
+max_calls = 4200
+max_trials = 420
 max_retries = 1
 concurrency = 3
 
@@ -90,13 +90,16 @@ concurrency = 3
 split = "dev"
 reps = 2
 
+# Pre-registered after the n=60 confirmatory run (d_quality +0.028, CI lower
+# 0.0083 just below min_effect 0.01): validate and holdout reps doubled to 6,
+# criteria unchanged; the gate's verdict on this run is final.
 [stages.validate]
 split = "validation"
-reps = 3
+reps = 6
 
 [stages.holdout]
 split = "holdout"
-reps = 3
+reps = 6
 max_uses = 1
 
 [criteria]
