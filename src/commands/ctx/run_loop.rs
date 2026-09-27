@@ -1215,8 +1215,10 @@ or {\"seconds\": <n>}.";
 /// Issue #537 (A4): a confident `continue` from Jev, at or above this floor,
 /// skips this cycle's helper judge call entirely -- `done`/`blocked`/`wait`
 /// stay the helper's sole authority, and Jev is never asked to produce them.
-/// Chosen from a live 2026-09-18 probe.
-const JUDGE_CONTINUE_FLOOR: f32 = 0.7;
+/// Chosen from a live 2026-09-18 probe. Shared with `zirv ctx jev probe
+/// --site judge`, which reports this exact floor unless overridden by its
+/// own `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`.
+pub(crate) const JUDGE_CONTINUE_FLOOR: f32 = 0.7;
 const MAX_CONSECUTIVE_JEV_SKIPS: u8 = 2;
 
 #[derive(Debug, Serialize)]
@@ -1250,6 +1252,47 @@ impl JudgeAdvice {
             Self::Disabled => "disabled",
             Self::MissingCredential => "missing_credential",
         }
+    }
+}
+
+/// [`jev_judge_continue`]'s own question, `"verdict"` -- shared verbatim
+/// with `zirv ctx jev probe --site judge`.
+pub(crate) fn judge_continue_question() -> jev::Question {
+    jev::Question::metadata_choice(
+        "verdict",
+        "From coarse local progress metadata only, is another work cycle clearly warranted?",
+        &[
+            (
+                "done",
+                "the objective is met and the tail shows the evidence",
+            ),
+            (
+                "blocked",
+                "cannot proceed without a human or external input",
+            ),
+            ("continue", "work is progressing normally"),
+            ("wait", "waiting on a process, file or time"),
+        ],
+    )
+}
+
+/// [`jev_judge_continue`]'s per-call decision: `"continue"` only for a
+/// decisive `continue` choice, `"helper"` otherwise (any other choice,
+/// indecisive, or no answer -- production keeps its own missing-vs-
+/// indecisive `Uncertain` distinction around this call, so `"helper"` alone
+/// does not tell them apart). Shared with `zirv ctx jev probe --site
+/// judge`, which reports exactly this outcome per call.
+pub(crate) fn judge_continue_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    if answer.is_some_and(|answer| {
+        answer.decisive(min_confidence, min_margin) && answer.as_choice() == Some("continue")
+    }) {
+        "continue"
+    } else {
+        "helper"
     }
 }
 
@@ -1294,22 +1337,7 @@ fn jev_judge_continue(
             budget_remaining_bucket,
         ]],
     };
-    let questions = [jev::Question::metadata_choice(
-        "verdict",
-        "From coarse local progress metadata only, is another work cycle clearly warranted?",
-        &[
-            (
-                "done",
-                "the objective is met and the tail shows the evidence",
-            ),
-            (
-                "blocked",
-                "cannot proceed without a human or external input",
-            ),
-            ("continue", "work is progressing normally"),
-            ("wait", "waiting on a process, file or time"),
-        ],
-    )];
+    let questions = [judge_continue_question()];
     let answers = match jev::advise_detailed(
         cfg,
         state,
@@ -1329,7 +1357,9 @@ fn jev_judge_continue(
     if !answer.decisive(JUDGE_CONTINUE_FLOOR, jev::DEFAULT_MIN_MARGIN) {
         return JudgeAdvice::Uncertain;
     }
-    if answer.as_choice() == Some("continue") {
+    if judge_continue_action(Some(answer), JUDGE_CONTINUE_FLOOR, jev::DEFAULT_MIN_MARGIN)
+        == "continue"
+    {
         JudgeAdvice::Continue
     } else {
         JudgeAdvice::OtherVerdict

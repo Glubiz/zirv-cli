@@ -9563,7 +9563,7 @@ fn trailing_same_command_failure_run(jsonl: &str, command: &str) -> usize {
 /// removes one -- the safe direction -- so this reuses the same
 /// general-purpose bar the harness proxy's own default `[proxy]
 /// min_confidence` ships with, rather than a stricter one.
-const APPROVE_ESCALATE_MIN_CONFIDENCE: f32 = 0.5;
+pub(crate) const APPROVE_ESCALATE_MIN_CONFIDENCE: f32 = 0.5;
 
 /// Issue #781 (`[jev] approve_allow`): the confidence floor for LOWERING a
 /// deterministic `ask` to `allow` -- the one direction that can cause harm,
@@ -9572,14 +9572,14 @@ const APPROVE_ESCALATE_MIN_CONFIDENCE: f32 = 0.5;
 /// 8/10 correct with both misses cautious (never a false allow) at n=10 --
 /// explicitly too small to gate on at a normal bar, so this floor demands
 /// near-certainty to compensate.
-const APPROVE_ALLOW_MIN_CONFIDENCE: f32 = 0.9;
+pub(crate) const APPROVE_ALLOW_MIN_CONFIDENCE: f32 = 0.9;
 
 /// Issue #781 (`[jev] approve_allow`): the margin floor for the same
 /// lowering direction, well above [`jev::DEFAULT_MIN_MARGIN`]'s
 /// determinism-only 0.2 -- same 2026-09-18 probe basis as
 /// [`APPROVE_ALLOW_MIN_CONFIDENCE`]: only a decisively safe answer, not
 /// merely a stable one, may ever widen a verdict.
-const APPROVE_ALLOW_MIN_MARGIN: f32 = 0.6;
+pub(crate) const APPROVE_ALLOW_MIN_MARGIN: f32 = 0.6;
 
 /// The `_zirv_metadata_only` request state `[jev] approve`/`approve_allow`
 /// send -- one row, [`jev_approve_facts`]'s own numeric-only projection.
@@ -9605,6 +9605,71 @@ none,1 worktree,2 repo,3 home/root-wide,4 credential), pipe count, redirect coun
 count, secret-placeholder count, wrapper flag]. This command already needs approval under zirv's \
 own policy, with no rule naming it -- only the plain unmatched-command default. Based only on \
 these bounded counts, is it safe enough to approve automatically?";
+
+/// [`jev_approve_escalate`]'s own question, `"risk"` -- shared verbatim
+/// with `zirv ctx jev probe --site approve-escalate`.
+pub(crate) fn approve_escalate_question() -> super::jev::Question {
+    super::jev::Question::metadata_choice(
+        "risk",
+        JEV_APPROVE_ESCALATE_INSTRUCTIONS,
+        &[
+            ("safe", "ordinary and safe to run unattended"),
+            (
+                "risky",
+                "destructive, security-sensitive, or otherwise needs a human first",
+            ),
+        ],
+    )
+}
+
+/// [`jev_approve_escalate`]'s per-call decision: `"ask"` only for a
+/// decisive `risky` choice, `"allow"` otherwise (`safe`, indecisive, or no
+/// answer). Shared with `zirv ctx jev probe --site approve-escalate`, which
+/// reports exactly this outcome per call.
+pub(crate) fn approve_escalate_action(
+    answer: Option<&super::jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    if answer.is_some_and(|answer| {
+        answer.as_choice() == Some("risky") && answer.decisive(min_confidence, min_margin)
+    }) {
+        "ask"
+    } else {
+        "allow"
+    }
+}
+
+/// [`jev_approve_lower`]'s own question, `"safe"` -- shared verbatim with
+/// `zirv ctx jev probe --site approve-lower`.
+pub(crate) fn approve_lower_question() -> super::jev::Question {
+    super::jev::Question::metadata_choice(
+        "safe",
+        JEV_APPROVE_LOWER_INSTRUCTIONS,
+        &[
+            ("unsafe", "should still ask a human first"),
+            ("safe", "safe enough to approve automatically"),
+        ],
+    )
+}
+
+/// [`jev_approve_lower`]'s per-call decision: `"allow"` only for a decisive
+/// `safe` choice, `"ask"` otherwise (`unsafe`, indecisive, or no answer).
+/// Shared with `zirv ctx jev probe --site approve-lower`, which reports
+/// exactly this outcome per call.
+pub(crate) fn approve_lower_action(
+    answer: Option<&super::jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    if answer.is_some_and(|answer| {
+        answer.as_choice() == Some("safe") && answer.decisive(min_confidence, min_margin)
+    }) {
+        "allow"
+    } else {
+        "ask"
+    }
+}
 
 /// Issue #781: the fixed local program-class table `jev_approve_facts` row
 /// index 0 uses -- deliberately coarse (a handful of risk-relevant
@@ -10354,17 +10419,7 @@ fn jev_approve_escalate(
         _zirv_metadata_only: true,
         facts: vec![jev_approve_facts(command, scratchpad_roots)],
     };
-    let questions = [super::jev::Question::metadata_choice(
-        "risk",
-        JEV_APPROVE_ESCALATE_INSTRUCTIONS,
-        &[
-            ("safe", "ordinary and safe to run unattended"),
-            (
-                "risky",
-                "destructive, security-sensitive, or otherwise needs a human first",
-            ),
-        ],
-    )];
+    let questions = [approve_escalate_question()];
     match super::jev::advise_detailed(
         cfg,
         state,
@@ -10386,11 +10441,11 @@ fn jev_approve_escalate(
                 );
                 return outcome;
             };
-            if answer.as_choice() == Some("risky")
-                && answer.decisive(
-                    APPROVE_ESCALATE_MIN_CONFIDENCE,
-                    super::jev::DEFAULT_MIN_MARGIN,
-                )
+            if approve_escalate_action(
+                Some(answer),
+                APPROVE_ESCALATE_MIN_CONFIDENCE,
+                super::jev::DEFAULT_MIN_MARGIN,
+            ) == "ask"
             {
                 super::jev::record_effect(
                     cfg,
@@ -10458,14 +10513,7 @@ fn jev_approve_lower(
         _zirv_metadata_only: true,
         facts: vec![jev_approve_facts(command, scratchpad_roots)],
     };
-    let questions = [super::jev::Question::metadata_choice(
-        "safe",
-        JEV_APPROVE_LOWER_INSTRUCTIONS,
-        &[
-            ("unsafe", "should still ask a human first"),
-            ("safe", "safe enough to approve automatically"),
-        ],
-    )];
+    let questions = [approve_lower_question()];
     match super::jev::advise_detailed(
         cfg,
         state,
@@ -10487,8 +10535,11 @@ fn jev_approve_lower(
                 );
                 return outcome;
             };
-            if answer.as_choice() == Some("safe")
-                && answer.decisive(APPROVE_ALLOW_MIN_CONFIDENCE, APPROVE_ALLOW_MIN_MARGIN)
+            if approve_lower_action(
+                Some(answer),
+                APPROVE_ALLOW_MIN_CONFIDENCE,
+                APPROVE_ALLOW_MIN_MARGIN,
+            ) == "allow"
             {
                 super::jev::record_effect(
                     cfg,

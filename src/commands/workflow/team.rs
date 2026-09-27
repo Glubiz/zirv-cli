@@ -782,6 +782,48 @@ fn plan_advisory_state(plan: &TeamPlan) -> serde_json::Value {
     })
 }
 
+/// [`maybe_advise_team_plan`]'s own confidence AND margin floor for a
+/// `planner_distinct` answer to omit the planner worker -- deliberately
+/// high on both axes since this removes a seat outright, not merely adds a
+/// warning. Shared with `zirv ctx jev probe --site intake-plan`, which
+/// reports this exact floor unless overridden by its own
+/// `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/`ZIRV_CTX_JEV_PROBE_MIN_MARGIN`.
+pub(crate) const INTAKE_PLAN_MIN_CONFIDENCE: f32 = 0.9;
+pub(crate) const INTAKE_PLAN_MIN_MARGIN: f32 = 0.9;
+
+/// [`maybe_advise_team_plan`]'s own question, `"planner_distinct"` --
+/// shared verbatim with `zirv ctx jev probe --site intake-plan`.
+pub(crate) fn intake_plan_question() -> Question {
+    Question::metadata_noul(
+        "planner_distinct",
+        "Given only these coarse team-plan facts, is a separate planner worker necessary to produce a distinct deliverable beyond the compiled seat order, claims, and dependencies? Answer true if the facts are insufficient or there is any doubt.",
+        "yes, keep the planner worker",
+        "no, the compiled plan already supplies the breakdown",
+    )
+}
+
+/// [`maybe_advise_team_plan`]'s per-call decision: `"omit_planner"` only for
+/// a decisive noul answer whose probability-of-"true" (== keep the planner)
+/// falls in `0.0..=0.05` -- i.e. decisively "no, omit it" -- `"keep_planner"`
+/// otherwise (indecisive, no answer, or any higher probability). Shared
+/// with `zirv ctx jev probe --site intake-plan`, which reports exactly this
+/// outcome per call.
+pub(crate) fn intake_plan_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let omit = answer
+        .and_then(|answer| {
+            answer
+                .decisive(min_confidence, min_margin)
+                .then(|| answer.as_noul())
+                .flatten()
+        })
+        .is_some_and(|value| (0.0..=0.05).contains(&value));
+    if omit { "omit_planner" } else { "keep_planner" }
+}
+
 /// Optional Jev advice acts on an already valid deterministic plan. The
 /// caller stores this returned plan, so omitting the planner also omits its
 /// later brief and dispatch from the compiled team path.
@@ -823,12 +865,7 @@ fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> 
     }
 
     let input = plan_advisory_state(&plan);
-    let questions = [Question::metadata_noul(
-        "planner_distinct",
-        "Given only these coarse team-plan facts, is a separate planner worker necessary to produce a distinct deliverable beyond the compiled seat order, claims, and dependencies? Answer true if the facts are insufficient or there is any doubt.",
-        "yes, keep the planner worker",
-        "no, the compiled plan already supplies the breakdown",
-    )];
+    let questions = [intake_plan_question()];
     let answers = match jev::advise_detailed(
         cfg,
         state,
@@ -842,15 +879,11 @@ fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> 
             return plan;
         }
     };
-    let omit = answers
-        .get("planner_distinct")
-        .and_then(|answer| {
-            answer
-                .decisive(0.9, 0.9)
-                .then(|| answer.as_noul())
-                .flatten()
-        })
-        .is_some_and(|value| (0.0..=0.05).contains(&value));
+    let omit = intake_plan_action(
+        answers.get("planner_distinct"),
+        INTAKE_PLAN_MIN_CONFIDENCE,
+        INTAKE_PLAN_MIN_MARGIN,
+    ) == "omit_planner";
     let mut final_plan = plan.clone();
     if omit {
         final_plan.seats.retain(|seat| seat.id != "planner-1");
