@@ -26,12 +26,12 @@ run inside the project folder -- never an unpinned or global `hyperframes` --
 with the environment variable `HYPERFRAMES_SKIP_SKILLS=1` set; without it
 `init` installs the renderer's own agent skills into every host globally.
 
-1. Preflight once: `npx --yes hyperframes@0.8.80 doctor --json`, and read its
-   `ok` field yourself -- the command always exits 0 even when environment
-   checks fail. Missing Node 22+, FFmpeg, FFprobe, or a launchable Chrome:
-   stop and report exactly what is missing. Never install anything on the
+1. Preflight once: `hyperframes doctor --json`. It always exits 0, and its
+   top-level `ok` is also false when optional checks (Docker, MusicGen,
+   whisper) fail -- gate only on the Node 22+, FFmpeg, FFprobe, and Chrome
+   checks. Any of those missing: stop and report exactly what is missing. Never install anything on the
    renderer's behalf.
-2. Scaffold at `<repo>/motion/<slug>/` with `npx --yes hyperframes@0.8.80
+2. Scaffold at `<repo>/motion/<slug>/` with `hyperframes
    init <slug> --non-interactive`, run from `<repo>/motion/`, so it can never
    wait on a prompt. Add a `renders/` line to a `.gitignore` inside that
    project folder -- the composition source is committed, rendered media is
@@ -48,9 +48,10 @@ with the environment variable `HYPERFRAMES_SKIP_SKILLS=1` set; without it
    error and no sound.
 4. Gate before any full render: `hyperframes check --json` (lint, runtime,
    layout, motion, and contrast checks in one pass; add `--strict` to fail on
-   warnings too), then `hyperframes snapshot` (numbered stills
-   under `snapshots/`). Actually look at the stills from every scene and
-   every mid-transition frame, not only the first and last, and fix
+   warnings too), then `hyperframes snapshot --at <t1>,<t2>,...` (stills
+   under `snapshots/`; without `--at` it takes five evenly spaced frames and
+   misses short transitions). Pick times inside every scene and every
+   transition, actually look at each still, and fix
    overflow, element collisions, or contrast failures before rendering
    anything full-length.
 5. Narration: `hyperframes tts "<line>" --voice <id> --output <path>` runs
