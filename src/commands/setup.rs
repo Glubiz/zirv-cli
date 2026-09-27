@@ -699,6 +699,14 @@ fn parse_node_version(output: &str) -> Option<(u64, u64, u64)> {
 /// wrapped agent discover the mismatch mid-render.
 const MOTION_NODE_MIN_MAJOR: u64 = 22;
 
+/// Pure: whether a parsed `node --version` clears [`MOTION_NODE_MIN_MAJOR`].
+/// `None` (version unknown -- probe failed, timed out, or did not parse) is
+/// never flagged as unsupported, the same "unknown is not a failure"
+/// discipline every other best-effort probe in this module holds.
+fn node_version_meets_floor(version: Option<(u64, u64, u64)>) -> bool {
+    version.is_none_or(|(major, _, _)| major >= MOTION_NODE_MIN_MAJOR)
+}
+
 /// The narration-module probe script handed to a candidate Python
 /// interpreter's `-c`, mirroring Hyperframes' own `hasPythonModules`
 /// (`packages/cli/src/tts/python.ts`): `importlib.util.find_spec` for each
@@ -783,7 +791,7 @@ fn motion_graphics_status() -> MotionGraphicsStatus {
         .then(|| run_bounded_probe("node", &["--version"]))
         .flatten()
         .and_then(|output| parse_node_version(&output));
-    let node_supported = node_version.is_none_or(|(major, _, _)| major >= MOTION_NODE_MIN_MAJOR);
+    let node_supported = node_version_meets_floor(node_version);
     let ffmpeg_installed = executable_exists("ffmpeg");
     let python = find_motion_python();
     let modules_present = python.as_deref().is_some_and(|python| {
@@ -4648,8 +4656,12 @@ mod tests {
         assert_eq!(parse_node_version("22.9.0\n"), None, "missing leading v");
         assert_eq!(parse_node_version("v22\n"), None, "missing minor/patch");
 
-        assert!(22 >= MOTION_NODE_MIN_MAJOR);
-        assert!(18 < MOTION_NODE_MIN_MAJOR);
+        assert!(node_version_meets_floor(Some((22, 9, 0))));
+        assert!(!node_version_meets_floor(Some((18, 20, 4))));
+        assert!(
+            node_version_meets_floor(None),
+            "an unknown version is never flagged unsupported"
+        );
     }
 
     #[test]
