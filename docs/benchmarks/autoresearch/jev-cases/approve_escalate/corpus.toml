@@ -117,3 +117,95 @@ family = "jev-approve_escalate"
 class = "ambiguous"
 split = "holdout"
 kind = "decision"
+
+# Confirmatory round (issue: approve-escalate probe confidence spread
+# ~0.2-0.64 for an identical mid-risk command; esc-018/esc-025 candidates in
+# the campaign manifest target this gap). apre-017..028 add MID-risk cases
+# shaped like the ones observed to flip (apre-003/004/005/010: sudo/rm-
+# family/curl+secret/rm-family with a scoped delete or credential/root-wide
+# path) plus a few low-risk read-only controls, split 8 validation / 4
+# holdout to give the gate enough validation-stage evidence.
+
+[[task]]
+id = "apre-017"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-018"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-019"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-020"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-021"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-022"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-023"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-024"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "apre-025"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "apre-026"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "apre-027"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "apre-028"
+family = "jev-approve_escalate"
+class = "bounded"
+split = "holdout"
+kind = "decision"
