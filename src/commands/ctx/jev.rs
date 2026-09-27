@@ -42,7 +42,7 @@
 //! unparsable response body -> `Malformed`; the credential env unset or
 //! empty -> `NoCredential`, checked BEFORE opening any connection.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -1143,6 +1143,13 @@ struct DecisionRecord<'a> {
     /// Whether these answers were served from [`ask`]'s own decision cache
     /// rather than a real call -- `usage` is `0`/`0` whenever this is `true`.
     cached: bool,
+    /// Session-scoped dash follow-up: this process's own [`session_and_
+    /// principal`] session id (`"proxy"` for an intake-proxy call made
+    /// before a harness session exists) -- what a session-scoped rollup
+    /// filters on. `EffectRecord` already carried this; decisions did not,
+    /// which is exactly why a session-scoped view could not be built from
+    /// them until now.
+    session: &'a str,
     /// Issue #800: this process's own campaign/candidate/trial/task ids, so
     /// `zirv workflow spend --campaign <id>` can count this decision. Never
     /// serialized when unset -- an existing row's JSON is byte-identical.
@@ -1179,6 +1186,7 @@ pub(crate) fn record(
     cached: bool,
 ) {
     let ts = state::now_secs();
+    let (session, principal) = session_and_principal();
     let answer_records: BTreeMap<&str, AnswerRecord> = answers
         .iter()
         .map(|(id, answer)| {
@@ -1199,6 +1207,7 @@ pub(crate) fn record(
         wall_ms,
         fallbacks,
         cached,
+        session: &session,
         attribution: Attribution::from_env(),
     };
     if let Ok(line) = serde_json::to_string(&record)
@@ -1208,7 +1217,6 @@ pub(crate) fn record(
         let _ = writeln!(file, "{line}");
     }
 
-    let (session, principal) = session_and_principal();
     let _ = log::append_delegation_cached(
         state,
         &log::Delegation {
@@ -1348,6 +1356,15 @@ struct DecisionRollupRow {
     cached: bool,
     #[serde(default)]
     fallbacks: Vec<String>,
+    /// Session-scoped dash follow-up: which session recorded this row.
+    /// `#[serde(default)]` so a row written before this field existed
+    /// deserializes as `""` (empty) rather than failing to parse -- `""` is
+    /// never a real session id (`session_and_principal`'s own fallback is
+    /// `"proxy"`, never empty), so an old row simply never matches any
+    /// session-scoped filter set and is silently excluded from a session
+    /// view, exactly as if it had never happened -- never a parse error.
+    #[serde(default)]
+    session: String,
 }
 
 /// The subset of a `jev-effects.jsonl` line (see [`EffectRecord`])
@@ -1358,6 +1375,11 @@ struct EffectRollupRow {
     ts: u64,
     #[serde(default)]
     removed_bytes: Option<u64>,
+    /// See [`DecisionRollupRow::session`]'s own doc comment -- same
+    /// back-compat default, same exclusion-not-parse-failure behavior for a
+    /// pre-existing row.
+    #[serde(default)]
+    session: String,
 }
 
 /// The single most recent `jev-decisions.jsonl` row in the rollup window,
@@ -1489,9 +1511,28 @@ fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
 /// fast: `zirv ctx jev status` is a read-only diagnostic and the dashboard
 /// reads this on its own throttled cadence, never per frame -- either way,
 /// this is the only I/O beyond loading config.
-pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
+///
+/// Session-scoped dash follow-up: both logs are a SINGLE machine-wide file
+/// (there is one `<platform state dir>/jev-decisions.jsonl`, written by
+/// every zirv process on the machine, across every repo and every day --
+/// confirmed by inspecting a real one on this box, which carried a dozen
+/// distinct session ids), so without a filter this folds every session's
+/// rows together. `sessions` is that filter: `None` keeps today's
+/// all-sessions behavior (`zirv ctx jev status`'s own 7-day, every-session
+/// view), `Some(set)` keeps only rows whose own `session` field is in it
+/// (the dashboard's session-scoped sidebar section). A row with no session
+/// at all (`DecisionRollupRow::session`/`EffectRollupRow::session`'s own
+/// `""` default, from before this field existed) never matches a `Some`
+/// filter, so it silently drops out of a session view rather than needing a
+/// special case.
+pub(crate) fn usage_rollup(
+    state: &StateDir,
+    window_secs: u64,
+    sessions: Option<&BTreeSet<String>>,
+) -> JevRollup {
     let now = state::now_secs();
     let cutoff = now.saturating_sub(window_secs);
+    let in_scope = |session: &str| sessions.is_none_or(|set| set.contains(session));
     let mut builders: BTreeMap<String, JevSiteUsageBuilder> = BTreeMap::new();
     let mut last_call: Option<JevLastCall> = None;
     let mut recent_errors: Vec<JevErrorEntry> = Vec::new();
@@ -1505,7 +1546,7 @@ pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
             let Ok(row) = serde_json::from_str::<DecisionRollupRow>(line) else {
                 continue;
             };
-            if row.ts < cutoff {
+            if row.ts < cutoff || !in_scope(&row.session) {
                 continue;
             }
             if last_call.as_ref().is_none_or(|last| row.ts >= last.ts) {
@@ -1542,7 +1583,7 @@ pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
             let Ok(row) = serde_json::from_str::<EffectRollupRow>(line) else {
                 continue;
             };
-            if row.ts < cutoff {
+            if row.ts < cutoff || !in_scope(&row.session) {
                 continue;
             }
             let entry = builders.entry(row.site).or_default();
@@ -1756,7 +1797,7 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
             let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
 
             if *json {
-                let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+                let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
                 let json_output = status_json(&cfg, &rollup.sites);
                 writeln!(writer, "{}", serde_json::to_string_pretty(&json_output)?)?;
                 Ok(0)
@@ -1905,7 +1946,7 @@ pub fn status(
     }
 
     // Print the usage rollup
-    let rollup = usage_rollup(state, ROLLUP_WINDOW_SECS);
+    let rollup = usage_rollup(state, ROLLUP_WINDOW_SECS, None);
     let window_days = ROLLUP_WINDOW_SECS / 86_400;
     writeln!(writer)?;
     writeln!(writer, "usage (last {window_days}d)")?;
@@ -2277,6 +2318,43 @@ pub(crate) mod tests {
             Some(cfg.proxy.typesafe.model.as_str())
         );
         assert_eq!(delegations[0].input_tokens, 10);
+    }
+
+    /// Session-scoped dash follow-up: a decision row now carries the calling
+    /// session id (`ZIRV_CTX_SESSION`), the same value `record_effect`'s own
+    /// `EffectRecord` already wrote -- without this, a session-scoped rollup
+    /// had nothing on a decision row to filter.
+    #[test]
+    fn record_writes_the_calling_sessions_id() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        unsafe {
+            std::env::set_var(adapters::SESSION_ENV, "sess-under-test");
+        }
+        record(
+            &state,
+            &cfg,
+            "memory",
+            &Answers::new(),
+            &usage,
+            1,
+            &[],
+            false,
+        );
+        unsafe {
+            std::env::remove_var(adapters::SESSION_ENV);
+        }
+
+        let text = std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE))
+            .expect("jev-decisions.jsonl");
+        let value: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("one line")).expect("parse json");
+        assert_eq!(value["session"], "sess-under-test");
     }
 
     /// Review finding: `record` used to read the whole file, append in
@@ -3323,7 +3401,7 @@ pub(crate) mod tests {
         );
         std::fs::write(state.root().join("jev-effects.jsonl"), effects).expect("write effects");
 
-        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         let usage = rollup.sites.get("memory").expect("memory site present");
         assert_eq!(usage.calls, 3);
         assert_eq!(
@@ -3374,7 +3452,7 @@ pub(crate) mod tests {
         std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
             .expect("write decisions");
 
-        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         assert_eq!(
             rollup.last_call,
             Some(JevLastCall {
@@ -3418,7 +3496,7 @@ pub(crate) mod tests {
         std::fs::write(state.root().join("jev-decisions.jsonl"), lines.join("\n"))
             .expect("write decisions");
 
-        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         assert_eq!(
             rollup.recent_errors.len(),
             MAX_KEPT_JEV_ERRORS,
@@ -3444,13 +3522,81 @@ pub(crate) mod tests {
         );
     }
 
+    /// Session-scoped dash follow-up: a `Some(set)` filter counts only rows
+    /// whose own `session` field is in that set -- the orchestrator's row
+    /// and its worker's row both count, an unrelated session's row (present
+    /// in the very same machine-wide file) does not.
+    #[test]
+    fn usage_rollup_filtered_to_a_session_set_counts_only_those_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+
+        let decisions = format!(
+            "{{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[],\"session\":\"orch\"}}\n\
+             {{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[],\"session\":\"worker\"}}\n\
+             {{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[],\"session\":\"unrelated-other-repo\"}}\n"
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let sessions: BTreeSet<String> = ["orch".to_string(), "worker".to_string()].into();
+        let scoped = usage_rollup(&state, ROLLUP_WINDOW_SECS, Some(&sessions));
+        assert_eq!(
+            scoped.sites.get("memory").map(|u| u.calls),
+            Some(2),
+            "only orch's and worker's own rows count"
+        );
+
+        let unscoped = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
+        assert_eq!(
+            unscoped.sites.get("memory").map(|u| u.calls),
+            Some(3),
+            "`zirv ctx jev status`'s own all-sessions view is unchanged"
+        );
+    }
+
+    /// Session-scoped dash follow-up: a row written before `session` existed
+    /// (`DecisionRollupRow::session`'s own `#[serde(default)]`) must still
+    /// parse -- and, filtered to any real session set, drop out silently
+    /// rather than either failing to parse or (worse) counting toward every
+    /// session because an empty string matched something.
+    #[test]
+    fn usage_rollup_a_row_with_no_session_field_parses_and_is_excluded_from_a_session_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+
+        let decisions = format!(
+            "{{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[]}}\n"
+        );
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let unscoped = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
+        assert_eq!(
+            unscoped.sites.get("memory").map(|u| u.calls),
+            Some(1),
+            "an old, session-less row still parses and counts in the all-sessions view"
+        );
+
+        let sessions: BTreeSet<String> = ["orch".to_string()].into();
+        let scoped = usage_rollup(&state, ROLLUP_WINDOW_SECS, Some(&sessions));
+        assert!(
+            scoped.sites.is_empty(),
+            "the same row is silently excluded from a session-scoped view: {scoped:?}"
+        );
+    }
+
     /// Issue #758: a state dir with neither log file must roll up to empty,
     /// never an error -- `zirv ctx jev status` is read-only diagnostics.
     #[test]
     fn usage_rollup_with_no_log_files_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_path(dir.path().to_path_buf());
-        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         assert!(
             rollup.sites.is_empty(),
             "no log files should yield an empty rollup: {rollup:?}"
@@ -3475,7 +3621,7 @@ pub(crate) mod tests {
         std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
             .expect("write decisions");
 
-        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         let usage = rollup
             .sites
             .get("dispatch")
@@ -3502,13 +3648,13 @@ pub(crate) mod tests {
             .expect("write decisions");
 
         let one_day_secs = 24 * 60 * 60;
-        let narrow = usage_rollup(&state, one_day_secs);
+        let narrow = usage_rollup(&state, one_day_secs, None);
         assert!(
             narrow.sites.is_empty(),
             "a 2-day-old row must not count in a 1-day window: {narrow:?}"
         );
 
-        let wide = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        let wide = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
         assert_eq!(
             wide.sites.get("memory").map(|u| u.calls),
             Some(1),
