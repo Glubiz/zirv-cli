@@ -212,10 +212,11 @@ pub enum Event {
     /// sandbox_args`) applied -- or explicitly not applied -- to this
     /// launch, so the behaviour change is visible on the one channel every
     /// other launch-time decision already narrates through, not silent.
-    /// `detail` is pre-rendered by the caller: the joined argv when the
-    /// posture (or an explicit `[policy]` restriction) applied, or a short
-    /// reason when it did not (`--sandbox.enabled = false`, or the
-    /// operator's own flags already pinned the same concern).
+    /// `detail` is pre-rendered by the caller: the compact posture summary
+    /// (see `posture_detail`) when the posture (or an explicit `[policy]`
+    /// restriction) applied, or a short reason when it did not
+    /// (`--sandbox.enabled = false`, or the operator's own flags already
+    /// pinned the same concern).
     SandboxPosture { detail: String },
     /// A ctx config layer (`~/.zirv/ctx.toml` or `<repo>/.zirv/ctx.toml`)
     /// failed to *parse* as TOML and was skipped rather than aborting the
@@ -293,6 +294,68 @@ pub enum Event {
     /// entries and their verdicts; `zirv ctx hook status` has the full
     /// detail.
     HookIntegrity { summary: String },
+}
+
+/// Renders a policy launch argv compactly for the one-line `SandboxPosture`
+/// announcement. Joined verbatim, claude's `--allowedTools=`/
+/// `--disallowedTools=` lists and `--add-dir` pairs scrolled ~20 lines right
+/// before the dashboard takes the screen, so each tool list collapses to its
+/// rule count and a run of two or more `--add-dir` pairs to `×<N>`. Every
+/// other token (all of codex's posture included) passes through verbatim.
+pub fn posture_detail(args: &[String]) -> String {
+    let mut rendered: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let token = &args[i];
+        // A run of `--add-dir <path>` pairs: two or more collapse to a
+        // count; a lone pair is already short enough to stay verbatim.
+        if token == "--add-dir" && i + 1 < args.len() {
+            let mut pairs = 0usize;
+            let mut j = i;
+            while j + 1 < args.len() && args[j] == "--add-dir" {
+                pairs += 1;
+                j += 2;
+            }
+            if pairs >= 2 {
+                rendered.push(format!("--add-dir \u{d7}{pairs}"));
+            } else {
+                rendered.push(token.clone());
+                rendered.push(args[i + 1].clone());
+            }
+            i = j;
+            continue;
+        }
+        if let Some((flag, value)) = token.split_once('=')
+            && (flag == "--allowedTools" || flag == "--disallowedTools")
+            && !value.is_empty()
+        {
+            let rules = top_level_comma_count(value) + 1;
+            let noun = if rules == 1 { "rule" } else { "rules" };
+            rendered.push(format!("{flag}=({rules} {noun})"));
+            i += 1;
+            continue;
+        }
+        rendered.push(token.clone());
+        i += 1;
+    }
+    rendered.join(" ")
+}
+
+/// Counts commas in `value` that sit outside any `(...)` nesting -- a rule
+/// like `Bash(foo, bar)` carries a comma that is part of one rule, not a
+/// separator between two.
+fn top_level_comma_count(value: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0usize;
+    for c in value.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// What the nudged session is actually going to do about it -- the three
@@ -763,6 +826,59 @@ mod tests {
                 .contains("sandbox posture: not applied ([sandbox] enabled = false)"),
             "got {}",
             event.line()
+        );
+    }
+
+    /// The compact rendering `posture_detail` feeds into `SandboxPosture`
+    /// above: a claude-shaped argv (an `--allowedTools=`/`--disallowedTools=`
+    /// pair, one rule of which nests a comma inside `(...)`, three
+    /// `--add-dir` pairs, and the other flags untouched) collapses to one
+    /// short line; a codex-shaped argv, which never has a comma-separated
+    /// list or a repeated `--add-dir`, comes out byte-for-byte unchanged.
+    #[test]
+    fn posture_detail_collapses_claude_rule_lists_and_add_dir_runs() {
+        let args: Vec<String> = [
+            "--permission-mode",
+            "bypassPermissions",
+            "--allowedTools=Bash(git status, git diff),Read,Edit",
+            "--disallowedTools=Write,NotebookEdit",
+            "--settings",
+            "p",
+            "--add-dir",
+            "p1",
+            "--add-dir",
+            "p2",
+            "--add-dir",
+            "p3",
+            "--plugin-dir",
+            "p",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        assert_eq!(
+            posture_detail(&args),
+            "--permission-mode bypassPermissions --allowedTools=(3 rules) \
+             --disallowedTools=(2 rules) --settings p --add-dir \u{d7}3 --plugin-dir p"
+        );
+    }
+
+    #[test]
+    fn posture_detail_leaves_codex_shaped_argv_unchanged() {
+        let args: Vec<String> = [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        assert_eq!(
+            posture_detail(&args),
+            "--sandbox workspace-write --ask-for-approval never"
         );
     }
 
