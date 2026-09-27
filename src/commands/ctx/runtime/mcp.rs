@@ -152,11 +152,21 @@ pub struct StdioTransport {
     /// tail so a transport error can explain itself instead of just "closed
     /// its output stream".
     stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Join handle for the thread draining `stderr_tail`. Taken and joined
+    /// once the child has exited, so a terminal error message is built from
+    /// the complete tail instead of racing the reader thread with a sleep.
+    stderr_pump: Option<std::thread::JoinHandle<()>>,
 }
 
 /// How much of a child's stderr is kept for error messages. Bounded so a
 /// chatty or hostile server cannot grow zirv's memory or its log lines.
 const MAX_STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// Upper bound on how long a broken pipe or a closed stdout will wait for the
+/// child to actually exit before giving up on draining its stderr tail. Only
+/// matters for a server that closed one pipe but never exits; a normally
+/// exiting child is reaped almost immediately and never approaches this.
+const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
 impl StdioTransport {
     pub fn spawn(config: &McpServerConfig) -> Result<Self, McpError> {
@@ -258,10 +268,10 @@ impl StdioTransport {
         let (sender, frames) = sync_channel(64);
         std::thread::spawn(move || pump_frames(stdout, &sender));
         let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
-        if let Some(stderr) = child.stderr.take() {
+        let stderr_pump = child.stderr.take().map(|stderr| {
             let tail = Arc::clone(&stderr_tail);
-            std::thread::spawn(move || pump_stderr(stderr, &tail));
-        }
+            std::thread::spawn(move || pump_stderr(stderr, &tail))
+        });
         Ok(Self {
             child,
             stdin,
@@ -269,6 +279,7 @@ impl StdioTransport {
             pending: Vec::new(),
             label: format!("stdio:{command_label}"),
             stderr_tail,
+            stderr_pump,
         })
     }
 
@@ -302,10 +313,12 @@ impl StdioTransport {
             Ok(()) => Ok(()),
             Err(error) => {
                 // A server that exits before the first frame lands (a broken
-                // pipe) usually explained itself on stderr; give the reader
-                // the same beat the closed-stdout path does so the
-                // diagnostic is on the error either way.
-                std::thread::sleep(Duration::from_millis(50));
+                // pipe) usually explained itself on stderr; a write failing
+                // this way means the read side of our stdin is already gone,
+                // which for a child pipe means the child itself is already
+                // gone or about to be, so wait for it and drain its stderr
+                // fully instead of racing the reader thread with a sleep.
+                self.drain_stderr_after_exit(STDERR_DRAIN_BUDGET);
                 Err(self.with_stderr(format!("could not write to MCP server: {error}")))
             }
         }
@@ -320,6 +333,44 @@ impl StdioTransport {
             McpError::Transport(message)
         } else {
             McpError::Transport(format!("{message} (stderr: {snippet})"))
+        }
+    }
+
+    /// Waits, bounded by `budget`, for the child to exit, then joins the
+    /// stderr-draining thread so the tail it collected is complete before an
+    /// error message is built from it.
+    ///
+    /// A write-side EPIPE or the stdout reader hitting EOF each mean the
+    /// corresponding pipe's other end is gone, which for a child process
+    /// almost always means the child itself has already exited or is about
+    /// to. Rather than sleeping a fixed, arbitrary duration and hoping the
+    /// background reader (`pump_stderr`) has been scheduled to observe and
+    /// buffer the child's stderr by then -- a real race under CI load that
+    /// used to surface as a bare "Broken pipe" with no diagnostic -- this
+    /// waits for the actual exit and then joins the reader thread, which can
+    /// only return after it has seen EOF on stderr. EOF on stderr is only
+    /// possible once every handle to the write end is closed, which is
+    /// guaranteed once the child has exited. So once the join returns, the
+    /// tail is complete, not a guess. `budget` only guards the (essentially
+    /// theoretical, for a process whose stdin/stdout pipe already broke)
+    /// case of a child that keeps running indefinitely without exiting; it
+    /// is not what makes the wait correct.
+    fn drain_stderr_after_exit(&mut self, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_status)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+        if let Some(handle) = self.stderr_pump.take() {
+            let _ = handle.join();
         }
     }
 
@@ -362,12 +413,12 @@ impl StdioTransport {
                 Ok(Err(why)) => return Err(self.with_stderr(why)),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    // The stdout pipe can close a beat before the child's
-                    // already-buffered stderr bytes are drained into the
-                    // tail by the background reader; give it a moment so the
-                    // error is not missing a diagnostic that was in fact
-                    // written.
-                    std::thread::sleep(Duration::from_millis(50));
+                    // The stdout pipe closing almost always means the child
+                    // itself is gone or going; wait for the exit and join the
+                    // stderr reader so its already-buffered bytes are
+                    // guaranteed to be in the tail, instead of guessing with
+                    // a sleep.
+                    self.drain_stderr_after_exit(STDERR_DRAIN_BUDGET);
                     return Err(self.with_stderr("MCP server closed its output stream".into()));
                 }
             }
