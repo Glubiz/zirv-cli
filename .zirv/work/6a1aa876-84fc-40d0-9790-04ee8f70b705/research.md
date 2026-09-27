@@ -1,8 +1,10 @@
 # Motion graphics from wrapped agents -- research
 
-Date: 2026-09-27. Status: research, no code. Question: how can a zirv-wrapped
-agent (claude, codex, copilot, ...) generate motion graphics -- MP4/WebM video
-and GIF -- the way `/brag` and other Claude motion-graphics skills do?
+Date: 2026-09-27. Status: research for workflow
+`6a1aa876-84fc-40d0-9790-04ee8f70b705`, no code. Question: how can a
+zirv-wrapped agent (claude, codex, copilot, ...) generate motion graphics --
+MP4/WebM video and GIF -- the way `/brag` and other Claude motion-graphics
+skills do?
 
 ## Answer
 
@@ -89,6 +91,7 @@ around Remotion/Manim/FFmpeg).
    - plan scenes and duration first, then author one seekable timeline;
    - gates before a full render: `lint --json`, `check`, then `snapshot` and
      actually look at stills from every scene and mid-transition;
+   - add audio per the Audio section below;
    - `render --format mp4`, and for GIF `render --format gif --fps 15
      --gif-loop 0` (width ~480-720 px); never call `ffmpeg` directly;
    - register outputs with `zirv artifact render <file> --kind ...` and
@@ -129,8 +132,6 @@ FFmpeg itself as a child of `node`, outside the host's Bash gate.
   64 KiB per file / 256 KiB total (`skill.rs:22-31`), so brag's bundled music
   cannot load as a zirv bundle. Operators who want brag install it as a native
   Claude Code skill; it then works inside wrapped Claude sessions unchanged.
-- **Audio is out of scope** for the first cut: sound needs licensed assets,
-  which a compiled-in skill cannot carry.
 - **GIF fallback**: for converting an existing MP4 (for example from
   Remotion), use FFmpeg's two-pass palette method with matching filters:
   `ffmpeg -i in.mp4 -vf "fps=15,scale=640:-1:flags=lanczos,palettegen" p.png`
@@ -144,19 +145,46 @@ FFmpeg itself as a child of `node`, outside the host's Bash gate.
   Hyperframes' Windows runtime support is asserted by its `doctor` code, not
   verified here.
 
-## Decisions for the operator
+## Audio
 
-1. Backend: Hyperframes as the default (recommended) or Remotion.
-2. Output location. Registration requires an in-repo path. Proposal:
-   composition source in `<repo>/motion/<slug>/` (committed -- it is
-   deterministic and re-renderable) with rendered media git-ignored there.
-3. Scope of the first PR: steps 1-5 above as one release, audio excluded.
+Small enough to include: Hyperframes already does the audio work, so zirv's
+share is skill text plus one optional preflight probe.
+
+- Mixing: `<audio>` elements in the composition carry timing and volume
+  attributes and are mixed into the MP4/WebM/MOV at render. GIF has no audio
+  track.
+- Beat sync: mark the track `data-timeline-role="music"` and
+  `hyperframes beats` writes `beats/<audio>.json` to time cuts against.
+- Loudness: `hyperframes normalize-audio` matches clips by integrated LUFS.
+- Narration: `hyperframes tts "<text>" --voice <id> --output vo.wav`. Engine
+  order (`packages/cli/src/audio/providers.ts`): HeyGen Starfish (account) ->
+  ElevenLabs (key) -> **Kokoro-82M, local** (weights Apache-2.0; needs
+  Python 3 plus `pip install kokoro-onnx soundfile`).
+- Music generation: HeyGen library (account) -> Lyria (Google key) ->
+  MusicGen local (`transformers torch`, several GB; `facebook/musicgen-*`
+  weights are **CC-BY-NC-4.0, non-commercial**). Not a default.
+
+Scope for zirv: narration via Kokoro (or the operator's own ElevenLabs key
+from the environment, never echoed); music and SFX only from files the
+operator puts in `<repo>/motion/assets/audio/`, never downloaded by the agent;
+no music track when none is supplied. Setup reports Python 3 + the Kokoro
+modules as optional ("narration unavailable"), and the skill renders without
+narration rather than installing packages itself.
+
+## Decisions
+
+1. Backend: open -- Hyperframes recommended over Remotion.
+2. Output location: **accepted** -- composition source committed in
+   `<repo>/motion/<slug>/`, rendered media git-ignored there.
+3. Scope of the first PR: **accepted** -- steps 1-5 above plus audio as
+   scoped in the Audio section, in one release.
 
 ## Sources
 
 - https://github.com/latent-spaces/brag (README, LICENSE, `skills/brag/SKILL.md`, `references/step-3-compose.md`, `references/step-4-deliver.md`, `skills/brag-slim/SKILL.md`)
 - https://github.com/aceman23/brag-videoadgenerator-claude
-- https://github.com/heygen-com/hyperframes (README, LICENSE, `packages/cli/README.md`, `packages/cli/src/commands/{render,doctor,docs,browser}.ts`); `npm view hyperframes version engines`
+- https://github.com/heygen-com/hyperframes (README, LICENSE, `packages/cli/README.md`, `packages/cli/src/commands/{render,doctor,docs,browser,tts,beats,normalize-audio}.ts`, `packages/cli/src/audio/providers.ts`, `packages/cli/src/tts/python.ts`); `npm view hyperframes version engines`
+- https://huggingface.co/hexgrad/Kokoro-82M, https://huggingface.co/facebook/musicgen-small (license fields via the Hub API)
 - https://github.com/remotion-dev/remotion/blob/main/LICENSE.md, https://github.com/remotion-dev/skills, https://www.remotion.dev/docs/render-as-gif
 - https://github.com/ImageOptim/gifski (LICENSE), https://blog.pkh.me/p/21-high-quality-gif-with-ffmpeg.html
 - https://github.com/motion-canvas/motion-canvas, https://github.com/ManimCommunity/manim, https://github.com/wilwaldon/Claude-Code-Video-Toolkit, https://github.com/dev-arctik/remotion-video-mcp
