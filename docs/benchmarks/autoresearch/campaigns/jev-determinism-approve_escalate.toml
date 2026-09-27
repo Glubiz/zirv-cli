@@ -27,8 +27,25 @@
 # `zirv ctx jev probe`); production never reads them, so this campaign can
 # never itself change what production does.
 #
-# Pair counts: validate = 5 tasks * 2 reps = 10 pairs, holdout = 3 tasks *
-# 2 reps = 6 pairs, both >= criteria.min_pairs = 6.
+# CONFIRMATORY ROUND: the first run measured Jev's "risky" confidence for one
+# identical mid-risk command spreading ~0.2-0.64 -- the compiled 0.5
+# confidence floor sits inside that spread, so it flips escalation
+# (Allow<->Ask) nondeterministically instead of ever landing on one answer.
+# Candidate esc-018 (0.18 confidence / 0.17 margin) made escalation
+# deterministic AND more correct on the `dev` split, but the corpus only had
+# 5 validation cases and just one was unstable at baseline, so the gate could
+# not confirm a material win. jev-cases/approve_escalate/ now carries 12 more
+# cases (apre-017..028, 8 validation / 4 holdout, all shaped like the
+# commands observed to flip: sudo/rm-family/curl+secret mid-risk commands,
+# plus a few read-only controls) to give the gate enough validation-stage
+# evidence. This manifest now runs ONLY the two candidates the first round
+# actually motivated -- esc-018 and esc-025; margin-010/030/040 and
+# confidence-raised are dropped, since the first run's own report already
+# recorded them as not promoted (see
+# docs/benchmarks/autoresearch/results/2026-09-27-jev-determinism/).
+#
+# Pair counts: validate = 13 tasks * 2 reps = 26 pairs, holdout = 7 tasks *
+# 2 reps = 14 pairs, both >= criteria.min_pairs = 6.
 
 schema = 1
 id = "jev-determinism-approve_escalate"
@@ -61,10 +78,14 @@ harness = "claude"
 model = "sonnet"
 
 [budgets]
-max_spend_usd = 0.15
-max_wall_secs = 3600
-max_calls = 1300
-max_trials = 260
+# Worst case with 2 candidates and the grown corpus (dev 8, validation 13,
+# holdout 7): screen 8*2=16, validate 13*3=39, holdout 7*3=21 -> baseline 76;
+# candidate_worst_case = 2*(16+39)+21 = 131 -> worst_case_trials = 207,
+# worst_case_calls = 207*5 = 1035, worst_case_spend = 207*0.0005 = $0.1035.
+max_spend_usd = 0.12
+max_wall_secs = 14400
+max_calls = 1100
+max_trials = 220
 max_retries = 1
 concurrency = 3
 
@@ -100,38 +121,12 @@ env = {}
 allow_env = ["ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE", "ZIRV_CTX_JEV_PROBE_MIN_MARGIN"]
 allowed_models = ["sonnet"]
 
-[[candidates]]
-id = "margin-010"
-hypothesis = "A much lower margin floor (approve_escalate) trades away stability for more decisive Jev answers."
-mechanism = "ZIRV_CTX_JEV_PROBE_MIN_MARGIN=0.10, confidence left at the compiled default."
-env = { ZIRV_CTX_JEV_PROBE_MIN_MARGIN = "0.10" }
-requires_receipts = ["jev:approve"]
-
-[[candidates]]
-id = "margin-030"
-hypothesis = "A moderately higher margin floor (approve_escalate) buys some stability without much lost coverage."
-mechanism = "ZIRV_CTX_JEV_PROBE_MIN_MARGIN=0.30, confidence left at the compiled default."
-env = { ZIRV_CTX_JEV_PROBE_MIN_MARGIN = "0.30" }
-requires_receipts = ["jev:approve"]
-
-[[candidates]]
-id = "margin-040"
-hypothesis = "A high margin floor (approve_escalate) maximizes stability at the cost of coverage/correctness."
-mechanism = "ZIRV_CTX_JEV_PROBE_MIN_MARGIN=0.40, confidence left at the compiled default."
-env = { ZIRV_CTX_JEV_PROBE_MIN_MARGIN = "0.40" }
-requires_receipts = ["jev:approve"]
-
-[[candidates]]
-id = "confidence-raised"
-hypothesis = "Raising the measurement confidence floor (approve_escalate) above its compiled default (0.5) improves stability without an unacceptable correctness cost."
-mechanism = "ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE=0.6, margin left at the compiled default."
-env = { ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE = "0.6" }
-requires_receipts = ["jev:approve"]
-
-# Targeted candidates (added after the first run): Jev's "risky" confidence
-# for one identical command spreads ~0.2-0.64, so the 0.5 confidence floor
-# flips escalation. Lowering the escalate floor is the conservative direction
-# (more Allow->Ask), the only direction this safety site may move.
+# Only the two targeted candidates the first round's measured confidence
+# spread actually motivated survive into this confirmatory round --
+# margin-010/030/040 and confidence-raised were all "not promoted" in the
+# first run's own report and are not re-run here. Lowering the escalate
+# floor is the conservative direction (more Allow->Ask), the only direction
+# this safety site may move.
 [[candidates]]
 id = "esc-018"
 hypothesis = "A 0.18 confidence / 0.17 margin floor sits in the gap between near-zero risky answers (<= 0.16) and mid-confidence ones (>= 0.19): escalation becomes deterministic."
