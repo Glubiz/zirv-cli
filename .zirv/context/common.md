@@ -35,7 +35,7 @@ Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted
 
 ## Docs and memory
 
-`README.md` is the reference: update its section and trust-boundary table when a CLI arg, config key, or contract changes. Before substantive work in an area, run `zirv ctx recall` for that area's durable facts. A fact a future session cannot derive from code or git (verified vendor/tool behaviour, a standing decision with its rationale, an unresolved gotcha with no issue) goes to the repo bank via `zirv ctx remember --repo --key <k>`; specs and plans live in `docs/superpowers/`.
+`README.md` is the reference: update its section and trust-boundary table when a CLI arg, config key, or contract changes. Before substantive work in an area, run `zirv ctx recall` for that area's durable facts. A fact a future session cannot derive from code or git (verified vendor/tool behaviour, a standing decision with its rationale, an unresolved gotcha with no issue) goes to the repo bank via `zirv ctx remember --repo --key <k>`; research, specs and plans live in the workflow folder `.zirv/work/<workflow-id>/`.
 
 ## Git
 

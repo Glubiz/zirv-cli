@@ -173,7 +173,7 @@ narration rather than installing packages itself.
 
 ## Decisions
 
-1. Backend: open -- Hyperframes recommended over Remotion.
+1. Backend: **accepted** -- Hyperframes (Remotion stays out of scope).
 2. Output location: **accepted** -- composition source committed in
    `<repo>/motion/<slug>/`, rendered media git-ignored there.
 3. Scope of the first PR: **accepted** -- steps 1-5 above plus audio as
