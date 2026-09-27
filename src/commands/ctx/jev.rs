@@ -1369,6 +1369,24 @@ pub(crate) struct JevLastCall {
     pub ts: u64,
 }
 
+/// How many of [`JevRollup::recent_errors`]' own rows are kept -- click
+/// affordance follow-up: the sidebar's `errors N \u{b7} <reason>` line opens
+/// a dialog listing these, and both logs are low-volume advisory telemetry,
+/// so 50 is generous headroom rather than a real cap on a busy window.
+const MAX_KEPT_JEV_ERRORS: usize = 50;
+
+/// One errored `jev-decisions.jsonl` row kept for the JEV errors dialog
+/// (click affordance follow-up: the sidebar's `errors N \u{b7} <reason>`
+/// line is clickable) -- the same timestamp/site/reason
+/// [`JevRollup::latest_error_reason`] already derives, just kept for more
+/// than the single newest row so the dialog has something to list.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JevErrorEntry {
+    pub ts: u64,
+    pub site: String,
+    pub reason: String,
+}
+
 /// [`usage_rollup`]'s full result: the per-site fold plus two "most recent
 /// row in the window" facts that only make sense taken across every site at
 /// once, gathered in the SAME read pass rather than a second scan of
@@ -1380,10 +1398,16 @@ pub(crate) struct JevRollup {
     pub sites: BTreeMap<String, JevSiteUsage>,
     /// `None` when no decision row fell inside the window at all.
     pub last_call: Option<JevLastCall>,
-    /// The latest window row that carried a non-empty `fallbacks` list, its
-    /// own fallbacks joined into one plain-words reason. `None` when nothing
-    /// in the window errored.
+    /// The newest of [`Self::recent_errors`]' own reasons, or `None` when
+    /// nothing in the window errored. Derived from `recent_errors` rather
+    /// than tracked separately -- the newest-first list already names its
+    /// own head.
     pub latest_error_reason: Option<String>,
+    /// Every errored row in the window, newest first, bounded to
+    /// [`MAX_KEPT_JEV_ERRORS`] -- click affordance follow-up: cached here so
+    /// opening the JEV errors dialog on a click never reads the log files
+    /// itself, only the last refresh's own rollup.
+    pub recent_errors: Vec<JevErrorEntry>,
 }
 
 /// One site's folded usage over the rollup window: call volume, cache-hit
@@ -1470,7 +1494,7 @@ pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
     let cutoff = now.saturating_sub(window_secs);
     let mut builders: BTreeMap<String, JevSiteUsageBuilder> = BTreeMap::new();
     let mut last_call: Option<JevLastCall> = None;
-    let mut latest_error: Option<(u64, String)> = None;
+    let mut recent_errors: Vec<JevErrorEntry> = Vec::new();
 
     if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_DECISIONS_FILE)) {
         for line in text.lines() {
@@ -1490,10 +1514,12 @@ pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
                     ts: row.ts,
                 });
             }
-            if !row.fallbacks.is_empty()
-                && latest_error.as_ref().is_none_or(|(ts, _)| row.ts >= *ts)
-            {
-                latest_error = Some((row.ts, row.fallbacks.join(", ")));
+            if !row.fallbacks.is_empty() {
+                recent_errors.push(JevErrorEntry {
+                    ts: row.ts,
+                    site: row.site.clone(),
+                    reason: row.fallbacks.join(", "),
+                });
             }
             let entry = builders.entry(row.site).or_default();
             entry.calls += 1;
@@ -1525,13 +1551,22 @@ pub(crate) fn usage_rollup(state: &StateDir, window_secs: u64) -> JevRollup {
         }
     }
 
+    // Newest first, bounded: lines are ordinarily already in append order,
+    // but nothing here may rely on that (see this function's own doc
+    // comment on torn/out-of-order writes from several call sites), so this
+    // sorts explicitly rather than just reversing.
+    recent_errors.sort_by_key(|e| std::cmp::Reverse(e.ts));
+    recent_errors.truncate(MAX_KEPT_JEV_ERRORS);
+    let latest_error_reason = recent_errors.first().map(|e| e.reason.clone());
+
     JevRollup {
         sites: builders
             .into_iter()
             .map(|(site, builder)| (site, builder.finish()))
             .collect(),
         last_call,
-        latest_error_reason: latest_error.map(|(_, reason)| reason),
+        latest_error_reason,
+        recent_errors,
     }
 }
 
@@ -3355,6 +3390,60 @@ pub(crate) mod tests {
         );
     }
 
+    /// Click affordance follow-up: [`JevRollup::recent_errors`] keeps every
+    /// errored row newest first, bounded to [`MAX_KEPT_JEV_ERRORS`] -- out of
+    /// order in the file (never guaranteed given no cross-process locking)
+    /// and past the cap both still resolve to the right newest-first,
+    /// truncated list.
+    #[test]
+    fn usage_rollup_recent_errors_are_bounded_and_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+
+        let mut lines = Vec::new();
+        // One well-formed row per age, written newest-last in the file
+        // (append order) except the very first line, which is deliberately
+        // the OLDEST of the batch -- out-of-order writes are expected, not
+        // exceptional (see `record`'s own doc comment), so the sort must not
+        // just trust file order.
+        for age in (0..(MAX_KEPT_JEV_ERRORS + 5) as u64).rev() {
+            lines.push(format!(
+                "{{\"site\":\"memory\",\"ts\":{ts},\"wall_ms\":10,\"cached\":false,\"fallbacks\":[\"err{age}\"]}}",
+                ts = now - age
+            ));
+        }
+        lines.swap(0, 1);
+        std::fs::write(state.root().join("jev-decisions.jsonl"), lines.join("\n"))
+            .expect("write decisions");
+
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS);
+        assert_eq!(
+            rollup.recent_errors.len(),
+            MAX_KEPT_JEV_ERRORS,
+            "the list is capped even though more errors fell in the window"
+        );
+        assert_eq!(
+            rollup.recent_errors.first().map(|e| e.reason.as_str()),
+            Some("err0"),
+            "the newest error (age 0) leads the list"
+        );
+        assert!(
+            rollup
+                .recent_errors
+                .windows(2)
+                .all(|pair| pair[0].ts >= pair[1].ts),
+            "the list is newest first throughout: {:?}",
+            rollup.recent_errors
+        );
+        assert_eq!(
+            rollup.latest_error_reason,
+            Some("err0".to_string()),
+            "derived from the newest-first list's own head"
+        );
+    }
+
     /// Issue #758: a state dir with neither log file must roll up to empty,
     /// never an error -- `zirv ctx jev status` is read-only diagnostics.
     #[test]
@@ -3368,6 +3457,7 @@ pub(crate) mod tests {
         );
         assert_eq!(rollup.last_call, None);
         assert_eq!(rollup.latest_error_reason, None);
+        assert!(rollup.recent_errors.is_empty());
     }
 
     /// Issue #758: both logs are appended by several call sites with no

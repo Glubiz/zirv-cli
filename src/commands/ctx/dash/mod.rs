@@ -115,6 +115,16 @@ pub enum DashAction {
     /// `Ctrl+A e` (issue #202 phase 2b) -- opens the kept-errors overlay
     /// (`push_error`'s own buffer, newest first).
     ShowErrors,
+    /// Click affordance follow-up: a left click on the JEV sidebar's own
+    /// `errors N \u{b7} <reason>` line -- opens `Overlay::JevErrors` over the
+    /// cached rollup's own recent-errors list. Mouse-only: it is a
+    /// dashboard-level action with no natural per-row `MenuAction`, so
+    /// giving it a global chord would mean a new letter, a `filter_key` arm
+    /// AND an `ACTIONS` row just to make the palette's copy of it do
+    /// anything -- not the "line or two" that would earn its own binding, so
+    /// it names no entry in `dash::actions::ACTIONS` and stays reachable by
+    /// mouse only.
+    ShowJevErrors,
     Zoom,
     /// `Ctrl+A b` (dash refresh PR1) -- forces the session column back on
     /// below the narrow-terminal floor, or hides it again above it.
@@ -257,6 +267,12 @@ fn route_mouse(
         }
         (Hit::SidebarSummary, MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Summary,
         (Hit::GroupToggle(id), MouseEventKind::Down(MouseButton::Left)) => MouseRoute::Toggle(id),
+        // Click affordance follow-up: only ever hit at all when the section
+        // drew `errors > 0` (see `Hit::JevErrors`'s own doc comment), so
+        // there is no zero-errors case to branch on here.
+        (Hit::JevErrors, MouseEventKind::Down(MouseButton::Left)) => {
+            MouseRoute::Action(DashAction::ShowJevErrors)
+        }
         (Hit::HeaderHint(id) | Hit::FooterHint(id), MouseEventKind::Down(MouseButton::Left)) => {
             MouseRoute::Action(match id {
                 HintId::Actions => DashAction::ContextActions,
@@ -792,6 +808,7 @@ fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Restore(_) => "restore",
         ui::Overlay::Palette(view) => view.mode.title(),
         ui::Overlay::Errors(_) => "errors",
+        ui::Overlay::JevErrors(_) => "jev errors",
         ui::Overlay::Menu(_) => "actions",
         ui::Overlay::Inspector(_) => "inspect",
     }
@@ -2015,6 +2032,20 @@ fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionF
             }
         })
         .collect();
+    // Click affordance follow-up: the errors dialog's own cached rows,
+    // built in the SAME pass as everything else here (the 10s JEV refresh
+    // cadence, never per frame or on click) -- see `ui::JevErrorRow`'s own
+    // doc comment for why a click must never read `recent_errors` off disk
+    // itself.
+    let errors_detail: Vec<ui::JevErrorRow> = rollup
+        .recent_errors
+        .iter()
+        .map(|e| ui::JevErrorRow {
+            age_secs: now.saturating_sub(e.ts),
+            site: e.site.clone(),
+            reason: e.reason.clone(),
+        })
+        .collect();
     Some(ui::JevSectionFact::Active {
         calls: total_calls,
         cache_hit_rate,
@@ -2026,6 +2057,7 @@ fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionF
             age_secs: now.saturating_sub(call.ts),
         }),
         sites: site_bars,
+        errors_detail,
     })
 }
 
@@ -9330,6 +9362,57 @@ fn build_errors_view(errors: &ErrorLog, now: Instant) -> ui::ErrorsView {
     }
 }
 
+/// Builds `Overlay::JevErrors`' own view (click affordance follow-up)
+/// straight from the JEV sidebar's own cached fact -- never a disk read on
+/// click, only whatever `jev_section_fact` last cached on the 10s JEV
+/// refresh cadence. `None` (the gate off, or `NoKey`) and zero cached
+/// errors both give an empty view; [`ui::list_spec_for`]'s own
+/// `empty_message` is what the operator actually sees for either.
+fn build_jev_errors_view(fact: &Option<ui::JevSectionFact>) -> ui::JevErrorsView {
+    let items = match fact {
+        Some(ui::JevSectionFact::Active { errors_detail, .. }) => errors_detail
+            .iter()
+            .map(|row| ui::ErrorItem {
+                text: format!("{} \u{b7} {}", row.site, row.reason),
+                count: 1,
+                age_secs: row.age_secs,
+                acked: false,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    ui::JevErrorsView {
+        items,
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Pure: one keystroke against the JEV errors dialog (click affordance
+/// follow-up) -- read-only history, so browsing is all there is: `j/k`/
+/// arrows move the cursor, `Esc`/`Enter`/`q` close it. No acknowledgement,
+/// unlike `Ctrl+A e`'s own `errors_overlay_reduce`: these rows are a rollup
+/// snapshot, not the dashboard's own live error buffer, so there is nothing
+/// to acknowledge and no `Ack` payload to hand back. Mirrors `inspector_
+/// overlay_reduce`'s own read-only shape.
+fn jev_errors_overlay_reduce(
+    mut view: ui::JevErrorsView,
+    key: KeyEvent,
+) -> Option<ui::JevErrorsView> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), -1);
+            Some(view)
+        }
+        _ => Some(view),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Issue #354 phase 3: the context menu and the inspector.
 // ---------------------------------------------------------------------
@@ -13931,6 +14014,16 @@ fn run_dashboard_inner(
                                             None => ui::Overlay::None,
                                         };
                                     }
+                                    // Click affordance follow-up: same
+                                    // read-only shape as `Inspector` above --
+                                    // a rollup snapshot has nothing to
+                                    // acknowledge, only browse and close.
+                                    ui::Overlay::JevErrors(view) => {
+                                        overlay = match jev_errors_overlay_reduce(view, key) {
+                                            Some(v) => ui::Overlay::JevErrors(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                    }
                                     ui::Overlay::Menu(view) => {
                                         let (next, effect) = menu_overlay_reduce(view, key);
                                         overlay = match next {
@@ -14739,6 +14832,11 @@ fn run_dashboard_inner(
                                             Instant::now(),
                                         ));
                                     }
+                                    InputVerdict::Dash(DashAction::ShowJevErrors) => {
+                                        overlay = ui::Overlay::JevErrors(build_jev_errors_view(
+                                            &facts_cache.disk.jev,
+                                        ));
+                                    }
                                     // Issue #354 phase 4: help and the palette
                                     // are one dialog over one table. Both
                                     // snapshot the selected row's own
@@ -15486,7 +15584,12 @@ fn run_dashboard_inner(
             view.offset = sidebar_offset;
             roster = ui::roster_frame(layout.sidebar, &rows, &view);
         }
-        let next_snapshot = ui::frame_snapshot(
+        // Click affordance follow-up: mutated once more below, after the JEV
+        // section's own geometry is worked out (`jev_area`), to add the
+        // errors line's own hit region -- both live in `next_snapshot`
+        // regardless, so this is still the one `FrameSnapshot` the frame
+        // ends up drawn from and hit-tested against.
+        let mut next_snapshot = ui::frame_snapshot(
             frame_area,
             &layout,
             zoomed,
@@ -15618,6 +15721,18 @@ fn run_dashboard_inner(
                 &mut touched_bar_keys,
             )
         });
+        // Click affordance follow-up: the errors line's own hit region --
+        // only when the section actually fit on screen (`jev_height > 0`;
+        // otherwise `jev_area` names rows that were never drawn) and only
+        // when `jev_errors_hit_rect` says the line means something (`Active`
+        // with `errors > 0`; see its own doc comment for the zero-errors
+        // and `NoKey` cases, which add no hit region at all).
+        if jev_height > 0
+            && let Some(fact) = &jev_eased_fact
+            && let Some(rect) = ui::jev_errors_hit_rect(jev_area, fact)
+        {
+            next_snapshot.rows.push((rect, Hit::JevErrors));
+        }
         eased_bars.retain(|key, _| touched_bar_keys.contains(key));
         // Dash refresh PR1: below the narrow-terminal floor `layout.sidebar`
         // is 0-wide (`sidebar_cols` is 0), and the two rules must draw a
@@ -33595,6 +33710,50 @@ mod tests {
                 false
             ),
             MouseRoute::ScrollRoster(1)
+        );
+    }
+
+    /// Click affordance follow-up: a left click on the JEV errors line opens
+    /// the dialog; `Hit::JevErrors` is only ever in a frame's own `rows` at
+    /// all when the section drew `errors > 0` (`ui::jev_errors_hit_rect`),
+    /// so the zero-errors "no-op" case is that the hit never reaches
+    /// `route_mouse` in the first place -- a click at that same screen
+    /// position instead falls through to whatever chrome (or nothing) is
+    /// really there, which this covers by asserting the same click is
+    /// `MouseRoute::Consume` once the row is gone.
+    #[test]
+    fn a_left_click_on_the_jev_errors_line_opens_its_dialog() {
+        let jev_errors_rect = Rect::new(0, 20, 44, 1);
+        let snap = hit::FrameSnapshot {
+            frame: Rect::new(0, 0, 120, 40),
+            sidebar: Rect::new(0, 2, 44, 36),
+            grid: Rect::new(45, 2, 75, 36),
+            divider: Rect::new(44, 2, 1, 36),
+            rows: vec![(jev_errors_rect, Hit::JevErrors)],
+            ..Default::default()
+        };
+        let click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: jev_errors_rect.x,
+            row: jev_errors_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            route_mouse(&snap, click, true, false, false),
+            MouseRoute::Action(DashAction::ShowJevErrors)
+        );
+
+        // Zero errors: `frame_snapshot` never adds the row at all (see
+        // `ui::jev_errors_hit_rect`), so the same click lands on nothing
+        // rather than on a hit that does nothing.
+        let no_errors_snap = hit::FrameSnapshot {
+            rows: Vec::new(),
+            ..snap
+        };
+        assert_eq!(
+            route_mouse(&no_errors_snap, click, true, false, false),
+            MouseRoute::Consume,
+            "no hit region means the click is a no-op"
         );
     }
 

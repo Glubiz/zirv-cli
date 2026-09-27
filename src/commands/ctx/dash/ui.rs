@@ -762,6 +762,20 @@ pub struct ErrorsView {
     pub mark: u64,
 }
 
+/// `Overlay::JevErrors`' own state (click affordance follow-up): a snapshot
+/// of the JEV sidebar's cached `errors_detail` taken when the dialog opens
+/// -- no disk read on click, the same snapshot-on-open convention every
+/// other overlay here already uses. Reuses [`ErrorItem`]/[`error_dialog_row`]
+/// for its rows (`acked` stays `false`, `count` stays `1`: there is no
+/// acknowledge workflow and no repeat-collapsing here, just the site and
+/// reason `dash::mod::build_jev_errors_view` formats into `text`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JevErrorsView {
+    pub items: Vec<ErrorItem>,
+    pub cursor: usize,
+    pub offset: usize,
+}
+
 /// Issue #354 phase 3: one thing the context menu can do to its target row.
 ///
 /// Every variant maps onto machinery the dashboard already has -- an overlay
@@ -1034,6 +1048,14 @@ pub enum Overlay {
     Palette(PaletteView),
     /// `Ctrl+A e`: the kept-errors overlay.
     Errors(ErrorsView),
+    /// Click affordance follow-up: a left click on the JEV sidebar's own
+    /// `errors N \u{b7} <reason>` line (only when `errors > 0`) -- a
+    /// read-only snapshot of the cached rollup's own recent-errors list
+    /// (`JevSectionFact::Active`'s `errors_detail`), never a disk read on
+    /// click. Unlike [`Overlay::Errors`], there is nothing here to
+    /// acknowledge: these are historical rollup rows, not the dashboard's
+    /// own live error buffer, so this carries no `mark`.
+    JevErrors(JevErrorsView),
     /// Issue #354 phase 3: `Ctrl+A c`, a right-click on a row, or the
     /// header's `actions` hint -- the target row's action menu.
     Menu(MenuView),
@@ -1063,6 +1085,7 @@ impl Overlay {
             Overlay::Restore(view) => Some((view.cursor, view.offset, view.entries.len())),
             Overlay::Handover(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::Errors(view) => Some((view.cursor, view.offset, view.items.len())),
+            Overlay::JevErrors(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::Menu(view) => Some((view.cursor, view.offset, view.entries.len())),
             Overlay::Inspector(view) => Some((view.cursor, view.offset, view.rows().len())),
             Overlay::Palette(view) => Some((view.cursor, view.offset, view.rows().len())),
@@ -1091,6 +1114,10 @@ impl Overlay {
                 view.offset = offset;
             }
             Overlay::Errors(view) => {
+                view.cursor = cursor;
+                view.offset = offset;
+            }
+            Overlay::JevErrors(view) => {
                 view.cursor = cursor;
                 view.offset = offset;
             }
@@ -2068,6 +2095,18 @@ pub struct JevLastLine {
     pub age_secs: u64,
 }
 
+/// One row of the JEV errors dialog (click affordance follow-up: the
+/// sidebar's `errors N \u{b7} <reason>` line is clickable) -- a cached
+/// [`jev::JevErrorEntry`](super::jev::JevErrorEntry), its timestamp already
+/// turned into an age by `dash::mod::jev_section_fact` at the same instant
+/// the rest of the section's facts are read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JevErrorRow {
+    pub age_secs: u64,
+    pub site: String,
+    pub reason: String,
+}
+
 /// Dash refresh PR2: the JEV sidebar section's facts (mock §03), built by
 /// `dash::mod` from `jev::usage_rollup`'s own 24h-windowed read, off the
 /// render path. `dash::mod` simply does not construct one (`DiskFacts::jev`
@@ -2091,6 +2130,12 @@ pub enum JevSectionFact {
         /// Top 3 by calls, busiest first, bars already relative to the
         /// busiest -- see [`JevSiteBar`].
         sites: Vec<JevSiteBar>,
+        /// Click affordance follow-up: every errored call in the window,
+        /// newest first, bounded (`jev::JevRollup::recent_errors`) -- what a
+        /// left click on the `errors` line above opens (`Overlay::
+        /// JevErrors`), read straight from this cached fact so the click
+        /// itself never touches disk.
+        errors_detail: Vec<JevErrorRow>,
     },
 }
 
@@ -2110,6 +2155,33 @@ pub fn jev_rows_for(fact: &JevSectionFact, shown_sites: usize) -> u16 {
     match fact {
         JevSectionFact::NoKey { .. } => 3,
         JevSectionFact::Active { .. } => 2 + 4 + shown_sites as u16,
+    }
+}
+
+/// The `errors` line's own row offset within the JEV section's area --
+/// title(0), rule(1), calls(2), wait(3), errors(4) -- matching
+/// [`render_jev`]'s own draw order for the `Active` fixed lines.
+const JEV_ERRORS_ROW: u16 = 4;
+
+/// Pure: the JEV errors line's own clickable rect within `jev_area` (click
+/// affordance follow-up), or `None` when a click there means nothing --
+/// `NoKey` draws no errors line at all, and `Active` with zero errors draws
+/// it muted with nothing to show. Mirrors `HintId::Restore`'s own "only
+/// drawn when it means something" convention: the hit region simply does
+/// not exist rather than existing and routing to a no-op.
+///
+/// The caller (`dash::mod`'s own draw loop) only calls this once it already
+/// knows the section fit on screen at all (`jev_height > 0`) -- this trusts
+/// `jev_area` to be tall enough for [`JEV_ERRORS_ROW`] whenever `fact` is
+/// `Active`, which is guaranteed by [`jev_rows_for`]'s own fixed-row count.
+pub fn jev_errors_hit_rect(jev_area: Rect, fact: &JevSectionFact) -> Option<Rect> {
+    match fact {
+        JevSectionFact::Active { errors, .. } if *errors > 0 => Some(Rect {
+            y: jev_area.y + JEV_ERRORS_ROW,
+            height: 1,
+            ..jev_area
+        }),
+        _ => None,
     }
 }
 
@@ -2158,6 +2230,9 @@ pub fn render_jev(
             latest_error_reason,
             last,
             sites,
+            // Not drawn here: the detail list is only ever read by the
+            // errors dialog (`Overlay::JevErrors`), never the sidebar line.
+            errors_detail: _,
         } => {
             let right = "24h \u{b7} on";
             let room = cols.saturating_sub(style::display_width(right));
@@ -4528,6 +4603,22 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             empty_message: "no recent errors",
             input: None,
         }),
+        // Click affordance follow-up: reuses `error_dialog_row` for its rows
+        // (`ErrorItem`'s `acked`/`count` just stay at their inert defaults),
+        // but its own title and a read-only footer with no "acknowledge" --
+        // there is nothing here to acknowledge (see `JevErrorsView`'s own
+        // doc comment).
+        Overlay::JevErrors(view) => Some(ListDialogSpec {
+            title: "jev errors".to_string(),
+            count: Some(view.items.len()),
+            rows: view.items.iter().map(error_dialog_row).collect(),
+            cursor: cursor_of(view.items.len(), view.cursor),
+            offset: view.offset,
+            footer: JEV_ERRORS_FOOTER,
+            warn: false,
+            empty_message: "no jev errors in the last 24h",
+            input: None,
+        }),
         Overlay::Menu(view) => Some(ListDialogSpec {
             title: format!("actions \u{b7} {}", view.subject),
             count: None,
@@ -4789,6 +4880,9 @@ const HANDOVER_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "swap"), ("esc", "cancel
 /// close, which is what an operator who has read the list has done.
 const ERRORS_FOOTER: &[(&str, &str)] =
     &[("j/k", "scroll"), ("a", "acknowledge"), ("esc/q", "close")];
+/// Click affordance follow-up: the JEV errors dialog's own keys -- read-only
+/// history, so there is nothing to acknowledge, just scroll and close.
+const JEV_ERRORS_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc/q", "close")];
 /// Issue #354 phase 3: the context menu's own keys. `esc` says `back`
 /// rather than `close` because that is what it does -- the previously
 /// focused pane keeps the keyboard, and nothing about the row changed.
@@ -7695,6 +7789,7 @@ mod tests {
                 age_secs: 2,
             }),
             sites,
+            errors_detail: Vec::new(),
         }
     }
 
@@ -7822,6 +7917,36 @@ mod tests {
             credential_env: "X".to_string(),
         };
         assert_eq!(jev_rows_for(&no_key, 0), 3);
+    }
+
+    /// Click affordance follow-up: the errors line only has a clickable rect
+    /// when it actually shows something -- `Active` with `errors > 0` names
+    /// the exact row [`render_jev`] draws it on; zero errors and `NoKey`
+    /// both give `None`, matching `HintId::Restore`'s own "only drawn when
+    /// it means something" convention (a click at zero errors is a no-op
+    /// because there is no hit region to click, not because one exists and
+    /// does nothing).
+    #[test]
+    fn jev_errors_hit_rect_only_exists_with_active_errors() {
+        let jev_area = Rect::new(0, 5, 44, 6);
+        let mut fact = jev_active(jev_sites());
+        assert_eq!(
+            jev_errors_hit_rect(jev_area, &fact),
+            None,
+            "zero errors gets no hit region"
+        );
+        if let JevSectionFact::Active { errors, .. } = &mut fact {
+            *errors = 3;
+        }
+        assert_eq!(
+            jev_errors_hit_rect(jev_area, &fact),
+            Some(Rect::new(0, 9, 44, 1)),
+            "the errors line is the fifth row (title, rule, calls, wait, errors)"
+        );
+        let no_key = JevSectionFact::NoKey {
+            credential_env: "X".to_string(),
+        };
+        assert_eq!(jev_errors_hit_rect(jev_area, &no_key), None);
     }
 
     #[test]
@@ -7979,6 +8104,45 @@ mod tests {
         assert!(
             text.contains("mailsend") || text.contains("mail send"),
             "got {text}"
+        );
+    }
+
+    /// Click affordance follow-up: `Overlay::JevErrors` renders its own
+    /// title, each row's site and reason, and the empty state when there is
+    /// nothing to show -- no "acknowledge" hint, since there is nothing to
+    /// acknowledge in a read-only rollup snapshot.
+    #[test]
+    fn jev_errors_overlay_shows_its_own_title_rows_and_empty_state() {
+        let overlay = Overlay::JevErrors(JevErrorsView {
+            items: vec![
+                err_item("approve \u{b7} rate limited"),
+                err_item("memory \u{b7} timeout"),
+            ],
+            cursor: 0,
+            offset: 0,
+        });
+        let area = Rect::new(0, 0, 60, 10);
+        let text = render_and_capture_text(area, |f, area| render_overlay(f, area, &overlay, 0));
+        assert!(text.contains("jev errors"), "got {text}");
+        assert!(
+            text.contains("approve") && text.contains("rate limited"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("memory") && text.contains("timeout"),
+            "got {text}"
+        );
+        assert!(
+            !text.contains("acknowledge"),
+            "a read-only rollup snapshot has nothing to acknowledge: {text}"
+        );
+
+        let empty = Overlay::JevErrors(JevErrorsView::default());
+        let empty_text =
+            render_and_capture_text(area, |f, area| render_overlay(f, area, &empty, 0));
+        assert!(
+            empty_text.contains("no jev errors in the last 24h"),
+            "got {empty_text}"
         );
     }
 

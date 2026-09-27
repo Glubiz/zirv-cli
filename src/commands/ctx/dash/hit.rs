@@ -62,6 +62,14 @@ pub enum Hit {
     /// A session row -- including any disclosure lines drawn under it, which
     /// belong to the same row for hit-testing purposes.
     SidebarRow(RowId),
+    /// The JEV sidebar section's own `errors N \u{b7} <reason>` line (click
+    /// affordance follow-up). Only ever added to a frame's own `rows` when
+    /// the section is drawn `Active` with `errors > 0` -- the same "only
+    /// drawn when it means something" convention [`HintId::Restore`]
+    /// already follows -- so a click on the line at zero errors, or with no
+    /// JEV section drawn at all, lands on nothing rather than routing
+    /// anywhere.
+    JevErrors,
     /// The one-column rule between the sidebar and the grid.
     Divider,
     /// The focused pane's terminal.

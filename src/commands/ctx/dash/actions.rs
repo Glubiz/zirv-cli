@@ -994,6 +994,13 @@ mod tests {
                     DashAction::ContextMenu(_) => {
                         panic!("pointer targets are covered by route_mouse tests")
                     }
+                    // Click affordance follow-up: mouse-only, deliberately
+                    // absent from every descriptor's `checks` (see its own
+                    // doc comment) -- covered by `route_mouse` tests
+                    // instead, the same as `ContextMenu` above.
+                    DashAction::ShowJevErrors => {
+                        panic!("mouse-only; covered by route_mouse tests")
+                    }
                     DashAction::ContextActions => cov.context_actions = true,
                     DashAction::CollapseGroup => cov.collapse_group = true,
                     DashAction::ExpandGroup => cov.expand_group = true,
