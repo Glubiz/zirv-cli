@@ -17,13 +17,13 @@ import jev_probe_trial  # noqa: E402
 
 SITE_ACTIONS = {
     "memory-rerank": {"keep", "prune"},
-    "memory-harvest": {"keep", "prune"},
+    "memory-harvest": {"keep", "skip"},
     "harvest-screen": {"skip", "run"},
     "context-report": {"omit", "keep"},
     "context-skill": {"omit", "keep"},
     "handoff-thin": {"demote", "keep"},
     "handoff-select": {"drop", "keep"},
-    "compaction-select": {"add", "omit"},
+    "compaction-select": {"keep", "omit"},
     "dispatch": {"cheap", "standard", "frontier", "deny"},
     "launch-effort": {"high", "low", "classifier"},
     "classify-domain": {"tag", "none"},

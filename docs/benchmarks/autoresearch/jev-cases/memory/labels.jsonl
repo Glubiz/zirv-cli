@@ -1,16 +1,16 @@
 {"id": "mem-001", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune"}}
 {"id": "mem-002", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep"}}
-{"id": "mem-003", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune"}}
+{"id": "mem-003", "labels": {"c0": "keep", "c1": "skip", "c2": "keep", "c3": "skip"}}
 {"id": "mem-004", "labels": {"c0": "keep", "c1": "prune", "c2": "keep"}}
 {"id": "mem-005", "labels": {"c0": "keep", "c1": "keep", "c2": "keep"}}
 {"id": "mem-006", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep"}}
 {"id": "mem-007", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune"}}
-{"id": "mem-008", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune", "c4": "keep", "c5": "prune"}}
+{"id": "mem-008", "labels": {"c0": "keep", "c1": "skip", "c2": "keep", "c3": "skip", "c4": "keep", "c5": "skip"}}
 {"id": "mem-009", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep", "c4": "keep", "c5": "keep"}}
 {"id": "mem-010", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep", "c4": "keep", "c5": "keep"}}
-{"id": "mem-011", "labels": {"c0": "keep", "c1": "prune", "c2": "keep"}}
+{"id": "mem-011", "labels": {"c0": "keep", "c1": "skip", "c2": "keep"}}
 {"id": "mem-012", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune", "c4": "keep"}}
 {"id": "mem-013", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune", "c4": "keep", "c5": "prune"}}
-{"id": "mem-014", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune", "c4": "keep"}}
+{"id": "mem-014", "labels": {"c0": "keep", "c1": "skip", "c2": "keep", "c3": "skip", "c4": "keep"}}
 {"id": "mem-015", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep", "c4": "keep"}}
 {"id": "mem-016", "labels": {"c0": "keep", "c1": "prune", "c2": "keep", "c3": "prune", "c4": "keep", "c5": "prune"}}

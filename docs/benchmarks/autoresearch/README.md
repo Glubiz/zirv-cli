@@ -339,11 +339,11 @@ correct by construction.
 
 Action vocabulary per SITE (kept in one place -- `SITE_FALLBACK` in
 `jev_probe_trial.py` -- so a rename on the Rust side is a one-line fix):
-`memory-rerank`/`memory-harvest`: keep|prune, fallback `keep`;
+`memory-rerank`: keep|prune, `memory-harvest`: keep|skip, fallback `keep`;
 `harvest-screen`: skip|run, fallback `run`; `context-report`/
 `context-skill`: omit|keep, fallback `keep`; `handoff-thin`: demote|keep,
 fallback `keep`; `handoff-select`: drop|keep, fallback `keep`;
-`compaction-select`: add|omit, fallback `omit`; `dispatch`:
+`compaction-select`: keep|omit, fallback `omit`; `dispatch`:
 cheap|standard|frontier, fallback `deny`; `launch-effort`: high|low,
 fallback `classifier`; `classify-domain`: tag|none per domain tag id,
 fallback `none`; `inject`: defer|inject_now, fallback `inject_now`.
