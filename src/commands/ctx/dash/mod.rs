@@ -22,7 +22,7 @@ pub mod roster;
 pub mod spawnreq;
 pub mod ui;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1988,7 +1988,21 @@ fn rollover_committed_toast(
 /// `None` with every `[jev]` gate off, which is what hides the section
 /// entirely. Gates enabled but no credential is the one-line `NoKey` state;
 /// otherwise the top 3 sites by calls, bars relative to the busiest.
-fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionFact> {
+///
+/// Session-scoped total follow-up: `jev-decisions.jsonl`/`jev-effects.jsonl`
+/// are a SINGLE machine-wide file, written by every zirv process on the
+/// machine across every repo -- without `sessions`, this used to fold every
+/// OTHER session's rows in too, which is why the section could look like it
+/// was not moving even though the calling session's own calls were landing:
+/// a handful of new rows barely shift a total already carrying a whole
+/// machine's unrelated history. `sessions` is `dashboard_session_set`'s own
+/// result -- this dashboard's own panes plus their descendants -- so the
+/// section now reads as this session's own total.
+fn jev_section_fact(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    sessions: &BTreeSet<String>,
+) -> Option<ui::JevSectionFact> {
     if !super::jev::any_gate_enabled(&cfg.jev) {
         return None;
     }
@@ -1997,7 +2011,7 @@ fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionF
             credential_env: super::jev::credential_env_name(cfg),
         });
     }
-    let rollup = super::jev::usage_rollup(state, JEV_SECTION_WINDOW_SECS);
+    let rollup = super::jev::usage_rollup(state, JEV_SECTION_WINDOW_SECS, Some(sessions));
     let now = super::state::now_secs();
     let total_calls: u64 = rollup.sites.values().map(|u| u.calls).sum();
     let total_errors: u64 = rollup.sites.values().map(|u| u.errors).sum();
@@ -2059,6 +2073,31 @@ fn jev_section_fact(cfg: &CtxConfig, state: &StateDir) -> Option<ui::JevSectionF
         sites: site_bars,
         errors_detail,
     })
+}
+
+/// Session-scoped total follow-up: the JEV sidebar's own session set --
+/// every pane this dashboard currently hosts (the orchestrator's own
+/// `Verb::Chat` pane included; a native in-process subagent shares its
+/// parent's session id outright, so it needs no separate entry), plus every
+/// session `sessions::session_closure` can reach from there through the
+/// delegation ledger's own parent chain (a `zirv agent` worker spawned by a
+/// worker, and so on). Read once per JEV refresh (`JEV_THROTTLE`, 10s) --
+/// never per frame -- alongside `jev_section_fact`'s own read.
+///
+/// A reaped/ended pane's session is NOT included: this dashboard keeps no
+/// full session id for a retained ended row today (only its short id and a
+/// few display fields, see `EndedRow`), so an ended pane's own JEV activity
+/// stops counting toward the total the instant it is reaped. Documented
+/// gap, not a silent one -- the common case this section is watched for
+/// (an operator following live progress) is unaffected.
+fn dashboard_session_set(panes: &[Pane], state: &StateDir) -> BTreeSet<String> {
+    let roots: BTreeSet<String> = panes.iter().map(|p| p.session_id().to_string()).collect();
+    let delegations = super::log::read_delegations(state, usize::MAX);
+    let pairs: Vec<(String, String)> = delegations
+        .into_iter()
+        .map(|row| (row.session, row.parent_session))
+        .collect();
+    sessions::session_closure(&roots, &pairs)
 }
 
 /// One step of the footer rot track's own eased fill -- `prev` is `None`
@@ -13008,7 +13047,8 @@ fn run_dashboard_inner(
         // (the section only ever needs 24h-rollup freshness).
         if due(last_jev_refresh, sweep_now, JEV_THROTTLE) {
             last_jev_refresh = sweep_now;
-            facts_cache.disk.jev = jev_section_fact(cfg, state);
+            let jev_sessions = dashboard_session_set(&panes, state);
+            facts_cache.disk.jev = jev_section_fact(cfg, state, &jev_sessions);
             let last_now = facts_cache.disk.jev.as_ref().and_then(|fact| match fact {
                 ui::JevSectionFact::Active { last, .. } => {
                     last.as_ref().map(|l| (l.site.clone(), l.age_secs))

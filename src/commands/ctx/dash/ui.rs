@@ -2236,8 +2236,16 @@ pub fn render_jev(
         } => {
             let right = "24h \u{b7} on";
             let room = cols.saturating_sub(style::display_width(right));
+            // Session-scoped total follow-up: `\u{b7} session` in the title
+            // itself (not the right-hand `24h \u{b7} on` cluster, which is
+            // about the window and the gate, not the scope) says these
+            // numbers are this dashboard's own session total, not every
+            // session on the machine.
             lines.push(Line::from(vec![
-                Span::styled(column(" JEV", room, false), style::tui::title()),
+                Span::styled(
+                    column(" JEV \u{b7} session", room, false),
+                    style::tui::title(),
+                ),
                 Span::styled("24h \u{b7} ".to_string(), style::tui::muted()),
                 Span::styled("on".to_string(), style::tui::ok()),
             ]));
