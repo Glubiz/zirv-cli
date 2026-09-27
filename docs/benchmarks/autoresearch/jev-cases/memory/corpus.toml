@@ -1,0 +1,118 @@
+# Jev determinism probe corpus for floor site "memory" (docs/superpowers
+# work: jev-determinism campaigns). Every case in cases.jsonl/labels.jsonl
+# appears here exactly once; graded by jev_probe_trial.py, not decision_trial.py.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "mem-001"
+family = "jev-memory"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-002"
+family = "jev-memory"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-003"
+family = "jev-memory"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-004"
+family = "jev-memory"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-005"
+family = "jev-memory"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-006"
+family = "jev-memory"
+class = "ambiguous"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-007"
+family = "jev-memory"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-008"
+family = "jev-memory"
+class = "bounded"
+split = "dev"
+kind = "decision"
+
+[[task]]
+id = "mem-009"
+family = "jev-memory"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "mem-010"
+family = "jev-memory"
+class = "ambiguous"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "mem-011"
+family = "jev-memory"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "mem-012"
+family = "jev-memory"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "mem-013"
+family = "jev-memory"
+class = "bounded"
+split = "validation"
+kind = "decision"
+
+[[task]]
+id = "mem-014"
+family = "jev-memory"
+class = "bounded"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "mem-015"
+family = "jev-memory"
+class = "ambiguous"
+split = "holdout"
+kind = "decision"
+
+[[task]]
+id = "mem-016"
+family = "jev-memory"
+class = "bounded"
+split = "holdout"
+kind = "decision"

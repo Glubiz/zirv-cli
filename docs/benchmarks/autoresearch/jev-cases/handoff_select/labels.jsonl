@@ -1,0 +1,16 @@
+{"id": "hsel-001", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep"}}
+{"id": "hsel-002", "labels": {"quality": "keep"}}
+{"id": "hsel-003", "labels": {"quality": "demote"}}
+{"id": "hsel-004", "labels": {"quality": "keep"}}
+{"id": "hsel-005", "labels": {"quality": "demote"}}
+{"id": "hsel-006", "labels": {"c0": "keep", "c1": "drop", "c2": "keep", "c3": "drop"}}
+{"id": "hsel-007", "labels": {"quality": "demote"}}
+{"id": "hsel-008", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep", "c4": "keep"}}
+{"id": "hsel-009", "labels": {"quality": "demote"}}
+{"id": "hsel-010", "labels": {"quality": "keep"}}
+{"id": "hsel-011", "labels": {"c0": "keep", "c1": "drop", "c2": "keep"}}
+{"id": "hsel-012", "labels": {"c0": "keep", "c1": "drop", "c2": "keep", "c3": "drop", "c4": "keep", "c5": "drop"}}
+{"id": "hsel-013", "labels": {"c0": "keep", "c1": "keep", "c2": "keep", "c3": "keep", "c4": "keep", "c5": "keep"}}
+{"id": "hsel-014", "labels": {"c0": "keep", "c1": "keep", "c2": "keep"}}
+{"id": "hsel-015", "labels": {"c0": "keep", "c1": "drop", "c2": "keep", "c3": "drop", "c4": "keep"}}
+{"id": "hsel-016", "labels": {"quality": "keep"}}

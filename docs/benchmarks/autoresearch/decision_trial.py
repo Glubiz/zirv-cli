@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -351,7 +352,18 @@ def fallback_spend_report():
     }
 
 
-def run_trial(spec_path, out_dir, zirv_bin=None):
+def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
+    """`reps=1` (the default) is byte-identical to this function's original,
+    single-call behaviour -- that code path is untouched below. `reps>1`
+    (issue: Jev determinism tuning) runs `reps` intake proxy calls in the
+    SAME trial state dir and folds them into one trial: `correctness` is the
+    mean of each rep's own `grade_decision` score (an errored rep grades
+    `None` against the label, same as today, and still counts); `quality` is
+    the modal share of the (predicted_seat_tier, predicted_clarify) tuple --
+    the exact fields `grade_decision` itself compares against the label --
+    across the `reps` repetitions (the same "how often does the modal answer
+    recur" stability measure `jev_probe_trial.py` uses, applied here to the
+    intake decision instead of a Jev site's per-item actions)."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -371,23 +383,67 @@ def run_trial(spec_path, out_dir, zirv_bin=None):
     timeout_s = spec.get("timeout_secs") or DEFAULT_TIMEOUT_S
     env_extra = spec.get("env") or {}
 
-    decision, elapsed_ms, _raw, error_note = call_proxy_decision(
-        input_row["prompt"], zirv_bin, state_dir, env_extra, timeout_s=timeout_s,
-        attribution=attribution)
+    if reps <= 1:
+        decision, elapsed_ms, _raw, error_note = call_proxy_decision(
+            input_row["prompt"], zirv_bin, state_dir, env_extra, timeout_s=timeout_s,
+            attribution=attribution)
 
-    correctness, details = grade_decision(decision, label_row)
-    details["latency_ms"] = elapsed_ms
-    # issue #803 review: distinguish "Jev abstained" (`details["abstained"]`,
-    # from the live decision object) from "Jev never ran" (missing
-    # credential / gate off) using the production's OWN persisted receipt --
-    # never nulls `correctness` (a deterministic-only arm is a legitimate
-    # baseline); see `jev_ran_from_proxy_decisions`'s docstring.
-    details["jev_ran"] = jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir))
-    if error_note:
-        details["error"] = error_note
+        correctness, details = grade_decision(decision, label_row)
+        details["latency_ms"] = elapsed_ms
+        # issue #803 review: distinguish "Jev abstained" (`details["abstained"]`,
+        # from the live decision object) from "Jev never ran" (missing
+        # credential / gate off) using the production's OWN persisted receipt --
+        # never nulls `correctness` (a deterministic-only arm is a legitimate
+        # baseline); see `jev_ran_from_proxy_decisions`'s docstring.
+        details["jev_ran"] = jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir))
+        if error_note:
+            details["error"] = error_note
+
+        status = "error" if decision is None else "ok"
+        trial_correctness = correctness if decision is not None else None
+        quality = None
+        route_model = (decision or {}).get("orchestrator", {}).get("model")
+        route_tier = (decision or {}).get("seat_tier")
+    else:
+        rep_details = []
+        total_elapsed = 0
+        any_decision = False
+        for _ in range(reps):
+            decision, elapsed_ms, _raw, error_note = call_proxy_decision(
+                input_row["prompt"], zirv_bin, state_dir, env_extra, timeout_s=timeout_s,
+                attribution=attribution)
+            rep_correctness, rep_grade = grade_decision(decision, label_row)
+            rep_grade["latency_ms"] = elapsed_ms
+            if error_note:
+                rep_grade["error"] = error_note
+            total_elapsed += elapsed_ms
+            any_decision = any_decision or decision is not None
+            rep_details.append({"correctness": rep_correctness, "grade": rep_grade})
+
+        status = "ok" if any_decision else "error"
+        if any_decision:
+            trial_correctness = sum(r["correctness"] for r in rep_details) / len(rep_details)
+            tuples = [
+                (r["grade"]["predicted_seat_tier"], r["grade"]["predicted_clarify"])
+                for r in rep_details
+            ]
+            top_count = Counter(tuples).most_common(1)[0][1]
+            quality = top_count / len(tuples)
+        else:
+            trial_correctness = None
+            quality = None
+
+        details = {
+            "reps": [r["grade"] for r in rep_details],
+            "latency_ms": total_elapsed,
+            "jev_ran": jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir)),
+        }
+        elapsed_ms = total_elapsed
+        last_decision_grade = rep_details[-1]["grade"]
+        route_model = None  # multi-rep: no single decision object to read a model from
+        route_tier = last_decision_grade.get("predicted_seat_tier")
+
     (out_dir / "details.json").write_text(json.dumps(details, indent=2), encoding="utf-8")
-
-    status = "error" if decision is None else "ok"
 
     receipts_path = find_receipts_file(state_dir)
     spend = None
@@ -401,22 +457,22 @@ def run_trial(spec_path, out_dir, zirv_bin=None):
         "schema": 1,
         "trial_id": spec.get("trial_id") or "",
         "status": status,
-        "correctness": correctness if decision is not None else None,
-        "quality": None,
+        "correctness": trial_correctness,
+        "quality": quality,
         "wall_ms": elapsed_ms,
         "spend": spend,
         "route": {
             "harness": "claude",
-            "model": (decision or {}).get("orchestrator", {}).get("model"),
-            "tier": (decision or {}).get("seat_tier"),
+            "model": route_model,
+            "tier": route_tier,
             "effort": None,
         },
         "env_fingerprint": "0" * 16,
         "details": "details.json",
     }
     (out_dir / "trial.json").write_text(json.dumps(trial, indent=2), encoding="utf-8")
-    print(f"decision trial {case_id} -> status={status} correctness={correctness} "
-          f"latency_ms={elapsed_ms}")
+    print(f"decision trial {case_id} -> status={status} correctness={trial_correctness} "
+          f"quality={quality} reps={reps} wall_ms={elapsed_ms}")
     return trial
 
 
@@ -424,9 +480,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trial", required=True, help="spec.json path")
     ap.add_argument("--out", required=True, help="trial output directory")
+    ap.add_argument("--reps", type=int, default=1,
+                     help="intake proxy calls to fold into one trial (default 1, byte-identical "
+                          "to the original single-call output)")
     ap.add_argument("--zirv", default=None, help="path to the zirv executable (default: PATH)")
     args = ap.parse_args()
-    run_trial(args.trial, args.out, zirv_bin=args.zirv)
+    run_trial(args.trial, args.out, zirv_bin=args.zirv, reps=args.reps)
 
 
 if __name__ == "__main__":

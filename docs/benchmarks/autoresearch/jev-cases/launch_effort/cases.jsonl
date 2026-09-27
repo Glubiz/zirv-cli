@@ -1,0 +1,16 @@
+{"id": "le-001", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 1, 0]]}}
+{"id": "le-002", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 3, 0]]}}
+{"id": "le-003", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 0, 0, 1]]}}
+{"id": "le-004", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 4, 3, 0]]}}
+{"id": "le-005", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 0, 0, 1]]}}
+{"id": "le-006", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[3, 7, 3, 0]]}}
+{"id": "le-007", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 1, 1]]}}
+{"id": "le-008", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "dev", "state": {"_zirv_metadata_only": true, "facts": [[0, 1, 1, 0]]}}
+{"id": "le-009", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[0, 0, 0, 1]]}}
+{"id": "le-010", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[2, 1, 1, 1]]}}
+{"id": "le-011", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[0, 0, 0, 1]]}}
+{"id": "le-012", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[3, 6, 3, 0]]}}
+{"id": "le-013", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "validation", "state": {"_zirv_metadata_only": true, "facts": [[2, 1, 1, 0]]}}
+{"id": "le-014", "site": "launch-effort", "floor_site": "launch_effort", "class": "ambiguous", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[2, 1, 1, 0]]}}
+{"id": "le-015", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[0, 0, 0, 1]]}}
+{"id": "le-016", "site": "launch-effort", "floor_site": "launch_effort", "class": "bounded", "split": "holdout", "state": {"_zirv_metadata_only": true, "facts": [[3, 5, 3, 0]]}}

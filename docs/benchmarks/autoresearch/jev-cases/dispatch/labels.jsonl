@@ -1,0 +1,16 @@
+{"id": "disp-001", "labels": {"tier": "deny"}}
+{"id": "disp-002", "labels": {"tier": "frontier"}}
+{"id": "disp-003", "labels": {"tier": "cheap"}}
+{"id": "disp-004", "labels": {"tier": "standard"}}
+{"id": "disp-005", "labels": {"tier": "deny"}}
+{"id": "disp-006", "labels": {"tier": "deny"}}
+{"id": "disp-007", "labels": {"tier": "standard"}}
+{"id": "disp-008", "labels": {"tier": "frontier"}}
+{"id": "disp-009", "labels": {"tier": "cheap"}}
+{"id": "disp-010", "labels": {"tier": "standard"}}
+{"id": "disp-011", "labels": {"tier": "deny"}}
+{"id": "disp-012", "labels": {"tier": "cheap"}}
+{"id": "disp-013", "labels": {"tier": "deny"}}
+{"id": "disp-014", "labels": {"tier": "frontier"}}
+{"id": "disp-015", "labels": {"tier": "cheap"}}
+{"id": "disp-016", "labels": {"tier": "deny"}}

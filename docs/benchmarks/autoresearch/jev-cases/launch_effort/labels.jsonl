@@ -1,0 +1,16 @@
+{"id": "le-001", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-002", "labels": {"launch_effort_high": "high"}}
+{"id": "le-003", "labels": {"launch_effort_high": "low"}}
+{"id": "le-004", "labels": {"launch_effort_high": "high"}}
+{"id": "le-005", "labels": {"launch_effort_high": "low"}}
+{"id": "le-006", "labels": {"launch_effort_high": "high"}}
+{"id": "le-007", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-008", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-009", "labels": {"launch_effort_high": "low"}}
+{"id": "le-010", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-011", "labels": {"launch_effort_high": "low"}}
+{"id": "le-012", "labels": {"launch_effort_high": "high"}}
+{"id": "le-013", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-014", "labels": {"launch_effort_high": "classifier"}}
+{"id": "le-015", "labels": {"launch_effort_high": "low"}}
+{"id": "le-016", "labels": {"launch_effort_high": "high"}}

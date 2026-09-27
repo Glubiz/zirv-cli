@@ -1,0 +1,16 @@
+{"id": "ctx-001", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit"}}
+{"id": "ctx-002", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit", "s4": "keep"}}
+{"id": "ctx-003", "labels": {"p0": "keep", "p1": "keep", "p2": "keep", "p3": "keep"}}
+{"id": "ctx-004", "labels": {"p0": "keep", "p1": "keep", "p2": "keep", "p3": "keep"}}
+{"id": "ctx-005", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit", "s4": "keep"}}
+{"id": "ctx-006", "labels": {"s0": "keep", "s1": "keep", "s2": "keep", "s3": "keep", "s4": "keep"}}
+{"id": "ctx-007", "labels": {"p0": "keep", "p1": "omit", "p2": "keep"}}
+{"id": "ctx-008", "labels": {"p0": "keep", "p1": "omit", "p2": "keep", "p3": "omit"}}
+{"id": "ctx-009", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit", "s4": "keep"}}
+{"id": "ctx-010", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit"}}
+{"id": "ctx-011", "labels": {"s0": "keep", "s1": "keep", "s2": "keep", "s3": "keep", "s4": "keep"}}
+{"id": "ctx-012", "labels": {"p0": "keep", "p1": "keep", "p2": "keep", "p3": "keep", "p4": "keep"}}
+{"id": "ctx-013", "labels": {"p0": "keep", "p1": "omit", "p2": "keep", "p3": "omit", "p4": "keep"}}
+{"id": "ctx-014", "labels": {"p0": "keep", "p1": "keep", "p2": "keep"}}
+{"id": "ctx-015", "labels": {"p0": "keep", "p1": "omit", "p2": "keep"}}
+{"id": "ctx-016", "labels": {"s0": "keep", "s1": "omit", "s2": "keep", "s3": "omit", "s4": "keep", "s5": "omit"}}

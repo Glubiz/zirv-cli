@@ -38,11 +38,15 @@ CLI agent harness with real dollar costs and safety floors:
   (issue #802) -- and `zirv workflow spend`, the spend reconciler (#800).
 - `../wrapped-vs-vanilla/run.py --trial <spec.json> --out <dir>` and
   `--check-graders` (#801, #802, #804).
-- `decision_trial.py` and the labelled intake decision-case corpus (#803).
+- `decision_trial.py` and the labelled intake decision-case corpus (#803),
+  including its `--reps K` determinism mode.
+- `jev_probe_trial.py` and the nine per-floor-site `jev-cases/` corpora --
+  the Jev determinism probe backend; see "Jev determinism campaigns" below.
 - `../wrapped-vs-vanilla/corpus.toml` (the versioned task/split list, #801)
   and `t25_sticky_notes` (#805's long-session chain task).
 - The campaign manifests under `campaigns/`; `plan` accepts every one of
-  them.
+  them (the ten `jev-determinism-*.toml` manifests have not themselves been
+  run through `plan` here -- see "Limitations").
 - `sample-report.md`: the `report.md` the free fixture campaign produces.
 
 The full contract is in
@@ -193,11 +197,22 @@ cohorts stay never-pooled either way).
   `"stage <x> yields N pairs < criteria.min_pairs=M: no candidate could
   ever be promoted"` -- before any real trial spends money finding that out
   the slow way.
-- `[criteria] min_pairs, correctness_floor, quality_floor,
+- `[criteria] objective, min_pairs, correctness_floor, quality_floor,
   max_correctness_regression, max_quality_regression, min_effect,
   confidence, bootstrap_resamples` -- the promotion gate (see the design
   spec's #801 section for the exact accept/reject/inconclusive decision
-  tree this feeds).
+  tree this feeds). `objective` picks which axis step 4 of that tree (the
+  "material benefit" check) measures: `"efficiency"` (the default, and
+  every campaign before the jev-determinism batch) looks for a material win
+  on cost or wall time, with correctness/quality only enforced as
+  non-inferiority floors; `"quality"` instead looks for a material win on
+  `quality` itself (bootstrap CI lower bound strictly greater than
+  `min_effect`, an absolute point on the same `quality` scale the trial
+  backend reports -- for the jev-determinism campaigns that scale is
+  acted-decision *stability*), with correctness kept as a non-inferiority
+  floor and cost/wall reported but not gating. A `"quality"` campaign
+  answers "does raising this floor make Jev's acted decisions more
+  reproducible, without breaking correctness" -- not "is it cheaper."
 - `[cohort] pressure, env` -- `pressure = "natural"|"forced"`; `env` applies
   to BOTH arms (never a candidate-only advantage) -- see
   `campaigns/context-compaction-forced.toml` for a forced-pressure cohort
@@ -241,11 +256,130 @@ specifically fired should use `requires_receipts = ["proxy:decider:
 typesafe"]` (see above), which is the runner's own exclusion mechanism for
 that.
 
-See `campaigns/*.toml` for six worked examples: `fixture-demo.toml` (free,
-scripted, safe to run any time), and four real campaigns
+See `campaigns/*.toml` for sixteen worked examples: `fixture-demo.toml`
+(free, scripted, safe to run any time); five real campaigns
 (`jev-intake-floors.toml`, `jev-gates-e2e.toml`, `routing-ladder.toml`,
-`context-compaction.toml` + its forced-pressure variant) that spend real
-money and are never run in CI.
+`context-compaction.toml` + its forced-pressure variant); and ten more real
+campaigns for Jev *determinism* tuning (`jev-determinism-<floor_site>.toml`
+for each of the nine tunable floor sites, plus `jev-determinism-intake.toml`
+for the intake proxy) -- see "Jev determinism campaigns" below. All the real
+campaigns spend money and are never run in CI.
+
+## Jev determinism campaigns
+
+Every Jev-gated feature acts on a sampled answer only when it clears a
+`(min_confidence, min_margin)` floor; below the floor it falls back to a
+fixed deterministic default. Raising a floor trades Jev's influence for
+stability. The ten `jev-determinism-*.toml` campaigns measure that
+trade-off directly, per floor site, using two axes:
+
+- **`quality`** = acted-decision *stability*: for `jev_probe_trial.py`, the
+  mean, across a case's items, of "how often does the plurality action
+  recur across `K` uncached repetitions" (`jev_probe_trial.py --reps 5`);
+  for `decision_trial.py --reps K` (the intake campaign), the modal share
+  of the `(seat_tier, clarify)` decision tuple across `K` uncached reps.
+  `K` uncached means every rep is a genuinely fresh Jev/proxy call --
+  `zirv ctx jev probe` forces its own cache off, and the intake campaign
+  sets `ZIRV_CTX_JEV_CACHE_TTL_SECS=0` in `[cohort] env`.
+- **`correctness`** = agreement with a labelled expected action: for
+  `jev_probe_trial.py`, the fraction of every `(rep, item)` pair whose
+  action equals that item's label in `jev-cases/<floor_site>/labels.jsonl`;
+  for the intake campaign, the mean of `decision_trial.py`'s existing
+  per-rep `grade_decision` score.
+
+`[criteria] objective = "quality"` on all ten manifests: a candidate is
+promoted only on a *material* stability win (bootstrap CI lower bound on
+the quality delta strictly above `min_effect`), with correctness held to a
+non-inferiority floor -- a floor change that only saves cost/wall time
+without also improving stability is not what these campaigns are for.
+
+### `jev_probe_trial.py` -- the probe backend
+
+`jev_probe_trial.py --trial <spec.json> --out <dir> --reps <K> [--zirv
+PATH]` looks up the case named by `spec.task` by scanning every
+`jev-cases/<floor_site>/cases.jsonl` (each case row names its own
+production probe `site`, e.g. `"memory-rerank"`), writes a scratch
+`{"id","state","n"}` case file into the trial's state dir, and runs `zirv
+ctx jev probe --site <site> --case <case.json> --reps <K> --json` -- the
+same production facts/decision path a real Jev call at that site would
+exercise, with the cache forced off by the probe itself and the floor read
+from `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN` (the same env
+a candidate's overlay already sets). It reuses `decision_trial.py`'s zirv
+resolution, child-env construction, attribution, and spend reconciliation
+by import rather than duplicating them. A rep that itself errors still
+contributes its production fallback action to both `quality` and
+`correctness` (that IS what production would do, not a hole in the
+data); a trial where every rep errored is `status: "error"` so the runner
+retries it instead of scoring a probe failure as a real result.
+`details.json` carries `site`, `floor_site`, `label`, `floor`, and, per
+item, its action list, label, and stability.
+
+### `jev-cases/<floor_site>/` -- the per-site corpora
+
+Nine directories (`memory`, `context`, `harvest_screen`, `handoff_select`,
+`compaction_select`, `dispatch`, `launch_effort`, `classify`, `inject`),
+each with `cases.jsonl`, `labels.jsonl`, `corpus.toml` (16 cases: 8 `dev`,
+5 `validation`, 3 `holdout`, `family = "jev-<floor_site>"`, `kind =
+"decision"`). Three floor sites cover two production SITEs each (`memory`:
+memory-rerank + memory-harvest; `context`: context-report + context-skill;
+`handoff_select`: handoff-thin + handoff-select) and mix both across every
+split rather than segregating them. About 40% of cases in every corpus are
+deliberately borderline (facts placed near the site's own decision
+threshold, `class = "ambiguous"`) -- that is where instability actually
+shows up; the rest are clear-cut (`class = "bounded"`).
+
+**Label policy**: every item in every case is labelled in `labels.jsonl`.
+A clear-cut case's items get the action a careful engineer would take from
+those facts (e.g. a recent, large, frequently-referenced handoff item ->
+`"keep"`). A genuinely borderline case's items get that SITE's own
+FALLBACK action -- the conservative deterministic default production falls
+back to when the floor isn't cleared -- never a guessed decisive action,
+since a borderline case's whole point is that no confident answer is
+correct by construction.
+
+Action vocabulary per SITE (kept in one place -- `SITE_FALLBACK` in
+`jev_probe_trial.py` -- so a rename on the Rust side is a one-line fix):
+`memory-rerank`/`memory-harvest`: keep|prune, fallback `keep`;
+`harvest-screen`: skip|run, fallback `run`; `context-report`/
+`context-skill`: omit|keep, fallback `keep`; `handoff-thin`: demote|keep,
+fallback `keep`; `handoff-select`: drop|keep, fallback `keep`;
+`compaction-select`: add|omit, fallback `omit`; `dispatch`:
+cheap|standard|frontier, fallback `deny`; `launch-effort`: high|low,
+fallback `classifier`; `classify-domain`: tag|none per domain tag id,
+fallback `none`; `inject`: defer|inject_now, fallback `inject_now`.
+
+### The ten manifests
+
+`campaigns/jev-determinism-<floor_site>.toml` for each of the nine tunable
+floor sites, plus `campaigns/jev-determinism-intake.toml` for the intake
+proxy's own floors. Each varies its floor's env var(s)
+(`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`, or
+`ZIRV_CTX_PROXY_MIN_CONFIDENCE|_MIN_MARGIN` for intake) across four
+candidates: three margin values (0.10, 0.30, 0.40, confidence left at the
+compiled default) and one raised-confidence candidate (the compiled
+default's own value, read from source, +0.1 -- or 0.6 where that default is
+0.0). `requires_receipts` is `["jev:<label>"]` only where every case in
+that floor site's corpus shares one production receipt label (`memory`,
+`harvest_screen` -> `"harvest"` -- the harvest-screen call records its
+receipt under site string `"harvest"`, not `"harvest_screen"` --
+`compaction_select`, `dispatch`, `launch_effort`, `classify`, `inject`);
+it is `[]` for `context` and `handoff_select`, whose two production SITEs
+each write a DIFFERENT receipt label (`"context-parent-reports"` vs
+`"context-skill-descriptions"`; `"handoff"` vs `"handoff_select"`), so no
+single `jev:<label>` could cover every case without silently mis-excluding
+half the corpus.
+
+The intake campaign also documents a real gap: `zirv ctx proxy --json
+--headless` can run a non-Jev-typesafe `"helper"` decider (`[proxy]
+decider` / `ZIRV_CTX_PROXY_DECIDER`), and that key is `REPO_FORBIDDEN` and
+absent from the runner's compiled env allowlist -- no campaign manifest can
+pin it to `typesafe`. The campaign relies on `ProxyDecider::default()`
+already being `typesafe` and uses `requires_receipts =
+["proxy:decider:typesafe"]` to exclude (not silently mismeasure) any trial
+that ran under an operator-set `helper` decider instead.
+
+Every ten-manifest `max_spend_usd` sums to $3.55, under the $4.00 operator
+cap on Jev spend.
 
 ## Budgets
 
@@ -262,7 +396,15 @@ but new work never starts once a cap would be exceeded.
   {spec} --out {out}` -- any wrapped-vs-vanilla task, including the
   `escalate` strategy and chain tasks.
 - **`command` (decision_trial.py)**: `python decision_trial.py --trial
-  {spec} --out {out}` -- any id in `decision-cases/inputs.jsonl`.
+  {spec} --out {out} [--reps K]` -- any id in `decision-cases/inputs.jsonl`.
+  `--reps` defaults to 1 (byte-identical to the original single-call
+  output); `K > 1` runs `K` uncached intake calls in the same trial state
+  dir and reports a modal-share `quality` alongside the mean `correctness`
+  -- see "Jev determinism campaigns" above.
+- **`command` (jev_probe_trial.py)**: `python jev_probe_trial.py --trial
+  {spec} --out {out} --reps K` -- any id in `jev-cases/<floor_site>/
+  cases.jsonl`, driving the (separately built) `zirv ctx jev probe` verb --
+  see "Jev determinism campaigns" above.
 - **`fixture`**: a TOML file of scripted `[[result]]` rows (see
   `campaigns/fixtures/demo.toml`) -- no process is launched at all.
 
@@ -303,8 +445,14 @@ explicit, operator-taken action.
 - **Single project family**: every task is `ledgerlite`. A report built
   from this corpus is flagged `single_family`; it is not evidence a
   candidate generalizes to a different codebase or language.
-- **No paid campaign has been run** yet -- every non-fixture manifest here
-  passes `plan`, but none has been executed, so no gain is claimed.
+- **No paid campaign has been run** yet -- none of the non-fixture
+  manifests here has been executed, so no gain is claimed. The five
+  campaigns predating the jev-determinism batch have each passed `plan`;
+  the ten `jev-determinism-*.toml` manifests parse as TOML and their
+  corpora self-check (ids/labels/split counts), but `zirv workflow
+  research plan` has not been run against them here -- they also depend on
+  the separately-built `zirv ctx jev probe` verb, which does not exist in
+  this worktree yet.
 - **Orchestration is unmeasured**: no multi-seat suite exists; every result
   here is single-seat.
 - **#762 owns rot-threshold calibration**; this campaign framework only
