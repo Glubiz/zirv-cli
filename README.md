@@ -1177,6 +1177,12 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   workflow outcomes and proposes (never applies) one-step heavier/lighter
   routing per complexity bucket. See [Maintain loop](#maintain-loop) and
   [Outcome calibration](#outcome-calibration).
+- **Autoresearch campaigns** — `research` (`plan`/`run`/`status`/`report`)
+  runs a bounded, budgeted, resumable experiment over small policy changes
+  against a fixed evaluator and baseline, and writes an evidence report plus
+  a reviewable proposal it never applies; `spend` reconciles attributed
+  spend exactly once, keeping execution cost and experiment overhead apart.
+  See [Autoresearch campaigns](#autoresearch-campaigns-issue-802).
 - **Frontend quality** — `frontend` derives a design profile and drives
   autonomous frontend work end to end (`profile`, `capabilities`, `check`,
   `render`, `review`, `benchmark`). See [Frontend quality](#frontend-quality).
