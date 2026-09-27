@@ -47,6 +47,27 @@ const JEV_TAG_PROBABILITY: f64 = 0.7;
 /// Minimum artifact-substance confidence from the 2026-09-18 probe.
 const JEV_ARTIFACT_CONFIDENCE: f32 = 0.9;
 
+/// [`pin_current_artifact_with_config`]'s own production advise-site LABEL.
+pub(crate) const ARTIFACT_SUBSTANCE_LABEL: &str = "workflow-artifact-substance";
+/// [`pin_current_artifact_with_config`]'s own default `(min_confidence,
+/// min_margin)` `decisive()` floor -- named (issue: `zirv ctx jev probe`) so
+/// a later retune targets exactly this constant.
+pub(crate) const ARTIFACT_SUBSTANCE_DEFAULT_FLOOR: (f32, f32) =
+    (JEV_ARTIFACT_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
+
+/// [`apply_jev_gate_advice`]'s own production advise-site LABEL.
+pub(crate) const GATE_RECLASS_LABEL: &str = "workflow-gate-reclassification";
+/// [`apply_jev_gate_advice`]'s own `sensitive_surface` and per-tag questions'
+/// default `(min_confidence, min_margin)` `decisive()` floor -- named (issue:
+/// `zirv ctx jev probe`) so a later retune targets exactly this constant. Not
+/// routed through `jev::floor`/`[jev.floors]` today: this stays the same
+/// fixed pair production has always used.
+pub(crate) const GATE_RECLASS_NOUL_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
+/// [`apply_jev_gate_advice`]'s own `work_domain` question's default
+/// `(min_confidence, min_margin)` `decisive()` floor.
+pub(crate) const GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR: (f32, f32) =
+    (JEV_FRONTEND_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
+
 /// Marks a `[skill ...]` provenance header this compiler itself emitted,
 /// placed right after the newline and before `[skill `. Repository skill
 /// bodies are untrusted text rendered into the same buffer; without a
@@ -1604,6 +1625,54 @@ struct JevArtifactState {
     artifact_text: String,
 }
 
+/// [`pin_current_artifact_with_config`]'s own single Choice question,
+/// factored out so `zirv ctx jev probe` can ask the exact same question from
+/// a fixture's own state.
+pub(crate) fn artifact_substance_questions() -> [Question; 1] {
+    [Question::choice(
+        "substance",
+        "Assess whether this artifact has substantive content for its section headings.",
+        &[
+            ("template_copy", "the template with only trivial edits"),
+            (
+                "thin",
+                "has content but no substance for its section headings",
+            ),
+            (
+                "substantive",
+                "substantive content for its section headings",
+            ),
+        ],
+    )]
+}
+
+/// [`pin_current_artifact_with_config`]'s own per-call decision: `"refuse"`
+/// for a decisive `template_copy`, `"warn"` for a decisive `thin`, `"pass"`
+/// otherwise (missing answer, indecisive, or a decisive `substantive`) --
+/// `pin_current_artifact_with_config`'s own fallback outcome (pin with no
+/// warning). Shared with `zirv ctx jev probe`, which reports exactly this
+/// outcome.
+pub(crate) fn artifact_substance_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "pass";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "pass";
+    }
+    let AnswerValue::Choice(choice) = &answer.value else {
+        return "pass";
+    };
+    match choice.as_str() {
+        "template_copy" => "refuse",
+        "thin" => "warn",
+        _ => "pass",
+    }
+}
+
 fn pin_current_artifact_with_config(
     state_dir: &StateDir,
     state: &mut WorkflowState,
@@ -1633,45 +1702,32 @@ fn pin_current_artifact_with_config(
             artifact_kind: stage,
             artifact_text: crate::utils::truncate_bytes(body.clone(), Some(MAX_JEV_ARTIFACT_BYTES)),
         };
-        let questions = [Question::choice(
-            "substance",
-            "Assess whether this artifact has substantive content for its section headings.",
-            &[
-                ("template_copy", "the template with only trivial edits"),
-                (
-                    "thin",
-                    "has content but no substance for its section headings",
-                ),
-                (
-                    "substantive",
-                    "substantive content for its section headings",
-                ),
-            ],
-        )];
+        let questions = artifact_substance_questions();
         if let Some(answers) = jev::advise(
             cfg,
             state_dir,
-            "workflow-artifact-substance",
+            ARTIFACT_SUBSTANCE_LABEL,
             cfg.jev.gates,
             &advice_state,
             &questions,
-        ) && let Some(answer) = answers.get("substance")
-            && answer.decisive(JEV_ARTIFACT_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
-            && let AnswerValue::Choice(choice) = &answer.value
-        {
-            match choice.as_str() {
-                "template_copy" => {
+        ) {
+            let answer = answers.get("substance");
+            let (min_confidence, min_margin) = ARTIFACT_SUBSTANCE_DEFAULT_FLOOR;
+            match artifact_substance_action(answer, min_confidence, min_margin) {
+                "refuse" => {
+                    let confidence = answer.map_or(0.0, |answer| answer.confidence);
                     return Err(format!(
                         "{stage} artifact refused by the template_copy advisory at {:.2} confidence: {}",
-                        answer.confidence,
+                        confidence,
                         path.display()
                     )
                     .into());
                 }
-                "thin" => {
+                "warn" => {
+                    let confidence = answer.map_or(0.0, |answer| answer.confidence);
                     warning = Some(format!(
                         "{stage} artifact substance advisory is thin at {:.2} confidence; pinning anyway",
-                        answer.confidence
+                        confidence
                     ));
                 }
                 _ => {}
@@ -2382,31 +2438,11 @@ struct JevGateState {
     current_domain: WorkDomain,
 }
 
-fn apply_jev_gate_advice(
-    cfg: &crate::commands::ctx::config::CtxConfig,
-    state_dir: &StateDir,
-    state: &mut WorkflowState,
-    measured: &mut Classification,
-) {
-    let current_risk = measured.risk.max(state.classification.risk);
-    let current_domain = if state.classification.work_domain.domain == WorkDomain::Frontend {
-        WorkDomain::Frontend
-    } else {
-        measured.work_domain.domain
-    };
-    let advice_state = JevGateState {
-        task: crate::utils::truncate_bytes(state.task.clone(), Some(MAX_JEV_GATE_TASK_BYTES)),
-        changed_paths: measured
-            .changed_paths
-            .iter()
-            .take(MAX_JEV_GATE_PATHS)
-            .cloned()
-            .collect(),
-        current_complexity: measured.complexity,
-        current_risk,
-        current_domain,
-    };
-    let questions = vec![
+/// [`apply_jev_gate_advice`]'s own full question set, factored out so `zirv
+/// ctx jev probe` can ask the exact same questions from a fixture's own
+/// state -- static, no per-call inputs.
+pub(crate) fn gate_reclass_questions() -> Vec<Question> {
+    vec![
         Question::noul(
             "sensitive_surface",
             "Do these paths or this task touch authentication, credentials, permissions, schema or data migration, deployment, or a public API contract?",
@@ -2443,11 +2479,106 @@ fn apply_jev_gate_advice(
             "architecture",
             "not architecture",
         ),
-    ];
+    ]
+}
+
+/// [`apply_jev_gate_advice`]'s own `sensitive_surface` decision: `"raise"`
+/// for a decisive noul at or above [`JEV_SENSITIVE_PROBABILITY`], `"none"`
+/// otherwise (missing, indecisive, or below the threshold) -- the gate's own
+/// fallback outcome (risk left unescalated by this question). Shared with
+/// `zirv ctx jev probe`, which reports exactly this outcome.
+pub(crate) fn gate_sensitive_surface_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "none";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "none";
+    }
+    match answer.as_noul() {
+        Some(probability) if probability >= JEV_SENSITIVE_PROBABILITY => "raise",
+        _ => "none",
+    }
+}
+
+/// [`apply_jev_gate_advice`]'s own `work_domain` decision: `"frontend"` for a
+/// decisive `frontend` choice at or above [`JEV_FRONTEND_CONFIDENCE`],
+/// `"none"` otherwise (missing, indecisive, or any other choice) -- the
+/// gate's own fallback outcome (domain left unreclassified by this
+/// question). Shared with `zirv ctx jev probe`, which reports exactly this
+/// outcome.
+pub(crate) fn gate_work_domain_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "none";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "none";
+    }
+    match &answer.value {
+        AnswerValue::Choice(choice) if choice == "frontend" => "frontend",
+        _ => "none",
+    }
+}
+
+/// [`apply_jev_gate_advice`]'s own per-tag decision (shared by `security`,
+/// `data`, `docs_only`, `devops`, `architecture`): `"tag"` for a decisive
+/// noul at or above [`JEV_TAG_PROBABILITY`], `"none"` otherwise (missing,
+/// indecisive, or below the threshold) -- the gate's own fallback outcome
+/// (no tag added for this question). Shared with `zirv ctx jev probe`, which
+/// reports exactly this outcome per tag id.
+pub(crate) fn gate_tag_action(
+    answer: Option<&jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "none";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "none";
+    }
+    match answer.as_noul() {
+        Some(probability) if probability >= JEV_TAG_PROBABILITY => "tag",
+        _ => "none",
+    }
+}
+
+fn apply_jev_gate_advice(
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    state_dir: &StateDir,
+    state: &mut WorkflowState,
+    measured: &mut Classification,
+) {
+    let current_risk = measured.risk.max(state.classification.risk);
+    let current_domain = if state.classification.work_domain.domain == WorkDomain::Frontend {
+        WorkDomain::Frontend
+    } else {
+        measured.work_domain.domain
+    };
+    let advice_state = JevGateState {
+        task: crate::utils::truncate_bytes(state.task.clone(), Some(MAX_JEV_GATE_TASK_BYTES)),
+        changed_paths: measured
+            .changed_paths
+            .iter()
+            .take(MAX_JEV_GATE_PATHS)
+            .cloned()
+            .collect(),
+        current_complexity: measured.complexity,
+        current_risk,
+        current_domain,
+    };
+    let questions = gate_reclass_questions();
     let Some(answers) = jev::advise(
         cfg,
         state_dir,
-        "workflow-gate-reclassification",
+        GATE_RECLASS_LABEL,
         cfg.jev.gates,
         &advice_state,
         &questions,
@@ -2471,24 +2602,28 @@ fn apply_jev_gate_advice(
     // a no-op at this floor, the same reasoning `memory.rs`'s harvest gate
     // documents for its own floor.
 
-    if answers.get("sensitive_surface").is_some_and(|answer| {
-        answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
-            && answer
-                .as_noul()
-                .is_some_and(|probability| probability >= JEV_SENSITIVE_PROBABILITY)
-    }) {
+    let (sensitive_min_confidence, sensitive_min_margin) = GATE_RECLASS_NOUL_DEFAULT_FLOOR;
+    if gate_sensitive_surface_action(
+        answers.get("sensitive_surface"),
+        sensitive_min_confidence,
+        sensitive_min_margin,
+    ) == "raise"
+    {
         measured.risk = measured.risk.max(RiskBand::High);
         measured.risk_score = measured.risk_score.max(45);
     }
+    let (domain_min_confidence, domain_min_margin) = GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR;
     if measured.work_domain.domain == WorkDomain::General
-        && answers.get("work_domain").is_some_and(|answer| {
-            matches!(&answer.value, AnswerValue::Choice(choice) if choice == "frontend")
-                && answer.decisive(JEV_FRONTEND_CONFIDENCE, jev::DEFAULT_MIN_MARGIN)
-        })
+        && gate_work_domain_action(
+            answers.get("work_domain"),
+            domain_min_confidence,
+            domain_min_margin,
+        ) == "frontend"
     {
         measured.work_domain.domain = WorkDomain::Frontend;
         measured.work_domain.score = measured.work_domain.score.max(90);
     }
+    let (tag_min_confidence, tag_min_margin) = GATE_RECLASS_NOUL_DEFAULT_FLOOR;
     for (question, tag) in [
         ("security", "security"),
         ("data", "data"),
@@ -2496,12 +2631,8 @@ fn apply_jev_gate_advice(
         ("devops", "devops"),
         ("architecture", "architecture"),
     ] {
-        if answers.get(question).is_some_and(|answer| {
-            answer.decisive(0.0, jev::DEFAULT_MIN_MARGIN)
-                && answer
-                    .as_noul()
-                    .is_some_and(|probability| probability >= JEV_TAG_PROBABILITY)
-        }) && !state.jev_tags.iter().any(|existing| existing == tag)
+        if gate_tag_action(answers.get(question), tag_min_confidence, tag_min_margin) == "tag"
+            && !state.jev_tags.iter().any(|existing| existing == tag)
         {
             state.jev_tags.push(tag.to_string());
         }
@@ -13881,5 +14012,115 @@ present_as = "summary"
             vec!["intent", "implement", "review", "verify", "deploy"]
         );
         assert_artifact_accepted(&completed, ArtifactStage::Intent);
+    }
+
+    fn choice_answer(choice: &str, confidence: f32) -> jev::Answer {
+        jev::Answer {
+            value: AnswerValue::Choice(choice.to_string()),
+            confidence,
+            probabilities: BTreeMap::from([
+                (choice.to_string(), 0.95_f32),
+                ("other".to_string(), 0.05_f32),
+            ]),
+        }
+    }
+
+    fn noul_answer(probability: f64) -> jev::Answer {
+        jev::Answer {
+            value: jev::AnswerValue::Noul(probability),
+            confidence: probability as f32,
+            probabilities: BTreeMap::new(),
+        }
+    }
+
+    /// A decisive `template_copy` refuses and a decisive `thin` warns; the
+    /// same confidence one step below [`JEV_ARTIFACT_CONFIDENCE`], and a
+    /// missing answer, both fall back to "pass" -- proves the `>=` edge, not
+    /// just a comfortably-clear case.
+    #[test]
+    fn artifact_substance_action_decides_on_the_confidence_edge() {
+        let (_, min_margin) = ARTIFACT_SUBSTANCE_DEFAULT_FLOOR;
+        let refuse = choice_answer("template_copy", JEV_ARTIFACT_CONFIDENCE);
+        assert_eq!(
+            artifact_substance_action(Some(&refuse), JEV_ARTIFACT_CONFIDENCE, min_margin),
+            "refuse"
+        );
+        let warn = choice_answer("thin", JEV_ARTIFACT_CONFIDENCE);
+        assert_eq!(
+            artifact_substance_action(Some(&warn), JEV_ARTIFACT_CONFIDENCE, min_margin),
+            "warn"
+        );
+        let just_below = choice_answer("template_copy", JEV_ARTIFACT_CONFIDENCE - 0.01);
+        assert_eq!(
+            artifact_substance_action(Some(&just_below), JEV_ARTIFACT_CONFIDENCE, min_margin),
+            "pass"
+        );
+        assert_eq!(
+            artifact_substance_action(None, JEV_ARTIFACT_CONFIDENCE, min_margin),
+            "pass"
+        );
+    }
+
+    /// A decisive noul at or above [`JEV_SENSITIVE_PROBABILITY`] raises; the
+    /// same answer one step below the value threshold, and a missing
+    /// answer, both fall back to "none".
+    #[test]
+    fn gate_sensitive_surface_action_decides_on_the_probability_edge() {
+        let (min_confidence, min_margin) = GATE_RECLASS_NOUL_DEFAULT_FLOOR;
+        let at_floor = noul_answer(JEV_SENSITIVE_PROBABILITY);
+        assert_eq!(
+            gate_sensitive_surface_action(Some(&at_floor), min_confidence, min_margin),
+            "raise"
+        );
+        let just_below = noul_answer(JEV_SENSITIVE_PROBABILITY - 0.01);
+        assert_eq!(
+            gate_sensitive_surface_action(Some(&just_below), min_confidence, min_margin),
+            "none"
+        );
+        assert_eq!(
+            gate_sensitive_surface_action(None, min_confidence, min_margin),
+            "none"
+        );
+    }
+
+    /// A decisive `frontend` choice at or above [`JEV_FRONTEND_CONFIDENCE`]
+    /// reclassifies; the same confidence one step below the threshold, and a
+    /// missing answer, both fall back to "none".
+    #[test]
+    fn gate_work_domain_action_decides_on_the_confidence_edge() {
+        let (_, min_margin) = GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR;
+        let at_floor = choice_answer("frontend", JEV_FRONTEND_CONFIDENCE);
+        assert_eq!(
+            gate_work_domain_action(Some(&at_floor), JEV_FRONTEND_CONFIDENCE, min_margin),
+            "frontend"
+        );
+        let just_below = choice_answer("frontend", JEV_FRONTEND_CONFIDENCE - 0.01);
+        assert_eq!(
+            gate_work_domain_action(Some(&just_below), JEV_FRONTEND_CONFIDENCE, min_margin),
+            "none"
+        );
+        assert_eq!(
+            gate_work_domain_action(None, JEV_FRONTEND_CONFIDENCE, min_margin),
+            "none"
+        );
+    }
+
+    /// A decisive noul at or above [`JEV_TAG_PROBABILITY`] tags; the same
+    /// answer one step below the value threshold, and a missing answer, both
+    /// fall back to "none".
+    #[test]
+    fn gate_tag_action_decides_on_the_probability_edge() {
+        let (min_confidence, min_margin) = GATE_RECLASS_NOUL_DEFAULT_FLOOR;
+        let at_floor = noul_answer(JEV_TAG_PROBABILITY);
+        assert_eq!(
+            gate_tag_action(Some(&at_floor), min_confidence, min_margin),
+            "tag"
+        );
+        let just_below = noul_answer(JEV_TAG_PROBABILITY - 0.01);
+        assert_eq!(
+            gate_tag_action(Some(&just_below), min_confidence, min_margin),
+            "none"
+        );
+        assert_eq!(gate_tag_action(None, min_confidence, min_margin), "none");
     }
 }

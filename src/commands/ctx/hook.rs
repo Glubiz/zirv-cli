@@ -1888,6 +1888,14 @@ const MISSING_TESTS_OWED_TEST_SCAN_CAP: usize = 50;
 /// no" -- may skip it.
 const MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY: f64 = 0.1;
 
+/// [`missing_tests_owed_jev_says_skip`]'s own default `(min_confidence,
+/// min_margin)` `decisive()` floor -- named (issue: `zirv ctx jev probe`) so
+/// a later retune targets exactly this constant, the same way every other
+/// tunable site's default floor is now named. Not routed through `jev::
+/// floor`/`[jev.floors]` today: this stays the same fixed pair production
+/// has always used.
+pub(crate) const MISSING_TESTS_DEFAULT_FLOOR: (f32, f32) = (0.0, super::jev::DEFAULT_MIN_MARGIN);
+
 /// Every tracked path `git ls-files` reports that itself looks like a test
 /// file ([`path_looks_like_test_file`]) -- the missing-tests-owed Jev gate's
 /// own "does this repo even have tests" and "mentions" facts both read off
@@ -2008,7 +2016,7 @@ fn missing_tests_owed_facts(repo: &Path, changed: &[PathBuf]) -> Vec<u32> {
     ]
 }
 
-fn missing_tests_owed_question() -> [super::jev::Question; 1] {
+pub(crate) fn missing_tests_questions() -> [super::jev::Question; 1] {
     [super::jev::Question::metadata_noul(
         "tests_owed",
         // Kept under `safe_metadata_request`'s own 512-char instructions cap
@@ -2023,6 +2031,29 @@ only if clearly not owed. Answer true if unsure.",
         "a new or updated test is owed for this change",
         "no new test is owed for this change",
     )]
+}
+
+/// [`missing_tests_owed_jev_says_skip`]'s own per-call decision: `"skip"`
+/// only for a DECISIVE, strongly "not owed" noul (at or below
+/// [`MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY`]), `"owed"` otherwise (missing
+/// answer, indecisive, unparseable, or a decisive answer that is not
+/// strongly "not owed") -- the deterministic gate's own fallback outcome.
+/// Shared with `zirv ctx jev probe`, which reports exactly this outcome.
+pub(crate) fn missing_tests_action(
+    answer: Option<&super::jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "owed";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "owed";
+    }
+    match answer.as_noul() {
+        Some(probability) if probability <= MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY => "skip",
+        _ => "owed",
+    }
 }
 
 /// Issue 6a: `[jev] missing_tests` (off by default). Asks Jev one metadata-
@@ -2053,20 +2084,13 @@ fn missing_tests_owed_jev_says_skip(
         "missing_tests",
         cfg.jev.missing_tests,
         &advise_state,
-        &missing_tests_owed_question(),
+        &missing_tests_questions(),
     ) else {
         return false;
     };
-    let Some(answer) = answers.get("tests_owed") else {
-        return false;
-    };
-    if !answer.decisive(0.0, super::jev::DEFAULT_MIN_MARGIN) {
-        return false;
-    }
-    let Some(probability) = answer.as_noul() else {
-        return false;
-    };
-    if probability > MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY {
+    let answer = answers.get("tests_owed");
+    let (min_confidence, min_margin) = MISSING_TESTS_DEFAULT_FLOOR;
+    if missing_tests_action(answer, min_confidence, min_margin) != "skip" {
         return false;
     }
     let effect = super::jev::JevEffect::new("missing_tests", "gate_skipped");
@@ -3098,6 +3122,14 @@ fn scope_guard_stop_reason(
 /// state is untested, so the floor sits well above the default margin.
 const STOP_VERIFY_MIN_PROBABILITY: f64 = 0.9;
 
+/// [`stop_verify_reason`]'s own default `(min_confidence, min_margin)`
+/// `decisive()` floor -- named (issue: `zirv ctx jev probe`) so a later
+/// retune targets exactly this constant, the same way every other tunable
+/// site's default floor is now named. Not routed through `jev::floor`/
+/// `[jev.floors]` today: this stays the same fixed pair production has
+/// always used.
+pub(crate) const STOP_VERIFY_DEFAULT_FLOOR: (f32, f32) = (0.0, super::jev::DEFAULT_MIN_MARGIN);
+
 /// How much of the transcript tail `stop_verify` parses for the closing turn.
 const STOP_VERIFY_TAIL_BYTES: u64 = 512 * 1024;
 
@@ -3196,7 +3228,7 @@ fn stop_verify_facts(events: &[NormalizedEvent]) -> Option<Vec<u32>> {
     ])
 }
 
-fn stop_verify_question() -> [super::jev::Question; 1] {
+pub(crate) fn stop_verify_questions() -> [super::jev::Question; 1] {
     [super::jev::Question::metadata_noul(
         "unverified_done",
         "Facts [completion-claim phrases, hedge phrases, tests-pass-style claims, question marks, \
@@ -3206,6 +3238,29 @@ since. Does it present unverified work as finished? Answer false if unsure.",
         "presents unverified work as finished",
         "hedged, partial, or insufficient evidence",
     )]
+}
+
+/// [`stop_verify_reason`]'s own per-call decision: `"block"` only for a
+/// DECISIVE noul at or above [`STOP_VERIFY_MIN_PROBABILITY`], `"allow"`
+/// otherwise (missing answer, indecisive, unparseable, or a decisive answer
+/// below the probability floor) -- the Stop hook's own fallback outcome
+/// (proceed as if `stop_verify` never ran). Shared with `zirv ctx jev
+/// probe`, which reports exactly this outcome.
+pub(crate) fn stop_verify_action(
+    answer: Option<&super::jev::Answer>,
+    min_confidence: f32,
+    min_margin: f32,
+) -> &'static str {
+    let Some(answer) = answer else {
+        return "allow";
+    };
+    if !answer.decisive(min_confidence, min_margin) {
+        return "allow";
+    }
+    match answer.as_noul() {
+        Some(probability) if probability >= STOP_VERIFY_MIN_PROBABILITY => "block",
+        _ => "allow",
+    }
 }
 
 /// Issue #786 (`[jev] stop_verify`, facts-only stage): only when a check is
@@ -3250,12 +3305,11 @@ fn stop_verify_reason(
         "stop_verify",
         cfg.jev.stop_verify,
         &advise_state,
-        &stop_verify_question(),
+        &stop_verify_questions(),
     )?;
-    let answer = answers.get("unverified_done")?;
-    if !answer.decisive(0.0, super::jev::DEFAULT_MIN_MARGIN)
-        || answer.as_noul()? < STOP_VERIFY_MIN_PROBABILITY
-    {
+    let answer = answers.get("unverified_done");
+    let (min_confidence, min_margin) = STOP_VERIFY_DEFAULT_FLOOR;
+    if stop_verify_action(answer, min_confidence, min_margin) != "block" {
         return None;
     }
     let effect = super::jev::JevEffect::new("stop_verify", "stop_blocked");
@@ -16652,9 +16706,40 @@ capable a model does it actually need?",
         let value = serde_json::to_value(&advise_state).expect("json");
         assert!(super::super::jev::safe_metadata_request(
             &value,
-            &stop_verify_question(),
+            &stop_verify_questions(),
             "jev-latest"
         ));
+    }
+
+    fn stop_verify_noul_answer(probability: f64) -> super::super::jev::Answer {
+        super::super::jev::Answer {
+            value: super::super::jev::AnswerValue::Noul(probability),
+            confidence: probability as f32,
+            probabilities: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A decisive answer at or above [`STOP_VERIFY_MIN_PROBABILITY`] blocks;
+    /// the same answer one step below the value threshold, and a missing
+    /// answer, both fall back to "allow" -- proves the `>=` edge, not just a
+    /// comfortably-clear case.
+    #[test]
+    fn stop_verify_action_decides_on_the_probability_edge() {
+        let (min_confidence, min_margin) = STOP_VERIFY_DEFAULT_FLOOR;
+        let at_floor = stop_verify_noul_answer(STOP_VERIFY_MIN_PROBABILITY);
+        assert_eq!(
+            stop_verify_action(Some(&at_floor), min_confidence, min_margin),
+            "block"
+        );
+        let just_below = stop_verify_noul_answer(STOP_VERIFY_MIN_PROBABILITY - 0.01);
+        assert_eq!(
+            stop_verify_action(Some(&just_below), min_confidence, min_margin),
+            "allow"
+        );
+        assert_eq!(
+            stop_verify_action(None, min_confidence, min_margin),
+            "allow"
+        );
     }
 
     // -- issue #785: `[jev] inject` at the hook sites ---------------------
@@ -18029,9 +18114,40 @@ exactly as before.";
         let value = serde_json::to_value(&advise_state).expect("json");
         assert!(super::super::jev::safe_metadata_request(
             &value,
-            &missing_tests_owed_question(),
+            &missing_tests_questions(),
             "jev-latest"
         ));
+    }
+
+    fn missing_tests_noul_answer(probability: f64) -> super::super::jev::Answer {
+        super::super::jev::Answer {
+            value: super::super::jev::AnswerValue::Noul(probability),
+            confidence: probability as f32,
+            probabilities: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A decisive answer at or below [`MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY`]
+    /// skips the gate; the same answer one step above the value threshold
+    /// falls back to "owed" -- proves the `<=` edge, not just a comfortably
+    /// -clear case.
+    #[test]
+    fn missing_tests_action_decides_on_the_probability_edge() {
+        let (min_confidence, min_margin) = MISSING_TESTS_DEFAULT_FLOOR;
+        let at_floor = missing_tests_noul_answer(MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY);
+        assert_eq!(
+            missing_tests_action(Some(&at_floor), min_confidence, min_margin),
+            "skip"
+        );
+        let just_above = missing_tests_noul_answer(MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY + 0.01);
+        assert_eq!(
+            missing_tests_action(Some(&just_above), min_confidence, min_margin),
+            "owed"
+        );
+        assert_eq!(
+            missing_tests_action(None, min_confidence, min_margin),
+            "owed"
+        );
     }
 
     /// Gate off (the default): behaviour is byte-identical to before this
