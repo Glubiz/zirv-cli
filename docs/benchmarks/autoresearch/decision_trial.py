@@ -149,6 +149,11 @@ def call_proxy_decision(prompt, zirv_bin, state_dir, env_extra, timeout_s=DEFAUL
     elapsed_ms = int((time.time() - t0) * 1000)
     stdout_text = proc.stdout.decode("utf-8", errors="replace")
     decision = parse_last_json(stdout_text)
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        return None, elapsed_ms, stdout_text + stderr_text, (
+            f"proxy exited non-zero (exit={proc.returncode})"
+        )
     if decision is None:
         stderr_text = proc.stderr.decode("utf-8", errors="replace")
         return None, elapsed_ms, stdout_text + stderr_text, (
@@ -280,15 +285,19 @@ def read_proxy_decisions(state_dir):
     return rows
 
 
-def jev_ran_from_proxy_decisions(rows):
+def jev_ran_from_proxy_decisions(rows, reps=1):
     """Whether the production intake path actually invoked Jev/helper
     decisively for THIS trial, per the persisted `proxy-decisions.jsonl`
-    receipt (the last row, since a trial's state dir is per-trial and
-    isolated -- see the design spec's `ZIRV_CTX_STATE_DIR=<trial>/state`)
-    -- ground truth independent of whatever this process parsed from the
-    subprocess's own stdout (`decision_abstained` above answers a related
-    but different question from the live decision object; this one answers
-    it from the receipt).
+    receipt. For `reps<=1` this is just the last row (a trial's state dir is
+    per-trial and isolated -- see the design spec's
+    `ZIRV_CTX_STATE_DIR=<trial>/state`). For `reps>1` it reflects the WHOLE
+    trial: true only when the trial's last `reps` rows (or all rows, if
+    fewer are present) are all typesafe/helper -- one deterministic-only rep
+    among several Jev-decisive ones must not read as "Jev ran" for the
+    trial -- ground truth independent of whatever this process parsed from
+    the subprocess's own stdout (`decision_abstained` above answers a
+    related but different question from the live decision object; this one
+    answers it from the receipt).
 
     `False` for an empty list: a missing Jev credential or an off gate
     means the production path never even attempted the call, which must
@@ -303,7 +312,8 @@ def jev_ran_from_proxy_decisions(rows):
     """
     if not rows:
         return False
-    return rows[-1].get("decider") in ("typesafe", "helper")
+    tail = rows[-reps:] if reps > 1 else rows[-1:]
+    return all(row.get("decider") in ("typesafe", "helper") for row in tail)
 
 
 def find_receipts_file(state_dir):
@@ -361,14 +371,24 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
     `None` against the label, same as today, and still counts); `quality` is
     the modal share of the (predicted_seat_tier, predicted_clarify) tuple --
     the exact fields `grade_decision` itself compares against the label --
-    across the `reps` repetitions (the same "how often does the modal answer
-    recur" stability measure `jev_probe_trial.py` uses, applied here to the
-    intake decision instead of a Jev site's per-item actions)."""
+    across ONLY the reps whose decision came back (a failed rep never counts
+    as "agreeing" with another failed rep; if every rep failed, `status` is
+    `"error"` and `quality`/`correctness` are both `None`, same as today)
+    (the same "how often does the modal answer recur" stability measure
+    `jev_probe_trial.py` uses, applied here to the intake decision instead
+    of a Jev site's per-item actions). Raises `ValueError` if the spec's own
+    `state_dir` is missing or empty, so a child `zirv` can never silently
+    fall back to the operator's real state dir."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     state_dir = spec.get("state_dir")
+    if not state_dir:
+        raise ValueError(
+            "trial spec is missing state_dir -- refusing to let a child zirv "
+            "fall back to the operator's real state dir"
+        )
     attribution = attribution_env_for(spec)
 
     case_id = spec["task"]
@@ -395,7 +415,7 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
         # credential / gate off) using the production's OWN persisted receipt --
         # never nulls `correctness` (a deterministic-only arm is a legitimate
         # baseline); see `jev_ran_from_proxy_decisions`'s docstring.
-        details["jev_ran"] = jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir))
+        details["jev_ran"] = jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir), reps=1)
         if error_note:
             details["error"] = error_note
 
@@ -418,14 +438,22 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
                 rep_grade["error"] = error_note
             total_elapsed += elapsed_ms
             any_decision = any_decision or decision is not None
-            rep_details.append({"correctness": rep_correctness, "grade": rep_grade})
+            rep_details.append({
+                "correctness": rep_correctness, "grade": rep_grade,
+                "decision_ok": decision is not None,
+            })
 
         status = "ok" if any_decision else "error"
         if any_decision:
             trial_correctness = sum(r["correctness"] for r in rep_details) / len(rep_details)
+            # Stability (quality) is the modal share over reps whose decision
+            # actually came back -- a failed rep (predicted_seat_tier/
+            # predicted_clarify both None) must never count as "agreeing"
+            # with another failed rep; correctness above still folds in every
+            # rep, failed or not, same as before.
             tuples = [
                 (r["grade"]["predicted_seat_tier"], r["grade"]["predicted_clarify"])
-                for r in rep_details
+                for r in rep_details if r["decision_ok"]
             ]
             top_count = Counter(tuples).most_common(1)[0][1]
             quality = top_count / len(tuples)
@@ -436,7 +464,7 @@ def run_trial(spec_path, out_dir, zirv_bin=None, reps=1):
         details = {
             "reps": [r["grade"] for r in rep_details],
             "latency_ms": total_elapsed,
-            "jev_ran": jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir)),
+            "jev_ran": jev_ran_from_proxy_decisions(read_proxy_decisions(state_dir), reps=reps),
         }
         elapsed_ms = total_elapsed
         last_decision_grade = rep_details[-1]["grade"]

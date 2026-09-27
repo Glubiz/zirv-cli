@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import decision_trial  # noqa: E402
@@ -257,7 +258,26 @@ class RunTrialStubbedTests(unittest.TestCase):
     def test_run_trial_unknown_case_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec_path = Path(tmp) / "spec.json"
-            spec = {"task": "not-a-real-case", "trial_id": "t1", "campaign": "c1"}
+            spec = {"task": "not-a-real-case", "trial_id": "t1", "campaign": "c1",
+                    "state_dir": str(Path(tmp) / "state")}
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                decision_trial.run_trial(str(spec_path), str(Path(tmp) / "out"))
+
+    def test_run_trial_missing_state_dir_raises(self):
+        # A spec with no state_dir (or an empty one) must never let the
+        # child zirv fall back to the operator's real state dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp) / "spec.json"
+            spec = {"task": "ic001", "trial_id": "t1", "campaign": "c1"}
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                decision_trial.run_trial(str(spec_path), str(Path(tmp) / "out"))
+
+    def test_run_trial_empty_state_dir_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = Path(tmp) / "spec.json"
+            spec = {"task": "ic001", "trial_id": "t1", "campaign": "c1", "state_dir": ""}
             spec_path.write_text(json.dumps(spec), encoding="utf-8")
             with self.assertRaises(ValueError):
                 decision_trial.run_trial(str(spec_path), str(Path(tmp) / "out"))
@@ -335,6 +355,45 @@ class RunTrialStubbedTests(unittest.TestCase):
         })
 
 
+class CallProxyDecisionTests(unittest.TestCase):
+    """`subprocess.run` itself stubbed -- proves `call_proxy_decision`'s exit
+    code handling without invoking `zirv`."""
+
+    def setUp(self):
+        self._orig_run = decision_trial.subprocess.run
+
+    def tearDown(self):
+        decision_trial.subprocess.run = self._orig_run
+
+    def test_nonzero_exit_with_parsable_stdout_is_treated_as_failed(self):
+        # Review finding: a non-zero exit must be a failed call even when
+        # stdout happens to parse as JSON (e.g. a partial/stale decision
+        # printed before a crash).
+        stdout = json.dumps(decision(seat_tier="standard")).encode("utf-8")
+
+        def fake_run(argv, capture_output, timeout, env):
+            return SimpleNamespace(stdout=stdout, stderr=b"boom", returncode=1)
+
+        decision_trial.subprocess.run = fake_run
+        result_decision, _elapsed_ms, _raw, error_note = decision_trial.call_proxy_decision(
+            "prompt", "zirv", None, {})
+        self.assertIsNone(result_decision)
+        self.assertIsNotNone(error_note)
+        self.assertIn("exit=1", error_note)
+
+    def test_zero_exit_with_parsable_stdout_succeeds(self):
+        stdout = json.dumps(decision(seat_tier="standard")).encode("utf-8")
+
+        def fake_run(argv, capture_output, timeout, env):
+            return SimpleNamespace(stdout=stdout, stderr=b"", returncode=0)
+
+        decision_trial.subprocess.run = fake_run
+        result_decision, _elapsed_ms, _raw, error_note = decision_trial.call_proxy_decision(
+            "prompt", "zirv", None, {})
+        self.assertIsNotNone(result_decision)
+        self.assertIsNone(error_note)
+
+
 class JevRanFromProxyDecisionsTests(unittest.TestCase):
     """Issue #803 review (P3): `jev_ran` must come from the production's own
     persisted `proxy-decisions.jsonl` receipt, distinguishing "Jev never ran"
@@ -363,6 +422,27 @@ class JevRanFromProxyDecisionsTests(unittest.TestCase):
         self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(rows))
         rows2 = [{"decider": "typesafe"}, {"decider": "deterministic"}]
         self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(rows2))
+
+    def test_k1_behaviour_unchanged_by_reps_kwarg(self):
+        rows = [{"decider": "deterministic"}, {"decider": "typesafe"}]
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(rows, reps=1))
+        rows2 = [{"decider": "typesafe"}, {"decider": "deterministic"}]
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(rows2, reps=1))
+
+    def test_reps_k_true_only_when_last_k_rows_all_decisive(self):
+        # Review finding: for K reps, jev_ran must reflect the WHOLE trial --
+        # one deterministic-only rep among several decisive ones must not
+        # read as "Jev ran" for the trial.
+        rows = [{"decider": "typesafe"}, {"decider": "typesafe"}, {"decider": "deterministic"}]
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(rows, reps=3))
+        rows_all_decisive = [{"decider": "typesafe"}, {"decider": "helper"}, {"decider": "typesafe"}]
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(rows_all_decisive, reps=3))
+
+    def test_reps_k_uses_all_rows_when_fewer_than_k_present(self):
+        rows = [{"decider": "typesafe"}, {"decider": "helper"}]
+        self.assertTrue(decision_trial.jev_ran_from_proxy_decisions(rows, reps=5))
+        rows2 = [{"decider": "typesafe"}, {"decider": "deterministic"}]
+        self.assertFalse(decision_trial.jev_ran_from_proxy_decisions(rows2, reps=5))
 
 
 class ReadProxyDecisionsTests(unittest.TestCase):
@@ -522,6 +602,31 @@ class RunTrialRepsTests(unittest.TestCase):
             details = json.loads((out_dir / "details.json").read_text(encoding="utf-8"))
             self.assertEqual(len(details["reps"]), 3)
             self.assertIn("jev_ran", details)
+
+    def test_reps_failed_reps_never_count_as_agreeing_in_quality(self):
+        # Review finding: quality (stability) must be computed only over
+        # reps whose decision is not None. Two of three reps fail here; if
+        # failed reps counted as "agreeing" (both grade to (None, None)),
+        # they'd form the modal tuple and quality would read 2/3. The only
+        # real decision must be the whole modal share: 1/1 = 1.0.
+        calls = {"n": 0}
+
+        def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return decision(seat_tier="standard", needs_clarification=0.9, decisive=True), 10, "", None
+            return None, 5, "", "proxy call failed"
+
+        decision_trial.call_proxy_decision = fake_call
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path = self._spec(tmp)
+            out_dir = Path(tmp) / "out"
+            trial = decision_trial.run_trial(str(spec_path), str(out_dir), reps=3)
+
+            self.assertEqual(trial["status"], "ok")
+            self.assertIsNotNone(trial["correctness"])
+            self.assertAlmostEqual(trial["quality"], 1.0)
 
     def test_reps_all_calls_return_none_is_error_status(self):
         def fake_call(prompt, zirv_bin, state_dir, env_extra, timeout_s=120, attribution=None):
