@@ -65,13 +65,25 @@ depends_on = ["implement"]
 condition = "always"
 
 [[steps]]
+id = "simplify"
+title = "Simplify"
+phase = "implement"
+skills = ["simplify"]
+agent_role = "implementer"
+capabilities = ["repo.read", "repo.write", "test.run"]
+depends_on = ["test"]
+condition = { risk-at-least = "medium" }
+effect = "repository"
+reason = "every review round is paired with a simplify pass, so reuse of existing code is applied before the diff is reviewed"
+
+[[steps]]
 id = "review"
 title = "Review"
 phase = "review"
 skills = ["review"]
 agent_role = "reviewer"
 capabilities = ["repo.read"]
-depends_on = ["test"]
+depends_on = ["simplify"]
 condition = { risk-at-least = "medium" }
 reason = "medium-or-higher risk gets an independent review before verification"
 

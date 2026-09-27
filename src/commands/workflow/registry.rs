@@ -745,6 +745,70 @@ present_as = "summary"
         }
     }
 
+    /// Every review round is paired with a `simplify` pass so a zirv-wrapped
+    /// agent reuses existing code instead of re-implementing it: any
+    /// built-in pack with BOTH a `test` step and a `review` step must carry a
+    /// `simplify` step, skilled `simplify`, sitting between them -- `test`
+    /// depends on nothing new, `simplify` depends on `test`, `review` depends
+    /// on `simplify`, and `simplify`'s condition matches `review`'s exactly
+    /// (it runs precisely when a review round does). Iterates every built-in
+    /// pack generically rather than naming the eight that currently qualify,
+    /// so a future pack that adds both steps is held to the same rule.
+    #[test]
+    fn every_test_plus_review_pack_gets_a_paired_simplify_step() {
+        let skills = skills();
+        let registry = WorkflowRegistry::load(Path::new("."), None, false, false, &skills)
+            .expect("every built-in pack must load");
+        let mut checked = 0usize;
+        for workflow in registry.list() {
+            if workflow.source != WorkflowSource::BuiltIn {
+                continue;
+            }
+            let definition = &workflow.definition;
+            let has_test = definition.steps.iter().any(|step| step.id == "test");
+            let review = definition.steps.iter().find(|step| step.id == "review");
+            let (Some(review), true) = (review, has_test) else {
+                continue;
+            };
+            checked += 1;
+            let simplify = definition
+                .steps
+                .iter()
+                .find(|step| step.id == "simplify")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: has both 'test' and 'review' steps but no 'simplify' step",
+                        definition.id
+                    )
+                });
+            assert_eq!(
+                simplify.skills,
+                vec!["simplify".to_string()],
+                "{}: 'simplify' step must run the simplify skill",
+                definition.id
+            );
+            assert!(
+                simplify.depends_on.iter().any(|id| id == "test"),
+                "{}: 'simplify' step must depend on 'test'",
+                definition.id
+            );
+            assert!(
+                review.depends_on.iter().any(|id| id == "simplify"),
+                "{}: 'review' step must depend on 'simplify'",
+                definition.id
+            );
+            assert_eq!(
+                simplify.condition, review.condition,
+                "{}: 'simplify' step's condition must match 'review''s",
+                definition.id
+            );
+        }
+        assert!(
+            checked >= 8,
+            "expected at least the 8 known test+review packs to be checked, got {checked}"
+        );
+    }
+
     #[test]
     fn an_operator_pack_overrides_a_builtin_only_with_override_true() {
         let home = tempdir().unwrap();

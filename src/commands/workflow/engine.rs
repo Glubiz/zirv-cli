@@ -475,6 +475,13 @@ fn definitions() -> Vec<WorkflowDefinition> {
                 step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
+                    "simplify",
+                    Phase::Implement,
+                    "simplify",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
+                step(
                     "review",
                     Phase::Review,
                     "review",
@@ -514,6 +521,13 @@ fn definitions() -> Vec<WorkflowDefinition> {
                 step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
                 step(
+                    "simplify",
+                    Phase::Implement,
+                    "simplify",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
+                step(
                     "review",
                     Phase::Review,
                     "review",
@@ -551,6 +565,13 @@ fn definitions() -> Vec<WorkflowDefinition> {
                 ),
                 step("implement", Phase::Implement, "implement", When::Always, false),
                 step("test", Phase::Test, "testing", When::Always, false),
+                step(
+                    "simplify",
+                    Phase::Implement,
+                    "simplify",
+                    When::RiskAtLeast(R::Medium),
+                    false,
+                ),
                 step(
                     "review",
                     Phase::Review,
@@ -614,6 +635,19 @@ fn definition(kind: WorkflowKind) -> WorkflowDefinition {
 fn legacy_apply_profile(kind: WorkflowKind, profile: WorkflowProfile, steps: &mut [WorkflowStep]) {
     let defaults = definition(kind).steps;
     for step in steps {
+        // The `simplify` step (issue: simplify-paired-with-review) shares
+        // `Phase::Implement` with `implement` itself but, like `implement`'s
+        // OWN pre-#542 phase-keyed selection below, has no frontend variant
+        // -- the real pack-driven `select_step_data` therefore always falls
+        // back to its own primary skill regardless of profile. This oracle
+        // is otherwise keyed purely on phase (a safe simplification when
+        // exactly one step ever occupied each phase); `simplify` breaks that
+        // one-step-per-phase assumption, so it is special-cased here rather
+        // than widening the match below to carry id-awareness for every
+        // phase.
+        if step.id == "simplify" {
+            continue;
+        }
         step.skill = match (profile, step.phase) {
             (_, WorkflowPhase::Intent) => continue,
             (WorkflowProfile::Frontend, WorkflowPhase::Design) => "frontend-design",
@@ -5455,6 +5489,7 @@ mod tests {
                 "plan",
                 "implement",
                 "test",
+                "simplify",
                 "review",
                 "verify",
                 "deploy"
@@ -7396,13 +7431,29 @@ mod tests {
         let code = run(&advance_args(), &mut out).unwrap();
         assert_eq!(code, 0, "a passing test check must advance past Test");
         let after_test = load(&state_dir, repo.path(), &id).unwrap();
-        assert_eq!(after_test.current().unwrap().phase, WorkflowPhase::Review);
+        assert_eq!(
+            after_test.current().unwrap().phase,
+            WorkflowPhase::Implement
+        );
+        assert_eq!(after_test.current().unwrap().id, "simplify");
+
+        // The `simplify` step paired with this review round: `Implement`
+        // phase, no run-checks gate of its own -- a plain successful advance
+        // moves it straight into Review.
+        let after_simplify =
+            advance_with_evidence(&state_dir, after_test, StepOutcome::Success, None, false)
+                .expect("the simplify step must advance");
+        assert_eq!(
+            after_simplify.current().unwrap().phase,
+            WorkflowPhase::Review
+        );
+        save(&state_dir, &after_simplify, true).unwrap();
 
         // Gate 2 (Review): a real, unresolved finding blocks -- the same
         // gate `a_finding_recorded_while_the_reviewer_ran_survives_the_
         // evidence_write` proves records for real; this proves what the
         // engine does with it.
-        let mut with_finding = after_test;
+        let mut with_finding = after_simplify;
         with_finding.review_findings.push(ReviewFinding {
             id: "finding-1".into(),
             severity: FindingSeverity::Major,
@@ -13143,6 +13194,7 @@ present_as = "summary"
                 "plan",
                 "implement",
                 "test",
+                "simplify",
                 "review",
                 "verify",
                 "deploy"
@@ -13168,7 +13220,15 @@ present_as = "summary"
         assert_eq!(completed.status, WorkflowStatus::Completed);
         assert_eq!(
             completed.completed_steps,
-            vec!["scope", "implement", "test", "review", "verify", "deploy"]
+            vec![
+                "scope",
+                "implement",
+                "test",
+                "simplify",
+                "review",
+                "verify",
+                "deploy"
+            ]
         );
         assert_artifact_accepted(&completed, ArtifactStage::Intent);
     }
@@ -13198,7 +13258,15 @@ present_as = "summary"
         assert_eq!(completed.status, WorkflowStatus::Completed);
         assert_eq!(
             completed.completed_steps,
-            vec!["intent", "implement", "test", "review", "verify", "deploy"]
+            vec![
+                "intent",
+                "implement",
+                "test",
+                "simplify",
+                "review",
+                "verify",
+                "deploy"
+            ]
         );
         assert_artifact_accepted(&completed, ArtifactStage::Intent);
     }
@@ -13724,6 +13792,7 @@ present_as = "summary"
                 "migration-plan",
                 "implement",
                 "test",
+                "simplify",
                 "review",
                 "verify",
                 "deploy"
@@ -13754,6 +13823,7 @@ present_as = "summary"
                 "root-cause",
                 "implement",
                 "test",
+                "simplify",
                 "review",
                 "verify",
                 "deploy"

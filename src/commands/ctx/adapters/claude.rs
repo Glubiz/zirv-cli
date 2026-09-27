@@ -97,7 +97,9 @@ repository's standards and to the engineering standard above: reuse before addin
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
-this seat's model), and never when a `zirv workflow` review gate covers the change.
+this seat's model), and never when a `zirv workflow` review gate covers the change. Its paired \
+simplify pass is one Agent worker on that same review model that loads the zirv `simplify` \
+skill (`zirv skill load simplify`), never this seat.
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
@@ -135,7 +137,9 @@ repository's standards and to the engineering standard above: reuse before addin
 diff, one focused test per behaviour change, format, lint and test before reporting back.
 - Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
 runs at low or medium effort on the roster's review model, never high or above (that forks \
-this seat's model), and never when a `zirv workflow` review gate covers the change.
+this seat's model), and never when a `zirv workflow` review gate covers the change. Its paired \
+simplify pass is one Agent worker on that same review model that loads the zirv `simplify` \
+skill (`zirv skill load simplify`), never this seat.
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
