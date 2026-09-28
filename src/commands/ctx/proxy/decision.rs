@@ -432,19 +432,6 @@ fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
-/// Truncates `text` to at most `max` bytes, at a `char` boundary -- never
-/// splitting a multi-byte UTF-8 sequence.
-fn truncate_bytes(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
-}
-
 /// The deterministic classification behind a decision's baseline --
 /// TEXT ONLY (issue #537 fix): classifies via `classify::classify` directly
 /// with zero declared changed files/lines, never `classify::from_args`.
@@ -468,7 +455,7 @@ pub fn classify_request(request: &str) -> Classification {
 /// panic (issue #753: the `UserPromptSubmit` hook's intake discipline, where
 /// any failure means "inject nothing"). Pure CPU on the request text.
 pub fn try_classify_request(request: &str) -> Option<Classification> {
-    let task = truncate_bytes(request, CLASSIFY_TASK_MAX_BYTES);
+    let task = crate::utils::truncate_bytes(request.to_string(), Some(CLASSIFY_TASK_MAX_BYTES));
     let mut classification = classify::classify(&classify::ClassificationInput {
         task,
         paths: Vec::new(),
@@ -1433,7 +1420,10 @@ pub fn build_intake(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.display().to_string());
     IntakeState {
-        request: truncate_bytes(request, cfg.proxy.request_max_bytes.max(1)),
+        request: crate::utils::truncate_bytes(
+            request.to_string(),
+            Some(cfg.proxy.request_max_bytes.max(1)),
+        ),
         repository: IntakeRepository { name: repo_name },
         workflows: roster.workflow_summaries(),
         policy: IntakePolicy {
