@@ -40,14 +40,13 @@
 //! `<state>/permits/writers/` directory ([`writer_permits_dir`]) -- the heavy
 //! pool above is untouched by it.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use super::sessions;
-use super::state::{self, StateDir};
+use super::state::{self, StateDir, create_new_private};
 
 /// Re-review (2026-08-27) finding 2a: how long an unparseable slot file is
 /// left alone before the dead-owner sweep treats it as crash-orphaned and
@@ -210,33 +209,6 @@ fn permits_dir(state: &StateDir) -> PathBuf {
 /// shared between [`acquire`] (which contends on it) and tests.
 fn slot_path(dir: &Path, slot: usize) -> PathBuf {
     dir.join(format!("slot-{slot}.json"))
-}
-
-/// Creates `path` exclusively (fails if it already exists) and writes
-/// `contents` in one call -- the same collision-as-the-open-result idiom
-/// `dash::spawnreq::create_new_private` and `memory`'s per-key entries use,
-/// duplicated locally rather than shared across modules this deep in two
-/// different subsystems. Private (0600) on Unix, plain on Windows (which has
-/// no equivalent bit); `create_new` itself is what supplies the atomicity on
-/// both platforms.
-#[cfg(unix)]
-fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-#[cfg(not(unix))]
-fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
 }
 
 /// One held slot in the machine-wide heavy-operation budget. Releases its

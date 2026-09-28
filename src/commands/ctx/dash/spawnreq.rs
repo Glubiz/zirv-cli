@@ -26,7 +26,7 @@ use super::super::CtxResult;
 use super::super::permit::WorkerMode;
 use super::super::policy::CapabilityWarning;
 use super::super::prompt::PromptRole;
-use super::super::state::StateDir;
+use super::super::state::{StateDir, TMP_INFIX, write_atomic_private};
 
 /// Exported into every pane's own `turn_env`: names the directory a pane's
 /// own `zirv ctx agent` invocation writes a [`SpawnRequest`] into.
@@ -419,34 +419,6 @@ pub fn owner_pid_path(requests_dir: &Path) -> PathBuf {
         .join("owner.pid")
 }
 
-#[cfg(unix)]
-fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-#[cfg(not(unix))]
-fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-/// The infix every in-progress write in this directory carries while it is
-/// still being written. Both listings below skip anything containing it, so a
-/// 50ms poller can never read a half-written file: the visible name only ever
-/// appears via [`write_atomic_private`]'s own rename, which is atomic.
-const TMP_INFIX: &str = ".tmp-";
-
 /// Whether `name` is one of [`write_atomic_private`]'s in-flight temporaries.
 /// Belt and braces: a temporary is named `<final>.tmp-<uuid>`, so it already
 /// fails every `ends_with(".json")` check in this module -- but a listing that
@@ -454,27 +426,6 @@ const TMP_INFIX: &str = ".tmp-";
 /// that says so.
 fn is_tmp_name(name: &str) -> bool {
     name.contains(TMP_INFIX)
-}
-
-/// R10: creates `<dir>/<name>` by writing `<dir>/<name>.tmp-<uuid>` first and
-/// renaming it into place. Every file in this directory is polled for by the
-/// other side of the channel (`take_requests` every tick, `wait_for_ack` every
-/// 100ms), and a plain create-then-write is visible under its final name while
-/// still empty -- which a poller reads as a torn write and deletes. The rename
-/// is atomic on both platforms, so the final name never exists in a partial
-/// state. The temporary itself is still `create_new` + 0600, the same private
-/// -file discipline `state::write_private` holds elsewhere, and is cleaned up
-/// if the rename fails.
-fn write_atomic_private(dir: &Path, name: &str, contents: &str) -> CtxResult<PathBuf> {
-    super::super::state::create_private_dir_all(dir)?;
-    let tmp = dir.join(format!("{name}{TMP_INFIX}{}", uuid::Uuid::new_v4()));
-    create_new_private(&tmp, contents)?;
-    let path = dir.join(name);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(path)
 }
 
 /// Writes `req` as a `req-<uuid>.json` file under `dir` through
@@ -1096,19 +1047,5 @@ mod tests {
         assert!(!is_claimed(&dir, &stem));
         // Idempotent: withdrawing twice is not an error.
         remove_claim(&dir, &stem);
-    }
-
-    #[test]
-    fn write_request_never_overwrites_an_existing_file() {
-        let (_tmp, dir) = dir();
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("req-collision.json");
-        std::fs::write(&path, "already here").expect("pre-create");
-
-        // `create_new_private` refuses to clobber an existing file; simulate
-        // the collision directly against the private writer rather than
-        // hoping for an actual uuid collision.
-        let err = create_new_private(&path, "{}").expect_err("must not overwrite");
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }

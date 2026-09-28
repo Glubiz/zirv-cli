@@ -922,6 +922,51 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     write_atomic(path, contents, true)
 }
 
+/// Creates `path` exclusively and writes `contents`, failing if it already
+/// exists. Uses umask-respecting 0600 on Unix; does not create parent directories.
+#[cfg(unix)]
+pub(crate) fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_new_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// Infix used by [`write_atomic_private`] so directory pollers can skip
+/// incomplete writes.
+pub(crate) const TMP_INFIX: &str = ".tmp-";
+
+/// Creates private parent directories and writes through an exclusive
+/// `<name>.tmp-<uuid>` sibling before atomically renaming it over `<name>`.
+/// Unlike [`write_private`], the temporary uses umask-respecting 0600 and
+/// remains on a write error; a failed rename removes it. Dashboard pollers
+/// ignore temporaries so they only read complete requests and acknowledgements.
+pub(crate) fn write_atomic_private(dir: &Path, name: &str, contents: &str) -> CtxResult<PathBuf> {
+    create_private_dir_all(dir)?;
+    let tmp = dir.join(format!("{name}{TMP_INFIX}{}", uuid::Uuid::new_v4()));
+    create_new_private(&tmp, contents)?;
+    let path = dir.join(name);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(path)
+}
+
 /// Same atomic temp-sibling-then-`rename` guarantee as `write_private`, for
 /// content meant to live in the repository checkout itself
 /// (`<repo>/.zirv/memory/`, the shared memory scope) rather than the
@@ -1430,6 +1475,21 @@ mod tests {
         assert!(state.handoffs().is_dir());
         assert!(state.sockets().is_dir());
         assert!(state.logs().is_dir());
+    }
+
+    #[test]
+    fn create_new_private_never_overwrites_an_existing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("requests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("req-collision.json");
+        std::fs::write(&path, "already here").expect("pre-create");
+
+        // `create_new_private` refuses to clobber an existing file; simulate
+        // the collision directly against the private writer rather than
+        // hoping for an actual uuid collision.
+        let err = create_new_private(&path, "{}").expect_err("must not overwrite");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     /// M6 only held for files zirv created. Writing over one that already
