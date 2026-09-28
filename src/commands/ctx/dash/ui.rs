@@ -3634,10 +3634,6 @@ pub fn frame_snapshot(
         // the click rects and the drawn chords can never describe different
         // columns (the same discipline the divider already follows).
         header_hints: header_hint_regions(layout.header, header),
-        // The footer carries no `^A x` chords today (the spend segment and
-        // the status grammar are both read-only), so it owns no hit regions
-        // yet; `Hit::FooterHint` exists for the phases that add them.
-        footer_hints: Vec::new(),
         zoomed,
         overlay: overlay_geom.as_ref().map(|(rect, ..)| *rect),
         overlay_rows: overlay_geom

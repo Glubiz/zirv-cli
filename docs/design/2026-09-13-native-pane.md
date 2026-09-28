@@ -135,15 +135,14 @@ case, accepting a bounded one-glyph overflow rather than an unbounded loop
 degenerate widths is unavoidable, but it must be bounded and it must
 terminate.
 
-Paste has two paths: a terminal that sends a real bracketed-paste event
+Paste uses a terminal's bracketed-paste event, which
 hands its text straight to `ComposerAction::InsertText` (crossterm's own
-`Event::Paste`, not reimplemented here); a terminal that does not is
-covered by `coalesce_paste_chunks`, a pure function over recorded
-(text, gap) pairs that a live input loop would drive from real keystroke
-timing. `InsertText` normalizes `\r\n`/`\r` to `\n` before inserting --
+`Event::Paste`, not reimplemented here). No fallback coalesces keystrokes
+for terminals without bracketed paste.
+`InsertText` normalizes `\r\n`/`\r` to `\n` before inserting --
 Windows clipboard/terminal paste routinely carries CRLF, and every other
-multiline convention in this module (`resolve_file_refs`, `wrap_line`,
-`render_item`) assumes `\n`-only line endings.
+multiline convention in this module (`wrap_line`, `render_item`) assumes
+`\n`-only line endings.
 
 ## What is verified
 
@@ -381,12 +380,10 @@ and which keys reach the pane changed.
   UI that looks live but is not; wiring the actual decision needs the
   broker/approval-authority seam this pane does not touch anywhere else
   either.
-- **An interactive `@` fuzzy file picker.** `resolve_file_refs` (tested,
-  containment-safe since the PR #531 review-finding-2 fix earlier on this
-  branch) is still not called from `run_native_dashboard`'s own key
-  handling -- unchanged from round 2's own deferred item. A live `@`-hint
-  overlay needs a picker widget (selection state, filtering, rendering) this
-  round did not build.
+- **An interactive `@` fuzzy file picker.** A live `@`-hint overlay needs
+  workdir containment checks and a picker widget (selection state,
+  filtering, rendering). The unused file-reference resolver was removed
+  in #793.
 - **A `!`-prefixed shell line.** The interactive session has no direct-exec
   path that bypasses a model turn -- every submission today becomes a turn
   `NativeLoop` drives. Adding one is an architecture change (a new command
@@ -444,15 +441,13 @@ and which keys reach the pane changed.
   `run_native_dashboard`'s minimal loop. A session whose tools need an
   approval this build cannot yet grant will simply stall.
 - **`@path` hints, text selection/copy, explicit history keys, paste
-  coalescing.** `resolve_file_refs`, `NativePresentation::set_selection`/
-  `clear_selection`, and `ComposerAction::HistoryUp`/`HistoryDown` are
-  implemented and unit-tested (round 1) but not called from
-  `run_native_dashboard`'s own key handling -- showing a live `@`-hint line
-  needs `composer_lines` to take a workdir; a copy mechanism needs
-  something to copy into; explicit history keys are redundant with
-  `MoveUp`/`MoveDown`'s own cursor-position rule today.
-  `coalesce_paste_chunks` is unused because `Event::Paste` (bracketed
-  paste) already covers the one paste path this loop exercises.
+  coalescing.** The unused file-reference, selection-setter and paste
+  coalescing helpers were removed in #793. Showing a live `@`-hint line
+  needs a file picker; a copy mechanism needs something to copy into.
+  `ComposerAction::HistoryUp`/`HistoryDown` remain unit-tested but are not
+  called from the key handling; explicit history keys are redundant with
+  `MoveUp`/`MoveDown`'s own cursor-position rule today. `Event::Paste`
+  (bracketed paste) covers the paste path this loop exercises.
 - **Task cards, group ownership, mail-to-a-native-pane.** A dashboard-
   opened native pane is a plain orchestrator session: no `task`, no
   `--writer` distinction beyond "always writing", and nothing here teaches
