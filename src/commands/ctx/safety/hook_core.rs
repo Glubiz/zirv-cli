@@ -2,21 +2,9 @@
 
 use super::*;
 
-/// The claude PreToolUse stdin payload, narrowed to what this hook reads.
-/// Every field optional with a zero default, the same rule `hook.rs`'s own
-/// `PreToolPayload` follows: a hook that fails to parse must fail open, not
-/// crash or silently deny everything.
-///
-/// `permission_mode` carries claude's own session mode (documented values:
-/// `"default"`, `"plan"`, `"acceptEdits"`, `"auto"`, `"dontAsk"`,
-/// `"bypassPermissions"`, https://code.claude.com/docs/en/hooks) and defaults
-/// to the empty string on an older payload that omits it entirely.
-/// `run_check_hook_mode_with_env` reads it as an ALLOWLIST of the values
-/// that prove a human is genuinely present to answer a prompt (`"default"`,
-/// `"plan"`, `"acceptEdits"`) -- anything else, including the empty string,
-/// `"dontAsk"`, `"auto"` and `"bypassPermissions"`, fails closed to
-/// `Headless` (2026-08-24, cross-harness permissions hardening): deciding
-/// from an explicit interactive signal, not from the absence of `"dontAsk"`.
+/// Claude PreToolUse payload fields used by this hook. Missing or malformed
+/// optional fields fail open; only explicit interactive permission modes
+/// prove a human can answer Ask, so unknown modes are headless.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct HookToolPayload {
@@ -27,17 +15,11 @@ struct HookToolPayload {
     tool_name: String,
     tool_input: HookToolInput,
     permission_mode: String,
-    /// The calling process's working directory (issue #334): the repo root
-    /// [`orchestrator_repo_write_target`] resolves relative write targets
-    /// against, when the hook payload carries it. Falls back to this
-    /// process's own `std::env::current_dir()` when empty, the same
-    /// fallback [`cd_allow_roots`] already uses.
+    /// Working directory for resolving relative repo writes; falls back to
+    /// the hook process directory when absent (#334).
     cwd: String,
-    /// Issue #313: the path to this session's own transcript JSONL, present
-    /// on claude's real PreToolUse payload. `None` on an older payload that
-    /// omits it, or when the field fails to parse -- the identical-failing-
-    /// command guard simply does not run in that case (see its call site),
-    /// the same fail-open discipline this whole struct already follows.
+    /// Transcript path for the identical-command guard; absent or invalid
+    /// values disable that best-effort signal (#313).
     #[serde(default)]
     transcript_path: Option<String>,
 }
@@ -56,48 +38,11 @@ impl HookToolPayload {
     }
 }
 
-/// The documented PreToolUse decision envelope -- the identical shape
-/// `hook.rs`'s own `pretool_output` uses (`hookSpecificOutput.
-/// permissionDecision`), verified against the installed claude CLI's
-/// PreToolUse hook contract (stdin JSON carries `tool_name`/`tool_input`;
-/// this structured stdout form lets a hook express `"allow"`/`"deny"`/`"ask"`
-/// without relying on exit code 2, which blocks unconditionally on stderr
-/// text with no `"ask"` equivalent). Interactively, `Verdict::Allow` emits
-/// `"allow"`, suppressing Claude's own permission prompt. Under `dontAsk`,
-/// Allow normally emits nothing and falls through to native permissions;
-/// additional context may still require an explicit allow envelope.
-///
-/// Under `--permission-mode dontAsk`, claude's own docs say a hook decision
-/// never bypasses permission rules ("Hook decisions don't bypass permission
-/// rules", https://code.claude.com/docs/en/permissions) and that `dontAsk`
-/// itself means "deny if not pre-approved" -- so an active `"ask"` in that
-/// mode is not a prompt, it is an unsatisfiable denial that would strip the
-/// operator's own `permissions.allow` entries from every zirv-launched
-/// session. `permission_mode` therefore also gates `Verdict::Ask`: under
-/// `dontAsk` it falls through to `None` (nothing emitted, same as `Allow`),
-/// letting claude's own permission flow -- and the operator's `allow` list --
-/// decide. Every other mode (including the empty/unknown default) keeps
-/// emitting `"ask"` unchanged, and `Deny` is unaffected by mode: it always
-/// emits `"deny"` (2026-08-23, issue #102).
-///
-/// **2026-08-24 re-scoping:** the `dontAsk` fall-through is unchanged,
-/// because the reason for it is unchanged -- an `ask` under `dontAsk` is
-/// still an unsatisfiable prompt claude turns into a denial that would strip
-/// the operator's own `permissions.allow`. What changed is which launches can
-/// reach it: zirv no longer pins `dontAsk` on an interactive launch
-/// (`ClaudeAdapter::default_sandbox_args` pins `default` there), so the only
-/// two remaining populations are a headless zirv launch and an operator who
-/// pinned `dontAsk` themselves -- `adapters::flags_pin_policy` already makes
-/// zirv stand down entirely for the latter. Pinned end to end by
-/// `the_dont_ask_suppression_is_reachable_only_from_the_headless_posture`.
-///
-/// Issue #313: the production call site (`run_check_hook_mode_with_env`) now
-/// calls [`hook_output_with_extras`] directly (it always has extras to pass,
-/// even if every field is `None` for an ordinary decision), so this five-
-/// argument form survives only as the pre-#313 shape every existing test
-/// below still calls -- `#[cfg(test)]` reflects that honestly rather than
-/// leaving a production-looking function `dead_code` would have to warn
-/// about.
+/// Claude PreToolUse decision envelope. Interactive Allow suppresses the
+/// native prompt; under `dontAsk`, Allow and Ask normally emit nothing so
+/// native permissions retain control. Deny always emits `deny`. An Ask in
+/// `dontAsk` cannot be answered and would override operator allow rules
+/// (#102). Additional context can require an explicit Allow envelope (#313).
 #[cfg(test)]
 pub(super) fn hook_output(
     command: &str,
@@ -117,42 +62,23 @@ pub(super) fn hook_output(
     )
 }
 
-/// Extra text issue #313's two loop breakers fold into the emitted
-/// `hookSpecificOutput`, threaded through one struct rather than growing
-/// [`hook_output`]'s own parameter list (which every pre-existing call site,
-/// production and test alike, still calls at its original five-argument
-/// arity via the thin wrapper above): the breaker and the guard each write
-/// into their own disjoint verdict branch (the denial-breaker note only ever
-/// accompanies an `Ask`/`Deny`; the identical-command guard's override/
-/// context only ever accompanies an `Allow`, or an `Allow` the guard itself
-/// has just turned into a `Deny`), so nothing here needs to reconcile the
-/// two against each other.
+/// Keep denial and identical-command breaker text in separate verdict
+/// branches so one cannot overwrite the other's reason (#313).
 #[derive(Debug, Clone, Default)]
 struct HookOutputExtras {
-    /// Consecutive-denial breaker (issue #313): prefixes the ordinary
-    /// `explain_text` narrative with an explicit "N consecutive denials --
-    /// stop retrying" instruction, joined by ` -- ` so the operator still
-    /// sees the original reason underneath.
+    /// Stop a denial loop while retaining the policy reason the operator
+    /// needs to understand the block (#313).
     breaker_note: Option<String>,
-    /// Identical-command guard refuse (issue #313, headless only): REPLACES
-    /// the ordinary `explain_text` narrative outright with a guard-specific
-    /// reason. The caller has already turned the underlying verdict into
-    /// `Deny` before reaching `hook_output_with_extras`; this is only the
-    /// text.
+    /// Name the repeated-failure refusal instead of an ordinary policy
+    /// reason that would misstate why headless execution stopped (#313).
     reason_override: Option<String>,
-    /// Identical-command guard warn (issue #313): folded into
-    /// `hookSpecificOutput.additionalContext`. Also forces output for an
-    /// `Allow` that `hook_output`/`hook_output_with_extras` would otherwise
-    /// print nothing for (`dontAsk`) -- staying silent there would hide the
-    /// one signal that could break the loop.
+    /// Emit a warning even when `dontAsk` would otherwise suppress Allow
+    /// output, so the repeated-failure signal reaches the agent (#313).
     additional_context: Option<String>,
 }
 
-/// The reason text for one hook decision: `extras.reason_override` when
-/// present (the identical-command guard's own full text), otherwise the
-/// ordinary `explain_text` narrative -- with `extras.breaker_note`, when
-/// present, prefixed onto whichever of those two won, joined by ` -- `, and
-/// (Change 5b) `blocked_instruction_suffix`, when the verdict is a real
+/// Build the hook reason from policy text and breaker overrides, appending
+/// a blocked-action instruction only for a visible block.
 /// block, appended at the very end.
 fn hook_reason_text(
     command: &str,
@@ -176,22 +102,9 @@ fn hook_reason_text(
     }
 }
 
-/// Change 5b: the instruction a worker must follow when this decision is a
-/// block it will actually see. `hook_reason_text` above only ever runs on a
-/// path that emits `hookSpecificOutput` at all -- the deliberately silent
-/// `Verdict::Ask` under `permission_mode == "dontAsk"` returns from
-/// `hook_output_with_extras` before ever calling `hook_reason_text` (see
-/// that function's own doc comment on why that silence must be preserved).
-/// So a `Deny` or `Ask` reaching this function always means either an
-/// explicit denial or an `Ask` that becomes a real prompt, never the
-/// unsatisfiable-prompt-turned-silent-denial case. `Allow` gets no suffix:
-/// nothing was blocked, so there is nothing to report.
-///
-/// Uses `hook::command_family` directly, not the stricter `safety_family`
-/// the persisted log needs (Change 5a): `explain_text`'s own narrative,
-/// just above this text in the same reason string, already names the full
-/// raw `command` verbatim, so a family word drawn from that SAME command
-/// adds no new exposure here the way it would in a persisted log file.
+/// Add instructions only for visible Ask/Deny decisions. Use the command
+/// family here because the full command is already shown in this reason;
+/// persisted logs use a stricter family to avoid exposing arguments.
 fn blocked_instruction_suffix(command: &str, verdict: Verdict) -> Option<String> {
     match verdict {
         Verdict::Deny | Verdict::Ask => {
@@ -230,15 +143,8 @@ fn hook_output_json(decision: &str, reason: String, additional_context: Option<&
     value.to_string()
 }
 
-/// [`hook_output`] plus issue #313's two loop breakers. Behaviourally
-/// identical to the pre-#313 `hook_output` when `extras` is
-/// `HookOutputExtras::default()` (every field `None`): `hook_reason_text`
-/// then reduces to plain `explain_text`, and `hook_output_json` omits
-/// `additionalContext` entirely, matching the original envelope byte for
-/// byte -- see `hook_output`'s own doc comment for the full contract this
-/// preserves. `mode` is the launch mode used to evaluate the verdict, so
-/// the explanation names the same default. `permission_mode` controls
-/// only the existing `dontAsk` output suppression.
+/// Render a hook decision with breaker context; default extras preserve
+/// the ordinary decision envelope (#313).
 fn hook_output_with_extras(
     command: &str,
     outcome: &Outcome,
@@ -251,18 +157,12 @@ fn hook_output_with_extras(
     let dont_ask = permission_mode == "dontAsk";
     let decision = match outcome.verdict {
         Verdict::Deny => "deny",
-        // Under `dontAsk` an "ask" is an unsatisfiable prompt claude turns
-        // into a denial that strips the operator's own `permissions.allow`
-        // (issue #102). Operator config edits must retain the approval gate
-        // even here, so a standing native allow cannot silently edit policy.
+        // Under `dontAsk`, Ask cannot prompt and can override operator native
+        // allow rules; protect config edits with an explicit approval gate (#102).
         Verdict::Ask if dont_ask && !operator_config_approval(outcome) => return None,
         Verdict::Ask => "ask",
-        // Under `dontAsk`, silence is ordinarily right: the mode already
-        // resolves anything pre-approved, and issue #102's finding was that
-        // a hook decision there displaces the operator's own rules. Issue
-        // #313's identical-command WARNING is the one exception: it must
-        // still reach the transcript even here, or the one signal that could
-        // break the loop would be the one thing `dontAsk` hides.
+        // Suppress ordinary decisions under `dontAsk` to preserve native rules.
+        // Emit identical-command warnings so the agent can break a retry loop (#313).
         Verdict::Allow if dont_ask => {
             return extras.additional_context.as_deref().map(|ctx| {
                 hook_output_json(
@@ -272,13 +172,8 @@ fn hook_output_with_extras(
                 )
             });
         }
-        // Interactively, silence is WRONG (2026-08-24). This hook is now the
-        // sole prompting gate: `--permission-mode default` prompts for
-        // anything not pre-approved, and the interactive projection
-        // deliberately pre-approves no per-command Bash families -- so
-        // falling through would prompt on exactly the everyday and novel
-        // commands the primary acceptance criterion says must never prompt.
-        // Stating "allow" is what makes them silent.
+        // Interactive Allow must be explicit: native defaults would prompt for
+        // commands this policy already cleared.
         Verdict::Allow => "allow",
     };
     Some(hook_output_json(
@@ -288,33 +183,11 @@ fn hook_output_with_extras(
     ))
 }
 
-/// Core of `zirv ctx safety check`. Fast and side-effect-free beyond
-/// `CtxConfig::load` itself (no network, no adapter probing): loading config
-/// reads only local TOML files and process environment.
-///
-/// Two modes, chosen by whether `args.command` is non-empty:
-/// - **CLI mode** (`-- <command>`): prints the verdict and matched rule,
-///   exits with `Verdict::exit_code()`.
-/// - **Hook mode** (no trailing command): reads a claude PreToolUse JSON
-///   payload from stdin. Anything this hook cannot make sense of (bad JSON,
-///   a non-`Bash` tool, an empty command) fails open -- prints nothing,
-///   exits 0 -- because a safety hook that crashes or misbehaves must never
-///   be the reason a session cannot make progress, the same fail-open rule
-///   `hook.rs::run_pretool` already holds to. Always exits 0 in this mode:
-///   `Deny`/`Ask` are expressed through the structured `hookSpecificOutput`
-///   envelope (`hook_output`), not the process exit code.
-///
-/// Issue #769: hook mode self-suppresses (prints nothing, exits 0, evaluates
-/// nothing) when `setup::claude_pretool_hook_runs_bash_safety_itself` reports
-/// that the consolidated `zirv ctx hook pretool` entry is ALSO installed at
-/// its own `Bash|PowerShell`-covering slot -- meaning this standalone
-/// registration is a stale leftover from before that consolidation (an
-/// un-migrated `~/.claude/settings.json` still carries both). Without this, a
-/// tool call on such a settings file would get evaluated twice: once here,
-/// once again inside `hook::run_pretool` for the exact same call. CLI mode
-/// (`-- <command>`) is never affected -- an operator running `zirv ctx safety
-/// check -- <command>` directly wants an answer regardless of what is
-/// installed as a hook.
+/// Check a command or a Claude PreToolUse payload. CLI mode returns a
+/// verdict exit code; hook mode fails open on unreadable or irrelevant input
+/// and expresses decisions in stdout with exit zero. Suppress a stale
+/// standalone registration when the consolidated Bash hook is installed,
+/// avoiding two evaluations of one tool call (#769).
 pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
 
@@ -344,25 +217,9 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
     run_check_hook_mode_for_agent(&cfg, w, &read_stdin(), env, args.agent.as_deref())
 }
 
-/// Issue #418: `run_check`'s hook-mode body for every agent, split out so it
-/// can be driven directly with a raw stdin string (the same reason
-/// `run_check_hook_mode_with_env` itself exists, one layer up). `None`/
-/// `Some("claude")` is byte-for-byte the original claude-only path; any
-/// other name projects `stdin` through [`super::hook_project::
-/// project_pretool`], runs [`run_check_hook_mode_with_env`] against the
-/// projected claude-shaped payload, and translates whatever it printed via
-/// [`super::hook_project::translate_pretool_envelope`] -- the same
-/// project/run/translate shape `hook::run_pretool_for_agent` uses, so a
-/// denial from either surface reaches a non-claude agent through one shared
-/// translation, never a per-agent copy of it.
-///
-/// Issue #769: `pub(crate)`, not private -- `hook::run_pretool_bash_or_
-/// powershell` calls this directly (with `agent: None`) to run this EXACT
-/// safety check in-process for the consolidated `PreToolUse` hook, rather
-/// than `zirv ctx safety check` being spawned as its own separate process for
-/// the same tool call. Nothing about this function's own behavior changes:
-/// it is the same call `run_check`'s own hook mode already made, from a
-/// second call site.
+/// Project non-Claude payloads through the shared safety check so adapters
+/// cannot drift on verdict semantics; the consolidated hook calls it
+/// in-process for Bash/PowerShell (#418, #769).
 pub(crate) fn run_check_hook_mode_for_agent<W: Write>(
     cfg: &CtxConfig,
     w: &mut W,
@@ -392,17 +249,8 @@ pub(crate) fn run_check_hook_mode_for_agent<W: Write>(
     }
 }
 
-/// Whether `env` carries zirv's own durable interactive-launch pin
-/// ([`super::adapters::LAUNCH_MODE_ENV`]) -- proof that THIS process was
-/// launched interactively by zirv itself (`zirv chat`/`zirv ctx wrap`/a
-/// dashboard pane spawned from an interactive request), independent of
-/// whatever Claude's own `permission_mode` self-report says. The hook
-/// process is a child of the claude process the pin was set on and
-/// inherits its environment, the same way it already inherits
-/// `POLICY_FINGERPRINT_ENV`/`POLICY_SNAPSHOT_ENV`. An exact-match comparison
-/// against the one value the pin is ever set to, not a mere presence check:
-/// an env var holding any other string (or absent entirely) reads as "not
-/// provably zirv-interactive-launched," the fail-closed default.
+/// Verify the exact interactive-launch pin inherited by the hook process;
+/// absence or any other value cannot prove an operator is present.
 fn launch_mode_pinned_interactive(env: EnvLookup<'_>) -> bool {
     env(super::adapters::LAUNCH_MODE_ENV).as_deref()
         == Some(super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE)
@@ -434,18 +282,8 @@ pub(super) fn scratchpad_write_root(temp_dir: &std::path::Path) -> String {
     scratchpad_write_roots(temp_dir).remove(0)
 }
 
-/// Issue #168, design decision (e): if `command` begins with a literal (no
-/// `$`, backtick, `~`, or glob character), single-token `cd <path>` segment
-/// followed by `&&`, `;`, or a newline, and `<path>` resolves under one of
-/// `allowed_roots` OR contains a `.claude/worktrees` path component anywhere,
-/// returns the remainder with that leading segment stripped -- e.g. `cd
-/// <worktree> && git log` becomes `git log`, so the compound is classified
-/// by the real work alone instead of the unmatched-by-any-rule `cd` segment
-/// dragging the whole thing to the mode default. `None` leaves `command`
-/// untouched: no leading `cd` at all, an unproven/dynamic path, a `cd`
-/// containing `..` (this classifier is text-only and cannot re-resolve a
-/// relative escape), or a bare `cd <path>` with nothing chained after it
-/// (left to classify exactly as it does today).
+/// Strip a leading literal `cd` only for known roots and a following
+/// command. Dynamic paths and `..` remain unproven and unstripped (#168).
 pub(crate) fn strip_known_root_cd_prefix(
     command: &str,
     allowed_roots: &[String],
@@ -479,15 +317,8 @@ fn cd_allow_roots(scratchpad_roots: &[String]) -> Vec<String> {
     roots
 }
 
-/// The forward-slash-normalized, no-trailing-separator working directory
-/// [`orchestrator_repo_write_target`] resolves an orchestrator seat's
-/// relative write targets against (issue #334): `cwd` (the PreToolUse
-/// payload's own working directory) when non-empty, else this process's
-/// own `std::env::current_dir()` -- `None` (fail open, no repo-write check
-/// at all) when neither is available, mirroring `cd_allow_roots`'s
-/// identical cwd-normalization fallback. Which git repository (if any) a
-/// resolved target actually lands in is a separate question, answered per
-/// target by [`filesystem_repo_root_of`], not by this function.
+/// Resolve the hook payload cwd, falling back to process cwd; if neither
+/// exists, no repo-write target can be proven (#334).
 fn hook_repo_root(cwd: &str) -> Option<String> {
     if !cwd.is_empty() {
         return Some(cwd.replace('\\', "/").trim_end_matches('/').to_string());
@@ -526,31 +357,10 @@ fn orchestrator_block_tool_family(command: &str) -> String {
     program
 }
 
-/// Issue #313 (identical-failing-command guard): parses one session
-/// transcript's JSONL exactly the way `adapters::claude::structural_context`
-/// already does internally -- a `Bash` `tool_use` block (assistant message,
-/// keyed by its own `id`) paired with its `tool_result` (a later user
-/// message, matched by `tool_use_id`, however many other tool calls fall
-/// between them) -- but narrowed to invocations whose command TEXT equals
-/// `command` exactly (no normalization: this catches an agent re-running the
-/// identical failing line, not a family of similar commands) and folded into
-/// a trailing run rather than a full history: the count of consecutive
-/// erroring invocations of `command` ending at the most recent one, reset to
-/// zero by any intervening SUCCESSFUL invocation of `command`. A dedicated
-/// parser rather than a reuse of `structural_context`'s own internal
-/// `invocations` list: that list is private to its own `last_verification_
-/// run` and never exposed outside `claude.rs`.
-///
-/// Pure over its two string arguments: no clock, filesystem, or environment
-/// -- the same discipline `evaluate`/`glob_match` hold to. A line that fails
-/// to parse as JSON, or lacks the fields this function looks for, is simply
-/// skipped, matching every other best-effort transcript reader in this
-/// codebase.
-/// How much of the transcript's tail the identical-command guard reads on
-/// each PreToolUse call. A guard that re-read a multi-megabyte transcript in
-/// full before every Bash call would add latency to the hot path for a
-/// signal that only ever concerns the most recent few invocations; a partial
-/// first line is skipped by the tolerant parser like any other bad line.
+/// Count a trailing run of failed Bash calls with exactly matching command
+/// text in a session JSONL transcript. Pair tool use and result by ID,
+/// ignoring malformed lines; successful calls reset the count (#313).
+/// Read only the transcript tail to bound PreToolUse latency.
 const GUARD_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 fn read_transcript_tail(path: &Path) -> Option<String> {
@@ -643,11 +453,7 @@ fn trailing_same_command_failure_run(jsonl: &str, command: &str) -> usize {
     run
 }
 
-/// The hook-mode core of `run_check`, split out so it can be tested by
-/// feeding it a raw stdin payload directly rather than the process's actual
-/// stdin (which `run_check` only reads lazily, once it knows this is hook
-/// mode -- reading it eagerly here would make CLI mode block waiting on
-/// stdin that never arrives).
+/// Evaluate hook stdin lazily so CLI mode never blocks waiting for it.
 pub(super) fn run_check_hook_mode_with_env<W: Write>(
     cfg: &CtxConfig,
     w: &mut W,
@@ -657,7 +463,8 @@ pub(super) fn run_check_hook_mode_with_env<W: Write>(
     run_check_hook_with_verdict(cfg, w, stdin, env).map(|_| 0)
 }
 
-/// Issue #466: rehydration needs the verdict even when headless hook output is silent.
+/// Return the verdict even when headless output is silent so rehydration can
+/// screen the actual command (#466).
 pub(crate) fn run_check_hook_with_verdict<W: Write>(
     cfg: &CtxConfig,
     w: &mut W,
@@ -675,26 +482,16 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
         return Ok(None);
     }
     let mode = hook_launch_mode(&payload.permission_mode, env);
-    // Issue #168, design decision (e): a leading, literal `cd <known-root>`
-    // prefix is classified away so `cd <worktree> && git log` is judged by
-    // `git log` alone. `command` (the ORIGINAL, unstripped text) is still
-    // what reaches `hook_output`/`audit_hook_decision` below, so the log and
-    // any denial message always name what was actually run.
+    // Strip a proven `cd` prefix so it cannot force a fallback verdict;
+    // retain the original text in decisions and audit output (#168).
     let scratchpad_roots = scratchpad_write_roots(&std::env::temp_dir());
     let cd_roots = cd_allow_roots(&scratchpad_roots);
     let effective_command =
         strip_known_root_cd_prefix(command, &cd_roots).unwrap_or_else(|| command.to_string());
 
-    // Issue #328/#334 (posture-aware since issue #358 T8): an orchestrator
-    // seat's own repository write through Bash is detected here -- before
-    // both `evaluate_with_attestation_evidence` and the scratchpad/sandbox
-    // widening below -- the same as before. Under `OrchestratorWrites::Deny`
-    // this still forces `outcome` to a hard deny, never reconsidered by
-    // either (both already guard on `outcome.verdict != Verdict::Deny`).
-    // Under `Advise`/`Allow` the write proceeds through the ordinary
-    // evaluation below unmodified; only a rate-limited advisory note
-    // (`Advise`) and the same logged row (`Advise`/`Allow` both) ride along
-    // via `orchestrator_advisory` below.
+    // Detect orchestrator repo writes before any widening. Hard Deny stays
+    // final; Advise and Allow follow ordinary evaluation and carry audit data
+    // until the final verdict is known (#328, #334, #358).
     let orchestrator_repo_write = (env(super::adapters::SEAT_ROLE_ENV).as_deref()
         == Some("orchestrator")
         && payload.agent_id.is_empty())
@@ -721,13 +518,8 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     );
     let mut outcome = evidence.outcome.clone();
     let mut orchestrator_advisory: Option<String> = None;
-    // Finding #9 (issue #358 review): `session`/`target` are captured here,
-    // but the audit row itself is NOT written until `outcome` is final (see
-    // the deferred block right before `audit_hook_decision` below) -- a
-    // later guard (the identical-failing-command breaker, specifically) can
-    // still turn an `Allow` from `Advise`/`Allow` posture into a `Deny`
-    // AFTER this point, and logging "advised"/"allowed" here would leave a
-    // permanently wrong audit row for a write that was, in fact, denied.
+    // Defer the repo-write audit row until the verdict is final: later guards
+    // can still turn an allowed write into Deny (#358).
     let mut orchestrator_block_pending: Option<(String, String)> = None;
     if let Some(target) = orchestrator_repo_write {
         let session =
@@ -756,12 +548,8 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
         }
         orchestrator_block_pending = Some((session, target));
     }
-    // Issue #168, design decision (d): a compound whose every write target
-    // is confined to the session scratchpad is treated as `Allow` even when
-    // it would otherwise rely on the unmatched-command mode default. Checked
-    // BEFORE the sandbox-retry branch below so the same widening survives an
-    // unsandboxed retry too (see that branch's `already_scratchpad_confined`
-    // short-circuit).
+    // Apply scratchpad confinement before sandbox retry so confined writes
+    // remain allowed on both paths (#168).
     if outcome.verdict != Verdict::Deny
         && every_segment_is_allow_or_unmatched_default(
             &cfg.safety,
@@ -782,22 +570,9 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
             }),
         };
     }
-    // Claude marks an explicit retry outside its OS sandbox on the Bash
-    // input itself. Preserve a stronger semantic deny and its more specific
-    // explanation when the command already hit one. The existing carve-outs
-    // keep their rule tags and ordering; their final fallthrough now also
-    // passes a base-Allow retry when every segment clears the escape-
-    // sensitivity screen. Base asks and screened Zirv/credential forms keep
-    // the existing interactive Ask / headless Deny escalation.
-    // - (2026-08-25) `gh` always needs to read its own credential config,
-    //   which the sandbox denies outright, so every `gh` call is already an
-    //   unsandboxed retry -- a single, simple, read-only `gh` invocation
-    //   ([`is_sandbox_bypass_safe_gh_command`]) qualifies.
-    // - (Issue #147) every executable segment of the retried command
-    //   matches `[safety] escape_allow` (built-in seed plus the operator's
-    //   own entries) AND clears the credential/root-scan screen
-    //   ([`escape_allow_matches`]) -- an operator-attested retry the
-    //   sandbox would otherwise force a fresh prompt for on every repeat.
+    // Preserve semantic Deny before considering unsandboxed retries. Read-only
+    // forge calls and operator-cleared segments still pass credential/root
+    // screens; unsafe or merely asked commands retain escalation (#147).
     if payload.tool_input.dangerously_disable_sandbox
         && outcome.verdict != Verdict::Deny
         && !operator_config_approval(&outcome)
@@ -844,17 +619,8 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
             cfg.safety.default_verdict(mode),
             &scratchpad_roots,
         ) {
-            // Issue #321 item 2: NOT gated on `outcome.verdict == Allow` like
-            // the carve-outs above -- a compound mixing a scratchpad-confined
-            // write segment (an unmatched `mkdir -p <scratch>/x`) with a
-            // read-only escape segment can fold to `Ask` at the whole-command
-            // level even though every individual segment is independently
-            // safe. The combinator carries the equivalent gate per SEGMENT
-            // instead (each segment's own verdict must be `Allow` or the
-            // plain unmatched default), plus a requirement that at least one
-            // segment actually be a confined write, so a command with no
-            // write at all still falls through to the base-`Allow`-gated
-            // carve-outs above; see its own doc comment.
+            // Mixed confined writes and safe reads can fold to whole-command Ask;
+            // check each segment's policy and require a real confined write (#321).
             Outcome {
                 verdict: Verdict::Allow,
                 matched: Some(Rule {
@@ -908,13 +674,8 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
             }
         };
     }
-    // Issue #313, breaker 1: a run of trailing consecutive Ask/Deny
-    // verdicts in THIS session -- this decision included -- past the
-    // configured threshold stops the reason text from explaining the policy
-    // yet again and instead tells the agent outright to stop retrying.
-    // Counted from the log BEFORE `audit_hook_decision` appends this
-    // decision below, so "this decision included" means `+ 1`, not a read
-    // of a record that does not exist yet.
+    // Count prior denials before logging this one, then include the current
+    // verdict with `+ 1` when deciding whether to stop retries (#313).
     let mut breaker_note: Option<String> = None;
     if matches!(outcome.verdict, Verdict::Ask | Verdict::Deny)
         && !payload.session_id.is_empty()
@@ -942,19 +703,11 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
         }
     }
 
-    // Issue #313, breaker 2: the identical-failing-command guard. Only
-    // examined when the base verdict is `Allow` -- a command the policy is
-    // already blocking gets no additional treatment here -- and only for a
-    // command that is not already read-only-escape-safe (that carve-out
-    // exists precisely for benign, repeatable inspection commands, which are
-    // never the loop this guard exists to catch).
+    // Guard only otherwise allowed repeated failures; already blocked and
+    // read-only inspection commands need no additional refusal (#313).
     let mut reason_override: Option<String> = None;
-    // Issue #358 T8: seeded from the orchestrator-write advisory above
-    // (`OrchestratorWrites::Advise`, rate-limited) rather than starting at
-    // `None` -- both this guard's own warning and that advisory only ever
-    // accompany an `Allow`, so a command that is BOTH a rate-limited
-    // orchestrator write AND an identical-failure run gets both notes,
-    // joined below, rather than one silently overwriting the other.
+    // Retain both the repo-write advisory and repeated-failure warning when
+    // both apply to an allowed command (#358).
     let mut additional_context: Option<String> = orchestrator_advisory;
     if outcome.verdict == Verdict::Allow
         && cfg.safety.identical_command_warn_after > 0
@@ -1021,18 +774,9 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
         };
     }
 
-    // Issue #781: the Jev-gated risk check, strictly the LAST deterministic
-    // adjustment before the notes below are finalized and `hook_output`/
-    // `audit_hook_decision` render this decision -- see
-    // `apply_jev_approve_outcome`'s own doc comment for the escalate/lower
-    // contract. Placed here (not earlier) so Jev only ever sees the FINAL
-    // deterministic verdict, and an escalation correctly falls through the
-    // `additional_context = None` cleanup just below, the same as any other
-    // guard that turns an `Allow` into something stricter. Skipped under
-    // `dontAsk` (a headless launch): `hook_output` emits nothing for either
-    // `Allow` or a non-operator `Ask` there, so the answer could never change
-    // the decision and the synchronous Jev call would only add latency to
-    // every tool call.
+    // Run Jev after deterministic adjustments so it sees the final local
+    // verdict and any escalation clears stale Allow context. Skip `dontAsk`,
+    // where its answer cannot change the decision (#781).
     if payload.permission_mode != "dontAsk"
         && let Ok(state) = super::state::StateDir::resolve(env)
     {
@@ -1046,24 +790,14 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
         );
     }
 
-    // Neither this guard's own warn note nor the orchestrator-write advisory
-    // seeded above is ever meant to survive onto a `Deny` -- the identical-
-    // command guard's own `refuses` branch (just above) can turn a prior
-    // `Allow` into a `Deny` after `additional_context` was already seeded,
-    // which would otherwise leave a stale "fine for a trivial edit"-style
-    // note riding alongside an actual refusal.
+    // Clear Allow-only notes after a later Deny so advice cannot contradict
+    // the actual refusal.
     if outcome.verdict != Verdict::Allow {
         additional_context = None;
     }
 
-    // Finding #9 (issue #358 review): the orchestrator-write audit row, now
-    // that `outcome.verdict` can no longer change underneath it. `Deny` wins
-    // regardless of `orchestrator_posture` -- it is the actual, final
-    // disposition, whether it came from posture `Deny` itself (forced above)
-    // or from a later guard (the identical-failing-command breaker) turning
-    // an `Advise`/`Allow` posture's `Allow` into a `Deny` after this write
-    // was already provisionally logged as "advised"/"allowed" under the old
-    // ordering.
+    // Audit the final repo-write disposition; a later guard may have changed
+    // an advised or allowed write into Deny (#358).
     if let Some((session, _target)) = orchestrator_block_pending {
         let outcome_label = if outcome.verdict == Verdict::Deny {
             "denied"
@@ -1109,20 +843,9 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     Ok(Some(outcome.verdict))
 }
 
-/// Change 5a: programs whose first non-flag argument is a genuine
-/// dispatcher SUBCOMMAND from a small, well-known vocabulary (`exec`,
-/// `push`, `mr`, `get`, ...) rather than caller-controlled data -- safe to
-/// name in `safety_family`'s plaintext `family` field. `hook::
-/// command_family`'s own rule ("not a flag, not `:`/`@`/`=`-shaped") is
-/// right for `PermissionPromptRow` but not strict enough for THIS log's
-/// tested "never the raw command" contract: `echo <secret>` or `rm -rf
-/// <path>` have a bare, dash-free, colon-free first argument too, and
-/// `hook::command_family` would report it as if it were a subcommand
-/// (`the_hook_audits_a_policy_fingerprint_without_storing_the_raw_command`
-/// pins exactly this). For any program NOT on this list, `safety_family`
-/// reports the program name alone -- e.g. `sudo` never gets the wrapped
-/// command's own program appended, matching the Change 5 spec's own
-/// worked example (`sudo`, not `sudo <whatever it wraps>`).
+/// Dispatcher programs whose known subcommands may appear in persisted
+/// safety-family logs. Other programs expose only their name, never raw
+/// arguments that may contain secrets or paths.
 const SAFETY_FAMILY_DISPATCHER_PROGRAMS: &[&str] = &[
     "git",
     "gh",

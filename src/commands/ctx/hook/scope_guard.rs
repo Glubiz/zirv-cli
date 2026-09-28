@@ -17,42 +17,16 @@ use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::event::{NormalizedEvent, input_hash};
 use crate::commands::ctx::state::StateDir;
 
-// -- Scope-creep guard ------------------------------------------------------
-//
-// Operator-requested guard: a hidden benchmark task asked for a sort-order
-// change plus "pagination works the same as always" and a `--legacy-order`
-// flag preserving "the old raw order exactly as before"; one agent noticed a
-// pre-existing pagination off-by-one, decided it "looked like an outright
-// bug" and fixed it unasked, and hidden tests expecting unchanged pagination
-// failed. This never blocks scope creep outright (that would need real
-// review); it only makes the request's own preservation language visible at
-// the moment of editing (`PreToolUse`) and catches an unrequested-fix claim
-// once at the end (`Stop`) as a backstop.
-//
-// `UserPromptSubmit` records the request's own state; `PreToolUse` reads it
-// for the checkpoint; `Stop` reads it for the backstop. All three degrade to
-// a silent no-op on any doubt at all (config off, no session identity, no
-// state dir, an I/O failure) -- a hook must never break a session over this.
+// Surface the request's preservation constraints at edit time and
+// check unrequested-fix claims at Stop. Prompt, tool and Stop hooks fail
+// open on missing identity, state or configuration.
 
-/// `ScopeGuardRecord`'s own schema version -- bumped if the shape ever
-/// changes, so an old record on disk reads back as "no record" rather than a
-/// deserialize failure or (worse) a wrongly-interpreted new field.
-///
-/// v2 (the shell-edit checkpoint): adds `shell_baseline`, the tracked
-/// modified/deleted file snapshot `record_scope_guard_request` takes at
-/// `UserPromptSubmit`. Bumped rather than defaulted in place because an old
-/// v1 record on disk has no baseline at all -- reading it back as "no
-/// record" (forcing the next `UserPromptSubmit` to rebuild one) is safer
-/// than silently treating an absent baseline as "nothing was ever modified",
-/// which would make the very first shell edit after an upgrade look like a
-/// change against an empty baseline and fire the checkpoint immediately.
-///
-/// v3 (the stated-details checklist): adds `stated_details`.
+/// Bump on schema changes so missing fields do not masquerade as an empty
+/// baseline and trigger a false shell-edit checkpoint.
 const SCOPE_GUARD_RECORD_VERSION: u32 = 3;
 
-/// At most this many characters across every extracted constraint sentence,
-/// joined -- keeps the checkpoint/backstop text bounded regardless of how
-/// verbose the request was.
+/// Bound extracted constraints so a long prompt cannot inflate a hot hook's
+/// checkpoint text without limit.
 const SCOPE_GUARD_CONSTRAINT_BUDGET: usize = 400;
 
 /// At most this many extracted constraint sentences.
@@ -89,40 +63,21 @@ struct ScopeGuardRecord {
     /// prompt.
     #[serde(default)]
     stop_checked: bool,
-    /// The repo's tracked modified/deleted files (never untracked) at the
-    /// moment this prompt was recorded, each with a cheap size/mtime
-    /// fingerprint (never file contents) -- the baseline the `PostToolUse`
-    /// shell-edit checkpoint diffs its own re-query against, so a shell
-    /// command (`sed -i`, `python -c "open(p,'w')..."`, `cat > file`) that
-    /// changes an existing tracked file is visible even though it never
-    /// goes through `Edit`/`Write` at all. Empty when git failed, this is
-    /// not a git repo, or the guard was disabled -- see
-    /// `scope_guard_tracked_modified`'s own doc comment.
+    /// Baseline of tracked modified/deleted files and cheap fingerprints for
+    /// detecting shell edits without retaining file contents.
     #[serde(default)]
     shell_baseline: Vec<ScopeGuardBaselineEntry>,
-    /// The request's own stated, checkable details -- a quoted literal or an
-    /// ordering/format/exactness word (see
-    /// [`SCOPE_GUARD_STATED_DETAIL_RE`]) -- in prompt order, never
-    /// duplicating a sentence already captured in `constraints`. Shown in
-    /// the checkpoint as a numbered "Stated details to check before you
-    /// finish" list, governed by `cfg.scope_guard.enabled` the same as
-    /// `constraints` itself.
+    /// Distinct checkable details from the request, kept in prompt order for
+    /// the checkpoint checklist.
     #[serde(default)]
     stated_details: Vec<String>,
 }
 
-/// One tracked file's cheap fingerprint for the shell-edit checkpoint's own
-/// before/after comparison: never a content hash (CLAUDE.md: "a cheap
-/// fingerprint (size + mtime is fine; do not hash large file contents)").
-/// `exists` distinguishes a tracked file `git status` reports as deleted
-/// (no size/mtime to read) from one that is merely absent from a snapshot
-/// entirely -- so a delete, and a later re-create with different content,
-/// both still count as a change.
+/// Size, mtime and existence distinguish tracked-file changes cheaply
+/// without reading or hashing file contents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ScopeGuardBaselineEntry {
-    /// Repo-relative, forward-slashed (`git status --porcelain`'s own
-    /// spelling) -- never a platform `PathBuf`, so the record round-trips
-    /// identically on every OS this hook runs on.
+    /// Repo-relative slash-normalized path for portable record round trips.
     #[serde(default)]
     path: String,
     #[serde(default)]
@@ -165,21 +120,8 @@ fn scope_guard_baseline_entry(repo: &Path, rel: &str) -> ScopeGuardBaselineEntry
     }
 }
 
-/// The repo's currently tracked, modified-or-deleted files -- the shell-edit
-/// checkpoint's own snapshot, taken once at `UserPromptSubmit` as the
-/// baseline and re-taken on every qualifying `PostToolUse` shell call to
-/// diff against it. Deliberately narrower than
-/// `workflow::verification::changed_paths` (which also folds in untracked
-/// `??` files via `git ls-files --others`): an untracked file is a NEW file,
-/// never an edit to "existing code", so including it here would make the
-/// checkpoint fire for a shell command that only ever created something.
-///
-/// `None` on any doubt at all -- not a git repo, git missing, git failing
-/// for any other reason -- so both the baseline write and the later
-/// re-query degrade to silence together (see this guard's own module-level
-/// doc comment: "all three degrade to a silent no-op on any doubt at all").
-/// `Some(vec![])` is a real, successful "nothing is modified" answer, never
-/// conflated with the failure case.
+/// Snapshot tracked modified/deleted files at prompt time and compare
+/// after shell calls. Ignore untracked files to avoid unrelated writes.
 fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEntry>> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain", "--no-renames"])
@@ -192,11 +134,8 @@ fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEnt
     let text = String::from_utf8_lossy(&output.stdout);
     let mut entries = Vec::new();
     for line in text.lines() {
-        // `git status --porcelain` lines are `XY PATH`, `XY` exactly two
-        // status characters, a space, then the path -- `??` (untracked) and
-        // `!!` (ignored) are the only two-letter codes with no tracked
-        // meaning at all; every other code names a real index/worktree
-        // change to a file git already tracks.
+        // Porcelain status `XY PATH`: ignore `??`/`!!`, which carry no
+        // tracked-file change for this guard.
         if line.len() < 4 {
             continue;
         }
@@ -204,10 +143,8 @@ fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEnt
         if status == "??" || status == "!!" {
             continue;
         }
-        // The INDEX column (`status`'s first byte) is `A` for a file
-        // created and staged THIS turn, never for one that existed before
-        // it -- `AM` (staged-new, then edited again) contains an `M` that
-        // would otherwise be read as an edit to an EXISTING tracked file.
+        // A staged-new `A` file was not an existing tracked file, even when its
+        // worktree column is also modified.
         if status.as_bytes()[0] == b'A' {
             continue;
         }
@@ -218,10 +155,8 @@ fn scope_guard_tracked_modified(repo: &Path) -> Option<Vec<ScopeGuardBaselineEnt
         if rel.is_empty() {
             continue;
         }
-        // Issue #229/#232's own exclusion, mirrored from `changed_paths`:
-        // the workflow's own `.zirv/work/<id>/*` artifacts are not the
-        // operator's change surface, and this benchmark's own transcripts
-        // are full of concurrent writes to them.
+        // Exclude workflow artifacts from the operator's change surface; they
+        // may be written concurrently by zirv (#229, #232).
         if crate::commands::workflow::classify::is_workflow_work_path(Path::new(rel)) {
             continue;
         }
@@ -322,11 +257,8 @@ fn scope_guard_split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Preservation/limitation phrasing (deliberately conservative -- favours
-/// catching a real constraint over precision): "same as always/before",
-/// "works the same", "as before", "exactly as", "unchanged", "keep ",
-/// "preserve", "don't/do not/never change/touch/modify/alter", "only ",
-/// "backward(s) compat[ible]", "existing behavio(u)r", "leave ... alone".
+/// Match preservation and limitation language conservatively so stated
+/// constraints are visible at the checkpoint.
 static SCOPE_GUARD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?xi)
@@ -347,15 +279,8 @@ static SCOPE_GUARD_CONSTRAINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid scope-guard constraint regex")
 });
 
-/// Shared selection algorithm for [`scope_guard_extract_constraints`]/
-/// [`scope_guard_extract_stated_details`]: keeps at most `max_count` of
-/// `candidates`, closest to the END of the prompt first -- a closing,
-/// clarifying sentence (e.g. "...exactly as before.") wins over an earlier
-/// one that only incidentally matches the same conservative pattern (e.g. a
-/// feature sentence that happens to use the word "keep" for an unrelated
-/// tie-break rule -- see this guard's own worked example, where exactly that
-/// happens) -- with the joined result capped at `budget` characters.
-/// Returned in the prompt's own original order.
+/// Prefer the last clarifying constraints in a prompt while bounding
+/// count; preserve their original order in the final checklist.
 fn scope_guard_select_capped(
     candidates: Vec<String>,
     max_count: usize,
@@ -457,11 +382,8 @@ fn scope_guard_extract_stated_details(prompt: &str, constraints: &[String]) -> V
     )
 }
 
-/// Whether the request itself already asks for a fix, anywhere in the
-/// prompt, case-insensitive. A superset of every word the Stop backstop's
-/// own [`SCOPE_GUARD_FIX_VERB_RE`]/[`SCOPE_GUARD_BUG_WORD_RE`] look for, so
-/// a request phrased as "resolve the pagination issue" can never have its
-/// own requested fix blocked as unrequested.
+/// Detect an explicitly requested fix anywhere in the prompt so the Stop
+/// backstop does not challenge work the operator asked for.
 fn scope_guard_prompt_asks_for_fix(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     [
@@ -486,18 +408,8 @@ fn scope_guard_prompt_asks_for_fix(prompt: &str) -> bool {
     .any(|keyword| lower.contains(keyword))
 }
 
-/// `UserPromptSubmit`: records this session's scope-guard state for the
-/// CURRENT prompt, replacing any record from an earlier one (a different
-/// `prompt_hash`). Never emits anything -- the checkpoint/backstop are the
-/// only channels that speak; this only persists state for them to read.
-/// Every gate below (config off, no session identity, no state dir) is a
-/// silent skip: a hook must never fail a prompt over this.
-///
-/// `repo` also seeds `shell_baseline` (the `PostToolUse` shell-edit
-/// checkpoint's own before-snapshot, [`scope_guard_tracked_modified`]) --
-/// best-effort like everything else here: a failed git query just leaves it
-/// empty, which reads downstream as "no baseline to diff against" and keeps
-/// that checkpoint silent too, never as a hook failure.
+/// Replace the prior prompt's scope state so an old request's constraints
+/// cannot govern a new edit; persistence failures remain silent.
 pub(super) fn record_scope_guard_request(
     cfg: &CtxConfig,
     payload_session_id: &str,
@@ -505,11 +417,8 @@ pub(super) fn record_scope_guard_request(
     repo: &Path,
     env: EnvLookup<'_>,
 ) {
-    // The record now also backs the missing-tests "tests owed" line folded
-    // into this same checkpoint (see `missing_tests_owed`/`scope_checkpoint_
-    // combine`), which fires independently of `scope_guard.enabled` -- so a
-    // record must exist whenever EITHER feature is on, not only when the
-    // scope guard itself is.
+    // Persist a prompt record when either scope guard or missing-tests
+    // checkpoint needs it, even if the other gate is disabled.
     if !cfg.scope_guard.enabled && !cfg.missing_tests_gate.enabled {
         return;
     }
@@ -523,9 +432,8 @@ pub(super) fn record_scope_guard_request(
     let path = scope_guard_record_path(&state, &session);
     let prompt_hash = input_hash(prompt);
     if load_scope_guard_record(&path).is_some_and(|existing| existing.prompt_hash == prompt_hash) {
-        // The identical prompt was already recorded -- leave the flags
-        // (`checkpoint_shown`/`stop_checked`) and the shell baseline exactly
-        // as they are.
+        // Preserve flags and baseline for an identical prompt so its
+        // one-time checkpoint cannot fire twice.
         return;
     }
     let constraints = scope_guard_extract_constraints(prompt);
@@ -546,33 +454,9 @@ pub(super) fn record_scope_guard_request(
     );
 }
 
-/// `PreToolUse`, `Edit`/`MultiEdit`/`NotebookEdit`/an existing-file `Write`
-/// only: the non-blocking scope checkpoint's own TEXT, shown once per prompt
-/// (the persisted `checkpoint_shown` flag). `None` on every gate below (a
-/// tool this guard does not cover, a `Write` to a file that does not exist
-/// yet, no session identity, no recorded prompt at all, already shown for
-/// this prompt, and -- since neither `cfg.scope_guard.enabled` nor
-/// `missing_tests_owed` has anything to say -- both features off or neither
-/// applying to this edit) -- a silent skip, like every other advisory in
-/// this file. Never changes `payload`'s own permission outcome: this only
-/// ever rides as a non-blocking `additionalContext` note.
-///
-/// Folds in the missing-tests gate's own "tests owed" line
-/// ([`missing_tests_owed`]/[`scope_checkpoint_combine`]) alongside the scope
-/// guard's own text: a headless session that would otherwise only learn it
-/// owes a test once the missing-tests Stop gate blocks it -- after the whole
-/// turn is already done -- sees it here instead, at the FIRST edit, in the
-/// same one-time note. Independent of `cfg.scope_guard.enabled`: the tests-
-/// owed line can fire this checkpoint on its own even with the scope guard
-/// itself turned off.
-///
-/// Deliberately a pure read -- it never marks the checkpoint shown itself.
-/// `run_pretool`'s own orchestrator-write guard can still DENY this exact
-/// call after this function returns `Some`, in which case nothing is ever
-/// actually surfaced to the model; the caller commits the flag with
-/// [`scope_checkpoint_mark_shown`] only once it knows the text is really
-/// going out, so a denied write never silently spends the one checkpoint a
-/// later, actually-allowed edit still needed.
+/// Produce one non-blocking checkpoint for an eligible edit, including
+/// a headless tests-owed note when applicable. Do not mark it shown until
+/// the caller actually emits it; a later Deny must not spend the note.
 pub(super) fn scope_checkpoint_note(
     payload: &PreToolPayload,
     cwd: &Path,
@@ -610,11 +494,8 @@ pub(super) fn scope_checkpoint_note(
     scope_checkpoint_combine(scope_text, tests_owed)
 }
 
-/// Commits [`scope_checkpoint_note`]'s own `checkpoint_shown` flag -- called
-/// only once its text is actually about to reach the model (see that
-/// function's own doc comment for why this is split out). Best-effort, like
-/// every other state write in this file: a save that fails costs the guard
-/// for this one prompt, never a hook failure.
+/// Mark the checkpoint shown only after its text is emitted; failed
+/// persistence leaves later hooks free to try again.
 pub(super) fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLookup<'_>) {
     let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
     if session.is_empty() {
@@ -634,40 +515,20 @@ pub(super) fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLook
     save_scope_guard_record(&path, &record);
 }
 
-/// zirv's own tests-owed sentence, folded into the same one-time checkpoint
-/// as the scope guard's own text (see [`missing_tests_owed`]/
-/// [`scope_checkpoint_combine`]) rather than waiting for the missing-tests
-/// Stop gate ([`missing_tests_gate_reason`]) to say it after the whole turn
-/// has already finished -- that costs a whole extra round for a headless
-/// session that never touched a test file.
+/// Fold tests-owed guidance into the first edit checkpoint so a headless
+/// agent sees it before the Stop gate.
 pub(super) const MISSING_TESTS_OWED_LINE: &str = "Write a focused test for each behaviour change in this same pass -- the run cannot finish \
      without one.";
 
-/// Whether `path` is the kind of change the missing-tests gate itself cares
-/// about: not a test file ([`path_looks_like_test_file`]) and not doc-only
-/// ([`crate::commands::ctx::lifecycle::changes_are_doc_only`]). Shared by
-/// `missing_tests_gate_reason` (which classifies every path the WHOLE turn
-/// changed) and [`missing_tests_owed`] (which classifies only the path(s) a
-/// single checkpoint call already knows about); unlike
-/// `missing_tests_gate_reason`'s own `rust_change_touches_cfg_test` check,
-/// this never shells out to `git diff` -- the checkpoint fires before
-/// (`PreToolUse`) or immediately after (`PostToolUse`, already cheap on its
-/// own hot path) an edit, so it only ever has a filename shape to go on, not
-/// a diff.
+/// Identify code changes for which the missing-tests gate expects tests;
+/// test files and docs-only paths do not create that debt.
 fn missing_tests_owed_by_path(path: &Path) -> bool {
     !path_looks_like_test_file(path)
         && !crate::commands::ctx::lifecycle::changes_are_doc_only(&[path.to_path_buf()])
 }
 
-/// Whether the checkpoint's own "tests owed" line
-/// ([`MISSING_TESTS_OWED_LINE`]) applies: the missing-tests gate is enabled,
-/// this is a HEADLESS session (`adapters::HEADLESS_ENV == "1"`, the same
-/// condition `missing_tests_gate_reason` itself checks), and at least one of
-/// `paths` is a non-test, non-doc source file
-/// ([`missing_tests_owed_by_path`]). Independent of `cfg.scope_guard.
-/// enabled` -- this can fire the checkpoint on its own even with the scope
-/// guard itself turned off, and never changes `missing_tests_gate_reason`'s
-/// own Stop-hook logic, which stays the backstop it always was.
+/// Headless agents cannot ask whether a test is owed mid-turn; show this
+/// guidance only when the gate is enabled and code changed.
 fn missing_tests_owed(cfg: &CtxConfig, env: EnvLookup<'_>, paths: &[&Path]) -> bool {
     cfg.missing_tests_gate.enabled
         && env(adapters::HEADLESS_ENV).as_deref() == Some("1")
@@ -690,9 +551,6 @@ fn scope_checkpoint_combine(scope_text: Option<String>, tests_owed: bool) -> Opt
     }
 }
 
-/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
-/// the request's own quoted preservation sentences, or empty when none were
-/// extracted.
 fn scope_guard_quoted_constraints(constraints: &[String]) -> String {
     if constraints.is_empty() {
         String::new()
@@ -701,11 +559,6 @@ fn scope_guard_quoted_constraints(constraints: &[String]) -> String {
     }
 }
 
-/// Shared by [`scope_checkpoint_text`] and [`scope_checkpoint_shell_text`]:
-/// the stated-details checklist itself -- a numbered "(1) ... (2) ..." list
-/// appended to the checkpoint, or empty when nothing was extracted. Leads
-/// with a space so the caller can splice it straight onto the end of its own
-/// sentence.
 fn scope_guard_stated_details_line(details: &[String]) -> String {
     if details.is_empty() {
         return String::new();
@@ -719,13 +572,8 @@ fn scope_guard_stated_details_line(details: &[String]) -> String {
     format!(" Stated details to check before you finish: {items}")
 }
 
-/// The checkpoint's own wording: interactive asks the user before an
-/// unrequested fix/improvement; headless (`permission_mode == "dontAsk"`,
-/// the same signal `safety.rs`'s `hook_output` reads for the identical
-/// purpose on its own payload) has no one to ask, so it defers to the final
-/// report instead. `stated_details` appends the queued item 2 checklist
-/// ([`scope_guard_stated_details_line`]) when the request pinned down any
-/// checkable detail.
+/// Interactive advice asks before an unrequested fix; headless advice
+/// tells the agent to defer because no operator can answer.
 fn scope_checkpoint_text(
     constraints: &[String],
     stated_details: &[String],
@@ -750,13 +598,8 @@ fn scope_checkpoint_text(
 /// touched.
 const SCOPE_GUARD_SHELL_PATH_CAP: usize = 5;
 
-/// The `PostToolUse`, after-the-fact counterpart to [`scope_checkpoint_text`]
-/// -- fires once the shell command has already changed `changed` (capped at
-/// [`SCOPE_GUARD_SHELL_PATH_CAP`] paths), so it names what changed and asks
-/// for an undo rather than warning before an edit. Shares
-/// [`scope_checkpoint_text`]'s own headless/interactive split, minus that
-/// variant's leading "leave it and" -- this sentence already opens with
-/// "undo it and".
+/// Describe already-changed tracked files and request an undo, rather
+/// than warning as if the edit had not happened.
 fn scope_checkpoint_shell_text(
     constraints: &[String],
     changed: &[String],
@@ -783,39 +626,11 @@ fn scope_checkpoint_shell_text(
     )
 }
 
-/// `PostToolUse`, `Bash`/`PowerShell` only: the tool-agnostic, AFTER-the-fact
-/// counterpart to [`scope_checkpoint_note`]. Benchmark transcripts show a
-/// headless agent makes most of its edits to an existing file through the
-/// SHELL (`python -c "open(p,'w').write(...)"`, `sed -i`, `cat > file`),
-/// never touching `Edit`/`MultiEdit`/`NotebookEdit`/`Write` at all -- so that
-/// checkpoint never fires for it. This re-checks the repo's tracked-file
-/// state against the baseline `record_scope_guard_request` snapshotted at
-/// `UserPromptSubmit` ([`ScopeGuardRecord::shell_baseline`]), and the FIRST
-/// time anything differs, surfaces the same one-time note worded for a
-/// change that already happened ([`scope_checkpoint_shell_text`]). Shares
-/// `checkpoint_shown` with [`scope_checkpoint_note`]/
-/// [`scope_checkpoint_mark_shown`]: whichever path fires first is the only
-/// one that ever speaks for a given prompt, so an agent that mixes `Edit`
-/// and shell edits never sees the note twice.
-///
-/// `None` on every gate below (not a shell tool, no session identity, no
-/// state dir, no recorded prompt, already shown, a positively read-only
-/// command, nothing changed, and -- since neither `cfg.scope_guard.enabled`
-/// nor `missing_tests_owed` has anything to say -- both features off or
-/// neither applying to what changed) -- a silent skip, like every other
-/// advisory in this guard. Deliberately ordered cheapest-first: the `git
-/// status` re-query -- this function's only non-trivial cost -- only ever
-/// runs once every cheaper gate above it (most of all `checkpoint_shown` and
-/// the read-only check, which reuses `safety::jev_approve_is_read_only_
-/// local`) has already passed, since this runs after EVERY `Bash`/
-/// `PowerShell` call. A command the classifier cannot positively confirm
-/// read-only still runs the re-query below, unchanged from before.
-///
-/// Folds in the missing-tests gate's own "tests owed" line the same way
-/// [`scope_checkpoint_note`] does ([`missing_tests_owed`]/
-/// [`scope_checkpoint_combine`]), classified against `changed` (every path
-/// this call found different from the baseline) rather than a single
-/// target -- independent of `cfg.scope_guard.enabled`.
+/// After a shell call, compare tracked files against the prompt baseline
+/// and emit the shared one-time checkpoint on the first change. Run cheap
+/// eligibility/read-only gates before the git status query on this hot path;
+/// uncertain commands still require rechecking. Tests-owed guidance applies
+/// independently of scope-guard configuration.
 pub(super) fn scope_guard_shell_checkpoint_note(
     tool_name: &str,
     cwd: &Path,
@@ -872,13 +687,8 @@ pub(super) fn scope_guard_shell_checkpoint_note(
     Some(note)
 }
 
-/// A COMPLETED fix verb, past tense only: `fixed`/`corrected`/`repaired`/
-/// `patched`. Bare `fix`/`fixing` are deliberately excluded (a benchmark
-/// false positive: "Fixing it would change the `--legacy-order` output
-/// too." names a hypothetical the agent explicitly did NOT do, not a claimed
-/// change) -- see [`SCOPE_GUARD_HYPOTHETICAL_RE`] for the second, general
-/// guard against a conditional/hypothetical sentence being read as a claim
-/// at all.
+/// Match completed fixes only; infinitives and hypotheticals must not be
+/// mistaken for a claim that the agent changed unrequested behaviour.
 static SCOPE_GUARD_FIX_VERB_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:fixed|corrected|repaired|patched)\b")
         .expect("valid scope-guard fix-verb regex")
@@ -893,9 +703,6 @@ static SCOPE_GUARD_HYPOTHETICAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:would|could|if)\b").expect("valid scope-guard hypothetical regex")
 });
 
-/// A word naming what the fix was for: `bug(s)`/`off-by-one`/`quirk`/
-/// `broken`/`wrong`/`issue`. Plural `bugs` alongside the design's own
-/// singular `bug`, since a real closing report ("It had two bugs") uses it.
 static SCOPE_GUARD_BUG_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:bugs?|off-by-one|quirk|broken|wrong|issue)\b")
         .expect("valid scope-guard bug-word regex")
@@ -921,17 +728,8 @@ fn scope_guard_truncate(text: &str) -> String {
     text.chars().take(SCOPE_GUARD_QUOTE_BUDGET).collect()
 }
 
-/// Whether a `Stop` closing message claims a fix the request never asked
-/// for: a completed fix verb ([`SCOPE_GUARD_FIX_VERB_RE`]) alongside a bug
-/// word ([`SCOPE_GUARD_BUG_WORD_RE`]) in the same sentence OR the very next
-/// one -- a closing report often splits the claim and what it was for across
-/// two short adjacent sentences (this guard's own worked example: "`page()`
-/// had two bugs, and I fixed both.") -- OR an explicit "also fixed/changed/
-/// updated/refactored", OR "while (I was) at it/there/here". Every candidate
-/// sentence is first checked against [`SCOPE_GUARD_HYPOTHETICAL_RE`] and
-/// skipped if it reads as conditional/hypothetical ("Fixing it would change
-/// the `--legacy-order` output too." names something the agent did NOT do).
-/// Returns the first matching sentence, truncated, or `None`.
+/// Detect a claimed unrequested fix only when a completed-fix verb and
+/// bug word occur together or in adjacent sentences.
 fn scope_guard_unrequested_fix_sentence(closing: &str) -> Option<String> {
     let sentences = scope_guard_split_sentences(closing);
     for (index, sentence) in sentences.iter().enumerate() {
@@ -994,14 +792,8 @@ fn scope_guard_closing_text(events: &[NormalizedEvent]) -> Option<&str> {
     })
 }
 
-/// `Stop` backstop: blocks once, after every other Stop gate/backstop has
-/// already had its chance (see `run_stop`'s own call site -- this runs only
-/// when `stop_verify_block` did not already fire, so at most one block per
-/// Stop), when the closing report claims a fix the request never asked for.
-/// `None` on every gate below (config off, no session identity, no recorded
-/// prompt, already checked this prompt, the request itself asks for a fix,
-/// no adapter, an unreadable transcript, no unrequested-fix sentence found)
-/// -- a silent skip, like every other Stop-hook check in this file.
+/// Block once when the closing report claims an unrequested fix and no
+/// earlier Stop gate already blocked; uncertainty passes through.
 pub(super) fn scope_guard_stop_reason(
     state: &StateDir,
     cfg: &CtxConfig,

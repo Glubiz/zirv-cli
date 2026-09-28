@@ -21,14 +21,8 @@ use crate::commands::ctx::rot::{Score, Verdict};
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::{CtxResult, log, score, signal};
 
-/// Issue #308 stage 1: the Stop-hook wiring for `diagnostics::post_edit_nudge`
-/// -- `cfg.diagnostics.enabled` is checked here, BEFORE the transcript is
-/// re-read and re-parsed for `files_modified`, so a session with the feature
-/// off (the default) never pays even that cost, mirroring
-/// `verify_on_stop_nudge`'s own guard ordering. `structural_context`'s own
-/// `last_n` is generously large (64): unlike `handoff`'s own callers, this is
-/// not trying to bound a prompt's size, only to avoid an unbounded
-/// allocation on a pathological transcript.
+// Check diagnostics configuration before parsing the transcript so
+// disabled sessions pay no post-edit analysis cost (#308).
 fn diagnostics_stop_nudge(
     state: &StateDir,
     repo: &Path,
@@ -69,26 +63,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         return Ok(0);
     }
     let repo = payload.repo();
-    // Cached: this hook is a fresh process after every single turn, so scoring
-    // the whole transcript each time is quadratic over a session's length.
-    // Issue #243: also screens the bytes this cycle ingested. Issue #293:
-    // also surfaces this pass's speed sample, cheaply -- the same
-    // incremental fold, nothing extra read or parsed.
-    //
-    // Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):
-    // a live measurement found the Stop hook averaging ~400ms against
-    // ~60ms for the other three hooks, all four otherwise doing comparable
-    // `CtxConfig::load` work. Passing `None` here (with no `agent` key in
-    // config either, the common case) sent every single invocation through
-    // `adapters::resolve_default_with_presence`'s full scan -- a
-    // `resolve_program`/PATH probe per registered adapter (~14 of them) --
-    // even though a Stop hook is ALWAYS invoked by the exact harness whose
-    // own hook mechanism just ran it, which already told this process which
-    // one that is via [`adapters::AGENT_ENV`] (set by every supervised
-    // launch). Reading it here skips straight to that one adapter's own
-    // `ready()` check when it is set, and falls back to the identical
-    // resolve-default scan of today whenever it is not (an unsupervised
-    // invocation, or a test harness that never set it).
+    // Score only newly appended transcript bytes on each Stop process;
+    // cache checkpoint state to avoid quadratic full-session rescans (#243).
     let Ok((score, screening, speed_sample)) =
         score::score_transcript_cached(transcript, env(adapters::AGENT_ENV).as_deref(), &repo, env)
     else {
@@ -114,9 +90,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         );
     }
 
-    // Loaded once, outside the `state`-gated block below, so `stop_output`
-    // can read `cfg.score.same_error_threshold` after that block ends
-    // without a second config load.
+    // Load config once so Stop output and scoring use the same thresholds.
     let cfg = cfg_or_operator_only_gate(&repo, env);
     let mut optimize_recommended = None;
     let mut adoption_nudge = None;
@@ -128,10 +102,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let mut stop_verify_block = None;
     let mut scope_guard_block = None;
     if let Ok(state) = StateDir::resolve(env) {
-        // Issue #243: a flagged screening result rides the same
-        // decision line this cycle already writes, and is persisted onto the
-        // session's own registry record for `zirv ctx status` to render --
-        // never a new file, and cleared once a later cycle screens clean.
+        // Persist the current screening flag in the session registry row; clear
+        // it after a clean later cycle (#243).
         let detail = if screening.is_clean() {
             payload.transcript_path.clone()
         } else {
@@ -158,21 +130,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 observed_at: None,
             },
         );
-        // Issue #243 (review round, F2): the STABLE short this session's
-        // own registry record is keyed by, not `short_id(&session)` --
-        // `session`/`payload.session_id` both carry the ROTATING
-        // per-restart session id, so after a supervised restart that
-        // derivation names a record that no longer exists (`SessionGuard::
-        // refresh_session`'s own doc comment: the short id is this
-        // supervisor's stable address and deliberately does not move with
-        // it). `SOCKET_ENV`'s own path is bound once for the life of the
-        // supervised run -- every restart's `register_turn_signal` call
-        // reuses the identical `server`/socket value -- and is named after
-        // that same stable short (`state::socket_for`), so its file stem
-        // recovers it without needing a new signal. Falls back to
-        // `short_id(payload.session_id)` -- today's behaviour -- only when
-        // no socket was ever bound (an unsupervised or `--no-supervise`
-        // launch, or the codex `Notify` path).
+        // Resolve the stable registry short ID from the bound socket; session
+        // IDs rotate during supervised restarts and cannot key this record (#243).
         let stable_short = socket
             .as_deref()
             .and_then(|p| p.file_stem())
@@ -180,16 +139,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| crate::commands::ctx::sessions::short_id(&payload.session_id));
-        // Issue #462: a lifecycle hook is the one place both identities are
-        // known at once -- `session` is zirv's own uuid (`SESSION_ENV`),
-        // while `payload.session_id` is the conversation the HARNESS
-        // actually minted, and the two are equal only for a pinned launch.
-        // Recorded on every turn boundary so a failed rollover can put this
-        // seat back into its OWN conversation rather than `--resume` zirv's
-        // uuid, which the harness has never heard of ("No conversation found
-        // with session ID: <zirv uuid>", the incident this exists for).
-        // Gated on `AGENT_ENV`: an unsupervised launch has no seat for a
-        // recovery to restore, so there is nothing to record it for.
+        // Record both zirv and harness session identities at lifecycle hooks;
+        // they can differ after a harness-minted conversation starts (#462).
         if let Some(agent) = env(adapters::AGENT_ENV) {
             crate::commands::ctx::sessions::record_native_conversation(
                 &state,
@@ -199,13 +150,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 &payload.session_id,
             );
         }
-        // Issue #349: a Stop hook is exactly a `Working -> Settled` turn
-        // boundary -- the agent has finished its response and is back at an
-        // idle prompt. `Attention::None` here is deliberate, not a no-op:
-        // it is what lets a LOWER-ranked authority's stale attention (a
-        // `Supervisor` stall latch from a prior turn, say) be cleared the
-        // moment the turn actually completes cleanly, since `AdapterHook`
-        // outranks every other authority on the attention axis too.
+        // Stop marks the Working-to-Settled boundary and clears stale attention
+        // from lower-ranked authorities (#349).
         let _ = crate::commands::ctx::attention::record(
             &state,
             &stable_short,
@@ -232,12 +178,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             &mut screening_announced,
         );
 
-        // The analysis itself is far too heavy for a hook, so this only queues
-        // the recommendation for a human to act on. Counting corrections is
-        // the one expensive part -- a full re-read and re-parse of the
-        // transcript -- so it is paid for only once the free gates say it
-        // could matter. Without that ordering every turn re-parses the whole
-        // session, which is precisely what the cached score above removes.
+        // Queue heavy analysis instead of running it in the Stop hook; count
+        // corrections only after cheap eligibility gates pass.
         let now = now_secs();
         if crate::commands::ctx::surface_collect::recommendation_possible(
             &state,
@@ -270,15 +212,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         diagnostics_nudge = diagnostics_stop_nudge(&state, &repo, &session, &cfg, transcript);
         missing_tests_gate =
             missing_tests_gate_reason(&state, &repo, &stable_short, &payload.session_id, &cfg, env);
-        // Issue #312: independent of the rot `Verdict` ladder above -- a
-        // cost-driven tier of its own, gated on stale tool-result tokens and
-        // window fraction, never on `score.verdict`.
-        //
-        // Hook start-up overhead fix (2026-09-24): reads `AGENT_ENV` first,
-        // same reasoning and same fallback as `score::score_transcript_cached`'s
-        // own call above -- a Stop hook already knows its own harness without
-        // asking `adapters::resolve_default_with_presence` to scan every
-        // registered adapter's presence again.
+        // Cost-driven compact advice is independent of rot verdict. Skip
+        // prompt-byte work when the agent gate already excludes it (#312).
         if let Ok(adapter) = adapters::select_for_identity(
             env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
             &[],
@@ -297,22 +232,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             stop_rot_advisory_deferred(&state, &cfg, &stable_short, &score, socket.is_some());
     }
 
-    // Issue #309 rides the same single advisory line `adoption_nudge`
-    // already carries -- `stop_output`'s own `adoption_nudge` parameter is
-    // generic "one more advisory line", not exclusively about workflow
-    // adoption, so folding both in here (rather than widening `stop_output`
-    // itself) keeps every one of its existing call sites/tests untouched.
-    // Issue #308 rides the same fold a third time, for the identical reason.
-    // Issue #312 rides it a fourth time, for the identical reason.
-    //
-    // Issue #478: whether this session may stop quietly is the shared stop
-    // service's call, not this function's. `stop_hook_active` is its loop
-    // breaker -- exactly what this hook's own early return above already used
-    // it for -- and the verify-on-stop result is the verification signal it
-    // reads. Behaviour is unchanged today (a `Required` verification yields
-    // `AllowWithNote`, and the note is the one computed above), but the moment
-    // `StopSignals::workflow_gate` or `incomplete_tools` is populated, the
-    // harness path blocks for the same reasons the native loop already does.
+    // Combine verify and adoption advice into the one Stop advisory line;
+    // each gate still decides its own text independently (#309).
     let stop_decision =
         crate::commands::ctx::lifecycle::stop(&crate::commands::ctx::lifecycle::StopSignals {
             already_blocked: payload.stop_hook_active,
@@ -326,13 +247,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             workflow_gate: None,
             missing_tests_gate,
         });
-    // Q1: a real `Block` overrides everything else this hook would otherwise
-    // say -- a session told to keep working must not also be handed an
-    // unrelated /compact advisory in the same breath. Claude Code's Stop-hook
-    // contract for an actual block is this flat envelope (no
-    // `hookSpecificOutput` wrapper, unlike PreToolUse/UserPromptSubmit); the
-    // top-of-function `payload.stop_hook_active` early return is what keeps
-    // this from looping (`stop()`'s own `already_blocked` maps to it).
+    // A Stop Block uses a flat envelope and suppresses unrelated advisories;
+    // `stop_hook_active` prevents a repeated block loop.
     if let crate::commands::ctx::lifecycle::StopDecision::Block(reason) = &stop_decision {
         let _ = writeln!(
             w,
@@ -360,8 +276,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     .collect::<Vec<_>>();
     let combined_nudge = (!combined_nudge.is_empty()).then(|| combined_nudge.join("\n"));
 
-    // Issue #785: a deferred rot advisory is dropped for this Stop only;
-    // every other nudge above still rides through `stop_output`.
+    // Defer only the rot advisory for this Stop; retain other nudges (#785).
     let shown_score = shown_stop_score(&score, rot_advisory_deferred);
     let line = stop_output(
         &payload,
@@ -384,8 +299,8 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     Ok(0)
 }
 
-/// Issue #785: the score `stop_output` renders -- a deferred rot advisory is
-/// a healthy verdict for this Stop, so only the rot line drops.
+/// Suppress the rot line for a deferred advisory while retaining other Stop
+/// output (#785).
 fn shown_stop_score(score: &Score, deferred: bool) -> std::borrow::Cow<'_, Score> {
     if !deferred {
         return std::borrow::Cow::Borrowed(score);
@@ -396,8 +311,7 @@ fn shown_stop_score(score: &Score, deferred: bool) -> std::borrow::Cow<'_, Score
     })
 }
 
-/// Issue #786: adds a Stop block to whatever advisory `stop_output` already
-/// produced, so the block never suppresses it.
+/// Add the verification block without discarding existing Stop advice (#786).
 pub(super) fn with_stop_block(line: Option<&str>, reason: &str) -> String {
     let mut object = line
         .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -411,9 +325,8 @@ pub(super) fn with_stop_block(line: Option<&str>, reason: &str) -> String {
     serde_json::Value::Object(object).to_string()
 }
 
-/// Issue #785: whether the `[jev] inject` gate defers this Stop's rot
-/// advisory. Only asked when `stop_output` would print one at all
-/// (unsupervised, non-healthy); gate off is `false` with no work done.
+/// Call Jev only when a rot advisory would be emitted; otherwise its answer
+/// cannot affect Stop output and would add needless hot-hook latency (#785).
 fn stop_rot_advisory_deferred(
     state: &StateDir,
     cfg: &CtxConfig,

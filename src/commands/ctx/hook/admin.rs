@@ -6,13 +6,10 @@ use crate::commands::ctx::config::EnvLookup;
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::{CtxResult, log};
 
-/// `zirv ctx hook install <agent> [--show] [--uninstall] [--dry-run]`
-/// (issue #418). Resolves `agent` through the adapter registry directly
-/// (never `adapters::select`, which requires the binary to be installed and
-/// the operator gate to allow it -- writing a hooks file must work before
-/// either is true), so an unknown name or an adapter with no native hooks
-/// surface (`AgentAdapter::native_hooks` returning `None`) both exit 1 with
-/// a clear message rather than silently doing nothing.
+/// Install or remove an adapter's native hooks without requiring its
+/// binary or operator gate; unknown or unsupported adapters exit 1 (#418).
+/// Resolves the agent via the adapter registry directly, never
+/// `adapters::select`, which requires both to be true.
 pub(super) fn run_hook_install<W: Write>(
     w: &mut W,
     agent: &str,
@@ -97,17 +94,8 @@ pub(super) fn run_hook_install<W: Write>(
     Ok(0)
 }
 
-/// `zirv ctx hook audit [--since N]` (issue #424): counts by verb/verdict
-/// over the main decision log, reuse-probe skip reasons, top denied
-/// programs from the orchestrator-write guard's own `Bash`/`PowerShell`
-/// rows (every other tool names a file path, not a program, so those are
-/// counted but never named), the top BLOCKED FAMILIES from the
-/// command-safety log (Change 5a: `SafetyDecision::family`, computed by
-/// `safety::safety_family` -- the command itself is still SHA-only, but
-/// the family is plaintext by design), and the compaction ledger's own
-/// outcome counts. One report tying every hook-observable signal together
-/// for an operator asking "is the hook actually doing anything." Read-only
-/// throughout.
+/// Summarize hook decisions, safety families and compaction outcomes from
+/// existing logs without exposing raw commands (#424).
 pub(super) fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let state = StateDir::resolve(env)?;
     let since_secs = crate::commands::ctx::spend::parse_since(since).ok_or_else(|| {
@@ -222,10 +210,8 @@ pub(super) fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) ->
     Ok(0)
 }
 
-/// Issue #420: `zirv ctx hook status`. Advisory only -- always exits 0,
-/// printing what went wrong inline rather than propagating it, since a
-/// classify/heal failure (e.g. a malformed `settings.json`) must never make
-/// this command itself the reason a session looks unhealthy.
+/// Report hook status inline and exit zero even when classification or
+/// healing fails; status is advisory (#420).
 pub(super) fn run_hook_status<W: Write>(
     w: &mut W,
     heal: bool,

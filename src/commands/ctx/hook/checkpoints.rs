@@ -34,30 +34,8 @@ fn optimize_hint(reason: crate::commands::ctx::surface_collect::RecommendReason)
     }
 }
 
-/// Decides what the Stop hook prints. `None` means print nothing, which is also
-/// what every failure path does.
-///
-/// `adoption_nudge` (issue #223) rides along as an extra line: a session can
-/// be perfectly `Healthy` by rot's own measure and still be doing substantial
-/// edit work with no active `zirv workflow`, so it is folded into both the
-/// healthy-session hint path and the ordinary advisory below, not gated
-/// behind either. Despite the name, this parameter is generic "one more
-/// advisory line" rather than exclusively about workflow adoption: `run_stop`
-/// (issue #309) also folds its own verify-on-stop nudge in here rather than
-/// widening this signature a second time.
-///
-/// `same_error_threshold` is `ScoreConfig::same_error_threshold` (default
-/// `3`): when `score.signals.same_error_repeats` meets or exceeds it, the
-/// advisory gets its own clause alongside the repetition one above -- a
-/// stuck same-error loop is a distinct failure mode from over-verification
-/// (the same tool call repeated with no edit in between): the fix is not
-/// landing at all, not merely re-checked. A threshold of `0` is how an
-/// operator disables the signal outright, so the clause also requires
-/// `same_error_threshold > 0` -- otherwise `repeats >= 0` is trivially true
-/// and the "disabled" signal would still print on every non-healthy advisory
-/// (review finding F2). `stop_output` itself takes no `ScoreConfig` --
-/// `run_stop`, its only production caller, already loads one and passes just
-/// the threshold through.
+/// Render Stop advice; failures emit nothing. Append adoption guidance
+/// independently of rot health, and keep output bounded (#223).
 pub fn stop_output(
     payload: &HookPayload,
     score: &Score,
@@ -114,14 +92,10 @@ pub fn stop_output(
             score.signals.max_repeat
         ));
     }
-    // Same-error loop: the longest run of consecutive identical (normalized)
-    // tool-result errors within the window met or crossed the operator's own
-    // threshold -- a distinct failure mode from the repetition clause above,
-    // which fires on an unchanged tool call rather than a recurring error.
-    // `same_error_threshold > 0` is required too: a threshold of zero is how
-    // an operator disables the signal, and `repeats >= 0` is trivially true,
-    // so without this guard a disabled signal would still fire on every
-    // non-healthy advisory (review finding F2).
+    // Repeated identical errors still need intervention when the agent
+    // varies its command enough to avoid unchanged-call detection.
+    // A threshold of 0 means the operator disabled this signal; keep the
+    // guard or `repeats >= 0` would fire on every non-healthy advisory.
     if same_error_threshold > 0 && score.signals.same_error_repeats >= same_error_threshold {
         advisory.push(' ');
         advisory.push_str(&format!(
@@ -140,27 +114,11 @@ pub fn stop_output(
     serde_json::to_string(&serde_json::json!({ "systemMessage": advisory })).ok()
 }
 
-/// Bumped whenever this file's shape changes, mirroring `score.rs`'s own
-/// `CHECKPOINT_VERSION` pattern: an older file is discarded and rebuilt once
-/// from scratch rather than misread.
+/// Invalidate stored checkpoints when their schema changes.
 const CORRECTION_CHECKPOINT_VERSION: u32 = 1;
 
-/// Incremental cursor + running total for `corrections_in`, one file per
-/// transcript (mirrors `score.rs`'s own per-transcript `checkpoint_path`).
-///
-/// `corrections_in` used to `read_to_string` and re-`structural_context` the
-/// WHOLE transcript on every Stop hook call once a session passed the
-/// correction-recommendation gate (`surface_collect::recommendation_possible`) --
-/// O(session) per turn, O(n^2) over a session, exactly the cost the cached
-/// score above already pays once to avoid for the rot score itself. This is
-/// kept as its own small checkpoint rather than folded into `score.rs`'s
-/// `Checkpoint` (a lower-level, adapter-agnostic scoring cursor that should
-/// not grow an optimize-specific concept) or into `AdoptionRecord` above
-/// (whose fold only runs when workflow-adoption policy is not `Off` and the
-/// session is not a delegated worker -- neither gate has anything to do with
-/// whether an optimize recommendation is due, and folding in there would
-/// stop counting corrections for exactly the sessions where adoption nudges
-/// are turned off).
+/// Track an incremental transcript cursor and correction total so each
+/// Stop call parses only new bytes, not the full growing transcript.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CorrectionCheckpoint {
     #[serde(default)]
@@ -212,28 +170,13 @@ fn save_correction_checkpoint(path: &Path, checkpoint: &CorrectionCheckpoint) {
     let _ = crate::commands::ctx::state::write_private(path, &json);
 }
 
-/// Corrections in `transcript`, read through the same adapter selection
-/// `score_transcript` uses to score it (`cfg.agent`/`cfg.agent_bin`), not a
-/// hardcoded claude parser (item 1). `adapters::select` failing (an unready
-/// adapter, e.g. codex today) degrades to zero corrections rather than
-/// panicking: an optimize recommendation is advisory, and a hook may never
-/// fail loudly.
-///
-/// Incremental (see `CorrectionCheckpoint`'s own doc comment): only the bytes
-/// appended to `transcript` since the last call are folded into the running
-/// total, via the same `Watcher` cursor `fold_adoption_delta` above already
-/// uses for `edit_like_calls`. Every adapter's `structural_context` parses
-/// each JSONL line independently with no cross-line state (a line's own
-/// `isSidechain`/`isMeta` flags decide its fate, nothing carried from an
-/// earlier line), so folding a chunk of newly appended lines finds exactly
-/// the correction-phrased user messages a full parse would have attributed
-/// to those same lines -- the same property that already lets
-/// `fold_adoption_delta` treat `adapter.parse_events` incrementally.
+/// Parse only appended JSONL with the transcript's selected adapter: its
+/// lines have no cross-line parser state, so the incremental count agrees
+/// with a full read. Adapter failure yields zero rather than failing an
+/// advisory Stop hook.
 pub(super) fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize {
-    // Issue #690: `select_for_identity`, never `select` -- this names the
-    // adapter whose transcript format to parse, and a hook subprocess with
-    // a reduced `PATH` must not stop screening because a presence probe
-    // could not see the harness that is running it.
+    // Select the transcript adapter by identity, without probing whether
+    // its binary is visible on the hook process PATH (#690).
     let Ok(adapter) = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg) else {
         return 0;
     };
@@ -274,25 +217,10 @@ pub(super) fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfi
 /// own `CORRECTION_CHECKPOINT_VERSION` pattern.
 const COMPACT_ADVISORY_CHECKPOINT_VERSION: u32 = 1;
 
-/// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24): how
-/// long a sampled `system_bytes`/`schema_bytes` pair (see [`CachedPromptBytes`])
-/// is trusted before [`compact_advisory_stop_nudge`] recompiles the prompt to
-/// resample it. A live measurement found `compile::compile_with_harness_
-/// roster` averaging ~230ms per Stop hook call, almost entirely
-/// `harness_roster_lines`' own per-adapter `AgentAdapter::ready()` calls (a
-/// `resolve_program` PATH walk for every registered adapter, ~14 of them) --
-/// NOT covered by that function's own `ProbeCache` (which only memoizes the
-/// separate `liveness_probe` check, not `ready()` itself), so it paid this
-/// cost fresh on every single turn. Mirrors [`crate::commands::ctx::adapters::
-/// ProbeCache`]'s own `PROBE_CACHE_TTL_SECS`: the harness roster's byte size
-/// is driven by the exact same "which harnesses are installed" fact that
-/// cache already tolerates up to an hour stale.
+/// Cache compiled prompt byte counts briefly to avoid recompiling the
+/// prompt on every Stop hook invocation.
 const COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS: u64 = 3600;
 
-/// A sampled `(system_bytes, schema_bytes)` pair from `compile::
-/// compile_with_harness_roster`, plus when it was taken -- see
-/// [`COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS`] for why this is cached rather
-/// than resampled on every Stop hook call.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct CachedPromptBytes {
     system_bytes: u64,
@@ -300,21 +228,10 @@ struct CachedPromptBytes {
     sampled_at: u64,
 }
 
-/// Issue #312: the reclaim-gated compact advisory's own persisted state, one
-/// file per transcript (mirrors `CorrectionCheckpoint`). `accumulator` is
-/// `breakdown::BreakdownAccumulator`, folded incrementally the same way
-/// `AdoptionRecord::edit_like_calls` is -- UNBOUNDED, unlike `RotState`'s
-/// windowed segments, because a stale-marking edit can reference a path read
-/// arbitrarily many turns back (see that type's own doc comment).
-/// `last_fired_window_tokens` is the hysteresis: `None` until the advisory
-/// has fired once, then the window size (`Score::context_tokens`) it fired
-/// at, so it cannot refire until the window has regrown a full
-/// trigger-sized runway past that point -- mirroring Hermes's own
-/// disarm-until-regrowth rule (see the issue's Origin section), reimplemented
-/// here as advice rather than automatic pruning. `cached_prompt_bytes` is the
-/// hook start-up overhead fix's own cache -- `#[serde(default)]` so a
-/// checkpoint written before this field existed just resamples once, exactly
-/// like a fresh checkpoint would.
+/// Persist incremental stale-output accounting so the Stop hook need not
+/// rescan a growing transcript on every turn (#312). `accumulator` is
+/// deliberately unbounded, unlike `RotState`'s windowed segments: a
+/// stale-marking edit can reference a path read arbitrarily many turns back.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CompactAdvisoryCheckpoint {
     #[serde(default)]
@@ -382,39 +299,9 @@ fn approx_tokens(tokens: u64) -> String {
     }
 }
 
-/// Issue #312: the reclaim-gated compact advisory -- a SECOND, cost-driven
-/// tier alongside the rot `Verdict` ladder `stop_output` already renders,
-/// firing only when stale tool-result tokens exceed `compact_advisory.
-/// min_reclaim_tokens` AND the window exceeds `compact_advisory.
-/// window_fraction` of the model's resolved context window. Independent of
-/// `score.verdict`: `run_stop` folds this into the same `combined_nudge`
-/// line the healthy-session early return in `stop_output` already honours,
-/// so a `Healthy`-verdict session with a lot of stale tool output still gets
-/// told.
-///
-/// A real compaction (`NormalizedEvent::Compaction` among the newly
-/// appended events) resets both the accumulator and the hysteresis: the
-/// bytes it summarized are no longer live context, and "regrown a full
-/// trigger-sized runway" must count from the post-compaction window, not a
-/// stale pre-compaction one.
-///
-/// Samples the compiled-prompt bytes (`compile::compile_with_harness_
-/// roster`), like `zirv ctx status --breakdown` does -- but, since the
-/// wrapper-overhead benchmark (2026-09-24), no more than once per
-/// [`COMPACT_ADVISORY_PROMPT_BYTES_TTL_SECS`]. A live measurement found that
-/// compile averaging ~230ms per call, almost entirely `harness_roster_
-/// lines`' own uncached per-adapter `ready()` PATH walk -- paid fresh on
-/// EVERY Stop hook of EVERY turn for a number this advisory only needs
-/// approximately right. `checkpoint.cached_prompt_bytes` (see
-/// [`CachedPromptBytes`]) carries the last sample forward across calls; a
-/// resample can therefore disagree with `status --breakdown`'s own live
-/// number by up to that TTL, which this advisory's own imprecise, threshold-
-/// gated wording ("~N tokens ... saves more than it costs") already assumes.
-/// The accumulator fold above stays exactly as incremental as before this
-/// fix -- only the prompt-bytes sample gained a cache.
-///
-/// `None` on every failure path and whenever either gate is not met -- like
-/// every other hook advisory, this must never fail loudly.
+/// Advise compaction only when stale tool-result tokens and window share
+/// exceed configured thresholds. This cost signal is independent of rot
+/// verdicts and fails open on missing state (#312).
 pub(super) fn compact_advisory_stop_nudge(
     state: &StateDir,
     repo: &Path,
@@ -541,19 +428,8 @@ pub(super) fn compact_advisory_stop_nudge(
     advisory
 }
 
-/// `CtxConfig::load`'s degrade-on-error fallback used by the Stop hook's
-/// optimize-recommendation path: a hook must never fail outright on a bad
-/// config, but degrading all the way to `CtxConfig::default()` would hand
-/// `corrections_in` a fully permissive `AgentGate`, which is exactly the
-/// same trust hole `surface_collect.rs`'s config-load fallback had (review finding
-/// 1): a malformed *repo* `.settings.toml` would silently revive an agent
-/// the *operator* disabled. It would also, since issue #44 made `cfg.policy`
-/// load-bearing, hand back the widest possible policy from a config that
-/// could not even be read. `config::degrade_to_operator_only` substitutes
-/// `AgentGate::load_operator_only`/`EffectivePolicy::fail_closed` for those
-/// two fields, keeping both the operator's disable and the operator's policy
-/// in force even when the rest of the config (or the repo settings layer
-/// specifically) cannot be read.
+/// Degrade Stop-hook config errors without granting a permissive agent
+/// gate; an invalid config must not make recommendations bypass policy.
 pub(super) fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxConfig {
     match CtxConfig::load(repo, env) {
         Ok(cfg) => cfg,
@@ -561,34 +437,8 @@ pub(super) fn cfg_or_operator_only_gate(repo: &Path, env: EnvLookup<'_>) -> CtxC
     }
 }
 
-/// Issue #223: per-session workflow-adoption bookkeeping, refreshed on every
-/// Stop/Notify hook call and re-read (never re-scanned) by the Prompt hook.
-/// `edit_like_calls`/`turns` are the same cumulative counts
-/// `adoption::signals` would report over the whole transcript;
-/// `offset`/`consumed` are this record's own [`Watcher`] resume position, so
-/// a fresh hook-per-turn process still only ever parses the bytes appended
-/// since the last one -- the same append-only-cost property `score.rs`'s own
-/// incremental checkpoint has, kept as a separate small fold here rather than
-/// widening that (separately versioned, heavily depended-on) schema.
-///
-/// `skill_loads` is the identical kind of cumulative count as
-/// `edit_like_calls` (folded the same way, in the same pass), and
-/// `last_skill_nudged_turn` is the skill nudge's own cadence field, kept
-/// separate from `last_nudged_turn` so the workflow-adoption nudge and the
-/// skill nudge never suppress each other. Both are `#[serde(default)]`: a
-/// record persisted before this change simply reads back as "no loads seen,
-/// never nudged yet", never a parse failure.
-///
-/// `shell_skill_loads` counts a shell-invoked `zirv skill load` -- the
-/// PRIMARY load path (the standing skill index and the subagent skill pointer
-/// both tell an agent to run it from a shell),
-/// which `adoption::signals`'s transcript scan can never see (see that
-/// module's own doc comment). Bumped ONLY by [`record_shell_skill_load`],
-/// NEVER by [`fold_adoption_delta`]: it is not transcript-derived at all, so
-/// a restarted transcript must never reset it the way
-/// `edit_like_calls`/`skill_loads` are reset. A lower bound, not an exact
-/// count: the bump is an unlocked read-modify-write, so two concurrent loads
-/// may record one -- harmless, since the nudge only tests for zero.
+/// Persist incremental workflow-adoption counts per session for Stop and
+/// Prompt hooks, avoiding repeated transcript scans (#223).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AdoptionRecord {
     pub(crate) substantial: bool,
@@ -611,14 +461,7 @@ pub(crate) struct AdoptionRecord {
     pub(crate) shell_skill_loads: usize,
 }
 
-/// One file per session id, named after a hash of it (mirrors `score.rs`'s
-/// `checkpoint_path`): session ids are not always filesystem-safe on their
-/// own, and are far too long/variable-shaped across adapters to trust as a
-/// filename directly.
-///
-/// `pub(crate)`: `agent::run_with`'s own enforce-policy gate (issue #223 §E)
-/// reads the same record this hook writes, rather than keeping a second copy
-/// of this path/schema.
+/// Hash session IDs into filesystem-safe, stable record filenames.
 pub(crate) fn adoption_record_path(state: &StateDir, session: &str) -> std::path::PathBuf {
     state
         .adoption()
@@ -649,11 +492,7 @@ impl AdoptionRecord {
     }
 }
 
-/// Best-effort, like `score.rs`'s `save_checkpoint`: a record that fails to
-/// write costs the next hook call a full-session refold, never a hook failure.
-///
-/// `pub(crate)`: also used directly by `agent::run_with`'s enforce-gate tests
-/// (issue #223 §E) to seed a record without driving a whole Stop hook call.
+/// Best-effort save; failure costs a later refold, never a hook failure.
 pub(crate) fn save_adoption_record(path: &Path, record: &AdoptionRecord) {
     let Ok(json) = serde_json::to_string(record) else {
         return;
@@ -693,17 +532,8 @@ fn fold_adoption_delta(
     record.consumed = consumed;
 }
 
-/// Best-effort bump of the CURRENT session's shell-invoked skill-load count.
-/// `zirv skill load` is the primary load path, but `adoption::signals` only
-/// ever sees a shell tool call's NAME, never its command text, so a shell
-/// load is invisible to the skill nudge's transcript scan. `skill::run_load`
-/// runs inside the wrapped session's shell and inherits `SESSION_ENV`, so it
-/// calls this once after a successful load. `shell_skill_loads` is not
-/// transcript-derived, so `fold_adoption_delta` never touches or resets it.
-///
-/// No `SESSION_ENV` (an unsupervised load), no state directory, or an
-/// unreadable record are silently ignored; returning nothing keeps `zirv
-/// skill load`'s own output and exit code unaffected by construction.
+/// Count shell-invoked skill loads separately: transcript adoption signals
+/// see tool names, not the command text that names a skill.
 pub(crate) fn record_shell_skill_load(env: EnvLookup<'_>) {
     let Some(session) = env(SESSION_ENV).filter(|s| !s.is_empty()) else {
         return;
@@ -717,35 +547,8 @@ pub(crate) fn record_shell_skill_load(env: EnvLookup<'_>) {
     save_adoption_record(&path, &record);
 }
 
-/// Workflow-adoption detection and Stop-hook nudge text, in one pass.
-/// `None` whenever nothing should be added to the hook's own output -- the
-/// policy is `off`, this session is a delegated worker, or no nudge is due --
-/// which is also every failure path: like every other hook function, this
-/// must never fail loudly.
-///
-/// Delegated workers are never nudged: only the top-level session a human is
-/// actually looking at should be told to start a workflow. A worker
-/// pane/headless child inherits [`crate::commands::ctx::agent::WORK_GROUP_ENV`] from its own
-/// delegation lineage (see that constant's own doc comment); a top-level
-/// interactive session never has it set. This is the one real "am I a
-/// delegated worker" signal already wired into a spawned child's own process
-/// env today -- `telemetry::TelemetryEvent::parent_session_id` exists as a
-/// field but nothing in this codebase populates it yet.
-///
-/// The skill nudge (`adoption::skill_nudge_due`/
-/// `skill_nudge_text`) rides the SAME transcript scan and the SAME
-/// delegated-worker exemption above -- it is computed after both early
-/// returns, so it is silent under `workflow.adoption == Off` (the fold never
-/// runs, so `record.substantial`/`skill_loads` never update -- deliberately
-/// NOT a second, independent gate on the skill nudge itself: see
-/// `AdoptionPolicy`'s own doc comment on what this key governs) and for a
-/// delegated worker, for the identical reason the workflow nudge is. Unlike
-/// the workflow nudge, it is NOT further gated on `workflow.adoption >=
-/// AdoptionPolicy::Nudge` (an `Advise`-level operator still gets it) and NOT
-/// gated on `workflow_active` (a workflow being active does not mean a skill
-/// was ever loaded) -- only on `cfg.prompt.skill_index`, the same switch that
-/// turns off the standing skill-index system-prompt layer and the Change-A
-/// dispatch pointer.
+/// Refresh adoption state and return a due Stop nudge only for an eligible
+/// session. Errors and missing state produce no hook output (#223).
 pub(super) fn adoption_stop_nudge(
     state: &StateDir,
     repo: &Path,
@@ -809,10 +612,8 @@ pub(super) fn adoption_stop_nudge(
             record.last_nudged_turn,
         )
     } else {
-        // `Advise`: fires exactly once, the turn substantial-without-workflow
-        // first becomes true. `nudge_due` itself never fires below `Nudge`
-        // (see its own doc comment), so `Advise`'s single notice is decided
-        // here instead.
+        // Advise once so an unmet workflow suggestion does not repeat on
+        // every Stop; stronger nudge modes use their own cadence.
         record.substantial && !record.workflow_active && record.last_nudged_turn.is_none()
     };
     let workflow_text = due.then(|| {
@@ -846,24 +647,8 @@ pub(super) fn adoption_stop_nudge(
     (!combined.is_empty()).then(|| combined.join("\n"))
 }
 
-/// Issue #293: records ONE `TurnLatencySampled` sample for this scoring
-/// pass, mirroring `adoption_stop_nudge`'s own local telemetry write right
-/// next to it -- "the score is computed for a live session" is exactly this
-/// call site, `run_stop`, and only here: the Stop hook is a fresh process on
-/// every turn (`score_transcript_cached`'s own doc comment), so one call
-/// here is one sample per turn, never per dashboard poll (`score::
-/// cached_score`'s own fast path answers most of ITS polls from an
-/// in-memory cache without ever reaching a scoring pass at all). `speed`
-/// comes from `score::score_transcript_cached`'s third element
-/// (`IncrementalScorer::last_speed_sample`) -- deliberately NOT a field on
-/// `Score` itself, since it is only ever derived from this ONE poll's
-/// appended events, not the whole session's accumulated history, and so is
-/// legitimately allowed to differ between a bounded poll and a full parse
-/// (unlike every field `Score` actually carries, which the incremental fold
-/// and a full parse must always agree on). A no-op when `speed` is `None`
-/// -- nothing measurable this pass, so nothing to record; best-effort like
-/// every other telemetry write in this module (`let _ =
-/// telemetry::record(..)`).
+/// Record one latency sample per live Stop scoring pass; avoid sampling
+/// again for the same turn (#293).
 pub(super) fn record_speed_sample(
     state: &StateDir,
     repo: &Path,
@@ -888,14 +673,8 @@ pub(super) fn record_speed_sample(
 /// own `CORRECTION_CHECKPOINT_VERSION`.
 const MODIFICATION_CHECKPOINT_VERSION: u32 = 1;
 
-/// Issue #309: incremental cursor plus a single "has this session made at
-/// least one modification (edit-like) tool call" bit, one file per
-/// transcript (mirrors `CorrectionCheckpoint`'s own naming/shape). Kept as
-/// its own small checkpoint rather than folded into `AdoptionRecord`'s own
-/// `edit_like_calls` fold: that fold only runs once `adoption_stop_nudge`
-/// clears the `workflow.adoption != Off` gate, and verify-on-stop must keep
-/// working when an operator has workflow-adoption nudges turned off but
-/// still wants the stale-gate nudge.
+/// Incrementally track whether this session has made a modification; a
+/// transcript cursor keeps Stop checks cheap (#309).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ModificationCheckpoint {
     #[serde(default)]
@@ -931,13 +710,8 @@ fn load_modification_checkpoint(
     {
         return None;
     }
-    // Once `modified` is true it is a session-scoped fact that never goes
-    // back to `false` (see `session_has_modification`'s own doc comment):
-    // the `offset`/transcript-length check below exists only to validate an
-    // incremental *resume point*, which a already-`true` checkpoint has no
-    // further use for -- requiring it here would mean a transcript that
-    // later shrinks, moves, or is cleaned up mid-session could silently
-    // forget a modification this session already made.
+    // Once modification is true, it remains a session fact; cursor validity
+    // matters only while looking for the first edit.
     if checkpoint.modified {
         return Some(checkpoint);
     }
@@ -956,21 +730,8 @@ fn save_modification_checkpoint(path: &Path, checkpoint: &ModificationCheckpoint
     let _ = crate::commands::ctx::state::write_private(path, &json);
 }
 
-/// Whether `transcript` has shown at least one modification (edit-like) tool
-/// call this session -- cheap and incremental like `corrections_in`: only the
-/// bytes appended since the last call are parsed, via the same `Watcher`
-/// cursor `fold_adoption_delta`/`corrections_in` already use, and
-/// `adoption::signals`' own `EDIT_LIKE_TOOLS` list decides what counts (the
-/// same signal `AdoptionRecord::edit_like_calls` uses, just folded into its
-/// own checkpoint here instead of that one -- see this function's own
-/// caller's doc comment for why). Once `modified` is persisted `true`, a
-/// later call short-circuits before touching the transcript at all -- a
-/// session-scoped fact never goes back to `false`. Originally only ever
-/// called once `cfg.verify_on_stop.enabled` is true (see the call site in
-/// `verify_on_stop_nudge`), so a session that has that feature off never
-/// pays even this bounded parse; `pub(crate)` so `diagnostics::
-/// post_edit_nudge` (issue #308) can gate its own, unrelated feature on the
-/// identical session-scoped fact rather than re-deriving it.
+/// Detect whether a transcript contains a modification by parsing only
+/// appended bytes; preserve the true result across later Stop calls (#309).
 pub(crate) fn session_has_modification(
     state: &StateDir,
     transcript: &Path,
@@ -1019,37 +780,18 @@ pub(crate) fn session_has_modification(
     checkpoint.modified
 }
 
-/// Issue #309: whether every entry in `paths` is doc-only -- extension
-/// `md`/`txt`/`rst`, or under a root-level `docs/` prefix -- in which case a
-/// verify nudge would be noise: neither `zirv test changed` nor `zirv
-/// verify` has anything to check in a documentation-only change. Vacuously
-/// `true` for an empty slice, the same "nothing to point to" reading
-/// `changed_paths` itself gives an untouched worktree.
-/// Issue #309: whether `phase` is a step that itself already gates on fresh
-/// verification evidence -- `engine::advance`'s own Test/Verify check prints
-/// exactly the "run `zirv test changed`/`zirv verify`" message a Stop-hook
-/// nudge would otherwise duplicate the moment the operator tries to
-/// complete that step.
+/// Treat docs-only changes as exempt from verification advice when all
+/// paths are documentation files or under root `docs/` (#309).
 fn workflow_step_covers_verification(phase: WorkflowPhase) -> bool {
     matches!(phase, WorkflowPhase::Test | WorkflowPhase::Verify)
 }
 
-/// The exact command a verify-on-stop nudge names. Reached only once
-/// `workflow_step_covers_verification` has already ruled out both Test and
-/// Verify for the active step (see `verify_on_stop_nudge`'s own early
-/// return), so the `Verify` arm here is presently unreachable through that
-/// caller -- kept anyway as the direct mirror of `engine::advance`'s own
-/// `if final_only { "zirv verify" } else { "zirv test changed" }` naming, in
-/// case a future change narrows the suppression rule to `Test` alone.
-/// Bumped whenever `VerifyOnStopRecord`'s own shape changes -- deliberately
-/// a separate constant from `MODIFICATION_CHECKPOINT_VERSION` even though
-/// both start at `1`: the two checkpoints have unrelated schemas and must be
-/// free to version independently.
+/// Name the verification command owed by the current workflow step,
+/// without duplicating an active test or verify gate (#309).
 const VERIFY_ON_STOP_RECORD_VERSION: u32 = 1;
 
-/// Issue #309: how many verify-on-stop nudges this session has already
-/// received, one file per session id (mirrors `adoption_record_path`'s own
-/// naming/hash scheme).
+/// Persist the verify-on-stop count so an internal restart cannot reset
+/// the nudge cap (#309).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct VerifyOnStopRecord {
     #[serde(default)]
@@ -1083,14 +825,8 @@ fn save_verify_on_stop_record(path: &Path, record: &VerifyOnStopRecord) {
     let _ = crate::commands::ctx::state::write_private(path, &json);
 }
 
-/// Issue #309: Stop-hook advisory naming the exact stale-gate command when
-/// code changed this session after the last passing verification run.
-///
-/// `None` on any doubt at all -- like every other hook advisory, this must
-/// never fail loudly. A read-only turn (no modification tool call) runs no
-/// git command at all: `session_has_modification` is checked first, and
-/// every `verification::*` call below (all of which shell out to git) only
-/// runs once that gate is true.
+/// Advise fresh verification after code edits only when prior evidence
+/// is stale; uncertainty emits nothing (#309).
 pub(super) fn verify_on_stop_nudge(
     state: &StateDir,
     repo: &Path,
@@ -1117,9 +853,8 @@ pub(super) fn verify_on_stop_nudge(
         .ok()
         .flatten()
         .and_then(|workflow| workflow.current().map(|step| step.phase));
-    // Issue #478: whether fresh evidence is owed, and which command produces
-    // it, is the shared verification service's decision -- a native session
-    // asks the same question with no transcript and no hook payload.
+    // Ask the shared verification service which fresh check is owed so
+    // native and hook sessions use the same rule (#478).
     let owed = crate::commands::ctx::lifecycle::verification(
         true,
         &changed,

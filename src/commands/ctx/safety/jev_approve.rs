@@ -7,27 +7,15 @@ use super::*;
 // issue #781)
 // ---------------------------------------------------------------------
 
-/// Issue #781 (`[jev] approve`): the confidence floor for ESCALATING a
-/// deterministic `allow` to `ask`. Escalating only ever adds a prompt, never
-/// removes one -- the safe direction -- so this reuses the same
-/// general-purpose bar the harness proxy's own default `[proxy]
-/// min_confidence` ships with, rather than a stricter one.
+/// Minimum confidence to escalate Allow to Ask, which only adds a prompt
+/// (#781).
 pub(crate) const APPROVE_ESCALATE_MIN_CONFIDENCE: f32 = 0.5;
 
-/// Issue #781 (`[jev] approve_allow`): the confidence floor for LOWERING a
-/// deterministic `ask` to `allow` -- the one direction that can cause harm,
-/// so it sits far above [`APPROVE_ESCALATE_MIN_CONFIDENCE`]. The only
-/// empirical evidence so far (2026-09-18 permission-eligibility probe) is
-/// 8/10 correct with both misses cautious (never a false allow) at n=10 --
-/// explicitly too small to gate on at a normal bar, so this floor demands
-/// near-certainty to compensate.
+/// Near-certain confidence required to lower Ask to Allow; the weaker
+/// direction needs a much higher bar (#781).
 pub(crate) const APPROVE_ALLOW_MIN_CONFIDENCE: f32 = 0.9;
 
-/// Issue #781 (`[jev] approve_allow`): the margin floor for the same
-/// lowering direction, well above [`jev::DEFAULT_MIN_MARGIN`]'s
-/// determinism-only 0.2 -- same 2026-09-18 probe basis as
-/// [`APPROVE_ALLOW_MIN_CONFIDENCE`]: only a decisively safe answer, not
-/// merely a stable one, may ever widen a verdict.
+/// Require a decisive margin before lowering Ask to Allow (#781).
 pub(crate) const APPROVE_ALLOW_MIN_MARGIN: f32 = 0.6;
 
 /// The `_zirv_metadata_only` request state `[jev] approve`/`approve_allow`
@@ -120,10 +108,8 @@ pub(crate) fn approve_lower_action(
     }
 }
 
-/// Issue #781: the fixed local program-class table `jev_approve_facts` row
-/// index 0 uses -- deliberately coarse (a handful of risk-relevant
-/// families, not a program registry), keyed on [`sql_program_name`]'s own
-/// bare, lowercased name so it never needs its own path/extension handling.
+/// Coarse fixed program-class bucket for facts row 0, keyed by the
+/// normalized executable name (#781).
 fn jev_approve_program_class(program: &str) -> u32 {
     match program {
         "git" => 1,
@@ -146,12 +132,8 @@ fn jev_approve_program_class(program: &str) -> u32 {
     }
 }
 
-/// Row index 1: a coarse bucket for the first non-flag argument after the
-/// program (the "subcommand" a dispatcher-style program takes), from a
-/// small fixed keyword table -- new for this issue (there is no existing
-/// generic "subcommand risk" concept to reuse), though every token it
-/// inspects already came from the shared [`sql_tokens`] tokenizer, not a
-/// fresh parse.
+/// Coarse subcommand bucket for facts row 1, using shared tokenization
+/// (#781).
 fn jev_approve_subcommand_class(tokens: &[String]) -> u32 {
     const READ: &[&str] = &[
         "get", "list", "show", "status", "log", "diff", "describe", "view", "inspect", "search",
@@ -264,12 +246,8 @@ const JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS: &[&str] =
 const JEV_APPROVE_INLINE_CODE_INTERPRETERS: &[&str] =
     &["python", "python3", "perl", "ruby", "node", "nodejs"];
 
-/// Review fix (issue #781, MAJOR): whether `program` (bare, lowercased --
-/// [`sql_program_name`]'s own output) or `tokens` name a shell, an
-/// always-opaque wrapper, dot-sourcing (`.`), or an inline-code interpreter
-/// invocation -- the single predicate [`jev_approve_program_is_refused`]
-/// and [`jev_approve_facts`]'s own wrapper flag both share, so the two can
-/// never drift on what counts as a wrapper.
+/// Share one opaque-wrapper predicate between admission and risk facts
+/// so they classify shells, eval and inline interpreters consistently (#781).
 fn jev_approve_is_eval_or_shell_wrapper(program: &str, tokens: &[String]) -> bool {
     program == "."
         || JEV_APPROVE_SHELL_PROGRAMS.contains(&program)
@@ -278,16 +256,8 @@ fn jev_approve_is_eval_or_shell_wrapper(program: &str, tokens: &[String]) -> boo
             && tokens.iter().skip(1).any(|t| t == "-c" || t == "-e"))
 }
 
-/// Review fix round 2 (issue #781, structural): programs that are always
-/// opaque or indirect regardless of arguments, beyond
-/// [`JEV_APPROVE_SHELL_PROGRAMS`]/[`JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS`] --
-/// a process/argv wrapper (`builtin`), PowerShell's own eval/process-launch
-/// surface (`iex`, `invoke-expression`, `start-process`, `invoke-command`),
-/// shell built-ins that install caller-controlled behaviour rather than
-/// running one visible command (`trap`, `alias`), remote/relay execution
-/// (`ssh`, `scp`, `nc`, `ncat`, `socat`, `telnet`), and embeddable-script or
-/// command interpreters this module had not previously named (`osascript`,
-/// `lua`, `deno`, `bun`, `php`, `tclsh`, `awk`, `gawk`, `expect`).
+/// Always-opaque dispatch, eval, remote execution and interpreter programs
+/// cannot qualify for lowering, regardless of their arguments (#781).
 const JEV_APPROVE_EXTRA_WRAPPER_PROGRAMS: &[&str] = &[
     "builtin",
     "iex",
@@ -313,17 +283,9 @@ const JEV_APPROVE_EXTRA_WRAPPER_PROGRAMS: &[&str] = &[
     "expect",
 ];
 
-/// Review fix round 2 (issue #781, structural): destructive or
-/// service/schedule-altering programs [`command_is_destructive`] does not
-/// itself recognize (it only knows `rm`/VCS/orchestrator/distribution
-/// shapes) -- refused unconditionally, since none of them has a routine,
-/// non-destructive everyday form worth preserving here. `mkfs*`, `rsync
-/// --delete*`, and `reg delete` are handled as their own conditions in
-/// [`jev_approve_program_is_refused`], not listed here. `kill` is here too
-/// (beyond the review's own named list): `SHIPPED_POSTURE_ASK` covers
-/// `taskkill`/`pkill`/`killall`/`Stop-Process` but never bare `kill`, so
-/// `nohup kill -9 1` -- one of the review's own launcher-prefix examples --
-/// would otherwise clear every other check here.
+/// Destructive or service-changing programs beyond the ordinary classifier
+/// are ineligible for lowering; include bare `kill`, which ordinary Ask
+/// patterns do not cover (#781).
 const JEV_APPROVE_DESTRUCTIVE_PROGRAMS: &[&str] = &[
     "shred",
     "srm",
@@ -341,19 +303,9 @@ const JEV_APPROVE_DESTRUCTIVE_PROGRAMS: &[&str] = &[
     "kill",
 ];
 
-/// Review fix round 2: whether `program`/`tokens` name a program
-/// [`jev_approve_lower_is_simple_enough`] refuses outright -- every shell/
-/// eval/interpreter wrapper [`jev_approve_is_eval_or_shell_wrapper`]
-/// already refuses, plus [`JEV_APPROVE_EXTRA_WRAPPER_PROGRAMS`]
-/// unconditionally, plus [`JEV_APPROVE_DESTRUCTIVE_PROGRAMS`]
-/// unconditionally, plus `mkfs*` (prefix match, covers `mkfs.ext4` and
-/// similar), `rsync` only when it carries a `--delete*` flag (its ordinary,
-/// non-deleting form is everyday sync work), and `reg` only with a
-/// `delete` subcommand (the same condition `SHIPPED_POSTURE_ASK`'s own
-/// `reg delete*` glob already narrows to). Shared by the outer-command
-/// check and the suffix-walk in [`jev_approve_lower_is_simple_enough`], so
-/// a launcher prefix (`nohup shred -u f`) cannot hide one of these programs
-/// any more than it can hide a deterministically ruled one.
+/// Refuse lowering for wrappers or destructive programs, including
+/// `mkfs*`, deleting `rsync` and `reg delete`. Apply to every possible
+/// launcher suffix, so an outer wrapper cannot hide the real program (#781).
 fn jev_approve_program_is_refused(program: &str, tokens: &[String]) -> bool {
     if jev_approve_is_eval_or_shell_wrapper(program, tokens)
         || JEV_APPROVE_EXTRA_WRAPPER_PROGRAMS.contains(&program)
@@ -375,16 +327,8 @@ fn jev_approve_program_is_refused(program: &str, tokens: &[String]) -> bool {
     false
 }
 
-/// Review fix round 2 (issue #781, structural): whether any ARGUMENT token
-/// (`tokens[1..]`) looks code-bearing rather than an ordinary flag or
-/// value -- contains whitespace (a quoted multi-word string, already
-/// dequoted by [`sql_tokens`]), `(`, `)`, `{`, `}`, or `@`, or is itself
-/// `-e`/`-c`/`/c` immediately followed by another token (an inline-code
-/// flag for an interpreter this module does not name elsewhere). Covers
-/// `ssh host '...'`, `trap '...' EXIT`, `alias x='...'`, `lua -e '...'`,
-/// `osascript -e '...'`, `Start-Process ... -ArgumentList '...'`,
-/// `iex (...)`, and any other shape carrying a quoted or code-like payload
-/// this predicate's callers cannot otherwise see past.
+/// Treat code-like arguments, quoted multiword values and inline-code
+/// flags as opaque; lowering requires a visible simple command (#781).
 fn jev_approve_has_code_bearing_argument(tokens: &[String]) -> bool {
     if tokens.len() <= 1 {
         return false;
@@ -404,57 +348,13 @@ fn jev_approve_has_code_bearing_argument(tokens: &[String]) -> bool {
     false
 }
 
-/// Review fix (issue #781, CRITICAL) plus review fix round 2 (structural):
-/// `approve_allow` may lower ONLY a "simple" command -- decided design, not
-/// to be relaxed without a new review. The deterministic fold
-/// ([`evaluate_candidates`]) keeps the FIRST candidate at a tied verdict
-/// rank, so an unmatched leading segment can hide a later MATCHED dangerous
-/// one even though the final `Outcome::matched` is `None` -- `foo-unknown;
-/// rm -rf ~` is exactly this shape (verified live: both segments are
-/// individually `ask`/`no rule matched` under `zirv ctx safety explain
-/// --mode headless`, and the whole command's own `Outcome` still carries
-/// `matched: None`). Restricting `approve_allow` to a single, unwrapped,
-/// unpiped, unredirected, non-substituting, non-env-prefixed,
-/// non-shell/eval/interpreter, non-code-bearing-argument segment removes
-/// the ambiguity at its root rather than patching the fold itself.
-///
-/// Round 2: a bare "not a shell/eval/interpreter" check on `tokens[0]`
-/// alone is still bypassable by a LAUNCHER prefix (`nohup`, `timeout N`,
-/// `nice -n N`, `command`, `time`, `stdbuf ...`, `setsid`, `caffeinate`,
-/// `ionice`, ...) that shifts the real program past every check that only
-/// looks at `tokens[0]` -- verified live for `nohup rm -rf ...`, `timeout 5
-/// git reset --hard`, `nohup sh -c 'rm -rf ~'`, and more, all reaching this
-/// gate as `ask`/no matched rule. This is defeated STRUCTURALLY, not by
-/// naming launchers: for every `i` in `1..tokens.len()` (round 3: walking
-/// EVERY suffix, not a bounded window -- a `min(tokens.len(), 6)` cap still
-/// missed `nice -n 5 stdbuf -o0 -e0 -i0 sh script.sh`, where the real
-/// program sits at token index 7), the SAME deterministic path the hook
-/// itself uses ([`evaluate`], no Jev) runs again on the suffix
-/// `tokens[i..]`, and the suffix is refused on a matched rule, a `Deny`,
-/// `command_is_destructive`, a network program, a privilege-escalation
-/// program, a refused program ([`jev_approve_program_is_refused`]), or a
-/// code-bearing argument ([`jev_approve_has_code_bearing_argument`]) --
-/// generic over ANY launcher prefix, named here or not, because it asks the
-/// real policy rather than enumerating launchers.
-///
-/// Round 3: the checks above all reason about DEQUOTED tokens, so a raw
-/// character [`sql_tokens`] treats specially -- `\`, `?`, `*`, `[`, `]`,
-/// `$`, `'`, `"`, `~`, `` ` ``, or a newline -- can still misdirect every
-/// program/argument comparison above without the RESULTING string ever
-/// looking dangerous itself: a backslash-split program name (`r\m -rf ...`,
-/// `gi\t push --force ...`), a glob standing in for the real name (`/bin/r?
-/// -rf ...`, `/bin/r[m] -rf ...`), or an unexpanded `$IFS` standing in for a
-/// space (`rm$IFS-rf$IFS/Users/x/proj`) all compare unequal to `"rm"`/
-/// `"git"` as plain strings while a real shell still executes them as such.
-/// None of this module's classifiers interpret shell expansion, so the only
-/// sound answer is to refuse outright whenever the RAW command contains any
-/// of these characters at all, before any other check runs.
-///
-/// `jev_approve_escalate` (the `Allow` -> `Ask` direction) is UNAFFECTED:
-/// widening what may be escalated is always safe, so this gate exists only
-/// on the lowering path. Called BEFORE any Jev call, so an ineligible
-/// command never even builds a facts row -- see
-/// [`apply_jev_approve_outcome`]'s own match guard.
+/// Lower only a single simple command with no shell syntax, dynamic
+/// expansion, wrapper, code-bearing argument or destructive inner program.
+/// A tied worst-of-candidates fold can leave `matched: None` even when a
+/// later segment matched a dangerous rule; check every token suffix through
+/// deterministic policy to defeat arbitrary launcher prefixes. Reject raw
+/// shell metacharacters before tokenization because the scanner cannot
+/// prove what an actual shell will execute (#781).
 fn jev_approve_lower_is_simple_enough(
     cfg: &CtxConfig,
     mode: super::adapters::LaunchMode,
@@ -536,33 +436,10 @@ fn jev_approve_lower_is_simple_enough(
     true
 }
 
-/// Issue #781: the one, bounded, numeric-only projection of `command` both
-/// `[jev] approve`/`approve_allow` questions ask about -- see
-/// [`JEV_APPROVE_ESCALATE_INSTRUCTIONS`]/[`JEV_APPROVE_LOWER_INSTRUCTIONS`]
-/// for the legend. Reuses this module's own tokenizer ([`sql_tokens`]/
-/// [`sql_program_name`]), segmenter ([`split_segments`]/[`split_segments_
-/// with_pipe_marker`]/[`normalize_segments`]), write-target resolver
-/// ([`write_targets_confined`]/[`segment_redirect_targets`]), and
-/// destructive/network classifiers ([`command_is_destructive`]/
-/// [`is_network_program`]) rather than re-deriving any of them; the
-/// secret-placeholder count reuses the #466 detector
-/// ([`super::obfuscate::obfuscate`]) the same way. Only
-/// [`jev_approve_program_class`]/[`jev_approve_subcommand_class`]/
-/// [`jev_approve_path_scope`]'s own bucket tables, and the wrapper flag
-/// ([`jev_approve_is_eval_or_shell_wrapper`]), are new.
-///
-/// Review fix (issue #781, MAJOR): the writes/deletes/network/privilege
-/// flags, path-scope class, and the wrapper flag are folded (OR/MAX) over
-/// EVERY candidate [`normalize_segments`] finds -- the same candidate
-/// expansion [`evaluate_candidates`] itself walks (top-level segments plus
-/// nested shell/env-wrapper children) -- never derived once from the outer
-/// command's own leading token alone. A single-token scope made
-/// `eval "$(curl ...)"` and an innocuous `mytool "$(date)"` project
-/// IDENTICAL facts (and so share a cache entry), and silently missed a
-/// dangerous LATER segment of a compound command entirely. `program_class`/
-/// `subcommand_class` (row indices 0/1) stay derived from the outer
-/// command's own leading token: they describe its entry point, not its
-/// overall risk, which the folded flags below already carry.
+/// Build bounded numeric Jev facts using shared tokenization and safety
+/// classifiers. Fold risk flags across every normalized candidate so later
+/// segments and nested commands cannot disappear into the outer program
+/// class or share an unsafe cache entry (#781).
 fn jev_approve_facts(command: &str, scratchpad_roots: &[String]) -> Vec<u32> {
     let bare = collapse_whitespace(command);
     let tokens = sql_tokens(&bare).unwrap_or_default();
@@ -638,13 +515,8 @@ fn jev_approve_facts(command: &str, scratchpad_roots: &[String]) -> Vec<u32> {
     ]
 }
 
-/// Issue #781 follow-up (operator decision, benchmark evidence): the fixed,
-/// narrow table of read-only inspection programs eligible to skip the Jev
-/// escalate call entirely -- see [`jev_approve_is_read_only_local`]'s own
-/// doc comment. Deliberately excludes test runners and interpreters
-/// (`pytest`, `python`, `cargo`, `npm`, `node`, ...): those execute code and
-/// must keep asking Jev. `git` and `find` are handled by their own
-/// subcommand/flag-aware predicates below rather than a bare name match.
+/// Fixed local inspection programs that skip escalation; interpreters and
+/// test runners execute code and remain subject to Jev (#781).
 const JEV_APPROVE_READ_ONLY_PROGRAMS: &[&str] = &[
     "grep", "rg", "cat", "head", "tail", "wc", "ls", "pwd", "echo", "less", "more", "file", "stat",
     "basename", "dirname", "which", "where", "type", "tree", "diff", "printf", "realpath",
@@ -756,42 +628,10 @@ fn jev_approve_program_is_read_only(program: &str, tokens: &[String]) -> bool {
     }
 }
 
-/// Issue #781 follow-up (operator decision, benchmark evidence): `[jev]
-/// approve` made a synchronous Jev call on every deterministically-ALLOWED
-/// Bash command, including plain read-only inspection -- in a benchmark
-/// round every one of 23 escalations was a false positive on a command like
-/// `grep -n ... | head -5`. This predicate is consulted BEFORE
-/// [`jev_approve_escalate`] ever builds a facts row or calls Jev: when it
-/// returns `true` the deterministic `Allow` is returned unchanged, with no
-/// Jev call and no recorded effect -- see [`apply_jev_approve_outcome`]'s
-/// own match guard.
-///
-/// Conservative by construction, reusing this module's own tokenizer/
-/// segmenter/classifiers rather than a parallel one: [`command_substitution_
-/// spans`] (no substitution), a literal scan for heredoc/process-substitution
-/// syntax, [`split_segments_with_pipe_marker`] (segmentation -- every
-/// non-leading segment MUST be pipe-joined; a `;`/`&&`/`||`/newline/
-/// background `&` join can smuggle in an unrelated later command, so any of
-/// those disqualifies the whole command), [`segment_redirect_targets`] (no
-/// redirection to a file on any segment), [`sql_tokens`]/[`sql_program_
-/// name`] (tokenizing), [`is_shell_identifier_assignment`] (no env-prefix
-/// assignment), [`jev_approve_is_eval_or_shell_wrapper`]/[`jev_approve_has_
-/// code_bearing_argument`] (the #781 wrapper/code-argument checks),
-/// [`command_is_destructive`]/[`is_network_program`] (the existing delete/
-/// network classifiers), and [`jev_approve_path_scope`] (the #781 path-scope
-/// bucket -- required to be exactly 0, i.e. no credential path, no root-wide
-/// or whole-home reference, and no write target at all) on every segment.
-/// Only after every one of those checks passes is the segment's own program
-/// checked against [`jev_approve_program_is_read_only`]'s fixed allowlist.
-///
-/// Anything this predicate cannot positively confirm falls through to
-/// `false`, which keeps calling Jev -- the issue's own "anything uncertain
-/// is NOT read-only" rule.
-///
-/// `pub(crate)`: also reused by `hook::scope_guard_shell_checkpoint_note`
-/// (with `scratchpad_roots: &[]`, conservative rather than duplicating this
-/// classifier) to skip its own `git status` re-query for a command that
-/// cannot itself have produced a tracked-file change.
+/// Skip Jev escalation only for a proven local read-only command or
+/// pipeline. Reject other separators, substitutions, redirections, code
+/// arguments, dynamic scopes and unknown programs; uncertainty still calls
+/// Jev. Also used to avoid needless scope checkpoint queries (#781).
 pub(crate) fn jev_approve_is_read_only_local(command: &str, scratchpad_roots: &[String]) -> bool {
     if command.contains(['\\', '$', '`', '\n']) {
         return false;
@@ -851,9 +691,8 @@ pub(crate) fn jev_approve_is_read_only_local(command: &str, scratchpad_roots: &[
     true
 }
 
-/// Issue #781 direction 1 (`[jev] approve`): may only ESCALATE. Called only
-/// when `outcome.verdict == Allow` and `cfg.jev.approve` is on -- see
-/// [`apply_jev_approve_outcome`]'s own doc comment.
+/// Jev may add a prompt to Allow, never remove an explicit policy prompt or
+/// Deny through this escalation path (#781).
 fn jev_approve_escalate(
     cfg: &CtxConfig,
     state: &super::state::StateDir,
@@ -939,15 +778,8 @@ fn jev_approve_escalate(
     }
 }
 
-/// Issue #781 direction 2 (`[jev] approve_allow`): may only LOWER. Called
-/// only when `outcome.verdict == Ask`, `outcome.matched.is_none()` (the
-/// plain unmatched-command mode default -- an explicit `deny`/`ask` rule,
-/// built-in, operator, or repo, always carries a matched rule, so this
-/// keeps every one of them, and the hard-deny list, out of reach),
-/// [`jev_approve_lower_is_simple_enough`] (review fix, issue #781
-/// CRITICAL: `matched.is_none()` alone is NOT enough -- see that
-/// function's own doc comment for why), and both `cfg.jev.approve`/
-/// `approve_allow` are on -- see [`apply_jev_approve_outcome`].
+/// Lower only an unmatched-default Ask for a simple command; explicit
+/// rules and Deny remain outside Jev's lowering authority (#781).
 fn jev_approve_lower(
     cfg: &CtxConfig,
     state: &super::state::StateDir,
@@ -1033,30 +865,9 @@ fn jev_approve_lower(
     }
 }
 
-/// Issue #781: the Jev-gated safety-hook risk check, called exactly once,
-/// strictly after every deterministic adjustment `run_check_hook_with_
-/// verdict` makes -- so Jev only ever sees (and can only ever adjust) the
-/// FINAL deterministic verdict, never one a later guard (the identical-
-/// failing-command breaker, the orchestrator-write posture) might still go
-/// on to override. Follow-up (operator decision, benchmark evidence): a
-/// deterministic `Allow` that [`jev_approve_is_read_only_local`] confirms is
-/// read-only and confined to the worktree/scratchpad is returned unchanged
-/// with NO Jev call at all -- `approve` never asks Jev about a `grep`/`cat`/
-/// `git status`-shaped command in the first place. Otherwise, `approve` may
-/// only ESCALATE `Allow` to `Ask`;
-/// `approve_allow` (effective only when `approve` is ALSO on) may only
-/// LOWER an unmatched-default, SIMPLE `Ask` to `Allow` -- never a hard
-/// `Deny`, never an `Ask` that carries any matched rule at all, and never a
-/// compound/piped/redirected/substituting/env-prefixed/shell-or-eval-
-/// wrapped command (review fix, issue #781 CRITICAL -- see
-/// [`jev_approve_lower_is_simple_enough`]'s own doc comment: the
-/// deterministic fold can hide a later MATCHED dangerous segment behind an
-/// earlier unmatched one at a tied verdict rank, so `matched.is_none()`
-/// alone is not a safe enough test). A `Deny` verdict is never considered
-/// at all: the `match` below has no arm for it. Both keys off, the verdict
-/// is `Deny`, an `Ask` carries a matched rule, or an unmatched `Ask` is not
-/// simple enough: zero cost, no `jev::available` check, no facts built --
-/// byte-identical to today.
+/// Apply Jev once after deterministic guards. Proven local reads skip Jev;
+/// escalation may only add Ask, and lowering applies only to simple,
+/// unmatched-default Ask. Deny and explicit rules remain final (#781).
 pub(super) fn apply_jev_approve_outcome(
     cfg: &CtxConfig,
     state: &super::state::StateDir,

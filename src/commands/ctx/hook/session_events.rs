@@ -52,15 +52,8 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
                 observed_at: None,
             },
         );
-        // Issue #379: a compaction is also the last thing anyone hears from a
-        // session until it comes back, and no adapter emits a
-        // compaction-FINISHED event zirv can wait on for codex at all. So the
-        // start is recorded on the attention axis too: it outranks the
-        // `Working` a prompt hook left behind (both are `AdapterHook`, this
-        // one is later), which is what stops `zirv ctx status` from reporting
-        // a wedged compaction as "working (user prompt submitted)". It clears
-        // itself the moment any adapter/supervisor observation lands again --
-        // see `attention::compose`'s own clearing rule.
+        // Record compaction start as attention because no reliable finished
+        // event follows; a later prompt clears it when work resumes (#379).
         let _ = crate::commands::ctx::attention::record(
             &state,
             &attention_short(env, &session),
@@ -104,22 +97,8 @@ fn producing_short_id(path: &std::path::Path) -> Option<String> {
     (!short.is_empty()).then(|| short.to_string())
 }
 
-/// Issue #326 B9: whether `handoff_path`'s own producing session is a
-/// DIFFERENT session from the one resuming/clearing right now, and that
-/// producer is still alive -- the case where injecting would leak up to tens
-/// of KiB of another, currently-active session's own context into this one,
-/// rather than the intended "hand off from a session that already ended"
-/// continuity. `current_short` is derived from the SAME identity precedence
-/// every other hook handler in this file already uses (`SESSION_ENV` -- this
-/// process's own zirv identity when supervised -- falling back to the
-/// harness's native `payload.session_id`), so a session's own supervised
-/// restart (which mints a fresh id, but is not what this guard exists to
-/// catch) is unaffected: this only refuses when the file names a DIFFERENT
-/// short id AND the registry says that other short id is still `Live` in
-/// THIS repo. A producer this repository's registry has no record of at all
-/// (the common case: a crashed or long-exited session) is never refused --
-/// this is a narrowing guard against a proven-live conflict, not a
-/// whitelist.
+/// Inject a handoff only when its producer is no longer a different
+/// live session; otherwise its active context could leak here (#326).
 fn handoff_produced_by_another_live_session(
     state: &StateDir,
     repo: &std::path::Path,
@@ -142,22 +121,8 @@ fn handoff_produced_by_another_live_session(
         })
 }
 
-/// The latest stored handoff for `payload`'s repo, labeled and screened for
-/// injection (`handoff::labeled_for_injection_with_working_set` -- the same
-/// shared assembly helper `resume::resume_prompt` uses, so the two paths
-/// cannot drift), or `None` when the state dir cannot be resolved, no
-/// handoff exists, the latest one is not usable (`Handoff::is_usable`), or
-/// (issue #326 B9) it was produced by a DIFFERENT session that is still
-/// alive in this same repo -- see `handoff_produced_by_another_live_session`.
-///
-/// Issue #281: no longer purely read-only. The base handoff read is still
-/// idempotent (repeated resumes re-read the same file and re-inject the
-/// same text), but the working-set manifest folded in alongside it is
-/// re-collected fresh every call (`handoff::working_set` does its own I/O,
-/// never cached), and the crash-interruption witness, when present, is
-/// CONSUMED by `sessions::take_interrupted_in_flight` -- it clears the
-/// marker it read, so a second call for the same crash reports the base
-/// handoff and manifest again but never re-emits the witness block.
+/// Load and label the latest handoff through the shared injection guard;
+/// unknown or unsafe state produces no injected context.
 fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Option<String> {
     let state = StateDir::resolve(env).ok()?;
     let repo = payload.repo();
@@ -177,12 +142,8 @@ fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Op
         crate::commands::ctx::handoff::working_set(&state, &repo, &payload.session_id);
     let crash_witness = crate::commands::ctx::sessions::take_interrupted_in_flight(&state, &repo)
         .map(|in_flight| crate::commands::ctx::handoff::render_crash_witness(&in_flight));
-    // Issue #272 review round 2: this function has no `CtxConfig` threaded
-    // to it (unlike `resume::resume_prompt`, its sibling on the other
-    // injection path), so it resolves one itself here, the same
-    // `CtxConfig::load` every other call site uses -- falling back to the
-    // built-in default on any load error, never failing the injection over
-    // a screening-threshold lookup.
+    // Resolve config for this injection path; failure uses built-in defaults
+    // rather than blocking the session (#272).
     let screen_thresholds = CtxConfig::load(&repo, env)
         .map(|cfg| cfg.screen.thresholds())
         .unwrap_or_default();
@@ -201,9 +162,8 @@ fn latest_handoff_for_injection(payload: &HookPayload, env: EnvLookup<'_>) -> Op
 /// the prior one -- can use a handoff.
 pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
-    // Issue #349: a session starting (fresh, resumed, cleared or post-
-    // compact) is `Working` again regardless of source -- best-effort, like
-    // every other observation here.
+    // A fresh, resumed or post-compaction prompt proves work resumed;
+    // replace stale attention with Working (#349).
     if let Ok(state) = StateDir::resolve(env) {
         let _ = crate::commands::ctx::attention::record(
             &state,
@@ -226,14 +186,12 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
-// -- SubagentStop: gate a subagent's own result before it reaches the lead
-// (issue #774) ----------------------------------------------------------
+// -- SubagentStop: gate the subagent result before it reaches the lead (#774)
 
 const SUBAGENT_STOP_GATE_RECORD_VERSION: u32 = 1;
 
-/// Mirrors `MissingTestsGateRecord`'s own shape/contract exactly: this gate
-/// may block a given subagent's own final turn at most once, ever, the same
-/// "capped at one block per subagent" rule issue #774 itself specifies.
+/// Persist the block cap so a retry cannot loop indefinitely on the same
+/// subagent's report (#774).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SubagentStopGateRecord {
     #[serde(default)]
@@ -241,10 +199,8 @@ struct SubagentStopGateRecord {
     blocked: bool,
 }
 
-/// `dispatch_key` names the ONE subagent dispatch this record caps -- see
-/// `run_subagent_stop`'s own doc comment for which payload field that is and
-/// why (`agent_id`, falling back to `agent_transcript_path` then
-/// `transcript_path`), never the lead session's own `session_id`.
+/// Key the cap to one dispatch, not the lead session shared by all
+/// subagents (#774).
 fn subagent_stop_gate_record_path(state: &StateDir, dispatch_key: &str) -> PathBuf {
     state.scoring().join(format!(
         "{:016x}-subagent-stop-gate.json",
@@ -280,10 +236,8 @@ fn save_subagent_stop_gate_record(path: &Path, record: &SubagentStopGateRecord) 
 /// on every single subagent completion.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SubagentTranscriptScan {
-    /// The Task dispatch's own first user message -- what the subagent was
-    /// actually asked for, read from its OWN transcript rather than any
-    /// state this process shares with whatever `PreToolUse` invocation
-    /// dispatched it (a separate process, long since exited).
+    /// Read the subagent's first user message from its own transcript; the
+    /// dispatching hook process cannot share transient state with this one.
     first_user_text: String,
     /// The last assistant text seen -- the subagent's own final report, in
     /// the ordinary case where its last turn ends in words rather than a
@@ -357,11 +311,8 @@ fn scan_subagent_transcript(transcript: &Path) -> Option<SubagentTranscriptScan>
     Some(scan)
 }
 
-/// Explicit, literal completion phrases only -- issue #774's own "claimed
-/// tests actually run" check must never fire on ordinary prose that merely
-/// mentions testing (a false positive here blocks a subagent that never
-/// claimed anything), so this deliberately matches a short, high-confidence
-/// list rather than any looser pattern.
+/// Match only literal completion claims; ordinary discussion of testing
+/// must not trigger a false block (#774).
 const TEST_CLAIM_PHRASES: &[&str] = &[
     "tests pass",
     "tests passed",
@@ -373,9 +324,8 @@ const TEST_CLAIM_PHRASES: &[&str] = &[
     "tests ran successfully",
 ];
 
-/// Issue #774's own three checks, in the order documented on
-/// [`run_subagent_stop`]. Returns the first one that fires, never more than
-/// one -- claude reads a single `reason` per decision anyway.
+/// Return only the first result-contract failure: the hook response carries
+/// one reason and the subagent gets one actionable retry (#774).
 fn subagent_stop_violation(scan: &SubagentTranscriptScan) -> Option<String> {
     let final_report = scan.final_assistant_text.trim();
     if final_report.is_empty() {
@@ -436,47 +386,13 @@ fn subagent_stop_violation(scan: &SubagentTranscriptScan) -> Option<String> {
     None
 }
 
-/// Claude's `SubagentStop` hook (issue #774): a cheap, deterministic gate on
-/// a native `Task` subagent's own final report, before it reaches the lead.
-/// Three checks against the SUBAGENT's own transcript -- a declared OUTPUT
-/// CONTRACT with no JSON reply at all, a claimed test run with no matching
-/// tool call anywhere in the transcript, and a `BLOCKED` report with no
-/// reason after it. The first one to fire blocks with
-/// `{"decision":"block","reason":...}` -- claude's documented contract for
-/// retrying the SAME subagent turn on a `SubagentStop` block, mirroring
-/// `run_stop`'s own real block envelope (issue #690's "Stop hook block
-/// decisions actually block" fix) -- and nothing else does.
-///
-/// Review fix (post-#774): the SUBAGENT's own transcript is `payload.
-/// agent_transcript_path`, NOT `payload.transcript_path` -- Claude's own
-/// hooks documentation (code.claude.com/docs/en/agent-sdk/hooks) states
-/// `transcript_path` on this event is the LEAD session's main transcript,
-/// the same file every subagent dispatched within that session shares, and
-/// `agent_transcript_path` is the subagent's own. Reading the wrong one
-/// would check the lead's own conversation, never the subagent's. Falls
-/// back to `transcript_path` only when a payload omits `agent_transcript_
-/// path` (an older harness, or a projected non-claude agent).
-///
-/// Capped at one block per subagent, ever (`SubagentStopGateRecord`).
-/// Review fix (post-#774): keyed by `payload.agent_id` -- claude's own
-/// unique id for the specific subagent dispatch, per the same
-/// documentation -- not `session_id`, which is the LEAD session's own id
-/// and is IDENTICAL across every subagent it dispatches ("subagents work
-/// within a single session"). Keying on `session_id` meant one subagent's
-/// block silently exempted every OTHER subagent in the same lead session
-/// forever. `agent_transcript_path` is the fallback when `agent_id` is
-/// missing (also unique per dispatch); `transcript_path` -- the lead's own,
-/// shared value -- is the last resort, no worse than this gate's previous
-/// behavior, for a payload carrying neither.
-///
-/// A subagent retried after a block gets exactly one more chance, never a
-/// loop. Fails open on every doubt -- an unparseable payload, a missing/
-/// unreadable transcript, `stop_hook_active`, the operator's own
-/// `[subagent_stop_gate] enabled = false` (narrow-only, the identical T9
-/// fold `missing_tests_gate.enabled` uses), an unresolvable state dir, or an
-/// already-spent block -- exits 0 with nothing on stdout, exactly like every
-/// other hook in this file. Nothing here may `unwrap`, `expect` or return
-/// `Err`.
+/// Check a native subagent's own report before the lead receives it:
+/// missing declared JSON, claimed tests without matching tool calls, or
+/// `BLOCKED` without a reason. Block at most once per dispatch and fail
+/// open on missing data or inactive gate. Use `agent_transcript_path` and
+/// `agent_id`, since ordinary transcript/session fields belong to the lead
+/// and are shared by its subagents (#774). Nothing here may `unwrap`,
+/// `expect` or return `Err`.
 pub fn run_subagent_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let Ok(payload) = HookPayload::parse(stdin) else {
         return Ok(0);
@@ -532,9 +448,8 @@ pub fn run_subagent_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
-/// Field names codex uses for the rollout path, most specific first. Populate
-/// from the verified notes file during Task A9/A10; the claude spelling stays
-/// last so a hook registered on either agent keeps working.
+/// Codex rollout-path keys in preference order; Claude's transcript key
+/// remains last for hooks registered with either agent.
 const NOTIFY_TRANSCRIPT_KEYS: &[&str] = &["rollout_path", "session_file", "transcript_path"];
 
 /// Maps an agent's notify payload onto the shape the scorer needs. Codex does
@@ -586,15 +501,11 @@ pub fn notify_shape(payload: &str) -> String {
 }
 
 pub fn run_notify<W: Write>(w: &mut W, payload: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
-    // Codex passes its notify payload as an argument on some versions and on
-    // stdin on others (see docs/superpowers/notes/2026-07-31-codex-cli-facts.md),
-    // so both routes land here.
+    // Codex sends notify payloads through argv or stdin depending on version;
+    // both routes must reach this handler.
     let Ok(mapped) = notify_payload_to_hook(payload) else {
-        // A hook never blocks the agent, so an unmapped payload is recorded
-        // rather than surfaced. The decision log is where a silent mismatch
-        // becomes visible. Issue #478: the shared notification service both
-        // classifies what the payload MEANT and bounds what may be written
-        // down about it (field names only, never values).
+        // Record unmapped payloads instead of blocking the agent; the shared
+        // notification service bounds logged content (#478).
         if let Ok(state) = StateDir::resolve(env) {
             let kind = crate::commands::ctx::lifecycle::notification_kind(payload);
             let _ = log::append(

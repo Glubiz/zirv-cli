@@ -41,17 +41,9 @@ pub(super) fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome 
     }
 }
 
-/// A3 (2026-09-06 audit): the operator's own `~/.zirv/` is the single
-/// configuration layer a repository may never contribute to (see `resolve`),
-/// and `zirv ctx permissions compile` is not the only way to reach it -- an
-/// ordinary redirection, copy, move or delete naming that path rewrites the
-/// policy governing the writer just as effectively. `Deny` for the same
-/// reason [`permissions_compile_write_deny_rule`] denies rather than asks: a
-/// headless-silenced `Ask` would be outrun by the broad `echo *`/`cp *`
-/// allow rules these spellings already match, and this runs after
-/// `evaluate_single` precisely so such an allow rule cannot short-circuit
-/// it. Reads stay silent, and a repository's own `.zirv/` is a different
-/// directory entirely.
+/// Deny writes to the operator `~/.zirv/` after ordinary rule evaluation:
+/// broad allow rules must not bypass protection of the policy layer itself.
+/// Reads and repo-local `.zirv/` writes remain unaffected.
 pub(super) fn apply_operator_config_outcome(command: &str, base: Outcome) -> Outcome {
     if base.verdict == Verdict::Deny {
         return base;
@@ -113,37 +105,9 @@ pub(super) fn apply_network_outcome(command: &str, base: Outcome) -> Outcome {
     }
 }
 
-/// `original` is the whole compound command `command` (this candidate) was
-/// split from -- see [`evaluate_candidate_outcome`]'s own doc comment. Used
-/// only to resolve a relative recursive-delete target against a leading `cd
-/// <dir>` segment ([`recursive_delete_confined_to_temp`]); every other rule
-/// here reasons about `command` alone, exactly as before.
-///
-/// Headless-denial bug (72-run sample: all 8 permission denials were
-/// recursive deletes of scratch the agent had just created, e.g. `rm -rf
-/// /tmp/ledgerlite_doc_test`, `cd /tmp && rm -rf lltest && ...`): the shipped
-/// `Bash(rm -rf *)` ASK posture cannot be answered at all under
-/// `--permission-mode dontAsk`, so it silently denies instead, costing a
-/// whole turn for cleanup the agent just created inside its own throwaway
-/// scratch directory. [`recursive_delete_confined_to_temp`] narrows this one
-/// case back to `Allow`.
-///
-/// `rm -rf` itself never reaches the fallback `Ask` this function builds at
-/// its own bottom: `"rm -rf *"`/`"rm -fr *"` are already explicit
-/// `Origin::BuiltIn` globs in `SHIPPED_POSTURE_ASK`, so `base` arrives here
-/// ALREADY `Ask` (matched, not the plain unmatched-command default) for
-/// every ordinary `rm -rf ...`. `overridable` is what lets this function
-/// still widen THAT case: only when the `Ask` it is being asked to
-/// reconsider is itself the shipped built-in `"rm -rf *"`/`"rm -fr *"` glob
-/// -- an operator's or a repository's own, deliberately narrower `ask` rule
-/// (`Origin::Operator`/`Origin::Repo`) is never widened, an existing `Deny`
-/// (e.g. a target naming `zirv`, `"rm -rf*zirv*"`, which wins by matching
-/// BEFORE this function ever runs) is never widened, and neither is a
-/// *different* built-in `Ask` that this same `rm -rf` command also happens
-/// to trip -- most notably `apply_credential_outcome`'s own `Origin::BuiltIn`
-/// `"<project secret file read>"` rule (e.g. `rm -rf /tmp/build-1234/.env`),
-/// which must keep asking rather than being silently widened to `Allow` by a
-/// helper that only meant to relax the recursive-delete posture.
+/// Reconsider only the shipped recursive-delete Ask for targets provably
+/// inside temp roots. Preserve operator/repo Ask, unrelated built-in Ask,
+/// credential checks and every Deny; `original` supplies a leading `cd`.
 pub(super) fn apply_recursive_delete_outcome(
     command: &str,
     original: &str,
@@ -179,15 +143,8 @@ pub(super) fn apply_recursive_delete_outcome(
     }
 }
 
-// ---------------------------------------------------------------------
-// Recursive delete of the caller's OWN temp-scratch directory (headless
-// `dontAsk` denial fix): a recursive delete is allowed, despite the shipped
-// ASK posture above, when every one of its own targets resolves -- lexically,
-// text only, no filesystem access, matching this whole module's contract --
-// STRICTLY below `std::env::temp_dir()` or the literal POSIX roots `/tmp`/
-// `/var/tmp` (Windows Git Bash maps `/tmp` onto its own temp directory, so a
-// headless agent's `rm -rf /tmp/...` targets a real scratch path there too).
-// ---------------------------------------------------------------------
+// Allow recursive deletion only when every target resolves lexically and
+// strictly below a temp root; unresolved paths retain the shipped Ask.
 
 /// The temp roots a recursive delete's targets may be confined to.
 /// `std::env::temp_dir()` covers the platform default (and any `TMPDIR`/
@@ -208,10 +165,8 @@ fn temp_delete_roots() -> Vec<String> {
     roots
 }
 
-/// Splits an absolute, forward-slash-normalized path into its root anchor
-/// (`"/"`, or a Windows drive prefix like `"C:/"`) and the rest -- `None` for
-/// anything not absolute in either sense, which this classifier then leaves
-/// exactly as restrictive as today rather than guess at a cwd.
+/// Split an absolute Unix or Windows path into root and remainder; reject
+/// relative paths rather than guessing the working directory.
 fn split_absolute_root(path: &str) -> Option<(&str, &str)> {
     if let Some(rest) = path.strip_prefix('/') {
         return Some((&path[..1], rest));
@@ -223,14 +178,8 @@ fn split_absolute_root(path: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Resolves `.`/`..` components AS TEXT, never touching the filesystem --
-/// this whole module's contract (see [`generated_path`]'s own NON-GOAL note).
-/// `None` when a `..` would climb above the root: there is nothing further
-/// up to pop, so the true target is unknowable from the text alone and this
-/// is treated as an escape rather than guessed at (e.g. `/tmp/../etc`
-/// resolves to `/etc`, which is NOT what escaping above `/tmp/`'s own root
-/// component would even mean here -- it simply lands outside every temp
-/// root, which the confinement check below then correctly refuses).
+/// Resolve path components lexically; reject `..` above the root because
+/// its target cannot be proven from command text.
 fn lexically_normalize_absolute(path: &str) -> Option<String> {
     let normalized = path.replace('\\', "/");
     let (root, rest) = split_absolute_root(&normalized)?;
@@ -259,16 +208,8 @@ fn path_strictly_below(path: &str, root: &str) -> bool {
     }
 }
 
-/// True when `target` -- one token of a recursive delete already confirmed
-/// by [`is_recursive_delete`] -- resolves, purely lexically, strictly below
-/// one of [`temp_delete_roots`]. A glob, shell variable, home (`~`), or
-/// command-substitution character leaves today's verdict untouched: none of
-/// those can be trusted from the text alone, so this returns `false` rather
-/// than guess at what the target actually expands to. A relative `target` is
-/// joined onto `cwd` (the compound's own leading `cd <dir>`, from
-/// [`recursive_delete_confined_to_temp`]) when present; with no `cwd` a
-/// relative target cannot be resolved at all and this returns `false`,
-/// leaving it exactly as restrictive as today.
+/// Prove a recursive-delete target is strictly below a temp root. Dynamic
+/// paths fail; relative targets require a known leading `cd` directory.
 fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
     let target = strip_quotes(target);
     if target.is_empty() || target.contains(['$', '`', '~', '*', '?']) {
@@ -292,31 +233,10 @@ fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
         .any(|root| path_strictly_below(&resolved, root))
 }
 
-/// Extracts a recursive delete's own target tokens: everything past the
-/// program name that is not itself one of that program's own flags. `None`
-/// when the command does not tokenize, or names a delete program this
-/// classifier does not recognize (kept in lock-step with
-/// [`normalized_delete_program`]'s own match arms via the `_ => None`
-/// fallback, so an unrecognized program is never silently treated as having
-/// zero targets).
-///
-/// Stops at the first shell chain-separator token (`&&`, `||`, `;`, `|`):
-/// [`normalize_segments`]'s candidate list always includes the WHOLE raw
-/// command as its own first candidate, alongside the split-apart segments
-/// `visit_executable_nodes` derives from it, so `command` here can be e.g.
-/// `rm -rf /tmp/x && mkdir -p /tmp/x && echo ok` in full -- the exact
-/// headless-agent-cleanup shape from the 72-run sample when the delete is
-/// the FIRST segment (no leading `cd` for `strip_known_root_cd_prefix` to
-/// eat). Without this, `rm`'s own "targets" would swallow the chained
-/// commands' tokens too (`"&&"`, `"mkdir"`, `"echo"`, `"ok"`, none of which
-/// are real delete targets), so [`recursive_delete_confined_to_temp`]'s
-/// "every target confined" check would always fail on those bogus entries
-/// and this whole-command candidate would stay `Ask` even though the actual
-/// `rm -rf` segment is confined -- outvoting the correctly-`Allow`ed split
-/// candidate in `evaluate_candidates`' worst-of-all-candidates fold. A
-/// legitimate `rm`/`del`/... invocation never carries a bare chain-separator
-/// token as its own argument, so stopping there loses nothing for the
-/// single-command case (the loop simply never reaches one).
+/// Extract only the delete command's targets, stopping at a shell chain
+/// separator. Whole-command candidates may include following commands,
+/// whose tokens must not be mistaken for delete targets and outvote a
+/// confined delete segment in the worst-of-candidates fold.
 fn delete_targets(command: &str) -> Option<Vec<String>> {
     let tokens = sql_tokens(&collapse_whitespace(command))?;
     let first = tokens.first()?;
@@ -338,14 +258,8 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
-/// The literal-`cd`-prefix parse shared by [`strip_known_root_cd_prefix`]
-/// (issue #168) and [`recursive_delete_confined_to_temp`] (this fix): a
-/// leading, single-token, non-dynamic `cd <path>` segment followed by `&&`,
-/// `;`, or a newline. Returns the normalized (backslash-free) path token and
-/// the untouched remainder; `None` for anything this text-only classifier
-/// cannot trust -- no leading `cd` at all, a `$`/backtick/`~`/glob path, a
-/// path containing `..` (a relative escape this classifier cannot
-/// re-resolve), or nothing chained after it.
+/// Parse a leading literal `cd <path>` with a following command; reject
+/// dynamic or escaping paths before using it as a confinement root (#168).
 pub(super) fn parse_leading_cd_segment(command: &str) -> Option<(String, String)> {
     let trimmed = command.trim_start();
     let rest = trimmed.strip_prefix("cd ")?;
@@ -370,17 +284,9 @@ pub(super) fn parse_leading_cd_segment(command: &str) -> Option<(String, String)
     Some((normalized, remainder.to_string()))
 }
 
-/// True when EVERY target of the recursive delete `candidate` (one segment
-/// of the whole compound `original`) resolves strictly below a temp root --
-/// see [`target_confined_to_temp`]. A relative target is resolved against
-/// `original`'s own leading `cd <dir>` prefix, found via
-/// [`parse_leading_cd_segment`] applied to `original` itself (NOT
-/// `candidate`: by the time `candidate` reaches here, [`normalize_segments`]
-/// has already split the `cd` and the delete into separate top-level
-/// candidates, so the `cd` is only ever recoverable from the original
-/// compound text). `false` when `candidate` names no target at all (an
-/// `is_recursive_delete` command always has at least one, but a delete
-/// program this classifier does not recognize could reach here with none).
+/// One unconfined target can delete outside scratch; require every target
+/// below a temp root. Recover a leading `cd` from the original compound
+/// because normalization removed it from the delete candidate.
 fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
     let Some(targets) = delete_targets(candidate) else {
         return false;
@@ -440,17 +346,8 @@ const SHELL_PIPE_WRAPPER_PROGRAMS: &[&str] = &[
 /// command string cannot make this classifier do unbounded work.
 const MAX_PIPE_WRAPPER_DEPTH: u8 = 8;
 
-/// Resolves the last pipeline stage's leading tokens past any
-/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] layers to the program that actually ends
-/// up executing -- `env sh`, `env -i VAR=x sh`, `sudo timeout 5 sh` all
-/// resolve to `sh`.
-///
-/// Not a shell parser: it only understands the wrapper's own leading flags
-/// (including separate values declared in `LAUNCHER_PREFIXES`), `env`'s leading
-/// `VAR=value` assignments, and `timeout`'s one mandatory DURATION positional before its
-/// command. Anything else just stops the unwrapping at whatever token it is
-/// looking at -- the fail-safe direction, since the caller then falls back
-/// to comparing the wrapper's own name, exactly the behavior this replaces.
+/// Unwrap known launchers to identify the executable in a pipeline stage.
+/// Unknown syntax stops unwrapping so safety cannot be inferred from a guess.
 fn unwrap_pipe_wrapper<'a>(tokens: &[&'a str], depth: u8) -> Option<&'a str> {
     let first = *tokens.first()?;
     let program = sql_program_name(first);
@@ -534,45 +431,10 @@ pub(crate) fn pipeline_stages(command: &str) -> Vec<String> {
     stages
 }
 
-/// Whether `command` pipes a network-fetching stage into a bare shell
-/// interpreter -- `curl ... | sh`, `wget ...|xargs sh`, no matter the
-/// whitespace around the `|` or which POSIX shell receives it. Purely local
-/// pipelines fall through to ordinary evaluation.
-///
-/// The whole-string glob patterns in `adapters::SHIPPED_POSTURE_DENY` only
-/// catch the exact spacing they spell out; this walks the actual pipeline
-/// stages and compares the last one's PROGRAM NAME instead, so no spacing/
-/// shell-name combination escapes it.
-/// The last stage's leading tokens are also resolved past any
-/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] layer (`| env sh`, `| sudo sh`, `| timeout
-/// 5 sh`, ...) via [`unwrap_pipe_wrapper`] before the program-name compare,
-/// so a wrapper cannot hide the real shell behind its own name.
-///
-/// Issue #326 adds one more transparent layer to that same resolution, on
-/// BOTH ends: a stage may be spelled `zirv ctx run --compact -- curl ...` or
-/// `... | zirv ctx run --compact -- sh`, and `zirv ctx run` is exactly the
-/// program it launches. This analyzer is the one place that has to be told,
-/// because it reasons about the RELATIONSHIP BETWEEN stages of a compound --
-/// something no single candidate in [`normalize_segments`] captures, so the
-/// inner argv being its own candidate does not help here the way it does for
-/// every other analyzer.
-/// Peels ANY chain of env-prefix ([`unwrap_env_prefix`]), launcher-prefix
-/// ([`unwrap_launcher_prefix`]) and `zirv ctx run --compact --` transparent-
-/// launcher ([`unwrap_compact_run_wrapper`]) layers off the front of one
-/// pipeline stage, bounded exactly like [`unwrap_pipe_wrapper`] so a
-/// deliberately long wrapper chain in an untrusted command string cannot make
-/// this loop do unbounded work.
-///
-/// Round-2 review finding: [`is_network_pipe_into_shell`] and
-/// [`is_network_fetching_stage`] used to call [`unwrap_compact_run_wrapper`]
-/// exactly once and never tried the env-prefix/launcher-prefix unwrappers at
-/// all, so `zirv ctx run --compact -- zirv ctx run --compact -- curl x | sh`
-/// (a second wrapper layer) and `env FOO=1 zirv ctx run --compact -- curl x
-/// | sh` (an env prefix in front of the wrapper) both left the resolved
-/// program name as `zirv`/`env` -- neither of which ever matches
-/// `curl`/`wget`/a shell -- a complete bypass of the pipe-to-shell Deny.
-/// Looping over all three unwrap layers here, on both pipeline ends, closes
-/// it without duplicating any of their own parsing.
+/// Detect network fetches piped into shells across spacing and wrapper
+/// variants. Unwrap env, launcher and `zirv ctx run --compact --` layers on
+/// both ends, within a fixed depth, so wrappers cannot hide either program
+/// from this compound-level Deny (#326).
 fn unwrap_pipeline_stage_wrappers(stage: &str) -> String {
     let mut current = stage.to_string();
     for _ in 0..MAX_PIPE_WRAPPER_DEPTH {
@@ -638,26 +500,11 @@ pub(super) fn apply_pipe_to_shell_outcome(command: &str, base: Outcome) -> Outco
     }
 }
 
-/// `find -exec`/`-ok` actions this classifier already knows are read-only
-/// (or close enough that raising them to `Ask` would just be everyday-work
-/// noise): the shipped `adapters::SHIPPED_POSTURE_ASK` comment names
-/// `-exec grep` as the motivating example for not blanket-asking on every
-/// `-exec`.
-///
-/// ADMISSION RULE (a security decision, not a style choice): a program
-/// belongs on this list ONLY if it cannot execute another program and
-/// cannot write outside the arguments explicitly handed to it on this
-/// command line -- no shell-escape, no `eval`/`system()`-style primitive, no
-/// `-exec`-like flag of its own, and no write/in-place mode (`-i`, a
-/// redirection built into the tool itself, ...). `awk` (`system()`, and
-/// piping to a command via `"cmd" | getline`/`print | "cmd"`) and GNU `sed`
-/// (the `e` command runs its argument as a shell command; `w`/`-i` write
-/// files) were REMOVED from this list on 2026-08-24 because both are
-/// documented GTFOBins command-execution primitives -- `find . -exec awk
-/// 'BEGIN{system("id")}' {} \;` and `find . -exec sed '1e id' {} \;` were
-/// classifying `Allow`, a complete escape from this module's ask-unless-
-/// proven-safe design. Any future addition needs the same audit spelled out
-/// here, not just "it looks like a reader".
+/// `find -exec` programs admitted without Ask only if they cannot spawn
+/// subprocesses or write via their own flags or language primitives.
+/// `awk` and `sed` have execution/write primitives and cannot qualify.
+/// A security decision, not a style choice: any future addition needs the
+/// same audit spelled out here, not just "it looks like a reader".
 const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
     "grep",
     "egrep",
@@ -682,13 +529,8 @@ const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
     "false",
 ];
 
-/// Whether `command` is a `find` invocation whose `-exec`/`-execdir`/`-ok`/
-/// `-okdir` action runs something NOT on [`FIND_EXEC_SAFE_PROGRAMS`] --
-/// `find -exec sh -c ...`, `find -exec chmod -R 777 ...`, an `-ok rm ...`,
-/// or any other action this module cannot prove is harmless. Ask-by-default
-/// unless proven safe, the inverse of the narrow deny-by-enumeration this
-/// classifier replaces -- see that constant's own doc comment for why the
-/// old blanket `find*-exec*` glob was removed in the first place.
+/// Ask for any `find -exec`/`-ok` action whose program is not proven safe;
+/// unknown executables cannot inherit an ordinary read verdict.
 fn is_risky_find_exec(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -757,28 +599,10 @@ pub(super) fn apply_distribution_outcome(command: &str, base: Outcome) -> Outcom
     }
 }
 
-/// Matches `command` against `policy` for one launch posture. For every raw
-/// or normalized executable candidate, the SQL classifier
-/// ([`sql_outcome`]) may adjust that candidate's answer within two strict
-/// rules before the most-restrictive-result fold:
-///
-/// - It may **narrow** to `Ask` whenever it cannot prove the statement
-///   read-only. A broad `Bash(psql *)` allow rule -- or, interactively, the
-///   permissive unmatched-command default -- must not become a way to run
-///   `DROP TABLE` unprompted.
-/// - It may **widen** to `Allow` only when no rule matched at all
-///   (`matched.is_none()`, i.e. the mode's own default was about to apply).
-///   An operator's or a repo's own `ask`/`deny` entry naming the client is an
-///   explicit statement about that client and the classifier does not
-///   overrule it; `Deny` is never overridden in any case.
-///
-/// `mode` still decides only the unmatched-command verdict -- see
-/// [`SafetyPolicy::default_verdict`]. Everything else about the pre-existing
-/// behaviour is unchanged: `command` is checked raw and per normalized
-/// segment, and the most restrictive outcome across all of them wins (see
-/// [`evaluate_candidates`]).
-///
-/// Pure: no clock, filesystem or environment access.
+/// Evaluate raw and normalized candidates, keeping the strictest verdict.
+/// SQL classification may narrow to Ask for unproven reads, or widen to Allow
+/// only when no explicit rule matched; it never overrides Deny or a configured
+/// Ask. Evaluation is pure.
 pub fn evaluate(
     policy: &SafetyPolicy,
     command: &str,
@@ -787,19 +611,9 @@ pub fn evaluate(
     evaluate_with_scratchpad_roots(policy, command, mode, &[], None, None, 0)
 }
 
-/// Same as [`evaluate`], but also threads `scratchpad_roots` down into the
-/// VCS classifier so a `git worktree remove --force` targeting the session's
-/// own scratchpad root (`target_is_confined`) can be recognized as agent-
-/// scoped cleanup rather than a destructive action on someone else's
-/// worktree, and `envelope` (issue #262) down into [`apply_envelope_outcome`]
-/// -- when present, its own restrictions apply on top of `policy`,
-/// regardless of `policy`'s own posture. Callers that already compute
-/// `scratchpad_roots` for other analyzers in the same hook evaluation
-/// (`run_check_hook_mode_with_env`, `run_explain`) use this instead of
-/// `evaluate` so the two stay consistent. Stays pure: `envelope` is an
-/// explicit parameter, never read from the process environment in here --
-/// see `evaluate_with_attestation_evidence`'s own `parse_envelope_env` call
-/// for where that reading actually happens.
+/// Evaluate with scratchpad and worker-envelope scope so both constraints
+/// apply to VCS cleanup and policy decisions. Keep the envelope explicit
+/// rather than reading process environment inside pure evaluation (#262).
 pub(crate) fn evaluate_with_scratchpad_roots(
     policy: &SafetyPolicy,
     command: &str,
@@ -819,13 +633,8 @@ pub(crate) fn evaluate_with_scratchpad_roots(
     apply_envelope_outcome(envelope, command, scratchpad_roots, cwd, now, base)
 }
 
-/// Issue #262: a command a delegation envelope forbids is `Deny` --
-/// regardless of `policy`'s own posture, the one override this module
-/// applies unconditionally. `Deny` is the top of `verdict_rank`'s ordering,
-/// so returning it outright here (rather than folding it in via
-/// `verdict_rank` comparison, the way every other `apply_*_outcome` step
-/// does) is equivalent and simpler: nothing `base` could already be ranks
-/// above `Deny`.
+/// A worker cannot exceed its delegated envelope even when ordinary policy
+/// allows the command; force Deny outside that scope (#262).
 fn apply_envelope_outcome(
     envelope: Option<&envelope::WorkerEnvelope>,
     command: &str,
@@ -877,11 +686,8 @@ fn apply_envelope_outcome(
     base
 }
 
-/// Issue #262: the union of every classifier this module already has for
-/// "the policy classifies this as destructive" -- an independent OR of the
-/// existing per-family analyzers rather than a new, separately-maintained
-/// definition, so the envelope override always agrees with whatever this
-/// module already considers destructive elsewhere.
+/// Reuse existing destructive classifiers so envelope restrictions track
+/// the same operations as ordinary safety policy (#262).
 pub(super) fn command_is_destructive(command: &str, scratchpad_roots: &[String]) -> bool {
     is_recursive_delete(command)
         || is_destructive_orchestrator_action(command)
@@ -889,14 +695,8 @@ pub(super) fn command_is_destructive(command: &str, scratchpad_roots: &[String])
         || is_destructive_vcs_action(command, scratchpad_roots)
 }
 
-/// Issue #262: the envelope-aware analogue of [`write_targets_confined`],
-/// checked against `envelope.paths` via `PathScope::is_subset_of` (so a `"."`
-/// scope correctly means "everything", the way a raw scratchpad-root prefix
-/// comparison does not) rather than against a scratchpad root list. Same
-/// conservative contract as `write_targets_confined`: `None` ("no opinion")
-/// whenever a target cannot be confidently resolved (`$`/backtick/`~`/glob)
-/// or `command` names no write target at all -- an envelope violation must
-/// be a definite fact, never a guess.
+/// Check definite write targets against the worker path scope. Unknown
+/// targets and commands without targets produce no inferred violation (#262).
 fn envelope_write_targets_confined(
     command: &str,
     envelope: &envelope::WorkerEnvelope,
@@ -955,15 +755,9 @@ fn envelope_write_targets_confined(
     Some(confined)
 }
 
-/// Issue #262: reads [`super::agent::ENVELOPE_ENV`] and parses it as a
-/// [`envelope::WorkerEnvelope`]. Absence is `None` -- no envelope in force,
-/// this session's OWN posture governs alone, exactly today's behavior. A
-/// PRESENT but malformed value is never treated as absent (that would mean
-/// "no restriction" for what is very likely a bounded worker whose envelope
-/// got corrupted in transit): it falls back to
-/// [`envelope::WorkerEnvelope::locked`], the tightest possible grant,
-/// consistent with `agent::resolve_parent_envelope`'s own fail-closed
-/// handling of the identical case.
+/// Parse the worker envelope from the environment. Absence means no worker
+/// scope; a malformed present value uses the locked envelope, never an
+/// unrestricted fallback (#262).
 pub(crate) fn parse_envelope_env(env: EnvLookup<'_>) -> Option<envelope::WorkerEnvelope> {
     let raw = env(super::agent::ENVELOPE_ENV)?;
     if raw.trim().is_empty() {

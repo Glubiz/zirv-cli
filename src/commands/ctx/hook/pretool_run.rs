@@ -51,16 +51,9 @@ fn pretool_advise_output(note: &str) -> String {
     .to_string()
 }
 
-/// F7 (wrapper-overhead benchmark, 2026-09-24): the plain allow envelope
-/// `run_pretool_bash_rewrite` emits for a `Bash` command `safety::evaluate`
-/// already classifies `Allow`, on a headless launch, so Claude Code's own
-/// verdict is this exact decision rather than whatever `--permission-mode
-/// dontAsk` plus the static `--allowedTools` list would otherwise reach for
-/// a command that happens not to be literally on that list. No `updatedInput`
-/// (this never rewrites the command) and no `additionalContext` note --
-/// unlike `pretool_advise_output`, this fires on the ordinary, common case
-/// (an everyday dev command the operator's own policy already allows), so it
-/// stays silent rather than narrating every one of them.
+/// Explicit headless Allow for a command cleared by safety policy but absent
+/// from Claude's finite native allowed-tools list. Omit rewrite and advisory
+/// text for this ordinary decision.
 fn pretool_safety_allow_output() -> String {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -71,19 +64,8 @@ fn pretool_safety_allow_output() -> String {
     .to_string()
 }
 
-/// The documented PreToolUse rewrite envelope (issue #419): the same `allow`
-/// shape [`pretool_advise_output`] prints, plus `updatedInput` -- claude
-/// replaces its own `tool_input` with this object before running the tool,
-/// rather than the one the model actually proposed. Only ever emitted for a
-/// `Bash` command the safety layer ([`crate::commands::ctx::safety::evaluate`]) already
-/// classifies as a plain, unconditional `Allow`: never for anything it would
-/// ask about or deny (see `run_pretool_bash_rewrite`'s own call site, the
-/// only place that builds this envelope). `reason` doubles as both channels
-/// a caller might otherwise need: it is the only place this envelope has to
-/// say anything at all, since the guards that produce a separate
-/// `additionalContext` note (the orchestrator-write advisory, the issue
-/// #406 reuse probe) are scoped to [`FILE_MODIFICATION_TOOLS`] and can never
-/// fire on the same `Bash` call this envelope answers.
+/// Claude replaces the whole tool input with `updatedInput`, so the rewrite
+/// envelope must preserve every original field it does not change (#419).
 fn pretool_rewrite_output(command: &str, reason: &str) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -98,11 +80,8 @@ fn pretool_rewrite_output(command: &str, reason: &str) -> String {
 
 // -- PreToolUse: the bare `git log` rewrite (issue #419) -------------------
 
-/// Whether `token` already limits a `git log` invocation: `-n`, `--max-
-/// count`/`--max-count=<N>`, or a bare `-<digits>` count flag (`-3`, `-10`).
-/// `--oneline` and every other formatting flag do NOT count -- issue #419's
-/// bare-`git log` rule is about the absence of a limit, not the absence of
-/// flags altogether.
+/// Recognize explicit `git log` count limits; formatting flags do not
+/// bound output (#419).
 fn is_git_log_limit_flag(token: &str) -> bool {
     token == "-n"
         || token == "--max-count"
@@ -112,30 +91,15 @@ fn is_git_log_limit_flag(token: &str) -> bool {
             && token[1..].bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Issue #419: appends ` -n 50` to `command` when the WHOLE trimmed command
-/// is one bare `git log` invocation -- `git`/`log` as its first two tokens,
-/// no [`is_git_log_limit_flag`] token anywhere in it, and none of `|`, `>`,
-/// `;`, `&&`, `||` at all -- so an orchestrator's habitual unbounded
-/// `git log` does not dump the whole history into a transcript. Returns
-/// `None` for anything else, including a compound command (`cd x && git
-/// log`): deliberately not a general shell splitter -- this codebase
-/// already has two of those (`safety::split_segments`, `safety::
-/// split_segments_with_pipe_marker`) -- a chained or redirected command is
-/// simply left alone rather than picked apart to rewrite one piece of it.
+/// Cap only a bare, unlimited `git log`: appending a limit to a compound
+/// shell command could change what executes (#419).
 fn rewrite_bare_git_log(command: &str) -> Option<String> {
     let trimmed = command.trim();
     if trimmed.contains(['|', '>', ';']) || trimmed.contains("&&") || trimmed.contains("||") {
         return None;
     }
-    // Review finding F5: a bare `git log` needs none of `#` (a shell
-    // comment -- appending ` -n 50` after one lands INSIDE the comment,
-    // leaving the actually-executed command unbounded), a backtick or `$`
-    // (command/variable substitution), `\` (line continuation or escaping),
-    // a quote (the "whole command" the whitespace split below sees is not
-    // necessarily the whole command a shell would run), or `(`/`{` (a
-    // subshell or brace group). Any of these means this is not the simple,
-    // literal invocation this rewrite is safe for, so it is left alone
-    // exactly like a pipe or `&&` above.
+    // Reject shell comments, substitution, escapes and quoting before
+    // appending a limit: these can change what the shell executes (#419).
     if trimmed.contains(['#', '`', '$', '\\', '\'', '"', '(', '{']) {
         return None;
     }
@@ -149,34 +113,10 @@ fn rewrite_bare_git_log(command: &str) -> Option<String> {
     Some(format!("{trimmed} -n 50"))
 }
 
-/// Issue #419's whole `Bash` decision, independent of every guard above and
-/// below: rewrites exactly one shape (a bare `git log`) via `updatedInput`,
-/// and, since F7 (2026-09-24), also names an explicit allow decision when
-/// the safety layer clears a headless command that Claude Code's own
-/// `--permission-mode dontAsk` plus the static `--allowedTools` list would
-/// otherwise deny purely for not being literally on that finite list (a
-/// heredoc, a pipe into an interpreter, `zirv ctx run --compact -- ...` --
-/// see [`pretool_safety_allow_output`]'s own doc comment). Never denies or
-/// asks: a `Deny`/`Ask` verdict here just falls through to Claude Code's own
-/// permission flow untouched, since `zirv ctx safety check`'s own separate
-/// hook (exit code 2, `run_check_hook_with_verdict`) is the one place a
-/// `Bash` command is actually blocked. `Bash` is not a
-/// [`FILE_MODIFICATION_TOOLS`] entry, so the orchestrator-write guard and the
-/// issue #406 reuse probe never see this call at all -- this function is the
-/// entirety of what `run_pretool` does for `Bash`.
-///
-/// Fails open on every path, matching every other guard in this file: an
-/// empty command, an unresolvable `cwd`, or a command the safety layer does
-/// not classify as a plain, unconditional `Allow` all print nothing, and the
-/// `Bash` call proceeds through claude's ordinary permission flow untouched.
-/// The safety check uses `LaunchMode::Headless` -- the stricter of the two
-/// defaults -- because this payload carries no `permission_mode` field (that
-/// lives only in `safety.rs`'s own hook payload), so there is no in-band
-/// signal here that a human is watching to answer an `Ask` verdict; the
-/// explicit-allow half below additionally requires
-/// [`crate::commands::ctx::adapters::HEADLESS_ENV`] to actually read `"1"` before it fires
-/// at all, so an interactive launch (where a human already answers Claude's
-/// own prompt) is never short-circuited by it.
+/// Rewrite bare `git log` or explicitly allow a proven headless safety
+/// Allow that static native tool lists would otherwise deny. Use the
+/// stricter headless default when permission mode is absent, and fail open
+/// on uncertain input (#419).
 fn run_pretool_bash_rewrite<W: Write>(
     w: &mut W,
     payload: &PreToolPayload,
@@ -187,15 +127,8 @@ fn run_pretool_bash_rewrite<W: Write>(
     if command.is_empty() {
         return Ok(0);
     }
-    // F1 (codex review fix): the rewrite/headless-allow logic below may only
-    // fire once the FULL attested/pinned safety check (`attested_verdict`,
-    // computed by the caller against both the launch snapshot and today's
-    // policy -- `safety::evaluate_with_attestation_evidence`) has itself
-    // resolved to `Allow`. Evaluating fresh, un-pinned config here (as
-    // before) could see today's home policy after an operator widened it
-    // mid-session, silently overriding the launch snapshot's stricter,
-    // pinned verdict -- the one `hook_output_with_extras` correctly (and
-    // deliberately) stays silent about under headless `dontAsk`.
+    // Gate rewrites and explicit Allow on the full attested verdict; current
+    // policy may have widened since the stricter launch snapshot was pinned.
     if attested_verdict != Some(crate::commands::ctx::safety::Verdict::Allow) {
         return Ok(0);
     }
@@ -229,14 +162,9 @@ fn run_pretool_bash_rewrite<W: Write>(
         return Ok(0);
     }
 
-    // F7 (wrapper-overhead benchmark, 2026-09-24): `safety::evaluate` just
-    // said `Allow` -- the operator's own `[safety] default`/`allow`/`ask`/
-    // `deny` rules, `default` and `allow` REPO_FORBIDDEN so this can never be
-    // a repo checkout loosening its own leash (`config.rs`'s own
-    // narrowing-fold table) -- but headlessly, `--permission-mode dontAsk`
-    // plus the static `--allowedTools` list denies anything not literally on
-    // that finite list before this hook's own verdict ever mattered. Naming
-    // the decision explicitly here is what actually lets it through.
+    // Explicit Allow lets a headless command cleared by safety policy pass
+    // Claude's finite native allowed-tools list. Repo config cannot widen
+    // this policy default (#419).
     if env(crate::commands::ctx::adapters::HEADLESS_ENV).as_deref() == Some("1") {
         let _ = writeln!(w, "{}", pretool_safety_allow_output());
 
@@ -264,55 +192,18 @@ fn run_pretool_bash_rewrite<W: Write>(
     Ok(0)
 }
 
-/// Issue #769: the `Bash`/`PowerShell` half of the consolidated `PreToolUse`
-/// entry point -- runs the safety check ITSELF, in-process, that used to be
-/// `zirv ctx safety check`'s own separately-registered hook (a second
-/// process Claude spawned for the exact same tool call). Calls
-/// [`crate::commands::ctx::safety::run_check_hook_mode_for_agent`] directly (the identical
-/// function `zirv ctx safety check`'s own hook mode calls), so the
-/// deny/ask/allow verdict, its reason text, and every one of that check's own
-/// loop-breaker/identical-command behaviours are byte-for-byte the same as
-/// before -- only the process spawn is gone. `PowerShell` gets exactly this
-/// safety pass and nothing else, unchanged from before consolidation (only
-/// `Bash` ever reached [`run_pretool_bash_rewrite`]'s own rewrite/headless-
-/// allow logic, which is untouched by this change).
-///
-/// Precedence when both this and `run_pretool_bash_rewrite` have something to
-/// say (only possible for `Bash`): the safety verdict wins outright on
-/// `deny`/`ask` -- `run_pretool_bash_rewrite`'s own (cheaper, headless-only)
-/// `safety::evaluate` call independently reaches the same "say nothing"
-/// conclusion for a non-`Allow` verdict, so returning here loses nothing. On
-/// `allow`, the rewrite's own `updatedInput` (a bare `git log` cap) and its
-/// own more specific reason are layered onto the safety envelope, so an
-/// operator gets both the rewrite AND an explicit reason in the one JSON line
-/// claude reads, rather than whichever of two racing processes' output
-/// happened to be the one claude kept.
-///
-/// Config is loaded exactly the way `safety::run_check`'s own CLI-less hook
-/// mode always has: from `"."` (the hook process's own working directory,
-/// which `CheckArgs::repo` defaults to and this hook registration never
-/// overrides), not `payload.cwd` -- the two are the same directory in
-/// practice (claude spawns every hook for one tool call from the same
-/// working directory), but `"."` is what the pre-consolidation standalone
-/// process actually used, so this keeps the exact same config that decided
-/// the verdict before. Fails open, like everything else in this file: a
-/// config load failure here only means the safety portion says nothing (the
-/// rewrite/headless-allow logic below still runs against its own,
-/// independently-loaded config) -- never an `Err` out of this function.
+/// Run consolidated Bash/PowerShell safety in-process, keeping the safety
+/// verdict authoritative. For Bash Allow, merge the rewrite into the one
+/// JSON response; Ask/Deny remain safety decisions. Config errors fail open
+/// and do not suppress other hook work (#769).
 fn run_pretool_bash_or_powershell<W: Write>(
     w: &mut W,
     stdin: &str,
     payload: &PreToolPayload,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    // F1 (codex review fix): calls `run_check_hook_with_verdict` directly
-    // (the same function `run_check_hook_mode_for_agent`'s `agent: None` arm
-    // reduces to, so the rendered envelope is byte-for-byte unchanged) to
-    // also capture the REAL, pinned verdict -- needed below so
-    // `run_pretool_bash_rewrite` can gate its own rewrite/headless-allow
-    // logic on it even on the `dontAsk` path where the rendered envelope
-    // itself stays silent for a pinned-stricter `Ask` (see that function's
-    // own doc comment).
+    // Capture the attested verdict alongside its rendered envelope so a
+    // silent `dontAsk` Ask cannot trigger a separate explicit Allow.
     let cfg = CtxConfig::load(Path::new("."), env).ok();
     let mut safety_buf: Vec<u8> = Vec::new();
     let attested_verdict = cfg.as_ref().and_then(|cfg| {
@@ -346,10 +237,8 @@ fn run_pretool_bash_or_powershell<W: Write>(
 
     match (safety_envelope, rewrite_envelope) {
         (Some(mut safety), Some(rewrite)) => {
-            // Both already agree on `allow` here -- let the rewrite's own
-            // `updatedInput` and its own more specific reason win, exactly
-            // what claude would have ended up applying from the rewrite
-            // hook's separate process before consolidation.
+            // Claude consumes one hook envelope; merge the bounded-log rewrite
+            // with Allow so neither decision is lost to a competing response.
             if let Some(updated_input) = rewrite.pointer("/hookSpecificOutput/updatedInput") {
                 safety["hookSpecificOutput"]["updatedInput"] = updated_input.clone();
             }
@@ -369,10 +258,8 @@ fn run_pretool_bash_or_powershell<W: Write>(
     Ok(0)
 }
 
-/// Parses `buf` as UTF-8 and then as one JSON value, treating anything that
-/// is not exactly that -- invalid UTF-8, empty or whitespace-only text,
-/// invalid JSON -- as "nothing to say" rather than an error: the ordinary
-/// silent-allow shape every hook in this file already prints for.
+/// Treat invalid or empty hook output as silence so a malformed optional
+/// decision cannot interrupt the tool call.
 fn parsed_json_envelope(buf: Vec<u8>) -> Option<serde_json::Value> {
     let text = String::from_utf8(buf).ok()?;
     let trimmed = text.trim();
@@ -382,38 +269,18 @@ fn parsed_json_envelope(buf: Vec<u8>) -> Option<serde_json::Value> {
     serde_json::from_str(trimmed).ok()
 }
 
-/// Runs four independent guards against the same payload: the expensive-seat
-/// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
-/// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
-/// orchestrator seat launched on a cheap model still carries no
-/// `SEAT_MODEL_ENV` (`seat_model_env` only ever exports it for an expensive
-/// tier), but must still be technically unable to edit repository files, so
-/// the second guard cannot be nested inside the first's own early return.
-/// The third, issue #406's reuse probe (`reuse_advice`), is gated on nothing
-/// at all -- every seat that writes a file gets it -- and is advisory only:
-/// it can add a note to an `allow` envelope and can never deny. The fourth,
-/// [`skill_pointer_override`] (issue #539 chunk F), is gated on
-/// `SESSION_ENV` -- broader than the first guard's `SEAT_MODEL_ENV` -- and,
-/// like the third, is advisory only: it never denies, and a dispatch the
-/// first guard already denied or rewrote never reaches it (both those paths
-/// already returned).
-///
-/// Fails open on every path: no seat/session env, an unparseable payload, a
-/// tool no guard knows anything about, an unresolvable `cwd`, and any internal
-/// error all exit 0 with nothing on stdout, which claude reads as "no
-/// decision, use the normal permission flow". Nothing here may `unwrap`,
-/// `expect` or return `Err` -- the release profile is `panic = "abort"`, and
-/// a hook that aborts takes the tool call with it.
+/// Run independent dispatch, repo-write, safety and reuse guards against
+/// one payload, preserving the strongest decision in a single response.
+/// Fails open on every path. Nothing here may `unwrap`, `expect` or return
+/// `Err` -- the release profile is `panic = "abort"`, and a hook that
+/// aborts takes the tool call with it.
 pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let Ok(payload) = PreToolPayload::parse(stdin) else {
         return Ok(0);
     };
 
-    // Issue #456: a `PreToolUse` hook only ever fires once Claude has already
-    // cleared this tool call to run -- a new tool call, of any kind, is proof
-    // a still-pending `Approval` latch from an earlier permission prompt is
-    // gone. Best-effort side channel, resolved before every guard below so it
-    // still runs on every early return those guards take.
+    // A new PreToolUse call proves any previous permission prompt ended;
+    // clear its attention latch before guard-specific early returns (#456).
     if let Ok(state) = StateDir::resolve(env) {
         clear_resolved_approval(
             &state,
@@ -434,26 +301,15 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         return Ok(0);
     }
 
-    // The subagent skill pointer (issue #539 chunk F): gated on
-    // `SESSION_ENV` -- set for every seat role zirv supervises, not only an
-    // orchestrator's own `SEAT_MODEL_ENV` -- so a Single or worker seat
-    // dispatching a native subagent gets the same pointer an orchestrator
-    // seat does; see `skill_pointer_override`'s own doc comment. A dispatch
-    // the guard above already DENIED already returned before reaching here;
-    // one it already REWRITES also already returned, with the pointer
-    // composed into that same `updatedInput` (`pretool_dispatch_tier_
-    // output`'s own call to `append_skill_pointer`) -- so this is only ever
-    // reached for a dispatch nothing above had anything to say about.
+    // Every supervised seat may dispatch a subagent that lacks its parent's
+    // skill index; attach the pointer regardless of seat role (#539).
     if let Some(output) = skill_pointer_override(&payload, stdin, env) {
         let _ = writeln!(w, "{output}");
         return Ok(0);
     }
 
-    // Issue #419/#769: `Bash`/`PowerShell` get their own, much narrower
-    // treatment -- see `run_pretool_bash_or_powershell`'s own doc comment --
-    // and never fall through to the orchestrator-write guard below, which
-    // only ever looks at `FILE_MODIFICATION_TOOLS` and would not recognize
-    // either tool anyway.
+    // Bash/PowerShell take the dedicated safety path; file-write guards
+    // inspect only structured modification tools (#419, #769).
     if matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
         return run_pretool_bash_or_powershell(w, stdin, &payload, env);
     }
@@ -470,9 +326,8 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     let session = crate::commands::ctx::mail::session_identity(env)
         .unwrap_or_else(|| payload.session_id.clone());
 
-    // Issue #406: the reuse probe is independent of the write guard below --
-    // every seat gets it, not only an orchestrator's -- so it is resolved
-    // before that guard's own "outside my scope" early return.
+    // Probe reuse before the orchestrator write guard returns for other
+    // seat roles (#406).
     let reuse_note = reuse_advice(&payload, &cwd, &cfg, env, &session);
 
     // The scope-creep guard's own checkpoint is likewise independent of the
@@ -504,9 +359,8 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
             {
                 let _ = writeln!(w, "{}", pretool_advise_output(&note));
             }
-            // Only committed here, now that the checkpoint text is actually
-            // going out (this branch is never reached on a `Deny` above) --
-            // see `scope_checkpoint_note`'s own doc comment.
+            // Persist the checkpoint only when emitted; a denied call must
+            // not spend the one note an allowed edit still needs.
             if checkpoint_note.is_some() {
                 scope_checkpoint_mark_shown(&payload, env);
             }
@@ -549,14 +403,8 @@ fn join_advisory_notes(notes: &[Option<&str>]) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Issue #406 layer 1: the pre-write reuse probe's own note, or `None` when
-/// there is nothing to say. Resolves the write target and the repository it
-/// sits in exactly as the orchestrator-write guard does, then hands the
-/// decision to `reuse::evaluate`; one decision-log row records a fire or a
-/// budget skip, best-effort like every other log write on this path.
-///
-/// Never denies and never fails: an unresolvable target, a target in no git
-/// repository, or a probe that runs out of budget all return `None`.
+/// Probe a prospective write for reusable work independently of seat
+/// posture, and record one decision-log row (#406).
 fn reuse_advice(
     payload: &PreToolPayload,
     cwd: &Path,

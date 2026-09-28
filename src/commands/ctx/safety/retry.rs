@@ -2,13 +2,8 @@
 
 use super::*;
 
-/// The `<noun> <verb>` gh forms this module treats as safe to run outside
-/// the sandbox despite `dangerouslyDisableSandbox` (2026-08-25): each is a
-/// read-only GitHub query that cannot mutate a repo, merge/close/create
-/// anything, or exfiltrate a credential through its own output. Matched by
-/// exact, whole-token equality against the tokenized command in
-/// [`is_sandbox_bypass_safe_gh_command`] -- never a substring or prefix
-/// check -- so `gh issue view` qualifies but `gh issue viewfoo` does not.
+/// Exact `gh <noun> <verb>` forms safe for unsandboxed read-only retry;
+/// whole-token matching excludes lookalike or mutating verbs.
 const SANDBOX_BYPASS_SAFE_GH_FORMS: &[(&str, &str)] = &[
     ("issue", "view"),
     ("issue", "list"),
@@ -66,45 +61,11 @@ fn contains_unquoted_redirection(command: &str) -> bool {
     false
 }
 
-/// Whether `command` qualifies as **sandbox-bypass-safe**: a single, simple
-/// invocation of one of [`SANDBOX_BYPASS_SAFE_GH_FORMS`] with plain
-/// flags/args and no shell composition of any kind. `gh` always needs to
-/// read its own credential config, which the OS sandbox denies outright, so
-/// every `gh` call zirv's Bash tool makes already arrives at the call site
-/// in `run_check_hook_mode_with_env` as an unsandboxed retry
-/// (`dangerouslyDisableSandbox: true`) -- this narrows which of those
-/// retries can skip the mandatory escalation.
-///
-/// Reuses this module's existing decomposition primitives rather than a
-/// substring scan, behind one gate none of them can be tricked past:
-/// - Every character of the trimmed command must be in the conservative
-///   literal set `[A-Za-z0-9 _./:@=,+#-]`. This runs BEFORE the
-///   quote-tracking checks below because those checks parse bash `$'...'`
-///   ANSI-C quoting and a PowerShell backtick line-continuation differently
-///   than the real shells do -- a `$'\''` or a trailing backtick can trick
-///   the quote tracker into treating a genuinely unquoted `;`/`>` as
-///   quoted data. A command built only from this literal set has no quote
-///   character, `$`, backtick, backslash, or shell metacharacter for a
-///   parser to disagree about in the first place.
-/// - [`split_segments`] (`;`, `&`, `&&`, `||`, `|`, newline) must yield
-///   exactly one segment; more than one means shell composition.
-/// - [`command_substitutions`] (`$(...)`, backticks) must be empty.
-/// - [`contains_unquoted_redirection`] (`>`, `>>`, `<`) must be false.
-/// - The first whitespace-separated token must be literally `gh` -- exact,
-///   case-sensitive, no path-separator or extension stripping. That alone
-///   disqualifies a shell wrapper (`bash -c '...'`), a launcher
-///   (`env`/`sudo`/`timeout gh ...`), an env-var prefix
-///   (`GH_TOKEN=x gh pr list`), and a `gh` reached through any other path
-///   than the bare literal name (`./gh`, `/tmp/evil/gh`, `gh.bat`, `GH`) in
-///   one stroke: none of those tokenize to a bare `gh` as the first word.
-///   Deliberately NOT routed through [`sql_program_name`] -- that
-///   normalization (directory-stripped, lowercased, `.exe`/`.cmd`/`.bat`
-///   stripped) is exactly what let a non-literal `gh` qualify before.
-/// - No token may be `--web`/`-w`: either would launch an external browser
-///   process outside the sandbox.
-/// - The second and third tokens must exactly equal one `(noun, verb)` pair
-///   from [`SANDBOX_BYPASS_SAFE_GH_FORMS`] -- whole-token equality, so
-///   `gh issue viewfoo` never qualifies just because it starts with `view`.
+/// Allow a `gh` sandbox retry only for one literal, simple read-only
+/// invocation. Reject shell syntax before tokenization, because real shell
+/// quote rules can differ; require bare `gh`, an exact safe noun/verb pair,
+/// and no browser-launch flag. Wrappers and path-qualified binaries cannot
+/// inherit the installed `gh` command's trust.
 pub(super) fn is_sandbox_bypass_safe_gh_command(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -149,14 +110,8 @@ pub(super) fn is_sandbox_bypass_safe_gh_command(command: &str) -> bool {
         .any(|&(n, v)| n == noun && v == verb)
 }
 
-/// The credential/config paths Claude's own native OS sandbox denies
-/// reading by default (`adapters::claude::launch_settings_value`'s
-/// `sandbox.filesystem.denyRead`) -- the single source both that array and
-/// [`sensitive_credential_path`] derive from, so the two can never drift
-/// apart (issue #147 amendment, 2026-08-26). An unsandboxed
-/// `--dangerously-disable-sandbox` retry runs entirely outside that OS
-/// boundary, which is exactly why [`escape_denied_by_screen`] re-checks
-/// every escape-allowed candidate against it.
+/// Native-sandbox-denied credential paths, shared with the launch policy;
+/// unsandboxed retries must screen these paths again (#147).
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) const SANDBOX_DENY_READ_HOME_PATHS: &[&str] = &[
     "~/.ssh",
@@ -172,70 +127,19 @@ pub(crate) const SANDBOX_DENY_READ_HOME_PATHS: &[&str] = &[
     "~/.git-credentials",
 ];
 
-/// Issue #147 (2026-08-26 operator evidence): the read-only shell-utility
-/// subset of `adapters::SHIPPED_POSTURE_ALLOW`'s own "Read-only shell
-/// utilities" block (`ls`/`grep`/`rg`/`cat`/`head`/`tail`/`wc`/`find`/
-/// `echo`/`pwd`/`which`/`where`/`diff`/`sort`/`uniq`/`tr`/`cut`) -- most
-/// interactive sandbox-escape asks turned out to be unsandboxed retries of
-/// exactly these tools reading paths outside the sandbox's default
-/// write/read scope (zirv's own state/log directories, most often). Seeded
-/// into `SafetyPolicy::escape_allow` as a BUILT-IN default via
-/// [`builtin_escape_allow`], alongside the operator's own entries.
-/// [`escape_denied_by_screen`] still gates every one of these, seeded or
-/// operator-added alike -- matching a family here proves nothing about
-/// what one specific invocation actually touches.
-///
-/// **This list means "genuinely read-only", not just "seeded into
-/// `escape_allow`"**: [`is_read_only_escape_safe`] (`:6865`) and the
-/// identical-command loop-breaker's read-only exemption (`:8680`) both
-/// reuse it as a per-program shortcut, on the assumption that any command
-/// starting with one of these names is safe to treat as read-only outright.
-/// [`ESCAPE_ALLOW_ADDITIONAL_PROGRAMS`] below exists SEPARATELY, and must
-/// keep existing separately, so [`builtin_escape_allow`] can widen past
-/// read-only tools without also telling those two unrelated, read-only-only
-/// consumers that `git`/`gh`/`cargo`/... are read-only (a live regression
-/// caught by this module's own test suite: adding `gh` here made `is_read_
-/// only_escape_safe("gh pr create --title x")` wrongly return `true`, and
-/// made a repeated `cargo test` wrongly exempt from the loop-breaker).
+/// Genuinely read-only utilities safe for retry and repeated-inspection
+/// exemptions. Every invocation still passes the credential/root screen.
+/// Keep mutable build/forge tools in a separate retry-only list so they
+/// cannot inherit the read-only exemption (#147).
 pub(super) const SANDBOX_ESCAPE_BUILTIN_PROGRAMS: &[&str] = &[
     "ls", "grep", "rg", "cat", "head", "tail", "wc", "find", "echo", "pwd", "which", "where",
     "diff", "sort", "uniq", "tr", "cut",
 ];
 
-/// **2026-09-16, spec Change 4:** `cargo`, `gh`, `glab`, `gitlab-ci-local`,
-/// `npm`, `npx`, `git`, `python3`, `mkdir`, plus the fixed macOS SSH-agent
-/// environment lookup through `launchctl getenv` and `export SSH_AUTH_SOCK=`
-/// -- the 200 unsandboxed-retry asks the 7-day audit found were almost all
-/// this build/dev tooling. Safe to
-/// widen [`builtin_escape_allow`]'s seed past read-only tools specifically
-/// THERE, and not by loosening [`escape_denied_by_screen`]/[`escape_allow_
-/// matches`]'s own gates: the one caller (`run_check_hook_mode_with_env`,
-/// the `--dangerously-disable-sandbox` retry branch at this module's own
-/// `escape_allow_matches` call site) only reaches this seed once the
-/// retried command's BASE verdict is already `Allow` -- deny and ask rules
-/// are evaluated first and still win, so an entry here can only clear a
-/// family the policy already permits for this command; it never grants a
-/// new capability on its own. Deliberately its own constant, not folded
-/// into [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`] -- see that constant's own doc
-/// comment for why the two other consumers of that list need it to stay
-/// read-only-only.
-///
-/// The spec's own list also named `zirv`, deliberately dropped here: unlike
-/// the other entries, `builtin_allow()`'s `zirv <name> *` entries mix genuinely
-/// retry-safe names with ones that are native-allowed at the permission-
-/// dialog level ONLY -- `test`/`verify`/`frontend` select a REPOSITORY-
-/// AUTHORED child process and are deliberately never sandbox-excluded (see
-/// `SANDBOX_CONFINED_RESERVED_BUILTINS`), and `chat`/`agent` launch a fresh
-/// harness session with caller-controlled argv (see `reserved_zirv_command_
-/// patterns`'s own doc comment on why they keep a name-level pattern
-/// anyway). A leading-token family match cannot tell those apart from
-/// `zirv ctx status`, and this module's own test suite caught the resulting
-/// regression live (`zirv test changed` and bare `zirv chat`, neither
-/// carrying a dangerous flag, both wrongly cleared an unsandboxed retry).
-/// zirv already has dedicated, narrower retry acceptors for exactly this
-/// case -- [`is_reserved_zirv_escape_safe`] and [`is_prompt_free_zirv_retry_
-/// safe`] -- so adding `zirv` here would not unlock any genuinely-safe
-/// retry those do not already cover; it would only reopen the gap.
+/// Additional tools eligible for unsandboxed retry only after an ordinary
+/// Allow and the escape screen. Exclude `zirv`: its reserved names include
+/// repo-authored subprocess and harness-launch paths requiring narrower
+/// semantic checks (#147, #224).
 pub(super) const ESCAPE_ALLOW_ADDITIONAL_PROGRAMS: &[&str] = &[
     "cargo",
     "gh",
@@ -266,12 +170,8 @@ pub(super) fn builtin_escape_allow() -> Vec<Rule> {
         .collect()
 }
 
-/// Issue #168, design decision (a): the `(noun, verb)` gh/glab forms this
-/// broader, tool-agnostic classifier treats as read-only -- a superset of
-/// [`SANDBOX_BYPASS_SAFE_GH_FORMS`]'s own gh table, kept separate because
-/// that table backs the narrower gh-credential-config carve-out
-/// specifically (see its own doc comment), while this one backs
-/// [`is_read_only_escape_safe`].
+/// Read-only gh/glab forms for general escape checks; keep separate from
+/// the narrower credential-config `gh` retry table (#168).
 const READ_ONLY_ESCAPE_SAFE_GH_FORMS: &[(&str, &str)] = &[
     ("issue", "view"),
     ("issue", "list"),
@@ -408,13 +308,8 @@ fn is_git_branch_mutation_flag(token: &str) -> bool {
     !short.is_empty() && short.chars().any(|c| "dDmMcCfu".contains(c))
 }
 
-/// Issue #168, design decision (a): git subcommands that can only read --
-/// `branch`/`remote`/`tag` are further restricted to their non-mutating
-/// forms, since the bare subcommand name also accepts destructive flags
-/// (`branch -d`, `remote add`, ...). `branch`'s own flag screen is
-/// [`is_git_branch_mutation_flag`], which covers every delete/rename/copy/
-/// force/upstream spelling rather than the four short forms this arm
-/// originally listed.
+/// Read-only git subcommands; branch, remote and tag require flag checks
+/// because their names also admit mutation (#168).
 pub(super) fn is_git_read_only(tokens: &[String]) -> bool {
     if tokens.first().map(|t| sql_program_name(t)).as_deref() != Some("git") {
         return false;
@@ -446,26 +341,10 @@ pub(super) fn is_git_read_only(tokens: &[String]) -> bool {
     }
 }
 
-/// Code review fix (CRITICAL, issue #168 follow-up), retained under issue
-/// #224: the `zirv ctx` verbs reachable via this carve-out WITHOUT launching
-/// an arbitrary subprocess of their own -- read-only reporting/audit verbs
-/// and simple state mutations against zirv's own mail/memory/group/log
-/// stores. Every OTHER `CtxVerb` spawns a fresh harness process with a
-/// caller-controlled prompt/argv/model (`exec` -- `-- <arbitrary command>`;
-/// `wrap`/`chat`/`resume`/`loop` -- an interactive or headless agent launch;
-/// `agent` -- an arbitrary adapter name plus its own trailing flags;
-/// `handover` -- swaps the live session's harness/model in place) and must
-/// NOT qualify here: an unsandboxed retry of one of those needs the ordinary
-/// ask/deny escalation, not a silent pass just because it happens to start
-/// with `zirv ctx`. Deliberately an ALLOW-list, not a deny-list enumerating
-/// the dangerous verbs: a newly added `CtxVerb` defaults to NOT qualifying
-/// until someone adds it here on purpose, rather than silently inheriting
-/// this carve-out.
-///
-/// Also the single source of truth [`ctx_base_allow_verbs`] filters down
-/// (dropping `usage`) for the BASE policy level's own `zirv ctx <verb> *`
-/// auto-allow, so the two surfaces cannot drift apart -- see that function's
-/// doc comment for why `usage` needs the extra filtering.
+/// Zirv ctx verbs safe outside the sandbox because they spawn no
+/// caller-controlled subprocess. Unknown or newly added verbs remain
+/// ineligible until reviewed; base auto-allow uses a narrower subset
+/// (#168, #224).
 pub(super) const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "score",
     "handoff",
@@ -482,27 +361,14 @@ pub(super) const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "safety",
     "permissions",
     "group",
-    // 2026-09-16, spec Change 2: `KillArgs` (`sessions.rs`) takes exactly one
-    // positional session-id prefix and no trailing argv -- a fixed-shape
-    // payload like the rest of this list, not caller-controlled argv handed
-    // to a subprocess, so it qualifies under this list's own doc comment.
+    // `kill` takes one session-id prefix, not caller-controlled subprocess
+    // argv, so it meets this list's escape-safe contract.
     "kill",
 ];
 
-/// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`] minus `usage`: the subset also safe to
-/// auto-allow at the BASE (sandboxed) policy level -- `reserved_zirv_auto_
-/// allow_rule`/`reserved_zirv_command_patterns` -- rather than only on the
-/// `--dangerously-disable-sandbox` retry path. `usage` cannot join it: a
-/// base-level rule is a plain `zirv ctx usage *` glob, and unlike [`is_
-/// reserved_zirv_escape_safe`]'s own fourth-token check, that glob cannot
-/// distinguish `zirv ctx usage --sessions` from `zirv ctx usage tee --
-/// <arbitrary command>` -- the one escape-safe verb with a subprocess-
-/// launching subcommand of its own (see that function's doc comment).
-/// Widening the base allow to cover `usage` would reintroduce, for `usage
-/// tee`, the exact base-Allow-plus-native-sandbox-exclusion combination this
-/// module's #224 review round flagged for `exec`/`wrap`. `usage` therefore
-/// stays on the ordinary ask/deny gate at the base level; it only skips the
-/// prompt on an unsandboxed retry, where the finer-grained check applies.
+/// Escape-safe ctx verbs eligible for base auto-allow, excluding `usage`:
+/// a static `usage *` glob cannot distinguish `usage tee -- <command>`
+/// from read-only usage, while the retry path checks subcommands (#224).
 pub(super) fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
     ZIRV_CTX_ESCAPE_SAFE_VERBS
         .iter()
@@ -510,37 +376,10 @@ pub(super) fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
         .filter(|verb| *verb != "usage")
 }
 
-/// Whether EVERY executable segment of `command` is an unsandboxed-retry-safe
-/// zirv built-in, used ONLY on the `--dangerously-disable-sandbox` retry path
-/// (`run_check_hook_mode_with_env`).
-///
-/// This is deliberately NARROWER than issue #224's policy-layer auto-allow.
-/// Being a reserved, unshadowable name makes `zirv <builtin>` trustworthy
-/// enough to skip a PreToolUse prompt, but it does NOT make it safe to run
-/// OUTSIDE the OS sandbox: `zirv ctx exec -- <cmd>`, `zirv ctx usage tee --
-/// <cmd>`, `zirv agent <adapter> "<prompt>"` and the harness-launching verbs
-/// all carry an arbitrary trailing command that `normalize_segments` cannot
-/// see past (it walks shell AST nodes, and everything after `--` is an
-/// argument, not an executable node). Issue #168's allow-list therefore still
-/// governs this gate; #224 only widens it by `zirv report`, whose sole child
-/// is a fixed `gh auth token --hostname github.com` argv.
-///
-/// Matching is case-insensitive like zirv's own dispatch, and directory-
-/// qualified programs are excluded: `./zirv ctx` could name repo-controlled
-/// code and must not inherit the installed binary's trust boundary. Explicit
-/// policy `deny`/`ask` still wins before this helper is called.
-///
-/// **Scope note (issue #331, 2026-09-04):** this helper is the NARROW
-/// acceptor only. The retry chain's general acceptor is
-/// [`is_prompt_free_zirv_retry_safe`] (issue #222), which deliberately admits
-/// `zirv agent <adapter> "<prompt>"` -- bare or inside a compound such as
-/// `zirv agent codex "x" | head` -- because the worker it launches runs under
-/// zirv's own sandbox posture and every dangerous spelling (`-- --sandbox
-/// danger-full-access`, `--dangerously-bypass-approvals-and-sandbox`) is a
-/// semantic Deny before that screen runs. `exec`, `usage tee`, `wrap`, `chat`
-/// and repo-controlled `./zirv` stay Ask on both acceptors. That Allow is the
-/// operator's policy, pinned by the #222 tests, not a fallthrough bypassing
-/// this list.
+/// Require every segment of a reserved zirv command to be retry-safe.
+/// Reserved names alone do not prove sandbox safety: ctx launchers and
+/// payload-carrying verbs can run caller-controlled subprocesses, and
+/// path-qualified `./zirv` can be repo-controlled (#168, #224, #331).
 pub(crate) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
@@ -551,14 +390,8 @@ pub(crate) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
         .all(|candidate| is_reserved_zirv_escape_safe_segment(candidate))
 }
 
-/// The single-segment body behind [`is_reserved_zirv_escape_safe`], factored
-/// out (issue #329) so [`is_read_only_escape_safe`] can accept the same
-/// per-segment judgment as one of ITS acceptors -- a compound mixing a
-/// reserved `zirv ctx` call with a benign read-only filter (`zirv ctx inbox
-/// | tail`) used to clear neither whole-command check on its own: this one
-/// requires EVERY segment to be zirv, the other one's per-segment table knew
-/// nothing about zirv. See [`is_read_only_escape_safe`]'s doc comment for the
-/// combined behaviour.
+/// Judge one zirv segment so compounds with safe read-only filters can
+/// qualify only when every segment is independently safe (#329).
 pub(super) fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(candidate)) else {
         return false;
@@ -587,12 +420,8 @@ pub(super) fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
             if is_permissions_compile_write(&tokens) {
                 return false;
             }
-            // `usage`'s own `tee` subcommand runs an arbitrary trailing
-            // statusline command -- the one escape-safe verb with a
-            // subprocess-launching subcommand of its own. Codex review on
-            // #329: clap accepts the verb's flags BEFORE the subcommand
-            // (`zirv ctx usage --json tee -- <cmd>`), so any `tee` token
-            // after the verb disqualifies, not only the fourth slot.
+            // `usage tee` launches an arbitrary command, even when flags precede the
+            // subcommand; reject `tee` anywhere after the verb (#329).
             !(verb == "usage"
                 && tokens
                     .iter()
@@ -605,16 +434,8 @@ pub(super) fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
     }
 }
 
-/// Lexically resolves `.`/`..` path components and collapses repeated `/`
-/// separators, exactly the way a real shell's path resolution would --
-/// text-only, no filesystem access (this whole module stays pure, see
-/// `rot.rs`'s identical discipline). `..` past the top of the walk simply
-/// has nothing left to pop: this function can never know whether a real
-/// parent exists above whatever root it was handed, so it stays put rather
-/// than going negative. Returns the resolved, non-empty component list --
-/// an EMPTY result means `path` lexically reduces to nothing beyond
-/// whatever root it started from (e.g. `/`, `//`, `/.`, `/./`, `/..`,
-/// `/../` all resolve to the same empty list).
+/// Normalize root aliases lexically without filesystem access so equivalent
+/// unbounded paths cannot bypass the root-wide screen.
 pub(super) fn resolve_lexical_path_components(path: &str) -> Vec<&str> {
     let mut components: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -629,45 +450,9 @@ pub(super) fn resolve_lexical_path_components(path: &str) -> Vec<&str> {
     components
 }
 
-/// Whether `token` is, after lexical resolution, the filesystem root or an
-/// ENTIRE home directory (this account's own, `~`, or -- since `~user`
-/// names a *different* account's whole home, the identical unbounded shape
-/// -- any other's) rather than a path bounded to a real subtree.
-///
-/// Review round 3 (2026-08-27, CRITICAL): the exact-literal check this
-/// replaced (`matches!(token, "/" | "~" | "~/")`) only ever caught the
-/// three spellings written out by hand -- `//`, `/.`, `/./`, `/..`, `/../`
-/// (all lexically identical to `/` on any POSIX filesystem: `.`/`..` at
-/// root have nowhere to go, and a doubled separator collapses) and a bare
-/// `~user` (someone else's whole home, never enumerated by name here) all
-/// sailed straight through to the seeded `find *` family's silent `Allow`.
-/// Enumerating spellings one PoC at a time does not converge -- this
-/// normalizes instead: an absolute path lexically resolves via
-/// [`resolve_lexical_path_components`] and is root-wide exactly when
-/// nothing survives the walk; a `~`-form splits off the (possibly empty)
-/// username before the first `/` -- no slash at all means the whole token
-/// IS the bare `~`/`~user` form (root-wide outright, since there is no
-/// subdirectory left to be bounded to) -- and resolves whatever follows
-/// the same way. A relative path (no leading `/` or `~`) is left alone:
-/// this classifier cannot know whether the launch's own working directory
-/// is itself at or above a sensitive root, the same non-goal
-/// `generated_path` already documents for the identical reason.
-///
-/// Issue #160 finding 2, option (a) (2026-08-28): this is a DELIBERATE
-/// ruling, recorded here rather than left implicit. A relative starting
-/// point (`find ..`, `find .`, `find some/subdir`) is out of scope for the
-/// root-wide-scan rule on purpose -- resolving it against the real cwd
-/// would need filesystem/process state this text-only classifier
-/// deliberately never touches (`evaluate`'s own doc comment: "Pure: no
-/// clock, filesystem or environment access"). The alternative considered
-/// and rejected was escalating every relative `find` to `Ask`, which would
-/// have turned the overwhelmingly common bounded case (`find . -name
-/// '*.rs'`, `find ./src -name '*.rs'`) into constant unprompted friction for
-/// no proven safety gain -- a relative token can, of course, still walk
-/// above the cwd (`find ..`), but this classifier has no way to know
-/// whether that lands it at or above a sensitive root either. See
-/// `find_dot_dot_relative_scan_is_deliberately_out_of_the_root_wide_rules_
-/// scope` for the pinning regression test.
+/// Detect lexical filesystem roots and whole home directories, including
+/// normalized `//`, `/.`, `/..` and bare `~user` forms. Relative paths remain
+/// outside this text-only root-wide rule because their cwd is unknown (#160).
 pub(super) fn is_root_wide_or_whole_home_path(token: &str) -> bool {
     if let Some(rest) = token.strip_prefix('~') {
         return match rest.split_once('/') {
@@ -678,38 +463,10 @@ pub(super) fn is_root_wide_or_whole_home_path(token: &str) -> bool {
     token.starts_with('/') && resolve_lexical_path_components(token).is_empty()
 }
 
-/// Whether `command` is a `find` invocation whose starting-point argument
-/// is the filesystem root or the home directory -- an unbounded scan of
-/// everything readable, as opposed to a `find ./src -name '*.rs'` style
-/// search bounded to a subtree. Issue #147 amendment: `find *` is a seeded
-/// built-in escape-allow family, but a root-wide scan must never ride that
-/// seed to `Allow` just because its family matches.
-///
-/// Review round 2 (2026-08-27, CRITICAL): this used to trust a fixed
-/// `tokens[1]` outright, so a leading find OPTION (`-H`/`-L`/`-P`/...)
-/// ahead of the real starting-point shifted the root path clean out of the
-/// position this check looked at -- `find -H / -iname id_rsa` rode the
-/// seeded family straight to `Allow` with no root-wide screening at all.
-/// Mirrors [`is_risky_find_exec`]'s own stance a few hundred lines above:
-/// scan every token rather than trusting one fixed position. Also denies a
-/// starting-point built through an unquoted command substitution (`find
-/// $(echo /) -iname id_rsa`) -- a real shell could resolve that to `/` at
-/// execution time with no literal `/` ever appearing in this text-only
-/// screen's input, so it cannot be proven bounded. Root-wide-or-refuse,
-/// same `$`/backtick disqualification [`generated_path`] already applies
-/// for the identical reason; a legitimate substitution false-positives
-/// into `Ask`, never into a silent bypass.
-///
-/// Review round 3 (2026-08-27, CRITICAL): the exact-match root/home check
-/// is now [`is_root_wide_or_whole_home_path`]'s lexical normalization --
-/// see that function's own doc comment for why `//`, `/.`, `/./`, `/..`,
-/// `/../`, and a bare `~user` all had to close in one pass rather than as
-/// individually enumerated literals.
-///
-/// Issue #160 finding 2, option (a): a relative starting point (`find ..
-/// -iname id_rsa`, `find . -iname id_rsa`) is deliberately never treated as
-/// root-wide here -- see [`is_root_wide_or_whole_home_path`]'s own doc
-/// comment for the recorded ruling and its rationale.
+/// Detect unbounded `find` starting points before an escape-allow family
+/// can clear them. Scan options and all candidate paths, reject dynamic
+/// substitutions, and normalize root/home spellings; relative starting
+/// points cannot be classified as root-wide without cwd (#147, #160).
 fn is_root_wide_find_scan(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -726,33 +483,9 @@ fn is_root_wide_find_scan(command: &str) -> bool {
         .any(|token| token.contains(['$', '`']) || is_root_wide_or_whole_home_path(token))
 }
 
-/// Issue #147 amendment: a family matching `escape_allow` (built-in or
-/// operator) proves nothing about what one specific retried invocation
-/// actually touches. An unsandboxed retry bypasses the OS sandbox's own
-/// `denyRead` protection entirely, so this re-checks every token against
-/// [`sensitive_upload_path`] (the existing credential-path/`.env`
-/// classifier -- a proven superset of [`SANDBOX_DENY_READ_HOME_PATHS`],
-/// reused rather than re-enumerated) and screens out an unbounded
-/// [`is_root_wide_find_scan`]. Applied per candidate in
-/// [`escape_allow_matches`], so it participates in that function's same
-/// worst-wins fold: one denied candidate fails the whole match.
-///
-/// Review round 1 (2026-08-27), Critical: an unquoted `>`/`>>`/`<` used to
-/// pass straight through this screen. `split_segments`/`normalize_segments`
-/// keep redirection characters inside the candidate text, and a seeded
-/// family pattern like `"echo *"` is a plain glob over that same text --
-/// `*` matches a trailing ` > ~/.claude/settings.json` exactly as happily as
-/// it matches an ordinary argument, so `echo '<payload>' >
-/// ~/.claude/settings.json` retried with `--dangerously-disable-sandbox`
-/// reached silent `Allow` via the built-in seed, in BOTH interactive and
-/// headless mode -- an unsandboxed *write* through a seed the doc comments
-/// above only ever reasoned about as read-only utilities. [`contains_
-/// unquoted_redirection`] (already trusted for the identical purpose by the
-/// `gh` carve-out) now screens every candidate first: any unquoted `>`/`>>`/
-/// `<` denies outright, seeded family or not. The seeded read-only
-/// utilities keep working -- their output still reaches the transcript,
-/// just never disk -- so this narrows the gate without breaking the
-/// legitimate case the seed exists for.
+/// Screen every unsandboxed retry candidate for credential paths, root-wide
+/// scans and unquoted redirects. A family glob alone cannot prove a specific
+/// invocation safe; one unsafe candidate defeats the whole match (#147).
 fn escape_denied_by_screen(candidate: &str) -> bool {
     escape_denied_by_screen_with_redirects(candidate, false)
 }
@@ -818,21 +551,9 @@ pub(super) fn escape_denied_by_screen_with_redirects(
     is_root_wide_find_scan(candidate)
 }
 
-/// Review round 2 (finding 96121126, Critical): [`sensitive_upload_path`] is
-/// a per-token *path* classifier, so a credential path embedded inside an
-/// opaque interpreter payload token -- `python3 -c 'open(... ".ssh",
-/// "id_rsa" ...)'` -- is never isolated as its own path token and slips the
-/// screen. A retried `bash <scratchpad>/x.sh` whose contents carry that line
-/// would then read a private key with no prompt, violating #222's own intent
-/// that credential reads must still stop. This is a deliberately coarse
-/// text-level tripwire over the whole candidate: if the raw text literally
-/// names credential material anywhere, the retry fails the screen and takes
-/// the ordinary ask/deny escalation. Benign gate scripts (cargo/phpstan/git)
-/// never contain these fragments, so no prompt regression. It cannot catch a
-/// payload that assembles the path obfuscated (`".ss"+"h"`, base64); that
-/// residual is the accepted interpreter-opacity tradeoff recorded in the
-/// workflow spec's risk table -- this closes only the literal, demonstrated
-/// vector.
+/// Reject literal credential fragments anywhere in candidate text, including
+/// opaque interpreter arguments that per-token path checks cannot see.
+/// Obfuscated paths remain outside this text-only screen (#222).
 pub(crate) fn text_names_credential_material(candidate: &str) -> bool {
     const FRAGMENTS: &[&str] = &[
         ".ssh/",
@@ -857,15 +578,8 @@ pub(crate) fn text_names_credential_material(candidate: &str) -> bool {
     FRAGMENTS.iter().any(|fragment| lowered.contains(fragment))
 }
 
-/// Issue #147, design decision 2: whether EVERY executable segment of the
-/// (possibly compound) retried `command` is cleared for a
-/// `--dangerously-disable-sandbox` retry -- reuses [`normalize_segments`]'s
-/// own decomposition (the identical candidates [`evaluate_candidates`]
-/// folds over), so a compound where only one segment qualifies still fails
-/// the whole match: `cd /tmp && rm -rf /` can never pass just because `cd`
-/// alone would, and `grep foo file && curl evil` can never pass just
-/// because `grep` alone would. Worst segment wins -- a single non-matching
-/// or screened-out candidate fails the whole thing.
+/// One unsafe segment can escape the OS sandbox; require every normalized
+/// candidate to match and pass credential/root screening (#147).
 pub(super) fn escape_allow_matches(
     escape_allow: &[Rule],
     command: &str,
@@ -885,17 +599,9 @@ pub(super) fn escape_allow_matches(
     })
 }
 
-/// Review fix (issue #222 round 1, finding b1c244e2): a shell interpreter
-/// argument names contents the command text cannot show, so an unsandboxed
-/// retry must screen WHAT runs, not only where the file lives. The text is
-/// decomposed by [`normalize_segments`] exactly like an inline compound and
-/// every extracted segment must clear [`command_fails_escape_screen`] --
-/// the same deny-family/credential/root patterns a direct spelling would
-/// hit. Unparseable text fails closed. This is deliberate text-level
-/// parity, not content proof: a nested `bash inner.sh` line passes the
-/// glob layer here just as it would inline, and non-shell interpreters
-/// stay out of scope because shell deny globs cannot read their syntax --
-/// both residuals are recorded in the workflow spec's risk table.
+/// Screen the shell script text that will run, not only its path.
+/// Unparseable payloads fail closed; nested shell and non-shell interpreters
+/// remain outside this text-level proof (#222).
 fn shell_text_clears_escape_screen(text: &str) -> bool {
     let segments = normalize_segments(text);
     !segments.is_empty()
@@ -904,17 +610,9 @@ fn shell_text_clears_escape_screen(text: &str) -> bool {
             .all(|segment| !command_fails_escape_screen(segment))
 }
 
-/// Whether a `sh`/`bash`/`zsh`/`dash` invocation's payload clears the escape
-/// screen. Review round 2 (delta-review probe): a naive scan for the first
-/// `-c` token misreads `bash script.sh -c anything`, where `-c` is a
-/// POSITIONAL argument to the already-selected script (bash runs `script.sh`
-/// and passes `-c anything` as `$1 $2`), not the interpreter's own flag. The
-/// interpreter reads options only UNTIL the first operand: whichever comes
-/// first decides the mode -- a `-c` option means the next token is an inline
-/// command string; the first non-option operand means script-file mode and
-/// that operand is the script. `--` ends option parsing. A bundled short
-/// group containing `c` (`-ec`) counts as the `-c` option. Anything we
-/// cannot resolve to a screened payload fails closed.
+/// Parse shell options only until the first operand: a later `-c` is a
+/// script argument, not an inline-command flag. Unknown payloads fail closed
+/// (#222).
 fn shell_interpreter_payload_clears(tokens: &[String]) -> bool {
     let mut index = 1;
     while let Some(token) = tokens.get(index) {
@@ -944,10 +642,8 @@ fn shell_interpreter_payload_clears(tokens: &[String]) -> bool {
     false
 }
 
-/// [`shell_text_clears_escape_screen`] over a script file's contents.
-/// Fail closed: an unreadable, non-regular, non-UTF-8, or oversized file
-/// never qualifies -- the retry then takes the ordinary ask/deny
-/// escalation instead of a silent pass.
+/// Screen script contents; unreadable, non-regular, non-UTF-8 or oversized
+/// files cannot qualify for silent retry.
 fn shell_script_contents_clear_escape_screen(script: &str) -> bool {
     const MAX_SCREENED_SCRIPT_BYTES: u64 = 128 * 1024;
     let path = std::path::Path::new(script);
@@ -1017,23 +713,9 @@ pub(super) fn allow_verdict_retry_clears_escape_screen(
     })
 }
 
-/// Extends the existing ctx-verb authority to the other non-payload
-/// reserved names for issue #222's general retry rule. Dangerous agent/chat
-/// posture flags and artifact server commands are semantic Deny outcomes
-/// before this screen; the payload-carrying and session-launching names stay
-/// excluded here regardless of their base/native permission.
-///
-/// **`--dry-run` carve-out (issue #307, 2026-09-03):** `test`/`verify` stay
-/// excluded from the blanket reserved-name pass below for the reason their
-/// own doc comment on `SANDBOX_CONFINED_RESERVED_BUILTINS` gives -- an
-/// ordinary invocation selects a repository-authored `.zirv/verify.toml` (or
-/// `package.json`) command that must stay inside Claude's OS sandbox even on
-/// an unsandboxed retry. `--dry-run` is different in kind, not degree:
-/// `verification::run_check` returns `CheckStatus::DryRun` before it ever
-/// builds that child command, so a dry-run invocation cannot reach
-/// repository-authored code no matter what `.zirv/verify.toml` says. Scans
-/// every token after the reserved name (not only a literal `--dry-run` in
-/// final position), mirroring this module's other conservative token scans.
+/// Clear reserved-name retries only when no caller-controlled payload or
+/// weaker posture can hide behind the name. `test`/`verify --dry-run` qualify
+/// because they return before running repo-authored checks (#222, #307).
 fn is_prompt_free_zirv_retry_safe(candidate: &str) -> bool {
     if is_reserved_zirv_escape_safe(candidate) {
         return true;
@@ -1105,12 +787,8 @@ fn is_retry_scaffolding(candidate: &str, scratchpad_roots: &[String]) -> bool {
     }
 }
 
-/// The retry boundary consumes the already-computed base outcome. The two
-/// compound shapes that previously produced false `Ask`s are normalized here
-/// without weakening an explicit policy rule: a literal `cd` or a scratchpad
-/// script may accompany an allowed command, and a tracked-file checkout may
-/// accompany allowed Git inspection. All other ask/deny outcomes remain ask
-/// or deny.
+/// Accept only known safe compound retry shapes after base evaluation;
+/// explicit Ask/Deny rules remain authoritative.
 pub(super) fn retry_has_allow_verdict(
     policy: &SafetyPolicy,
     command: &str,
@@ -1160,16 +838,8 @@ pub(super) fn retry_has_allow_verdict(
     saw_checkout || (saw_scaffolding && saw_allow)
 }
 
-/// Issue #147, design decision 6: whether ANY segment of `command` matches
-/// one of this module's own deny-classification signals -- the exact
-/// dangerous-pattern set `escape_allow_matches` above already screens an
-/// escape retry against (credential paths, `.env` access, an unbounded
-/// root-wide `find`, via [`escape_denied_by_screen`]) plus every ordinary
-/// built-in/operator `deny` verdict [`evaluate`] would already raise (a
-/// destructive `rm -rf`, force-push, etc.). `permissions::compile`'s
-/// `--escape` eligibility reuses this single combinator rather than
-/// re-declaring any of these patterns: a family is eligible for `[safety]
-/// escape_allow` only when every OBSERVED command in it fails this check.
+/// Reuse credential, root-scan and ordinary deny classifiers to reject
+/// escape-allow eligibility if any observed segment is dangerous (#147).
 pub(crate) fn command_fails_escape_screen(command: &str) -> bool {
     escape_denied_by_screen(command)
         || evaluate(

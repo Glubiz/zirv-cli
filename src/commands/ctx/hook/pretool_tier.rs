@@ -11,28 +11,13 @@ use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::state::StateDir;
 
-// -- PreToolUse: the expensive-seat inheritance guard, and (below) the
-// orchestrator-write guard that refuses an orchestrator seat's own direct
-// edit of a repository file (issue #334) ------------------------------------
+// PreToolUse dispatch-tier and orchestrator-write guards (#334).
 
-// The expensive-tier model fragments, the subagent-dispatch tool names and
-// the subagent types that pin no model of their own now live in
-// `lifecycle.rs` (issue #478): the same vocabulary decides a native session's
-// dispatches, where there is no hook payload at all.
+// Shared lifecycle vocabulary also covers native sessions without
+// PreToolUse payloads (#478).
 
-/// The PreToolUse stdin payload, narrowed to what the guard reads. Every
-/// field is optional with a zero default, the same rule the Stop payload
-/// follows: a hook that fails to parse is a hook that silently stops
-/// guarding, so nothing here may be mandatory.
-///
-/// `cwd`/`session_id` (issue #334) feed the orchestrator-write guard:
-/// `cwd` resolves a relative `file_path`/`notebook_path` only -- the
-/// repository root the guard confines itself to is derived from the
-/// resolved TARGET (`repo_root_for_target`), never from `cwd` -- and
-/// `session_id` is the fallback identity for a logged block when this
-/// process has no zirv session env of its own. `agent_id` distinguishes a
-/// delegated native subagent from the orchestrator's guarded main thread;
-/// `agent_type` retains the other documented subagent discriminator.
+/// Optional Claude PreToolUse fields; malformed or missing fields fail
+/// open rather than breaking the hook.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolPayload {
@@ -64,43 +49,29 @@ pub struct PreToolPayload {
 pub struct PreToolInput {
     pub subagent_type: String,
     pub model: String,
-    /// The subagent's own task text. Every real `Agent`/`Task` dispatch
-    /// carries a non-empty one; `pretool_decision` reads its absence as
-    /// schema drift -- a missing `tool_input`, an empty `{}`, or one that
-    /// simply does not name a `prompt` -- rather than an actual dispatch,
-    /// and fails open on it instead of denying on the zero values `#[serde(
-    /// default)]` invented for fields the payload never carried at all.
+    /// Dispatch task text; missing or empty text indicates schema drift and
+    /// must fail open rather than deny on serde defaults.
     pub prompt: String,
-    /// The Agent tool's own short (3-5 word) task description (issue #537
-    /// A5): purely descriptive context for the dispatch-tier advisory, never
-    /// consulted by the deterministic guard above.
+    /// Short descriptive dispatch text for advisory use, never a
+    /// deterministic admission signal (#537).
     pub description: String,
-    /// `Edit`/`Write`/`MultiEdit`'s own target path (issue #334).
+    /// Target path for Edit, Write and MultiEdit (#334).
     pub file_path: String,
-    /// `NotebookEdit`'s own target path (issue #334).
+    /// NotebookEdit target path (#334).
     pub notebook_path: String,
-    /// `Write`'s own incoming file content (issue #406): the text whose
-    /// added definitions the reuse probe looks for in the repository.
+    /// Write content inspected for reusable definitions (#406).
     pub content: String,
-    /// `Edit`'s replacement text (issue #406).
+    /// Edit replacement text (#406).
     pub new_string: String,
-    /// `Edit`'s replaced text (issue #406) -- a definition present in BOTH
-    /// halves is not something this edit adds.
+    /// Edit original text; definitions in both halves are not additions (#406).
     pub old_string: String,
-    /// `MultiEdit`'s own list of edits (issue #406), each with the same
-    /// `old_string`/`new_string` pair a single `Edit` carries.
+    /// MultiEdit entries with the same original/replacement pair (#406).
     pub edits: Vec<PreToolEdit>,
-    /// `Bash`'s own command line (issue #419): the text the bare-`git log`
-    /// rewrite reads to build `updatedInput`. Every other tool's `tool_input`
-    /// simply never carries this key, so the zero default is never mistaken
-    /// for a real (empty) `Bash` command -- `run_pretool_bash_rewrite` is
-    /// only ever reached when `payload.tool_name == "Bash"`.
+    /// Bash command text for the bounded bare-`git log` rewrite (#419).
     pub command: String,
 }
 
-/// One entry of `MultiEdit`'s `edits` array (issue #406). `#[serde(default)]`
-/// throughout for the same reason [`PreToolInput`] is: a payload that fails
-/// to parse is a hook that silently stops guarding.
+/// Optional MultiEdit entry; payload drift must not break the hook.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PreToolEdit {
@@ -129,17 +100,8 @@ impl PreToolPayload {
 /// runs in front of every tool call in the session, and the cost of a wrong
 /// deny is far higher than the cost of a missed one.
 pub fn pretool_decision(seat: Option<&str>, payload: &PreToolPayload) -> Option<String> {
-    // Issue #478: the decision itself is `lifecycle::subagent_admission`, so
-    // a native session (which has no PreToolUse payload at all) reaches the
-    // same guard. This function stays exactly what it always was on the hook
-    // side -- the translator from claude's payload shape into that intent.
-    //
-    // A payload with no `tool_input` at all, an empty `{}`, or one that
-    // simply omits `prompt` is schema drift, not a subagent dispatch: every
-    // genuine `Agent`/`Task` call carries a non-empty `prompt` (the
-    // subagent's own task text), so the guard must not deny on `#[serde(
-    // default)]`'s own zero values for a call it never actually recognised --
-    // `subagent_admission` applies that same empty-prompt rule.
+    // Translate Claude dispatch payloads into the shared lifecycle guard so
+    // native sessions use the same admission rule (#478).
     crate::commands::ctx::lifecycle::subagent_admission(seat, &pretool_intent(payload))
 }
 
@@ -162,16 +124,8 @@ pub(super) fn pretool_intent(
     }
 }
 
-/// The original `tool_input` object exactly as claude sent it -- every field
-/// it carried, known or unknown -- re-read from the raw payload rather than
-/// the typed [`PreToolInput`] (issue #537 A5 review finding): claude's
-/// `updatedInput` REPLACES the whole `tool_input` object rather than merging
-/// into it, so a rewrite built only from the fields `PreToolInput` models
-/// would silently drop anything else the real call carried (e.g.
-/// `isolation`). `stdin` has already parsed successfully once by the time
-/// this runs (`run_pretool`'s own `PreToolPayload::parse` at the top), so
-/// this reparse cannot fail in practice; a defensive empty object covers it
-/// regardless.
+/// Preserve every original tool-input field: Claude `updatedInput`
+/// replaces the object rather than merging partial fields (#537).
 pub(super) fn raw_tool_input(stdin: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(stdin)
         .ok()
@@ -192,18 +146,12 @@ pub(super) fn resolved_cwd(payload: &PreToolPayload) -> Option<PathBuf> {
 
 // -- PreToolUse: the dispatch model-tier advisory (issue #537 A5) ----------
 
-/// Issue #537 (A5): from a live 2026-09-18 probe -- 9/10 correct at 0.6.
+/// Require a confident tier suggestion before rewriting an omitted model;
+/// weak advice leaves the deterministic denial in force (#537).
 pub(crate) const DISPATCH_TIER_FLOOR: f32 = 0.6;
 
-/// The metadata-only envelope [`safe_metadata_request`] (`jev.rs`) accepts:
-/// no brief text, only the bounded numeric row [`dispatch_brief_facts`]
-/// computes locally. Issue #744: the previous text-carrying state
-/// (`brief`/`subagent_type`/`description`) has been rejected by the shared
-/// client's egress boundary since issue #746 (`safe_metadata_request`),
-/// which made this path a dead deny-only fallback -- this is its
-/// re-projection onto the contract every other `[jev]`-gated site already
-/// uses (see `review.rs`'s `JevMetadataState`, `run_loop.rs`'s
-/// `JudgeAdviseState`).
+/// Send only bounded numeric brief metadata to Jev; prompt text and
+/// descriptions must never leave through this request (#744).
 #[derive(Debug, Serialize)]
 pub(super) struct DispatchAdviseState {
     #[serde(rename = "_zirv_metadata_only")]
@@ -271,9 +219,6 @@ fn count_path_like_tokens(brief: &str) -> u32 {
     )
 }
 
-/// Total occurrences (case-insensitive, substring) of every keyword in
-/// `keywords` across `lower_brief`, which the caller has already
-/// lower-cased once for both keyword classes.
 pub(super) fn count_keyword_class(lower_brief: &str, keywords: &[&str]) -> u32 {
     let total: usize = keywords
         .iter()
@@ -298,12 +243,7 @@ fn seat_tier_index(seat: &str) -> u32 {
         )
 }
 
-/// The one metadata row Jev sees for a dispatch-tier decision -- seven
-/// locally computed integers, never the brief text itself (issue #744):
-/// brief byte length, line count, path-like token count, hard-keyword
-/// count ([`HARD_BRIEF_KEYWORDS`]), mechanical-keyword count
-/// ([`MECHANICAL_BRIEF_KEYWORDS`]), code-fence count, seat-tier index
-/// ([`seat_tier_index`]).
+/// Seven numeric dispatch facts for Jev, never raw brief text (#744).
 fn dispatch_brief_facts(brief: &str, seat: &str) -> Vec<u32> {
     let lower = brief.to_ascii_lowercase();
     vec![
@@ -364,30 +304,17 @@ pub(crate) fn dispatch_tier_action(
     }
 }
 
-/// Conservative, deterministic exclusion for an independent-review
-/// dispatch: the review model is the roster's own choice
-/// ([`crate::commands::ctx::adapters::resolve_review_model`]), never this advisory's, so a
-/// dispatch whose `subagent_type`/`description` names a review is excluded
-/// before any Jev call is even built -- no request, no cache read, no
-/// effect recorded. Deliberately loose (a plain substring match) rather
-/// than an exact enum of known review agent types: a false exclusion costs
-/// nothing (the deterministic deny path still runs), while a false
-/// inclusion would let this advisory override a roster-mandated review
-/// model.
+/// Exclude independent reviews from tier advice; their model comes from
+/// the review roster, not this dispatch gate. Deliberately a loose
+/// substring match: a false exclusion costs nothing, but a false inclusion
+/// would let this advisory override a roster-mandated review model.
 fn is_review_dispatch(subagent_type: &str, description: &str) -> bool {
     let names_review = |text: &str| text.to_ascii_lowercase().contains("review");
     names_review(subagent_type) || names_review(description)
 }
 
-/// True only for the one [`crate::commands::ctx::lifecycle::subagent_admission`] deny
-/// reachable by an OMITTED `model` -- a fork (which denies regardless of
-/// `model`, ignoring it outright) and an explicit model that merely re-asks
-/// for the seat tier by name (denied BECAUSE a model was given) are both
-/// excluded, mirroring that function's own three-way split so the two never
-/// drift. `subagent_admission` itself is not called here: it collapses all
-/// three sub-cases into one reason string, which cannot be told apart after
-/// the fact, so this stays a small, deliberate duplicate of its guard
-/// conditions for the one sub-case Jev may narrow.
+/// Advise only when an omitted model alone caused admission denial;
+/// explicit model or fork denials must remain final.
 fn omitted_model_on_generic_type(seat: &str, tool_name: &str, input: &PreToolInput) -> bool {
     if !crate::commands::ctx::lifecycle::names_expensive_tier(seat) {
         return false;
@@ -406,23 +333,9 @@ fn omitted_model_on_generic_type(seat: &str, tool_name: &str, input: &PreToolInp
             || crate::commands::ctx::lifecycle::GENERIC_SUBAGENT_TYPES.contains(&subagent_type))
 }
 
-/// The `updatedInput`/`additionalContext` envelope for a dispatch Jev has
-/// right-sized: the same `allow` shape [`pretool_advise_output`] prints, plus
-/// `updatedInput` -- mirroring [`pretool_rewrite_output`]'s own shape for the
-/// `Bash` rewrite, the one other place this hook rewrites a tool call rather
-/// than merely allowing or denying it outright.
-///
-/// Review finding: claude's `updatedInput` REPLACES the tool's whole input
-/// object rather than merging into it, so `updatedInput` here must be the
-/// ORIGINAL `tool_input` (`original_tool_input`, [`raw_tool_input`]) with
-/// `model` inserted or overwritten -- never a bare `{"model": ...}`, which
-/// would launch the dispatch with no `prompt`, no `subagent_type` and no
-/// `description` at all.
-///
-/// (issue #539 chunk F) also appends [`SKILL_POINTER_NOTE`] to the same
-/// `updatedInput.prompt`, when eligible ([`append_skill_pointer`]) -- the
-/// single `updatedInput` this envelope carries has to speak for both rewrites
-/// at once, since claude only ever reads one.
+/// Rewrite the complete original tool input with the selected model and
+/// eligible skill pointer. Claude replaces `tool_input` wholesale, so a
+/// model-only object would drop the prompt and other fields (#537, #539).
 fn pretool_dispatch_tier_output(
     original_tool_input: &serde_json::Value,
     model: &str,
@@ -437,9 +350,8 @@ fn pretool_dispatch_tier_output(
                 serde_json::Value::String(model.to_string()),
             );
         }
-        // The original was not a JSON object at all (malformed payload) --
-        // never reachable in practice, but a bare model object is still a
-        // safer fallback than propagating a non-object `updatedInput`.
+        // Keep an object fallback for malformed input; never emit a non-object
+        // `updatedInput`.
         None => updated_input = serde_json::json!({ "model": model }),
     }
     append_skill_pointer(&mut updated_input, cfg);
@@ -454,42 +366,10 @@ fn pretool_dispatch_tier_output(
     .to_string()
 }
 
-/// Issue #537 (A5), re-projected onto the metadata-only contract by issue
-/// #744: when [`pretool_decision`]'s deny is reachable ONLY by an omitted
-/// `model` on a generic (or empty) `subagent_type`
-/// ([`omitted_model_on_generic_type`]), the dispatch is not an independent
-/// review ([`is_review_dispatch`] -- that model is the roster's own choice),
-/// and `cfg.jev.dispatch` is on, asks Jev to right-size the model instead of
-/// denying outright, from bounded numeric metadata about the brief only
-/// ([`dispatch_brief_facts`]) -- never the brief text itself, which
-/// `jev::safe_metadata_request` has rejected outright since issue #746. At
-/// or above [`DISPATCH_TIER_FLOOR`], returns the allow-with-rewrite
-/// envelope and records a `tier_selected` effect; below it, an unrecognised
-/// choice, a missing catalogue route, no answer, or any error (`jev::
-/// advise`'s own contract -- gate off, no credential, transport/parse
-/// failure) returns `None` so the caller denies exactly as today, with
-/// nothing recorded. Never touches an explicit `model`, a named custom
-/// `subagent_type`, or a review dispatch: all three are excluded before
-/// this is even reached. Takes `cfg`/`state` directly (rather than
-/// resolving them itself from `env`) so it is directly unit-testable
-/// against a canned Jev response, the same split every other `[jev]`-gated
-/// site in this codebase uses. `tool_input` is the ORIGINAL raw
-/// `tool_input` object ([`raw_tool_input`]), threaded through unchanged to
-/// [`pretool_dispatch_tier_output`] -- see its own doc comment for why a
-/// rebuild from typed fields alone would be wrong.
-///
-/// What this records and what it does not: the effect row carries the
-/// chosen tier label and the actual model alias (both `&'static str` --
-/// [`crate::commands::ctx::catalogue::tier_model`] returns one), never a monetary cost or
-/// token class for the child dispatch, because neither is known at
-/// PreToolUse time -- the child has not run yet. Unknown is not zero; no
-/// site in this crate joins a dispatch's `tier_selected` effect back to its
-/// child's actual usage. `session_spend::fold_session_spend` derives a
-/// SESSION's total priced spend from its own transcript after the fact; a
-/// future join would correlate that per-session total (or a per-agent-id
-/// transcript slice, if one becomes addressable) against this effect's own
-/// `ts`/`session` fields in `jev-effects.jsonl`, not duplicate the pricing
-/// logic here.
+/// Ask Jev to select a model only for generic dispatches denied solely
+/// because the model was omitted. Use bounded numeric metadata, never brief
+/// text. Unknown, weak or failed answers preserve Deny; explicit models,
+/// custom agent types and independent reviews are excluded (#537, #744).
 fn dispatch_tier_advise(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -550,12 +430,8 @@ fn dispatch_tier_advise(
     ))
 }
 
-/// The production wrapper around [`dispatch_tier_advise`]: resolves `cfg`/
-/// `state` from `env` exactly as the file-modification guard below resolves
-/// its own `cfg` (same [`resolved_cwd`]/[`cfg_or_operator_only_gate`]
-/// pair) and the original `tool_input` from `stdin` ([`raw_tool_input`]),
-/// then delegates. `None` on an unresolvable cwd or state directory, same
-/// fail-open posture as every other best-effort lookup on this path.
+/// Resolve config and state with the write guard's path rules so tier advice
+/// cannot read a different repo posture from the dispatch guard.
 pub(super) fn dispatch_tier_override(
     seat: &str,
     payload: &PreToolPayload,
