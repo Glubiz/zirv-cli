@@ -271,7 +271,16 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "restart-chains",
         SlugEntry::File("", ".json"),
-        &["commands/ctx/exec.rs", "commands/ctx/chain.rs"],
+        &[
+            "commands/ctx/exec/mod.rs",
+            "commands/ctx/exec/entry.rs",
+            "commands/ctx/exec/argv.rs",
+            "commands/ctx/exec/command.rs",
+            "commands/ctx/exec/supervision.rs",
+            "commands/ctx/exec/accounting.rs",
+            "commands/ctx/exec/restart.rs",
+            "commands/ctx/chain.rs",
+        ],
     ),
     (
         "probes",

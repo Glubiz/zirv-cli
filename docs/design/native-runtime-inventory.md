@@ -233,8 +233,8 @@ installed binary during self-update; never spawns it).
 | Dash pane harness handover | `src/commands/ctx/dash/pane.rs` | `handover` | N16 (#485) | swaps the harness under a live pane, same session identity |
 | Dash pane swap launch builder | `src/commands/ctx/dash/pane.rs` | `build_swap_launch` | N19 (#488) | derives one successor launch (argv, turn env, knobs); shared by the in-place handover and the open-then-retire successor seam (#552) |
 | Dash spawn-request fulfillment | `src/commands/ctx/dash/spawn_policy.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
-| Headless exec spawn | `src/commands/ctx/exec.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
-| Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
+| Headless exec spawn | `src/commands/ctx/exec/mod.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
+| Headless in-place resume/compact | `src/commands/ctx/exec/compact.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
 | Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock_and_presence` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn; `run_with_clock` is now the thin real-`PATH` wrapper over it (issue #690's launch pre-flight takes an injected presence oracle) |
 | Agent loop objective judge | `src/commands/ctx/run_loop.rs` | `evaluate_objective_after_cycle` | N09 (#478) | distinct helper-model call: judges the objective gate after a loop cycle |
 | Helper-model chokepoint | `src/commands/ctx/handoff.rs` | `helper_answer` | N15 (#484) | the ONE place a non-chat model call is made: native first (`ctx::helper`), harness second. Shared by the distiller, run_loop's judge, memory harvest/consolidation, optimize and ask below |
@@ -253,7 +253,7 @@ installed binary during self-update; never spawns it).
 | `ctx optimize` judgment call | `src/commands/ctx/surface_collect.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
 | Harness proxy helper-model intake | `src/commands/ctx/proxy/llm.rs` | `decide` | N15 (#484) | second decider in the proxy's chain: calls `handoff::helper_answer(helper::ROLE_PROXY, ..)`, the same native-first (`helper.rs`) / harness-second (`handoff::run_model`) chokepoint `ctx ask`/`ctx optimize` already reuse |
-| Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec.rs/wrap.rs restart and session-end seams |
+| Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec/mod.rs/wrap.rs restart and session-end seams |
 | Memory optimize consolidation | `src/commands/ctx/memory_optimize.rs` | `apply_consolidation` | N06 (#475) | `zirv memory optimize`'s model-assisted merge |
 | Builtin argv-shape checks | `src/commands/workflow/checks/argv.rs` | `headless_cmd` | shared | Notes: probe/check only -- `ZCHK-ARGV-CODEX-EXEC` / `ZCHK-ARGV-CLAUDE-HEADLESS` build argv to inspect it, never spawn |
 | Autoresearch proposer spawn | `src/commands/workflow/research/proposer.rs` | `production_proposer_argv` | harness-backend | issue #802: builds the self-recursion argv (`current_exe agent <harness> "<prompt>" -- --model <model>`) for the optional `[proposer]` round's production spawn; `spawn_and_validate_proposal` is the actual `Command::new`/`.output()` call, and tests substitute a portable stub argv there instead of this function |
@@ -347,7 +347,7 @@ left over fails the check by name. A small, explicit `excluded_model_call`
 allowlist keeps this from false-positiving on shapes that match a marker
 but are not a production entry point in their own right: test-only argv
 probes/builders already owned by their spawning caller
-(`ctx/exec.rs::headless_resume_launch`/`prompt_delivery_via_stdin`,
+(`ctx/exec/command.rs::headless_resume_launch`/`prompt_delivery_via_stdin`,
 `ctx/run_loop.rs::prompt_delivery_via_stdin`/`zirv_invocation`,
 `ctx/dash/spawn_policy.rs::task_prompt_fallback_is_safe`), binary
 inspection/self-service (`ctx/measure.rs::current_binary_mtime`,
