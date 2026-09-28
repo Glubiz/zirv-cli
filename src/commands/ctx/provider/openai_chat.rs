@@ -26,7 +26,7 @@ use super::adapter::{
     CacheMode, Cancellation, Effort, EventSink, FailureClass, FailureScope, FailureScopeKind,
     FinishReason, ProviderAdapter, ProviderContent, ProviderFailure, ProviderMessageRole,
     ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderTarget, ProviderUsage,
-    RetryHint, ThinkingConfig, resolve_target,
+    ThinkingConfig, resolve_target,
 };
 use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
@@ -34,7 +34,8 @@ use super::probe::{is_local_http_host, is_plaintext_non_loopback, join_url_path}
 use super::profiles::{CredentialClass, RouteProfile, profile_for, validate_extensions};
 use super::transport::{
     MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
-    check_response_block_cap, parse_retry_after_ms, read_sse_line, supervise, target_scope,
+    check_response_block_cap, classified_http_failure, error_code, parse_retry_after_ms,
+    read_sse_frame, supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId, Support};
 use crate::commands::ctx::config::EnvLookup;
@@ -756,41 +757,28 @@ fn parse_sse<R: BufRead>(
     target: &ProviderTarget,
 ) -> Result<ProviderResponse, ProviderFailure> {
     let mut accumulator = Accumulator::default();
-    let mut data = String::new();
-    let mut line = String::new();
     let mut done = false;
     let mut limits = ResponseLimits::new();
     loop {
-        let read = read_sse_line(&mut reader, &mut line, PROVIDER, cancellation, target)?;
-        limits.record_bytes(PROVIDER, read)?;
-        if read == 0 {
-            if !data.is_empty() && !done {
-                process_chunk(&data, &mut accumulator, sink, target)?;
+        let frame = read_sse_frame(
+            &mut reader,
+            &mut limits,
+            PROVIDER,
+            false,
+            cancellation,
+            target,
+        )?;
+        if !frame.data.is_empty() {
+            if !frame.eof && frame.data.trim() == "[DONE]" {
+                done = true;
+            } else if !frame.eof || !done {
+                process_chunk(&frame.data, &mut accumulator, sink, target)?;
                 check_response_block_cap(PROVIDER, accumulator.tool_calls.len() + 2)?;
             }
+        }
+        if frame.eof {
             break;
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            if !data.is_empty() {
-                if data.trim() == "[DONE]" {
-                    done = true;
-                } else {
-                    process_chunk(&data, &mut accumulator, sink, target)?;
-                    check_response_block_cap(PROVIDER, accumulator.tool_calls.len() + 2)?;
-                }
-                data.clear();
-            }
-            line.clear();
-            continue;
-        }
-        if let Some(value) = trimmed.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(value.trim_start());
-        }
-        line.clear();
     }
     finish_response(accumulator, request_id, sink)
 }
@@ -1048,22 +1036,7 @@ fn classify_transport_error(
     saw_event: bool,
     target: &ProviderTarget,
 ) -> ProviderFailure {
-    if matches!(error, ureq::Error::Timeout(_)) {
-        return super::transport::timeout_failure(PROVIDER, saw_event, target);
-    }
-    super::transport::transport_failure(
-        format!("chat-completions transport failed: {error}"),
-        target,
-    )
-}
-
-fn error_code(value: &Value) -> String {
-    value
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("type").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string()
+    super::transport::classify_transport_error(error, saw_event, PROVIDER, target)
 }
 
 fn classify_http_error(
@@ -1124,14 +1097,14 @@ fn classify_http_error(
             false,
         ),
     };
-    let mut failure = ProviderFailure::new(class, target_scope(target, scope_kind), message);
-    failure.http_status = Some(status);
-    failure.provider_request_id = header_request_id;
-    failure.retry = RetryHint {
-        retryable,
-        after_ms: retry_after_ms,
-    };
-    failure
+    classified_http_failure(
+        status,
+        message,
+        header_request_id,
+        retry_after_ms,
+        target,
+        (class, scope_kind, retryable),
+    )
 }
 
 fn classify_error_payload(value: &Value, target: &ProviderTarget) -> ProviderFailure {

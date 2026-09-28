@@ -29,8 +29,8 @@ use serde_json::{Map, Value, json};
 use super::adapter::{
     CacheMode, Cancellation, EventSink, FailureClass, FailureScope, FailureScopeKind, FinishReason,
     ProviderAdapter, ProviderContent, ProviderFailure, ProviderMessageRole, ProviderRequest,
-    ProviderResponse, ProviderStreamEvent, ProviderTarget, ProviderUsage, RetryHint,
-    ThinkingConfig, resolve_target,
+    ProviderResponse, ProviderStreamEvent, ProviderTarget, ProviderUsage, ThinkingConfig,
+    resolve_target,
 };
 use super::aws_sigv4::{AwsCredentials, CanonicalRequest, amz_date, sign, uri_encode};
 use super::config::NativeConfig;
@@ -38,7 +38,8 @@ use super::credential::{Credential, CredentialStore};
 use super::profiles::{RouteProfile, profile_for};
 use super::transport::{
     MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
-    check_response_block_cap, parse_retry_after_ms, supervise, target_scope,
+    check_response_block_cap, classified_http_failure, parse_retry_after_ms, supervise,
+    target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId, Support};
 use crate::commands::ctx::config::EnvLookup;
@@ -1133,10 +1134,7 @@ fn classify_transport_error(
     saw_event: bool,
     target: &ProviderTarget,
 ) -> ProviderFailure {
-    if matches!(error, ureq::Error::Timeout(_)) {
-        return super::transport::timeout_failure(PROVIDER, saw_event, target);
-    }
-    super::transport::transport_failure(format!("Bedrock transport failed: {error}"), target)
+    super::transport::classify_transport_error(error, saw_event, PROVIDER, target)
 }
 
 fn classify_exception(name: &str, value: &Value, target: &ProviderTarget) -> ProviderFailure {
@@ -1222,14 +1220,14 @@ fn classify_http_error(
             false,
         ),
     };
-    let mut failure = ProviderFailure::new(class, target_scope(target, scope_kind), message);
-    failure.http_status = Some(status);
-    failure.provider_request_id = request_id;
-    failure.retry = RetryHint {
-        retryable,
-        after_ms: retry_after_ms,
-    };
-    failure
+    classified_http_failure(
+        status,
+        message,
+        request_id,
+        retry_after_ms,
+        target,
+        (class, scope_kind, retryable),
+    )
 }
 
 #[cfg(test)]

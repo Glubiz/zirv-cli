@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::adapter::{
     Cancellation, EventSink, FailureClass, FailureScope, FailureScopeKind, ProviderFailure,
-    ProviderResponse, ProviderStreamEvent, ProviderTarget,
+    ProviderResponse, ProviderStreamEvent, ProviderTarget, RetryHint,
 };
 
 pub(crate) const MAX_ERROR_BODY_BYTES: u64 = 1024 * 1024;
@@ -219,6 +219,46 @@ pub(crate) fn read_sse_line<R: BufRead>(
     }
 }
 
+pub(crate) struct SseFrame {
+    pub event_name: String,
+    pub data: String,
+    pub eof: bool,
+}
+
+pub(crate) fn read_sse_frame<R: BufRead>(
+    reader: &mut R,
+    limits: &mut ResponseLimits,
+    provider: &'static str,
+    named_events: bool,
+    cancellation: &dyn Cancellation,
+    target: &ProviderTarget,
+) -> Result<SseFrame, ProviderFailure> {
+    let mut event_name = String::new();
+    let mut data = String::new();
+    let mut line = String::new();
+    loop {
+        let read = read_sse_line(reader, &mut line, provider, cancellation, target)?;
+        limits.record_bytes(provider, read)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if read == 0 || trimmed.is_empty() {
+            return Ok(SseFrame {
+                event_name,
+                data,
+                eof: read == 0,
+            });
+        }
+        if named_events && let Some(value) = trimmed.strip_prefix("event:") {
+            event_name = value.trim_start().to_string();
+        } else if let Some(value) = trimmed.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim_start());
+        }
+        line.clear();
+    }
+}
+
 /// Rejects a content block whose accumulated text/thinking/partial-JSON buffer
 /// would exceed [`MAX_BLOCK_ACCUMULATOR_BYTES`] once the next delta is
 /// appended, settling the stream to the same typed failure class used for an
@@ -340,6 +380,45 @@ pub(crate) fn transport_failure(message: String, target: &ProviderTarget) -> Pro
     failure
 }
 
+pub(crate) fn classify_transport_error(
+    error: ureq::Error,
+    saw_event: bool,
+    provider: &'static str,
+    target: &ProviderTarget,
+) -> ProviderFailure {
+    if matches!(error, ureq::Error::Timeout(_)) {
+        return timeout_failure(provider, saw_event, target);
+    }
+    transport_failure(format!("{provider} transport failed: {error}"), target)
+}
+
+pub(crate) fn classified_http_failure(
+    status: u16,
+    message: String,
+    request_id: Option<String>,
+    retry_after_ms: Option<u64>,
+    target: &ProviderTarget,
+    (class, scope_kind, retryable): (FailureClass, FailureScopeKind, bool),
+) -> ProviderFailure {
+    let mut failure = ProviderFailure::new(class, target_scope(target, scope_kind), message);
+    failure.http_status = Some(status);
+    failure.provider_request_id = request_id;
+    failure.retry = RetryHint {
+        retryable,
+        after_ms: retry_after_ms,
+    };
+    failure
+}
+
+pub(crate) fn error_code(value: &Value) -> String {
+    value
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn invalid_stream(message: String) -> ProviderFailure {
     ProviderFailure::new(
         FailureClass::InvalidStream,
@@ -428,6 +507,35 @@ mod tests {
     use crate::commands::ctx::provider::{
         AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
     };
+
+    #[test]
+    fn sse_frames_preserve_multiline_data_empty_frames_and_eof() {
+        let mut reader = std::io::Cursor::new(
+            b"event: one\r\ndata: first\ndata: second\n\n\ndata: tail".as_slice(),
+        );
+        let mut limits = ResponseLimits::new();
+        let target = target();
+        let mut next = || {
+            read_sse_frame(
+                &mut reader,
+                &mut limits,
+                "OpenAI",
+                true,
+                &NeverCancelled,
+                &target,
+            )
+            .unwrap()
+        };
+        let first = next();
+        assert_eq!(first.event_name, "one");
+        assert_eq!(first.data, "first\nsecond");
+        assert!(!first.eof);
+        let empty = next();
+        assert!(empty.event_name.is_empty() && empty.data.is_empty() && !empty.eof);
+        let tail = next();
+        assert_eq!(tail.data, "tail");
+        assert!(tail.eof);
+    }
 
     fn target() -> ProviderTarget {
         ProviderTarget {
