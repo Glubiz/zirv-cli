@@ -1,4 +1,5 @@
 //! Native Model Context Protocol client (issue #483, roadmap N14).
+//! Keep this wire layer: stock rmcp 3.3.0 lacks bounded JSON reads and retries HTTP POSTs after 404 by default (#795).
 //!
 //! A native session has no host harness to inherit MCP servers from, so zirv
 //! speaks the protocol itself. This module owns the wire: transport lifecycle,
