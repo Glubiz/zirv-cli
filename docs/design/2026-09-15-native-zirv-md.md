@@ -4,7 +4,7 @@
 
 ## Context
 
-The wrapped-harness context collector (`src/commands/ctx/optimize.rs`) and
+The wrapped-harness context collector (`src/commands/ctx/surface_collect.rs`) and
 the shared trust vocabulary (`src/commands/ctx/surface.rs`) already treat
 `CLAUDE.md` and `AGENTS.md` as generic, trust-classed context surfaces
 (issues #40/#41). Issue #538 gives the native harness its own instruction
@@ -19,7 +19,7 @@ tooling and the native `/instructions` view.
 ## Decisions
 
 **File and precedence contract.** Five new `Layer` variants
-(`optimize.rs`): `GlobalZirvMd` (`~/.zirv/ZIRV.md`), `RepoZirvMd`
+(`surface_collect.rs`): `GlobalZirvMd` (`~/.zirv/ZIRV.md`), `RepoZirvMd`
 (`<repo>/ZIRV.md`, or `<repo>/.zirv/ZIRV.md` when the root file is absent —
 both may be collected as separate surfaces when both exist), `NestedZirvMd`,
 plus `RepoAgentMd`/`NestedAgentMd` for the singular `AGENT.md` compatibility
@@ -71,7 +71,7 @@ leaves its own trust root (`repo` for every repo-owned scope, `home` for
 `Global`) is `Excluded { reason: "escapes trust root" }`.
 
 **Symlinked instruction files are refused, not read through** — mirroring
-`runtime/context.rs::push_file`'s posture, extended to `optimize.rs`'s own
+`runtime/context.rs::push_file`'s posture, extended to `surface_collect.rs`'s own
 collector for the first time. `push_surface_tracking` (renamed from
 `push_surface`, all ~30 call sites updated) checks `Kind::Instructions`
 candidates for a symlink before reading; a hit is never turned into a
@@ -123,7 +123,7 @@ second competing "which layer wins" computation.
   --base release/native-harness`, `scripts/check-readme-features.sh`: all
   pass.
 - The `#[cfg(unix)]`-gated `symlinked_instruction_files_are_excluded_not_
-  skipped` test (`optimize.rs`) could not be exercised on this Windows
+  skipped` test (`surface_collect.rs`) could not be exercised on this Windows
   development box; it follows the exact pattern of the pre-existing
   `the_nested_scan_does_not_follow_a_symlink_out_of_the_repo` test in the
   same file, which carries the same platform gate.
@@ -146,7 +146,7 @@ second competing "which layer wins" computation.
 ## Context
 
 Chunk A gave the wrapped-harness collector `ZIRV.md` discovery and
-same-directory precedence (`optimize.rs`'s five new `Layer` variants,
+same-directory precedence (`surface_collect.rs`'s five new `Layer` variants,
 `context.rs`'s `resolve_instruction_winners`). The native context compiler
 (`runtime/context.rs`, issue #475) never read any of it: its own module doc
 promised it "never reads a vendor CLI's own instruction file", and until this

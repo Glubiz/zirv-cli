@@ -163,7 +163,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "optimize",
         SlugEntry::Directory,
-        &["commands/ctx/optimize.rs"],
+        &["commands/ctx/surface_collect.rs"],
     ),
     (
         "search",

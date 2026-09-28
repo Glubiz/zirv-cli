@@ -1410,7 +1410,7 @@ pub(super) fn narrow_objective_gates(home: Vec<String>, repo: Option<Vec<String>
 /// `--allowedTools`/`--disallowedTools` themselves already take on the
 /// command line, so an operator setting one of these can paste the identical
 /// rule syntax), `memory.rs`'s `Tags`/`Paths` header parsing, and
-/// `optimize.rs`'s `Evidence:` line parsing. Previously three separate
+/// `surface_collect.rs`'s `Evidence:` line parsing. Previously three separate
 /// copies of the identical `split(',').trim().filter(!is_empty())` logic.
 pub(crate) fn split_csv_list(raw: &str) -> Vec<String> {
     raw.split(',')

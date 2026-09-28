@@ -3,7 +3,7 @@
 //! relative to the repository checkout, and whether zirv may ever treat its
 //! content as operator-authoritative.
 //!
-//! `optimize.rs`'s `Layer` enum is the first consumer: each of its variants
+//! `surface_collect.rs`'s `Layer` enum is the first consumer: each of its variants
 //! maps onto one `(Provider, Kind, Scope)` triple, and its `is_settings()`/
 //! `is_repo_owned()` helpers are derived from that mapping rather than
 //! hand-rolled per variant. As of issue #40, `Layer` maps both Claude's
@@ -28,15 +28,15 @@ use std::path::{Path, PathBuf};
 pub enum Provider {
     /// zirv's own `ctx.toml`, `.settings.toml`, memory bank, mail, session
     /// state -- and, since issue #41, the canonical `.zirv/context/common.md`
-    /// layer (`optimize.rs`'s `Layer::ContextCommon`): meant for every
+    /// layer (`surface_collect.rs`'s `Layer::ContextCommon`): meant for every
     /// harness alike, so it names the system that owns it (zirv), not one
-    /// it targets. `optimize.rs` collects both Claude's and Codex's own
+    /// it targets. `surface_collect.rs` collects both Claude's and Codex's own
     /// surfaces (issues #39/#40) plus this one; memory/mail/session state
     /// still have no surface naming this variant.
     Zirv,
     Claude,
     /// Codex's own AGENTS.md and `config.toml` analogues (issue #40) --
-    /// `optimize.rs`'s `Layer::GlobalAgentsMd`/`RepoAgentsMd`/
+    /// `surface_collect.rs`'s `Layer::GlobalAgentsMd`/`RepoAgentsMd`/
     /// `NestedAgentsMd`/`CodexUserSettings`/`CodexProjectSettings` all map
     /// here. Claude contributes a `LocalPrivate`-scoped surface
     /// (`settings.local.json`); Codex does not have an equivalent yet --
@@ -51,7 +51,7 @@ pub enum Kind {
     /// Free-form prose/bullet instructions (CLAUDE.md, AGENTS.md).
     Instructions,
     /// The cross-session durable-fact bank. Deliberately outside
-    /// `optimize.rs`'s own collection today (N7: a memory key/body must
+    /// `surface_collect.rs`'s own collection today (N7: a memory key/body must
     /// never reach the judgment model) -- a later task wires this through.
     #[allow(dead_code)]
     Memory,
@@ -121,7 +121,7 @@ pub enum Trust {
 ///
 /// Deliberately holds no content: `path` plus `provider`/`kind`/`scope` is
 /// provenance, not the surface's text, which callers already have from their
-/// own read (`optimize::Surface::text`, for instance) and cap independently.
+/// own read (`surface_collect::Surface::text`, for instance) and cap independently.
 ///
 /// Constructed only through `for_path` (which derives `Global` vs. repo-owned
 /// from the path itself, not from a caller-supplied flag) and the two
@@ -255,7 +255,7 @@ impl ContextSurface {
     }
 
     // No production caller yet for the four accessors below --
-    // `optimize::Surface::context_surface()` constructs a `ContextSurface`
+    // `surface_collect::Surface::context_surface()` constructs a `ContextSurface`
     // for future tasks (issue #39) but nothing reads one back yet, except
     // `trust()` right below (`compile.rs`'s context compiler, issue #44); the
     // module's own tests exercise every accessor in the meantime.
@@ -336,7 +336,7 @@ mod tests {
     /// context sources alongside CLAUDE.md/AGENTS.md/settings; this proves
     /// the vocabulary already models them, before any task wires a real
     /// collector through it (memory stays deliberately outside
-    /// `optimize.rs`'s own collection today -- see its module doc).
+    /// `surface_collect.rs`'s own collection today -- see its module doc).
     #[test]
     fn the_vocabulary_already_covers_sources_no_task_has_wired_up_yet() {
         let memory = ContextSurface::new(

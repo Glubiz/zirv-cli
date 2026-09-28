@@ -617,7 +617,7 @@ pub fn screen_with_thresholds(
 /// Where a piece of untrusted text handed to [`screen`] came from, for
 /// [`action`]'s source-aware matrix (issue #272 design item 3). Distinct
 /// from `surface::Trust` (`Operator`/`RepoUntrusted`, the context-injection
-/// provenance taxonomy `optimize.rs`/`compile.rs` already use): that
+/// provenance taxonomy `surface_collect.rs`/`compile.rs` already use): that
 /// taxonomy has no peer-session bucket, since mail is a different subsystem
 /// than the canonical-context layers it describes. A caller that already
 /// has a `surface::Trust` maps it straight across: `RepoUntrusted ->

@@ -19,11 +19,11 @@ use super::super::config::CtxConfig;
 use super::super::context as chunk_a;
 use super::super::jev;
 use super::super::memory::{self, MemoryScope};
-use super::super::optimize;
 use super::super::prompt::{self, PromptRole};
 use super::super::provider::capability::{Capability, ModelCapabilities};
 use super::super::state::{self, StateDir};
 use super::super::surface;
+use super::super::surface_collect;
 use super::tools::{ToolDefinition, ToolRegistry};
 
 pub const NATIVE_CONTEXT_SCHEMA_VERSION: u32 = 1;
@@ -1126,8 +1126,12 @@ fn scope_ancestor_directories(repo: &Path, scope_paths: &[PathBuf]) -> BTreeSet<
 /// `scope_dirs`); a nested one only when its own directory is too. A
 /// global-scoped layer is never a candidate here at all -- it is pushed
 /// separately by `push_global_zirv_md_source`.
-fn in_active_scope(layer: optimize::Layer, path: &Path, scope_dirs: &BTreeSet<PathBuf>) -> bool {
-    use optimize::Layer;
+fn in_active_scope(
+    layer: surface_collect::Layer,
+    path: &Path,
+    scope_dirs: &BTreeSet<PathBuf>,
+) -> bool {
+    use surface_collect::Layer;
     match layer {
         Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => true,
         Layer::NestedZirvMd
@@ -1141,8 +1145,8 @@ fn in_active_scope(layer: optimize::Layer, path: &Path, scope_dirs: &BTreeSet<Pa
 /// `repo` / `nested:<relative dir>` for `SourceProvenance::scope` -- `global`
 /// is stamped separately by `push_global_zirv_md_source`, so this is never
 /// called for that layer.
-fn native_scope_label(repo: &Path, layer: optimize::Layer, path: &Path) -> String {
-    use optimize::Layer;
+fn native_scope_label(repo: &Path, layer: surface_collect::Layer, path: &Path) -> String {
+    use surface_collect::Layer;
     match layer {
         Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => {
             "repo".to_string()
@@ -1158,8 +1162,8 @@ fn native_scope_label(repo: &Path, layer: optimize::Layer, path: &Path) -> Strin
 /// "Root first, then nested by depth" stable ordering (issue #538, decision
 /// 1's aggregate-cap ordering): 0 for every repo-root-scoped layer,
 /// otherwise the touched directory's component distance from `repo`.
-fn native_scope_depth(repo: &Path, layer: optimize::Layer, path: &Path) -> usize {
-    use optimize::Layer;
+fn native_scope_depth(repo: &Path, layer: surface_collect::Layer, path: &Path) -> usize {
+    use surface_collect::Layer;
     match layer {
         Layer::RepoZirvMd | Layer::RepoAgentsMd | Layer::RepoClaudeMd | Layer::RepoAgentMd => 0,
         _ => path
@@ -1170,7 +1174,7 @@ fn native_scope_depth(repo: &Path, layer: optimize::Layer, path: &Path) -> usize
     }
 }
 
-fn native_source_trust(layer: optimize::Layer) -> SourceTrust {
+fn native_source_trust(layer: surface_collect::Layer) -> SourceTrust {
     match layer.trust() {
         surface::Trust::Operator => SourceTrust::Operator,
         surface::Trust::RepoUntrusted => SourceTrust::RepositoryUntrusted,
@@ -1217,8 +1221,8 @@ pub fn resolve_active_scope_instructions(
     scope_paths: &[PathBuf],
     max_surface_bytes: usize,
 ) -> Vec<ResolvedInstructionSource> {
-    let surfaces = optimize::collect_surfaces(home, repo, max_surface_bytes);
-    let exclusions = optimize::collect_instruction_exclusions(home, repo, max_surface_bytes);
+    let surfaces = surface_collect::collect_surfaces(home, repo, max_surface_bytes);
+    let exclusions = surface_collect::collect_instruction_exclusions(home, repo, max_surface_bytes);
     let resolved = chunk_a::resolve_instruction_winners(&surfaces, &exclusions, repo, home);
     let scope_dirs = scope_ancestor_directories(repo, scope_paths);
 
@@ -1270,9 +1274,12 @@ pub fn resolve_active_scope_instructions(
 /// unchanged).
 fn push_native_instruction_sources(out: &mut Vec<Candidate>, request: &CompileRequest<'_>) {
     let max_surface_bytes = request.config.optimize.max_surface_bytes;
-    let surfaces = optimize::collect_surfaces(request.home, request.repo, max_surface_bytes);
-    let exclusions =
-        optimize::collect_instruction_exclusions(request.home, request.repo, max_surface_bytes);
+    let surfaces = surface_collect::collect_surfaces(request.home, request.repo, max_surface_bytes);
+    let exclusions = surface_collect::collect_instruction_exclusions(
+        request.home,
+        request.repo,
+        max_surface_bytes,
+    );
     let resolved =
         chunk_a::resolve_instruction_winners(&surfaces, &exclusions, request.repo, request.home);
     let scope_dirs = scope_ancestor_directories(request.repo, request.scope_paths);

@@ -2021,7 +2021,7 @@ fn announce_unparsable_layers_once(cfg: &CtxConfig) {
         .emit(&super::announce::Event::ConfigUnparsable { detail });
 }
 
-/// The shared "config failed to load" fallback `optimize.rs` (report-only)
+/// The shared "config failed to load" fallback `surface_collect.rs` (report-only)
 /// and `hook.rs` (the `Stop` hook) both need: neither may hard-fail a run
 /// over a bad config, but degrading all the way to `CtxConfig::default()`
 /// hands back a fully permissive `AgentGate` (review finding 1, see
@@ -5757,7 +5757,7 @@ intake_discipline = true
         // The repo file alone is a hard load error (see the test above);
         // simulate what a caller degraded to the operator-only layers would
         // see instead (`config::degrade_to_operator_only`, the same
-        // fail-closed path `optimize.rs`/`hook.rs` already take on an
+        // fail-closed path `surface_collect.rs`/`hook.rs` already take on an
         // unreadable repo config) -- `cfg.sandbox` still defaults `true`.
         let cfg = super::degrade_to_operator_only(&|k| empty.get(k).cloned());
         assert!(cfg.sandbox.enabled);

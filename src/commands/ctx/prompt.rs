@@ -9811,7 +9811,7 @@ mod tests {
     /// contains. `compose` reads only `.zirv/system-prompt.md` and canonical
     /// `.zirv/context/`, never `ZIRV.md`/`AGENTS.md`/`CLAUDE.md` -- those
     /// stay drift-detection-only surfaces for the wrapped harness path, per
-    /// `optimize.rs`'s own module doc.
+    /// `surface_collect.rs`'s own module doc.
     #[test]
     fn a_zirv_md_file_never_changes_the_legacy_wrapped_harness_prompt() {
         let (_tmp, home, repo) = tree();

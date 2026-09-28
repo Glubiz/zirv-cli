@@ -498,8 +498,8 @@ fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now:
 
 /// The optimize hint sentence, worded from the signal that actually fired
 /// rather than always blaming the tools.
-fn optimize_hint(reason: super::optimize::RecommendReason) -> &'static str {
-    use super::optimize::RecommendReason;
+fn optimize_hint(reason: super::surface_collect::RecommendReason) -> &'static str {
+    use super::surface_collect::RecommendReason;
     match reason {
         RecommendReason::ToolFailures => {
             "This session hit tools hard: `zirv ctx optimize` reviews the instruction files for \
@@ -540,7 +540,7 @@ pub fn stop_output(
     payload: &HookPayload,
     score: &Score,
     socket: Option<&Path>,
-    optimize_recommended: Option<super::optimize::RecommendReason>,
+    optimize_recommended: Option<super::surface_collect::RecommendReason>,
     adoption_nudge: Option<&str>,
     same_error_threshold: usize,
 ) -> Option<String> {
@@ -634,7 +634,7 @@ const CORRECTION_CHECKPOINT_VERSION: u32 = 1;
 ///
 /// `corrections_in` used to `read_to_string` and re-`structural_context` the
 /// WHOLE transcript on every Stop hook call once a session passed the
-/// correction-recommendation gate (`optimize::recommendation_possible`) --
+/// correction-recommendation gate (`surface_collect::recommendation_possible`) --
 /// O(session) per turn, O(n^2) over a session, exactly the cost the cached
 /// score above already pays once to avoid for the rot score itself. This is
 /// kept as its own small checkpoint rather than folded into `score.rs`'s
@@ -745,7 +745,8 @@ fn corrections_in(state: &StateDir, transcript: &Path, cfg: &CtxConfig) -> usize
     if appended.restarted {
         checkpoint.corrections = 0;
     }
-    checkpoint.corrections += super::optimize::count_corrections(adapter.as_ref(), &appended.lines);
+    checkpoint.corrections +=
+        super::surface_collect::count_corrections(adapter.as_ref(), &appended.lines);
     let (offset, consumed) = watcher.position();
     checkpoint.offset = offset;
     checkpoint.consumed = consumed;
@@ -1027,7 +1028,7 @@ fn compact_advisory_stop_nudge(
 /// optimize-recommendation path: a hook must never fail outright on a bad
 /// config, but degrading all the way to `CtxConfig::default()` would hand
 /// `corrections_in` a fully permissive `AgentGate`, which is exactly the
-/// same trust hole `optimize.rs`'s config-load fallback had (review finding
+/// same trust hole `surface_collect.rs`'s config-load fallback had (review finding
 /// 1): a malformed *repo* `.settings.toml` would silently revive an agent
 /// the *operator* disabled. It would also, since issue #44 made `cfg.policy`
 /// load-bearing, hand back the widest possible policy from a config that
@@ -3535,9 +3536,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // could matter. Without that ordering every turn re-parses the whole
         // session, which is precisely what the cached score above removes.
         let now = now_secs();
-        if super::optimize::recommendation_possible(&state, &score, &cfg.optimize, now) {
+        if super::surface_collect::recommendation_possible(&state, &score, &cfg.optimize, now) {
             let corrections = corrections_in(&state, transcript, &cfg);
-            optimize_recommended = super::optimize::queue_recommendation(
+            optimize_recommended = super::surface_collect::queue_recommendation(
                 &state,
                 &session,
                 &score,
@@ -9638,7 +9639,7 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(
-            log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            log.contains(crate::commands::ctx::surface_collect::RECOMMEND_ACTION),
             "got {log}"
         );
 
@@ -9727,7 +9728,7 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(
-            log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            log.contains(crate::commands::ctx::surface_collect::RECOMMEND_ACTION),
             "corrections alone must be enough to queue: {log}"
         );
         assert!(
@@ -10031,7 +10032,7 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).unwrap_or_default();
         assert!(
-            !log.contains(crate::commands::ctx::optimize::RECOMMEND_ACTION),
+            !log.contains(crate::commands::ctx::surface_collect::RECOMMEND_ACTION),
             "got {log}"
         );
         assert!(

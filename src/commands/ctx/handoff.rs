@@ -1163,7 +1163,7 @@ fn sanitized_model_stderr(stderr: &[u8], prompt: &str) -> String {
 /// which reached `codex exec --model haiku` for a codex session and failed
 /// outright, falling back to codex's empty `structural_context` for a
 /// silently near-empty handoff. Every model-taking caller in this module,
-/// `exec.rs`, `wrap.rs`, and `optimize.rs` goes through this rather than
+/// `exec.rs`, `wrap.rs`, and `surface_collect.rs` goes through this rather than
 /// reading `cfg.handoff.model`/`cfg.optimize.model` directly, so a third
 /// adapter with its own default (or none) is handled without an edit at any
 /// of those call sites.
