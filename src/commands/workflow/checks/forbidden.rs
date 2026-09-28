@@ -148,7 +148,7 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
             super::not_the_zirv_repo(repo),
         );
     }
-    let path = repo.join("src/commands/ctx/config.rs");
+    let path = repo.join("src/commands/ctx/config/repo_layer.rs");
     if !path.exists() {
         return BuiltinCheckResult::inconclusive(
             ID,
@@ -365,8 +365,8 @@ mod tests {
 
     fn write_config_rs(repo: &Path, body: &str) {
         super::super::write_manifest(repo, "zirv");
-        std::fs::create_dir_all(repo.join("src/commands/ctx")).unwrap();
-        std::fs::write(repo.join("src/commands/ctx/config.rs"), body).unwrap();
+        std::fs::create_dir_all(repo.join("src/commands/ctx/config")).unwrap();
+        std::fs::write(repo.join("src/commands/ctx/config/repo_layer.rs"), body).unwrap();
     }
 
     /// Issue #406: the reuse probe's own scope knob is repo-settable, so it
