@@ -1,20 +1,7 @@
 //! Overlay reducers: mail, spawn, memory, restore, errors, menu, inspector, palette, quit, handover.
 use super::*;
 
-/// Issue #354 phase 3: relaunches one retained ended row from the very
-/// `spawnreq::SpawnRequest` that created it, through the existing
-/// [`fulfill_spawn_request`] machinery -- the same call `drain_one_channel`
-/// makes for a request that arrives on disk, with the same
-/// `FILE_DROP_TRUSTED_INTERACTIVE` posture and the same requester identity
-/// the original spawn was granted.
-///
-/// Deliberately NOT a stored argv replay and NOT a new process-launch path:
-/// every gate `fulfill_spawn_request` applies (the argv guard, the repo/cwd
-/// acceptance check, workdir confinement, the envelope re-narrowing, the
-/// depth cap, admission and pacing) is re-applied to the relaunch exactly as
-/// it was to the original. The row is dropped from the retained list only
-/// once the relaunch succeeds -- a refusal leaves it on screen with its
-/// reason in the error channel, still restorable.
+/// Relaunch a retained row from its original request through the normal spawn gate (#354).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn restore_ended_row(
     short: &str,
@@ -42,8 +29,7 @@ pub(super) fn restore_ended_row(
         return;
     };
     let requested_by = retained[index].requested_by.clone();
-    // A1-2: captured BEFORE the relaunch grows `panes` and shrinks
-    // `retained` -- the two index moves `restore_fixup` folds together.
+    // Capture both indices before restore changes pane and retained-row positions.
     let old_pane_count = panes.len();
     let restored_row = rows.iter().position(|row| row.short == short);
     match fulfill_spawn_request(
@@ -66,8 +52,7 @@ pub(super) fn restore_ended_row(
                 *selected = restore_fixup(old_pane_count, panes.len(), restored_row, *selected);
             }
             push_notice(notices, now, format!("restored {short} as {new_short}"));
-            // Issue #399: same posture as the fresh-spawn path -- informational,
-            // never the sticky error log.
+            // Report restore success as a transient notice, not a sticky error (#399).
             if let Some(text) = advisory {
                 push_notice(notices, now, text);
             }
@@ -84,14 +69,7 @@ pub(super) fn clamp_cursor(cursor: usize, len: usize) -> usize {
     if len == 0 { 0 } else { cursor.min(len - 1) }
 }
 
-/// One `j`/`k` (or Down/Up) press against a list cursor: `delta` is `+1` for
-/// "down/next", `-1` for "up/previous". Shared by every browsing-mode
-/// reducer that walks a flat list -- issue #202 phase 2b factors the
-/// copy-pasted `clamp_cursor(cursor + 1, len)` / `cursor.saturating_sub(1)`
-/// pair out of the new errors/handover reducers below, plus `restore_
-/// overlay_reduce` (an existing one, updated here to prove the shape holds
-/// there too; `mail_overlay_reduce`/`memory_overlay_reduce` are left as they
-/// were, to keep this change's diff proportional to what it is fixing).
+/// Move a list cursor by one row in either direction without leaving the list.
 pub(super) fn move_cursor(cursor: usize, len: usize, delta: isize) -> usize {
     if delta >= 0 {
         clamp_cursor(cursor.saturating_add(delta as usize), len)
@@ -100,10 +78,7 @@ pub(super) fn move_cursor(cursor: usize, len: usize, delta: isize) -> usize {
     }
 }
 
-/// Inserts a newline for every compose-style overlay. These reducers keep
-/// the insertion point at the end of the draft, so an unmodified Enter can
-/// follow Claude Code's portable convention by replacing the trailing
-/// backslash immediately before that point.
+/// Insert a newline at the end of compose drafts using the same Enter convention as the pane.
 pub(super) fn insert_compose_newline(input: &mut String, modifiers: KeyModifiers) -> bool {
     if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
         input.push('\n');
@@ -146,10 +121,7 @@ pub fn mail_overlay_reduce(
                 let body = draft.body.clone();
                 view.compose = None;
                 let msg = mail::Message {
-                    // Placeholders: `apply_mail_effect` overwrites all three
-                    // right before `mail::store` -- see `ui::MailEffect`'s
-                    // own doc comment for why the reducer never touches
-                    // identity or the clock itself.
+                    // Fill sender identity and timestamp only when applying the mail effect to storage.
                     from_session: String::new(),
                     from_agent: String::new(),
                     to,
@@ -348,10 +320,7 @@ pub fn memory_overlay_reduce(
     }
 }
 
-/// Executes a `MailEffect` against real storage -- the only place either
-/// reducer's output actually touches disk. `from_session`/`from_agent` are
-/// this dashboard's own identity (the orchestrator pane's short id and this
-/// session's agent name), stamped onto a `Send` right before `mail::store`.
+/// Apply mail effects to storage with the dashboard's own sender identity.
 pub(super) fn apply_mail_effect(
     effect: ui::MailEffect,
     state: &StateDir,
@@ -364,11 +333,7 @@ pub(super) fn apply_mail_effect(
     let slug = super::state::repo_slug(repo);
     match effect {
         ui::MailEffect::Consume(path) => {
-            // Issue #30, item 3: the operator drives this from the
-            // dashboard's own mail overlay, on behalf of the orchestrator
-            // pane's identity (`from_session`), not through `zirv ctx
-            // inbox` -- logged the same as every other on-behalf-of
-            // consumption seam.
+            // Send overlay mail as the orchestrator pane, not as a process reading inbox (#30).
             if let Err(e) =
                 mail::consume_and_log(state, &slug, &path, from_session, "dash", "dash:overlay")
             {
@@ -433,8 +398,7 @@ pub(super) fn apply_memory_effect(
     }
 }
 
-/// A single-line preview of a body: its first line, capped short enough to
-/// fit the overlay dialog next to a `from`/`key` label.
+/// Preview only the first line within the dialog's width.
 pub(super) fn mail_preview(body: &str) -> String {
     body.lines().next().unwrap_or("").chars().take(60).collect()
 }
@@ -487,11 +451,6 @@ pub(super) fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView
     }
 }
 
-// Task 12: the startup restore dialog -- same pure-reducer shape as Task 8's
-// mail/memory overlays. `restore_overlay_reduce` never touches a roster or a
-// pane itself; it only tracks which checkboxes are on and, on Enter, reports
-// back *which* entries were checked (by index) for the caller to act on.
-
 /// What confirming the restore dialog (Enter) reports back: the indices,
 /// into whatever candidate list the caller built the view's entries from in
 /// the same order, that were checked at the moment of confirmation. `Esc`
@@ -542,10 +501,7 @@ pub fn restore_overlay_reduce(
     }
 }
 
-/// Issue #354 phase 5: what browsing the kept errors asks the caller to do.
-///
-/// Exactly one thing -- acknowledge the entries this dialog was opened over.
-/// The dialog itself stays pure; the buffer it names lives in the event loop.
+/// Acknowledgement applies to the errors visible when the dialog opened (#354).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorsAck {
     /// The snapshot's own [`ui::ErrorsView::mark`] -- what the caller passes
@@ -554,23 +510,13 @@ pub struct ErrorsAck {
     pub mark: u64,
 }
 
-/// Pure: one keystroke against the `Ctrl+A e` errors overlay.
-///
-/// Issue #354 phase 5: an operator who has read the list has, by definition,
-/// seen the errors in it -- so the closing keys acknowledge on the way out,
-/// and `a` acknowledges in place (the entries stay, dimmed, so the list an
-/// operator is still reading does not rearrange under them). Acknowledgement
-/// never deletes: it only stops the sticky header line, until a NEW error --
-/// a different message, or the same one again after the acknowledgement --
-/// arrives.
+/// Closing the error list acknowledges its snapshot because the operator has seen it (#354).
 pub fn errors_overlay_reduce(
     mut view: ui::ErrorsView,
     key: KeyEvent,
 ) -> (Option<ui::ErrorsView>, Option<ErrorsAck>) {
     match key.code {
-        // Issue #354 phase 4 (deliverable D): `Enter` closes it too -- a
-        // read-only list has nothing to activate, and an `Enter` that does
-        // nothing at all is the inconsistency that phase removed.
+        // Enter closes a read-only list because it has no activation action (#354).
         KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
             (None, Some(ErrorsAck { mark: view.mark }))
         }
@@ -593,15 +539,7 @@ pub fn errors_overlay_reduce(
     }
 }
 
-/// Builds the `Ctrl+A e` overlay's own view: every kept error
-/// (`push_error`'s buffer, `MAX_KEPT_ERRORS`), newest first -- a snapshot
-/// taken once when the overlay opens, the same convention every other
-/// overlay here already follows (mail/memory/restore do not live-update
-/// while open either).
-///
-/// Issue #354 phase 5: each row carries its own repeat count, the age of its
-/// most recent repeat and whether it has been acknowledged. `now` is injected
-/// so the age is the caller's clock, not a second one read in here.
+/// Snapshot retained errors at dialog open so acknowledgement does not include later arrivals.
 pub(super) fn build_errors_view(errors: &ErrorLog, now: Instant) -> ui::ErrorsView {
     ui::ErrorsView {
         items: errors
@@ -672,10 +610,6 @@ pub(super) fn jev_errors_overlay_reduce(
     }
 }
 
-// ---------------------------------------------------------------------
-// Issue #354 phase 3: the context menu and the inspector.
-// ---------------------------------------------------------------------
-
 /// Everything the context menu decides ONE row's entries from. Assembled at
 /// the moment the menu opens, from values already in hand -- the row the
 /// roster built, the pane behind it (if any), and whether a spawn request was
@@ -725,18 +659,7 @@ impl MenuFacts {
     }
 }
 
-/// Pure: the context menu's entries for one row, in the approved order, each
-/// either available or disabled with a short reason.
-///
-/// Issue #354 phase 4: the order, the entries and every disable reason now
-/// come out of the one action-descriptor table (`actions::menu_actions`)
-/// rather than a second matrix written down here -- so the menu, the header
-/// cluster, the help screen and the palette cannot disagree about what an
-/// action is called or why it is unavailable.
-///
-/// Every entry is ALWAYS present. An operator who cannot see that `restore`
-/// exists cannot learn why it is unavailable, and a menu whose shape changes
-/// per row is a menu whose letters move under the operator's fingers.
+/// Derive menu entries and disabled reasons from the shared action table (#354).
 pub(super) fn menu_entries(facts: &MenuFacts) -> Vec<ui::MenuEntry> {
     let available = actions::menu_actions(&facts.action_context());
     let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
@@ -765,10 +688,7 @@ pub(super) fn build_menu_view(facts: &MenuFacts) -> ui::MenuView {
     }
 }
 
-/// Issue #354 phase 5: the context menu over the sidebar's summary line --
-/// the dashboard itself. Same entries in the same order as every other menu
-/// (an operator must never have to learn a second shape), with `inspect` the
-/// one that applies and the rest inert behind [`actions::MENU_SUMMARY_LINE`].
+/// Keep the summary-line menu's session actions visible with reasons, though the target is the dashboard (#354).
 pub(super) fn build_summary_menu_view() -> ui::MenuView {
     let ctx = actions::ActionContext {
         summary: true,
@@ -935,8 +855,7 @@ pub(super) const INSPECT_WRITER: &str = "writer";
 pub(super) const INSPECT_SIGNAL: &str = "signal";
 pub(super) const INSPECT_ERRORS: &str = "errors";
 
-/// Issue #354 phase 5: the DASHBOARD-level inspector's own section names.
-/// Same dialog, same viewport, same `Esc`; a different subject.
+/// Use the same inspector sections for the dashboard target (#354).
 pub(super) const INSPECT_DASH_HARNESS: &str = "harness";
 pub(super) const INSPECT_DASH_SESSIONS: &str = "sessions";
 pub(super) const INSPECT_DASH_SPEND: &str = "spend";
@@ -1103,10 +1022,7 @@ pub(super) fn build_inspector_view(
     }
 }
 
-/// Everything the DASHBOARD-level inspector reports (issue #354 phase 5),
-/// all of it already cached: nothing here reads the disk, runs git or shells
-/// out, and a fact that has not been read yet renders the shared placeholder
-/// rather than a fabricated zero.
+/// Build the dashboard inspector only from cached facts; rendering must not read disk or run commands (#354).
 pub(super) struct DashboardFacts<'a> {
     harness: &'a str,
     short: &'a str,
@@ -1132,13 +1048,7 @@ pub(super) struct DashboardFacts<'a> {
     supervised: (usize, usize),
 }
 
-/// Pure: the inspector over the DASHBOARD itself -- what `^A i` opens while
-/// the sidebar's summary line is selected (issue #354 phase 5).
-///
-/// The same [`ui::InspectorView`] the per-row inspector produces, so it draws
-/// through the identical phase-3 scrollable dialog and obeys the identical
-/// `Esc`/`Enter` rule. The summary line's own one-line disclosure (phase 1)
-/// is unchanged: this is the long form, on demand.
+/// Open the dashboard inspector when the summary line is selected (#354).
 pub(super) fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::InspectorView {
     let age = |secs: u64| format!("read {} ago", style::format_age(secs));
     let harness = ui::InspectorSection {
@@ -1188,10 +1098,7 @@ pub(super) fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::Inspe
                 .map(|s| super::price::format_usd(s.cost_micros, false)),
         ),
     ];
-    // Issue #457: surfaced only when non-zero -- a session where every
-    // message priced cleanly shows no extra line at all, matching the
-    // "quiet unless there is something to flag" convention every other
-    // inspector section here already follows.
+    // Show unknown-priced work only when its count is nonzero (#457).
     if let Some(spend) = facts.spend
         && spend.skipped_messages > 0
     {
@@ -1325,13 +1232,7 @@ pub(super) fn dashboard_facts<'a>(
     }
 }
 
-/// Pure: one keystroke against the inspector. Read-only, like the errors
-/// overlay -- there is no effect type, only "still open" or "closed".
-///
-/// Issue #354 phase 4 (deliverable D): `Enter` closes it too. A read-only
-/// report has nothing to activate, and the one rule that now holds in every
-/// dialog is that `Esc` closes and `Enter` confirms -- an `Enter` that does
-/// nothing at all is exactly the inconsistency this phase removes.
+/// Close a read-only inspector on Enter or Esc; it has no action to activate (#354).
 pub fn inspector_overlay_reduce(
     mut view: ui::InspectorView,
     key: KeyEvent,
@@ -1421,14 +1322,7 @@ pub fn palette_overlay_reduce(
     }
 }
 
-/// The availability snapshot for whatever row the sidebar cursor is on --
-/// exactly the facts the context menu decides from, so the palette can never
-/// offer an action the menu says is unavailable (or the other way round).
-/// An empty roster yields the default context, in which every row action is
-/// `Hidden` and only the dashboard-wide ones are listed.
-/// Issue #354 phase 5: `summary` is "the cursor is parked on the sidebar's
-/// summary line", where the target is the dashboard itself -- `inspect` still
-/// applies, every per-session action is listed inert with its reason.
+/// Use the same availability snapshot for palette and context menu.
 pub(super) fn selected_action_context(
     rows: &[ui::SidebarRow],
     selected: usize,
@@ -1448,9 +1342,7 @@ pub(super) fn selected_action_context(
     }
 }
 
-/// Builds the palette (or the help screen, which is the same list read-only)
-/// over whatever row is selected right now. `ctx` is snapshotted here, the
-/// same convention every other overlay follows.
+/// Snapshot row context when opening the palette, matching other overlays.
 pub(super) fn build_palette_view(
     mode: ui::PaletteMode,
     ctx: actions::ActionContext,
@@ -1466,12 +1358,7 @@ pub(super) fn build_palette_view(
     view
 }
 
-/// What confirming/cancelling the quit confirmation dialog means -- pulled
-/// out of the event loop's own match arm (issue #202 phase 2b) so the "which
-/// key does what" decision is a pure, independently testable function; the
-/// actual shutdown sequence (`on_quit`/`render_shutting_down`/
-/// `shutdown_all`/breaking the loop) stays at the call site, since none of
-/// that is expressible from inside a pure reducer.
+/// Reduce quit confirmation keys without side effects (#202).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuitConfirmEffect {
     Confirm,
@@ -1488,12 +1375,7 @@ pub fn quit_confirm_reduce(
     }
 }
 
-/// What confirming a handover pick means -- the operator's own choice, not
-/// yet applied to a real pane. Pulled out of the event loop's own match arm
-/// (issue #202 phase 2b) the same way `quit_confirm_reduce` was: the actual
-/// swap (looking the target pane up by short id, checking it is `Idle`,
-/// calling `handover_pane`) stays at the call site, since it needs mutable
-/// access to `panes`/`errors` a pure reducer cannot have.
+/// Return the chosen handover action for the event loop to apply (#202).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoverEffect {
     Swap {
@@ -1532,12 +1414,7 @@ pub fn handover_overlay_reduce(
     }
 }
 
-/// Builds the restore dialog's own view from every roster candidate the
-/// caller already filtered down to workers only (`run_dashboard`'s startup
-/// path excludes `roster::ROLE_ORCHESTRATOR` before this is ever called).
-/// Every entry defaults to checked, so a bare Enter restores the whole
-/// roster -- the common case -- and unchecking is the exception the operator
-/// opts into.
+/// Offer only worker restore candidates, since startup already creates the orchestrator.
 pub(super) fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
     ui::RestoreView {
         entries: candidates
@@ -1552,35 +1429,14 @@ pub(super) fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::Resto
     }
 }
 
-/// Pure: how many of `wanted` restore candidates fit alongside `live` panes
-/// already running, and how many are therefore skipped.
-///
-/// R7: restoring bypassed the pane cap entirely -- every other way a pane is
-/// created (the spawn-request channel, the `Ctrl+A s` dialog) goes through
-/// `fulfill_spawn_request`'s check, but the restore dialog spawned straight
-/// from the roster. A stale roster from a busy session could therefore reopen
-/// far more harness processes than `dash.max_panes` allows, at startup, before
-/// the operator had touched anything.
+/// Cap restored panes against live panes; return the number that cannot fit.
 pub(super) fn restore_budget(live: usize, max_panes: usize, wanted: usize) -> (usize, usize) {
     let room = max_panes.saturating_sub(live);
     let take = wanted.min(room);
     (take, wanted - take)
 }
 
-/// Pure: splits a confirmed restore selection (`RestoreEffect::Confirm`'s own
-/// indices, into `restore_candidates`) into what this launch may actually
-/// spawn -- the first `take` of them, per `restore_budget` -- and the
-/// `RosterPane`s the pane cap forced it to skip.
-///
-/// G3: the skipped indices used to be dropped on the floor at the call site
-/// (`indices.into_iter().take(take)` simply never looked at the rest). The
-/// restore dialog closes on `Confirm` regardless of the cap, `restore_
-/// candidates` itself is never consulted again after this tick, and
-/// `roster::take_roster` already consumed the on-disk roster reading it --
-/// so those sessions were lost for good, not merely left unrestored this
-/// launch. Returned as owned `RosterPane`s, not indices, so the caller can
-/// carry them all the way to `on_quit` (as `deferred_restore`) without
-/// keeping `restore_candidates` borrowed for the rest of the session.
+/// Take only candidates within the pane cap and keep the skipped remainder.
 pub(super) fn partition_restore_selection(
     indices: Vec<usize>,
     restore_candidates: &[roster::RosterPane],
@@ -1601,33 +1457,7 @@ pub(super) fn partition_restore_selection(
     (to_spawn, deferred)
 }
 
-/// Builds the `turn_env` a restored dashboard pane spawns with -- everything
-/// `spawn_restored_pane` pushes ahead of `Pane::spawn`: the base env `build_
-/// turn_env` produces (including the durable interactive-launch pin, when
-/// `candidate` carried one), a fresh spawn-request channel of its own
-/// (Security review Finding 1), and the roster's group binding when the
-/// candidate carried one (Security review Finding 6). Factored out of
-/// `spawn_restored_pane` so the exact fields it adds are pinned directly,
-/// independent of a real pty spawn's behavior -- the same reasoning
-/// `trusted_launch_mode`'s own doc comment gives for testing a launch-mode
-/// decision as a pure function rather than reading a real spawned child's
-/// own environment back.
-///
-/// Issue #160 finding 1, review round (2026-08-28): a restore used to
-/// unconditionally pin `LaunchMode::Interactive`, which handed every worker
-/// pane that survived a dashboard quit+restore cycle an interactive posture
-/// it may have been explicitly REFUSED at spawn time (a file-dropped spawn
-/// request is untrusted and always launches `Headless` --
-/// `FILE_DROP_TRUSTED_INTERACTIVE`). The correct rule (issue #160: "on the
-/// same terms as a freshly spawned one") is to restore whatever launch mode
-/// the pane ORIGINALLY had, recorded on the roster entry at quit time
-/// (`RosterPane::interactive`, `#[serde(default)]` so an old-format roster
-/// entry with the field absent restores fail-closed -- no pin, today's
-/// pre-fix-round behavior -- rather than defaulting to the permissive side).
-///
-/// Returns the built `turn_env` alongside the freshly minted pane channel
-/// path: `spawn_restored_pane` needs both, the env to spawn with and the
-/// path to hand the spawned `Pane` via `set_intake_dir`.
+/// Rebuild restored turn environment from trusted roster state, including launch mode and lineage.
 pub(super) fn restored_pane_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -1652,53 +1482,25 @@ pub(super) fn restored_pane_turn_env(
     if let Some(e) = turn_env_err {
         push_error(errors, e);
     }
-    // Security review Finding 1: a restored pane is a pane like any other and
-    // gets its own channel -- a fresh token, since the one it carried before
-    // the quit died with that dashboard's token directory.
+    // Give a restored pane a fresh private request channel; its old token belonged to the prior dashboard.
     let pane_channel = mint_pane_channel(requests_dir, errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         pane_channel.display().to_string(),
     ));
-    // Security review Finding 6: and the group binding travels back with it,
-    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
-    // restore that dropped it left the pane's own further delegations
-    // ungrouped, outside the child limit and the token ceiling its batch was
-    // launched under.
+    // Restore work-group binding so descendants and coordinator ownership keep their lineage.
     if let Some(group_id) = &candidate.work_group_id {
         turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
     }
-    // Issue #249/#250 review (Fix 4): and the parent lineage travels back
-    // with it too, the same pair `fulfill_spawn_request` pushes from
-    // `verified_parent` at first spawn -- a restore that dropped it left the
-    // restored child's own real process env with no `PARENT_SESSION_ENV` at
-    // all, so a nested `zirv ctx` call inside it (e.g. `zirv ctx inbox`)
-    // rendered this same pane's own parent's mail as peer even though this
-    // dashboard's own sweep (`Pane::parent_session`, restored separately via
-    // `set_parent_session`) still labels it steering.
+    // Restore server-verified parent lineage in the child environment (#249, #250).
     if let Some(parent) = &candidate.parent_session {
         turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent.clone()));
     }
     (turn_env, pane_channel)
 }
 
-/// Spawns one roster candidate back as a fresh pane: resolves its
-/// adapter (re-checked against the live gate, same "data, never authority"
-/// discipline `fulfill_spawn_request` already holds a spawn request to --
-/// an agent an operator disabled since the last quit must not come back just
-/// because it was in the roster), builds its argv via `roster::restore_argv`,
-/// and spawns it reusing the roster entry's own `session_id` (so its
-/// registry short id, and the address mail/nudge reach it at, are the same
-/// as before the quit -- restoring is continuing the same session, not
-/// starting a new one with the old one's history).
-///
-/// H3: on either failure path the candidate is pushed into `deferred_restore`
-/// -- the same vec G3 added for candidates the pane cap skipped. Without
-/// this, a candidate whose spawn failed (a harness binary gone missing, an
-/// adapter disabled since the last quit) was already consumed out of the
-/// roster by `roster::take_roster` and, once `errors` scrolled off screen,
-/// gone for good: `on_quit` only ever writes back *live* panes plus whatever
-/// this vec carries, and a failed spawn is neither.
+/// Recheck a roster candidate against live adapter and configuration gates:
+/// stored spawn requests are data, never authority to bypass current policy.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_restored_pane(
     candidate: &roster::RosterPane,
@@ -1712,12 +1514,7 @@ pub(super) fn spawn_restored_pane(
     errors: &mut ErrorLog,
     deferred_restore: &mut Vec<roster::RosterPane>,
 ) {
-    // Issue #490 (roadmap N21 item A): a native pane comes back through the
-    // SAME seam a fresh one opens on -- `open_native_pane`, and therefore
-    // `resolve_attach`. That is the whole point of routing the restore here
-    // rather than reconstructing a session: if the persistent runtime is
-    // still holding this seat's conversation, the restored pane attaches to
-    // it instead of opening a second in-process supervisor over it.
+    // Open native restores through resolve_attach so an existing runtime session is reattached, not duplicated (#490).
     if candidate.native {
         match Pane::spawn_native(
             cfg,
@@ -1768,12 +1565,7 @@ pub(super) fn spawn_restored_pane(
     let spec = PaneSpec {
         agent_name: candidate.agent.clone(),
         argv,
-        // Security review Finding 6: the role the roster recorded, not a
-        // hardcoded `Worker`. A restored coordinator used to come back
-        // demoted -- refused its own onward delegation by the depth cap, and
-        // no longer able to close the group it still owned. An unrecognised
-        // label (a roster written by a future build) falls back to `Worker`,
-        // the least-privileged reading, exactly as `spawnreq::role_of` does.
+        // Restore the role recorded in the roster; a coordinator must retain its delegation scope.
         role: prompt::PromptRole::from_label(&candidate.role).unwrap_or(prompt::PromptRole::Worker),
         verb: sessions::Verb::Dash,
         session_id: candidate.session_id.clone(),
@@ -1794,15 +1586,7 @@ pub(super) fn spawn_restored_pane(
         Duration::from_millis(cfg.dash.idle_quiet_ms),
     ) {
         Ok(mut pane) => {
-            // F3 (review, PR #116): restore the report-back target and
-            // reminder-sent state the roster carried for this pane.
-            // `set_report_to` always resets `report_reminder_sent` to
-            // `false` (the right default for a *freshly spawned* pane), so
-            // the sent flag is restored afterwards, only when the roster
-            // says it was already true -- a restore resurrects the SAME
-            // logical session, so an already-reminded worker must not be
-            // reminded again (contrast `Pane::handover`'s F5 reset, which
-            // is right for a successor session, not this one).
+            // Restore report target and reminder state without sending a second one-shot reminder (#116).
             pane.set_report_to(candidate.report_to.clone());
             if candidate.report_reminder_sent {
                 pane.mark_report_reminder_sent();
@@ -1811,10 +1595,7 @@ pub(super) fn spawn_restored_pane(
             pane.set_intake_dir(pane_channel);
             pane.set_work_group_id(candidate.work_group_id.clone());
             pane.set_budget_tokens(candidate.budget_tokens);
-            // Issue #249/#250 review (Fix 4): restores this pane's own
-            // dashboard-side parent lineage (mirrors `restored_pane_turn_
-            // env`'s identical re-export into the restored child's own real
-            // process env, just above).
+            // Restore the pane's server-verified parent for dashboard-side steering checks (#249, #250).
             pane.set_parent_session(candidate.parent_session.clone());
             panes.push(pane);
             nudge_queues.push(VecDeque::new());
@@ -1825,12 +1606,6 @@ pub(super) fn spawn_restored_pane(
         }
     }
 }
-
-// Task 9: idle-gated visible intervention -- a per-pane nudge queue drained
-// only once the pane is `Idle`, plus a once-per-tick mail sweep that injects
-// swept mail the same visible way. Both share the same read-once discipline
-// mail delivery already holds itself to elsewhere (`exec`/`loop`): a message
-// is only ever marked consumed after it was actually shown to the agent.
 
 #[cfg(test)]
 mod tests {

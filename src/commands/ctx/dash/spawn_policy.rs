@@ -1,10 +1,8 @@
 //! Spawn candidate discovery, workdir/prompt/refusal policy, and request fulfilment.
 use super::*;
 
-/// Why one `<state>/dash/*` token directory [`discover_live_dash_dirs`] found
-/// was, or was not, usable -- issue #145's own acceptance criterion ("my pane
-/// never appeared" must be diagnosable from the worker's own log alone) needs
-/// the reason, not just a filtered list.
+/// Preserve each rejection reason so a missing pane is diagnosable from the
+/// requester's log alone (#145).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CandidateStatus {
     /// `started_at` is `owner.pid`'s own mtime. The file is written exactly
@@ -32,29 +30,8 @@ pub(crate) struct DashCandidate {
     pub status: CandidateStatus,
 }
 
-/// Issue #145: every `<state>/dash/*` token directory, live or not --
-/// `agent::try_join_dashboard`'s own fallback scan for when the single
-/// directory it inherited via `DASH_REQUESTS_ENV` turned out to be absent or
-/// its `owner.pid` dead. Modeled on [`sweep_stale_token_dirs`]'s identical
-/// walk of the same tree, but reporting rather than deleting: a candidate
-/// this call distrusts is not this function's business to remove, only to
-/// describe -- it never mutates the filesystem, and never blocks on
-/// anything.
-///
-/// Deliberately does not filter or weight candidates by the requester's own
-/// repo. A request whose `cwd` names neither this dashboard's own repo nor a
-/// linked `git worktree add` sibling of it is refused outright by
-/// `fulfill_spawn_request`'s own `accepted_spawn_cwd` gate, with a
-/// `retryable` ack (`SpawnRefusal::channel`) that `agent::answer_for_ack`
-/// already reads as "fall back to headless" rather than a hard failure --
-/// and any request that gate DOES accept always spawns its pane at the
-/// request's own `cwd`, never at the dashboard's own (`accepted_spawn_cwd`'s
-/// own doc comment: "The accepted pane cwd is always `req_cwd`, never
-/// `repo`"). So joining a dashboard hosting a different repo costs at most
-/// one extra round-trip before falling back headless anyway, and can never
-/// misroute the task's working directory -- it is display-only (the pane
-/// simply appears in that other dashboard's own sidebar). See `agent::
-/// live_join_target`'s own doc comment for the selection rule this feeds.
+/// Report live and dead token directories when the inherited channel fails;
+/// discovery never removes files it does not own (#145).
 pub(crate) fn discover_live_dash_dirs(state: &StateDir) -> Vec<DashCandidate> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(state.dash()) else {
@@ -116,16 +93,8 @@ pub(crate) fn flatten_command(command: std::process::Command) -> Vec<String> {
     argv
 }
 
-/// The refusal text a prompt that would be misread as a flag gets. A request
-/// prompt is encoded *positionally* into `interactive_cmd`'s argv, so a
-/// prompt like `--dangerously-skip-permissions` would reach the real harness
-/// child as a flag rather than as the task text. Refused at the authority
-/// side -- here, where the pane is actually spawned -- rather than only at
-/// the requesting side, because a request is data, never authority.
-///
-/// Pure, so both ends of the channel (this one, and `agent.rs`'s own
-/// defense-in-depth check before it ever writes a request) can assert the
-/// same rule.
+/// Reject a leading flag-like prompt here at the spawn authority: a request
+/// is data, never permission to pass argv to the harness.
 pub(crate) fn argv_unsafe_prompt(prompt: &str) -> bool {
     prompt.trim_start().starts_with('-')
 }
@@ -141,29 +110,8 @@ pub(super) fn same_directory(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// Whether a spawn request naming `req_cwd` may be fulfilled by a dashboard
-/// whose own repo is `repo`, and if so, the directory the freshly spawned
-/// pane should actually run in.
-///
-/// Two ways to accept:
-/// - the fast, filesystem-only path (`same_directory`): `req_cwd` and `repo`
-///   canonicalise to the identical directory.
-/// - linked git worktrees of the same repository (issue #119): `req_cwd` and
-///   `repo` sit in different working trees but share the same
-///   `git_common_dir`, which is exactly what distinguishes "another linked
-///   worktree of this repo" from "a genuinely unrelated repo".
-///
-/// `None` (refuse) covers everything else, including two independent
-/// repositories, a `req_cwd` with no git ancestry at all, and `git` being
-/// unavailable -- refusing is always the safe default here, never the
-/// permissive one.
-///
-/// The accepted pane cwd is always `req_cwd`, never `repo`: a linked
-/// worktree's pane must actually run inside that worktree, not inside the
-/// dashboard's own checkout (issue #119's actual bug -- the dashboard used to
-/// accept-and-then-still-spawn into its own `repo` once this gate is
-/// loosened, which would silently run the requester's task in the wrong
-/// working tree).
+/// Refuse unless cwd is this repo or shares its git common dir; missing git
+/// ancestry is a refusal, the safe default. Always return req_cwd, never repo (#119).
 pub(super) fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf> {
     if same_directory(req_cwd, repo) {
         return Some(req_cwd.to_path_buf());
@@ -177,18 +125,8 @@ pub(super) fn accepted_spawn_cwd(req_cwd: &Path, repo: &Path) -> Option<PathBuf>
     }
 }
 
-/// Default pane `--workdir` roots when the operator has configured no
-/// additional ones of their own (`CtxConfig::dash::workdir_roots`): the
-/// dashboard's own repo root, and that repo root's PARENT directory -- so a
-/// sibling checkout (`git worktree add ../other`, or a plain sibling clone,
-/// issue #228's own use case) is accepted with zero configuration, while a
-/// directory sharing only a string prefix with the repo (`zirv-other` next
-/// to `zirv`) is not: containment below is `Path::starts_with`, which
-/// compares path COMPONENTS, never raw string bytes.
-///
-/// Canonicalised the same lenient way `same_directory` canonicalises,
-/// falling back to the literal path when canonicalisation fails (a `repo`
-/// that does not exist on disk, which only happens in a test).
+/// Allow the repo and sibling checkouts by default; containment later compares
+/// path components, never string prefixes that admit a similarly named path (#228).
 pub(super) fn default_workdir_roots(repo: &Path) -> Vec<PathBuf> {
     let canon_repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let mut roots = vec![canon_repo.clone()];
@@ -198,13 +136,8 @@ pub(super) fn default_workdir_roots(repo: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// The parent directory [`default_workdir_roots`] widens to ("sibling
-/// checkouts"), or `None` when that parent is itself a filesystem or drive
-/// root (`/`, `C:\`, `\\?\C:\`). A checkout sitting directly below the root
-/// -- `/workspace/repo`, `/app/repo`, `C:\repo`, the usual container and CI
-/// layout -- must not turn "sibling checkouts" into "every absolute path on
-/// the machine", which would reopen exactly the any-repo exposure the roots
-/// exist to close (review finding, 2026-08-31).
+/// Refuse a filesystem or drive root as a sibling root: it would admit every
+/// absolute path on that volume instead of just sibling checkouts (#228).
 pub(super) fn sibling_root_for(canon_repo: &Path) -> Option<PathBuf> {
     let parent = canon_repo.parent()?;
     // A root has no parent of its own; refuse to widen to it.
@@ -253,30 +186,8 @@ pub(super) fn workdir_outside_roots_reason(dir: &Path, roots: &[PathBuf]) -> Str
     )
 }
 
-/// Issue #228 (security review, 2026-08-31): the directory a pane should
-/// actually launch into, given `accepted` (`accepted_spawn_cwd`'s own return
-/// -- the dashboard's own repo-family acceptance, unaffected by this
-/// function) and an optional, explicitly requested `--workdir`.
-///
-/// `workdir` is `SpawnRequest::workdir`, untrusted JSON like every other
-/// field on that struct -- a same-uid pane could forge it (the same trust
-/// boundary issue #179 already documents for the rest of the request), so
-/// it is re-validated here with the identical rule `agent::validate_workdir`
-/// already ran on the requesting side (must exist, be a directory, sit
-/// inside a git repository) rather than trusted outright.
-///
-/// Deliberately NOT checked against `repo`/`accepted` the way
-/// `accepted_spawn_cwd` checks `req.cwd` -- delegation to a repo other than
-/// the dashboard's own is the entire point of the feature (issue #228's own
-/// bug report: cross-repo delegation from inside a dashboard). It IS,
-/// however, checked against `roots`: request forgery by a same-uid sibling
-/// pane is in the accepted threat model (issue #179), so `--workdir` may
-/// only name a directory the OPERATOR has opened -- the dashboard's own repo
-/// family, or an explicitly widened root -- never an arbitrary git checkout
-/// elsewhere on the machine. See [`workdir_roots`]'s own doc comment for
-/// what the default confinement is and how an operator widens it.
-///
-/// `Ok(accepted)`, unchanged, when `workdir` is `None` -- pre-#228 behaviour.
+/// Revalidate untrusted workdir at the authority side against operator-opened
+/// roots; refuse other checkouts, but absent workdir keeps accepted req_cwd (#228).
 pub(crate) fn resolved_spawn_cwd(
     accepted: PathBuf,
     workdir: Option<&Path>,
@@ -294,19 +205,8 @@ pub(crate) fn resolved_spawn_cwd(
     }
 }
 
-/// The `extra` argv a freshly spawned **dashboard pane** launches with: its
-/// composed-prompt injection arguments plus `AgentAdapter::session_pin_args`,
-/// which pins the harness's own conversation to the uuid this pane is
-/// registered under.
-///
-/// R1: without the pin, the quit roster stored a uuid the harness had never
-/// heard of, and the next launch's restore ran `claude --resume <zirv-uuid>`
-/// straight into "no conversation found" -- the restored pane died on the
-/// spot. Only *fresh* pane launches pin (this one and `chat.rs::
-/// dash_orchestrator_pane`, the two seams that mint their own uuid); a
-/// restored pane carries `resume_args` instead and must never carry both
-/// (`roster::restore_argv`), and `wrap`'s own relaunch path is untouched --
-/// it expects the harness to mint a fresh conversation on every restart.
+/// Pin only fresh launches to their registered UUID so restore can resume it;
+/// restored panes carry resume args and must never also pin a new ID.
 pub(super) fn pane_launch_extra(
     adapter: &dyn adapters::AgentAdapter,
     mut prompt_args: Vec<String>,
@@ -316,33 +216,8 @@ pub(super) fn pane_launch_extra(
     prompt_args
 }
 
-/// The full trailing-extras argv a dashboard-spawned worker pane launches
-/// with: the resolved worker model, then the shipped-default "sandboxed, no
-/// prompts" posture plus any explicit `[policy]` restriction (`adapters::
-/// policy_launch_args`, the same seam every real launch now calls), then the
-/// system-prompt injection args and the session pin. Extracted as its own
-/// function (2026-08-22, Bug B seam coverage, fix round 3) specifically so
-/// this composition is unit-testable directly -- `fulfill_spawn_request`'s
-/// own wiring previously rested on full-suite-green plus log inspection, the
-/// exact shape of regression that would not fail any existing test if this
-/// seam silently lost its policy prefix.
-///
-/// A dashboard-spawned worker pane's own join protocol structurally admits
-/// only a lone `--model` pin (see `try_join_dashboard` in `agent.rs`) --
-/// there is no generic trailing-flags channel here for an operator to pin a
-/// conflicting `--sandbox`/`--ask-for-approval` through, so `flags_pin_
-/// policy` (inside `policy_launch_args`) is checked against an empty slice --
-/// which is also why `adapters::AgentAdapter::extra_writable_root_args`
-/// below is called unconditionally rather than gated on `flags_pin_policy`
-/// itself: with no trailing flags this pane can ever pin policy with, that
-/// gate is always open here (see task 3's own binding decision: the extra
-/// writable roots only apply "when the operator hasn't pinned policy").
-///
-/// `req.cwd` (issue #119) + `state.mail()` (`zirv ctx send` report-back) are
-/// the two writable roots `CodexAdapter::extra_writable_root_args` may add on
-/// top of `policy_launch_args`'s own sandbox baseline -- see that method's
-/// own doc comment for the mechanism and why they are not threaded through
-/// `policy_launch_args` itself.
+/// Build argv only from revalidated request data and adapter policy; file-dropped
+/// flags cannot widen the actual child posture.
 pub(super) fn worker_pane_extra_args(
     req: &spawnreq::SpawnRequest,
     cfg: &CtxConfig,
@@ -361,28 +236,12 @@ pub(super) fn worker_pane_extra_args(
     } else {
         adapters::LaunchMode::Headless
     };
-    // Bug fix (2026-09-06 review round, issue #326): this function's own
-    // caller (`fulfill_spawn_request`) always builds this pane's real
-    // harness child via `adapter.interactive_cmd`, UNCONDITIONALLY --
-    // `req.interactive` never gates that choice, only `approval_mode`
-    // above. An ordinary `zirv ctx agent codex - --mode read-only` dispatch
-    // sets `interactive: false` on its `SpawnRequest` (that call site
-    // cannot vouch a human is watching whatever dashboard picks the request
-    // up -- see its own doc comment in `agent.rs`), yet a live dashboard
-    // still fulfills it as this same real interactive pane. Any argv choice
-    // that depends on the ACTUAL CLI surface -- codex's `read_only_args()`
-    // vs `interactive_read_only_args()`, since `--ignore-rules`/
-    // `--ignore-user-config` exist only on `codex exec --help` and the
-    // top-level interactive launch rejects both with a clap usage error,
-    // exit 2 -- must therefore be resolved against the surface this
-    // function always builds for, never against `approval_mode`/
-    // `req.interactive`.
+    // The child always uses interactive_cmd; req.interactive only controls the
+    // approval posture, so surface mode must match the real launch (#326).
     let surface_mode = adapters::LaunchMode::Interactive;
     let mut extra = pane_model_args(req, cfg, adapter);
-    // Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
-    // `spawnreq::role_of` is the same Worker/SubOrchestrator read the depth
-    // cap already uses -- a Worker pane skips the native skill plugin, a
-    // SubOrchestrator still needs it (it may itself dispatch Workers).
+    // Workers skip the native skill plugin's listing cost; sub-orchestrators
+    // retain it because they can dispatch workers.
     extra.extend(adapters::policy_launch_args_for_surface(
         cfg,
         adapter,
@@ -391,20 +250,10 @@ pub(super) fn worker_pane_extra_args(
         surface_mode,
         spawnreq::role_of(req),
     ));
-    // 2026-09-06: the trailing `-- <flags>` the requester typed, in the same
-    // position `agent::worker_launch_flags` puts them for an inline
-    // supervised child (after the policy baseline, so an explicit pin wins).
-    // Empty for every request that arrived through the file-backed drop
-    // directory -- `sanitize_file_dropped_request` clears them there, because
-    // these become argv on this pane's real harness child.
+    // Keep trusted trailing flags after the policy baseline; file-dropped
+    // requests have these flags stripped before they can become child argv.
     extra.extend(req.flags.iter().cloned());
-    // 2026-09-06: `--mode read-only` is a NARROWING the pane must apply
-    // itself. It used to reach the pane only as a `Delegation::mode` label
-    // while the actual read-only argv travelled in the requester's trailing
-    // flags -- which a pane cannot carry across an untrusted channel, so a
-    // read-only delegation that landed on a pane silently ran writable.
-    // Replace codex's earlier sandbox selection; appending it twice makes
-    // the child reject argv before it can create a session.
+    // Replace the adapter's writable sandbox selection for read-only panes; duplicate sandbox flags can reject launch.
     if req.mode == super::permit::WorkerMode::ReadOnly {
         adapters::extend_read_only_args(adapter, &mut extra, surface_mode);
     }
@@ -413,43 +262,8 @@ pub(super) fn worker_pane_extra_args(
     extra
 }
 
-/// Strips every WIDENING field from a request that arrived through the
-/// file-backed drop directory, before anything reads it.
-///
-/// A `SpawnRequest` is untrusted JSON: the requests directory is
-/// capability-protected by an unguessable token, not authenticated, and a
-/// same-uid sibling pane can enumerate and write into a channel it was never
-/// invited into (issue #179, accepted). Fields that only ever NARROW what a
-/// pane may do (`max_restarts`/`timeout_secs`/`max_tool_calls`, `mode`,
-/// `path_scope`, `no_network`, `depth`) are safe to honour from such a drop
-/// and are left alone. Two are not:
-///
-/// * `force` (dash review A2-2) suppresses this dashboard's own cross-harness
-///   rerouting and its spend gate, so a forged `"force": true` bought a
-///   placement the operator never asked for. Only the in-process Spawn
-///   overlay -- which builds its request in memory this instant -- may set it.
-/// * `flags` become argv tokens on the pane's real harness child, which is
-///   the whole permission posture. The one flag that survives is the model
-///   pin, and it travels separately in `model` (re-checked by
-///   `pane_model_args`), so clearing this loses nothing a pane could safely
-///   have honoured anyway.
-///
-/// `system_prompt` (R1-4) survives, deliberately: it is DATA, never argv --
-/// `with_requested_seat_prompt` caps it and folds it into the pane's own
-/// composed prompt, where the only flag involved is the adapter's own -- and
-/// a requester on this channel already controls `prompt`, which carries
-/// strictly more injected text. Clearing it would drop the reviewer-seat
-/// instructions of every review a dashboard happens to fulfil as a pane,
-/// which is the bug this field exists to fix.
-///
-/// `timeout_secs` only ever narrows, so it is honoured -- but it is CLAMPED
-/// to `pane::MAX_TIMEOUT_SECS` here (R1-1, 2026-09-06 review): a forged
-/// `18446744073709551615` is not a narrowing at all, it is an unrepresentable
-/// `Instant` this dashboard would otherwise carry until `Pane::set_timeout`
-/// (which now clamps too -- this is the earlier of the two, so the request
-/// this dashboard reasons about and the deadline it arms say the same thing).
-///
-/// Pure, so the rule is testable without a live dashboard.
+/// Strip widening file-dropped fields before use: the token path does not
+/// authenticate a same-UID writer. Clamp timeout before arming it (#179).
 pub(super) fn sanitize_file_dropped_request(
     mut req: spawnreq::SpawnRequest,
 ) -> spawnreq::SpawnRequest {
@@ -461,21 +275,7 @@ pub(super) fn sanitize_file_dropped_request(
     req
 }
 
-/// The `LaunchMode` [`fulfill_spawn_request`] feeds to `build_turn_env` for
-/// a fresh worker pane's durable interactive-launch pin (`adapters::
-/// LAUNCH_MODE_ENV`, issue #147 amendment). `trusted_interactive` is the
-/// ONLY input -- deliberately not `SpawnRequest.interactive`, which is
-/// untrusted JSON any process able to write into the requests directory can
-/// forge (review round 1, 2026-08-27, Important). Pure and directly testable
-/// so the security property ("a forged request can never produce the pin")
-/// is pinned independent of any particular call site's real process-spawn
-/// behavior; see `fulfill_spawn_request`'s own doc comment for which callers
-/// pass `true` (only the dashboard's own in-process Spawn overlay) versus
-/// `false` (everything else, including every file-dropped request).
-///
-/// Resolves the `LaunchMode` only; `build_turn_env` does the actual
-/// pin-pushing (issue #160 finding 2) -- see that function's own doc comment
-/// for why the push lives there.
+/// Derive interactive launch pin only from trusted in-process origin, never request JSON (#147, #160).
 pub(super) fn trusted_launch_mode(trusted_interactive: bool) -> adapters::LaunchMode {
     if trusted_interactive {
         adapters::LaunchMode::Interactive
@@ -492,55 +292,8 @@ pub(super) fn trusted_launch_mode(trusted_interactive: bool) -> adapters::Launch
 /// invariant.
 pub(super) const FILE_DROP_TRUSTED_INTERACTIVE: bool = false;
 
-/// Re-validates and fulfils one spawn request: the argv-safety guard, the
-/// requesting repo, the pane cap, the agent gate and adapter resolution
-/// first (a request is data, never authority -- the same checks an
-/// operator-issued `zirv ctx agent` invocation goes through), then builds
-/// a Worker pane's composed prompt and argv following `exec::run_with`'s own
-/// recipe (`compile::compile` -- issue #44, memory, the canonical `.zirv/
-/// context/` layer and the policy report all in one call -- then mail
-/// listing scoped to this fresh session's own short id ->
-/// `prompt::with_mail_layer` -> `prompt::injection_args_for_session`), and
-/// spawns it. `Ok((short, capability_warnings))` carries the freshly
-/// spawned pane's own registry short id, plus its degraded/unsupported
-/// capabilities (issue #230 item 3, F2) against the EFFECTIVE (post-reroute)
-/// adapter -- empty when nothing is degraded; `Err(reason)` is exactly the
-/// text `spawnreq::SpawnAck::reason` carries back to the requester.
-///
-/// `trusted_interactive` (review round 1, 2026-08-27, Important): whether
-/// THIS SPECIFIC CALL originates from the dashboard's own in-process Spawn
-/// overlay -- a human's keypress in the running dashboard's own event loop,
-/// literally constructing the `SpawnRequest` right there and calling this
-/// function directly -- rather than a request that arrived through the
-/// file-backed drop directory (`spawnreq::take_requests`). `req.interactive`
-/// is data a pane's own `zirv ctx agent` invocation writes as untrusted
-/// JSON, and any process able to reach the requests directory (its path is
-/// only capability-protected, not authenticated) can hand-write a
-/// `req-*.json` claiming `"interactive": true` -- which used to reach
-/// `worker_pane_extra_args`'s (pre-existing) `interactive`-gated posture AND
-/// (issue #147 amendment) the new durable interactive-launch pin below,
-/// letting a forged file grant a freshly spawned pane the fully permissive
-/// posture with nobody actually watching it. `trusted_interactive` is passed
-/// in by the CALLER, never derived from `req` itself: the Spawn-overlay call
-/// site passes `true` (it just built `req` in memory this instant), the
-/// requests-directory poll loop always passes `false` regardless of what
-/// the taken file claims. Scoped to the pin only -- `req.interactive` still
-/// drives `worker_pane_extra_args`'s pre-existing sandbox-posture choice,
-/// unchanged, out of scope for this fix.
-///
-/// Pushes the new pane (and a matching empty nudge queue, keeping the two
-/// vectors the same length -- see `deliver_queued_nudges`'s own doc comment)
-/// on success. Delivered mail is consumed only after the pane has actually
-/// spawned, mirroring `exec::run_with`'s own "consume right after the spawn
-/// that carried it genuinely started" discipline.
-/// Why one spawn request was not fulfilled, and whether the requester may
-/// fall back to running the task headless itself.
-///
-/// O2: the requester used to see only a string, so every `ok: false` ack
-/// suppressed its headless fallback -- including the two failures that say
-/// nothing at all about whether the task is allowed to run (a `cwd` that does
-/// not match this dashboard's repo, and a pty spawn that failed). See
-/// `spawnreq::SpawnAck::retryable`.
+/// Revalidate request cwd, model, pane cap, agent gate and adapter before spawning;
+/// the dropped request is data, never authority to launch a child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnRefusal {
     pub reason: String,
@@ -580,24 +333,8 @@ impl SpawnRefusal {
     }
 }
 
-/// Whether a request's claimed `parent_session` is refused, and as which
-/// KIND of refusal. `None` allows it.
-///
-/// `requester` is the identity the intake channel itself proved (`Some` only
-/// for a pane's own private directory); `claims_a_live_pane` says whether an
-/// unproven claim names a session this dashboard is actually running.
-///
-/// Issue #627: the two cases are not the same refusal. A request that arrived
-/// on some pane's OWN channel and named a different session is that pane
-/// forging a lineage -- `::policy`, because an inline fallback would route
-/// straight around a gate this operator's dashboard just applied. A request
-/// on the SHARED channel proved no identity at all, which is the ordinary
-/// shape of a dashboard-hosted seat that re-registered after a restart with
-/// handoff: nothing was forged, the channel simply cannot carry the claim.
-/// That is `::channel`, so the requester falls back to the inline supervised
-/// run (`agent::answer_for_ack`) instead of the delegation exiting 1 with no
-/// fallback at all. The claim itself is refused either way -- the caller's
-/// `verified_parent` reads `requester` and never `req.parent_session`.
+/// Only the intake channel verifies parent lineage; a request's claimed ID is
+/// untrusted and must not promote a worker to coordinator.
 pub(crate) fn parent_claim_refusal(
     claimed: &str,
     requester: Option<&str>,
@@ -625,14 +362,8 @@ pub(crate) fn parent_claim_refusal(
     })
 }
 
-/// Why this spawn is refused on delegation depth, or `None` to allow it.
-///
-/// The whole permitted tree is Orchestrator -> SubOrchestrator -> Worker.
-/// Enforced here, at the authority side, because prompt text that asks a
-/// coordinator not to spawn coordinators is a request, not a cap -- and an
-/// unbounded delegation tree is precisely the cost failure this phase exists
-/// to bound. A refusal is `SpawnRefusal::policy`, never `::channel`: a
-/// headless fallback would route straight around the cap.
+/// Enforce Orchestrator -> SubOrchestrator -> Worker at the spawn authority;
+/// refusal is policy so a headless fallback cannot bypass the depth cap.
 pub(crate) fn depth_refusal(
     parent_role: prompt::PromptRole,
     requested: prompt::PromptRole,
@@ -651,77 +382,7 @@ pub(crate) fn depth_refusal(
     }
 }
 
-/// The PARENT session's role for [`depth_refusal`], resolved from data this
-/// dashboard already trusts -- never from anything `req` itself claims about
-/// its own lineage. Mirrors `trusted_launch_mode`'s own discipline (see its
-/// doc comment): a spawn request is untrusted JSON any process that can reach
-/// the requests directory can hand-write, so `req.parent_session` is used
-/// only as a KEY into this dashboard's own live pane list, never trusted as
-/// an assertion of role by itself.
-///
-/// `req.parent_session` naming one of this dashboard's own live panes reads
-/// as THAT PANE'S OWN role (`Pane::role`, issue #169) -- the role it was
-/// actually spawned with, stamped server-side at `Pane::spawn` from
-/// `PaneSpec::role` and never revised by anything the pane's own child says
-/// afterward. Before issue #169 this returned a hardcoded `Worker` for any
-/// match at all (`PaneSpec::role` was read and discarded by `Pane::spawn`),
-/// which misclassified the dashboard's own interactive orchestrator pane
-/// (`Verb::Chat`, always spawned with `role: Orchestrator`) as a `Worker`
-/// the moment it tried to delegate from within a live dash -- see the
-/// regression test `an_interactive_orchestrator_pane_may_delegate_from_
-/// within_its_own_dash` below. The same fix lets a legitimately-spawned
-/// SubOrchestrator pane's own further delegation read as `SubOrchestrator`
-/// rather than being fail-closed to `Worker`.
-///
-/// A `parent_session` naming no pane this dashboard tracks -- absent, or a
-/// value matching nothing live -- still reads as `PromptRole::Orchestrator`:
-/// a real operator process that used to be a pane of some OTHER dashboard
-/// that has since quit legitimately rejoins a different live one this way
-/// (`agent::live_join_target`'s own fallback search), and that rejoin must
-/// still be able to request a plain worker pane. A forged value here cannot
-/// grant a KNOWN pane more than the cap already refuses it (see above); it
-/// can only leave an unrelated request exactly as unrestricted as every
-/// request was before this cap existed for THAT allowance -- narrowing
-/// only, never widening.
-///
-/// I, security review (Finding 1): despite the name, this `Orchestrator`
-/// answer for an UNMATCHED parent is never a VERIFIED one. Trusting it for a
-/// coordinator role (`sub-orchestrator`) would let exactly the attack this
-/// phase exists to close: a live Worker pane that simply omits or forges its
-/// own `parent_session` reads identically to a genuine rejoin, and could
-/// otherwise claim a sub-orchestrator spawn no real Worker may ever request.
-/// `fulfill_spawn_request` (the sole caller) therefore refuses a coordinator
-/// role outright the moment lineage is unverified, BEFORE `depth_refusal`
-/// ever sees this function's answer. A worker-role request rides the
-/// unverified `Orchestrator` reading unaffected: a forged or absent parent
-/// gets it no more than a genuine rejoin already could, and
-/// `depth_refusal(Orchestrator, Worker)` was always `None`.
-///
-/// II, security review round 2 (Finding 1, 2026-08-28): `requester` -- the
-/// identity the dashboard derived from the intake channel this request
-/// actually arrived on (`handle_spawn_requests`) -- WINS over anything
-/// `req` says, and is the only lineage that is ever verified. Matching
-/// `req.parent_session` against the live pane list was never a binding
-/// between the requester and the parent it named: a Worker pane knows its
-/// own orchestrator's short id (`zirv ctx status` prints it), so naming that
-/// pane was enough to be classified with that pane's role and mint a real
-/// SubOrchestrator. The claimed value now only ever reaches this function
-/// when the channel proves nothing about who wrote it, and it is refused
-/// outright whenever it names a live pane (see `fulfill_spawn_request`).
-///
-/// III, security review round 2 (Finding 5): a parent this dashboard hosts no
-/// pane for is looked up in the session REGISTRY before the `Orchestrator`
-/// default is reached -- `sessions::Record::role` is stamped server-side by
-/// whichever supervisor spawned that session (`Pane::spawn`, `wrap::run_
-/// with`) and is exactly the answer this function was otherwise guessing.
-/// That covers the two real cases the pane list cannot: a headless
-/// coordinator delegating from its own terminal (its record says
-/// `sub-orchestrator`, so its worker spawns are allowed) and a headless
-/// WORKER trying to delegate onward (its record says `worker`, so the depth
-/// cap now bites there too, instead of reading as an unrestricted
-/// orchestrator). Only a parent the registry has never heard of -- an
-/// operator's own raw terminal, which registers nothing until it launches
-/// something -- keeps the `Orchestrator` default.
+/// Resolve parent role from dashboard-owned pane or registry state, never request fields.
 pub(super) fn parent_role_for(
     requester: Option<&str>,
     req: &spawnreq::SpawnRequest,
@@ -742,11 +403,7 @@ pub(super) fn parent_role_for(
         .unwrap_or(prompt::PromptRole::Orchestrator)
 }
 
-/// The role one registry record was spawned with (issue #169's own
-/// `sessions::Record::role`), with the pre-#169 fallback for a record written
-/// before that field existed: `Verb::Chat` is an operator's own orchestrator
-/// seat, and every other verb is a delegated worker -- the least-privileged
-/// reading of a record that never said.
+/// Read the recorded role with a Worker fallback for older registry entries (#169).
 pub(super) fn recorded_role(record: &sessions::Record) -> prompt::PromptRole {
     record
         .role
@@ -758,36 +415,7 @@ pub(super) fn recorded_role(record: &sessions::Record) -> prompt::PromptRole {
         })
 }
 
-/// Whether the task-prompt fallback (`worker_task_prompt`, below) has
-/// anywhere safe to put its text this launch. Both fallback blocks contain
-/// characters `guard_cmd_shim_reparse` refuses on a reparsed argv (embedded
-/// newlines from the mail/report-back labels, and `<`/`>` from `report_back_
-/// command`'s literal `<summary>`), so on a Windows launcher form that
-/// reparses its downstream argv -- `cmd.exe /c <shim>` (an npm-installed
-/// `.cmd`, e.g. `codex.cmd`) or `powershell -NoProfile -File <script>` (a
-/// `.ps1`) -- appending either would make `Pane::spawn`'s own guard
-/// (`pane.rs`) refuse the launch outright.
-///
-/// Medium 1, 2026-08-15: this used to key on `adapter.launches_through_cmd_
-/// shim()`, which only recognises the `cmd.exe` form -- a `.ps1` `agent_bin`
-/// would report "safe" here while `guard_cmd_shim_reparse` (which also
-/// covers `powershell -File`, via `reparse_launcher_prefix`) still refused
-/// the spawn, reproducing the exact cmd-shim regression this module already
-/// closed once, just on the other launcher shape. `launch_reparses_through_
-/// shim` is the same broader predicate `prompt.rs`'s `injection_args_for_
-/// session` uses, so both defences now agree. It takes an argv, not a bare
-/// adapter, so the probe below builds exactly the launcher prefix this
-/// pane's real spawn will use (`interactive_cmd(None, &[])` -- no prompt
-/// token yet, since deciding whether one is safe to append is the whole
-/// point) and asks the same question `Pane::spawn` will.
-///
-/// I, 2026-08-15: every dashboard-spawned codex worker failed to start
-/// whenever mail was pending or the requester was addressable, until this
-/// was caught. `false` here means both blocks are held back entirely rather
-/// than risking that refusal; a capable adapter never needs to ask (its own
-/// delivery channel -- composed + `injection_args_for_session`'s forced
-/// file-form on a shim launch, FIX A -- is a solved problem this module does
-/// not own).
+/// Use prompt fallback only where the adapter has a safe text channel.
 pub(super) fn task_prompt_fallback_is_safe(adapter: &dyn AgentAdapter) -> bool {
     let probe = flatten_command(adapter.interactive_cmd(None, &[]));
     !adapters::launch_reparses_through_shim(&probe)
@@ -843,31 +471,11 @@ type ComposedWorkerPrompt = (
     Vec<mail::Message>,
 );
 
-/// R1-4: the ceiling on `SpawnRequest::system_prompt`. The honest caller
-/// (`workflow::review::reviewer_args`) sends an agent manifest's own
-/// instructions, a few kilobytes at most; the channel is untrusted, so a
-/// request cannot use it to push an unbounded body into every pane's argv.
-/// Truncated rather than refused, the same way every other capped block in
-/// this codebase (`mail.max_delivered_bytes`, the artifact excerpts) is.
+/// Cap requester system instructions before folding them into a pane prompt.
 pub(super) const MAX_REQUEST_SYSTEM_PROMPT_BYTES: usize = 16 * 1024;
 
-/// R1-4: folds a request's own `system_prompt` (the seat instructions `zirv
-/// ctx agent --system-prompt` carried) into this pane's composed prompt --
-/// last, after everything zirv composed for the pane itself, so a request can
-/// only ever add to the seat it is given, never displace it.
-///
-/// Data, not authority: the text is capped, and it reaches the harness only
-/// through `AgentAdapter::system_prompt_args`/the task-prompt fallback, where
-/// the flag name is the adapter's own. A requester able to write into this
-/// channel already controls `SpawnRequest::prompt`, which is strictly more
-/// injected text than this -- so this survives `sanitize_file_dropped_
-/// request`, unlike `flags`, which become argv.
-///
-/// Pure, so what a pane-fulfilled reviewer actually hears is testable without
-/// a pty. `None` in, `None` out only when there is nothing at all to say: a
-/// request that carries seat instructions gets a prompt even if nothing else
-/// composed (`--simple`, a disabled prompt, a failed compile), because the
-/// instructions are the whole point of the delegation that asked for them.
+/// Append bounded requester instructions last so they can add to zirv's seat
+/// policy but never displace it or supply a harness flag.
 pub(super) fn with_requested_seat_prompt(
     composed: Option<prompt::ComposedPrompt>,
     req: &spawnreq::SpawnRequest,
@@ -907,30 +515,17 @@ pub(super) fn compose_worker_prompt(
     state: &StateDir,
     repo: &Path,
     slug: &str,
-    // Issue #249: this pane's own server-verified parent (`fulfill_spawn_
-    // request`'s `verified_parent` -- never `req.parent_session`), threaded
-    // straight through to every mail-rendering call below.
+    // Use only the server-verified parent for steering trust in the composed prompt (#249).
     parent_short: Option<&str>,
 ) -> ComposedWorkerPrompt {
-    // Issue #44: gathers memory, the canonical `.zirv/context/` layer, and
-    // attaches the policy report -- see `compile::compile`'s own doc
-    // comment. `slug` is still taken as a parameter (unlike every other
-    // launch path's own `compile` call) because the caller
-    // (`fulfill_spawn_request`) already computed it for its own mail
-    // listing and this function reuses that exact value rather than letting
-    // `compile` recompute an identical one from `repo`.
+    // Compile memory and canonical context with the policy report (#44).
     let composed = super::compile::compile(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         false,
         cfg,
         adapter,
-        // Issue #155, Phase 5(c): the role the REQUEST asks for, not a
-        // hardcoded Worker -- `spawnreq::role_of` already reads an unstated
-        // or unrecognised `req.role` as `PromptRole::Worker`, so this is a
-        // strict widening only for a request that named
-        // `"sub-orchestrator"` and was not refused by the depth cap in
-        // `fulfill_spawn_request` below.
+        // Honor the requested role only after depth checks; unknown roles resolve to Worker (#155).
         spawnreq::role_of(req),
         state,
         super::state::now_secs(),
@@ -942,16 +537,7 @@ pub(super) fn compose_worker_prompt(
         true,
     )
     .composed;
-    // R1-4 (2026-09-06 review): the seat instructions the requester asked to
-    // be injected (`zirv ctx agent --system-prompt`, e.g. `workflow::review::
-    // reviewer_args`'s reviewer-seat text). Folded into this pane's own
-    // composed prompt -- the same channel, and the same `with_mail_layer`
-    // shape, the rest of the prompt already travels on -- rather than
-    // appended as a SECOND system-prompt argv pair, which claude would append
-    // twice and codex's single `developer_instructions` key would simply
-    // clobber. Folding here also means an adapter without system-prompt
-    // support still hears it: `worker_task_prompt`'s own composed fallback
-    // delivers exactly this text on the task-prompt channel instead.
+    // Keep reviewer seat instructions in the composed prompt, since dropped argv flags cannot carry them.
     let composed = with_requested_seat_prompt(composed, req);
     let system_prompt_supported = adapter.system_prompt_supported(&[]);
     let should_list_mail = cfg.mail.enabled && (composed.is_some() || !system_prompt_supported);
@@ -989,44 +575,15 @@ pub(super) fn compose_worker_prompt(
     } else {
         composed
     };
-    // Last, and after the mail layer on purpose: this is zirv's own plumbing,
-    // not something another session's message is allowed to sit on top of.
-    //
-    // G2: gated on `cfg.mail.enabled`, same as the mail layer just above --
-    // telling a worker to `zirv ctx send` its outcome back when mail delivery
-    // is off would only ever produce a command that gets refused. An operator
-    // who has turned mail off has not asked for a task-completion channel that
-    // silently fails at the end of every worker's run.
+    // Append report-back instructions after mail framing only when mail is enabled.
     let composed = if cfg.mail.enabled && system_prompt_supported {
-        // Fix 5 (issue #249/#250 review): `parent_short` here is `verified_
-        // parent` (see this function's own parameter doc comment) -- the
-        // report-to ADDRESS may still be `req.requested_by`, but the
-        // authority claim inside the layer is only made when the two agree.
+        // Gate report-back authority by the verified parent, not the requester-supplied address (#249, #250).
         prompt::with_report_back_layer(composed, &req.requested_by, parent_short)
     } else {
         composed
     };
-    // Issue #115: `with_report_back_layer`/`task_prompt_with_report_back_
-    // fallback` (the latter is `worker_task_prompt`'s own equivalent, for an
-    // adapter with no system-prompt injection) both silently omit the block
-    // whenever `req.requested_by` fails `is_addressable_short` -- reasonably,
-    // since there is no real address to hand the worker a command for, but
-    // silently: nothing told the operator that a worker pane was launched
-    // with no way to report its outcome back. Logged here, once, for
-    // whichever adapter shape this request actually launches (this
-    // function's own `composed` above already reflects a capable adapter's
-    // path; a fallback-only adapter's omission is this exact same fact about
-    // `req.requested_by`, so one check here covers both call sites named in
-    // issue #115 without double-logging one spawn twice).
-    //
-    // F6 (review, PR #116): this used to restate the addressability
-    // predicate inline (`!prompt::is_addressable_short(&req.requested_by)`)
-    // rather than asking `report_to_for` -- the one function that already
-    // computes, and is the single source of truth for, "does this pane get
-    // a report-back target" (`Pane::set_report_to`'s own caller uses it
-    // too). A drift between the two predicates would have logged
-    // "report-back-omitted" for a pane that in fact got a target, or stayed
-    // silent for one that did not.
+    // Include report-back instructions only for an addressable target;
+    // otherwise a worker would receive a command it cannot send (#115).
     if cfg.mail.enabled && report_to_for(req, cfg).is_none() {
         let _ = super::log::append(
             state,
@@ -1048,28 +605,8 @@ pub(super) fn compose_worker_prompt(
     (composed, mail_entries, mail_messages)
 }
 
-/// The model flags one worker pane launches with.
-///
-/// A spawn request carries no trailing flags of the operator's own except one:
-/// the model this worker was pinned to (`zirv agent <name> "<prompt>" --
-/// --model <m>`, which `agent::try_join_dashboard` recognises; a request
-/// carrying anything else never reaches the dashboard at all). That pin wins
-/// over the operator's resolved worker default, the same precedence
-/// `agent.rs`'s own `worker_launch_flags` applies on the headless path.
-///
-/// Re-checked here rather than trusted: `req.model` becomes an argv token, so a
-/// blank or flag-shaped value falls back to the resolved default instead --
-/// the same authority-side defense in depth the request's prompt gets from
-/// `argv_unsafe_prompt`, rather than relying on the requester's own filtering.
-/// It also has to pass `validate_model_str`'s own charset/length/leading-dash
-/// guard, the same one `config.rs` applies to `worker.claude`/`worker.codex`
-/// before either ever reaches a launch argv: a request's `model` reaches this
-/// pane's argv exactly the same way, so an over-long or bad-charset value
-/// falls back to the configured default rather than reaching `model_args`.
-///
-/// Split out of `fulfill_spawn_request` for the same reason
-/// `compose_worker_prompt` is: what a worker pane actually launches with stays
-/// testable without spawning a pty.
+/// Revalidate the only permitted pin at this authority side; any other
+/// requester-supplied argv could widen child permissions.
 pub(super) fn pane_model_args(
     req: &spawnreq::SpawnRequest,
     cfg: &CtxConfig,
@@ -1107,49 +644,16 @@ pub(super) fn strip_leading_separator_for_an_empty_prompt(
     }
 }
 
-/// The text passed positionally to `interactive_cmd` for a freshly spawned
-/// worker pane: `req.prompt` as written for an adapter with real
-/// system-prompt injection (its composed conventions, mail and report-back
-/// instruction already rode `compose_worker_prompt`'s `composed` above), or
-/// -- for one without -- the same, now three, blocks appended onto the task
-/// prompt text instead: the complete compiled `composed` text (bug fix,
-/// review finding -- this used to be only the bare `DEFAULT_PROMPT`
-/// constant via `task_prompt_with_conventions_fallback`, so an adapter with
-/// its own worker/sub-orchestrator layer, e.g. codex's `WORKER_PROMPT`/
-/// `SUB_ORCHESTRATOR_PROMPT`, never heard it on this path even though it was
-/// already sitting in `composed.text`), then mail, then the report-back
-/// instruction -- unless even that channel is unsafe on this launch
-/// (`task_prompt_fallback_is_safe`, I), in which case the bare requester
-/// prompt is returned unchanged and the caller (`fulfill_spawn_request`) is
-/// responsible for not treating `mail_messages` as delivered. Split out of
-/// `fulfill_spawn_request` for the same testability reason `compose_worker_
-/// prompt` was.
-///
-/// Low 12: `fallback_is_safe` is `task_prompt_fallback_is_safe(adapter)`'s
-/// own answer, computed once by the caller and passed in rather than
-/// recomputed here -- it walks `PATH` to resolve the launcher shape
-/// (`interactive_cmd` -> `resolve_program`), and `fulfill_spawn_request`
-/// already needs the same answer for its own narration decision just below
-/// this call. Evaluating it twice per spawn request cost a second PATH walk
-/// for a fact that cannot have changed between the two call sites.
+/// Pass task text positionally; keep system instructions in their supported adapter channel.
 pub(super) fn worker_task_prompt(
     req: &spawnreq::SpawnRequest,
     mail_messages: &[mail::Message],
     cfg: &CtxConfig,
-    // Bug fix (review finding): this pane's own composed prompt, from
-    // `compose_worker_prompt` -- already carries the adapter's own worker/
-    // sub-orchestrator layer (codex's `WORKER_PROMPT`/`SUB_ORCHESTRATOR_
-    // PROMPT`, folded in by `compose` regardless of injection capability)
-    // ahead of the bare `DEFAULT_PROMPT` constant this fallback used to
-    // append on its own. Delivered through `task_prompt_with_composed_
-    // fallback`, the same channel `exec.rs`/`run_loop.rs` use for a headless
-    // launch, so a dashboard-spawned codex worker hears exactly what a
-    // headless one does.
+    // Avoid duplicating the composed worker prompt in fallback task text.
     composed: Option<&prompt::ComposedPrompt>,
     system_prompt_supported: bool,
     fallback_is_safe: bool,
-    // Issue #249: this pane's own server-verified parent -- see
-    // `compose_worker_prompt`'s identical parameter.
+    // Use only the server-verified parent in task-prompt mail framing (#249).
     parent_short: Option<&str>,
 ) -> String {
     if !system_prompt_supported && !fallback_is_safe {
@@ -1181,10 +685,7 @@ pub(super) fn worker_task_prompt(
         parent_short,
     );
     let text = if cfg.mail.enabled {
-        // Fix 5 (issue #249/#250 review): see `compose_worker_prompt`'s
-        // identical `with_report_back_layer` call -- `parent_short` here is
-        // `verified_parent`, gating the authority claim, not the report-to
-        // address.
+        // Gate report-back authority by the verified parent in fallback prompts (#249, #250).
         prompt::task_prompt_with_report_back_fallback(
             &with_mail,
             system_prompt_supported,
@@ -1223,24 +724,11 @@ pub(super) fn fulfill_spawn_request(
     requests_dir: &Path,
     errors: &mut ErrorLog,
 ) -> Result<(String, Vec<policy::CapabilityWarning>, Option<String>), SpawnRefusal> {
-    // Every one of these is checked before anything is spawned, resolved or
-    // written, in cheapest-and-most-hostile-first order.
+    // Apply cheapest hostile-input and policy checks before resolving or spawning.
     if argv_unsafe_prompt(&req.prompt) {
         return Err(SpawnRefusal::policy(ARGV_GUARD_REFUSAL));
     }
-    // `cwd` used to be written by the requester and then never looked at.
-    // Honouring it outright would mean this dashboard spawning panes into any
-    // directory its operator never opened; ignoring it silently would mean a
-    // request from another repo quietly running here instead. `accepted_
-    // spawn_cwd` is the middle ground (issue #119): a linked `git worktree
-    // add` sibling of this dashboard's own repo is accepted -- and hosted at
-    // its own path, not this repo's -- while a genuinely unrelated repo is
-    // still refused with the same honest contract as before, visible to the
-    // requester in the ack.
-    //
-    // O2: retryable. A repo mismatch means *this* dashboard cannot host the
-    // pane, not that the task is disallowed -- the requester's own headless
-    // run happens in its own repo and is exactly the right answer.
+    // Verify request cwd belongs to this dashboard repo family before honoring it.
     let Some(spawn_cwd) = accepted_spawn_cwd(&req.cwd, repo) else {
         return Err(SpawnRefusal::channel(format!(
             "this dashboard only spawns panes in its own repo ({}); the request named {}",
@@ -1248,33 +736,12 @@ pub(super) fn fulfill_spawn_request(
             req.cwd.display()
         )));
     };
-    // Issue #228: an explicit `--workdir` is a validated, harness-agnostic
-    // escape from the dashboard's own repo family the gate above just
-    // enforced -- but only within the operator's own workdir roots
-    // (security review, 2026-08-31): request forgery by a same-uid sibling
-    // pane is in the accepted threat model (issue #179), so an unconfined
-    // `--workdir` would let a compromised pane obtain write authority over
-    // any git checkout on the machine, not only ones the operator opened.
-    // `SpawnRefusal::channel`, not `::policy`: an invalid or out-of-roots
-    // workdir is the same "this dashboard cannot host it as asked" shape as
-    // a repo mismatch above, not a policy judgment on the task itself, and
-    // the requester's own headless fallback (unrestricted -- it runs as the
-    // operator's own command, never a pane's) runs the identical validation
-    // check minus the roots confinement. See `resolved_spawn_cwd`'s own doc
-    // comment for why `req.workdir` is re-validated here rather than trusted
-    // outright, and [`workdir_roots`] for the confinement itself.
+    // Validate explicit workdir against allowed roots after accepting the request repo (#228).
     let roots = workdir_roots(cfg, repo);
     let spawn_cwd = resolved_spawn_cwd(spawn_cwd, req.workdir.as_deref(), &roots)
         .map_err(|e| SpawnRefusal::channel(e.to_string()))?;
-    // Issue #262: `req.envelope` is the REQUESTING session's own envelope
-    // (the parent), never a ready-made grant -- reconstructed and re-
-    // narrowed here exactly like `workdir` just above, rather than trusted
-    // outright. Absent `envelope` (an older request, or the human-driven
-    // Spawn overlay, which has no delegation lineage at all) reads as "this
-    // dashboard's own root" (`agent::root_envelope`). `principal` is
-    // finalised once this pane's own session id exists, further down --
-    // narrowing itself does not depend on it, only the value carried in the
-    // resulting envelope's `principal` field does.
+    // Treat the request envelope as untrusted parent data, never a ready grant;
+    // derive the child here and refuse widening (#262).
     let parent_envelope = match req.envelope.as_deref().filter(|s| !s.trim().is_empty()) {
         Some(raw) => {
             serde_json::from_str(raw).unwrap_or_else(|_| envelope::WorkerEnvelope::locked())
@@ -1298,10 +765,7 @@ pub(super) fn fulfill_spawn_request(
     let mut child_envelope =
         envelope::WorkerEnvelope::narrow(&parent_envelope, &requested_envelope)
             .map_err(|e| SpawnRefusal::channel(format!("delegation envelope refused: {e}")))?;
-    // R2: every pane in the vector is a live one -- `reap_ended_panes` takes
-    // an exited pane out on the very next tick -- so the cap is a plain
-    // `len()` again rather than a filtered count over a vector that only ever
-    // grew.
+    // Count live panes directly for the cap because reap removes exited panes.
     let live = panes.len();
     if live >= cfg.dash.max_panes {
         return Err(SpawnRefusal::policy(format!(
@@ -1309,33 +773,8 @@ pub(super) fn fulfill_spawn_request(
             cfg.dash.max_panes
         )));
     }
-    // Issue #155, Phase 5(e): the former machine-wide heavy-worker gate here
-    // (`sessions::count_heavy_workers`, refusing a spawn outright) is gone --
-    // a worker pane is no longer a heavy event just by existing. The budget
-    // now gates the actual heavy COMMAND a pane's agent runs, at
-    // `script_runner::Command::invoke` (`permit::acquire`), so an idle pane
-    // holds nothing and never counts against it.
-    // Security review round 2 (Finding 1): the requester is whoever's intake
-    // channel this request arrived on, and a request may not speak for
-    // anybody else. `requester` is `Some` only for a pane's own private
-    // directory (`spawnreq::pane_request_dir_for`, handed to that pane's
-    // child tree and nothing else), so a `parent_session` that disagrees with
-    // it is a pane claiming another session's lineage -- refused outright
-    // rather than quietly ignored, so the forgery is visible in the ack and
-    // in the dashboard's own notice channel. On the SHARED channel (an
-    // operator's own terminal, or a pane rejoining after its own dashboard
-    // quit) nothing can be proven about the writer, so naming a live pane
-    // there is refused for the same reason: a short id is public
-    // (`zirv ctx status` prints it) and can never be an authentication.
-    //
-    // Trust boundary (issue #179): `requester` proves which directory a
-    // request arrived in, and this gate stops a request from CLAIMING a
-    // foreign parent -- it does not prove which process wrote the file. A
-    // same-uid pane can `readdir` a sibling's private channel directory
-    // (`spawnreq::pane_request_dir_for`) and write a forged request straight
-    // into it; that request is indistinguishable here from a genuine one and
-    // is attributed the sibling's identity. Accepted for this release;
-    // socket-peer-credential hardening is tracked in issue #179.
+    // Check claimed lineage before selection or spawn; the request cannot make
+    // its own unverified parent authoritative (#155).
     if let Some(claimed) = req.parent_session.as_deref() {
         let claims_a_live_pane = requester.is_none()
             && panes
@@ -1345,40 +784,14 @@ pub(super) fn fulfill_spawn_request(
             return Err(refusal);
         }
     }
-    // Issue #249: the ONLY parent id any downstream mail-trust seam for the
-    // pane this call spawns may use -- `requester` alone, the identity the
-    // gate just above already proved by which channel this request arrived
-    // on, never `req.parent_session` (unverified data on the shared
-    // channel -- see that gate's own doc comment) and never anything else
-    // this request claims. `is_addressable_short` is the same bound every
-    // other short-id-carrying field in this module already applies.
+    // Derive the parent only from the intake channel identity, never request JSON (#249).
     let verified_parent = requester
         .filter(|id| prompt::is_addressable_short(id))
         .map(str::to_string);
-    // Issue #155, Phase 5(c): the delegation depth cap. `parent_role_for`
-    // never trusts `req` for its own lineage (see its own doc comment); a
-    // refusal here is policy, the same reasoning the pane cap and the agent
-    // gate right below already apply.
+    // Apply the delegation depth cap to the verified parent role (#155).
     let parent_role = parent_role_for(requester, req, panes, state);
     let requested_role = spawnreq::role_of(req);
-    // Security review Finding 1: `parent_role_for`'s `Orchestrator` answer
-    // is never a VERIFIED one (see its own doc comment) -- it is what BOTH
-    // a legitimate rejoin from a pane whose own dashboard already quit, and
-    // a live Worker pane that simply omitted or forged `parent_session`,
-    // read as. Letting either claim a coordinator (`sub-orchestrator`) role
-    // on that unverified lineage is exactly how a Worker pane defeated the
-    // depth cap: request an unrecognised parent, ask for `sub-orchestrator`,
-    // pass `depth_refusal(Orchestrator, SubOrchestrator)` (`None`) even
-    // though its own real parent is a live, known `Worker`. A worker-role
-    // request rides the same unverified lineage unaffected -- that is the
-    // one allowance the rejoin case still needs, and a bounded single worker
-    // pane is no more than the pane cap, agent gate and spawn quota below
-    // already allow any unverified requester to obtain.
-    //
-    // Round 2 (Finding 1): "verified" is now a property of the CHANNEL, not
-    // of a value the request supplied -- only a request that arrived on some
-    // pane's own private intake directory has a lineage this dashboard
-    // established itself.
+    // An unattributed channel cannot request coordinator role; only a pane channel proves its parent lineage.
     if requester.is_none() && matches!(requested_role, prompt::PromptRole::SubOrchestrator) {
         return Err(SpawnRefusal::policy(
             "a request arriving on a channel that proves no session identity may not claim the \
@@ -1393,21 +806,7 @@ pub(super) fn fulfill_spawn_request(
     if let Some(reason) = cfg.agents.refusal(&req.agent) {
         return Err(SpawnRefusal::policy(reason));
     }
-    // Issue #490 (roadmap N21 item A): a request naming the NATIVE runtime
-    // opens a native pane instead of a wrapped harness child. Everything
-    // above this point has already run -- the argv guard, the repo gate, the
-    // workdir roots, the pane cap, the delegation depth cap and the operator's
-    // own agent allowlist -- and the pane's own session takes it from there:
-    // `spawn_interactive` acquires its writer lease against this seat's own
-    // generation and its execution broker is the effect-time authority, so a
-    // native worker is fenced by N04 rather than by a harness's argv.
-    //
-    // What this path deliberately does NOT do is the wrapped path's
-    // harness-shaped accounting -- the reroute search, the per-provider token
-    // reservation, the work-group token ledger and the pane deadline are all
-    // keyed to an adapter and a transcript a native session does not have. A
-    // request that asks for any of them is refused here rather than accepted
-    // and silently unaccounted.
+    // Apply normal spawn gates before opening a native pane; refuse adapter-specific accounting requests a native session cannot honor (#490).
     if req
         .agent
         .eq_ignore_ascii_case(super::runtime::RuntimeKind::Native.as_str())
@@ -1452,11 +851,7 @@ pub(super) fn fulfill_spawn_request(
     let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
 
-    // Issue #186 hardening: the dashboard's own Spawn overlay reaches this
-    // authority-side path directly, without passing through agent::run_with.
-    // Reuse the same fallback selector here so a root dashboard delegation
-    // does not hard-refuse an exhausted requested seat while another enabled
-    // harness has safe equivalent capacity.
+    // Apply the same worker fallback policy to direct dashboard overlay spawns (#186).
     let source_model = req.model.clone().or_else(|| {
         let model_args = adapters::worker_model_args(cfg, &req.agent, requested_adapter.as_ref());
         adapters::last_model_flag(&model_args).map(str::to_string)
@@ -1472,18 +867,13 @@ pub(super) fn fulfill_spawn_request(
             tool_calls: None,
         },
         now,
-        // The dashboard's own Spawn overlay authority path, not an
-        // `agent::run_with` orchestrator-seat delegation -- issue
-        // #328's same-harness exclusion is scoped to that call site.
+        // Same-harness exclusion applies to `agent::run_with` delegation, not this overlay (#328).
         exclude: &[],
         requester: None,
     };
     let route = super::fallback::route_new_delegation(state, cfg, route_request, req.force);
-    // Issue #455 slice C (finding 2): this authority path launches panes
-    // without ever passing through `agent::run_with`, so it needs the same
-    // claim-at-commit as every other launch -- a half-open route admits one
-    // recovery probe, and two panes probing the same broken endpoint is what
-    // the rule exists to prevent. Same helper, so the two cannot drift.
+    // Claim at commit before another pane probes the same half-open route; this
+    // dashboard path bypasses agent::run_with's equivalent gate (#455).
     let route = match super::fallback::claim_route_trial(
         state,
         cfg,
@@ -1500,14 +890,8 @@ pub(super) fn fulfill_spawn_request(
         }
     };
     let mut effective_req = req.clone();
-    // Issue #228: from here on, `effective_req.cwd` (and so `req.cwd` once
-    // rebound below) IS the actual accepted spawn location -- `spawn_cwd`
-    // itself when no `--workdir` was honoured (a no-op copy: `accepted_
-    // spawn_cwd` never returns anything but `req.cwd.to_path_buf()`), or the
-    // validated workdir otherwise. `worker_pane_extra_args` (widened
-    // writable roots) is the one remaining reader of `req.cwd` past this
-    // point, and it must see the directory the pane is actually about to
-    // run in, not the requester's own.
+    // After validation, req.cwd must be the effective pane cwd; later writable
+    // roots must not be widened for the requester's different repo (#228).
     effective_req.cwd = spawn_cwd.clone();
     if let Some(route) = route {
         effective_req.agent = route.selected.clone();
@@ -1526,9 +910,7 @@ pub(super) fn fulfill_spawn_request(
                 observed_at: route.requested_observed_at,
             },
         );
-        // Issue #358 (task 5): the same reroute, in the capacity-pool
-        // vocabulary, so an operator can read delegation placement and
-        // orchestrator rollover out of one story instead of two.
+        // Describe rerouting in the shared provider-capacity vocabulary (#358).
         super::rollover::record_route(state, &req.requested_by, "dash", now, &route, None);
         push_error(
             errors,
@@ -1544,13 +926,7 @@ pub(super) fn fulfill_spawn_request(
     }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
-    // Issue #230 item 3 (F2, review round): computed once here, against
-    // this ALREADY-RESOLVED, post-reroute `adapter` -- not a second
-    // `adapters::select` against the ORIGINAL request's agent, which is
-    // what let a rerouted spawn's ack describe a harness that was never
-    // launched. `mode` mirrors the exact match `compose_worker_prompt`
-    // itself uses below; no second policy evaluation happens anywhere else
-    // in this function.
+    // Assess degraded capabilities against the final selected adapter, after reroute (#230).
     let mode = if req.interactive {
         adapters::LaunchMode::Interactive
     } else {
@@ -1559,28 +935,7 @@ pub(super) fn fulfill_spawn_request(
     let capability_warnings =
         policy::evaluate(&cfg.policy, adapter.as_ref(), mode).degraded_capabilities();
 
-    // Issue #155, Phase 6(c); reworked for issue #358 (T9): usage headroom
-    // ranks a delegation, it never refuses or delays one -- so this is now
-    // an informational note plus, for the ceiling band, an `Attention::Quota`
-    // row, never a `SpawnRefusal`. Placed right after the depth cap, ahead
-    // of the more expensive prompt-composition work below, in the same
-    // cheapest-and-most-hostile-first order this function's own doc comment
-    // promises. Re-applies the SAME check `agent.rs::run_with` already
-    // evaluated against this very request before it was ever written to
-    // disk, so a request that reaches a dashboard other than the one that
-    // check consulted (a live-dashboard fallback, a request that sat claimed
-    // for a while) is held to an equally fresh reading rather than trusting
-    // a decision that may now be stale.
-    //
-    // Track C (#383) note: this whole function -- the gate read here, the
-    // token reservation below, and its settle counterpart in
-    // `account_reaped_pane_spend` -- stays on the static, name-only
-    // `adapter.provider()`/`provider_for_agent_name` rather than
-    // `provider_for_model`, deliberately: `Pane` does not retain the model a
-    // pane actually launched with (see `Pane::handover`'s matching note in
-    // `pane.rs`), so a model-aware gate/reserve here would have no way to
-    // settle against the same provider once the child reaps. All three stay
-    // symmetric until `Pane` carries its own resolved model.
+    // Report low headroom as information; it must not block or delay delegation (#155, #358).
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
@@ -1588,13 +943,7 @@ pub(super) fn fulfill_spawn_request(
         .map(|reading| reading.age_secs);
     if let Some(note) = super::pace::describe_spawn_gate(&gate, reading_age) {
         if matches!(gate, super::pace::SpawnGate::Refuse { .. }) {
-            // Issue #349: filed against the REQUESTING pane's own short id
-            // (`req.requested_by`) -- untrusted the same way the log line
-            // right below already treats it (best-effort, informational
-            // only; a bogus value just files a stray, harmless row). The
-            // spawn below still proceeds regardless: this is a ranking
-            // signal, kept on the attention row because it is useful, not a
-            // reason to refuse the pane.
+            // Record attention against the requesting pane's short ID without treating it as authority (#349).
             let _ = super::attention::record(
                 state,
                 &req.requested_by,
@@ -1614,21 +963,7 @@ pub(super) fn fulfill_spawn_request(
         );
     }
 
-    // The pane-side admission choke point for the group's child, token, and
-    // deadline limits. `agent::run_with`'s own headless choke point
-    // (`resolve_worker_budget`) never runs for a request that reaches here
-    // -- `try_join_dashboard` is the fork point between the two forks of one
-    // delegation -- so this is the ONLY place a pane spawn is counted
-    // against its group. `SpawnRefusal::policy`, not `::channel`: a headless
-    // fallback would call the identical `admit_child` in `agent.rs` and get
-    // refused there too, so falling back gains nothing and the requester
-    // deserves the honest, non-retryable answer.
-    // Issue #301: `admit_child` resolves AND reserves this pane's own token
-    // ceiling atomically inside the group's admission lock -- the group's
-    // remaining, unreserved budget, already tightened by `req.budget_tokens`
-    // exactly as `agent::resolve_budget_tokens` used to tighten it here
-    // afterward. Without that reservation, two panes admitted concurrently
-    // could each be handed the group's entire remaining budget.
+    // Admit group children against child, token and deadline limits before spawning.
     let budget_tokens = if let Some(group_id) = &req.work_group_id {
         match super::group::admit_child(state, group_id, now, req.budget_tokens) {
             Ok((_, ceiling)) => ceiling,
@@ -1646,25 +981,7 @@ pub(super) fn fulfill_spawn_request(
     let registry_short = sessions::short_id(&session_id);
     let slug = super::state::repo_slug(repo);
 
-    // Issue #358 (task T3): the pane-side mirror of `agent::run_with`'s own
-    // provider reservation -- a durable, per-PROVIDER ledger entry for this
-    // pane's own token ceiling, independent of `req.work_group_id`'s own
-    // `reserved_tokens` (which protects one group's budget, not a
-    // provider's machine-wide outstanding total). Released via
-    // `reservation::release` by `rollback_admission` below on every
-    // pre-spawn refusal, or settled via `reservation::settle` once the
-    // pane's own child actually exits (`account_reaped_pane_spend`).
-    // Best-effort, like every other ledger write in this codebase: a ledger
-    // error must never refuse a spawn this dashboard already admitted.
-    // Finding #11 (issue #358 review): `reserve_within` checks "is there
-    // room" and reserves atomically under the ledger's own lock -- placement
-    // was decided against a `CapacitySnapshot`/pacing reading taken before
-    // this point, outside any lock, so a plain `reserve` here let two
-    // concurrent pane admissions both read "room enough" and both reserve,
-    // jointly over-committing the provider (mirrors `agent::run_with`'s own
-    // identical fix). `limit_tokens` is `None` (no check) when this
-    // provider has no configured token budget to convert projected headroom
-    // against.
+    // Reserve provider tokens durably for dashboard panes as for headless workers (#358).
     let limit_tokens =
         super::pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
     let reservation_id = match super::reservation::reserve_within(
@@ -1696,17 +1013,7 @@ pub(super) fn fulfill_spawn_request(
         }
     };
 
-    // Re-review (2026-08-27) finding 1: from here on, `req.work_group_id`
-    // (if any) has genuinely been admitted -- every remaining fallible step
-    // between here and the pane actually spawning must roll that admission
-    // back on its way out, or a post-admission failure (prompt composition,
-    // the pty spawn itself) permanently burns a
-    // `child_limit` slot for a child that never ran, and (issue #301) leaks
-    // its reservation forever. Best-effort, like `rollback_admission`
-    // itself: never shadows the real refusal being returned. `budget_tokens`
-    // is exactly the ceiling `admit_child` just reserved (or `None` if it
-    // reserved nothing), so releasing it here always matches. Issue #358:
-    // the provider-level reservation just above rolls back the same way.
+    // After admission, release every acquired permit on any remaining failure before pane ownership transfers.
     let rollback_admission = || {
         if let Some(group_id) = &req.work_group_id {
             super::group::rollback_admission(state, group_id, budget_tokens.unwrap_or(0));
@@ -1716,43 +1023,13 @@ pub(super) fn fulfill_spawn_request(
         }
     };
 
-    // Issue #264 (EXTRA, Track A residual): `req.mode` used to travel on
-    // `SpawnRequest` for data parity only (see that field's own doc comment)
-    // -- a pane fulfilling a `writing` request never actually enforced the
-    // writer-permit pool `agent::run_with`'s headless fork already does.
-    // Same gate, same reason, same one-line refusal text -- acquired here,
-    // before any further fallible step, so a refusal rolls back the group
-    // admission exactly like every other pre-spawn refusal in this function
-    // does. `spawn_cwd`, not `repo`: the tree this pane's child is actually
-    // about to write into (a linked worktree or an explicit `--workdir`),
-    // never the dashboard's own checkout. Held as a local `Option` rather
-    // than committed to the pane until the spawn actually succeeds below --
-    // an early return here drops it via `HeavyPermit::drop`, releasing the
-    // slot exactly like every other fallible step past this point already
-    // does for the group admission it rolls back.
-    //
-    // Coordinator panes never take a writer slot: an orchestrator or
-    // sub-orchestrator delegates edits to the workers it spawns into this
-    // same tree, so holding the tree's one writer permit itself would refuse
-    // every worker it is about to dispatch (`fulfill_spawn_request_never_
-    // charges_a_coordinator_pane_a_writer_permit`).
+    // Acquire a writer permit only for Writing and before further fallible work,
+    // so refusal can roll back group admission as one transaction (#264).
     let writer_permit = if req.mode == super::permit::WorkerMode::Writing
         && spawnreq::role_of(req) == prompt::PromptRole::Worker
     {
         let tree = std::fs::canonicalize(&spawn_cwd).unwrap_or_else(|_| spawn_cwd.clone());
-        // Issue #543 (review F2): the REQUESTING pane's own seat identity,
-        // not the dashboard process's -- `fulfill_spawn_request` runs inside
-        // the long-lived dashboard, a different process than whatever pane
-        // wrote `req`, so the dashboard's own environment says nothing about
-        // whether the ACTUAL requester's rollover has committed (it is
-        // usually unset, silently falling back to the lenient supersession-
-        // only verdict, and even when set it names an unrelated seat). `req.
-        // parent_session`/`req.parent_seat_generation` carry the requester's
-        // own identity instead, fed into the STRICT `seat::guard` verdict via
-        // an explicit `SeatFence` -- an uncommitted successor spawning a
-        // writing pane must not hand it a lease before its own rollover
-        // commits, which `guard_from_env`'s supersession-only check let
-        // through.
+        // Fence writer acquisition with the requesting pane's seat generation, never the dashboard process's (#543).
         let identity = req.parent_session.as_deref().and_then(|session| {
             req.parent_seat_generation
                 .map(|generation| (sessions::short_id(session), generation))
@@ -1919,26 +1196,14 @@ pub(super) fn fulfill_spawn_request(
     let spec = PaneSpec {
         agent_name: req.agent.clone(),
         argv,
-        // Issue #169: the role this request was actually granted, already
-        // checked against the depth cap above -- not a hardcoded `Worker`.
-        // Before this fix a legitimately-approved SubOrchestrator spawn
-        // still landed on a pane whose `Pane::role()` read back as `Worker`,
-        // so its own further delegation was refused by the depth cap one
-        // hop too early.
+        // Store the role actually granted by depth policy, not a fixed Worker role (#169).
         role: requested_role,
         verb: sessions::Verb::Dash,
         session_id: session_id.clone(),
         title: format!("wrk {}", req.agent),
     };
 
-    // Issue #147 amendment, review round 1 (2026-08-27) correction, and
-    // issue #160 finding 2 (2026-08-28): the durable interactive-launch pin
-    // is decided by `trusted_launch_mode`, which is `trusted_interactive`-
-    // only and never reads `req.interactive` (see both that function's and
-    // this one's own doc comments for the full security reasoning), and
-    // pushed by `build_turn_env` itself -- this call site no longer pushes
-    // it separately, closing off the "forgot the pin" bug class at this
-    // call site for good.
+    // Pin interactive launch only for a trusted live dashboard action; file-dropped requests remain headless (#147, #160).
     let (mut turn_env, turn_env_err) = build_turn_env(
         cfg,
         state,
@@ -1950,39 +1215,21 @@ pub(super) fn fulfill_spawn_request(
     if let Some(e) = turn_env_err {
         push_error(errors, e);
     }
-    // Security review Finding 1: this pane's OWN channel, not the shared one
-    // -- what makes the next request it writes attributable to it.
+    // Give the new pane its own request channel so later requests are attributable to it.
     let pane_channel = mint_pane_channel(requests_dir, errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         pane_channel.display().to_string(),
     ));
-    // Issue #170: a work-group binding travels by lineage, not convention --
-    // this pane's own child inherits `agent::WORK_GROUP_ENV` in its real
-    // process environment, so any further `zirv agent` call it makes with no
-    // `--group` of its own (`agent::resolve_group_binding`'s own env
-    // fallback) lands in the SAME group automatically, and every process
-    // THAT spawns inherits it in turn via ordinary environment inheritance
-    // -- no additional plumbing needed past this one seam.
+    // Export the work-group binding to the child so delegation lineage survives nested spawns (#170).
     if let Some(group_id) = &req.work_group_id {
         turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
     }
-    // Issue #249: set EXPLICITLY from `verified_parent` alone -- never
-    // inherited -- so this pane's own child (and, through the same turn-
-    // signal env every nested `zirv ctx` call already inherits, any further
-    // worker IT spawns) sees THIS pane's own supervising session, not
-    // whatever `PARENT_SESSION_ENV` this dashboard process itself happens to
-    // carry. `sessions::SUPERVISION_ENV` already covers this key, so
-    // `Pane::spawn`'s own scrub (just below) clears any such stray value
-    // before this push lands.
+    // Export only the server-verified parent session; inherited environment cannot establish lineage (#249).
     if let Some(parent) = &verified_parent {
         turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent.clone()));
     }
-    // Issue #318: the OUTPUT CONTRACT this delegation declared travels the
-    // same way -- into the pane's own child env, so a self-report it sends
-    // with `zirv ctx send --to-session` (which inherits this real process
-    // environment) is held to the identical contract the headless retry
-    // path validates against.
+    // Export the declared result schema so pane self-reports keep their output contract (#318).
     if let Some(schema) = &req.result_schema {
         turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema.clone()));
         turn_env.push((
@@ -1990,13 +1237,7 @@ pub(super) fn fulfill_spawn_request(
             spawn_cwd.display().to_string(),
         ));
     }
-    // Issue #262: `child_envelope` was already narrowed (and, on a widening
-    // request, this function already returned `Err` before ever reaching
-    // this point) -- `principal` just needed this pane's own session id,
-    // which now exists. Pushed into the pane's real process env the same
-    // way `WORK_GROUP_ENV`/`RESULT_SCHEMA_ENV` are, so a further `zirv
-    // agent` this pane's own child runs reads it back as ITS parent
-    // envelope (`agent::resolve_parent_envelope`).
+    // Export the narrowed child envelope with its newly assigned principal (#262).
     child_envelope.principal = format!(
         "{}/{}",
         parent_envelope.principal,
@@ -2011,17 +1252,8 @@ pub(super) fn fulfill_spawn_request(
         child_envelope.principal.clone(),
     ));
 
-    // O2: retryable. A pty that could not be opened is an environment
-    // failure, not a policy one -- the headless path has no pty to open.
-    //
-    // `spawn_cwd`, not `repo`: a request accepted via the linked-worktree
-    // path (issue #119) must actually run inside that worktree's own working
-    // tree, never inside the dashboard's own checkout -- see `accepted_
-    // spawn_cwd`'s doc comment. Every other input to this spawn
-    // (`build_turn_env`, `slug`, `compose_worker_prompt`'s state paths)
-    // stays keyed off the dashboard's own `repo` on purpose: the session/
-    // state store is shared across every pane this dashboard hosts,
-    // regardless of which worktree a given pane's argv actually runs in.
+    // Spawn in accepted req_cwd, never repo; PTY-open failure is retryable
+    // environment failure, so admission is rolled back before returning (#119).
     let mut pane = match Pane::spawn(
         spec,
         state,
@@ -2038,10 +1270,7 @@ pub(super) fn fulfill_spawn_request(
             return Err(SpawnRefusal::channel(e.to_string()));
         }
     };
-    // Issue #115: set eagerly here even for adapter shapes whose fallback
-    // channel turned out unsafe (`fallback_is_safe == false` above) -- a
-    // worker that received no report-back text at all in its launch prompt
-    // still benefits from the reminder pointing it at the right command.
+    // Keep a report target even when prompt fallback was unsafe, so a later reminder can still reach the worker (#115).
     pane.set_report_to(report_to_for(req, cfg));
     pane.set_intake_dir(pane_channel);
     pane.set_work_group_id(req.work_group_id.clone());
@@ -2052,13 +1281,7 @@ pub(super) fn fulfill_spawn_request(
     // already satisfied -- and `--max-tool-calls` is reported just below
     // rather than enforced, because a pane has no verified tool-call counter.
     pane.set_timeout(Instant::now(), req.timeout_secs);
-    // Issue #399: informational, not a failure -- the sandbox posture is
-    // exactly what `--mode read-only` asked for, and `codex_read_only_build_
-    // warning`'s own stderr print (`agent::run_with`) already told the
-    // operator once at dispatch time. Pushing this through `push_error`
-    // pinned the sticky `\u{26a0}` header line for the pane's whole life over
-    // an expected posture, not a real failure; the notice channel says it
-    // once and lets it expire like any other spawn confirmation.
+    // Report requested read-only posture through a transient notice, not a failure (#399).
     let read_only_advisory = super::agent::codex_read_only_build_warning(adapter.name(), req.mode)
         .map(|warning| format!("pane '{}' ({}): {warning}", pane.title(), pane.short()));
     if let Some(calls) = req.max_tool_calls {
@@ -2073,11 +1296,7 @@ pub(super) fn fulfill_spawn_request(
         );
     }
     pane.set_reservation_id(reservation_id.clone());
-    // Issue #249: the same server-verified value just pushed into this
-    // pane's own `turn_env` above, stored here too so this dashboard's own
-    // in-process mail sweep (`sweep_one_pane`, which never spawns a new OS
-    // process and so never re-reads `PARENT_SESSION_ENV` off anything) can
-    // label this pane's parent mail without a filesystem round trip.
+    // Store the server-verified parent on the pane for in-process mail trust checks (#249).
     pane.set_parent_session(verified_parent.clone());
     // 2026-09-06: what this pane owes the cost ledger once its child exits
     // (`account_reaped_pane_spend`). `verified_parent` first -- the identity
@@ -2099,13 +1318,7 @@ pub(super) fn fulfill_spawn_request(
         envelope_sha256: envelope::digest(&child_envelope).ok(),
         started_at: Instant::now(),
     });
-    // Issue #264 (EXTRA): the pane exists now, so the writer permit acquired
-    // above (if any) is tied to its real child pid -- the same `set_child_
-    // pid` discipline `agent::run_with`'s headless fork applies -- and handed
-    // to the pane itself, which is what makes it release automatically the
-    // moment this pane is dropped (`Pane::writer_permit`'s own field
-    // comment), rather than needing an explicit release call on every one of
-    // this dashboard's several pane-removal paths (reap, shutdown, quit).
+    // Tie an acquired writer permit to the spawned child's real PID (#264).
     if let Some(permit) = writer_permit {
         if let Some(child_pid) = pane.child_pid() {
             permit.set_child_pid(child_pid);
@@ -2116,15 +1329,7 @@ pub(super) fn fulfill_spawn_request(
         pane.set_owns_cwd();
     }
     let short = pane.short().to_string();
-    // Security review Finding 2: the dash-side half of issue #170's
-    // claim/close pair. `agent::run_with` claims a group for the coordinator
-    // it launches headlessly, but the dashboard fork of the very same
-    // delegation claimed nothing -- so a dash-spawned coordinator's group sat
-    // open and unclaimed forever, and `group::is_abandoned` (which needs a
-    // claim to have anything to say) could never flag it when that pane died.
-    // First-claim-wins, and best-effort for the same reason `run_with`'s own
-    // claim is: a group swept between admission and here must not fail a
-    // spawn that has already happened.
+    // Claim a coordinator's work group on this dashboard path and close it on reap (#170).
     if matches!(requested_role, prompt::PromptRole::SubOrchestrator)
         && let Some(group_id) = &req.work_group_id
     {
@@ -2134,11 +1339,7 @@ pub(super) fn fulfill_spawn_request(
     nudge_queues.push(VecDeque::new());
 
     for (path, _) in mail_entries.drain(..) {
-        // Issue #30, item 3: this pane's own launch prompt already carried
-        // these messages (`compose_worker_prompt`/`worker_task_prompt`), so
-        // consumption here is on the freshly spawned pane's behalf, never in
-        // answer to its own explicit `zirv ctx inbox` -- logged so a message
-        // that no longer shows up in anyone's inbox is at least traceable.
+        // Consume launch mail only after the pane has received it through its composed prompt (#30).
         let _ = mail::consume_and_log(
             state,
             &slug,
@@ -2152,20 +1353,7 @@ pub(super) fn fulfill_spawn_request(
     Ok((short, capability_warnings, read_only_advisory))
 }
 
-/// Pairs every request in one taken batch with its own file stem, in order.
-///
-/// R5: claiming used to be interleaved with fulfilment -- request B was only
-/// claimed once A had finished spawning. Fulfilling A is a real pty spawn and
-/// can easily outlast B's requester's ack timeout, and for that whole window B
-/// sat taken-but-unclaimed: `take_requests` had already deleted its file, so B's
-/// requester saw neither an ack nor a claim, concluded nobody was listening,
-/// and ran the same task headless as well.
-///
-/// O6: the claim is no longer written here at all. `spawnreq::take_requests`
-/// takes a request *by renaming it into its own claim*, so the whole batch is
-/// claimed the instant it is taken -- there is no longer any window, however
-/// short, in which a taken request is unclaimed. What is left here is the
-/// stem derivation every caller downstream keys its ack off.
+/// Claim a whole request batch before fulfilling any member so timeout cannot trigger duplicate headless work.
 pub(super) fn claim_batch(
     batch: Vec<(PathBuf, spawnreq::SpawnRequest)>,
 ) -> Vec<(String, spawnreq::SpawnRequest)> {
@@ -2175,17 +1363,7 @@ pub(super) fn claim_batch(
         .collect()
 }
 
-/// Every intake channel this dashboard drains on a tick, paired with the
-/// session identity a request arriving there proves: this dashboard's own
-/// shared `requests` directory first (`None` -- any process that discovered
-/// this dashboard can write there, so it proves nothing), then one channel
-/// per live pane (`Some(short)` -- that directory's path was handed to that
-/// pane's child tree and to nothing else).
-///
-/// Security review Finding 1: snapshotted BEFORE any fulfilment, because
-/// fulfilling appends panes and a pane spawned on this tick cannot yet have
-/// queued anything -- and because `fulfill_spawn_request` needs `panes`
-/// mutably while this list is being walked.
+/// Pair each intake directory with the requester identity it proves; the shared channel proves none.
 pub(super) fn intake_channels(
     requests_dir: &Path,
     panes: &[Pane],
@@ -2240,36 +1418,14 @@ pub(super) fn handle_spawn_requests(
 /// as a clean finish.
 pub(super) const EXIT_KILLED: i32 = 143;
 
-/// SECURITY (issue #435 item 1, superseding review round 2's original rule):
-/// the refusal a `kill` request gets when it arrives on the dashboard's own
-/// SHARED channel. That directory used to be trusted precisely because it
-/// is not attributed to any one pane -- but it is a fixed sibling of every
-/// pane's own intake directory (`Pane::intake_dir`), so any pane's child
-/// tree can derive its path just as easily as `zirv ctx kill` can, and
-/// nothing arriving there proves who wrote it. See [`kill_allowed`].
+/// Refuse kill on the shared channel because sibling panes can derive and write its path (#435).
 pub(super) const KILL_SHARED_CHANNEL_REFUSAL: &str = "kill requests are refused on the dashboard's shared channel -- ask through the requester's own pane channel instead";
 
-/// SECURITY (issue #435 item 1): the refusal a `kill` request gets when it
-/// arrives on a pane's own channel (identifying that pane as the honest
-/// requester -- see [`kill_allowed`]'s own doc comment for the issue #179
-/// caveat) but names a target that is neither that pane itself nor a pane
-/// it spawned, directly or transitively. See [`kill_allowed`].
+/// Refuse a pane-channel kill of an unrelated pane or ancestor (#435).
 pub(super) const KILL_UNRELATED_PANE_REFUSAL: &str =
     "kill requests may only target the requester's own pane or a pane it spawned";
 
-/// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
-/// kill` that would otherwise have to signal the pane's pid from outside.
-///
-/// Two things an outside signal cannot do, and this can. The pane's process
-/// is this dashboard's own `Child`, so `Pane::stop_now` reaches it as its
-/// real parent even where a sandboxed harness shell's `kill` is refused with
-/// `EPERM`. And the writer permit the pane holds is released by this
-/// dashboard's own reap (`permit::HeavyPermit::drop`, once `reap_ended_panes`
-/// sees the child exit), never by anything the killing process does -- so a
-/// pane killed from outside used to leave its permit slot occupied by a
-/// session `zirv ctx kill` had already deregistered, and the next dispatch
-/// into that worktree was refused `writer-busy` naming a session that no
-/// longer existed.
+/// Stop dashboard-owned children through their parent so reap releases the writer permit (#403).
 pub(super) fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
     let Some(pane) = panes.iter_mut().find(|pane| pane.short() == short) else {
         return Err(format!("no pane {short} is running on this dashboard"));
@@ -2277,31 +1433,7 @@ pub(super) fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), Str
     pane.stop_now(EXIT_KILLED).map_err(|e| e.to_string())
 }
 
-/// SECURITY (issue #435 item 1): whether a `kill` naming `target` is
-/// honoured, arriving on `requester`'s channel (`None` for the dashboard's
-/// own shared one, `Some(short)` for a pane's own intake channel -- see
-/// [`intake_channels`]). Pure and testable without a running dashboard: the
-/// only state it needs is `kept_requests`, the very map `drain_one_channel`
-/// already threads through every spawn to make `restore_ended_row` possible.
-///
-/// The shared channel identifies no requester at all, so it is refused
-/// outright regardless of target. A pane's own channel identifies which
-/// pane an HONEST requester is -- only that pane's own child tree was ever
-/// handed the path -- and a kill arriving there is trusted for that pane
-/// itself or for any pane it spawned, directly or through a chain of
-/// further spawns: found by walking `target`'s own `requested_by` ancestry
-/// (`kept_requests[short].1`) upward looking for `requester`. Anything else
-/// -- an unrelated sibling, an ancestor, a pane this dashboard never kept a
-/// request for -- is refused.
-///
-/// Trust boundary (issue #179, the same residual the `parent_session` gate
-/// above and `spawnreq::pane_request_dir_for`'s own doc comment already
-/// carry): this narrows to the honest requester, it does not authenticate
-/// the writer. A same-uid pane can list the parent token directory,
-/// discover a sibling's `p-<pane_token>` channel, and write a forged kill
-/// request straight into it, being attributed that sibling's identity --
-/// indistinguishable here from a genuine one. Accepted for this release;
-/// socket-peer-credential hardening is tracked in issue #179.
+/// Permit a pane to stop itself or descendants through its channel; shared-channel requests are refused. Same-UID peers can forge channel writes until peer authentication exists (#179, #435).
 pub(super) fn kill_allowed(
     requester: Option<&str>,
     target: &str,
@@ -2352,29 +1484,9 @@ pub(super) fn drain_one_channel(
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
     for (stem, req) in batch {
-        // 2026-09-06: every request in this loop came off the file-backed
-        // drop directory, so its widening fields are stripped before
-        // anything below reads them -- see `sanitize_file_dropped_request`.
+        // Strip widening fields from every file-dropped request before using them.
         let req = sanitize_file_dropped_request(req);
-        // Issue #403: the one request kind on this channel that is not a
-        // spawn. It names a pane this dashboard already owns, so none of the
-        // spawn gates below have anything to say about it, and it is answered
-        // with the same ack shape before any of them run.
-        //
-        // SECURITY (issue #435 item 1, superseding review round 2's original
-        // rule): honoured ONLY on the REQUESTER'S OWN pane channel
-        // (`requester` identifies that pane as the honest requester --
-        // see `kill_allowed`'s own doc comment for the issue #179 caveat: a
-        // same-uid sibling can still forge a request into it), naming that
-        // pane itself or a pane spawned through it, directly or
-        // transitively (`kill_allowed`, which follows the `requested_by`
-        // chain `kept_requests` keeps for every spawn). The dashboard's own
-        // SHARED channel identifies no requester at all -- it is a fixed
-        // sibling of every pane's own intake directory, so any pane's child
-        // tree can derive its path too -- and is refused outright,
-        // regardless of target. Without this gate `stop_owned_pane` matches
-        // on the short id alone and would not notice a pane killing one it
-        // does not own.
+        // Handle kill separately from spawn because it targets an existing pane (#403).
         if let Some(target) = req.kill.clone() {
             let stopped = match kill_allowed(requester, &target, kept_requests) {
                 // The requester's fallback is signalling the pid itself,
@@ -2387,28 +1499,9 @@ pub(super) fn drain_one_channel(
                 // and none will be, so the claim no longer stands for
                 // anything a requester that timed out could read.
                 spawnreq::remove_claim(dir, &stem);
-                // SECURITY (issue #435 item 1): `kill_allowed` refuses every
-                // shared-channel kill unconditionally, and no supported
-                // client writes one there any more (`zirv ctx kill` uses its
-                // own pane channel now -- see `sessions::kill_via_
-                // dashboard`), so nothing on the shared channel ever polls
-                // for this ack. Writing one anyway would just leave an
-                // `ack-req-<uuid>.json` neither `spawnreq::take_requests`
-                // nor `wait_for_ack` ever sweeps back up. The refusal is
-                // still surfaced -- into the dashboard's own error log
-                // rather than a file nobody reads.
+                // Log shared-channel kill refusal locally because no supported requester waits for its ack (#435).
                 if requester.is_none() {
-                    // Review round 2: the pushed message must not vary with
-                    // `target` -- a same-uid process can name a different
-                    // (even nonexistent) short id on every forged kill, and
-                    // `ErrorLog::record`'s own adjacent-message dedup only
-                    // collapses BYTE-IDENTICAL text, so a varying target
-                    // would let repeated forged kills evict every real error
-                    // out of the ring (`MAX_KEPT_ERRORS` slots) indefinitely.
-                    // `reason` alone is already constant here (`kill_
-                    // allowed` returns the same `&'static str` for every
-                    // shared-channel kill), so repeats collapse onto one
-                    // slot for free.
+                    // Keep shared-channel kill refusal text constant so forged requests collapse in the bounded error log.
                     push_error(errors, format!("kill refused: {reason}"));
                     continue;
                 }
@@ -2459,15 +1552,9 @@ pub(super) fn drain_one_channel(
             errors,
         ) {
             Ok((short, capability_warnings, advisory)) => {
-                // Issue #354 phase 3: the request that actually produced this
-                // pane, kept verbatim so `restore`/`retry` can replay THIS --
-                // never a reconstructed argv. It is moved onto the pane's
-                // retained ended row when the pane is reaped, and dropped
-                // with that row.
+                // Retain the exact request that spawned a pane for restore and retry (#354).
                 kept_requests.insert(short.clone(), (req.clone(), requester.map(str::to_string)));
-                // Issue #399: same posture as every other spawn confirmation
-                // on this path -- informational, so it goes through the
-                // transient notice channel, never the sticky error log.
+                // Report successful spawn through a transient notice, not the sticky error channel (#399).
                 if let Some(text) = advisory {
                     push_notice(notices, Instant::now(), text);
                 }
@@ -2481,13 +1568,7 @@ pub(super) fn drain_one_channel(
                 }
             }
             Err(refusal) => {
-                // R6: a refusal means no pane exists and none ever will, so
-                // the claim no longer stands for anything. Left in place, a
-                // requester whose ack timed out reads it as "the dashboard has
-                // this" and reports success for a spawn that never happened.
-                // Withdrawn only on an outright failure: when the spawn
-                // succeeded and only `write_ack` below failed, a pane really
-                // is running and the claim is exactly right.
+                // Withdraw a claim on refusal so a timed-out requester cannot mistake it for a running pane; keep claims after ack-write failure.
                 spawnreq::remove_claim(dir, &stem);
                 spawnreq::SpawnAck {
                     ok: false,
@@ -2504,13 +1585,6 @@ pub(super) fn drain_one_channel(
         }
     }
 }
-
-// Task 8: mail + memory overlays, driven by the same pure-reducer pattern
-// `filter_key`/`encode_key` already established -- typing and navigation are
-// pure functions from `(view, key)` to `(next view or close, effect)`; only
-// the effect (a mail send/consume, a memory remember/forget/verify) touches
-// disk, and only from `run_dashboard`'s own loop, through the exact same
-// library functions the CLI verbs call.
 
 #[cfg(test)]
 mod tests {

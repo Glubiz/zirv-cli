@@ -7,8 +7,7 @@ pub(super) struct PaneRowMeta {
     /// `PromptRole::label`'s own spelling; `display_role` shortens it for the
     /// row's 8-column role field.
     pub(super) role: String,
-    /// Issue #354: `Pane::launch_model` -- what the child was actually
-    /// launched with, `None` when the argv pinned nothing.
+    /// Show the model actually pinned in the pane's launch argv, if any (#354).
     pub(super) model: Option<String>,
     /// `Pane::work_group_id`, the only source of group membership.
     pub(super) group_id: Option<String>,
@@ -23,19 +22,13 @@ pub(super) struct PaneRowMeta {
     pub(super) short: String,
     pub(super) harness: String,
     pub(super) state: ui::RowState,
-    /// Issue #209/v3 codex review finding 5: `Pane::reachable()`, threaded
-    /// through so the footer's supervision segment can render the truth
-    /// instead of an assumed `supervised`.
+    /// Use the pane's actual reachability when rendering supervision status (#209).
     pub(super) supervised: bool,
-    /// Issue #354 phase 2: `Some` for a **retained ended row** -- a completed
-    /// pane whose `Pane` `reap_ended_panes` has already dropped but whose row
-    /// the roster keeps. `None` for every live pane.
+    /// Retained ended rows have no live Pane; their facts are frozen at reap (#354).
     pub(super) ended: Option<EndedMeta>,
 }
 
-/// Issue #354 phase 2: what a retained ended row knows that a live pane's row
-/// does not. Frozen at the moment of the reap: the session's registry record
-/// is released there, so nothing can be re-derived from it afterwards.
+/// Freeze retained-row facts before the pane's registry record is released (#354).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct EndedMeta {
     /// The child's own exit code. A nonzero one is `✗`; a clean one is `◆`
@@ -50,14 +43,7 @@ pub(super) struct EndedMeta {
     pub(super) age_secs: Option<u64>,
 }
 
-/// Issue #354 phase 2: one completed pane's retained sidebar row.
-///
-/// A reaped pane used to vanish from the roster in the same tick its child
-/// exited, which is exactly when an operator wants to see what happened to it.
-/// The row survives the `Pane` -- glyph from the exit code, age frozen, role
-/// and model retained -- until the cap below drops it or the dashboard exits.
-/// It is deliberately *not* attached: it is selectable (so its disclosure can
-/// be read) and never focusable, since there is no child left to type into.
+/// Retain completed panes in the sidebar so their outcome and unread output remain visible (#354).
 #[derive(Debug, Clone)]
 pub(super) struct EndedRow {
     pub(super) short: String,
@@ -66,21 +52,14 @@ pub(super) struct EndedRow {
     pub(super) harness: String,
     pub(super) group_id: Option<String>,
     pub(super) parent: Option<String>,
-    /// The pane's last `budget`/`writer` disclosure values, captured before it
-    /// was dropped rather than re-derived from a `Pane` that no longer exists.
+    /// Capture budget and writer status before the live pane is dropped.
     pub(super) budget: String,
     pub(super) writer: String,
     /// The checkout the pane ran in, captured for the same reason -- the
     /// inspector's `cwd` line and the menu's `open worktree` entry both read
     /// it, and there is no `Pane` left to ask.
     pub(super) cwd: String,
-    /// Issue #354 phase 3: the very `spawnreq::SpawnRequest` that created
-    /// this pane, kept so `restore`/`retry` can relaunch it VERBATIM through
-    /// the existing `fulfill_spawn_request` machinery -- never a
-    /// reconstructed argv (`Command Safety`). `None` for a pane this
-    /// dashboard did not spawn from a request (the orchestrator itself, and
-    /// a startup-restored pane), which is exactly what disables the two
-    /// entries with `no spawn request kept`.
+    /// Keep the original spawn request for restore and retry through the normal spawn gate (#354).
     pub(super) request: Option<spawnreq::SpawnRequest>,
     /// Who asked for that request, so a relaunch is attributed to the same
     /// lineage the original spawn was rather than to the dashboard itself.
@@ -96,12 +75,7 @@ pub(super) struct EndedRow {
 /// recent history on the smallest dashboard-eligible terminal.
 pub(super) const MAX_RETAINED_ENDED_ROWS: usize = 8;
 
-/// Pure: the `budget` disclosure text for a pane -- `used / ceiling`, with
-/// the shared placeholder for whichever half nothing has measured.
-///
-/// Review of 5c1b6c3, finding 2: shared by [`build_pane_rows`] (a live pane)
-/// and [`reap_ended_panes`] (the retained row frozen at the reap), so the two
-/// can never disagree about what a pane's budget line says.
+/// Use the same budget disclosure for live and retained rows.
 pub(super) fn budget_text(used: Option<u64>, ceiling: Option<u64>) -> String {
     format!(
         "{} / {}",
@@ -128,30 +102,7 @@ pub(super) fn writer_text(holds_permit: bool, cwd: &Path) -> String {
     )
 }
 
-/// Pure: the attention observations a reap owes the session it is retiring,
-/// in the order they must be recorded.
-///
-/// Review of 5c1b6c3, finding 1: a CLEAN exit gets a `Settled` observation
-/// FIRST whenever nothing had already settled the session, because
-/// `attention::compose` latches `Visibility::Unseen` only on a genuine
-/// `Working -> Settled` transition -- and a worker with no Stop hook that
-/// works right up to a fast, clean exit never spends a tick `Settled` for the
-/// quiet heuristic to observe (`PaneState` reports `Ended` the instant
-/// `child_exit` is set, so the idle debounce never elapses). Without it the
-/// retained row rendered `●` immediately and the operator was never told the
-/// worker had finished. A nonzero exit is `✗` regardless of visibility, so it
-/// gets the exit observation alone.
-///
-/// Review round 2, finding 2: the exit observation also asserts
-/// `Attention::None`, which is what actually CLEARS a latch on the attention
-/// axis. Every other variant of `Attention` is a latch that survives until
-/// something positively says otherwise (`attention::compose` clears only
-/// `Compacting`, and only implicitly), so a pane that `report_stalled_
-/// compaction` latched `Stalled` and that then exited kept projecting
-/// `Blocked(Stalled)` forever -- `zirv ctx status` never showed the exit, and
-/// `zirv ctx wait` resolved for no target at all. A process that is gone is
-/// blocked on nothing, whatever it was blocked on while it lived, so exit is
-/// exactly the authority that may say so.
+/// Record Settled before an exit observation so clean completion remains visible in attention.
 pub(super) fn reap_observations(
     prior: super::attention::Lifecycle,
     code: i32,
@@ -241,15 +192,7 @@ pub(super) fn assemble_sidebar(
         .collect();
     let age_of = |short: &str| started_at.get(short).map(|at| now_secs.saturating_sub(*at));
 
-    // Issue #354 phase 2: the retained ended rows sit at the very END of the
-    // roster -- after the view-only registry rows, not immediately after the
-    // live panes. That keeps `reap_fixup`'s index arithmetic exactly right:
-    // reaping still removes one row from the middle and shifts everything
-    // after it down by one, and the row retained in its place is appended
-    // where no existing selection points. A retained row that still carries a
-    // work group is drawn under that group's header regardless
-    // (`ui::roster_frame` gathers a group's members from the whole row list),
-    // so only an ungrouped one actually sits at the bottom.
+    // Append retained rows after live and view-only rows to keep index fixups stable (#354).
     let (live_panes, ended_panes): (Vec<&PaneRowMeta>, Vec<&PaneRowMeta>) =
         panes.iter().partition(|p| p.ended.is_none());
     let row_of = |p: &PaneRowMeta| ui::SidebarRow {
@@ -269,10 +212,7 @@ pub(super) fn assemble_sidebar(
         disclosure: Vec::new(),
         short: p.short.clone(),
         harness: p.harness.clone(),
-        // Issue #354 phase 2: a retained ended row's age is frozen at the
-        // instant it exited. Its registry record was released by the same
-        // reap that retained it, so `age_of` would report the placeholder
-        // here anyway -- but frozen is the honest answer either way.
+        // Freeze retained-row age at exit because the released registry record cannot supply it later (#354).
         age_secs: match &p.ended {
             Some(ended) => ended.age_secs,
             None => age_of(&p.short),
@@ -287,19 +227,12 @@ pub(super) fn assemble_sidebar(
         selected: false,
         focused: false,
         supervised: p.supervised,
-        // Phase 1 placeholders; `enrich_sidebar` refines `fact_state`/
-        // `fact_since_secs` from the cached attention status and fills
-        // `workflow`/`unread_mail` from this same throttled tick's disk
-        // reads. A retained ended row's own fact is final already -- frozen
-        // at the reap, the same way its `since` disclosure line is.
+        // Initialize sidebar facts from placeholders until the throttled cache enriches them.
         fact_state: row_state_label(p.state).to_string(),
         fact_since_secs: p.ended.map(|e| now_secs.saturating_sub(e.exited_at)),
         workflow: None,
         unread_mail: 0,
-        // Dash refresh PR2 placeholders, same convention as `workflow`/
-        // `unread_mail` above: `enrich_sidebar` fills these from this same
-        // throttled tick's seat/rollover-runtime reads and the flash
-        // tracker.
+        // Enrich placeholders from the throttled seat and flash facts.
         rollover_badge: None,
         flash: None,
     };
@@ -356,21 +289,10 @@ pub(super) fn assemble_sidebar(
 
     if let Some(row) = rows.get_mut(selected) {
         row.selected = true;
-        // Issue #354: the selected row's disclosure, in the spec's own key
-        // order. Every value comes from something already in hand -- the
-        // pane's own fields, the registry record, or a placeholder that
-        // `enrich_sidebar` fills in from the throttled facts cache a moment
-        // later. Nothing here reads the disk and nothing shells out: `branch`
-        // in particular stays the placeholder rather than running git, which
-        // would put a subprocess on the render path.
+        // Build selected-row disclosure from facts already in memory, never disk reads in render (#354).
         let pane = panes.iter().find(|p| p.short == row.short);
         let state = row_state_label(row.state);
-        // Dash refresh PR1: the fact block's own line 1 -- phase 1's plain
-        // `RowState` word and elapsed time, the same facts the old `reason`/
-        // `since` disclosure lines led with before `enrich_sidebar` composes
-        // a richer word from the cached attention status a moment later. A
-        // retained ended row's fact is already final: frozen at the reap,
-        // exactly like its old `since` disclosure line was.
+        // Lead the fact block with the row state and elapsed time.
         match pane.and_then(|p| p.ended) {
             Some(ended) => {
                 row.fact_state = "ended".to_string();
@@ -407,11 +329,7 @@ pub(super) fn assemble_sidebar(
             ),
             (
                 "since".into(),
-                // Issue #354 phase 2: a retained ended row says how long ago
-                // it exited and with what -- the two facts that are actually
-                // still true about it. A live row keeps the placeholder
-                // `enrich_sidebar` fills in from the cached attention status
-                // (or, with none, from `DiskFacts::state_since`).
+                // Show exit age and status for retained rows; live rows use refreshed facts (#354).
                 match pane.and_then(|p| p.ended) {
                     Some(ended) => format!(
                         "exited {} \u{b7} exit {}",
@@ -467,10 +385,7 @@ pub(super) fn shorten_home(cwd: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Pure: the word a disclosure line uses for a row's state when the composed
-/// attention model has nothing to say about it. Phase 2's [`lifecycle_word`]
-/// is the richer answer whenever a `SessionStatus` exists; this stays the
-/// fallback for a row that has never been observed by an issue #349 writer.
+/// Use lifecycle state only when composed attention has no stronger state.
 pub(super) fn row_state_label(state: ui::RowState) -> &'static str {
     match state {
         ui::RowState::Working => "working",
@@ -522,26 +437,7 @@ pub(super) fn spaced_lowercase(camel: &str) -> String {
     out
 }
 
-/// Dash refresh PR1: resolves ONE session's own bound workflow (`workflow_
-/// id`) into the fact the sidebar/pane-header renders, replacing the old
-/// repo-wide `active_workflow_summary` pointer every pane used to share.
-///
-/// Three outcomes, matching the bug this replaces (`WorkflowState::current()`
-/// returns `None` once `current_step` is out of range -- previously papered
-/// over as an empty step string):
-/// - `Completed`: the fact reads `done` for 10 minutes after the run's own
-///   state file was last written (`engine::state_mtime_secs`), then `None`.
-///   Round 2 coordinator review, CONFIRMED: a state file this build could
-///   not stat (`state_mtime_secs` returns `None`) is treated as NOT fresh
-///   -- `None` right away -- never as "just written" (an `unwrap_or(now)`
-///   would make `now.saturating_sub(now) == 0`, always inside the 10-minute
-///   window, so a completed workflow's own "done" could never expire).
-/// - Any other status with a valid current step (`WorkflowState::current()`
-///   is `Some`): the step, its 1-based position, and whether the run is
-///   `AwaitingApproval`.
-/// - Anything else -- `current_step` out of range for a non-`Completed`
-///   status, or the run could not be loaded at all (purged, malformed,
-///   unknown id) -- `None`. Never a guessed or empty step.
+/// Resolve the workflow bound to this session rather than a repo-wide active pointer.
 pub(super) fn resolve_session_workflow(
     state: &StateDir,
     repo: &Path,
@@ -575,16 +471,7 @@ pub(super) fn resolve_session_workflow(
     })
 }
 
-/// Pure: whether a `Completed` run's own "done" fact is still fresh, given
-/// its state file's own last-write time (`engine::state_mtime_secs`) and
-/// `now`.
-///
-/// Round 2 coordinator review, CONFIRMED: `None` (no state file, or one
-/// this build could not stat) must NEVER be fresh. The bug this replaces
-/// was `mtime.unwrap_or(now)`, which made `now.saturating_sub(now) == 0` --
-/// always inside the 10-minute window -- so a completed workflow whose
-/// state file had since been purged, or was simply unreadable, showed
-/// "done" forever instead of fading like every other completed run.
+/// A completed workflow with no readable state-file mtime is not fresh; otherwise its done badge could persist indefinitely.
 pub(super) fn completed_workflow_is_fresh(mtime: Option<u64>, now: u64) -> bool {
     match mtime {
         Some(mtime) => now.saturating_sub(mtime) <= 600,
@@ -620,11 +507,7 @@ pub(super) fn apply_navigation(
     total_rows: usize,
 ) -> (usize, usize) {
     match action {
-        // N2: a digit beyond the pane count is a no-op, not a jump to the
-        // last pane. `Ctrl+A 7` on a two-pane dashboard is a mistyped `1`
-        // far more often than it is a request for "whatever is last", and
-        // silently retargeting it moved the keyboard out from under the
-        // operator.
+        // An out-of-range pane digit is a no-op, never an implicit jump to the last pane.
         DashAction::Switch(i) => {
             if i >= pane_count {
                 (selected, focused)
@@ -693,42 +576,13 @@ pub(super) fn assemble_header_facts(
         error_count,
         latest_error,
         notice,
-        // Issue #354 phase 4: set by the event loop right after this, the
-        // same way the hint context is -- it is session state, not a fact
-        // this assembly step has any way to know.
+        // The event loop supplies action availability because it depends on current selection (#354).
         tip: None,
     }
 }
 
-/// Pure: assembles `ui::FooterFacts` (issue #209/v3 §D) for the **focused**
-/// pane (Q1) from already-computed ingredients, the same separation-of-
-/// concerns `assemble_header_facts` keeps: the impure disk reads happen in
-/// `FactsCache::refresh_if_due`, this only shapes what they already found.
-///
-/// `focused_row` is the sidebar row already marked `focused` in this tick's
-/// `assemble_sidebar` output, reused rather than re-derived: it already
-/// carries the harness, cached score, age and dead/alive state the footer
-/// needs, and reusing it means the sidebar and the footer can never disagree
-/// about which pane is focused or what its own facts are.
-///
-/// `None` means there is no attached pane at all right now -- an empty
-/// dashboard, or (codex review finding 1) the tick right after the last one
-/// exited: `reap_ended_panes` removes an `Ended` pane from `panes` in the
-/// same tick it detects the exit, so `focused_row` can never actually carry
-/// `RowState::Dead` in the live loop the way the sidebar's own glyph styling
-/// still accounts for. `last_exited` (`(harness, age since it exited)`,
-/// from `reap_ended_panes`'s own `LastExited`, only ever set when that
-/// reap left `panes` empty) is what makes the dead-pane footer variant
-/// reachable for exactly that case; with nothing focused and no exit to
-/// report either, this is `ui::FooterFacts::None` and nothing draws.
-///
-/// `mail` (codex review finding 2) is the FOCUSED pane's own unread count
-/// (`FactsCache::disk.mail_by_session`, looked up by its short id) -- never
-/// the dashboard's own fixed launch identity's, which answers a different
-/// question (see `MailMap`'s own doc comment).
-/// Dash refresh PR2: `cfg.dash.motion` (`config::DashMotion`) as `ui::
-/// Motion` -- `dash::ui` takes no config dependency of its own (see that
-/// module's own doc comment), so this thin mapping is where the two meet.
+/// Assemble the focused pane's footer only from cached facts; disk reads must
+/// stay on the throttled facts path, outside rendering (#209).
 pub(super) fn dash_motion_of(cfg: &CtxConfig) -> ui::Motion {
     match cfg.dash.motion {
         super::config::DashMotion::Full => ui::Motion::Full,
@@ -736,13 +590,7 @@ pub(super) fn dash_motion_of(cfg: &CtxConfig) -> ui::Motion {
     }
 }
 
-/// Review fix: `cached`'s own `pct`, but ONLY when it names the exact seat
-/// (`short` + `generation`) `current` reads as live right now -- a pane's
-/// registry short id survives a handover unchanged (`Pane::handover` never
-/// re-registers), so `short` alone cannot tell an old seat from the new one
-/// a rollover just put in its place; only `generation` advances. Pulled out
-/// of the render loop as its own pure function so the identity check has a
-/// test independent of the whole loop.
+/// Show cached headroom only for the same seat short ID and generation.
 pub(super) fn seat_headroom_for_current(
     cached: Option<&SeatHeadroom>,
     current: Option<&seat::Seat>,
@@ -752,14 +600,7 @@ pub(super) fn seat_headroom_for_current(
     (current.short == cached.short && current.generation == cached.generation).then_some(cached.pct)
 }
 
-/// Review fix: which of `after`'s own sessions should flash for newly
-/// arrived mail -- `None` (never flashes anything) on the first observation
-/// (`seen_before: false`), since `before` is then `FactsCache`'s still-empty
-/// starting map and every already-unread row would otherwise read as "just
-/// arrived" (the same false-transition mistake the DoneUnread path avoids
-/// for free, since ITS OWN `previous: Option<Projection>` genuinely means
-/// "never sampled" when absent -- a plain `MailMap` has no such marker, so
-/// this flag stands in for one).
+/// Do not flash mail on the first observation; only newly arrived mail earns a flash.
 pub(super) fn mail_flash_targets(
     before: &MailMap,
     after: &MailMap,
@@ -778,12 +619,7 @@ pub(super) fn mail_flash_targets(
         .collect()
 }
 
-/// Review fix: the "rolled over" toast text, if this observation earns one
-/// -- `None` on the first observation (`seen_before: false`) even when
-/// `current` is already `Committed`, since that settlement may predate this
-/// dashboard process entirely (a prior session's rollover); the toast is
-/// for a commit that happens WHILE this dashboard is watching, never one it
-/// merely discovers on its first read.
+/// Do not announce a rollover already committed before the first observation.
 pub(super) fn rollover_committed_toast(
     current: &Option<super::rollover::runtime::Settlement>,
     previous: &Option<super::rollover::runtime::Settlement>,
@@ -802,21 +638,7 @@ pub(super) fn rollover_committed_toast(
     ))
 }
 
-/// Dash refresh PR2: the JEV sidebar section's facts, off `jev::
-/// usage_rollup`'s own 24h-windowed read (`JEV_SECTION_WINDOW_SECS`) --
-/// `None` with every `[jev]` gate off, which is what hides the section
-/// entirely. Gates enabled but no credential is the one-line `NoKey` state;
-/// otherwise the top 3 sites by calls, bars relative to the busiest.
-///
-/// Session-scoped total follow-up: `jev-decisions.jsonl`/`jev-effects.jsonl`
-/// are a SINGLE machine-wide file, written by every zirv process on the
-/// machine across every repo -- without `sessions`, this used to fold every
-/// OTHER session's rows in too, which is why the section could look like it
-/// was not moving even though the calling session's own calls were landing:
-/// a handful of new rows barely shift a total already carrying a whole
-/// machine's unrelated history. `sessions` is `jev_session_snapshot`'s own
-/// result -- every pane this dashboard has ever hosted, this run -- so the
-/// section now reads as this session's own total.
+/// Read JEV's 24-hour usage rollup only when its section is enabled.
 pub(super) fn jev_section_fact(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -894,34 +716,7 @@ pub(super) fn jev_section_fact(
     })
 }
 
-/// Session-scoped total, review round: folds this tick's live pane session
-/// ids into `sessions` (the dashboard's own grow-only running set -- see its
-/// own doc comment where it is declared) and hands back a snapshot for
-/// `jev::usage_rollup`'s own filter. Read once per JEV refresh
-/// (`JEV_THROTTLE`, 10s) -- never per frame -- alongside `jev_section_
-/// fact`'s own read.
-///
-/// A prior shape of this closed the set over `log::read_delegations`' own
-/// parent chain (a `zirv agent` worker spawned by a worker, and so on) --
-/// review round found that this could never actually grow the set past a
-/// dashboard's own panes: a pane's `session_id()` is the FULL id
-/// `jev::session_and_principal` reads back off `ZIRV_CTX_SESSION`
-/// (confirmed identical for both adapters -- `claude.rs`'s own `register_
-/// turn_signal` sets it from `session.id.to_string()`, and `build_turn_env`'s
-/// own signal-less fallback pushes the same `session_id` string verbatim),
-/// while `DelegationRow::parent_session` is stamped from `mail::
-/// session_identity` (`sessions::short_id`, an 8-character prefix) -- so the
-/// two could never match, and every worker this dashboard itself spawns is
-/// already one of its own panes regardless, which is exactly what makes the
-/// simpler grow-only set below sufficient on its own. Reading the
-/// never-rotated delegation ledger in full every 10s was also needless
-/// cost this removes.
-///
-/// A reaped/ended pane's session id, once added, is never removed -- its
-/// own JEV rows keep counting toward the total after it finishes. What is
-/// NOT covered: a quit/restore round trip starts a fresh, empty set (a
-/// prior launch's session is not carried forward), and a headless worker
-/// that never became a pane of THIS dashboard is never added at all.
+/// Fold each live pane's session ID into the session-scoped total without duplicating registry rows.
 pub(super) fn jev_session_snapshot(
     sessions: &mut BTreeSet<String>,
     panes: &[Pane],
@@ -989,14 +784,7 @@ pub(super) fn eased_jev_fact(
     fact
 }
 
-/// Review fix: `rollover_sweep`'s own captured headroom, tagged with the
-/// seat it was computed for -- `short` alone is not enough, since a pane's
-/// registry short id survives a handover unchanged (`Pane::handover` never
-/// re-registers); only `generation` actually advances when the seat swaps.
-/// The render loop compares this against `DiskFacts::seat_full`'s own
-/// current `(short, generation)` before ever handing the `pct` to
-/// [`rollover_state`], so a reading computed for the seat BEFORE a rollover
-/// never gets shown against the seat AFTER one.
+/// Match cached headroom by short ID and generation because handover preserves the short ID.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SeatHeadroom {
     pub(super) short: String,
@@ -1004,24 +792,8 @@ pub(super) struct SeatHeadroom {
     pub(super) pct: f64,
 }
 
-/// Dash refresh PR2: this dashboard's own orchestrator seat's rollover
-/// state, from the same two small JSON files (`seat`/`record`) read on the
-/// facts-refresh cadence -- shared by the footer's `RolloverFooterFact` and
-/// the sidebar's `RolloverBadge` (see [`rollover_footer_fact_of`]/
-/// [`rollover_badge_of`]). `None` (nothing shown anywhere) when cross-
-/// harness fallback or automatic orchestrator rollover is off, or this
-/// dashboard has no seat at all yet.
-///
-/// Priority, most urgent first: a `Parked` settlement/phase (nothing could
-/// take the seat) outranks a merely-`Pending` one (a candidate is already
-/// lined up), which outranks the plain distance/soon reading -- and THAT
-/// reading is `seat_headroom_pct`, exactly the `source_headroom_pct`
-/// `rollover::evaluate` itself last computed for this seat (`rollover_
-/// sweep`'s own out-parameter capture), never a separately estimated
-/// value. Coordinator follow-up: the operator does not want the dashboard
-/// guessing at a number the real trigger does not use -- with no
-/// evaluation having produced one yet (`None`), the distance/soon segment
-/// is hidden entirely rather than approximated.
+/// Read cached seat state for both sidebar and footer; Parked outranks Pending.
+/// Show distance only from the trigger's evaluated headroom, never an estimate.
 pub(super) fn rollover_state(
     cfg: &CtxConfig,
     seat: Option<&seat::Seat>,
@@ -1107,26 +879,15 @@ pub(super) fn rollover_badge_of(state: &RolloverState) -> Option<ui::RolloverBad
 pub(super) fn assemble_footer_facts(
     focused_row: Option<&ui::SidebarRow>,
     mail: Option<(usize, usize)>,
-    // Dash refresh PR1: only the DEAD-pane variant still carries a workflow
-    // segment (the alive footer's own workflow segment moved to the pane
-    // header, which has nowhere to draw for a pane that no longer exists).
+    // Retained dead panes need the workflow footer because they have no pane header.
     workflow: Option<&workflow::ActiveWorkflowSummary>,
     last_exited: Option<(&str, Option<u64>)>,
-    // Issue #310: whether the focused pane's stall latch is currently armed
-    // (`DiskFacts::stalled`, looked up by the caller the same way `mail`
-    // above is) -- see `FooterAliveFacts::stalled`'s own doc comment for how
-    // this overrides the supervision segment.
+    // Show the focused pane's armed stall latch from cached disk facts (#310).
     stalled: bool,
-    // Dash refresh PR2: the rot track's own eased fill value, kept across
-    // frames by the caller (`ease_toward`) -- `None` in lockstep with
-    // `focused_row`'s own score (there is nothing to ease toward without a
-    // cached score).
+    // Ease rot fill across frames; absent whenever the focused row has no score.
     eased_score: Option<f64>,
-    // Dash refresh PR2: the orchestrator seat's own rollover facts, built by
-    // the caller from the same seat/rollover-runtime reads the sidebar
-    // badge uses -- `None` unless the focused pane IS the orchestrator seat
-    // and rollover has something to say (see `RolloverFooterFact`'s own doc
-    // comment for every hidden case).
+    // Footer rollover shares cached seat facts with the sidebar and appears
+    // only while the orchestrator seat is focused.
     rollover: Option<ui::RolloverFooterFact>,
 ) -> ui::FooterFacts {
     let footer_workflow = match workflow {
@@ -1168,10 +929,7 @@ pub(super) fn assemble_footer_facts(
         score: row.score,
         eased_score,
         unread_mail,
-        // Issue #209/v3 codex review finding 5: `Pane::reachable()`, via
-        // `SidebarRow::supervised` -- a pane whose turn-signal socket
-        // failed to bind at spawn runs genuinely unsupervised, and the
-        // footer now says so instead of assuming every alive pane is fine.
+        // Render unsupervised when the pane's turn-signal socket did not bind (#209).
         supervised: row.supervised,
         stalled,
         rollover,
@@ -1184,17 +942,7 @@ pub(super) fn assemble_footer_facts(
 /// `rot --`. Nothing here ever stores a placeholder zero.
 pub(super) type ScoreMap = HashMap<String, u32>;
 
-/// `mail::unread_counts`'s own `(broadcast, direct)`, keyed by session short
-/// id -- issue #209/v3 codex review finding 2. `mail::unread_counts`'s
-/// `direct` count is relative to a *particular session's own identity*
-/// (`msg.to_session == session_short`), not the repo as a whole, so a single
-/// `Option<(usize, usize)>` scoped to the dashboard's own launch identity
-/// (`DiskFacts`'s old `mail` field, kept for whatever else eventually reads
-/// it) cannot answer "how much mail is addressed to the *focused* pane" --
-/// it can only ever answer that for the dashboard's own fixed identity.
-/// Populated exactly like `ScoreMap`: every attached pane, by its own
-/// `agent()`/`short()`, plus every live registry row this dashboard owns.
-/// An absent key means mail is disabled, never a fabricated `(0, 0)`.
+/// Read unread mail per session short ID; direct counts depend on the recipient.
 pub(super) type MailMap = HashMap<String, (usize, usize)>;
 
 /// How often the header's own disk-backed facts (rot scores, mail,
@@ -1204,32 +952,18 @@ pub(super) type MailMap = HashMap<String, (usize, usize)>;
 /// but nothing here needs a disk hit that often.
 pub(super) const FACTS_THROTTLE: Duration = Duration::from_secs(1);
 
-/// Dash refresh PR2: the JEV sidebar section's own cadence -- coarser than
-/// [`FACTS_THROTTLE`] because the section rolls up a 24h window; nothing
-/// about it needs second-level freshness.
+/// A 24h JEV rollup needs a slower cadence than [`FACTS_THROTTLE`].
 pub(super) const JEV_THROTTLE: Duration = Duration::from_secs(10);
 
-/// Dash refresh PR2: how far back the JEV sidebar section's own
-/// `jev::usage_rollup` looks -- 24h (mock §03's own words), narrower than
-/// `zirv ctx jev status`'s 7-day window.
+/// Keep sidebar JEV usage to 24h; the CLI status window is seven days.
 pub(super) const JEV_SECTION_WINDOW_SECS: u64 = 24 * 60 * 60;
 
-/// Pure: whether an action last performed at `last` is due again as of `now`,
-/// given how often it may run (`interval`). Shared by the header facts refresh
-/// pattern (`FactsCache::refresh_if_due`) and the mail sweep throttle (H3):
-/// both are disk-backed housekeeping that must not run on the render loop's
-/// own 50ms cadence.
+/// Throttle disk-backed housekeeping outside the render cadence.
 pub(super) fn due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.duration_since(last) >= interval
 }
 
-/// Issue #780: [`due`], but also advances `*last` to `now` whenever the
-/// cadence comes due -- regardless of what the caller does next. Used where a
-/// cheap cadence check gates a second, expensive check (e.g. `auto_rollover.
-/// is_enabled()`'s two `stat`s): without advancing `*last` unconditionally, a
-/// negative outcome of that second check (the switch found disabled) would
-/// leave `*last` stale forever, so `due` alone would keep reporting "due" on
-/// every subsequent tick and the expensive check would run every tick again.
+/// Advance the cadence even when a gated follow-up check is negative, or that check repeats every tick (#780).
 pub(super) fn due_advancing(last: &mut Instant, now: Instant, interval: Duration) -> bool {
     let is_due = due(*last, now, interval);
     if is_due {
@@ -1247,24 +981,12 @@ pub(super) fn due_advancing(last: &mut Instant, now: Instant, interval: Duration
 /// requester is already waiting on.
 pub(super) const SPAWN_REQUEST_POLL: Duration = Duration::from_millis(250);
 
-/// Pure: whether this tick reads the spawn-request channels.
-///
-/// L17: forced when there are no panes left, whatever the throttle says. The
-/// empty-exit decision runs immediately after the intake, and a request that
-/// arrives on the very tick the last pane ends must still be seen -- otherwise
-/// the dashboard exits first and the requester burns its ack timeout against a
-/// channel nobody will ever poll again.
+/// Force intake when no panes remain so a request arriving on the last pane's exit tick is seen before dashboard quit.
 pub(super) fn spawn_intake_due(last: Instant, now: Instant, panes_empty: bool) -> bool {
     panes_empty || due(last, now, SPAWN_REQUEST_POLL)
 }
 
-/// Pure: the order one tick drains its panes in -- the focused pane first,
-/// then every other pane round-robin from `start`.
-///
-/// Issue #330: the focused pane is the one the operator is looking at and
-/// typing into, so it gets first call on the tick's parsing budget; `start`
-/// rotates each tick so that whichever unfocused pane gets what is left over
-/// changes, and none of them starves behind a noisier neighbour.
+/// Drain the focused pane first, then rotate unfocused panes to prevent starvation (#330).
 pub(super) fn drain_order(count: usize, focused: usize, start: usize) -> Vec<usize> {
     if count == 0 {
         return Vec::new();
@@ -1286,28 +1008,7 @@ pub(super) fn drain_order(count: usize, focused: usize, start: usize) -> Vec<usi
     order
 }
 
-/// Spends one tick's shared vt100 budget ([`pane::DRAIN_BUDGET_BYTES`]) over
-/// `count` panes in [`drain_order`], returning the indices that actually
-/// produced output.
-///
-/// `drain_one(index, share)` returns `(any, used)`. Every pane is visited --
-/// a visit is also how a pane's child exit is noticed and how a signal-less
-/// pane's turn flags retire -- and nothing is ever dropped: what a pane could
-/// not parse this tick stays queued for the next one.
-///
-/// Review finding 1: the focused pane gets first call on the budget, but a
-/// capped one. Uncapped, a focused pane streaming faster than the whole
-/// budget took all of it every tick, and the unfocused panes behind it never
-/// drained at all -- their channels grew without bound and their quiescence
-/// and turn-signal logic, which only ever runs off a drain, never saw
-/// another byte. So every other pane keeps a reserved floor of
-/// `budget / (2 * count)`, which is what the focused pane's share is reduced
-/// by; a share an earlier pane leaves unspent flows to the ones behind it,
-/// and anything still unspent at the end flows back to the focused pane, so a
-/// firehose next to quiet neighbours still gets the whole tick's budget.
-///
-/// `drain_one` is a closure so the sharing itself is testable with plain byte
-/// counters, without a pty child or a terminal.
+/// Reserve a budget floor for unfocused panes so a streaming focused pane cannot starve their output; return unused bytes to focus.
 pub(super) fn drain_shared_budget<F>(
     count: usize,
     focused: usize,

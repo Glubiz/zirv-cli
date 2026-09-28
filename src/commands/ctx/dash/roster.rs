@@ -17,17 +17,8 @@ use super::super::CtxResult;
 use super::super::adapters::AgentAdapter;
 use super::super::state::StateDir;
 
-/// The role label `dash::mod::on_quit` stamps on the orchestrator pane --
-/// `prompt::PromptRole::Orchestrator`'s own `label()`, which is the
-/// vocabulary every `RosterPane::role` is written in (issue #169), so a
-/// coordinator pane records `"sub-orchestrator"` and is restored as one
-/// (`dash::mod::spawn_restored_pane`). A roster entry carrying this role is never offered for
-/// restore -- see this module's own `restore` doc section and `dash::mod`'s
-/// startup filter: the `first` `PaneSpec` a fresh dashboard launch already
-/// builds *is* the orchestrator, so spawning a second one from the roster
-/// would duplicate it. Kept as a plain string (not an enum) because the
-/// roster file is read by a struct with no other typed vocabulary to lean
-/// on, matching `sessions::Record`'s own plain-string `agent` field.
+/// The orchestrator's role label; its roster entry is skipped because a fresh
+/// launch already creates the orchestrator (#169).
 pub const ROLE_ORCHESTRATOR: &str = "orchestrator";
 
 /// One pane's own snapshot at quit time: enough to relaunch it (`agent`,
@@ -40,37 +31,19 @@ pub struct RosterPane {
     pub role: String,
     pub short: String,
     pub title: String,
-    /// F3 (review, PR #116): the report-back address this worker pane was
-    /// spawned with (`Pane::report_to`), persisted so a restored worker
-    /// still gets `report_back_reminder_sweep`'s one-shot reminder --
-    /// `spawn_restored_pane` used to leave a restored pane's `report_to`
-    /// permanently unset (the roster carried no such field at all), which
-    /// silently dropped the reminder for every worker that survived a
-    /// dashboard restart. `#[serde(default)]` so a roster file written by an
-    /// older build, with no such field on disk, still parses: absence reads
-    /// as `None`, the same as a pane that was never given a report-back
-    /// target.
+    /// Persist the report-back address so a restored worker keeps its one-shot
+    /// reminder; absent fields in older rosters read as `None` (#116).
     #[serde(default)]
     pub report_to: Option<String>,
-    /// Whether this pane had already received its one-shot report-back
-    /// reminder (`Pane::report_reminder_sent`) at quit time. A restore
-    /// resurrects the SAME logical session (unlike a handover, which starts
-    /// a fresh one -- see `Pane::handover`'s own F5 doc comment), so a
-    /// worker already reminded before the restart must not be reminded
-    /// again. `#[serde(default)]`, same reasoning as `report_to`.
+    /// Preserve the one-shot reminder state across restoration of the same
+    /// logical session; older rosters default to false (#116).
     #[serde(default)]
     pub report_reminder_sent: bool,
     /// Whether this session already sent its one-shot settled report before quit.
     #[serde(default)]
     pub settled_mail_sent: bool,
-    /// Security review Finding 6 (2026-08-28): the `group::WorkGroup` this
-    /// pane was spawned into, so a restore puts it back inside the same
-    /// group -- `dash::mod::spawn_restored_pane` re-exports it as
-    /// `agent::WORK_GROUP_ENV`, which is what keeps the restored pane's own
-    /// further delegations bound by lineage, and what lets a restored
-    /// coordinator still close the group it claimed. Before this, a restore
-    /// silently dropped the binding along with the role. `#[serde(default)]`,
-    /// same reasoning as `report_to`.
+    /// Restore the work group binding so delegated descendants retain their
+    /// lineage and a coordinator can close its group; older rosters omit it.
     #[serde(default)]
     pub work_group_id: Option<String>,
     /// Per-child token ceiling for this pane. A restore resumes the same
@@ -78,46 +51,16 @@ pub struct RosterPane {
     /// turn bounded work into unbounded work. Older rosters remain unbounded.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
-    /// Issue #160 finding 1, review round (2026-08-28): whether this pane
-    /// carried the durable interactive-launch pin (`adapters::LAUNCH_MODE_
-    /// ENV`/`LaunchMode::Interactive`) at quit time -- `dash::mod::on_quit`
-    /// reads it off `Pane::launch_mode()`. A restore must relaunch a pane
-    /// "on the same terms as a freshly spawned one" (issue #160): a worker
-    /// pane spawned through the untrusted file-dropped request channel is
-    /// ALWAYS launched `Headless` (`FILE_DROP_TRUSTED_INTERACTIVE`), so
-    /// restoring it as `Interactive` regardless would hand it a posture it
-    /// was explicitly refused at spawn time. `#[serde(default)]`, same
-    /// reasoning as `report_to`/`work_group_id` above -- but note the
-    /// direction: a roster entry written by an OLDER build, before this
-    /// field existed, has no way to say what its pane's launch mode
-    /// actually was, so absence must default to the FAIL-CLOSED reading
-    /// (`false`, no pin) rather than the permissive one. That is also
-    /// exactly today's pre-this-round behavior for such an entry, so an
-    /// old roster restores no worse than it already did.
+    /// Restore an interactive pin only when recorded; older rosters default
+    /// to headless so an untrusted file request cannot gain privilege (#160).
     #[serde(default)]
     pub interactive: bool,
-    /// Issue #249/#250 review (Fix 4): this pane's own `Pane::parent_
-    /// session` at quit time -- the same server-verified fact `Pane::spawn`/
-    /// `Pane::handover` establish, never `SpawnRequest::parent_session`.
-    /// Without this, a dashboard quit/restore round-trip silently downgraded
-    /// a genuine worker's steering mail to peer: `spawn_restored_pane` had
-    /// nothing to hand `Pane::set_parent_session`, and `restored_pane_turn_
-    /// env` had nothing to re-export as `PARENT_SESSION_ENV` for the
-    /// restored child's own real process env either. `#[serde(default)]`,
-    /// the same fail-safe reasoning as `work_group_id`: an old-format roster
-    /// entry with no such key on disk restores as `None` (peer trust), not a
-    /// hard parse failure and not a fabricated parent.
+    /// Preserve the server-verified parent session for steering mail; missing
+    /// fields in older rosters mean peer trust (#249, #250).
     #[serde(default)]
     pub parent_session: Option<String>,
-    /// Issue #490 (roadmap N21 item A): whether this pane was a NATIVE one.
-    /// A restore then reopens it through `dash::native_pane::
-    /// open_native_pane`, whose `resolve_attach` decides all over again
-    /// whether the persistent runtime already holds this seat -- so a
-    /// dashboard restarting while the runtime kept the conversation alive
-    /// re-ATTACHES to it rather than opening a second supervisor over it,
-    /// which is exactly what `link::RUNTIME_OWNS_IT` exists to prevent.
-    /// `#[serde(default)]` reads an older roster's entries as wrapped, which
-    /// is what they were.
+    /// Native panes reattach through the persistent runtime on restore;
+    /// older rosters default to wrapped panes (#490).
     #[serde(default)]
     pub native: bool,
     /// The seat generation this native pane answered for at quit time,
@@ -166,23 +109,8 @@ pub fn write_roster(state: &StateDir, repo_slug: &str, roster: &Roster) -> CtxRe
     Ok(())
 }
 
-/// Reads and consumes this repo's roster, if one is there. The rename to the
-/// `.consumed` path is the **claim**, and it happens first, before the read
-/// and before the age check: exactly the idiom `sessions::claim_nudge_marker`
-/// and `mail::consume` already use, where the single atomic filesystem
-/// operation is what decides who got it. A rename that fails means somebody
-/// else claimed it (or it was never there), and the answer is `None`.
-///
-/// N3: reading first and renaming afterwards -- with the rename's own error
-/// discarded -- made consume-at-most-once best-effort in both directions: two
-/// dashboards launching together both read the same roster and both restored
-/// it, and a rename that failed left the roster to be offered again on every
-/// later launch.
-///
-/// `None` covers every reason there is nothing to restore: absent, already
-/// claimed, unreadable, malformed, or older than `max_age` as of `now`. A
-/// stale roster is still consumed -- it must not linger to be picked up by
-/// some later, larger `max_age`.
+/// Atomically claim the roster by rename before reading or checking age, so
+/// concurrent dashboards cannot restore it twice. Stale rosters are consumed.
 pub fn take_roster(state: &StateDir, repo_slug: &str, now: u64, max_age: u64) -> Option<Roster> {
     let path = roster_path(state, repo_slug);
     let consumed = consumed_path(state, repo_slug);
@@ -195,23 +123,8 @@ pub fn take_roster(state: &StateDir, repo_slug: &str, now: u64, max_age: u64) ->
     Some(roster)
 }
 
-/// Splits restore candidates into the ones worth offering and the ones whose
-/// session is *still running*, per `is_live` (in production
-/// `sessions::short_is_live`, keyed on the candidate's own `short`).
-///
-/// P4: `take_roster` has never checked liveness, and the case that matters is
-/// exactly the one a roster exists for. A dashboard that was *killed* rather
-/// than quit -- window closed, `taskkill`, a crash -- left its roster behind
-/// and, on Windows before the job-object backstop, left its panes' agents
-/// genuinely running: they lived on their own ConPTYs and never saw the
-/// console-close event. Offering those back spawned a second agent onto a
-/// conversation the first one still held, two live sessions writing one
-/// repo. A candidate whose recorded process is gone is the normal case and
-/// still offered.
-///
-/// Pure (the liveness probe is the caller's), so the filtering is testable
-/// without a registry or a live process. Returns `(offerable, skipped)`;
-/// order is preserved in both, so the caller can name what it skipped.
+/// Skip candidates whose sessions are still live to avoid duplicate agents;
+/// return `(offerable, skipped)` in original order.
 pub fn partition_live(
     candidates: Vec<RosterPane>,
     is_live: &dyn Fn(&str) -> bool,

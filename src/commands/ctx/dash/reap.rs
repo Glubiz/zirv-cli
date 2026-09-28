@@ -32,7 +32,6 @@ pub(super) fn attention_row_shorts(
     shorts
 }
 
-/// Which way [`fold_group`] moves a work group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GroupFold {
     Collapse,
@@ -89,21 +88,7 @@ pub(super) fn group_under_cursor(
     }
 }
 
-/// Issue #354 phase 2: the done-unread (`◆`) acknowledgement gate.
-///
-/// `Visibility::Unseen` is latched by a `Working -> Settled` transition and
-/// only [`super::attention::mark_seen`] ever clears it, so whatever calls it
-/// is asserting "an operator has actually looked at this session". Phase 1
-/// called it on every focus change, which asserts something weaker and often
-/// false: arrowing past a pane, or clicking it while a modal covers the whole
-/// grid, cleared a badge nobody read.
-///
-/// The rule now is a *render* rule, not an input rule: the pane must be the
-/// focused one, no overlay may be covering it, and it must be at its live
-/// scroll position (a pane scrolled back into history is showing something
-/// else entirely). [`ack_candidate`] decides that against one drawn frame;
-/// this remembers the `(short, revision)` it qualified at and hands it back
-/// exactly once, on the next tick, so the write happens off the render path.
+/// Latch done-unread until a completed, unobscured frame shows the focused pane (#354).
 #[derive(Debug, Default)]
 pub(super) struct DoneUnreadAck {
     /// The `(short, revision)` a qualifying render observed, waiting for the
@@ -117,19 +102,12 @@ pub(super) struct DoneUnreadAck {
 }
 
 impl DoneUnreadAck {
-    /// Pure: records what the frame just drawn qualifies for.
     pub(super) fn observe(&mut self, candidate: Option<(String, u64)>) {
         self.pending = candidate.filter(|key| !self.acked.contains(key));
     }
 
-    /// Pure: latches an acknowledgement earned OFF the render path, returning
-    /// the short id whose `mark_seen_io` is owed -- at most once per
-    /// `(short, revision)`, exactly like [`Self::take_due`].
-    ///
-    /// Issue #354 phase 3: the render path's own rule requires the pane to be
-    /// FOCUSED, which a retained ended row can never be -- there is no child
-    /// left to type into. Opening the inspector on such a row is the operator
-    /// reading it, and is the only way its `◆` can ever clear.
+    /// Queue one acknowledgement per revision after visibility is earned;
+    /// rendering must not write attention state itself.
     pub(super) fn acknowledge(&mut self, candidate: Option<(String, u64)>) -> Option<String> {
         let (short, revision) = candidate?;
         self.acked
@@ -137,8 +115,7 @@ impl DoneUnreadAck {
             .then_some(short)
     }
 
-    /// Pure: the short id whose `mark_seen_io` is now due, at most once per
-    /// `(short, revision)`.
+    /// Take each due acknowledgement at most once per session revision.
     pub(super) fn take_due(&mut self) -> Option<String> {
         let (short, revision) = self.pending.take()?;
         self.acked.insert((short.clone(), revision));
@@ -173,20 +150,7 @@ pub(super) fn ack_candidate(
     Some((short.to_string(), status.revision))
 }
 
-/// Pure: the `(short, revision)` opening the inspector on `row` qualifies for.
-///
-/// Keyed off the glyph the roster actually drew rather than the projection
-/// alone, because a retained ended row's `◆` comes from `glyph_for`'s own
-/// exit-code rule (a clean exit with `Visibility::Unseen`), which
-/// `attention::project` maps to `Failed` and so would never match here.
-///
-/// Review of 9314156 (finding 1, HIGH): restricted to rows the render path
-/// can NEVER acknowledge on its own -- an ended row (`exit_code`), or one
-/// this dashboard owns no pane for. Done-unread clears only after the
-/// operator actually views a pane, which means focus plus one unoccluded
-/// render at live scroll; a live attached pane that is merely *selected* has
-/// not been viewed, and opening the inspector on it used to clear its `◆`
-/// anyway. Those rows are left to the render path's own rule.
+/// Use the glyph actually drawn for the row when deciding whether its inspector acknowledges it.
 pub(super) fn inspect_ack_candidate(row: &ui::SidebarRow) -> Option<(String, u64)> {
     let status = row.status.as_ref()?;
     if row.exit_code.is_none() && row.attached {
@@ -198,20 +162,7 @@ pub(super) fn inspect_ack_candidate(row: &ui::SidebarRow) -> Option<(String, u64
     Some((row.short.clone(), status.revision))
 }
 
-/// Pure: `(focused, selected)` after the pane at `removed` has been taken out
-/// of `panes`. An index past the removed one shifts down by one; `focused`
-/// landing exactly on it goes to the first pane (the keyboard has to point
-/// *somewhere*, and the pane that shifted into the slot is a session the
-/// operator never asked to type into); `selected` landing on it stays put,
-/// since it addresses the combined sidebar (panes plus view-only rows) and the
-/// row that shifted up is the natural next thing to have the cursor on.
-///
-/// R2: reaping supersedes the earlier keep-every-pane-forever choice, which
-/// bought index stability at the price of unbounded growth -- registry corpses
-/// listed as `Live` by `zirv ctx sessions` (a `SessionGuard` was released only
-/// at quit, so `send`/`nudge` "succeeded" against dead workers), leaked
-/// sockets and `vt100` buffers, and live panes pushed past `Ctrl+A <digit>`
-/// reach. Index stability is now maintained by this explicit fixup instead.
+/// Shift indices after removal; focus falls back to the first pane if its pane was reaped.
 pub(super) fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize) {
     let focused = match focused.cmp(&removed) {
         std::cmp::Ordering::Greater => focused - 1,
@@ -245,11 +196,7 @@ pub(super) fn early_pane_failure(
     ))
 }
 
-/// Review round 1 (R5): resolved against the PANE's own cwd, not the
-/// dashboard's `repo`. Both adapters key a transcript on the directory the
-/// session runs in -- claude by project slug, codex by the `cwd` its rollout's
-/// `session_meta` records -- so a worktree-hosted pane priced off the root
-/// repo read another pane's transcript, or none.
+/// Resolve transcripts from the pane's own cwd because adapters key them by launch directory.
 pub(super) fn pane_transcript_usage(
     pane: &Pane,
     cfg: &CtxConfig,
@@ -275,14 +222,7 @@ pub(super) fn enforce_pane_token_budgets(
     });
 }
 
-/// The budget sweep with its transcript read injected, so the throttle guarding
-/// it is testable without a multi-megabyte transcript on disk.
-///
-/// A1-1: `usage_of` is a full `read_to_string` + parse of one pane's whole
-/// transcript, plus an `adapters::select` on either side of it. That is disk
-/// work, and disk work in this loop runs on [`FACTS_THROTTLE`] -- the same
-/// ~1s cadence `DiskFacts` and the mail sweep use -- not on the render
-/// loop's own 20-100 ticks a second.
+/// Throttle transcript usage reads with other disk work; each read parses the whole pane transcript.
 pub(super) fn enforce_pane_token_budgets_with<F>(
     panes: &mut [Pane],
     cfg: &CtxConfig,
@@ -334,13 +274,7 @@ pub(super) fn enforce_pane_token_budgets_with<F>(
     }
 }
 
-/// 2026-09-06: the pane-side mirror of `exec::run_with`'s wall clock. A
-/// delegation that asked for `--timeout-secs` used to hard-error rather than
-/// spawn a pane at all; it spawns one now, and this is what makes the ceiling
-/// real. Runs on the same [`FACTS_THROTTLE`] cadence as the token-budget
-/// sweep beside it -- a wall clock measured to the second does not need the
-/// render loop's tick rate -- and reports each stop exactly once, because
-/// `Pane::enforce_deadline` disarms the deadline in the same step.
+/// Apply wall-clock timeout to dashboard worker panes as well as headless delegations.
 pub(super) fn enforce_pane_deadlines(
     panes: &mut [Pane],
     cfg: &CtxConfig,
@@ -378,18 +312,8 @@ pub(super) fn enforce_pane_deadlines(
     }
 }
 
-/// Settles this pane's reservations against what it actually spent, and --
-/// 2026-09-06 -- writes the `log::Delegation` row for it.
-///
-/// The row belongs here rather than on the requesting side: `agent::run_with`
-/// returns at `Dispatch::Answered` as soon as the dashboard acknowledges the
-/// spawn, which is before the pane has run a single turn, so the requester
-/// never learns this delegation's usage, exit code or model at all. Since
-/// headless spawns were removed, a delegation made while any dashboard is
-/// live is ALWAYS a pane -- so with nothing appended here,
-/// `logs/delegations.jsonl` simply stopped growing and every cost line read
-/// `$0.00`. One row per completed pane delegation, attributed to the
-/// requester, carrying the same fields the inline supervised path writes.
+/// Settle reservations and write the delegation row at reap, when actual spend
+/// is known; the requester can return while the pane is still running.
 pub(super) fn account_reaped_pane_spend(
     pane: &Pane,
     cfg: &CtxConfig,
@@ -426,18 +350,11 @@ pub(super) fn account_reaped_pane_spend(
     }
     let actual = super::agent::token_spend(&usage);
     if let Some(group_id) = pane.work_group_id() {
-        // Issue #301: `pane.budget_tokens()` is exactly the ceiling
-        // `admit_child` reserved for this pane at spawn time
-        // (`fulfill_spawn_request` sets both from the same `admit_child`
-        // result), so settling here always releases exactly what was
-        // reserved.
+        // Settle the exact token ceiling reserved for this pane at admission (#301).
         let reserved = pane.budget_tokens().unwrap_or(0);
         let _ = super::group::settle_reservation(state, group_id, reserved, actual);
     }
-    // Issue #358 (task T3): the provider-level reservation `fulfill_spawn_
-    // request` took for this pane, regardless of whether it also belonged
-    // to a work group -- settled with the same actual spend just computed
-    // above, mirroring `agent::run_with`'s own headless completion path.
+    // Settle the provider reservation taken for this pane, with or without a work group (#358).
     if let Some(reservation_id) = pane.reservation_id() {
         // Must match `fulfill_spawn_request`'s own reserve exactly -- see
         // that function's Track C (#383) note for why this stays name-only.
@@ -446,16 +363,7 @@ pub(super) fn account_reaped_pane_spend(
     }
 }
 
-/// Pure: `selected` after `new_pane_count - old_pane_count` panes were
-/// appended to `panes`. `selected` indexes the combined sidebar (panes first,
-/// then view-only registry rows), so appending a pane pushes every view-only
-/// row -- and any selection sitting on one -- down by the number appended.
-///
-/// M4: the mirror of [`reap_fixup`] for insertion. Removal was fixed up;
-/// insertion was not, so `fulfill_spawn_request`/`spawn_restored_pane` pushing
-/// onto `panes` silently re-aimed a view-only selection (e.g. `Ctrl+A n`) at a
-/// different session. A selection already on a pane (index below the old pane
-/// count) keeps naming that same pane.
+/// Shift selected view-only row indices when panes are inserted, preserving the same logical target.
 pub(super) fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selected: usize) -> usize {
     let added = new_pane_count.saturating_sub(old_pane_count);
     if selected >= old_pane_count {
@@ -465,16 +373,7 @@ pub(super) fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selecte
     }
 }
 
-/// Pure: `selected` after the retained ended row at combined-roster index
-/// `restored_row` was relaunched into a pane.
-///
-/// A1-1 review finding A1-2: restoring grows `panes` (every view-only and
-/// retained row below shifts DOWN by the number of panes appended) and
-/// shrinks `retained` (every row after the restored one shifts back UP by
-/// one) in a single step, and `restore_ended_row` applied neither, so the
-/// sidebar cursor silently re-aimed at a different session. The restored row
-/// itself becomes the newest pane, so a cursor that was on it follows it
-/// there rather than landing on whatever slid into its old slot.
+/// Adjust selection after restore grows live panes and removes a retained row.
 pub(super) fn restore_fixup(
     old_pane_count: usize,
     new_pane_count: usize,
@@ -492,41 +391,13 @@ pub(super) fn restore_fixup(
     }
 }
 
-/// Issue #209/v3 codex review finding 1: `reap_ended_panes` removes an ended
-/// pane from `panes` (and reindexes `focused`/`selected`) in the same tick it
-/// detects the exit -- well before `assemble_sidebar`/`assemble_footer_facts`
-/// ever run downstream that tick. A `SidebarRow` with `RowState::Dead` is
-/// therefore never actually observed by either: `panes` never contains an
-/// `Ended` pane by the time rows are built from it. `LastExited` is the
-/// dashboard's own record of the pane it just lost, kept only for as long as
-/// there is nothing else to focus instead (`panes` is empty) -- once a new or
-/// restored pane takes focus, `assemble_footer_facts` finds a real focused
-/// row again and this becomes irrelevant until the next full reap, so it
-/// never needs an explicit clear.
+/// Keep a retained ended row available after its pane is reaped so unread output can be inspected (#209).
 pub(super) struct LastExited {
     pub(super) harness: String,
     pub(super) exited_at: Instant,
 }
 
-/// Removes every pane whose child has exited, in place: each one is shut down
-/// first (`Pane::finish_shutdown` releases the registry record, writer permit
-/// and socket), announced into the header's notice channel, then
-/// dropped along with its nudge queue, with `focused`/`selected` fixed up by
-/// [`reap_fixup`].
-///
-/// Called once per tick, right after every pane has been drained and polled,
-/// so `state()` is as fresh as it gets.
-///
-/// F4: every reaped pane's own exit code is recorded in `reaped_codes`, in
-/// reap order. The dashboard's own exit status is a fold over that list
-/// (`empty_exit_code`) once the last pane is gone: a dashboard whose sessions
-/// all died badly used to exit 0 regardless, which is the same dishonest exit
-/// `exec`/`wrap` are careful never to report.
-///
-/// `last_exited` records whichever pane this call reaps last, but only when
-/// it leaves `panes` empty -- see [`LastExited`]'s own doc comment for why
-/// that is exactly the condition under which the footer would otherwise have
-/// nothing to describe.
+/// Finish shutdown and release registry, permit and socket before retaining the ended row.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reap_ended_panes(
     panes: &mut Vec<Pane>,
@@ -543,13 +414,7 @@ pub(super) fn reap_ended_panes(
     retained: &mut VecDeque<EndedRow>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) -> Vec<String> {
-    // A1-5: the module's own rule (`Notice`'s doc comment) is failures ->
-    // the sticky `\u{26a0}` error channel, confirmations -> the transient
-    // notice channel. A pane that exited 0 finished; routing it through
-    // `push_error` pinned the warning glyph and burned one of five
-    // `MAX_KEPT_ERRORS` slots a real failure needs. Returned rather than
-    // pushed here so the reap path keeps its existing parameter list and the
-    // one caller that owns a notice channel does the pushing.
+    // Route clean completion to a transient notice; reserve the sticky error ring for failures.
     let mut confirmations = Vec::new();
     let mut index = 0;
     while index < panes.len() {
@@ -557,16 +422,7 @@ pub(super) fn reap_ended_panes(
             index += 1;
             continue;
         };
-        // Issue #330 (review finding 2): an exited pane whose reader channel
-        // is not drained yet keeps its place for another tick. The vt100
-        // budget is shared across panes now, so a pane can genuinely reach
-        // its exit with its last lines still queued -- and reaping it here
-        // would retire the row, drop the parser and take exactly the output
-        // the operator needs to understand the exit with it. `drain_with_
-        // budget` reports `more` only when it stopped on the budget rather
-        // than on an empty channel, so this can hold a pane back for a tick
-        // but never forever: the next drain that reaches the end of the
-        // channel clears it.
+        // Keep an exited pane until its reader channel drains, since the shared vt100 budget may defer output (#330).
         if panes[index].has_pending_output() {
             index += 1;
             continue;
@@ -583,11 +439,7 @@ pub(super) fn reap_ended_panes(
             );
             confirmations.extend(notices.into_iter().map(|notice| notice.text));
         }
-        // Issue #354 phase 2: the row survives the pane, so everything it will
-        // ever need is captured HERE -- before `finish_shutdown` below releases the
-        // registry record the age comes from, and before the `Pane` itself is
-        // dropped. Nothing about a finished worker can be re-derived a tick
-        // later.
+        // Capture retained-row facts before shutdown releases the pane's registry record (#354).
         let now_secs = super::state::now_secs();
         let ended_meta = EndedMeta {
             exit_code: code,
@@ -595,12 +447,7 @@ pub(super) fn reap_ended_panes(
             age_secs: sessions::load_record(state, panes[index].short())
                 .map(|record| now_secs.saturating_sub(record.started_at)),
         };
-        // Review of 5c1b6c3, finding 2: `budget`/`writer` are read off the
-        // LIVE pane here, through the very same helpers `build_pane_rows`
-        // uses for a running one. They used to be hardcoded placeholders, so
-        // a retained row's disclosure claimed nothing was ever known about a
-        // worker's token usage or its write permit -- while the doc comment
-        // on `EndedRow` promised the opposite.
+        // Capture budget and writer disclosure from the live pane before it is dropped.
         let retained_budget = budget_text(
             panes[index]
                 .measured_usage()
@@ -639,14 +486,7 @@ pub(super) fn reap_ended_panes(
             short,
             meta: ended_meta,
         };
-        // Issue #349: the dashboard's own quiet-heuristic sync never sees this
-        // pane again (it is about to leave `panes`), so the one authority that
-        // can say the child is gone files it here instead -- a `Supervisor`
-        // observation, the same rank `exec`/`wrap` use for a process exit.
-        // Without it the retained row's cached status would still claim the
-        // session was working. Review of 5c1b6c3, finding 1: a clean exit is
-        // preceded by the `Settled` observation that latches `Unseen` -- see
-        // [`reap_observations`].
+        // Record the child's exit at supervisor authority before removing its pane (#349).
         let prior_lifecycle = super::attention::load(state, &retained_row.short).lifecycle;
         let tail = panes[index].screen_tail();
         for observation in reap_observations(prior_lifecycle, code, ended_meta.exited_at, &tail) {
@@ -660,9 +500,7 @@ pub(super) fn reap_ended_panes(
         report_settled_pane(&mut panes[index], state, cfg, errors);
         push_retained_ended(retained, retained_row, MAX_RETAINED_ENDED_ROWS);
         let pane = panes.remove(index);
-        // Review finding (2026-09), finding 2a: captured before `pane` is
-        // consumed below, so the worktree-reclaim check after this pane is
-        // fully torn down still has its own cwd and label to work with.
+        // Capture owned worktree identity before consuming the pane for shutdown.
         let pane_cwd = pane.cwd().to_path_buf();
         let pane_owns_cwd = pane.owns_cwd();
         let pane_short = pane.short().to_string();
@@ -671,11 +509,7 @@ pub(super) fn reap_ended_panes(
         if index < queues.len() {
             queues.remove(index);
         }
-        // L19: `finish_shutdown` above released the registry record immediately, but
-        // `facts_cache.registry` is up to ~1s stale, so the dead session would
-        // re-list as a view-only (nudge-targetable) row until the next refresh.
-        // Remember its short and exclude it from the view-only rows until the
-        // registry snapshot no longer carries it.
+        // Exclude a just-reaped session from the up-to-one-second stale registry view until refresh drops it.
         reaped_recent.insert(pane.short().to_string());
         reaped_codes.push(code);
         let ended_line = format!(
@@ -695,13 +529,7 @@ pub(super) fn reap_ended_panes(
             });
         }
         (*focused, *selected) = reap_fixup(index, *focused, *selected);
-        // Review finding (2026-09), finding 2a: `agent::run_with`'s own
-        // `--worktree` reclamation only ever runs for the HEADLESS fallback
-        // path -- a dashboard-hosted worker pane's linked worktree is
-        // handed off entirely (its own allocating process disarms its own
-        // reclaim guard) and nothing else reclaimed it once the pane's
-        // child exited. `pane` (and, via its own `Drop`, any writer permit
-        // it held) is already gone by this point.
+        // Reclaim worktrees for dashboard-hosted panes on reap; the headless path cannot reclaim them.
         if let Some(outcome) = reclaim_pane_worktree(
             state,
             repo,
@@ -720,15 +548,7 @@ pub(super) fn reap_ended_panes(
     confirmations
 }
 
-/// Review finding (2026-09), finding 2a: reclaims `cwd` if (and only if) the
-/// pane OWNED it -- its spawn request carried `owns_workdir` because
-/// `zirv agent --worktree` allocated it (review round 3: ownership travels
-/// on the request, never inferred from the path, so an operator-named
-/// `--workdir` that happens to live under `.zirv/worktrees/` is never
-/// touched) -- and it is one of THIS repo's own agent-managed worktrees
-/// (`agent::is_agent_managed_worktree`, the second guard). `None` for an
-/// ordinary pane. Split out of [`reap_ended_panes`] so the checks and the
-/// reclaim call are directly testable without spawning a real pane.
+/// Reclaim only a workdir explicitly owned by this pane's request, never one merely under a worktree path.
 pub(super) fn reclaim_pane_worktree(
     state: &StateDir,
     repo: &Path,
@@ -739,13 +559,7 @@ pub(super) fn reclaim_pane_worktree(
     if !owns_cwd || !super::agent::is_agent_managed_worktree(repo, cwd) {
         return None;
     }
-    // Issue #718 review finding (2026-09): threaded from the caller's own
-    // resolved `cfg.worktree.idle_pool_max`, the same way `run_dashboard_
-    // inner` threads `cfg.worktree.idle_ttl_secs` into `worktree::gc` --
-    // a dashboard-hosted pane's own worktree reclaim now honors a repo/
-    // operator override exactly like the headless `zirv ctx agent
-    // --worktree --worktree-reuse` path (`agent::run_with`) already does,
-    // instead of silently falling back to the built-in default.
+    // Use the caller's configured idle-pool cap when reclaiming a worktree (#718).
     Some(super::agent::reclaim_worktree(
         state,
         repo,
@@ -791,24 +605,7 @@ pub(super) fn describe_pane_worktree_reclaim(
     }
 }
 
-/// Security review Finding 2 (2026-08-28): a coordinator pane's scope is
-/// done the moment its own child exits -- successfully or not -- exactly as
-/// `agent::run_with`'s completion path already treats a headless
-/// coordinator's, and with the same two guards: only a `SubOrchestrator`
-/// pane, and only for a group THIS pane actually claimed
-/// (`group::claim_sub_orchestrator` is first-claim-wins, so a group some
-/// other session owns must never be closed out from under it). Totals
-/// survive: `group::close` only stamps `closed_at`, leaving
-/// `admitted_children` and the terms a reviewer reads with `zirv ctx group
-/// status` exactly as they were.
-///
-/// Best-effort throughout: a pane is being reaped either way, and a group
-/// record that cannot be read or written is not a reason to fail that.
-/// Deliberately NOT called from `on_quit`: a dashboard quitting kills its
-/// panes mid-work rather than watching them finish, and such a group is
-/// genuinely still open -- `group::is_abandoned` (claimed, unclosed, claimant
-/// gone) is what surfaces it then, which is what the claim at spawn now makes
-/// possible for a dash-spawned coordinator at all.
+/// Close a coordinator's work group when its child exits, regardless of exit code.
 pub(super) fn close_claimed_group(pane: &Pane, state: &StateDir) {
     if !matches!(pane.role(), prompt::PromptRole::SubOrchestrator) {
         return;
@@ -825,38 +622,7 @@ pub(super) fn close_claimed_group(pane: &Pane, state: &StateDir) {
     let _ = super::group::close(state, group_id, super::state::now_secs());
 }
 
-/// Called on every quit path, before any pane is torn down (shutdown --
-/// quit-sequence, registry release, socket unpublish -- happens in the
-/// caller right after this returns). Two things happen here, both
-/// best-effort (the dashboard is exiting either way, and there is nothing
-/// left to report a failure to):
-///
-/// 1. Writes this repo's own restore roster (`roster::write_roster`) from
-///    every pane still alive, orchestrator included -- `RosterPane::role`
-///    records which is which (`Pane::role`'s own `label()`), so
-///    a later startup restore can filter the orchestrator back out itself
-///    rather than this write having to guess which pane index is safe to
-///    keep. A pane whose child has already exited is left out entirely: there
-///    is nothing there to restore (R2).
-/// 2. Removes the whole spawn-request directory this dashboard created at
-///    startup (`requests_dir`'s own parent, `<dash_short>-<token>`, not just
-///    the `requests` leaf, so no empty shell is left under `<state>/dash/`):
-///    once this dashboard is gone, nothing should still be able to reach a
-///    channel that nobody is polling any more.
-///
-/// F5: `unoffered` is whatever this launch took out of the previous roster and
-/// never actually put to the operator -- the restore dialog still sitting
-/// unanswered when the dashboard exited. `roster::take_roster` consumes on
-/// read, so without writing those candidates back this quit's fresh roster
-/// overwrote them and the sessions were lost for good, unoffered twice over.
-///
-/// G3: `deferred_restore` is the other pool of candidates a quit still owes
-/// the next launch -- every restore candidate the pane cap forced this
-/// session to skip when the operator confirmed the restore dialog
-/// (`partition_restore_selection`'s own `deferred` half), independent of
-/// whether that dialog is still open now. Merged in the same way and for the
-/// same reason as `unoffered`: both are offers this launch consumed without
-/// ever actually spawning them.
+/// Snapshot live panes for roster before any shutdown releases their records.
 pub(super) fn on_quit(
     panes: &[Pane],
     unoffered: &[roster::RosterPane],
@@ -867,52 +633,27 @@ pub(super) fn on_quit(
 ) {
     let live: Vec<roster::RosterPane> = panes
         .iter()
-        // R2: a pane whose child already exited has nothing to restore.
-        // Offering it back would spawn a fresh session for something the
-        // operator watched finish, and would spend the next launch's pane
-        // budget doing it.
+        // Skip already-ended pane candidates when writing the next restore roster.
         .filter(|pane| !matches!(pane.state(), PaneState::Ended(_)))
         .map(|pane| roster::RosterPane {
             agent: pane.agent().to_string(),
             session_id: pane.session_id().to_string(),
-            // Security review Finding 6: the role this pane was actually
-            // spawned with (`Pane::role`, issue #169), not a guess re-derived
-            // from its verb. The verb form collapsed every non-chat pane to
-            // `roster::ROLE_WORKER`, so a coordinator pane came back from a restore
-            // demoted -- refused its own onward delegation by the depth cap,
-            // and unable to close the group it still owned.
+            // Persist each pane's actual role so restoration cannot demote a coordinator (#169).
             role: pane.role().label().to_string(),
             short: pane.short().to_string(),
             title: pane.title().to_string(),
-            // F3 (review, PR #116): persisted so a restore
-            // (`spawn_restored_pane`) can hand a worker pane back its
-            // report-back target and reminder-sent state -- without this,
-            // every restored worker pane lost `report_to` for good, so
-            // `report_back_reminder_sweep` could never remind it again.
+            // Persist report target and one-shot reminder state across dashboard restart (#116).
             report_to: pane.report_to().map(str::to_string),
             report_reminder_sent: pane.report_reminder_sent(),
             settled_mail_sent: pane.settled_mail_sent,
-            // Finding 6: and the group it belongs to, so the restore can put
-            // it back inside the same one.
+            // Persist the work-group binding for restoration.
             work_group_id: pane.work_group_id().map(str::to_string),
             budget_tokens: pane.budget_tokens(),
-            // Issue #160 finding 1, review round (2026-08-28): the launch
-            // mode this pane was ACTUALLY spawned with (`Pane::launch_mode`),
-            // so a restore can relaunch it on the same terms rather than
-            // unconditionally pinning `Interactive` -- see `restored_pane_
-            // turn_env`'s own doc comment.
+            // Persist the actual launch mode so restore cannot grant interactive posture to a headless pane (#160).
             interactive: pane.launch_mode() == adapters::LaunchMode::Interactive,
-            // Issue #249/#250 review (Fix 4): this pane's own server-verified
-            // parent (`Pane::parent_session`), so a restore can hand it back
-            // to `Pane::set_parent_session` and re-export it as `PARENT_
-            // SESSION_ENV` -- without this, a quit/restore round-trip
-            // silently downgraded a genuine worker's steering mail to peer.
+            // Persist the server-verified parent session for restored steering (#249, #250).
             parent_session: pane.parent_session().map(str::to_string),
-            // Issue #490 (roadmap N21 item A): which KIND of pane this was, so
-            // the restore reopens it through `open_native_pane`/
-            // `resolve_attach` rather than trying to relaunch an argv a native
-            // pane never had. The generation is recorded beside it so a
-            // restore that comes back on a different one is visible.
+            // Persist pane kind so native sessions reattach through the runtime (#490).
             native: pane.is_native(),
             native_generation: pane.native().map(|native| native.generation()).unwrap_or(0),
         })
@@ -929,12 +670,7 @@ pub(super) fn on_quit(
     remove_request_dir(requests_dir);
 }
 
-/// Pure: this quit's own live panes, plus every candidate this launch took out
-/// of the previous roster and never offered, minus any duplicate.
-///
-/// Deduped on `session_id` because that is the identity a restore actually
-/// resumes (`roster::restore_argv` feeds it to `resume_args`): a candidate that
-/// somehow *is* live again must be written once, as the live pane, not twice.
+/// Carry live and skipped prior candidates into the new roster, deduplicated by session ID.
 pub(super) fn merge_unoffered(
     mut live: Vec<roster::RosterPane>,
     unoffered: &[roster::RosterPane],
@@ -965,16 +701,7 @@ pub(super) fn unoffered_candidates<'a>(
     }
 }
 
-/// Removes the whole capability-token directory this dashboard created for its
-/// spawn-request channel -- `requests_dir`'s own parent
-/// (`<state>/dash/<short>-<token>`), not just the `requests` leaf, so no empty
-/// shell is left behind under `<state>/dash/`.
-///
-/// O7: shared by every path that leaves `run_dashboard` -- the quit path
-/// (`on_quit`), the terminal-setup failures (`abort_setup`) and the very first
-/// pane's own spawn failure. Only the first of the three used to clean up, so
-/// a dashboard that failed to start leaked a directory per attempt, each still
-/// holding a live capability token's name.
+/// Remove the entire capability-token tree, including pane-specific request channels.
 pub(super) fn remove_request_dir(requests_dir: &Path) {
     let dir = requests_dir.parent().unwrap_or(requests_dir);
     let _ = std::fs::remove_dir_all(dir);

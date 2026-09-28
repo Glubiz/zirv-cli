@@ -1,17 +1,10 @@
 //! Error log plus the pane rollover/handover sweep.
 use super::*;
 
-/// Issue #354 phase 5: one kept error, collapsed over identical CONSECUTIVE
-/// repeats. A supervisor that fails the same way once a second used to evict
-/// the whole five-entry buffer in five seconds, taking every other error with
-/// it and telling the operator nothing they did not already know; one entry
-/// with a count says strictly more in one line.
+/// Keep consecutive unacknowledged duplicate errors in one counted entry so one repeated failure cannot evict other errors (#354).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ErrorEntry {
-    /// Monotonic within one dashboard run. A1-3: `Ctrl+A e` acknowledges the
-    /// entries its own snapshot covered, and an id is the only stable way to
-    /// name them -- an index moves the moment the buffer cap drops an entry
-    /// off the front while the dialog is open.
+    /// Use monotonic error IDs so an open dialog can acknowledge its snapshot after the bounded ring shifts.
     id: u64,
     pub(super) text: String,
     /// How many times in a row this exact message was pushed. `1` is the
@@ -39,12 +32,7 @@ pub(crate) struct ErrorLog {
 }
 
 impl ErrorLog {
-    /// Pure: records one error as of `now`.
-    ///
-    /// Collapses onto the newest entry when it is the same message AND has
-    /// not been acknowledged. The acknowledgement check is what makes "the
-    /// same failure, again, after I said I had seen it" news again rather
-    /// than a silent `\u{d7}n` bump nothing draws the operator's eye to.
+    /// Collapse only onto an unacknowledged newest entry; a repeat after acknowledgement is a new error.
     pub(super) fn record(&mut self, message: String, now: Instant) {
         if let Some(last) = self.entries.last_mut()
             && !last.acked
@@ -75,13 +63,7 @@ impl ErrorLog {
         self.next_id
     }
 
-    /// Pure: marks acknowledged every entry the snapshot taken at `mark`
-    /// covered. Never deletes anything.
-    ///
-    /// A1-3: this used to acknowledge the whole buffer, including errors
-    /// pushed AFTER the dialog took its snapshot -- clearing the sticky
-    /// `\u{26a0}` for failures that were never on screen. An entry that
-    /// arrived after the snapshot keeps holding the line.
+    /// Acknowledge only errors present in the dialog's snapshot; later arrivals must retain their warning.
     pub(super) fn acknowledge(&mut self, mark: u64) {
         for entry in &mut self.entries {
             if entry.id < mark {
@@ -159,23 +141,7 @@ pub(super) fn push_error(errors: &mut ErrorLog, message: String) {
     errors.record(message, Instant::now());
 }
 
-/// The dashboard's own successor backend (issue #552).
-///
-/// Two backends, one per successor runtime:
-///
-/// * a HARNESS successor is the in-place pty swap `Pane::handover` has always
-///   performed -- one child replaced under one pane, the pane's own identity
-///   untouched;
-/// * a NATIVE successor cannot be an in-place child replacement, because a
-///   native pane has no child: it is an in-process session with its own
-///   journal. So it is opened first (`Pane::spawn_native`, on THIS seat's
-///   short id and the committed generation) and the source pane is retired
-///   only once the successor exists. Exactly one of the two is ever live: the
-///   successor is built before anything is taken away, and a failure to build
-///   it leaves the source untouched and holding the seat.
-///
-/// Nothing here is `#[cfg(unix)]`; both halves compile and run on every
-/// platform CI covers.
+/// A native successor is opened before retiring its source; a failed launch leaves the source holding the seat (#552).
 pub(super) struct PaneSuccessorLauncher<'a> {
     pub(super) pane: &'a mut Pane,
     pub(super) cfg: &'a CtxConfig,
@@ -233,9 +199,7 @@ impl super::rollover::runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
                     self.role,
                     self.repo,
                     &session_id,
-                    // The socket `Pane::spawn_on_seat` goes on to bind for
-                    // this identity, so the child is told where to report
-                    // before the pane exists to bind it.
+                    // Give the child its report address before the pane binds that socket.
                     Some(&state.socket_for(&session_id)),
                     self.pane.title().to_string(),
                 )
@@ -255,9 +219,7 @@ impl super::rollover::runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
             return Ok(self.retire_source_for(successor));
         }
 
-        // Built BEFORE anything is taken away: a failure here leaves the
-        // source pane exactly as it was, still holding the seat with all of
-        // its durable state (`rollover::runtime`'s own item 7).
+        // Build the successor before retiring the source so launch failure leaves its seat intact.
         let state = self.pane.state_dir().clone();
         let successor = super::rollover::runtime::launch_native_pane(
             self.cfg,
@@ -298,20 +260,7 @@ impl PaneSuccessorLauncher<'_> {
     }
 }
 
-/// Issue #84: the `Ctrl+A o` picker's confirm action. Distills a handoff
-/// packet through the exact same machinery `wrap::perform_handover_swap`
-/// uses (`handoff::distill_or_structural` against the pane's own current
-/// adapter/transcript, never a parallel format), then hands it to `Pane::
-/// handover`, which resolves the new adapter/argv/turn-env and performs the
-/// actual pty swap. The pane keeps its registry short id throughout (`Pane::
-/// handover` never re-registers), which is what keeps mail and `zirv ctx
-/// nudge` addressed to it valid across the swap.
-///
-/// Issue #358 (task 5): takes an already-built `HandoverRequest` rather than
-/// a target agent/model pair, so an automatically decided rollover
-/// (`rollover::evaluate`) and the operator's own picker are executed by the
-/// exact same code -- including the seat transaction `req.generation` names.
-/// Returns whether the swap actually happened.
+/// Manual and automatic handovers share the same distillation and seat transaction; the pane keeps its short ID so mail and nudges remain addressed to it (#84, #358).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handover_pane(
     pane: &mut Pane,
@@ -320,13 +269,7 @@ pub(super) fn handover_pane(
     repo: &Path,
     state: &StateDir,
     errors: &mut ErrorLog,
-    // Issue #440: whose transcript the outgoing context is read from, as
-    // `(agent, session id)`. `None` -- every ordinary swap -- means this
-    // pane's own current agent and session, which is what is leaving. A
-    // SOURCE recovery is the exception: the pane is running the dead
-    // successor by then, so reading `pane.agent()` there would build the
-    // packet from the successor's own (usually empty) transcript rather than
-    // from the source whose context is the thing actually being carried.
+    // SOURCE recovery must read the outgoing source transcript, not the dead successor's transcript (#440).
     context: Option<(&str, &str)>,
 ) -> bool {
     let (old_agent_name, context_session) = match context {
@@ -386,8 +329,7 @@ pub(super) fn handover_pane(
         .ok()
         .flatten()
         .map(|(_, h)| h);
-    // Issue #358: a reactive rollover fires because this provider stopped
-    // answering; the distiller call would run against that same provider.
+    // A reactive rollover cannot distill through the provider that stopped answering (#358).
     let (note, _source) = if req.structural_only {
         (handoff::structural(&ctx), "structural")
     } else {
@@ -407,12 +349,7 @@ pub(super) fn handover_pane(
         prompt::PromptRole::Worker
     };
     let size = pane.screen().size();
-    // Issue #552: every live swap starts its successor through the ONE
-    // production seam, `rollover::runtime::launch_successor` -- so the
-    // direction (harness->harness, harness->native, native->harness,
-    // native->native) decides which backend runs, this seat's subagents are
-    // settled before anything takes the seat, and an ambiguous tool effect
-    // halts the successor instead of being replayed by it.
+    // Launch every successor through the seat transaction so subagents settle and ambiguous tool effects cannot be replayed (#552).
     let from = if pane.is_native() {
         super::runtime::RuntimeKind::Native
     } else {
@@ -459,9 +396,7 @@ pub(super) fn handover_pane(
     ) {
         Ok(_) => true,
         Err(e) => {
-            // `Pane::handover` assembles the successor completely before it
-            // touches the old child, so a failure here leaves the pane
-            // exactly as it was -- the seat transaction is a clean abort.
+            // Build the successor before touching the old child; a launch failure aborts the seat transaction.
             if let Some(generation) = req.generation {
                 let _ = super::rollover::fail(
                     state,
@@ -478,11 +413,7 @@ pub(super) fn handover_pane(
     }
 }
 
-/// Issue #358 (task 5): one automatic rollover evaluation for the
-/// dashboard's own orchestrator pane. The evaluation, the seat transaction
-/// and the swap all go through the same seams a manual `Ctrl+A o` does; the
-/// only difference is who decided. A parked seat is asked first, in case its
-/// window has elapsed and the best harness is no longer its own.
+/// Evaluate automatic rollover through the same seat transaction as manual handover (#358).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn rollover_sweep(
     panes: &mut [Pane],
@@ -491,14 +422,7 @@ pub(super) fn rollover_sweep(
     state: &StateDir,
     pending: &mut Option<(String, u64, Instant)>,
     errors: &mut ErrorLog,
-    // Coordinator follow-up: the footer's rollover distance/soon reading
-    // must be the SAME `source_headroom_pct` this evaluation computed, not
-    // a separate guess -- captured here (via `evaluate`'s own out-param)
-    // and kept across ticks by the caller so the footer can read it on
-    // frames this sweep does not itself run on. Left untouched (not
-    // cleared) on any tick this function returns before calling `evaluate`
-    // at all (e.g. the `on_resume`/parked-return path) -- the last real
-    // reading is still the best answer until a fresh one replaces it.
+    // Keep the latest evaluated headroom for the footer until a fresh evaluation replaces it.
     seat_headroom_pct: &mut Option<SeatHeadroom>,
 ) {
     let Some(idx) = panes
@@ -508,13 +432,7 @@ pub(super) fn rollover_sweep(
         return;
     };
     let short = panes[idx].short().to_string();
-    // The seat in full: its currently-registered model (`Seat::model`,
-    // stamped by the same `seat::register` call `Pane::spawn`/`Pane::
-    // handover` make), for a point-in-time rollover-eligibility read, and
-    // its own `generation`, which is what tags whatever headroom this tick
-    // computes below (review fix: a pane's registry short id survives a
-    // handover unchanged, so `short` alone cannot tell an old seat from a
-    // new one at the same address -- only `generation` advances).
+    // Tag headroom with seat generation; the same short ID can survive a handover to a different model.
     let loaded_seat = super::seat::load(state, &short);
     let seat_generation = loaded_seat.as_ref().map(|seat| seat.generation);
     let seat_model = loaded_seat.and_then(|seat| seat.model);
@@ -540,11 +458,7 @@ pub(super) fn rollover_sweep(
                 true,
                 &mut headroom_out,
             );
-            // Cache the reading -- tagged with the generation it was
-            // actually read against -- regardless of what this evaluation
-            // decided: Skip/Pending/Park all still computed a real,
-            // current headroom worth showing. A Rollover decision is
-            // cleared right below instead, before the handover itself.
+            // Cache headroom for the generation evaluated, including Skip, Pending and Park outcomes.
             if let (Some(pct), Some(generation)) = (headroom_out, seat_generation) {
                 *seat_headroom_pct = Some(SeatHeadroom {
                     short: short.clone(),
@@ -558,13 +472,7 @@ pub(super) fn rollover_sweep(
             }
         }
     };
-    // Review fix: a handover is about to be attempted (from `on_resume` or
-    // the fresh `Rollover` decision just above) -- `evaluate`'s own
-    // `seat::prepare_onto` already advanced the on-disk seat to `Phase::
-    // Prepared` under a NEW generation before this point, so whatever
-    // headroom is cached for the OLD generation is stale the instant it is
-    // cleared here, not merely once the identity check downstream happens
-    // to notice.
+    // Clear old headroom as soon as prepare advances the seat generation.
     *seat_headroom_pct = None;
     // The seat transaction is already open, so a pane that is no longer at a
     // clean boundary has to close it rather than leave it prepared -- the
@@ -589,12 +497,7 @@ pub(super) fn rollover_sweep(
     }
 }
 
-/// The other half: an open rollover transaction is committed only once the
-/// successor pane has actually answered, and aborted when it never does.
-/// `Pane::handover` spawns the successor before it touches the old child, so
-/// a pane that has already ENDED here is the only genuine "it never came up"
-/// case; a timeout leaves the (live but silent) successor alone rather than
-/// killing the operator's own orchestrator pane.
+/// Commit only after the successor answers; abort only if it ended, since silence alone does not justify killing a live pane.
 pub(super) fn settle_pending_rollover(
     panes: &mut [Pane],
     cfg: &CtxConfig,
@@ -657,15 +560,7 @@ pub(super) fn settle_pending_rollover(
             *pending = None;
         }
         super::rollover::Readiness::Dead => {
-            // Issue #440: `Pane::handover` has already quit the source child
-            // by the time a successor can die, so without this arm the
-            // dashboard simply reaped the pane and the operator's
-            // orchestrator was gone -- the incident this whole fix exists
-            // for. The seat still names the SOURCE (a failed rollover never
-            // commits), so relaunching it in this same pane, through the very
-            // seam the swap itself used, gives the seat its own harness back
-            // at the same short id. Structural handoff only: the source is
-            // the harness that just proved it cannot answer a distiller call.
+            // Relaunch the source in the same pane if its successor dies before answering; the seat still names that source (#440).
             let source = super::seat::load(state, &short);
             let reactive = source.as_ref().is_some_and(|seat| {
                 matches!(
@@ -676,12 +571,7 @@ pub(super) fn settle_pending_rollover(
                     }
                 )
             });
-            // Issue #462: preserve WHY the successor exited. Recovery below
-            // can fail in its own right -- in the incident the restored pane
-            // died immediately on a resume of an id its harness had never
-            // heard of -- and a reason string that only ever said "the
-            // successor exited before it answered" left the initial failure
-            // unexplained in the retained evidence.
+            // Retain the successor's exit reason even when source recovery later fails (#462).
             let mut reason = "the successor exited before it answered".to_string();
             if let PaneState::Ended(code) = pane_state {
                 reason.push_str(&format!(" (exit {code})"));
@@ -693,22 +583,7 @@ pub(super) fn settle_pending_rollover(
             }
             super::rollover::fail(state, "dash", &short, generation, &reason, now);
             *pending = None;
-            // Issue #440: resume the source's OWN conversation where the
-            // adapter has a verified mechanism for it. A cold relaunch
-            // carrying a structural packet cannot carry unsaved in-flight
-            // state, and that state is exactly what the incident lost.
-            //
-            // Issue #462: the id resumed here is the one the HARNESS knows,
-            // which equals zirv's seat uuid only when the launch was pinned
-            // (`AgentAdapter::session_pin_args`). A `zirv chat -- --resume
-            // <id>` launch deliberately suppresses that pin, so the seat's
-            // uuid is a zirv-side handle no `--resume` can resolve: resuming
-            // it blind is what killed the restored pane and closed the
-            // orchestrator outright. Preference order is therefore the
-            // conversation a lifecycle hook actually OBSERVED for this seat
-            // (`sessions::native_conversation`), then the seat uuid -- and
-            // either one only when the adapter cannot prove that
-            // conversation is absent.
+            // Resume only a conversation the harness knows: prefer a lifecycle-observed ID, then a pinned seat ID, and fall back to structural relaunch when absence is proven (#440, #462).
             let resume = source.as_ref().and_then(|seat| {
                 let adapter = adapters::select(Some(&seat.agent), &[], cfg).ok()?;
                 match super::sessions::native_conversation(
@@ -722,15 +597,7 @@ pub(super) fn settle_pending_rollover(
                     // exact seat and zirv session: the strongest evidence
                     // there is, and it needs no probe.
                     Some(observed) => adapter.resume_args(&observed).map(|_| observed),
-                    // Nothing observed (no turn boundary reached this seat
-                    // yet, or an unsupervised launch). The seat uuid is only
-                    // the conversation id when the launch was PINNED, so it
-                    // is used only where the adapter cannot prove that
-                    // conversation is absent -- `None` from
-                    // `conversation_exists` means "cannot tell", which keeps
-                    // the previous behaviour, while a proven-absent
-                    // conversation downgrades to a cold structural relaunch
-                    // instead of a resume the harness would reject.
+                    // An unpinned seat ID may not be a harness conversation ID; resume only when the adapter cannot prove it absent (#462).
                     None => {
                         adapter.resume_args(&seat.session)?;
                         let exists = adapter.conversation_exists(&SessionRef {
@@ -744,11 +611,7 @@ pub(super) fn settle_pending_rollover(
             let restored = source
                 .filter(|seat| !seat.agent.eq_ignore_ascii_case(pane.agent()))
                 .is_some_and(|seat| {
-                    // Issue #462: the outgoing context is read from the
-                    // conversation actually being resumed, not from zirv's
-                    // seat uuid -- `handover_pane` resolves the transcript
-                    // from this value, and for an unpinned launch the seat
-                    // uuid names no transcript at all.
+                    // Read handoff context from the conversation being resumed, which may differ from the seat ID (#462).
                     let context_session = resume.clone().unwrap_or_else(|| seat.session.clone());
                     handover_pane(
                         pane,
@@ -808,19 +671,7 @@ pub(super) fn settle_pending_rollover(
             );
         }
         super::rollover::Readiness::TimedOut => {
-            // Finding #13 (issue #358 review): unlike `wrap`'s identical
-            // arm, this used to leave the on-disk seat naming the OLD
-            // predecessor after the transaction aborted -- the pane itself
-            // is kept alive running the SUCCESSOR (killing a live-but-
-            // silent successor here would end the operator's own dashboard
-            // pane outright, the same DEVIATION `wrap`'s own timeout arm
-            // documents), so the seat record and the actually-running pane
-            // disagreed about which agent was answering at this address
-            // until the next rollover happened to overwrite it. Peek the
-            // model `seat::prepare` recorded before `rollover::fail`/`seat::
-            // abort` discards the `Prepared` phase, then re-register onto
-            // the successor that is, in fact, running -- mirroring wrap's
-            // own re-registration exactly.
+            // After timeout, keep the live successor and re-register its model; the seat record must name the pane actually running (#358).
             let successor_model =
                 super::seat::load(state, &short).and_then(|seat| match seat.phase {
                     super::seat::Phase::Prepared {
@@ -856,22 +707,12 @@ pub(super) fn settle_pending_rollover(
     }
 }
 
-/// How long a transient header notice stays on screen before it expires (L13).
-/// Issue #354 phase 3: how close together two clicks on the same dialog row
-/// have to be to count as a double-click (activate) rather than two
-/// selections. The usual desktop default; a slow second click simply
-/// re-selects the row it is already on, which is a no-op.
+/// A double-click must hit the same dialog row within the configured interval; a slower click just selects it (#354).
 pub(super) const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub(super) const NOTICE_TTL: Duration = Duration::from_secs(4);
 
-/// Issue #354 phase 5: how wide an attention notice may be built.
-///
-/// The header's middle slot is whatever is left after the fixed chrome and
-/// the hint cluster, which `header_layout` truncates to anyway -- this is the
-/// reducer's own clamp so a notice is never *composed* longer than the middle
-/// can ever be at the dashboard's minimum eligible width. Anything wider
-/// would only be ellipsised twice.
+/// Clamp notices to the header's middle slot at the minimum eligible width (#354).
 pub(super) const NOTICE_MAX_COLS: usize = 48;
 
 #[cfg(test)]

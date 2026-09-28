@@ -1,26 +1,9 @@
 //! Terminal lifecycle (panic hook, resize) and per-turn env/token setup.
 use super::*;
 
-/// Best-effort kitty keyboard-enhancement negotiation, requesting only
-/// `DISAMBIGUATE_ESCAPE_CODES` -- never event-type/release reporting, which
-/// would flood the per-tick input drain with a keydown+keyup pair for every
-/// keystroke nothing here reads. Without this, a unix terminal sends a plain
-/// `\r` for Shift+Enter and `encode_key`'s Shift+Enter branch can never see
-/// the modifier at all: it is simply not on the wire.
-///
-/// Must run before anything starts reading stdin: `supports_keyboard_enhancement`'s
-/// own docs say it blocks on the same terminal query/reply cycle `event::read`/
-/// `poll` use, so calling it once the dashboard's own event loop (below) has
-/// started would have the two race over the same bytes. Nothing else reads
-/// stdin before `run_dashboard` calls this during setup.
-///
-/// Any probe or push failure is silent and leaves the terminal exactly as it
-/// was -- this is an enhancement, never a requirement, matching this
-/// dashboard's rule that a supervision/UI failure must never make a session
-/// worse. Returns whether the push actually happened, so the caller knows
-/// whether teardown owes the terminal a matching pop. On success also arms
-/// `term::set_kbd_enhanced`, so a panic or an external kill that never
-/// reaches `teardown_terminal` still knows to pop the stack entry it pushed.
+/// Probe before the input loop: the query shares stdin with event reads.
+/// Request only escape disambiguation for Shift+Enter; release events would
+/// flood input. Pop only after success, including on panic; failures are silent.
 pub(super) fn push_keyboard_enhancement() -> bool {
     let pushed = match supports_keyboard_enhancement() {
         Ok(true) => execute!(
@@ -36,22 +19,8 @@ pub(super) fn push_keyboard_enhancement() -> bool {
     pushed
 }
 
-/// Restores the shared terminal on the way out of `run_dashboard`: disables
-/// raw mode, then writes `term::dash_reset_bytes()` -- cursor shown, scroll
-/// region un-fenced, alternate screen left -- to **stdout**, which is the
-/// stream the alternate screen was entered on.
-///
-/// Showing the cursor is not optional and is not implied by leaving the
-/// alternate screen: ratatui hides it on every frame it draws, and
-/// `LeaveAlternateScreen` says nothing about cursor visibility, so before F4
-/// every clean exit handed the operator a shell with an invisible cursor.
-///
-/// Idempotent, and called from every exit arm, matching the `RawGuard`/
-/// `SessionGuard` precedent this plan's Global Constraints call for --
-/// `panic = "abort"` in the release profile means `Drop` is not a safety
-/// net here either. `keyboard_enhancement_pushed` is whatever
-/// `push_keyboard_enhancement` returned during setup -- `false` at any call
-/// site that could not have pushed yet (an abort before that point).
+/// Restore raw mode and reset stdout on every exit; leaving the alternate
+/// screen does not show the cursor, and `panic = "abort"` skips `Drop`.
 pub(super) fn teardown_terminal(keyboard_enhancement_pushed: bool) {
     term::set_dash_active(false);
     let _ = disable_raw_mode();
@@ -75,22 +44,8 @@ pub(super) fn teardown_terminal(keyboard_enhancement_pushed: bool) {
 /// `restore_panic_hook` (which puts it back).
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
-/// Puts the terminal back before the previous hook prints its message and the
-/// process aborts, and hands back the hook it displaced so `restore_panic_hook`
-/// can put exactly that one back. Three things the pre-F4 hook got wrong, all
-/// of which left a panicking dashboard's operator with an unusable console:
-///
-/// 1. Raw mode was never disabled, so the shell that inherited the console
-///    had no echo and no line editing.
-/// 2. It wrote `term::emergency_reset_bytes(false)`, which is the **empty**
-///    slice (see `term.rs`) -- so nothing was reset and the cursor was never
-///    shown again.
-/// 3. It wrote to stderr, but the alternate screen was entered on stdout.
-///
-/// A fourth: if `push_keyboard_enhancement` had succeeded, the kitty
-/// keyboard-enhancement stack entry it pushed was never popped either --
-/// `term::kbd_enhanced()` records whether that push happened, since this
-/// hook is installed before the push and so cannot close over the answer.
+/// Reset raw mode, cursor, stdout's alternate screen and any keyboard stack
+/// entry before the previous hook prints; return that hook for restoration.
 pub(super) fn install_panic_hook() -> Arc<PanicHook> {
     let previous: Arc<PanicHook> = Arc::new(std::panic::take_hook());
     let chained = Arc::clone(&previous);
@@ -107,27 +62,15 @@ pub(super) fn install_panic_hook() -> Arc<PanicHook> {
     previous
 }
 
-/// Puts back the hook that was in place before `install_panic_hook` ran.
-///
-/// N1: every exit arm used to call a bare `std::panic::take_hook()`, which
-/// removes the dashboard's hook but installs **std's default** in its place --
-/// so any hook the process had already chained in before the dashboard opened
-/// (an outer supervisor's terminal restore, a test harness's own) was silently
-/// dropped for the rest of the process's life. Taking and then re-setting the
-/// captured one is what makes the dashboard's hook a genuine push/pop.
+/// Restore the displaced hook; `take_hook()` alone installs the default hook.
 pub(super) fn restore_panic_hook(previous: &Arc<PanicHook>) {
     let _ = std::panic::take_hook();
     let previous = Arc::clone(previous);
     std::panic::set_hook(Box::new(move |info| previous(info)));
 }
 
-/// Dash refresh PR1: THE one effective-width value for `dash.sidebar_cols`
-/// -- `0` (hidden) below 100 total columns unless `forced_visible`, else
-/// the operator's own configured width. Every call site that used to read
-/// `cfg.dash.sidebar_cols` directly for a geometry decision (pty resize,
-/// `ui::layout`, `effective_main`) goes through this instead, so a narrow
-/// terminal and a forced-visible toggle can never disagree about how wide
-/// the sidebar actually is this frame.
+/// Resolve sidebar width once for layout and PTY sizing: hide below 100
+/// columns unless visibility was forced.
 pub(super) fn effective_sidebar_cols(
     cfg: &CtxConfig,
     frame_width: u16,
@@ -151,15 +94,8 @@ pub(super) fn effective_main(area: Rect, sidebar_cols: u16, zoomed: bool) -> Rec
     }
 }
 
-/// Applies a new terminal size: stores it (`term_cols`/`term_rows`/`full`,
-/// which the zoom handler and every `terminal::size` fallback read) and
-/// resizes every pane's pty+parser to this size's effective main geometry.
-///
-/// M6: factored out of the `Event::Resize` arm so the render loop can call it
-/// too. crossterm can coalesce or miss a resize event (a tmux SIGWINCH race, a
-/// conhost buffer change), which used to leave the ptys pinned at the old
-/// geometry forever; the renderer now compares the freshly-queried size to the
-/// stored one every frame and reconciles through here when they differ.
+/// Store terminal size and resize pane PTYs and parsers. The render loop also
+/// checks size because crossterm can coalesce or miss resize events.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_terminal_resize(
     cols: u16,
@@ -178,10 +114,7 @@ pub(super) fn apply_terminal_resize(
     *full = Rect::new(0, 0, cols, rows);
     let m = effective_main(*full, sidebar_cols, zoomed);
     let new_size = (m.height.max(1), m.width.max(1));
-    // MEDIUM (review): a resize is one of the ways a selection's grid
-    // coordinates go stale -- see `cancel_selection_on_resize`. Read before
-    // any pane is actually resized, since it compares against each pane's
-    // *current* size.
+    // Check selection against each pane's current size before resizing it.
     cancel_selection_on_resize(selection, panes, new_size);
     for pane in panes.iter_mut() {
         if let Err(e) = pane.resize(new_size.0, new_size.1) {
@@ -222,20 +155,8 @@ pub(super) fn turn_signal_capable_for(cfg: &CtxConfig, agent_name: &str) -> bool
         .unwrap_or(false)
 }
 
-/// Builds a fresh pane's `turn_env`: the adapter's own turn-signal
-/// registration (or its resolution-failure fallback), the pane's session
-/// identity, and -- security review round (2026-08-28), review of issue
-/// #160's own fix -- the durable interactive-launch pin, ALWAYS pushed here
-/// rather than left to each of the three call sites to remember on their
-/// own. Before this, `fulfill_spawn_request`, `run_dashboard`'s first pane,
-/// and `spawn_restored_pane` each pushed `adapters::launch_mode_pin_env`
-/// separately after calling this function -- three independent chances to
-/// forget the pin, and issue #160 finding 1 was exactly that: the third
-/// occurrence of the forgotten-pin bug class. `mode` is now a MANDATORY
-/// parameter so a call site that forgets to decide it is a compile error,
-/// not a silently-headless pane; `LaunchMode::Headless` already reads as
-/// "no pin" through `launch_mode_pin_env`, so no separate `Option` is
-/// needed to make "no pin" explicit -- the enum already has that variant.
+/// Build turn environment with session identity and a mandatory launch mode,
+/// so every spawn path carries the same interactive pin policy (#160).
 pub(crate) fn build_turn_env(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -263,19 +184,8 @@ pub(crate) fn build_turn_env(
             );
             let mut env = setup.env;
             env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
-            // Issue #30, item 1: a worker pane's own session identity must
-            // not depend on whether its adapter has a turn-signal mechanism
-            // to register at all. `register_turn_signal` legitimately
-            // returns an empty `env` for an adapter with no such mechanism
-            // (codex today, `capabilities().turn_signal == false`) -- that
-            // silence is correct for the socket/signal env it owns, but it
-            // used to also leave `SESSION_ENV` entirely unset, so any `zirv
-            // ctx send` such a pane ran recorded `identity_or_unknown`'s
-            // `"unknown"` as its sender and had no address of its own for a
-            // reply to be `--to-session`-directed at. A turn-signal-capable
-            // adapter (claude) already sets this as part of its own `setup.
-            // env`, so it is added here only when not already present,
-            // rather than risking a duplicate entry.
+            // Supply session identity even when an adapter has no turn signal;
+            // avoid duplicating an identity already provided by the adapter (#30).
             if !env.iter().any(|(k, _)| k == adapters::SESSION_ENV) {
                 env.push((adapters::SESSION_ENV.to_string(), session_id.to_string()));
             }
@@ -305,13 +215,8 @@ pub(crate) fn build_turn_env(
     }
 }
 
-// Task 10: the spawn-request channel. A pane's own `zirv ctx agent`
-// invocation (inheriting `DASH_REQUESTS_ENV` from its own turn_env, set up
-// below) writes a `spawnreq::SpawnRequest` rather than running headless in
-// the pane's own subshell; this dashboard fulfils it as a fresh worker pane
-// using exactly the composed-prompt recipe `exec::run_with` uses for its own
-// first launch (memory, then mail, then `with_mail_layer`), and answers with
-// a `spawnreq::SpawnAck`.
+// Panes send spawn requests through their inherited channel; the dashboard
+// owns worker launch and preserves prompt order: memory, mail, mail layer.
 
 /// A 16-hex-character capability token for this dashboard's own
 /// spawn-request directory (`spawnreq::request_dir_for`). Freshly minted per
@@ -322,21 +227,9 @@ pub(super) fn spawn_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
 }
 
-/// Security review Finding 1 (2026-08-28): one freshly minted intake
-/// directory for a pane that is about to spawn -- its own capability token,
-/// its own channel, nobody else's. The dashboard drains each pane's channel
-/// separately, so "this request was in that directory" is what identifies the
-/// requesting session; nothing about the requester is ever read out of the
-/// request itself (see `fulfill_spawn_request`'s own lineage gate).
-///
-/// Created eagerly rather than left to `spawnreq::write_request`'s own lazy
-/// `create_private_dir_all`: a pane's `agent::live_join_target` refuses a
-/// `DASH_REQUESTS_ENV` directory that does not exist yet, and would then scan
-/// for another live dashboard instead. A creation failure is therefore
-/// narrated, not fatal -- the pane simply falls back to that scan (finding
-/// this dashboard's own shared channel, where it can still ask for a plain
-/// worker), which is the never-make-it-worse degradation this module holds
-/// everywhere else.
+/// Create each pane's private request directory before spawn so the directory
+/// identifies its requester and `live_join_target` can find it. Failure falls
+/// back to the shared channel.
 pub(super) fn mint_pane_channel(requests_dir: &Path, errors: &mut ErrorLog) -> PathBuf {
     let dir = spawnreq::pane_request_dir_for(requests_dir, &spawn_token());
     if let Err(e) = super::state::create_private_dir_all(&dir) {

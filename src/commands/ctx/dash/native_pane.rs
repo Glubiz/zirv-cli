@@ -1,43 +1,5 @@
 //! Issue #480 (roadmap N11): the native conversation view -- a pure,
-//! deterministic reducer from N03's [`journal::ConversationState`] to a
-//! transcript view model, plus the composer/scroll/status presentation state
-//! that a native pane owns, and two renderers (ratatui and plain text) over
-//! the exact same view model.
-//!
-//! # What lives here and what does not
-//!
-//! Presentation state (scroll, selection, focus, draft, expanded tool calls)
-//! is a separate struct ([`NativePresentation`]) from runtime/session
-//! ownership: [`NativePaneRuntime`] is the one thing in this module that
-//! owns a live session (`runtime::native::InteractiveSession`, itself a
-//! thin handle onto a background thread -- no PTY, no vt100 -- see that
-//! module's own doc comment), and it never touches raw mode itself, only
-//! the same `dash::mod` terminal-setup helpers a wrapped dashboard already
-//! calls (`install_panic_hook`/`enable_raw_mode`/`push_keyboard_
-//! enhancement`/`teardown_terminal`/`restore_panic_hook`, reused verbatim by
-//! [`run_native_dashboard`], never modified).
-//!
-//! [`run_native_dashboard`] is a SEPARATE, additional entry point from
-//! `dash::mod::run_dashboard`: it does not add a `PaneKind` to `dash::mod`'s
-//! existing `Vec<Pane>` (that list, and the ~100 call sites that thread it
-//! through mail sweep/budget accounting/attention projection/restore
-//! roster, stay untouched, so nothing about a wrapped-harness dashboard's
-//! existing behaviour changes). Today a native pane is its own dedicated,
-//! single-pane dashboard mode, opened by `zirv chat --runtime native`
-//! rather than mixed into a multi-pane wrapped dashboard; see the design
-//! note (`docs/design/2026-09-13-native-pane.md`) for exactly what mixed-
-//! pane integration this still owes and why it was scoped out here.
-//!
-//! [`build_transcript`] is the reducer: pure, total, and free of I/O, the
-//! clock or randomness, so replaying the same
-//! [`journal::ConversationState`] (itself already a pure reduction of the
-//! same committed events, however many times they are replayed --
-//! `journal::Journal::replay`) always yields byte-identical
-//! [`TranscriptView`]s. `render_lines`/`render_plain`/`render_native_pane`
-//! are likewise pure functions of a view model and presentation state, so
-//! every rendering behaviour below (unicode/CJK/emoji width, wrapping, a
-//! narrow pane, follow-mode scrolling) is covered by tests that construct a
-//! view model directly and never touch a terminal.
+//! deterministic view of journal state; composer actions are routed through the pane.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,10 +41,9 @@ pub enum ToolOutcomeView {
     Pending,
     /// The effect is in flight.
     Running,
-    /// Never started, and now never will be.
+    /// A cancelled operation has not started and will not start.
     Cancelled,
-    /// Completed with an outcome-unknown result: needs reconciliation before
-    /// any retry (mirrors `journal::ExecutionState::OutcomeUnknown`).
+    /// Outcome-unknown execution requires reconciliation before retry.
     OutcomeUnknown,
     /// A unified diff (`--- `/`+++ `/`@@` markers detected in the result).
     Diff { unified: String },
@@ -145,10 +106,7 @@ pub enum TranscriptItem {
     SessionEnded {
         reason: String,
     },
-    /// PR #531 review finding 4: a marker standing in for `hidden` older
-    /// items dropped by [`cap_transcript_items`] once a transcript grows
-    /// past [`MAX_TRANSCRIPT_ITEMS`]. Always the first item in a capped
-    /// view, never produced by [`build_transcript`] itself.
+    /// Place the truncation marker first so hidden transcript items remain visible as a count (#531).
     Elided {
         hidden: usize,
     },
@@ -256,16 +214,7 @@ pub fn build_transcript(state: &ConversationState) -> TranscriptView {
     TranscriptView { items }
 }
 
-/// PR #531 review finding 4: an unbounded transcript re-rendered from a full
-/// journal replay on every ~150ms dashboard tick eventually re-lays out
-/// (and re-allocates) an ever-growing item list even though only the tail
-/// is ever new. This is the bound: displayed items are capped at
-/// `max_items`, keeping the NEWEST ones (a live conversation cares about
-/// what just happened, not the start), with a single [`TranscriptItem::
-/// Elided`] marker standing in for however many older items were dropped.
-/// A no-op when `view` is already at or under the cap. Pure, so it is
-/// tested directly against a hand-built [`TranscriptView`] rather than
-/// through a live session.
+/// Cap rendered transcript items so repeated journal refresh does not grow layout work without bound (#531).
 pub fn cap_transcript_items(view: TranscriptView, max_items: usize) -> TranscriptView {
     if view.items.len() <= max_items || max_items == 0 {
         return view;
@@ -337,11 +286,7 @@ fn build_tool_call_item(
     }
 }
 
-/// The most recent (highest-sequence) execution record for `tool_call`, if
-/// any. A tool call can have more than one execution row across a retry;
-/// the latest is authoritative for "what is true now", the same rule
-/// `journal::ConversationState::executions` itself keys by `ExecutionId`
-/// rather than `ToolCallId` in order to preserve.
+/// Use the latest execution record for a retried tool call.
 fn latest_execution_for<'a>(
     state: &'a ConversationState,
     tool_call: &ToolCallId,
@@ -500,21 +445,11 @@ pub struct StatusFacts {
     /// Presentation-layer bookkeeping, not a journal fact -- see
     /// [`NativePresentation::note_terminal_reached`].
     pub unread_result: bool,
-    /// PR #531 review finding 5: a non-fatal condition the worker thread
-    /// wants the operator to see (today, only a standing-context compile
-    /// failure -- `runtime::native::InteractiveProgress::Notice`) rather
-    /// than swallowing it silently. Rendered on the status line by
-    /// [`status_line_text`]; `None` on every path that constructs
-    /// `StatusFacts` without a live [`NativePaneRuntime`] behind it.
+    /// Surface nonfatal worker notices in the status area (#531).
     pub notice: Option<String>,
-    /// Operator direction (PR #531 follow-up): the spinner/verb/elapsed/
-    /// token/interrupt-hint line shown while a turn runs -- see
-    /// [`activity_line_text`]. `None` while idle, and on every path that
-    /// constructs `StatusFacts` without a live [`NativePaneRuntime`] behind
-    /// it.
+    /// Show an activity line only while a turn is running (#531).
     pub activity: Option<ActivityFacts>,
-    /// The repository this session is running in -- part of the bottom
-    /// status line (operator direction, PR #531 follow-up).
+    /// Include this session's repository in its status line (#531).
     pub cwd: String,
     /// The checked out branch, read once from `.git/HEAD` at spawn time --
     /// `None` when `repo` is not a git checkout, is in a detached-HEAD
@@ -621,10 +556,7 @@ pub fn status_tone(status: PresentationStatus) -> Tone {
     }
 }
 
-/// Where a composer submission goes, mapping onto N09's queue/steer/
-/// interrupt semantics at the presentation boundary. Never a function of the
-/// composer's own state -- only of `StatusFacts` -- so "what does Enter do
-/// right now" is answerable without inspecting the draft at all.
+/// Choose queue, steer or interrupt from session state, never draft text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitIntent {
     /// No turn is in flight: send immediately as a fresh `Submit`.
@@ -681,8 +613,7 @@ pub struct ComposerState {
     /// `Some(index)` while browsing `history` (0 = most recent); `None`
     /// while editing the live draft.
     pub history_cursor: Option<usize>,
-    /// The draft being edited before history browsing started, restored
-    /// when `history_down` walks past the newest history entry.
+    /// Restore the pre-history draft after moving past the newest history entry.
     history_stash: Option<String>,
     pub queued: Vec<QueuedInput>,
 }
@@ -710,9 +641,7 @@ pub enum ComposerAction {
     ClearLine,
 }
 
-/// What [`apply_composer_action`] did, for a caller that needs to know
-/// whether a submit actually happened (and what text it carries) without
-/// re-inspecting `draft` (already cleared by the time it returns).
+/// Return submit text directly because submission clears the draft.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComposerOutcome {
     Changed,
@@ -901,15 +830,8 @@ fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Operator direction (PR #531 follow-up): `Ctrl+C` no longer interrupts a
-/// turn by itself -- `Esc` owns that now (see `run_native_dashboard`'s own
-/// key contract). A single `Ctrl+C` only arms a quit confirmation; the pane
-/// quits only when a SECOND `Ctrl+C` lands within `window` of the first.
-/// Pure so the arming/window arithmetic is unit-testable without a real
-/// terminal loop -- `run_native_dashboard` is the only caller, tracking
-/// `last_press` as its own local `Option<Instant>`, replaced with `Some(now)`
-/// on every `Ctrl+C` that does not itself confirm a quit and cleared by any
-/// other key.
+/// Esc interrupts; Ctrl+C quits only on a second press within the window,
+/// preventing one accidental keypress from ending a live turn (#531).
 fn ctrl_c_confirms_quit(
     last_press: Option<std::time::Instant>,
     now: std::time::Instant,
@@ -938,22 +860,7 @@ fn toggle_most_recent_tool_call(pane: &mut NativePaneRuntime) {
     }
 }
 
-/// Operator direction (PR #531 follow-up): a submission that IS a
-/// recognised slash command, handled entirely here rather than sent as a
-/// turn. `/clear` has a real effect (drops the queued backlog); `/help` is
-/// informational; `/compact` is an honest inert stub -- wiring it to the
-/// real compaction envelope needs facts (`NativeSessionConfig`'s own
-/// budget) the pane does not hold today, see the design note. `/status` and
-/// `/context`/`/instructions` need live facts (`StatusFacts`/`context_view_
-/// facts`) this pure function cannot produce, so `NativePaneRuntime::
-/// handle_composer_action` handles both directly instead of routing through
-/// here.
-///
-/// Returns `Some(notice)` for a recognised command (`notice` may be empty,
-/// e.g. `/clear`, which has nothing to report), `None` for anything else --
-/// including a `/`-prefixed line this list does not recognise, which falls
-/// through to the normal submit path as ordinary text rather than being
-/// silently swallowed.
+/// Handle recognized slash commands locally rather than sending them as turns (#531).
 fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Option<String> {
     match text.trim() {
         "/clear" => {
@@ -969,10 +876,7 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
         "/compact" => {
             Some("/compact is not yet wired to the native pane's compaction envelope".to_string())
         }
-        // Issue #538 (chunk C): `/context`/`/instructions` need this pane's
-        // own live journal, so -- same shape of exception as `/status` --
-        // `NativePaneRuntime::handle_composer_action` handles them directly
-        // (`context_view_facts`) rather than through this pure helper.
+        // Read context commands from this pane's live journal (#538).
         _ => None,
     }
 }
@@ -1114,15 +1018,7 @@ pub enum PaneFocus {
     Composer,
 }
 
-/// Operator direction (PR #531 follow-up): a `Shift+Tab`-cycled composer
-/// mode label, the same idea Claude Code's own CLI shows above its prompt.
-/// **Decorative only, today**: no submit path reads this back to change
-/// approval or tool-write behaviour -- an `AcceptEdits`/`Plan` mode that
-/// actually gated the execution broker would be a policy change at the
-/// enforcement layer, out of scope for a rendering/key-contract pass (see
-/// the design note). Shown on the composer's own hint line so the key
-/// binding is visibly real even while the behaviour it will eventually
-/// drive is not wired yet.
+/// The cycled composer mode label is decorative and does not change submission behavior (#531).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ComposerMode {
     #[default]
@@ -1168,18 +1064,10 @@ pub struct NativePresentation {
     /// `Shift+Tab`-cycled, decorative only -- see [`ComposerMode`]'s own
     /// doc comment.
     pub mode: ComposerMode,
-    /// Issue #490: the worktree the `@` picker is allowed to offer paths
-    /// from. `None` disables the picker entirely rather than falling back to
-    /// the process's current directory -- a pane with no declared worktree
-    /// must not be able to complete a path outside one.
+    /// Disable path picking without an explicit pane repository; never fall back to process cwd (#490).
     pub workdir: Option<PathBuf>,
-    /// Review finding 3 (PR #544): true when this pane attached to a
-    /// runtime-owned session without the controller seat -- either
-    /// `RuntimeLink::attach` was refused outright, or it succeeded but
-    /// another client already holds control. A read-only pane offers no
-    /// send/steer/approve at all rather than attempting one that the
-    /// server's own controller check would refuse anyway; the composer's
-    /// hint line says so. Always `false` for an in-process pane.
+    /// Without the runtime's controller seat, this pane must remain an observer;
+    /// its composer cannot submit or steer turns (#544).
     pub observer: bool,
 }
 
@@ -1570,8 +1458,7 @@ fn take_columns(text: &str, budget: usize) -> (&str, &str) {
     (&text[..end], &text[end..])
 }
 
-/// The bullet operator direction (PR #531 follow-up) puts in front of every
-/// assistant text block and tool call, Claude Code style.
+/// Prefix assistant text and tool calls with the transcript bullet (#531).
 const BULLET: &str = "⏺";
 /// The indented tree marker a tool call's own result line hangs off, one
 /// level under [`BULLET`].
@@ -1609,12 +1496,7 @@ fn with_marker(marker: &str, tone: Tone, mut lines: Vec<StyledLine>) -> Vec<Styl
 pub fn render_item(item: &TranscriptItem, expanded: bool) -> Vec<StyledLine> {
     match item {
         TranscriptItem::User { text, steering, .. } => {
-            // Operator direction (PR #531 follow-up): user turns render as
-            // `>` lines. A per-line shaded background is deferred -- the
-            // shared `Tone`/`StyledSpan` model this renderer and the plain-
-            // text one both use carries no per-line background today, and
-            // adding one is a crate-wide change well past this pane's own
-            // scope (see the design note).
+            // Render user turns as quoted lines (#531).
             let marker = if *steering { "> (steering)" } else { ">" };
             with_marker(marker, Tone::Muted, markdown_lines(text))
         }
@@ -1704,14 +1586,7 @@ fn outcome_summary(outcome: &ToolOutcomeView) -> (&'static str, Tone, String) {
     }
 }
 
-/// Operator direction (PR #531 follow-up): a tool call is a `⏺ name(args)`
-/// bullet header followed by one indented `⎿` tree line summarising the
-/// result, with "(ctrl+r to expand)" on the tree line while collapsed and
-/// an outcome with more to show (a pending/running/cancelled outcome never
-/// gets more detailed by expanding it, so no hint is offered for those).
-/// Expanding replaces the hint with the full classified outcome body,
-/// indented one level further under the tree line -- unchanged from the
-/// pre-restyle layout's own column 4.
+/// Render tool calls with a result tree and expansion hint (#531).
 fn render_tool_call(
     name: &str,
     arguments_preview: &str,
@@ -1790,10 +1665,7 @@ fn parse_hunk_header(line: &str) -> Option<(u64, u64)> {
     Some((old_start, new_start))
 }
 
-/// Renders a unified diff with an old/new line-number gutter and coloured
-/// +/- rows (operator direction, PR #531 follow-up). Pure and total: a line
-/// outside any parsed hunk (before the first `@@` header, or a header this
-/// parser cannot read) gets no gutter numbers rather than a guess.
+/// Render diff hunks with old and new line gutters; lines outside hunks stay total (#531).
 fn render_diff_lines(unified: &str) -> Vec<StyledLine> {
     let mut old_line: Option<u64> = None;
     let mut new_line: Option<u64> = None;
@@ -1891,12 +1763,7 @@ pub fn render_lines(view: &TranscriptView, presentation: &NativePresentation) ->
     lines
 }
 
-/// [`render_lines`] plus, when `activity` is `Some`, one final line showing
-/// it -- operator direction (PR #531 follow-up): the spinner/verb/elapsed/
-/// token/interrupt-hint line shown while a turn runs. Appended to the
-/// transcript's own content rather than a separately reserved row, so it
-/// scrolls and wraps exactly like everything else and follow-mode (already
-/// "stay at the bottom") keeps it in view for free.
+/// Append the activity line after transcript lines only while a turn runs (#531).
 pub fn render_lines_with_activity(
     view: &TranscriptView,
     presentation: &NativePresentation,
@@ -1953,11 +1820,7 @@ pub fn status_line_text(facts: &StatusFacts) -> String {
         glyph = status_glyph(status),
         label = status_label(status),
     );
-    // Operator direction (PR #531 follow-up): context-left%, cwd and git
-    // branch join the bottom status line, in that order, each omitted
-    // (rather than shown as a placeholder) when unknown -- "unknown, not a
-    // guess", the same convention `resolve_billing` already documents for
-    // this same struct's other fields.
+    // Omit unavailable status facts instead of drawing placeholders (#531).
     if let Some(pct) = facts.context_left_pct {
         line.push_str(&format!("  context left {pct}%"));
     }
@@ -1989,10 +1852,7 @@ pub fn render_native_pane(
     }
     let width = area.width as usize;
     let composer = composer_block(presentation, facts, width);
-    // The in-flight activity line (spinner frame, rotating verb, elapsed
-    // time, token total, "esc to interrupt") is the head's
-    // `activity_line_text`, rendered with the transcript by
-    // `render_lines_with_activity` -- issue #490 does not add a second one.
+    // Render the in-flight activity line from current turn facts (#531).
     let composer_rows = (composer.len() as u16).min(area.height.saturating_sub(1));
     let status_rows: u16 = 1;
     let transcript_height = area
@@ -2071,12 +1931,7 @@ fn render_styled(f: &mut Frame, area: Rect, lines: &[StyledLine]) {
     f.render_widget(Paragraph::new(text), area);
 }
 
-/// Issue #490: the whole native dashboard frame -- the conversation pane, the
-/// agent/task overview beside it, the usage/health provenance strip beneath
-/// it, and whichever modal (approval dialog, shortcut list, worker
-/// inspection) is open. Which of those exist at all is
-/// [`super::native_ux::resolve_layout`]'s decision, so the same code draws
-/// 40, 80, 120 and 200 columns with no size-specific branches of its own.
+/// Compose conversation, overview, usage strip and modal in one native frame (#490).
 pub fn render_native_dashboard(
     f: &mut Frame,
     area: Rect,
@@ -2225,9 +2080,7 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     } else {
         String::new()
     };
-    // Review finding 3 (PR #544): an observer pane offers no send/steer/
-    // approve at all -- the hint line says so instead of naming keys that
-    // would only queue input no one is going to deliver.
+    // Observer hints must not advertise send, steer or approve controls they cannot use (#544).
     if presentation.observer {
         return format!(
             "? for shortcuts \u{b7} observer: read-only, the controller seat is held elsewhere{queued_note}"
@@ -2240,17 +2093,10 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
     )
 }
 
-/// How many completion rows the `/`, `@` and `!` entry modes may show.
-/// Issue #541 chunk C bumped this from 6 to 7 alongside `/agent`/`/agents`/
-/// `/team`; issue #538 chunk C bumped it to 9 for `/context`/`/instructions`;
-/// issue #542 chunk 3b bumped it to 11 for `/workflow`/`/workflows`, so a
-/// bare `/` still shows every slash command at once.
+/// Bound completion rows so entry-mode lists fit the composer.
 pub const COMPLETION_ROWS: usize = 11;
 
-/// Issue #490: the bordered composer, its hint line, and -- when the draft
-/// starts an entry mode -- the completion list above it. The box is drawn
-/// here rather than with a ratatui `Block` so `render_plain` and every
-/// deterministic test below see exactly the same characters a terminal does.
+/// Draw composer and completion list inside the pane's own region (#490).
 pub fn composer_block(
     presentation: &NativePresentation,
     facts: &StatusFacts,
@@ -2327,15 +2173,8 @@ pub fn composer_block(
     out
 }
 
-/// Issue #490 (N21, operator direction): the mock's hint line, three columns
-/// spread across the composer's own width -- `? for shortcuts` hard left, the
-/// mode and what `Enter` does centred, `\u{29d7} N queued` hard right and only
-/// when something IS queued.
-///
-/// Laid out here rather than by the renderer so the exact character positions
-/// are asserted by a deterministic test at every terminal width the mock
-/// draws, and so `render_plain` and a real terminal cannot disagree about
-/// them.
+/// Lay out hint columns before rendering so plain output and the terminal
+/// place them at identical character positions across widths (#490).
 fn composer_hint_row(
     presentation: &NativePresentation,
     facts: &StatusFacts,
@@ -2449,45 +2288,16 @@ pub fn render_plain(
 pub struct NativeDashboardSpec {
     pub repo: PathBuf,
     pub role: String,
-    /// A CANDIDATE route name OR model alias -- not a guaranteed route.
-    /// `dash::mod.rs`'s worker spawn path feeds a delegation's own model
-    /// alias in here already; issue #703 adds `chat::native_pane_spec`,
-    /// which feeds it the harness proxy's decided model. Both are
-    /// harness-CLI-style aliases (`"sonnet"`, `"opus"`, ...) that select a
-    /// route either by naming it directly (`NativeConfig::routes`) or, more
-    /// commonly, by resolving to the SAME catalogue model as one of the
-    /// allowed routes' own configured `model` -- `NativePaneRuntime::spawn`'s
-    /// own `resolve_native_route` does both checks before this ever reaches
-    /// `InteractiveRequest::route`, and falls back to `None` (the role's own
-    /// default route) for anything that resolves to neither, rather than
-    /// failing the launch.
+    /// Treat a route or model alias as a candidate until native configuration validates it (#703).
     pub route: Option<String>,
-    /// Whether this session should hold a writer permit for `repo` -- see
-    /// `runtime::native::InteractiveRequest::writing`. A plain `zirv chat
-    /// --runtime native` is the operator's own seat, the same as the
-    /// orchestrator pane of a wrapped dashboard, so it is always `true`
-    /// from `chat.rs`'s own call; a future read-only spawn path (a native
-    /// reviewer pane, say) would pass `false`.
+    /// Request a writer permit only for a writable native session.
     pub writing: bool,
-    /// `runtime::native::InteractiveRequest::provider`'s own escape hatch,
-    /// threaded through so a deterministic test can open a REAL native pane
-    /// against `fixture::FixtureProvider` instead of the operator's native
-    /// provider configuration. `None` on every production call site, which
-    /// resolves the real configuration exactly as before this field existed.
+    /// Allow a fixture provider only through the explicit interactive request escape hatch.
     pub provider: Option<String>,
-    /// Issue #552: the SEAT this pane is taking over, as
-    /// `(short, generation)` -- set only by a rollover successor
-    /// (`dash::PaneSuccessorLauncher`). It keeps the seat's stable short id
-    /// and runs under the generation `seat::commit` promoted. It also forces
-    /// the in-process spawn: a successor is a NEW conversation under a
-    /// committed generation, never an attach to whatever a persistent runtime
-    /// already holds for this repository.
+    /// A rollover successor takes the committed seat short ID and generation (#552).
     pub seat: Option<(String, u64)>,
-    /// Issue #552: what the successor is told first -- the handoff packet,
-    /// every acknowledged input the source never delivered, and the
-    /// reconciliation it is halted on. Submitted as this session's first
-    /// turn, which is the only way a fresh native conversation can be handed
-    /// what the source still owed.
+    /// Submit handoff and acknowledged pending inputs as the successor's first
+    /// turn; a fresh native conversation has no earlier turn to receive them (#552).
     pub initial_input: Option<String>,
 }
 
@@ -2516,15 +2326,7 @@ pub fn resolve_billing(route: &RouteIdentity, repo: &Path) -> String {
     }
 }
 
-/// Best-effort checked-out branch for `repo`, read directly from `.git/
-/// HEAD` rather than shelling out to `git` -- this pane polls on a ~150ms
-/// tick, and spawning a process that often is not acceptable (operator
-/// direction, PR #531 follow-up). `None` when `repo` is not a git checkout,
-/// is in a detached-HEAD state, or its `.git` is a worktree link this
-/// cannot resolve -- "unknown, not a guess", the same convention
-/// [`resolve_billing`] already documents. Called once at spawn time (the
-/// checked-out branch essentially never changes for the life of one chat
-/// session), never per-tick.
+/// Read branch from git HEAD without spawning a process on the fast pane tick.
 fn git_branch(repo: &Path) -> Option<String> {
     let git_path = repo.join(".git");
     let head_path = if git_path.is_dir() {
@@ -2583,12 +2385,7 @@ const ACTIVITY_VERBS: [&str; 6] = [
     "Reticulating",
 ];
 
-/// Operator direction (PR #531 follow-up): the activity line shown while a
-/// turn runs -- a spinner frame, a rotating verb, real elapsed time and a
-/// running token total, ending with the interrupt hint. Pure and total:
-/// `elapsed`/`tokens` are the caller's own (`NativePaneRuntime::
-/// activity_line`), so this is directly testable without a live session or
-/// a wall clock.
+/// Show spinner, elapsed time, token total and interrupt hint while a turn runs (#531).
 pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64, width: usize) -> String {
     let millis = elapsed.as_millis() as u64;
     let spinner = ACTIVITY_SPINNER_FRAMES[(millis / 120) as usize % ACTIVITY_SPINNER_FRAMES.len()];
@@ -2627,15 +2424,7 @@ pub fn activity_line_text(elapsed: std::time::Duration, tokens: u64, width: usiz
     spinner.to_string()
 }
 
-/// Issue #490 (PR #545 review finding 1): the inputs an activity line is
-/// rendered from, carried on [`StatusFacts`] instead of a pre-rendered
-/// string.
-///
-/// The line is width-aware now, and the width belongs to whoever is drawing --
-/// `render_native_pane` and `render_plain` each know theirs, and
-/// `NativePaneRuntime::status_facts` knows none. Carrying the facts rather
-/// than the text is what lets both renderers narrow correctly from one place,
-/// instead of one of them wrapping a string the other had already baked.
+/// Carry raw activity facts so rendering can truncate to available width (#490).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActivityFacts {
     pub elapsed: std::time::Duration,
@@ -2644,22 +2433,7 @@ pub struct ActivityFacts {
     pub tokens: u64,
 }
 
-/// Issue #490 (N21 item B): the dialog's request, built from the enforcement
-/// broker's OWN request -- the one whose `scope_digest` the grant is signed
-/// against.
-///
-/// Nothing here re-derives or widens the scope: the tool name and the paths
-/// come straight off `ExecutionAction`/`resolved_paths`, so the dialog can
-/// never describe less authority than the grant actually carries. No
-/// directory widening is offered at all, because the digest is the exact
-/// thing a session-scoped "don't ask again" remembers, and inventing a
-/// directory the request never carried is precisely what
-/// `native_ux::detect_pending_approval` already refuses to do.
-///
-/// It lives here, not in `dash::native_ux`, for review finding 8's own
-/// reason (PR #544): that module is a view model over durable records and
-/// keeps no `enforcement` dependency. This module is the one that owns an
-/// `enforcement::ApprovalPrompt`, and this is its only caller.
+/// Build approval dialog from the broker's own request and scope digest, never reconstructed authority (#490).
 fn dialog_request_from_broker(
     request: &super::super::runtime::enforcement::ApprovalRequest,
     actor: impl Into<String>,
@@ -2740,14 +2514,10 @@ fn token_text(tokens: u64) -> String {
     }
 }
 
-/// Issue #490 (N20 integration): where a native pane's conversation actually
-/// lives.
+/// Select the owner or runtime transport for the native conversation (#490).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaneAttach {
-    /// This process owns it -- `runtime::native::spawn_interactive`, a
-    /// background thread, a journal handle of our own. The mode every native
-    /// pane used before the persistent runtime existed, and still the mode
-    /// whenever the operator has not opted in.
+    /// A locally owned session runs in this process with its own journal.
     InProcess,
     /// The persistent runtime owns it; the pane is a protocol v1 client
     /// (`dash::link::RuntimeLink`). Opening a second in-process session for
@@ -2806,16 +2576,11 @@ pub struct NativePaneRuntime {
     session_state: NativeSessionState,
     turn_state: Option<NativeTurnState>,
     billing: String,
-    /// Issue #490: the multi-agent/attention/rollover surfaces around this
-    /// one conversation -- the overview, the usage strip, notices, the
-    /// approval dialog and the worker inspection. All of it is a view model
-    /// over durable records; see `dash::native_ux`.
+    /// Keep native overview, usage, notices and approvals adjacent to the conversation (#490).
     ux: super::native_ux::UxState,
     repo: PathBuf,
     state: StateDir,
-    /// Issue #490 (item 4): what must survive a compaction, a rollover or a
-    /// reconnect, and the guard that refuses a submission aimed at a retired
-    /// generation.
+    /// Preserve presentation across reconnect or rollover, and reject submissions to retired generations (#490).
     continuity: super::native_ux::Continuity,
     /// Consecutive journal replay failures, so a recovery can be announced as
     /// a reconnect rather than passing unnoticed.
@@ -2831,16 +2596,9 @@ pub struct NativePaneRuntime {
     /// Set once an `InteractiveProgress::Ended` is observed; the dashboard
     /// loop's own cue to stop.
     pub ended: bool,
-    /// PR #531 review finding 5: the most recent `InteractiveProgress::
-    /// Notice`, surfaced on the status line. `None` until the worker thread
-    /// sends one; never cleared automatically -- a notice describes a
-    /// degraded session for as long as that session runs, not a one-off
-    /// toast.
+    /// Retain the newest nonfatal progress notice until replaced (#531).
     notice: Option<String>,
-    /// Operator direction (PR #531 follow-up): when the current turn
-    /// started, for the activity line's elapsed-time reading -- `None`
-    /// while idle. Set the first time `tick()` observes `Busy` for a turn
-    /// and cleared on `Idle`/`Failed`/`Ended`.
+    /// Record turn start once to keep activity elapsed time stable (#531).
     turn_started_at: Option<std::time::Instant>,
     stop_state: NativeStopState,
     /// The repo this pane is running in, for the bottom status line.
@@ -2848,10 +2606,7 @@ pub struct NativePaneRuntime {
     /// The checked-out branch, read once at spawn time -- see `git_branch`'s
     /// own doc comment for why this is not re-read every tick.
     git_branch: Option<String>,
-    // -- issue #490 (N20 integration): identity and transport ------------
-    /// The seat's short id, the journal session and the generation this pane
-    /// answers for. Held directly rather than read back off `session`,
-    /// because a runtime-attached pane HAS no local `InteractiveSession`.
+    // Keep seat short ID, journal session and generation even for runtime-attached panes with no local session (#490).
     short: String,
     session_id: JournalSessionId,
     generation: u64,
@@ -2868,17 +2623,10 @@ pub struct NativePaneRuntime {
     /// The journal cursor this pane has consumed through, so a reconnect
     /// carries on rather than re-reading the conversation.
     link_cursor: u64,
-    /// Review finding 6 (PR #544): a monotonic counter mixed into every
-    /// [`Self::next_idempotency_key`], so two submits minted in the same
-    /// millisecond never collide.
+    /// Mix a monotonic sequence into each idempotency key to prevent same-millisecond collision (#544).
     idempotency_seq: u64,
-    /// Issue #490 (N21 item B): the LIVE approval request this pane's own
-    /// in-process broker is blocked on, held for exactly as long as the dialog
-    /// is open. `Some` means a tool call is parked on the operator right now;
-    /// answering it consumes the prompt, so a decision is applied once and
-    /// only once. Always `None` for a runtime-attached pane (which answers
-    /// over the protocol) and therefore for an observer pane, which holds no
-    /// in-process session to block in the first place.
+    /// Hold a live approval only while its tool call waits; consuming the
+    /// prompt applies one decision once. Runtime-attached observers have none (#490).
     live_approval: Option<super::super::runtime::enforcement::ApprovalPrompt>,
     #[cfg(test)]
     journal_payload_reads: usize,
@@ -2894,35 +2642,7 @@ enum NativeStopState {
 
 const STOP_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Issue #703: validates `spec.route`'s candidate against the operator's own
-/// native provider configuration -- the SAME `NativeConfig` `resolve_billing`/
-/// `runtime::native::build_transport` already read -- before it ever reaches
-/// `InteractiveRequest::route`. `build_transport`'s own lookup hard-fails a
-/// route name that is not configured or not policy-allowed (`"unknown native
-/// route"`), which is the right answer for an operator's own explicit
-/// `--route`, but not for a candidate nobody asked for by name: a harness
-/// proxy decision's model (`"sonnet"`, `"opus"`, ...) or a delegation's own
-/// model alias are native-runtime-agnostic and only sometimes also happen to
-/// name a real route.
-///
-/// A candidate that IS itself an allowed, configured route name is used
-/// as-is. Otherwise -- the common case, since the proxy's harness-CLI-style
-/// aliases and an operator's own route names are independent vocabularies,
-/// so the exact-name match above almost never fires -- this resolves the
-/// candidate to a catalogue model (the SAME `provider/inventory.rs::
-/// resolve_model` that `NativeConfig::validate` itself uses to check every
-/// route's own `model` field, run once per allowed route under THAT route's
-/// own vendor) and picks the allowed route whose own configured `model`
-/// resolves to that same catalogue model: an operator who named a route
-/// `cheap` with `model = "sonnet"` still gets it picked for a decided
-/// `"sonnet"`, without also having to name the route `sonnet`. Several
-/// matching routes prefer the role's own default (`[roles].<role>`) when it
-/// is one of them, else the first by `RouteId` order -- `NativeConfig::
-/// routes` is a `BTreeMap`, so TOML declaration order is not recoverable,
-/// and route-id order is the only deterministic order left. No match at all
-/// -- blank, or nothing configured/allowed resolves to the same model --
-/// falls back to `None`: the role's own default route, exactly what a native
-/// launch resolved to before this seam existed.
+/// Resolve a candidate to an allowed route by exact route ID or catalogue model; prefer the role default among matches, then RouteId order. Use the role default when none match (#703).
 fn resolve_native_route(candidate: Option<&str>, role: &str, repo: &Path) -> Option<String> {
     use super::super::provider::RouteId;
     use super::super::provider::config::NativeConfig;
@@ -2998,8 +2718,7 @@ impl NativePaneRuntime {
         let billing = resolve_billing(&session.route, &spec.repo);
         let git_branch = git_branch(&spec.repo);
 
-        // Issue #490: the `@` picker may only ever offer paths from this
-        // pane's own repository.
+        // Restrict the path picker to this pane's own repository (#490).
         let mut presentation = NativePresentation {
             workdir: Some(spec.repo.clone()),
             ..NativePresentation::default()
@@ -3013,10 +2732,7 @@ impl NativePaneRuntime {
             generation: session.handle.generation,
         });
 
-        // Issue #552: what the source still owed, handed to the successor as
-        // its first turn. Submitted AFTER the opening replay, so this pane is
-        // fully built before a turn can start under it; the pane re-reads the
-        // journal every tick, so the input appears on the next one.
+        // Submit carried source inputs only after the successor is built and its opening replay completes (#552).
         if let Some(initial) = spec.initial_input.as_deref()
             && !initial.trim().is_empty()
         {
@@ -3062,12 +2778,7 @@ impl NativePaneRuntime {
         })
     }
 
-    /// Issue #490: a pane over a conversation the persistent runtime already
-    /// owns. Nothing is spawned: the journal is the same durable SQLite file
-    /// the runtime writes, so the transcript reducer is unchanged, and every
-    /// ACTION (submit, steer, interrupt, approve) goes out over protocol v1
-    /// instead of into a local session -- see [`Self::send_submit`],
-    /// [`Self::interrupt`] and [`Self::decide_approval`].
+    /// Attach to the runtime-owned journal without spawning a second session (#490).
     pub fn attach_runtime(
         state: &StateDir,
         mut link: super::link::RuntimeLink,
@@ -3090,14 +2801,7 @@ impl NativePaneRuntime {
         };
         load_draft(state, &facts.short).restore_onto(&mut presentation.composer);
 
-        // Review finding 3 (PR #544): register this pane as the session's
-        // controller instead of relying on the server's "nobody attached
-        // yet" bypass in `native_controller_check`, which stops applying
-        // silently the moment any other client attaches. A refusal, or a
-        // non-controller outcome, falls back to observer mode: no
-        // send/steer/approve is offered (`composer_hint_line`,
-        // `send_submit`, `interrupt`, `decide_approval`), and the failure is
-        // surfaced as a notice rather than swallowed.
+        // Explicitly register controller ownership before sending, even when no other controller is attached (#544).
         let mut attach_notice = None;
         match link.attach(&facts.session_id, true) {
             Ok(attachment) => {
@@ -3231,10 +2935,7 @@ impl NativePaneRuntime {
     /// idempotency key, so a reconnect that resends cannot start a second
     /// turn), the in-process channel otherwise.
     fn send_submit(&mut self, text: &str) {
-        // Review finding 3 (PR #544): an observer pane (no controller seat)
-        // never attempts a send -- the server would refuse it anyway, and
-        // attempting it silently would contradict the hint line that just
-        // told the operator this pane is read-only.
+        // An observer without controller ownership cannot send or steer (#544).
         if self.link.is_some() && self.presentation.observer {
             self.notice = Some(
                 "submit unavailable: this pane holds no controller seat (observer mode)"
@@ -3244,12 +2945,7 @@ impl NativePaneRuntime {
         }
         if self.link.is_some() {
             let session_id = self.session_id.to_string();
-            // Review finding 6 (PR #544): `short-{now_ms}` alone can
-            // collide within the same millisecond (two queued sends
-            // draining back to back, or a fast double-Enter). Append a
-            // per-pane monotonic counter so two keys minted in the same
-            // tick are always distinct. Computed before borrowing
-            // `self.link` mutably below, since it needs `&mut self` too.
+            // Add a per-pane sequence to millisecond-based request IDs to prevent collisions (#544).
             let key = self.next_idempotency_key();
             if let Some(link) = self.link.as_mut()
                 && let Err(error) = link.submit(&session_id, text, Some(&key))
@@ -3261,18 +2957,13 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Review finding 6 (PR #544): this pane's own idempotency identity for
-    /// [`Self::send_submit`] -- `short-now_ms-seq`, where `seq` is a
-    /// monotonic counter that makes two keys minted in the same millisecond
-    /// distinct even though `now_ms()` alone would not.
+    /// Mint idempotency keys with a monotonic sequence so rapid submissions remain distinct (#544).
     fn next_idempotency_key(&mut self) -> String {
         self.idempotency_seq = self.idempotency_seq.wrapping_add(1);
         format!("{}-{}-{}", self.short, now_ms(), self.idempotency_seq)
     }
 
-    // -- issue #490 (N21 item A): what a `dash::pane::Pane` asks a native
-    //    driver for, so a native pane can live in the ordinary dashboard's
-    //    pane vector beside wrapped ones. -----------------------------------
+    // Expose only the native driver facts and actions the ordinary dashboard pane needs (#490).
 
     /// The seat short id this pane answers at -- its mail/nudge address, and
     /// the id the restore roster and the budget/attention sweeps key on. The
@@ -3291,21 +2982,17 @@ impl NativePaneRuntime {
         self.generation
     }
 
-    /// Where this conversation lives -- see [`PaneAttach`]. A runtime-owned
-    /// pane is detached on shutdown rather than stopped, which is exactly
-    /// what a restore needs to know.
+    /// Detach runtime-owned sessions on shutdown; locally owned sessions can be stopped.
     pub fn attach(&self) -> &PaneAttach {
         &self.attach
     }
 
-    /// The journal sequence this pane has rendered through. The dashboard's
-    /// drain uses it as "did anything change this tick" without needing to
-    /// know anything else about the conversation.
+    /// Use rendered journal sequence to detect native output changes without replaying for comparison.
     pub fn last_sequence(&self) -> u64 {
         self.conversation.last_sequence.0
     }
 
-    /// Whether a turn is running right now.
+    /// Report whether the native turn is currently running.
     pub fn busy(&self) -> bool {
         !matches!(self.stop_state, NativeStopState::Active)
             || matches!(self.session_state, NativeSessionState::Running)
@@ -3345,13 +3032,8 @@ impl NativePaneRuntime {
         self.recorded_usage
     }
 
-    /// Issue #490 (N21 item A): the mail sweep's delivery path for a native
-    /// pane. A wrapped pane is typed into and then submitted with a carriage
-    /// return; a native pane has no composer to type into, so the message
-    /// goes through the SAME submit path the operator's own Enter uses --
-    /// which means it is subject to the same rollover/generation guard
-    /// (`resolve_submit_target`) and can never be written into a retired
-    /// generation.
+    /// Deliver mail through the same guarded submit path as operator Enter;
+    /// it must never write into a retired seat generation (#490).
     pub fn deliver(&mut self, label: &str, body: &str) -> CtxResult<()> {
         if self.has_draft() {
             return Err("native pane: operator draft is still being composed".into());
@@ -3414,13 +3096,7 @@ impl NativePaneRuntime {
                 queued,
             } = self.continuity.carry_across(next)
             {
-                // Review finding 1 (PR #544): `carry_across` only updates
-                // `self.continuity.seat` -- this pane's OWN identity
-                // (`self.session_id`/`self.generation`, read by every tick's
-                // journal replay, link polling and `current_identity`'s own
-                // guard) must be resynced too, or `resolve_submit_target`
-                // disagrees with `continuity.seat` forever after the first
-                // rollover. See `apply_retarget`.
+                // Resync pane session ID and generation when continuity moves to a new seat (#544).
                 self.apply_retarget(&to_session, generation);
                 self.ux.notices.push(super::native_ux::Notice {
                     kind: super::native_ux::NoticeKind::Rollover,
@@ -3572,13 +3248,7 @@ impl NativePaneRuntime {
             );
             return;
         }
-        // Review finding 2 (PR #544): route through the same current-session
-        // guard a composer submit uses (finding 1) rather than calling
-        // `delegation::send` unconditionally. `delegation::send` addresses
-        // its target by the worker's short id through the shared mailbox,
-        // not by this pane's own session/generation, so it cannot itself
-        // tell a live pane from a stale one -- that is this pane's own
-        // identity to know, not the mail path's.
+        // Apply the current-generation guard to mail just as to composer submissions (#544).
         if let super::native_ux::SubmitTarget::Hold { reason } =
             super::native_ux::resolve_submit_target(&self.continuity, &self.current_identity())
         {
@@ -3629,14 +3299,7 @@ impl NativePaneRuntime {
             request.scope_text()
         );
         match route {
-            // Issue #490 + N20: a runtime-owned conversation's decision goes
-            // to the service that is actually holding the request open, by
-            // ITS request id -- the dashboard never mints a grant of its own,
-            // and a note carries the "tell the agent what to do differently"
-            // text of a denial.
-            // Review finding 3 (PR #544): an observer pane holds no
-            // controller seat -- approving or denying is not offered at
-            // all, per the same rule as submit/steer/interrupt.
+            // Route runtime approvals by the service's own request ID; the dashboard never grants on its behalf (#490).
             ApprovalRoute::Protocol if self.presentation.observer => {
                 self.notice = Some(
                     "approval unavailable: this pane holds no controller seat (observer mode)"
@@ -3660,27 +3323,14 @@ impl NativePaneRuntime {
                     self.notice = Some(format!("approval refused by the runtime: {error}"));
                 }
             }
-            // Review finding 3 (PR #544), extended to the broker route by
-            // issue #490's own live-approval path: an observer pane holds no
-            // controller seat, so consent is not its to give by EITHER route.
-            // A live prompt is deliberately left parked rather than answered
-            // or dropped -- the controller's own pane still holds it, and a
-            // tool call that fails closed because a bystander said no is
-            // exactly the outcome observer mode exists to prevent.
+            // Observers without controller ownership cannot approve through either runtime or local broker (#544).
             ApprovalRoute::Broker if self.presentation.observer => {
                 self.notice = Some(
                     "approval unavailable: this pane holds no controller seat (observer mode)"
                         .to_string(),
                 );
             }
-            // The in-process broker. Issue #490 (N21 item B): when a LIVE
-            // request is held, the decision goes straight back to the tool
-            // call that is blocked on it -- Yes releases it once,
-            // "don't ask again" also remembers this exact scope for the rest
-            // of the session, and No fails the call with the operator's own
-            // guidance AND commits that guidance as steering so the loop picks
-            // it up between requests. A decision is applied exactly once: the
-            // prompt is consumed here and cannot be answered again.
+            // Answer a live in-process broker request directly so its blocked tool call resumes once (#490).
             ApprovalRoute::Broker => {
                 match self.live_approval.take() {
                     Some(prompt) => {
@@ -3738,18 +3388,7 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Review finding 7 (PR #544): a denial's guidance used to be written as
-    /// steering off `self.session_id` unconditionally, with none of the
-    /// generation guard finding 1 gives every other send/steer path. It is
-    /// routed through the same current-session resolution instead: held --
-    /// never written into a retired generation -- exactly as a composer
-    /// submit is, and re-targeted to the seat's CURRENT session when the pane
-    /// is carried across a rollover.
-    ///
-    /// Issue #490 (N21 item B) shares it between both denial paths: the live
-    /// in-process request blocked on the operator right now, and the one
-    /// reconstructed from a refusal the journal already recorded. Both commit
-    /// the same guidance under the same guard.
+    /// Guard denial guidance by current generation before sending it as steering (#544).
     fn commit_denial_guidance(&mut self, guidance: &str) {
         match super::native_ux::resolve_submit_target(&self.continuity, &self.current_identity()) {
             super::native_ux::SubmitTarget::Send { .. } => {
@@ -3781,11 +3420,7 @@ impl NativePaneRuntime {
                 InteractiveProgress::Busy => {
                     self.session_state = NativeSessionState::Running;
                     self.turn_state = Some(NativeTurnState::Requesting);
-                    // `NativePaneRuntime::turn_started_at` is the ONE clock
-                    // for "how long has this turn been running" -- the
-                    // activity line and issue #490's spinner line both read
-                    // it through `elapsed_turn_secs`, so they can never
-                    // disagree.
+                    // Use one turn-start clock for both activity and spinner elapsed time.
                     if self.turn_started_at.is_none() {
                         self.turn_started_at = Some(std::time::Instant::now());
                     }
@@ -3801,9 +3436,7 @@ impl NativePaneRuntime {
                     self.turn_started_at = None;
                 }
                 InteractiveProgress::Notice(message) => {
-                    // Issue #490: a runtime notice is also a pane notice, so
-                    // it survives in the scrollback rather than only in the
-                    // single-slot `notice` the activity line shows.
+                    // Append runtime notices to pane scrollback so a later notice cannot erase them (#490).
                     self.ux.notices.push(super::native_ux::Notice {
                         kind: super::native_ux::NoticeKind::Reconnected,
                         headline: message.clone(),
@@ -3826,12 +3459,7 @@ impl NativePaneRuntime {
             self.refresh_transcript();
             return;
         }
-        // Issue #490 + N20: a runtime-attached pane has no progress channel.
-        // Its cue that something happened is protocol v1's journal cursor --
-        // the same durable sequence the transcript is reduced from -- and a
-        // `gap` is the runtime telling us the cursor cannot be continued,
-        // which is a reconnect the operator must see rather than a silent
-        // resynchronization.
+        // Use the runtime journal cursor as the change signal for attached panes, which have no progress channel (#490).
         if let Some(link) = self.link.as_mut() {
             let session_id = self.session_id.to_string();
             match link.events(&session_id, self.link_cursor) {
@@ -3857,19 +3485,12 @@ impl NativePaneRuntime {
         }
         self.refresh_transcript();
         let actor = format!("{} \u{b7} {}", self.short, "orchestrator");
-        // Issue #490 (N21 item B): a LIVE request outranks a transcript-
-        // derived one. A tool call is blocked on this answer right now, the
-        // request carries the broker's own scope digest, and the dialog it
-        // opens can actually grant -- so it is polled first and, while it is
-        // held, the journal-derived detector is not allowed to replace it with
-        // a reconstruction of an older refusal.
+        // Prefer a live broker approval over a journal-reconstructed refusal; only the live request can grant its exact scope (#490).
         self.poll_live_approval(&actor);
         if self.live_approval.is_some() {
             return;
         }
-        // Issue #490 (item 5): `blocked` is now a fact read from what the
-        // journal recorded -- the broker's own approval refusal on a tool
-        // call -- rather than the hardcoded `false` N11 shipped.
+        // Derive blocked state from the journal's recorded approval refusal (#490).
         let pending = super::native_ux::detect_pending_approval(
             &self.transcript.items,
             &self.session_id.to_string(),
@@ -3962,10 +3583,7 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Issue #490 (N21 item B): drains at most one live approval request from
-    /// the in-process broker and opens the operator's dialog for it. Never
-    /// blocks, and never replaces a dialog that is already open -- the prompt
-    /// behind that one is still parked on an answer.
+    /// Take at most one live broker approval without replacing an open dialog (#490).
     fn poll_live_approval(&mut self, actor: &str) {
         if self.live_approval.is_some() {
             return;
@@ -3982,15 +3600,7 @@ impl NativePaneRuntime {
         self.ux.open_live_approval(request);
     }
 
-    /// PR #531 review finding 4: this used to do a full journal replay AND a
-    /// full `build_transcript` rebuild on every ~150ms tick regardless of
-    /// whether anything changed. The journal exposes no cursor read (a
-    /// "replay since sequence N" call), so the replay itself stays
-    /// unavoidable -- but the (heavier, allocation-per-item) transcript
-    /// rebuild is now skipped whenever `last_sequence` has not moved since
-    /// the last one, and the rebuilt view is capped at
-    /// [`MAX_TRANSCRIPT_ITEMS`] so a very long session's per-tick cost (and
-    /// the pane's own memory) stays flat rather than growing without bound.
+    /// Replay and rebuild the transcript only when the durable journal cursor advances.
     fn refresh_transcript(&mut self) {
         let Ok((_first, last)) = self.journal.sequence_bounds(&self.session_id) else {
             self.replay_failures = self.replay_failures.saturating_add(1);
@@ -4000,9 +3610,7 @@ impl NativePaneRuntime {
             return;
         }
         let Ok(conversation) = self.journal.replay(&self.session_id) else {
-            // Issue #490 (item 4): a replay failure is a lost connection to
-            // the durable record, not a reason to redraw a stale pane
-            // silently. Count it; the recovery emits the reconnect notice.
+            // Count replay failures as connection loss rather than showing stale content silently (#490).
             self.replay_failures = self.replay_failures.saturating_add(1);
             return;
         };
@@ -4010,9 +3618,7 @@ impl NativePaneRuntime {
         {
             self.journal_payload_reads += 1;
         }
-        // Issue #490: a recovered replay is a reconnect the operator should
-        // see. Announced BEFORE the watermark check below, because a
-        // reconnect that brought no new events is still a reconnect.
+        // Announce reconnect even if its replay has no new journal events (#490).
         if self.replay_failures > 0 {
             let missed = self.replay_failures;
             self.replay_failures = 0;
@@ -4044,16 +3650,8 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Issue #538 (chunk C), decision 3: the live data the native `/context`
-    /// (alias `/instructions`) view needs -- read from the journal's own
-    /// most recent `ContextCompiled` event (`Journal::latest_event_of_type`,
-    /// the same read `zirv ctx sessions show`-style tooling would use), never
-    /// a fresh re-derivation from disk. That is deliberate: what shaped the
-    /// live session is exactly what was recorded when it compiled, which can
-    /// disagree with "what would `resolve_active_scope_instructions` say
-    /// right now" if a file changed again since. Returns `(rows, context_
-    /// version, found)`; `found` is `false` when nothing has compiled this
-    /// session yet (a fresh pane before its first turn).
+    /// Read recorded context provenance from the journal, never re-derive it
+    /// from files that may have changed since the live session compiled (#538).
     fn context_view_facts(&self) -> (Vec<super::native_ux::ContextViewSource>, String, bool) {
         let Ok(Some(stored)) = self
             .journal
@@ -4080,10 +3678,7 @@ impl NativePaneRuntime {
                     _ => "repo-untrusted",
                 },
                 scope: source.scope,
-                // Review fix (issue #538, item 5): the journal's own
-                // `ContextCompiled` provenance now carries `raw_bytes`
-                // (`ResolvedInstructionSource`), so this is the file's real
-                // size, not a placeholder.
+                // Use recorded raw source bytes for context size, not the rendered text length (#538).
                 bytes: source.raw_bytes.unwrap_or(0),
                 sha256: source.sha256,
                 decision: source.decision,
@@ -4100,9 +3695,7 @@ impl NativePaneRuntime {
             billing: self.billing.clone(),
             session_state: self.session_state,
             turn_state: self.turn_state,
-            // Issue #490: an approval the journal says is outstanding and
-            // the operator has not answered. One fact, one place: the same
-            // flag that opens the dialog is the one that makes Enter queue.
+            // Use the same outstanding-approval fact for dialog and Enter gate (#490).
             blocked: self.ux.blocked(),
             unread_result: self.presentation.unread,
             notice: self.notice.clone(),
@@ -4113,13 +3706,8 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Operator direction (PR #531 follow-up): the spinner/verb/elapsed/
-    /// token/interrupt-hint line for the activity area, or `None` while
-    /// idle. The token count is an approximation -- the conversation's
-    /// OWN recorded usage so far, not a per-turn count (the journal has no
-    /// "usage recorded since this turn started" read), so it only ever
-    /// grows across turns rather than resetting at each one; documented in
-    /// the design note.
+    /// Treat token count as conversation-wide recorded usage, not per-turn:
+    /// the journal has no usage-since-turn-start read.
     fn activity_facts(&self) -> Option<ActivityFacts> {
         let started = self.turn_started_at?;
         let tokens = self
@@ -4153,12 +3741,7 @@ impl NativePaneRuntime {
         let ComposerOutcome::Submitted(text) = outcome else {
             return;
         };
-        // Operator direction (PR #531 follow-up): a `/`-prefixed submission
-        // is a pane-local command, never a turn -- see `apply_slash_
-        // command`'s own doc comment for which ones actually do something
-        // and which are honest stubs. `/status` needs live `StatusFacts`
-        // this method alone can produce, so it stays here rather than in
-        // that pure helper.
+        // Handle slash commands inside the pane before treating text as a turn.
         if text.trim() == "/status" {
             let facts = self.status_facts();
             self.notice = Some(format!(
@@ -4169,21 +3752,12 @@ impl NativePaneRuntime {
             ));
             return;
         }
-        // Issue #541 chunk C: `/agents`, `/agent <id> <task>` and `/team
-        // [plan <objective>]` all need this pane's own repo/state access a
-        // pure helper cannot have, so -- like `/status` -- they are handled
-        // here rather than in `apply_slash_command`. Each renders through
-        // `dash::native_ux::render_*`, the SAME functions the headless
-        // `zirv workflow agent list`/`team show|plan` commands print
-        // through, so the two surfaces cannot silently drift.
+        // Resolve agent and team commands with this pane's repo and state access (#541).
         if let Some(notice) = self.handle_team_slash(&text) {
             self.notice = Some(notice);
             return;
         }
-        // Issue #538 (chunk C), decision 3: `/context`/`/instructions` need
-        // this pane's own live journal (`context_view_facts`), so -- same
-        // shape of exception as `/status` above -- they are handled here
-        // rather than in the pure `apply_slash_command` helper.
+        // Resolve context commands from this pane's live journal (#538).
         if matches!(text.trim(), "/context" | "/instructions") {
             // `found` doubles as the render's "recompiled" flag: the journal
             // has no cheap way to say "was THIS specific event tied to the
@@ -4198,22 +3772,12 @@ impl NativePaneRuntime {
             ));
             return;
         }
-        // Issue #542 chunk 3b (decision 5): `/workflows` and `/workflow`
-        // need live registry/state-directory access `apply_slash_command`'s
-        // pure helper does not have, so -- like `/status` above -- they are
-        // handled here. Every branch renders through the SAME engine
-        // functions (`write_registry_list`/`write_registry_entry`/
-        // `write_state`/`write_definition_status`/`write_start_outcome`)
-        // the headless `--json`/text CLI uses, so the two surfaces can never
-        // print conflicting information for the same state.
+        // Resolve workflow commands with live registry and state access (#542).
         if let Some(notice) = self.workflow_slash_notice(&text) {
             self.notice = Some(notice);
             return;
         }
-        // Issue #539 chunk C: `/skills`/`/skill <id>` need this pane's own
-        // repo/home access to load the resolved `SkillRegistry`, so -- same
-        // shape of exception as `/workflow*` above -- they are handled here
-        // rather than in the pure `apply_slash_command` helper.
+        // Resolve skill commands through this pane's repo and home skill registry (#539).
         if let Some(notice) = self.skill_slash_notice(&text) {
             self.notice = Some(notice);
             return;
@@ -4225,16 +3789,10 @@ impl NativePaneRuntime {
             return;
         }
         let intent = classify_submit_intent(&self.status_facts());
-        // Issue #490 (item 4, criterion 4): even an otherwise-sendable
-        // submission is refused when this pane no longer answers for the
-        // logical seat's CURRENT session -- a rollover that moved the seat on
-        // must never let a keystroke land in the retired generation.
+        // Reject submissions from a pane whose session or generation no longer owns the logical seat (#490).
         let intent = match intent {
             SubmitIntent::Queue => SubmitIntent::Queue,
-            // Review finding 3 (PR #544): an observer pane offers no
-            // send/steer at all -- held exactly like a rollover mismatch,
-            // never attempted against a controller seat this pane does not
-            // hold.
+            // Hold observer submissions locally rather than attempting a send without controller ownership (#544).
             _other if self.presentation.observer => {
                 self.ux.notices.push(super::native_ux::Notice {
                     kind: super::native_ux::NoticeKind::Rollover,
@@ -4280,13 +3838,7 @@ impl NativePaneRuntime {
         self.sync_continuity();
     }
 
-    /// Issue #541 chunk C: recognises `/agents`, `/agent <manifest-id>
-    /// <task>` and `/team` / `/team plan <objective>`, rendering each
-    /// through `dash::native_ux::render_*` -- the SAME functions the
-    /// headless `zirv workflow agent list`/`team show|plan` commands print
-    /// through. `None` for anything else, so an unrecognised `/`-prefixed
-    /// line still falls through to `apply_slash_command` and then to the
-    /// ordinary text path.
+    /// Render agent and team commands through the shared native UX views (#541).
     fn handle_team_slash(&self, text: &str) -> Option<String> {
         let trimmed = text.trim();
         if trimmed == "/agents" {
@@ -4306,11 +3858,7 @@ impl NativePaneRuntime {
             if manifest_id.is_empty() || task.is_empty() {
                 return Some("usage: /agent <manifest-id> <task>".to_string());
             }
-            // A dry-run preview, deliberately never persisted: it never
-            // supersedes a coordinator's own compiled plan. Still goes
-            // through the identical capability/team-role/route checks
-            // `compile_explicit` always applies -- explicit selection never
-            // bypasses policy.
+            // Keep a team-plan preview unpersisted while running normal capability and route checks (#541).
             let result = crate::commands::workflow::team::compile_for_objective(
                 &self.repo,
                 dirs::home_dir().as_deref(),
@@ -4331,13 +3879,7 @@ impl NativePaneRuntime {
             if objective.is_empty() {
                 return Some("usage: /team plan <objective>".to_string());
             }
-            // Issue #541 chunk C review finding: `/team plan` reaches the
-            // SAME `store_plan` the native `team_plan` tool does, and a
-            // writable non-coordinating pane calling it could silently
-            // replace a coordinator's compiled plan. Gated on this pane's
-            // OWN persisted seat role (never a claim the pane makes about
-            // itself), the same `team::Authority::may_delegate` table
-            // `coordinator::check` itself reads.
+            // Only a coordinating pane may persist a team plan through store_plan (#541).
             let role = super::super::seat::load(&self.state, &self.short)
                 .map(|seat| seat.role)
                 .unwrap_or_default();
@@ -4366,19 +3908,7 @@ impl NativePaneRuntime {
         None
     }
 
-    /// Recognises `/workflows` and `/workflow ...`, returning the notice to
-    /// display, or `None` when `text` is neither (falls through to
-    /// `apply_slash_command`/ordinary submission). Issue #542 chunk 3b,
-    /// decision 5.
-    ///
-    /// `/workflows` lists the registry (read-only). `/workflow status
-    /// [id]` shows a running workflow's status, defaulting to this repo's
-    /// active one. `/workflow <id>` shows that registry pack's definition
-    /// when given alone (read-only, mirrors `workflow show`); with trailing
-    /// text it starts that pack, treating the trailing text as the task
-    /// (mirrors `workflow start <id> --task ...`) -- "start or show" per
-    /// the brief, disambiguated by whether a task was actually supplied so
-    /// a bare id never has a side effect.
+    /// Handle workflow commands with this pane's live state; unrelated text falls through.
     fn workflow_slash_notice(&self, text: &str) -> Option<String> {
         let trimmed = text.trim();
         let head = trimmed.split_whitespace().next()?;
@@ -4487,12 +4017,7 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Issue #539 chunk C: `/skills` lists this session's resolved skill
-    /// catalogue; `/skill <id>` shows one skill's digest detail and
-    /// instruction body (`id@version` accepted, same as `SkillRegistry::
-    /// get`). Both render through the SAME `dash::native_ux::render_skill_
-    /// *` functions any future `zirv skill` CLI rewrite would use, mirroring
-    /// the `/workflows`/`/workflow` precedent immediately above.
+    /// Render skills from the resolved catalogue with digest and instruction body (#539).
     fn skill_slash_notice(&self, text: &str) -> Option<String> {
         let trimmed = text.trim();
         let head = trimmed.split_whitespace().next()?;
@@ -4539,17 +4064,7 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Review finding 1 (PR #544): resyncs this pane's OWN identity after
-    /// `Continuity::carry_across` retargets the seat it watches. Without
-    /// this, `self.session_id`/`self.generation` stayed at their spawn-time
-    /// value forever -- `current_identity` kept disagreeing with
-    /// `self.continuity.seat` after the FIRST rollover, so
-    /// `resolve_submit_target` returned `Hold` on every submit/steer from
-    /// then on. Also resets the runtime-link cursor (a new session starts
-    /// its own durable event sequence at zero, so the old cursor means
-    /// nothing for it) and re-reads the journal for the new session id
-    /// immediately, rather than waiting for the next `tick()` to notice a
-    /// `last_sequence` that no longer describes this identity at all.
+    /// Update this pane's own session and generation after continuity retargets its seat (#544).
     fn apply_retarget(&mut self, to_session: &str, generation: u64) {
         match JournalSessionId::new(to_session.to_string()) {
             Ok(session_id) => {
@@ -4596,10 +4111,7 @@ impl NativePaneRuntime {
     /// running turn picks this up between requests without either side
     /// coordinating directly.
     fn write_steering(&mut self, text: &str) -> CtxResult<()> {
-        // Issue #490: a runtime-owned conversation is steered through the
-        // service that owns it, never by a second writer on its journal --
-        // the runtime is the one supervisor, and `session.send_input` is the
-        // documented way in.
+        // Steer runtime-owned conversations through the service, never by writing their journal directly (#490).
         if self.link.is_some() {
             self.send_submit(text);
             return Ok(());
@@ -4619,9 +4131,7 @@ impl NativePaneRuntime {
     }
 
     pub fn interrupt(&mut self) {
-        // Review finding 3 (PR #544): an observer pane holds no controller
-        // seat, so an interrupt would only be refused by the server -- say
-        // so directly rather than making the round trip.
+        // Reject observer interrupts locally because the server would refuse them (#544).
         if self.link.is_some() && self.presentation.observer {
             self.notice = Some(
                 "interrupt unavailable: this pane holds no controller seat (observer mode)"
@@ -4632,11 +4142,7 @@ impl NativePaneRuntime {
         match (self.link.as_mut(), self.session.as_ref()) {
             (Some(link), _) => {
                 let session_id = self.session_id.to_string();
-                // Review finding 4 (PR #544): a refused interrupt used to be
-                // silently swallowed. Surface it exactly like `send_submit`/
-                // `decide_approval` do -- an operator who pressed Esc and saw
-                // nothing happen has no way to tell "refused" from "still in
-                // flight" otherwise.
+                // Surface refused interrupts to the operator instead of swallowing them (#544).
                 if let Err(error) = link.interrupt(&session_id) {
                     self.notice = Some(format!("interrupt refused by the runtime: {error}"));
                 }
@@ -4644,12 +4150,7 @@ impl NativePaneRuntime {
             (None, Some(session)) => session.interrupt(),
             (None, None) => {}
         }
-        // Issue #490 (N21 item B): an interrupt cancels the tool call that is
-        // blocked on the operator too. `InteractiveSession::interrupt` has
-        // already cancelled the gate, so dropping the prompt here releases
-        // nothing -- it only stops the dashboard from drawing a dialog whose
-        // call has already failed closed, and stops a later answer from being
-        // delivered to a call that is gone.
+        // Interrupt must also cancel the held approval dialog for that tool call (#490).
         if self.live_approval.take().is_some() {
             let _ = self.ux.close_approval();
             self.notice = Some("the pending approval was cancelled by the interrupt".to_string());
@@ -4718,18 +4219,7 @@ impl NativePaneRuntime {
     }
 }
 
-/// Issue #490 (PR #545 review finding 3): a mouse wheel notch over a focused
-/// NATIVE pane.
-///
-/// A native pane has no `vt100` grid and no pty scrollback, so routing the
-/// wheel to `Pane::scroll_wheel` moved a buffer that is never rendered while
-/// the transcript the operator is actually looking at sat still. This moves
-/// the one scroll position that exists -- `NativePresentation::scroll`, the
-/// same state `Up`/`Down`/`PageUp`/`PageDown` reach through
-/// [`handle_native_key`] -- so the wheel and the keyboard agree.
-///
-/// Reaching the bottom marks the transcript seen, exactly as `End` does:
-/// scrolling back to the live view IS having looked at it.
+/// Scroll native transcript history directly; native panes have no vt100 scrollback (#490).
 pub fn wheel_scroll(pane: &mut NativePaneRuntime, delta: isize) -> bool {
     if delta == 0 {
         return false;
@@ -4747,15 +4237,7 @@ pub fn wheel_scroll(pane: &mut NativePaneRuntime, delta: isize) -> bool {
     true
 }
 
-/// Issue #490 (roadmap N21 item A): #354's clickable overview rows, for a
-/// native pane living inside the ordinary dashboard.
-///
-/// `area` is the pane's own main area, so the panel column is computed
-/// against what was actually drawn rather than against the whole terminal --
-/// a dashboard with a sidebar would otherwise map every click one panel to
-/// the left. A click outside the panel (or on a layout with no panel at all)
-/// selects nothing, which is the same "not ours" answer the single-pane loop
-/// gave.
+/// Map overview clicks in the pane's local geometry to the rendered agent row (#490).
 pub fn click_overview_row(pane: &mut NativePaneRuntime, area: Rect, column: u16, row: u16) -> bool {
     let width = area.width as usize;
     let height = area.height as usize;
@@ -4783,14 +4265,7 @@ pub fn click_overview_row(pane: &mut NativePaneRuntime, area: Rect, column: u16,
     true
 }
 
-/// What a key press did to a native pane, from its host loop's point of view.
-///
-/// Issue #490 (roadmap N21 item A): the key contract lives in ONE function so
-/// the single-pane `zirv chat --runtime native` loop and the ordinary
-/// dashboard's mixed roster can never drift on what `Esc`, `Ctrl+C`,
-/// `Ctrl+R`, `Tab` or a digit means inside a native pane. A wrapped pane
-/// never reaches it at all, which is what "native controls are offered only
-/// on a native pane" means in practice.
+/// Share one native key router between single-pane chat and the ordinary dashboard (#490).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeKey {
     /// Handled by the pane. The host loop does nothing else with it.
@@ -4828,13 +4303,8 @@ pub fn handle_native_key(
     if ctrl && key.code == KeyCode::Char('q') {
         return NativeKey::Quit;
     }
-    // Operator direction (PR #531 follow-up): `Esc` owns interrupt now;
-    // `Ctrl+C` only arms/confirms a quit -- see `ctrl_c_confirms_quit`'s own
-    // doc comment.
-    //
-    // Issue #490 refines only WHEN that applies: while a modal is open (an
-    // approval dialog, a worker inspection, the shortcut list) `Esc` closes it
-    // first, and only a second `Esc` reaches the turn.
+    // Esc closes an open modal first; only a later Esc interrupts the turn.
+    // Ctrl+C arms or confirms quit without answering that modal (#490).
     if key.code == KeyCode::Esc && !pane.ux().modal_open() {
         *last_ctrl_c = None;
         pane.interrupt();
@@ -4879,11 +4349,7 @@ pub fn handle_native_key(
         };
         return NativeKey::Consumed;
     }
-    // Issue #490: everything the dashboard's own regions claim -- Tab focus,
-    // `?`, `a`, the overview cursor, the open modal -- goes through one
-    // router, which also decides whether the key belongs to the composer or
-    // the transcript. The pane-global bindings above (Ctrl+Q, Esc, Ctrl+C,
-    // Ctrl+R, Shift+Tab) have already had their say and never reach it.
+    // Route keys claimed by dashboard regions before reaching the native composer (#490).
     match pane.ux_mut().handle_key(key, overview_visible) {
         super::native_ux::UxKey::Consumed => return NativeKey::Consumed,
         super::native_ux::UxKey::Quit => return NativeKey::Quit,
@@ -4940,21 +4406,14 @@ pub fn handle_native_key(
     NativeKey::Consumed
 }
 
-/// Issue #490 + N20: opens the pane on whichever transport
-/// [`resolve_attach`] selects. Kept separate from [`run_native_dashboard`]
-/// so the decision is one small, readable function rather than a branch
-/// buried in a terminal-setup sequence.
+/// Open native panes through the transport selected by resolve_attach (#490).
 pub(crate) fn open_native_pane(
     cfg: &CtxConfig,
     state: &StateDir,
     env: EnvLookup<'_>,
     spec: NativeDashboardSpec,
 ) -> CtxResult<NativePaneRuntime> {
-    // Issue #552: a rollover successor never attaches. It is a brand-new
-    // conversation taking a seat under a generation that was just committed;
-    // attaching to whatever the persistent runtime already holds for this
-    // repository would put the OLD conversation back in the seat the
-    // rollover just moved.
+    // A rollover successor opens a fresh conversation for its committed generation, never attaches (#552).
     if spec.seat.is_some() {
         return NativePaneRuntime::spawn(cfg, state, env, spec);
     }
@@ -4972,15 +4431,7 @@ pub(crate) fn open_native_pane(
     }
 }
 
-// Issue #490 (roadmap N21 item A): the dedicated single-pane loop that used
-// to live here is gone. `zirv chat --runtime native` opens its conversation
-// as the FIRST PANE of the ordinary dashboard (`dash::run_dashboard`), so
-// there is one event loop, one raw-mode/alternate-screen sequence and one key
-// contract ([`handle_native_key`]) for wrapped and native panes alike -- and a
-// native pane sits in the same roster, mail sweep, attention projection,
-// budget sweep and restore roster as every wrapped one. [`open_native_pane`]
-// above is what `dash::pane::Pane::spawn_native` calls, so the attachment
-// decision ([`resolve_attach`]) is unchanged and still the only one.
+// Run single-pane native chat as the first pane of the ordinary dashboard (#490).
 
 #[cfg(test)]
 mod tests {

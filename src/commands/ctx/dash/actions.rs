@@ -1,27 +1,5 @@
 //! Issue #354 phase 4: the dashboard's ONE action-descriptor table.
-//!
-//! Before this module the same set of actions was written down four times --
-//! `ui::HELP_BINDINGS` (the help overlay), `ui::header_hints` (the header's
-//! context cluster), `dash::menu_entries` (the phase-3 context menu and its
-//! disable reasons) and, implicitly, `filter_key` itself. Four tables that
-//! had to be kept in step by hand is how a drawn chord ends up naming an
-//! action the keyboard does not have (finding F09) and how the help screen
-//! ends up describing a dashboard that no longer exists (finding F08).
-//!
-//! [`ACTIONS`] is now the single source of truth. It feeds:
-//!
-//! 1. the help overlay (`^A ?` / `^A h`) -- grouped by [`ActionSection`];
-//! 2. the header hint cluster -- [`header_ids`] picks its at-most-four
-//!    entries out of the table by context;
-//! 3. the phase-3 context menu -- every descriptor carrying a
-//!    [`MenuAction`], in table order, with its own disable reason;
-//! 4. the `^A p` palette -- every descriptor, fuzzy-searchable.
-//!
-//! The module is pure: no frame, no filesystem, no clock, no config. A
-//! descriptor's `checks` are the exact `(KeyEvent, DashAction)` pairs
-//! `filter_key` must produce for that chord, which is what the sync tests at
-//! the bottom walk -- `filter_key` stays the one and only key -> action
-//! mapping, and this table only *references* it.
+//! ACTIONS supplies help, header hints, context menu and palette; filter_key remains the key-to-action authority.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -37,10 +15,7 @@ pub const MENU_NO_REQUEST: &str = "no spawn request kept";
 pub const MENU_NO_CWD: &str = "no cwd known";
 pub const MENU_EXITED_CLEAN: &str = "exited cleanly";
 pub const MENU_NOT_RETAINED: &str = "only a finished row can be dismissed";
-/// Issue #354 phase 5: the sidebar's summary line is a real action target --
-/// `inspect` opens the dashboard-level inspector over it -- but it is not a
-/// session, so every per-session action is listed there inert with this
-/// reason rather than hidden.
+/// The summary line is inspectable but is not a session, so session actions remain visible with an inert reason (#354).
 pub const MENU_SUMMARY_LINE: &str = "the dashboard, not a session";
 
 /// A stable identity for one row of [`ACTIONS`].
@@ -74,8 +49,7 @@ pub enum ActionId {
     Memory,
     Errors,
     Zoom,
-    /// Dash refresh PR1: forces the session column back on below the
-    /// narrow-terminal floor, or hides it again above it.
+    /// Toggle sidebar visibility below or above the narrow-terminal threshold.
     ToggleSidebar,
     Palette,
     Help,
@@ -177,10 +151,7 @@ pub struct ActionContext {
     pub clean_exit: bool,
     /// Its checkout is known.
     pub has_cwd: bool,
-    /// Issue #354 phase 5: the target is the sidebar's summary line -- the
-    /// dashboard itself. `selected` is false there (there is no session row),
-    /// but `inspect` still has something to open, so this is its own bit
-    /// rather than an overload of `selected`.
+    /// The summary target has no session row but still supports dashboard inspection (#354).
     pub summary: bool,
 }
 
@@ -320,11 +291,7 @@ impl ActionDescriptor {
         self.checks.first().map(|(_, action)| action.clone())
     }
 
-    /// Whether this descriptor documents something rather than binding it:
-    /// nothing dispatches it and no menu entry runs it. Review of cc92a56
-    /// (finding 1): these used to be listed in the palette as ordinary
-    /// enabled rows, so Enter on one closed the palette and did nothing at
-    /// all. They are [`PaletteRow::Note`]s now.
+    /// Informational descriptors are displayed as non-activatable notes, never runnable palette actions.
     pub fn informational(&self) -> bool {
         self.checks.is_empty() && self.menu.is_none()
     }
@@ -352,16 +319,7 @@ const fn ch(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
 
-/// THE table. Order inside a section is display order; the `Session`
-/// section's order is additionally the context menu's own approved order
-/// (inspect, focus, nudge, mail, handover, stop, restore, open worktree,
-/// evidence, retry, dismiss) -- `^A c` itself leads the section because it is
-/// what opens that menu.
-///
-/// A `static`, not a function rebuilding a `Vec`: the header cluster reaches
-/// this on every frame, which during the adaptive poll's hot window is up to
-/// ~100/s. `KeyEvent::new` is `const fn` in crossterm 0.29, so the whole
-/// table is built once at compile time.
+/// Table order controls display order and the context menu; a static table avoids per-frame allocation.
 pub static ACTIONS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::NextPane,
@@ -452,8 +410,7 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         id: ActionId::Inspect,
         chord: "^A i",
         label: "inspect",
-        // Issue #354 phase 5: "this row" includes the summary line, where it
-        // opens the dashboard-level inspector instead.
+        // The summary target opens the dashboard inspector (#354).
         description: "evidence for this row",
         section: ActionSection::Session,
         availability: needs_target,
@@ -718,8 +675,7 @@ pub fn menu_actions(ctx: &ActionContext) -> Vec<(MenuAction, Availability)> {
 /// inert here.
 pub fn header_ids(ctx: &ActionContext) -> Vec<ActionId> {
     let wanted: &[ActionId] = if ctx.summary {
-        // Issue #354 phase 5: the cursor is on the summary line -- the two
-        // things that still apply there, then the two that always do.
+        // On the summary line, offer inspection plus dashboard-wide actions (#354).
         &[
             ActionId::Inspect,
             ActionId::ContextActions,
@@ -788,12 +744,7 @@ pub fn fuzzy_match(query: &str, haystack: &str) -> bool {
 pub enum PaletteRow {
     /// A section heading. Never activatable, and skipped by the caret.
     Section(&'static str),
-    /// Review of cc92a56 (finding 1): a descriptor that documents something
-    /// rather than binding it -- the mouse wheel, and the one Esc/Enter rule
-    /// every dialog holds. Both are worth listing (that is the whole point of
-    /// the help screen) and neither can be run, so they are their own kind:
-    /// drawn dim, never taking the caret, and never claiming to be "disabled"
-    /// -- there is nothing to enable.
+    /// Notes explain non-activatable bindings without taking the palette caret.
     Note {
         label: &'static str,
         chord: &'static str,

@@ -30,106 +30,44 @@ pub(super) struct DiskFacts {
     /// either itself, or a redraw could stall on a stale rollout file or the
     /// network.
     pub(super) usage: Vec<ui::HarnessUsage>,
-    /// Issue #209/v3 §D: the dashboard's own repo's active `zirv workflow`,
-    /// as much as the footer's workflow segment needs. `workflow::
-    /// active_workflow_summary` is the same plain-file read `zirv workflow
-    /// status` itself uses with no `--id` -- no subprocess, no scan --
-    /// so it costs nothing more than the scores/usage reads right above it
-    /// to fold into this same throttled tick. `None` covers "no active
-    /// workflow" and "failed to load" alike; the footer renders the same
-    /// dim `▸ –` either way.
+    /// Read the repository's active workflow on the throttled tick; absence and read failure both render as unavailable (#209).
     pub(super) workflow: Option<workflow::ActiveWorkflowSummary>,
-    /// Issue #209/v3 codex review finding 2: per-session unread mail, for
-    /// the footer's own `✉` segment -- see [`MailMap`]'s own doc comment
-    /// for why `mail` above cannot answer this.
+    /// Track unread mail per session because the aggregate mail count cannot drive the focused footer (#209).
     pub(super) mail_by_session: MailMap,
-    /// Issue #310: session short ids with an armed stall latch
-    /// (`sessions::stall_marker`), read on the same throttled tick as
-    /// `mail_by_session` and populated exactly the same way -- every
-    /// attached pane by its own `short()`, plus every live registry row this
-    /// dashboard owns. Absence means "not stalled" (never armed, or already
-    /// cleared by observed progress), matching the marker's own
-    /// once-cleared-on-progress contract; there is no separate "unknown"
-    /// state to represent here.
+    /// Track stall latches for attached and registry sessions; absence means no armed stall (#310).
     pub(super) stalled: HashSet<String>,
-    /// Dash refresh PR1: each pane's own bound workflow, resolved by id from
-    /// its own session record -- see `resolve_session_workflow`'s own doc
-    /// comment. Read on the same throttled tick and populated the same way
-    /// as `mail_by_session`/`stalled` right above; absence means "no bound
-    /// workflow, or its run could not be resolved," never a guess.
+    /// Resolve each session's bound workflow on refresh; absence never implies
+    /// a repo-wide workflow belongs to it.
     pub(super) workflow_by_session: HashMap<String, ui::SessionWorkflowFact>,
-    /// Issue #264: the aggregate row's own `failed`/`cost` cells, read once
-    /// per throttled tick alongside `usage`/`mail` above -- `delegations.
-    /// jsonl` is a plain file read, the same no-scan/no-network discipline
-    /// `usage`'s own doc comment holds. `None` when the ledger has no rows
-    /// at all yet (a fresh state dir, or a dashboard that has never spawned
-    /// a delegated worker): [`ui::render_aggregate_row`] renders `--` for
-    /// both cells rather than a phantom `0`/`$0.00` that would be
-    /// indistinguishable from "checked and found none".
+    /// Read aggregate spend on the throttled tick; no ledger means unknown, not zero (#264).
     pub(super) spend: Option<AggregateSpendFacts>,
-    /// Issue #358 (task T6a): one [`ui::HarnessStrip`] per harness `cfg.
-    /// fallback.order` names, for the aggregate row's own pool strip -- off
-    /// the identical `fallback::capacity_snapshot` the fallback/status
-    /// surfaces already build. Empty when the repo configures no fallback
-    /// order at all. Composed by the background refresher and swapped in
-    /// whole (see [`FactsSnapshot::pool_harnesses`]): that call lists the
-    /// session registry itself, so unlike `usage` right above it is not a
-    /// plain file read and has no business on the tick.
+    /// Build the configured provider pool strip on the background refresher because capacity snapshots scan session state (#358).
     pub(super) pool_harnesses: Vec<ui::HarnessStrip>,
     /// This dashboard's own orchestrator seat's `"gen N"` label (`seat::
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
     /// registered for it.
     pub(super) pool_seat: Option<String>,
-    /// Dash refresh PR2: this dashboard's own orchestrator seat, in full --
-    /// `pool_seat` above only ever kept the formatted generation string.
-    /// Read on the same throttled tick, the same `<short>.seat.json` file
-    /// `pool_seat` already opens. `None` until a seat is registered.
+    /// Keep the full seat beside its generation label from the same throttled read.
     pub(super) seat_full: Option<super::seat::Seat>,
-    /// Dash refresh PR2: that same seat's own rollover-runtime record
-    /// (`<short>.rollover.json`), read alongside `seat_full` above. `None`
-    /// with no rollover history at all for this seat.
+    /// Read rollover state beside the seat; `None` means no record for this seat.
     pub(super) rollover_record: Option<super::rollover::runtime::Record>,
-    /// Dash refresh PR2: the JEV sidebar section's facts, refreshed on its
-    /// OWN (much coarser, 10s) cadence -- see `jev_due`/its own call site.
-    /// `None` with every `[jev]` gate off, which is also how the section
-    /// hides itself entirely.
+    /// Refresh JEV on its own slower cadence; `None` hides it when all gates are off.
     pub(super) jev: Option<ui::JevSectionFact>,
-    /// Issue #354: every live pane's work group, by id -- the sidebar's group
-    /// headers name a scope, and `group::load` is a disk read that must never
-    /// happen per frame. Read by the background [`FactsRefresher`] and swapped
-    /// in whole (see [`FactsSnapshot`]).
+    /// Load each live work group in the background, never on a render frame (#354).
     pub(super) groups: HashMap<String, super::group::WorkGroup>,
-    /// Issue #354: when each pane last changed [`ui::RowState`], for the
-    /// `since` disclosure line. Kept here rather than on `Pane` because it is
-    /// a property of what the *dashboard* has observed across ticks, and it
-    /// is pruned to the live panes on every refresh.
+    /// Keep observed state-change time here, not on Pane: it describes the
+    /// dashboard's observation and must disappear when the pane is reaped (#354).
     pub(super) state_since: HashMap<String, (ui::RowState, u64)>,
-    /// Issue #354 phase 2: the composed `attention::SessionStatus` behind
-    /// every row's glyph, its rollups and its `reason` line -- one
-    /// `attention::load` (a single small JSON read) per drawable row, on this
-    /// same throttled tick and NEVER per frame. Filled by
-    /// [`FactsCache::refresh_attention`], which the event loop calls only on a
-    /// tick where [`FactsCache::refresh_if_due`] actually re-read. A missing
-    /// or corrupt file loads back as `SessionStatus::default()`, which
-    /// projects `Unknown` -- and `ui::glyph_for` treats that exactly like no
-    /// entry at all, so a dashboard with no issue #349 writers renders the
-    /// phase 1 sidebar unchanged.
+    /// Cache one composed attention status per drawable row on refresh, never per frame; absent or corrupt status projects Unknown (#354).
     pub(super) attention: HashMap<String, super::attention::SessionStatus>,
 }
 
-/// Issue #264: [`DiskFacts::spend`]'s own shape. Issue #457: `cost_micros`
-/// now folds in the seat's own transcript and its native subagent
-/// transcripts too, not only `delegations.jsonl` -- see
-/// `session_spend::fold_session_spend`, the one function this and
-/// `status::spend_status_line` both call.
+/// Aggregate spend includes the seat transcript, native subagents and delegation ledger through the shared fold (#264, #457).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AggregateSpendFacts {
     pub(super) failed: u64,
     pub(super) cost_micros: u64,
-    /// Issue #457: how many deduplicated assistant messages/delegation rows
-    /// contributed nothing to `cost_micros` because their model priced as
-    /// unknown -- surfaced on the dashboard inspector (`^A i`) so "$0.00"
-    /// never looks indistinguishable from "nothing happened".
+    /// Count unknown-priced messages so a displayed cost of zero does not imply no work occurred (#457).
     pub(super) skipped_messages: u64,
 }
 
@@ -162,14 +100,7 @@ pub(super) struct FactsSnapshot {
     pub(super) memory_count: usize,
     pub(super) registry: Vec<(sessions::Record, sessions::Liveness)>,
     pub(super) groups: HashMap<String, super::group::WorkGroup>,
-    /// Issue #358 (task T6a): the aggregate row's pool strip. Here rather
-    /// than on the tick because `fallback::capacity_snapshot` calls
-    /// `sessions::list` itself (`fallback.rs`), so leaving it behind would
-    /// have kept the very sweep this snapshot exists to move -- and its
-    /// `refresh_ranked_providers` can walk a codex rollout tree on top of
-    /// that. Composed all the way into [`ui::HarnessStrip`]s on the
-    /// refresher's thread: the mapping is pure, so nothing is gained by
-    /// carrying the raw snapshot back to the loop.
+    /// Build provider strips on the refresher thread because capacity snapshots may scan the registry and rollout tree (#358).
     pub(super) pool_harnesses: Vec<ui::HarnessStrip>,
 }
 
@@ -206,8 +137,7 @@ pub(super) fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String])
     let slug = super::state::repo_slug(repo);
     let memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
     let registry = sessions::list_with_retention(state, cfg.dash.roster_max_age_secs);
-    // Issue #354: the sidebar's group headers name a scope -- one `group::
-    // load` per distinct live group, never one per frame.
+    // Load each distinct live work group once for sidebar headers, never per frame (#354).
     let groups = group_ids
         .iter()
         .filter_map(|id| {
@@ -229,15 +159,7 @@ pub(super) fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String])
     }
 }
 
-/// Issue #358 (task T6a): the aggregate row's own pool strip.
-/// `fallback::capacity_snapshot` is a read of already-stored usage windows
-/// plus the session registry -- never a poller and never an outbound request
-/// -- but it is a `sessions::list` and, through `refresh_ranked_providers`, a
-/// possible rollout scan, so it runs on the refresher's thread with the rest
-/// of the machine-wide reads. `requester`/`requested` are both `None`: this is
-/// a repo-wide overview, not a placement decision for one particular unit of
-/// work, so nothing needs excluding from the live `active` count and no
-/// harness outside `cfg.fallback.order` needs to be forced in.
+/// Read repo-wide provider capacity on the refresher thread; it scans stored usage and sessions but makes no outbound request (#358).
 pub(super) fn pool_strips(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -248,11 +170,7 @@ pub(super) fn pool_strips(
         .harnesses
         .iter()
         .map(|harness| {
-            // Audit finding G2: the strip reports the reading the allocator
-            // ranks on, so an idle codex whose rollout snapshot has aged past
-            // `collector_max_age_secs` reads `stale 53%` rather than the old
-            // `unknown --`. `harness.state` itself is unchanged -- `classify`
-            // still refuses an unbinding reading as a hard-gate authority.
+            // Show the allocator's stale reading in the pool strip; stale usage does not become hard-gate authority.
             let ranking = snapshot
                 .provider(&harness.provider)
                 .and_then(super::allocator::ranking_window);
@@ -288,18 +206,9 @@ pub(super) struct FactsRefresher {
     group_ids: Arc<Mutex<Vec<String>>>,
     rx: mpsc::Receiver<FactsSnapshot>,
     stop: Arc<AtomicBool>,
-    /// `Some` only when the thread could not be spawned at all: the snapshot
-    /// is then computed inline, exactly as it was before this loop had a
-    /// background half. A dashboard that cannot start a thread still shows a
-    /// correct sidebar -- it just pays the old latency for it.
+    /// Compute a snapshot inline only if the refresher thread could not start, so the sidebar still has facts.
     inline: Option<FactsInputs>,
-    /// When the inline fallback last collected. Review finding 3: the tick
-    /// asks on EVERY iteration now (that is the point of the swap being
-    /// decoupled from the throttle), so without a clock of its own the
-    /// fallback would read the whole state directory up to 100 times a
-    /// second -- far worse than the once-a-second it replaced. Inert while
-    /// the thread is running, which is the only case that is not a
-    /// pathology.
+    /// Throttle the inline fallback independently because the tick probes it on every iteration.
     last_inline: std::cell::Cell<Instant>,
 }
 
@@ -367,14 +276,8 @@ impl FactsRefresher {
         }
     }
 
-    /// The newest snapshot the refresher has published, or `None` when it has
-    /// not finished a cycle since the last call. Never blocks: `try_recv` in a
-    /// loop keeping only the last, so a tick costs one channel probe however
-    /// far behind a busy machine has left the thread.
-    ///
-    /// `now` is the tick's own clock, and is used only by the inline
-    /// fallback, which stands in for the thread's cadence with a throttle of
-    /// its own (review finding 3).
+    /// Take only the latest snapshot without blocking the UI tick; the inline
+    /// fallback uses its own cadence so failed thread startup cannot cause scans every tick.
     pub(super) fn take_latest(&self, now: Instant) -> Option<FactsSnapshot> {
         if let Some(inputs) = self.inline.as_ref() {
             if !due(self.last_inline.get(), now, FACTS_THROTTLE) {
@@ -480,9 +383,7 @@ impl FactsCache {
             &transcript,
             &table,
         );
-        // Issue #457 item 3: `--` only when NEITHER source exists at all --
-        // `spend.cost_micros` is already `None` in exactly that case (see
-        // `fold_session_spend`'s own doc comment), never re-hidden here.
+        // Display unknown spend only when neither transcript nor delegation source exists (#457).
         self.disk.spend = spend.cost_micros.map(|cost_micros| AggregateSpendFacts {
             failed: spend.delegation_failed,
             cost_micros,
@@ -510,31 +411,7 @@ impl FactsCache {
         true
     }
 
-    /// Every disk read the header and sidebar need, at most once per
-    /// `FACTS_THROTTLE`. `panes` is only walked when a refresh is actually
-    /// due, so a throttled tick costs the `due` comparison and nothing else.
-    ///
-    /// `take_snapshot` is the non-blocking hand-off from the background
-    /// [`FactsRefresher`] -- the machine-wide reads (mail, memory bank, the
-    /// session registry, the work groups, the pool strip) happen on its
-    /// thread and are only swapped in here.
-    ///
-    /// Deliberately claimed on EVERY tick, ahead of and independently of the
-    /// throttle (review finding 1). Tying the swap to `last_refresh` meant a
-    /// due tick that found nothing waiting still consumed the window: the
-    /// refresher starts after `FactsCache::new` has already seeded itself
-    /// due, so the very first due tick almost always missed and the sidebar
-    /// stayed empty for a second window -- and any later cycle that slipped
-    /// past a due tick cost another whole one. The throttled block below
-    /// keeps its own clock, so a tick that only swaps stays free of disk.
-    ///
-    /// Returns whether the tick refreshed anything: the throttled block ran,
-    /// a snapshot landed, or both. Issue #354 phase 2 hangs
-    /// [`FactsCache::refresh_attention`] off that answer rather than off a
-    /// second throttle of its own: the attention statuses have to be exactly
-    /// as fresh as the registry listing they are keyed against, and a second
-    /// clock could only ever drift them apart. Reporting a swap-only tick as
-    /// a refresh is what keeps that true now that the two can happen apart.
+    /// Swap background facts on every tick, independent of the disk throttle; refresh attention whenever facts change so rows and registry stay aligned (#354).
     pub(super) fn refresh_if_due<F>(
         &mut self,
         cfg: &CtxConfig,
@@ -559,11 +436,7 @@ impl FactsCache {
             session_short,
         } = owner;
 
-        // Issue #354: the sidebar's `since` line, on this same throttled
-        // cadence -- a state-change clock that only ever moves when the state
-        // actually changed, pruned to the live panes so a reaped pane leaves
-        // nothing behind. In-memory and keyed to the panes this tick is
-        // holding, so unlike the group headers it stays on this thread.
+        // Update state-change time only when the row changes and prune entries for reaped panes (#354).
         self.disk
             .state_since
             .retain(|short, _| panes.iter().any(|p| p.short() == short));
@@ -578,27 +451,10 @@ impl FactsCache {
                 *entry = (current, super::state::now_secs());
             }
         }
-        // Issue #209/v3 §D: same throttled tick as the reads above it, same
-        // no-subprocess/no-scan discipline -- see `DiskFacts::workflow`'s
-        // own doc comment. Deliberately the dashboard's own `repo`, not a
-        // per-pane one (codex review finding 3, refuted): a workflow is a
-        // repo-level singleton with no session dimension at all
-        // (`engine::WorkflowState`/`load_active` take a repo, never a
-        // session id), and every other per-session disk read in this loop
-        // -- scores, mail, memory -- is already keyed off this same shared
-        // `repo` by the identical, deliberate convention `Pane::spawn`'s own
-        // doc comment documents for `cwd` vs. `repo` (issue #119): a
-        // worktree-hosted pane's *argv* runs in its own working tree, but
-        // its identity for every disk read stays the dashboard's repo,
-        // because the session/state store is shared across every pane this
-        // dashboard hosts.
+        // Read the dashboard repository's singleton workflow; worktree panes share this repository's session and state store (#119, #209).
         self.disk.workflow = workflow::active_workflow_summary(state, repo);
 
-        // Task 7: one usage entry per enabled harness, read straight off
-        // disk. `window::load_for` is a file read, never a scan/poll -- see
-        // `DiskFacts::usage`'s own doc comment for why this loop must stay
-        // that way. `window::available` is a pure in-memory filter over what
-        // was just read, so it costs nothing extra here.
+        // Load one entry per enabled harness from files; refresh must never scan transcripts.
         let now_secs = super::state::now_secs();
         self.disk.usage = adapters::ADAPTERS
             .iter()
@@ -634,21 +490,11 @@ impl FactsCache {
         self.disk.pool_seat = loaded_seat
             .as_ref()
             .map(|s| format!("gen {}", s.generation));
-        // Dash refresh PR2: the same seat record in full, plus its own
-        // rollover-runtime settlement -- two small JSON files, both already
-        // being read (or immediately adjacent) on this same throttled tick,
-        // never per frame.
+        // Read seat and rollover records on the throttled tick, never per frame.
         self.disk.rollover_record = super::rollover::runtime::load(state, session_short);
         self.disk.seat_full = loaded_seat;
 
-        // Issue #264/#457: the aggregate row's own `failed`/`cost` cells --
-        // delegations, the seat's own transcript, and its native subagent
-        // transcripts, folded through the one shared function `status::
-        // spend_status_line` also calls. `None` when NONE of those sources
-        // exist at all, so the aggregate row renders `--` rather than a
-        // phantom `0`/`$0.00`. A1-4: a handful of `stat` calls, not a full
-        // read-and-re-price of every source, on the overwhelmingly common
-        // tick where nothing has moved since the last one.
+        // Fold changed spend sources only; absence of every source renders unknown rather than a fabricated zero (#264, #457).
         let transcript = super::session_spend::resolve_transcript(state, session_short);
         self.refresh_spend_with(
             super::session_spend::fingerprint(state, transcript.as_deref()),
@@ -690,12 +536,7 @@ impl FactsCache {
             }
         }
 
-        // Issue #209/v3 codex review finding 2: `mail_by_session`, mirroring
-        // the `scores` loop right above -- every attached pane by its own
-        // agent/short, then every live registry row this dashboard owns.
-        // Rebuilt rather than updated in place for the identical reason
-        // `scores` is: a reaped pane's short must not linger with a stale
-        // count once something else reuses it.
+        // Rebuild mail counts for attached and registry sessions so reaped shorts cannot retain stale values (#209).
         self.disk.mail_by_session.clear();
         if cfg.mail.enabled {
             for pane in panes {
@@ -724,11 +565,7 @@ impl FactsCache {
             }
         }
 
-        // Issue #310: `stalled`, mirroring `mail_by_session` right above --
-        // every attached pane by its own `short()`, then every live registry
-        // row this dashboard owns. Rebuilt rather than updated in place for
-        // the identical reason: a cleared latch (or a reaped pane) must not
-        // linger as a stale badge once something else reuses the short.
+        // Rebuild stall latches for attached and registry sessions so cleared or reaped entries disappear (#310).
         self.disk.stalled.clear();
         for pane in panes {
             if sessions::stall_marker(state, pane.short()).is_some() {
@@ -747,14 +584,7 @@ impl FactsCache {
             }
         }
 
-        // Dash refresh PR1: each pane's OWN bound workflow, resolved from its
-        // own session record by id -- mirroring `mail_by_session`/`stalled`
-        // right above, the same throttled per-session disk read. Never the
-        // repo-wide `active_workflow_summary` pointer above: that pointer
-        // moves on any `zirv workflow start` anywhere in the repo and can
-        // point at a completed run's now out-of-range step, which is exactly
-        // the bug this per-session resolution replaces (see
-        // `resolve_session_workflow`'s own doc comment).
+        // Resolve each pane's bound workflow by session ID; the repo-wide active pointer can change independently.
         let now = super::state::now_secs();
         self.disk.workflow_by_session.clear();
         for pane in panes {
@@ -784,19 +614,7 @@ impl FactsCache {
         true
     }
 
-    /// Issue #354 phase 2: re-reads the composed attention status for exactly
-    /// the rows the sidebar can draw. Called only on a tick where
-    /// [`FactsCache::refresh_if_due`] returned `true`, so a frame never costs
-    /// a read; `load` is a seam purely so a test can count how often that
-    /// actually happens.
-    ///
-    /// Rebuilt rather than updated in place, for the same reason `scores` and
-    /// `mail_by_session` are: a reaped, un-retained pane's status must drop
-    /// out of the map rather than linger against a short id something else may
-    /// reuse.
-    /// Issue #354 phase 5: returns the map it replaced, which is exactly the
-    /// "previous projection" half the notice reducer needs -- handed over
-    /// rather than cloned, so watching for transitions costs nothing.
+    /// Refresh only drawable rows on a facts tick, and return the previous map for transition notices; rebuilding prunes stale shorts (#354).
     pub(super) fn refresh_attention(
         &mut self,
         shorts: &[String],

@@ -1,38 +1,7 @@
 //! Issue #490 (roadmap N21): the native harness's multi-agent attention,
-//! evidence and rollover experience -- the view model N11's conversation
-//! pane (`dash::native_pane`) deliberately stopped short of.
-//!
-//! # Why a second module rather than more of `native_pane`
-//!
-//! `native_pane` owns ONE conversation: its reducer turns one session's
-//! journal into one transcript, and its presentation state is that pane's
-//! scroll/composer/focus. Everything this module adds is about the work
-//! AROUND that conversation -- the other agents, their tasks, the evidence
-//! they produced, the capacity they are spending, the approvals they are
-//! blocked on, and the rollovers/compactions/reconnects that move a seat
-//! from one session to another underneath all of it. Those are fed by
-//! completely different authorities (`coordinator`, `delegation`, `seat`,
-//! `rollover::runtime`, `pool`), so mixing them into `native_pane` would make
-//! its one clean "journal in, transcript out" contract answer to five more
-//! record types.
-//!
-//! # The one rule every builder here follows
-//!
-//! **Authoritative records in, view model out -- never a transcript.** Every
-//! `build_*` function below takes already-loaded, already-durable records
-//! (a `coordinator::Coordinator`, a slice of `delegation::Record`, a slice of
-//! `seat::Seat`, a `pool::PoolView`, a `delegation::Manifest`) and returns a
-//! plain data structure. None of them read a JSONL transcript, replay a
-//! journal, call the clock, or touch the network; `now` is a parameter
-//! wherever elapsed time matters. That is what lets every behaviour in this
-//! file -- including the cross-platform/accessibility/performance ones,
-//! which have no terminal to run in -- be a deterministic unit test.
-//!
-//! Worker inspection ([`build_inspection`]) is the sharpest case: it reads a
-//! `delegation::Manifest` -- the BOUNDED result N10 already publishes -- and
-//! never the worker's own conversation. A coordinator inspecting a worker
-//! therefore pays the manifest's bytes, not the worker's transcript's, no
-//! matter how long that worker ran.
+//! built from already loaded coordinator, delegation, seat and pool records.
+//! Each pane owns its own journal transcript; these views never read worker transcripts.
+//! They do no I/O or clock reads, and inspection uses a bounded manifest (#490).
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -144,8 +113,7 @@ impl AgentState {
         }
     }
 
-    /// Whether this state needs the operator before anything moves. Drives
-    /// the overview's own ordering and the "what needs me" count.
+    /// Prioritize states that need the operator in the overview.
     pub fn needs_operator(self) -> bool {
         matches!(self, Self::ApprovalNeeded | Self::DoneUnread | Self::Failed)
     }
@@ -185,7 +153,7 @@ pub struct AgentRow {
     /// The exact decision the operator owes this agent, when it has one.
     pub pending_decision: Option<String>,
     pub result: Option<ResultRef>,
-    /// Seconds in the current state, from the caller's `now`.
+    /// Measure time in the current state from the caller's clock.
     pub since_secs: u64,
 }
 
@@ -279,7 +247,7 @@ impl Overview {
         self.rows.get(line / per.max(1))
     }
 
-    /// How many rows are waiting on the operator right now.
+    /// Count rows awaiting operator action.
     pub fn needs_operator(&self) -> usize {
         self.rows
             .iter()
@@ -349,14 +317,8 @@ impl Overview {
     }
 }
 
-/// Builds the overview from the authoritative records. Ordering is by
-/// urgency ([`AgentState`]'s own declaration order) and then by short id, so
-/// the rows an operator must act on are always at the top and the order
-/// never flickers between two ticks with the same facts.
-///
-/// `approvals` supplies the one fact no durable record carries: which
-/// sessions have an approval outstanding right now. Passing it in (rather
-/// than querying a broker here) keeps this function pure.
+/// Order by urgency, then short ID, so actionable rows lead and unchanged
+/// facts cannot reorder the overview between ticks.
 pub fn build_overview(
     graph: &coordinator::Coordinator,
     records: &[delegation::Record],
@@ -366,12 +328,7 @@ pub fn build_overview(
 ) -> Overview {
     let mut rows: Vec<AgentRow> = Vec::new();
 
-    // Review finding 5 (PR #544): indexed once per call instead of a linear
-    // `.find` over every coordinator node for every delegation record --
-    // O(records + nodes) rather than O(records * nodes). `entry(..).or_
-    // insert` keeps the same "first match in `graph.nodes`'s own key
-    // order" semantics the replaced `.find` had, in the (should not
-    // happen) case two nodes ever name the same delegation.
+    // Index coordinator nodes once to keep delegation lookup linear (#544).
     let mut nodes_by_delegation: HashMap<&str, &coordinator::Node> = HashMap::new();
     for node in graph.nodes.values() {
         if let Some(delegation) = node.delegation.as_deref() {
@@ -775,8 +732,7 @@ fn bounded_summary_lines(width: usize) -> usize {
 // Item 3: usage and health provenance
 // =========================================================================
 
-/// One number with its provenance. `value: None` renders as "unknown", never
-/// as `0` -- the distinction criterion 5 and issue #490 item 3 both call for.
+/// Keep provenance with each number; unknown must never render as zero (#490).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Measure {
     pub label: String,
@@ -1020,8 +976,7 @@ pub enum NoticeKind {
     Compacted,
     Rollover,
     Reconnected,
-    /// Mail/attention that was held while the session was blocked and has
-    /// now been delivered. Criterion 2's "completion notices are not lost".
+    /// Keep notices held during a block and deliver them when the session becomes available.
     DeferredDelivery,
 }
 
@@ -1259,8 +1214,7 @@ impl Continuity {
 pub enum Retarget {
     /// Same session and generation: nothing to do.
     Unchanged,
-    /// The logical seat advanced. Everything presentational was preserved
-    /// and every queued item now addresses the NEW session.
+    /// After seat rollover, preserve presentation state and retarget queued items to the new session.
     Retargeted {
         from_session: String,
         to_session: String,
@@ -1290,7 +1244,7 @@ impl Continuity {
     }
 }
 
-/// Where a submission is allowed to go right now.
+/// Identify where a submission may be delivered in the current state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmitTarget {
     /// Safe: this session is the logical seat's current one.
@@ -1382,8 +1336,7 @@ pub struct ApprovalRequest {
     /// dialogs knows which worker each belongs to.
     pub actor: String,
     pub reason: String,
-    /// A bounded preview (a diff excerpt, a command line). Capped by the
-    /// caller; the dialog renders at most [`APPROVAL_PREVIEW_LINES`].
+    /// Bound approval previews before rendering them.
     pub preview: Vec<String>,
     pub asked_at: u64,
 }
@@ -1414,12 +1367,7 @@ impl ApprovalDecision {
     }
 }
 
-/// Where a decision is actually delivered. The in-process broker for a
-/// session this process spawned itself (`runtime::native::spawn_interactive`),
-/// and protocol v1's `session.approve` for one owned by the persistent
-/// runtime (N20). The dialog itself is identical either way -- only the
-/// delivery differs -- so an operator never has to know which kind of
-/// session they are answering.
+/// Deliver approvals through the live broker or protocol request that owns the blocked tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalRoute {
     Broker,
@@ -1453,25 +1401,13 @@ pub struct ApprovalDialog {
     /// then quietly failing -- see [`PendingApproval::grantable`].
     pub grantable: bool,
     pub unavailable_reason: Option<String>,
-    /// Issue #490 (N21 item B): whether the broker behind this dialog can
-    /// remember an answer for this EXACT tool+scope for the rest of this
-    /// session. True only for a live in-process request, whose
-    /// `enforcement::ApprovalRequest::scope_digest` is what would be
-    /// remembered -- an exact, statable scope, which is why it may be offered
-    /// at all. Never true for a transcript-derived request: the journal does
-    /// not carry the digest the broker fenced.
+    /// Remember an answer only when a live broker supports the exact tool and scope (#490).
     pub session_remember: bool,
     selected: usize,
 }
 
 impl ApprovalDialog {
-    /// A fully grantable dialog over a LIVE broker request -- one whose tool
-    /// call is blocked on the answer right now. Reached through
-    /// [`UxState::open_live_approval`], from the `enforcement::
-    /// ApprovalPrompt` `native_pane::NativePaneRuntime::poll_live_approval`
-    /// drains. The request it is built from carries the broker's own
-    /// `scope_digest`, which is what makes the session-scoped "don't ask
-    /// again" option below exact rather than a widening.
+    /// Only a live blocked broker request can open a grantable approval dialog (#490).
     pub fn new(request: ApprovalRequest) -> Self {
         Self {
             request,
@@ -1518,11 +1454,7 @@ impl ApprovalDialog {
                 ),
             ));
         } else if self.session_remember {
-            // Issue #490 (N21 item B): the session-scoped form. It widens
-            // nothing -- it suppresses the next request whose scope digest is
-            // byte-identical, and only until this session ends -- so the
-            // label says exactly that rather than naming a directory the
-            // request never carried.
+            // Reuse a session approval only for a byte-identical scope digest until that session ends (#490).
             options.push((
                 ApprovalDecision::AllowAlways,
                 format!(
@@ -1658,11 +1590,8 @@ pub struct PendingApproval {
     pub unavailable_reason: Option<String>,
 }
 
-/// Finds the newest outstanding approval in a transcript. Reads only what the
-/// journal actually recorded -- the tool name, its argument preview and the
-/// broker's own refusal message -- and never invents a path or a directory
-/// the record did not carry, which is why the scope it builds names the tool
-/// and its arguments rather than a guessed filesystem grant.
+/// Use only journaled tool, argument preview and refusal evidence; never
+/// invent a grantable path or directory the record did not carry.
 pub fn detect_pending_approval(
     items: &[super::native_pane::TranscriptItem],
     session: &str,
@@ -2051,16 +1980,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/workflows", "list the registry's workflow packs"),
 ];
 
-/// One instruction surface as the native `/context` (alias `/instructions`)
-/// view renders it -- the same columns `zirv context status` shows for the
-/// wrapped harness (issue #538, acceptance bullet 6's native half): path,
-/// trust, scope, bytes, sha256, decision+reason. Deliberately a local,
-/// display-only shape rather than `runtime::context::ResolvedInstructionSource`
-/// directly: this module stays presentation-only, and the caller (mirroring
-/// how `/status` needs live `StatusFacts` `apply_slash_command` cannot
-/// produce) is the one with repo/home/config access to assemble it --
-/// `NativePaneRuntime::context_view_facts` (chunk C), reading the journal's
-/// own recorded `ContextCompiled` provenance.
+/// Show native instruction provenance and context version through the same status fields (#538).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextViewSource {
     pub path: String,
@@ -2076,12 +1996,7 @@ pub struct ContextViewSource {
     pub decision: String,
 }
 
-/// Renders the native `/context` view (issue #538, decision 4): the current
-/// compiled instruction provenance, the context version
-/// (`CompiledNativeContext::stable_prefix_sha256`), and whether the last
-/// turn recompiled it -- the same journal columns `JournalEvent::
-/// ContextCompiled` records, and the same per-surface facts `zirv context
-/// status` reports for the wrapped harness.
+/// Render current compiled instruction provenance and its stable context hash (#538).
 pub fn render_context_view(
     sources: &[ContextViewSource],
     context_version: &str,
@@ -2127,14 +2042,7 @@ pub fn slash_completions(draft: &str) -> Vec<Completion> {
         .collect()
 }
 
-// =========================================================================
-// Issue #541 chunk C: `/agents`, `/agent`, `/team` -- rendered from the SAME
-// structs the headless `zirv workflow agent list|show`/`team show|plan`
-// surfaces print, through the SAME formatting functions, never a duplicated
-// table. These are pure: the pane (which alone holds the repo/state access
-// a registry or a stored plan needs) reads the data and calls one of these
-// to turn it into the notice text it shows.
-// =========================================================================
+// Render agent and team views from the shared workflow structs (#541).
 
 /// `/agents`: the resolved roster, straight through
 /// `workflow::agents::write_agent_table` -- the exact function `zirv
@@ -2173,13 +2081,7 @@ pub fn render_agent_plan(
     }
 }
 
-// =========================================================================
-// Issue #539 chunk C: `/skills`, `/skill <id>` -- rendered through the SAME
-// `workflow::skill_render` writer functions a future `zirv skill list`/
-// `show` rewrite would use, mirroring the `/workflows`/`/workflow`
-// precedent (issue #542 chunk 3b, decision 5) so the discovery table and
-// the detail view can never silently drift from whatever the CLI prints.
-// =========================================================================
+// Render skill views through the shared workflow writer (#539).
 
 /// `/skills`: the session repository's resolved skill catalogue, plus the
 /// registry's own collision warnings appended verbatim -- an ignored
@@ -2199,11 +2101,7 @@ pub fn render_skill_list(
     text
 }
 
-/// `/skill <id>`: the digest detail `write_digest_detail` renders, followed
-/// by the instruction body -- the body is deliberately not part of the
-/// shared writer (issue #539's progressive disclosure keeps it a separate
-/// stage), so this is the one place that appends it for the operator who
-/// explicitly asked to see it.
+/// Show digest detail before the instruction body, keeping progressive disclosure (#539).
 pub fn render_skill_detail(skill: &crate::commands::workflow::skill::RegisteredSkill) -> String {
     let mut buf: Vec<u8> = Vec::new();
     let _ = crate::commands::workflow::skill_render::write_digest_detail(&mut buf, skill);
@@ -2488,9 +2386,7 @@ impl UxState {
         self.approval.is_some()
     }
 
-    /// Whether a modal owns the screen right now. The pane's global `Esc`
-    /// (interrupt the turn) defers to this: a modal closes first, and only a
-    /// second `Esc` reaches the turn.
+    /// Close an open modal on Esc before forwarding a later Esc to interrupt the turn.
     pub fn modal_open(&self) -> bool {
         self.approval.is_some() || self.inspection.is_some() || self.help
     }
@@ -2548,15 +2444,8 @@ impl UxState {
         self.focus = Focus::Approval;
     }
 
-    /// Issue #490 (N21 item B): opens the dialog for a LIVE broker request --
-    /// one whose tool call is blocked on the answer right now, rather than one
-    /// reconstructed from a refusal the journal already recorded. It is
-    /// grantable by construction (there is a gate waiting on it) and it may
-    /// offer the session-scoped "don't ask again", because the broker's own
-    /// scope digest is what would be remembered.
-    ///
-    /// Idempotent for the same request id, like [`Self::sync_approval`]: the
-    /// pane polls its prompt channel on every tick.
+    /// Grant only a live broker request whose tool call is waiting now;
+    /// journal-reconstructed refusals have no gate to release (#490).
     pub fn open_live_approval(&mut self, request: ApprovalRequest) {
         if self
             .approval
@@ -2716,9 +2605,7 @@ impl UxState {
 // Item 6: headless parity
 // =========================================================================
 
-/// The truthful limitations item 6 demands be stated rather than papered
-/// over. Each line names a fact the TUI and this report BOTH cannot know, so
-/// a headless consumer is never misled into treating a gap as a zero.
+/// State facts the TUI and report cannot know so headless consumers do not infer false certainty.
 pub const LEGACY_LIMITATIONS: &[&str] = &[
     "a wrapped (PTY) adapter reports the model it was configured with, not the one the provider billed: its model provenance is 'estimated'",
     "approval state is known only for sessions this process owns or can reach over the runtime protocol; a wrapped adapter's own in-terminal prompt is invisible here",

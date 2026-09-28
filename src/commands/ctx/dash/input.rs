@@ -21,15 +21,9 @@ pub enum DashAction {
     /// `Ctrl+A c`, or the header's `actions` hint: the same menu for the
     /// selected row.
     ContextActions,
-    /// `Ctrl+A i`, or the header's `inspect` hint (issue #354 phase 3): the
-    /// per-row inspector over the selected row. Replaces phase 1/2's mapping
-    /// of this chord onto the errors overlay; `^A e errors` is unchanged.
+    /// Open the selected row's inspector with Ctrl+A i (#354).
     Inspect,
-    /// `Ctrl+A r`, or the header's `restore` hint (issue #354 phase 3):
-    /// relaunch the selected ended/reaped row from the spawn request the
-    /// dashboard kept for it. A no-op with a notice when the selected row is
-    /// not restorable -- the hint is not drawn for such a row in the first
-    /// place, and the context menu says why.
+    /// Relaunch a retained ended row from its saved request, or show why it cannot be restored (#354).
     RestoreRow,
     /// `Ctrl+A Left`/`Ctrl+A Right`, or a click on a group header's
     /// disclosure triangle: fold a work group shut, or open it again.
@@ -43,14 +37,9 @@ pub enum DashAction {
     Nudge,
     Mail,
     Memory,
-    /// `Ctrl+A o` (issue #84) -- opens the handover picker: swap the focused
-    /// pane's model or harness in place. Not `m`: that key already opens
-    /// `Mail`, and `M` already opens `Memory` -- `o` ("orchestrator") is the
-    /// nearest free mnemonic, a deliberate deviation from the issue's own
-    /// literal "Ctrl+A m" wording to avoid silently breaking either binding.
+    /// Ctrl+A o opens the focused pane's handover picker (#84).
     Handover,
-    /// `Ctrl+A e` (issue #202 phase 2b) -- opens the kept-errors overlay
-    /// (`push_error`'s own buffer, newest first).
+    /// Ctrl+A e opens the retained errors overlay (#202).
     ShowErrors,
     /// Click affordance follow-up: a left click on the JEV sidebar's own
     /// `errors N \u{b7} <reason>` line -- opens `Overlay::JevErrors` over the
@@ -63,17 +52,13 @@ pub enum DashAction {
     /// mouse only.
     ShowJevErrors,
     Zoom,
-    /// `Ctrl+A b` (dash refresh PR1) -- forces the session column back on
-    /// below the narrow-terminal floor, or hides it again above it.
+    /// Let the operator override automatic narrow-terminal sidebar hiding.
     ToggleSidebar,
     Quit,
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
     /// binding below.
     Help,
-    /// `Ctrl+A p` (issue #354 phase 4) -- opens the searchable palette over
-    /// the one action-descriptor table (`dash::actions::ACTIONS`). The same
-    /// dialog the help overlay is, with Enter wired to run the caret's own
-    /// action against the current selection.
+    /// Ctrl+A p opens the searchable action palette (#354).
     Palette,
     /// Scroll the focused pane a half-screen back into its history
     /// (`Ctrl+A PageUp`) or toward the live view (`Ctrl+A PageDown`).
@@ -88,10 +73,7 @@ pub enum DashAction {
     LiteralPrefix,
 }
 
-/// Issue #354: what one pointer event means to the dashboard, decided
-/// entirely from the last drawn frame's geometry. `Grid` is the one variant
-/// that lets the event through to the focused child; every other variant is
-/// the dashboard's own chrome and stops here.
+/// Resolve pointer actions from the last drawn frame; only Grid routes reach the child (#354).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum MouseRoute {
     /// Hand the event on to the existing grid path unchanged: child mouse
@@ -111,40 +93,15 @@ pub(super) enum MouseRoute {
     ScrollRoster(isize),
     /// A chrome hit that maps onto a keyboard action the dash already has.
     Action(DashAction),
-    /// Issue #354 phase 3: a left click on one visible row of the open list
-    /// dialog, by its index into that dialog's own full row list. Selecting
-    /// vs activating is decided by the loop, which is the only thing holding
-    /// a clock ([`DOUBLE_CLICK`]); this stays pure.
+    /// Select an overlay row by index; the event loop decides whether a second click activates it (#354).
     OverlayRow(usize),
-    /// Issue #354 phase 3: a click on the open dialog's own pinned hint row,
-    /// fed to that dialog's reducer as exactly the key the hint names -- so
-    /// the pointer can never reach a code path the keyboard could not.
+    /// Feed a dialog hint click to the same reducer key as its keyboard binding (#354).
     OverlayKey(KeyCode),
-    /// Issue #354 phase 3: the wheel over an open dialog, in list rows.
+    /// Scroll the open dialog's list, not the underlying pane (#354).
     ScrollOverlay(isize),
 }
 
-/// Pure: the dispatch order the behaviour contract calls for, in one place.
-///
-/// 1. the mouse-capture-off guard (`dash.mouse = false`; the terminal itself
-///    owns the pointer, so nothing here may act on it);
-/// 2. the modal layer -- an open overlay owns every pointer event, wheel
-///    included. Phase 3 refines "owns" from "swallows" to "owns its own
-///    targets": a click on one of the dialog's visible rows selects (or, on a
-///    double-click, activates) it, a click on its pinned hint row is fed to
-///    its reducer as that key, the wheel scrolls its list, and everything
-///    else inside or around it is consumed and does nothing. Nothing under a
-///    dialog is ever reachable;
-/// 3. the captured gesture owner -- a drag or release that belongs to an
-///    in-progress text selection, or to a left press still waiting on the
-///    click-vs-drag decision (`PendingPress`), stays with the grid wherever
-///    it lands, so neither the translation/cancel rules nor the deferred
-///    click can be defeated by the pointer straying onto chrome mid-gesture;
-/// 4. the chrome hit;
-/// 5. the existing grid path, unchanged.
-///
-/// Nothing but `MouseRoute::Grid` may reach `Pane::forward_mouse_button`,
-/// `Pane::scroll_wheel` or `Pane::write_input`.
+/// Routing order is capture guard, modal overlay, captured gesture, chrome, then grid; only Grid may forward input to the child (#354).
 pub(super) fn route_mouse(
     snap: &hit::FrameSnapshot,
     mouse: event::MouseEvent,
@@ -255,14 +212,7 @@ pub(super) fn select_row(
     }
 }
 
-/// Pure: which session row a session-scoped action (`^A i`, `^A n`, the
-/// action menu) addresses, or `None` when the cursor is parked on chrome.
-///
-/// Review finding A1-7: `selected` keeps naming whichever session row the
-/// cursor was last on while the cursor itself sits on the summary line or a
-/// group header, so an action read straight off `selected` acted on a
-/// session the operator was no longer pointing at. Chrome owns the cursor or
-/// nothing does.
+/// Resolve session actions against the row cursor, never a stale pane index.
 pub(super) fn session_target(
     chrome: Option<&Hit>,
     rows: &[ui::SidebarRow],
@@ -277,14 +227,7 @@ pub(super) fn session_target(
     rows.get(selected).map(|row| row.short.clone())
 }
 
-/// Pure: whether a left press at `(column, row)` is eligible to start a
-/// pending zirv selection over the focused pane -- issue #697: the dashboard
-/// now owns click-drag inside every pane, including one whose child has
-/// turned on its own mouse reporting (`Pane::wants_mouse`), so this no
-/// longer gates on that at all. What still tells a click for such a child
-/// apart from a drag meant for zirv's own selection is decided later, by how
-/// far the pointer moves before release (see `past_drag_threshold` and
-/// `PendingPress`) -- not by where the press landed.
+/// Allow a pending selection press in every pane while preserving ordinary clicks for child TUIs (#697).
 pub(super) fn press_starts_selection(main: Rect, column: u16, row: u16) -> bool {
     main.contains(Position::new(column, row))
 }
@@ -307,11 +250,7 @@ pub(super) fn navigate_roster(
     focused: usize,
     chrome: &mut Option<Hit>,
 ) -> (usize, usize) {
-    // A1-6: `order` is empty until the first successful draw fills
-    // `FrameSnapshot::roster`, and an empty tree is not a tree with only a
-    // summary line in it -- walking it parked the very first `Ctrl+A ↓` on
-    // the summary instead of moving. With no drawn tree to follow, fall back
-    // to the flat row list the pre-#354 keyboard already used.
+    // Before the first draw populates the tree, navigate the flat row list so the first Down does not land on a phantom summary.
     if order.is_empty() || !matches!(action, DashAction::SelectUp | DashAction::SelectDown) {
         *chrome = None;
         return apply_navigation(
@@ -356,9 +295,7 @@ pub(super) fn navigate_roster(
 /// the placeholder `assemble_sidebar` put there.
 pub(super) fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now: u64) {
     for row in rows {
-        // Issue #354 phase 2: the glyph column, the rollups and the `reason`
-        // line all read this one cached value. It is looked up here, on the
-        // facts cadence's own output -- never loaded per frame.
+        // Use cached attention status for glyph, rollups and reason; render must not read it from disk (#354).
         row.status = disk.attention.get(&row.short).cloned();
         if let Some(group) = row.group.as_mut()
             && let Some(cached) = disk.groups.get(&group.id)
@@ -368,11 +305,8 @@ pub(super) fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now:
                 *value = value.replacen(style::PLACEHOLDER, &group.scope, 1);
             }
         }
-        // Dash refresh PR1: the fact block's own state word -- the composed
-        // projection's own word (`working`, `needs approval`, ...) once a
-        // status exists. `Unknown` (what a missing/never-written status file
-        // reads back as) keeps whatever phase-1 `RowState` word `assemble_
-        // sidebar` already set -- never a fabricated word.
+        // An Unknown projection preserves the row's lifecycle word; never
+        // fabricate an attention state from a missing status file.
         if let Some(status) = row.status.as_ref() {
             let projection = super::attention::project(status);
             if projection != super::attention::Projection::Unknown {
@@ -432,13 +366,7 @@ pub(super) fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now:
     }
 }
 
-/// Matches `PREFIX` in either shape a real terminal can deliver it in: the
-/// classic `Char('a')` (or shifted `Char('A')`) plus a `CONTROL` modifier
-/// flag, or -- per the vt100 spike's own finding
-/// (`docs/superpowers/notes/2026-08-13-vt100-spike.md`) -- the raw control
-/// byte `Char('\u{01}')` with no modifier flag at all, which is how Windows
-/// can deliver `Ctrl+A` in VT input mode. Both `filter_key`'s own arming
-/// check and its armed-and-pressed-again check reuse this.
+/// Match both modifier-bearing Ctrl+A and the raw C0 byte Windows VT input can send.
 pub(super) fn is_prefix_key(key: &KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('a') | KeyCode::Char('A') => key.modifiers.contains(KeyModifiers::CONTROL),
@@ -447,11 +375,8 @@ pub(super) fn is_prefix_key(key: &KeyEvent) -> bool {
     }
 }
 
-/// Pure: decides what one keystroke means, given whether the prefix is
-/// currently armed from the previous keystroke. Returns the *new* armed
-/// state alongside the verdict -- every path disarms except successfully
-/// arming on an unarmed prefix press, so a caller never has to reason about
-/// the transition table itself, only apply the pair it gets back.
+/// Return the next prefix state with every verdict; every path disarms except
+/// the prefix key itself, so an unrelated key cannot leave the prefix armed.
 pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
     if !prefix_armed {
         if is_prefix_key(&key) {
@@ -481,9 +406,7 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         KeyCode::Tab => Some(DashAction::NextPane),
         KeyCode::Up => Some(DashAction::SelectUp),
         KeyCode::Down => Some(DashAction::SelectDown),
-        // Issue #354: the roster is a tree now, so Left/Right fold a work
-        // group shut and open it again -- the keyboard equivalent of clicking
-        // a group header's disclosure triangle. Both were unbound before.
+        // Left and Right fold or unfold the selected work group (#354).
         KeyCode::Left => Some(DashAction::CollapseGroup),
         KeyCode::Right => Some(DashAction::ExpandGroup),
         // Scrollback, behind the prefix only. The bare keys deliberately keep
@@ -498,29 +421,21 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
             Some(DashAction::Switch((c as u8 - b'1') as usize))
         }
         KeyCode::Char('s') => Some(DashAction::Spawn),
-        // Issue #354: the selected row's action menu -- the same one a
-        // right-click raises. `c` was unbound before.
+        // Open the selected row's action menu (#354).
         KeyCode::Char('c') => Some(DashAction::ContextActions),
         KeyCode::Char('n') => Some(DashAction::Nudge),
         KeyCode::Char('m') => Some(DashAction::Mail),
         KeyCode::Char('M') => Some(DashAction::Memory),
         KeyCode::Char('o') => Some(DashAction::Handover),
         KeyCode::Char('e') => Some(DashAction::ShowErrors),
-        // Issue #354 phase 3: the real per-session inspector. Phase 1/2
-        // mapped this chord onto the errors overlay so the drawn hint was
-        // never inert; it now leads to the surface it always named.
+        // Open the selected row's inspector (#354).
         KeyCode::Char('i') => Some(DashAction::Inspect),
-        // Issue #354 phase 3: the dead footer has advertised `^A r restore`
-        // since #209 with nothing behind it. It relaunches the selected
-        // ended row now.
+        // Restore the selected retained ended row (#354).
         KeyCode::Char('r') => Some(DashAction::RestoreRow),
-        // Issue #354 phase 4: the searchable palette over the one
-        // action-descriptor table. `p` was unbound before.
+        // Open the searchable action palette (#354).
         KeyCode::Char('p') => Some(DashAction::Palette),
         KeyCode::Char('z') => Some(DashAction::Zoom),
-        // Dash refresh PR1: below 100 columns the session column hides
-        // itself; this forces it back (or hides it again) regardless of
-        // width. `b` was unbound before.
+        // Toggle the session sidebar even below its automatic width threshold.
         KeyCode::Char('b') => Some(DashAction::ToggleSidebar),
         KeyCode::Char('q') => Some(DashAction::Quit),
         KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
@@ -575,11 +490,7 @@ pub(super) fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// The bytes `Ctrl+<c>` sends. M8: the non-alphabetic control combinations
-/// crossterm pre-maps to a plain char are listed out -- without them they
-/// typed a literal `4`/`7`/space instead of the C0 byte the operator meant.
-/// Shared by [`encode_key`]'s own CONTROL arm and its ALT fast-path, which
-/// prefixes an ESC to exactly these bytes for `Ctrl+Alt+<c>`.
+/// Map nonalphabetic Ctrl keys to C0 bytes, including the Ctrl+Alt path.
 pub(super) fn control_byte(c: char) -> Vec<u8> {
     match c {
         ' ' => vec![0x00],  // Ctrl+Space -> NUL
@@ -605,28 +516,7 @@ pub(super) fn control_byte(c: char) -> Vec<u8> {
     }
 }
 
-/// `crossterm::event::KeyEvent` -> bytes to write to the active pane's pty.
-/// Covers the terminal basics: `Enter`, arrows, `Tab`/`BackTab`, navigation
-/// keys, function keys, `Alt-<x>`, `Ctrl-<x>`, and plain/UTF-8 characters.
-///
-/// M7: the special keys (arrows, Home/End, PageUp/Down, Delete/Insert) carry
-/// their held modifiers through the standard xterm `CSI 1 ; <mod> <final>` /
-/// `CSI <n> ; <mod> ~` forms, so `Ctrl+Left` moves a word rather than one
-/// character. M8: the CONTROL arm maps the non-alphabetic control combinations
-/// crossterm pre-maps to a plain char (Ctrl+Space, Ctrl+\`]^_`) to their real
-/// C0 bytes, so they no longer type a literal digit or space -- covering
-/// both the legacy digit-alias shape an un-negotiated terminal sends
-/// (Ctrl+\/]/^/_ arriving as `Char('4'..'7')`) and the literal-character
-/// shape a terminal sends once the kitty keyboard protocol is negotiated
-/// (`push_keyboard_enhancement`), where those same keys arrive as
-/// `Char('\\'/']'/'^'/'_')` instead.
-///
-/// Deliberately makes no special case for a raw control byte arriving as
-/// `KeyCode::Char('\u{01}')` (or any other `Char('\u{0N}')`) with no
-/// modifier flag: those code points already encode to the same single byte
-/// through plain UTF-8 (ASCII control characters are their own UTF-8
-/// encoding), so the fallback `Char(c)` arm below reproduces the raw byte
-/// unchanged without needing to detect the shape at all.
+/// Encode modified navigation keys with xterm CSI forms and control combinations as C0 bytes; preserve legacy digit aliases from unnegotiated terminals.
 pub fn encode_key(key: KeyEvent) -> Vec<u8> {
     if key.modifiers.contains(KeyModifiers::ALT)
         && let KeyCode::Char(c) = key.code
@@ -644,27 +534,7 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         return bytes;
     }
     match key.code {
-        // Bare Enter submits (`\r`); Shift+Enter must NOT -- it inserts a
-        // newline. The encoding is `ESC CR`, deliberately *not* the CSI-u form
-        // (`ESC [ 13 ; 2 u`): CSI-u belongs to the kitty keyboard protocol,
-        // which a terminal may only emit once the application has negotiated
-        // it, and a harness that has not would read the bytes as ESC plus a
-        // literal `[13;2u` typed into its prompt. `ESC CR` is what Claude
-        // Code's own `/terminal-setup` binds Shift+Enter to, and it is the
-        // long-standing Meta+Enter convention, so it degrades to "newline"
-        // rather than to garbage.
-        //
-        // ALT is checked here too, not just SHIFT: an empirical probe of the
-        // real claude CLI under ConPTY established that once an operator's
-        // Windows Terminal has claude's own `/terminal-setup` binding, WT
-        // rewrites Shift+Enter itself into `ESC CR` before zirv ever sees a
-        // keystroke -- and zirv's own console layer folds that byte pair back
-        // into a single Enter keydown carrying ALT rather than SHIFT (the
-        // `ALT` fast-path above this match is gated on `KeyCode::Char`, so
-        // `Enter`+ALT is not intercepted there and still reaches this arm).
-        // Without this, that keydown fell through to the bare-`\r` branch and
-        // silently submitted instead of inserting the newline the operator
-        // asked for. Ctrl+Enter (neither SHIFT nor ALT) still submits.
+        // Encode Shift+Enter as ESC CR for newline, while bare Enter submits; Windows Terminal may present its configured Shift+Enter as Alt+Enter.
         KeyCode::Enter => {
             if key
                 .modifiers
@@ -751,50 +621,20 @@ pub(super) fn overlay_name(overlay: &ui::Overlay) -> &'static str {
     }
 }
 
-/// Pure: a cheap identity for the open overlay -- its name plus, for the
-/// dialogs that are opened against one particular row, that row's short id.
-///
-/// Review of 9314156 (finding 2): this is what the pending double-click is
-/// tagged with. Two different dialogs never share an identity, and neither
-/// does the same dialog opened on a different row; `Overlay::None` in
-/// between makes a close-then-reopen a change too.
+/// Tag a pending double-click with overlay name and target so another dialog or row cannot inherit it.
 pub(super) fn overlay_identity(overlay: &ui::Overlay) -> (&'static str, String) {
     let subject = match overlay {
         ui::Overlay::Menu(view) => view.target.clone(),
         ui::Overlay::Inspector(view) => view.target.clone(),
         ui::Overlay::Handover(draft) => draft.target_short.clone(),
-        // Review of cc92a56 (finding 2): the palette's own row list is a
-        // function of its query, so the query IS part of its identity. Without
-        // it, a click on row 3, one keystroke that re-filters the list, and a
-        // second click on row 3 inside the double-click window activated
-        // whatever action had moved under the pointer.
+        // Include palette query in dialog identity so filtering between clicks cannot activate a different row.
         ui::Overlay::Palette(view) => view.query.clone(),
         _ => String::new(),
     };
     (overlay_name(overlay), subject)
 }
 
-/// Review of #354 (defect 1, HIGH): whether a mouse route computed from the
-/// tick's one shared `frame_snapshot` may still be trusted for THIS event.
-///
-/// `HIGH-2` (below, at the drain loop) processes several queued events
-/// against a single snapshot taken at the top of the tick. If an earlier
-/// event in that same drain closes -- or replaces -- the open overlay (an
-/// `Esc` that closes the palette, say), a later queued click can still land
-/// on the snapshot's now-stale overlay hint or row: `route_mouse` only knows
-/// the frozen geometry, not that the dialog it names is already gone. Acting
-/// on it anyway would synthesize the keystroke the hint names (e.g. `Enter`)
-/// with no overlay left open to consume it -- which is the one way a chrome
-/// hit could otherwise reach `Pane::write_input`.
-///
-/// Comparing `overlay_identity` -- not just "is some overlay open" -- also
-/// catches a *different* dialog opening at the exact same screen position
-/// within the same drain, the same staleness `last_overlay_click` above
-/// already guards against for the double-click clock.
-///
-/// Every non-overlay route (`Grid`, `Select`, chrome, ...) is unaffected: it
-/// was never computed from the overlay's own rows/hints, so there is nothing
-/// here for it to go stale against.
+/// Trust overlay hit routes only while the live dialog identity matches the frame snapshot; queued events can outlive the overlay they hit (#354).
 pub(super) fn overlay_route_is_current(
     route: &MouseRoute,
     live_overlay: &ui::Overlay,
@@ -854,20 +694,7 @@ pub(super) const KEYLOG_ENV: &str = "ZIRV_CTX_DASH_KEYLOG";
 /// scale is maintenance or drawing, not waiting for a keystroke.
 pub(super) const KEYLOG_SLOW_TICK: Duration = Duration::from_millis(100);
 
-/// The loop state the diagnostic watches for changes between ticks. Small and
-/// `Copy`-ish on purpose: it is compared every iteration, and only a change
-/// writes anything.
-///
-/// These four fields are exactly the ones the three live hypotheses turn on --
-/// `prefix_armed` for "the arming is lost between keystrokes", `overlay` for
-/// "something is swallowing keys before `filter_key` runs", and
-/// `panes`/`focused` for "the action fired but there was nothing to apply it
-/// to".
-///
-/// `focused_alt` was added for the scrolling report: a child that holds the
-/// alternate screen has no scrollback at all (see `pane::alt_scroll_bytes`),
-/// so "nothing scrolls" and "the harness entered full-screen mode" are the
-/// same fact and the log has to carry it without needing a scroll to happen.
+/// Watch prefix, overlay, pane focus and alternate-screen state only when they change, keeping per-tick logging cheap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LoopState {
     pub(super) prefix_armed: bool,
@@ -877,33 +704,7 @@ pub(super) struct LoopState {
     pub(super) focused_alt: bool,
 }
 
-/// The append-only input log behind [`KEYLOG_ENV`].
-///
-/// Every write is best-effort and its error discarded, on purpose: a
-/// diagnostic that can fail a session is worse than no diagnostic, and the
-/// dashboard's whole contract is that a failure degrades the feature rather
-/// than the session (`panic = "abort"` in the release profile means a panic
-/// here would take the operator's terminal with it).
-///
-/// The log is shaped to separate three specific hypotheses about `Ctrl+A`
-/// doing nothing, since a real terminal probe has already ruled out both the
-/// terminal and the matcher (`Ctrl+A` arrives as `Char('a')` + `CONTROL`,
-/// `kind: Press`, which [`is_prefix_key`] matches):
-///
-/// * **(a) an overlay is swallowing keys before [`filter_key`] is reached.**
-///   Every key line carries the overlay variant, `none` included, and a
-///   `TICK` line reports the overlay the moment it changes -- so an
-///   `Overlay::Restore` opened before the first keystroke is the very first
-///   `TICK` in the file.
-/// * **(b) arming is lost between keystrokes.** `EVENT` carries
-///   `armed_before`, `DISPATCH` carries the `armed_after` the loop actually
-///   stored, and `TICK` reports any change to it -- including one that
-///   happens with no event in between, which is precisely the signature of a
-///   state reset.
-/// * **(c) the action fires with no visible effect.** `DISPATCH` names every
-///   [`DashAction`] produced and `OVERLAY` records each take/assign of the
-///   overlay slot, so "set then immediately cleared" and "nothing at all
-///   happened downstream" read differently.
+/// Append diagnostic events best-effort so logging failures cannot break a session. Event, dispatch, overlay and tick records distinguish lost input from downstream effects.
 pub(super) struct KeyLog {
     file: std::fs::File,
     /// Monotonic, so the timestamps are readable deltas rather than wall
@@ -949,8 +750,7 @@ impl KeyLog {
         let _ = self.file.flush();
     }
 
-    /// The one line written before the event loop starts, recording the facts
-    /// that decide whether keystrokes can reach it at all.
+    /// Record input reachability at event-loop startup.
     pub(super) fn startup(
         &mut self,
         cfg: &CtxConfig,
@@ -969,22 +769,7 @@ impl KeyLog {
         ));
     }
 
-    /// Called once at the top of every loop iteration: bumps the tick counter
-    /// and writes a `TICK` line **only when the watched state changed**.
-    ///
-    /// The silence is the point. At a 50ms poll an unconditional line would
-    /// bury the interesting ones, while a change-triggered line makes a
-    /// transition that happened *without* an event impossible to miss -- which
-    /// is exactly what hypothesis (b) would look like: an `EVENT` arming the
-    /// prefix, then a `TICK armed=false` on a later tick with no keystroke
-    /// logged in between.
-    /// Issue #330 adds `dur=<n>ms`: how long the PREVIOUS iteration took, wall
-    /// clock. Keystroke latency is exactly that number -- the loop reaches
-    /// `event::poll` only after a tick's maintenance and draw are done -- so it
-    /// is the one measurement that turns "typing feels laggy" into evidence.
-    /// A tick at or over [`KEYLOG_SLOW_TICK`] writes a line even when nothing
-    /// else about the loop state moved; anything faster still only writes on a
-    /// change, so the silence the rest of this log depends on is kept.
+    /// Write a tick record only when watched state changes, avoiding a log entry for every poll.
     pub(super) fn tick(&mut self, state: LoopState, previous_tick: Duration) {
         self.tick = self.tick.saturating_add(1);
         let ms = previous_tick.as_millis();
@@ -1049,21 +834,7 @@ impl KeyLog {
         ));
     }
 
-    /// One line for one `event::read()`, whatever the event. A key press also
-    /// carries the arming state and the overlay it is about to be decided
-    /// against -- `overlay=none` included, so "no overlay was open" is a
-    /// recorded fact rather than an absence -- plus the decision itself:
-    /// either the overlay that will consume it, or the `(new_armed, verdict)`
-    /// pair [`filter_key`] returns.
-    ///
-    /// The verdict is re-derived here rather than observed from the dispatch
-    /// below. That is sound precisely because `filter_key` is pure -- a total
-    /// function of `(prefix_armed, key)` and nothing else, which is the
-    /// property its own doc comment states and its own tests pin -- so calling
-    /// it a second time cannot disagree with the call that actually runs, and
-    /// cannot have a side effect of its own. [`KeyLog::dispatch`] then records
-    /// what the loop *actually did* with it, so the two disagreeing would
-    /// itself be the finding.
+    /// Record event, prior prefix, overlay and verdict so lost input can be distinguished from swallowed or ineffectual input.
     pub(super) fn observe<E: std::fmt::Display>(
         &mut self,
         read: &Result<Event, E>,
@@ -1095,14 +866,7 @@ impl KeyLog {
         }
     }
 
-    /// What the loop actually did with a key press that reached
-    /// [`filter_key`]: the arming state it stored afterwards, and the verdict
-    /// -- every [`DashAction`] included, not just the interesting ones.
-    ///
-    /// Paired with `EVENT`'s `armed_before`, this is the whole of hypothesis
-    /// (b): if `armed_after=true` here and the next `EVENT` reports
-    /// `armed_before=false` with no `TICK` explaining the change, the arming
-    /// was lost between the two.
+    /// Record every key verdict and stored prefix state, including actions with no visible effect.
     pub(super) fn dispatch(
         &mut self,
         armed_before: bool,
@@ -1121,18 +885,11 @@ impl KeyLog {
         ));
     }
 
-    /// One take/assign of the overlay slot. `run_dashboard` `mem::take`s the
-    /// overlay before running a reducer and puts back whatever the reducer
-    /// returned, so "opened then immediately closed again" is a real shape
-    /// this makes visible -- and it is hypothesis (c)'s signature.
+    /// Take and restore the overlay slot once per reduction so an opened dialog is not immediately cleared.
     pub(super) fn overlay_swap(&mut self, took: &'static str, now: &ui::Overlay) {
         self.line(&format!("OVERLAY took={took} now={}", overlay_name(now)));
     }
 }
-
-// Task 7: sidebar row assembly (dashboard panes + view-only registry rows)
-// and the header's own live facts (mail, memory-bank size, session count),
-// both refreshed at most once per second.
 
 #[cfg(test)]
 mod tests {

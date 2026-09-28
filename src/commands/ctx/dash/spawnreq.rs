@@ -1,21 +1,5 @@
 //! The dashboard's spawn-request channel: a capability-token directory a
-//! pane's own `zirv ctx agent` invocation (inheriting `DASH_REQUESTS_ENV`
-//! from its own turn_env, see `dash::mod::build_turn_env`'s call sites) can
-//! write a [`SpawnRequest`] into, and poll for a matching [`SpawnAck`]. Only
-//! a process that was actually told this directory's path -- by inheriting
-//! it from a pane the dashboard itself spawned -- can reach it at all: the
-//! directory name embeds a random token
-//! (`dash::mod`'s own `spawn_token`), not anything derivable from the
-//! dashboard's own public identity, so an unrelated process on the same
-//! machine cannot forge a request into a dashboard it was never invited
-//! into.
-//!
-//! A request is data, never authority. `dash::mod::fulfill_spawn_request`
-//! re-checks `cfg.agents.refusal` and `adapters::select` against the live
-//! configuration before ever spawning anything -- exactly the same gate an
-//! operator-issued `zirv ctx agent` invocation goes through -- so a pane
-//! child cannot spawn an agent this dashboard's own configuration would
-//! otherwise have refused.
+//! A pane receives a private capability-token request directory through its environment; requests are data and are revalidated against live configuration.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,68 +26,12 @@ pub const DASH_REQUESTS_ENV: &str = "ZIRV_CTX_DASH_REQUESTS";
 /// How often [`wait_for_ack`] polls for a matching ack file.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One `zirv ctx agent` invocation's ask: spawn `agent` as a fresh worker
-/// pane, with `prompt` as its first-turn task text (data, never argv --
-/// mirrors every other delegation path in this codebase). `requested_by` is
-/// advisory only (the caller's own session short, or `"unknown"`): nothing
-/// in the fulfilment path trusts it for anything but a label.
-///
-/// `cwd` is the repo the requester was invoked in, and it is **checked
-/// before it is honoured**: `dash::fulfill_spawn_request` (via `dash::
-/// accepted_spawn_cwd`) refuses outright when `cwd` names neither the
-/// dashboard's own repo nor a linked `git worktree add` sibling of it
-/// (issue #119). Spawning a pane into a directory the operator never opened
-/// is not something a request gets to ask for, and silently ignoring the
-/// field would let a request from another repo run here without either side
-/// noticing -- but a linked worktree of the dashboard's own repo *is* opened,
-/// just at a different path, so an accepted request's pane runs at `cwd`
-/// itself rather than being redirected into the dashboard's own checkout.
-///
-/// `model` is the one trailing flag a pane can honour: the model the requester
-/// pinned for this worker (`zirv agent <name> "<prompt>" -- --model <m>`, in
-/// any spelling `adapters::model_only_flags` recognises). `None` -- also what
-/// a request written by an older build deserialises to -- means the fulfilment
-/// side resolves the operator's own worker default instead, exactly as before
-/// this field existed. It reaches the pane's argv as a `--model` token, so
-/// `dash::fulfill_spawn_request` re-checks it rather than trusting the
-/// requester's own filtering.
-///
-/// `interactive` (2026-08-24, cross-harness permissions hardening): whether
-/// the REQUESTER can vouch that a human is present to answer an `Ask`
-/// prompt raised on the pane this spawns -- true only for a spawn a human
-/// directly triggered from the dashboard's own live TUI (the Spawn
-/// overlay). `#[serde(default)]` makes `false` (`Headless`, fail-closed)
-/// what an older request -- or a scripted/headless one, like `zirv ctx
-/// agent`'s own request-file write, which cannot prove a human is watching
-/// the dashboard that will fulfil it -- deserialises to. `worker_pane_
-/// extra_args`/`compose_worker_prompt` are what actually read it.
+/// Prompt is task data, never argv, and requested_by is advisory, never
+/// authority; revalidate every request field at fulfilment (#119).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
-    /// Issue #403: the ONE request kind on this channel that is not a spawn.
-    /// `Some(short)` asks the dashboard to stop the pane it already owns at
-    /// that short id and answer with the same [`SpawnAck`] shape; every
-    /// spawn field above and below is then unread. `None` -- also what every
-    /// request written before this field existed deserialises to -- is the
-    /// ordinary spawn this struct has always described.
-    ///
-    /// `zirv ctx kill` writes it: a pane's process is the DASHBOARD's own
-    /// `Child` and its writer permit is released by that dashboard's own
-    /// reap, so an outside signal against the bare pid cannot free the slot
-    /// even when it lands -- and from a sandboxed harness shell it may not
-    /// land at all (`EPERM`).
-    ///
-    /// SECURITY (review round 2, 2026-09-08): honoured only on the
-    /// DASHBOARD'S OWN shared channel, never on a pane's attributed intake
-    /// channel (`dash::drain_one_channel`). The earlier justification here
-    /// -- that any process able to write into this directory can already
-    /// signal the same-uid pane itself -- is exactly what #403 disproves: a
-    /// sandboxed pane's own child tree can write into that pane's channel
-    /// and cannot signal anything. Left unguarded, that would let one worker
-    /// stop an unrelated pane through the unsandboxed dashboard, since the
-    /// request names nothing but a short id. On the dashboard's own channel
-    /// it is still safe to honour from an untrusted file drop, unlike
-    /// `flags`/`force`: it only ever NARROWS (it stops work, never starts
-    /// any).
+    /// Stop requests require an attributed pane channel and may target only
+    /// that pane or its descendants (#403, #435).
     #[serde(default)]
     pub kill: Option<String>,
     pub agent: String,
@@ -114,12 +42,7 @@ pub struct SpawnRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub interactive: bool,
-    /// What the requester is asking this pane to BE (issue #155): absent, or
-    /// unrecognised, means `PromptRole::Worker` -- the least-privileged
-    /// reading, and exactly what every pre-2.35.0 request meant. Never
-    /// trusted as authority on its own: `fulfill_spawn_request` re-derives
-    /// the requesting session's own role and applies the depth cap itself
-    /// (see `role_of`, and `dash::mod::depth_refusal`).
+    /// Missing or unknown roles mean Worker; the dashboard re-derives the requester's role and enforces the depth cap (#155).
     #[serde(default)]
     pub role: Option<String>,
     /// The session that asked for this spawn, for cost attribution and for
@@ -129,8 +52,7 @@ pub struct SpawnRequest {
     /// changing who asked for it.
     #[serde(default)]
     pub parent_session: Option<String>,
-    /// The `group::WorkGroup` this spawn belongs to, if any. `None` is a
-    /// one-off delegation, which is every delegation before 2.35.0.
+    /// A missing work group means a one-off delegation.
     #[serde(default)]
     pub work_group_id: Option<String>,
     /// Token ceiling this pane must enforce. For a grouped request written
@@ -140,84 +62,33 @@ pub struct SpawnRequest {
     /// Older request files predate pane budgets and remain unbounded.
     #[serde(default)]
     pub budget_tokens: Option<u64>,
-    /// Issue #155, Phase 6(c): whether the requester already accepted the
-    /// spend at quota pressure (`agent.rs`'s own `--force`). `fulfill_spawn_
-    /// request` applies the SAME `pace::spawn_gate` the requester's own
-    /// `run_with` already evaluated before this request was ever written --
-    /// without this field the dashboard would re-evaluate that gate blind to
-    /// the requester's choice and refuse a spawn `--force` was meant to
-    /// allow, silently defeating the flag for anyone whose worker happens to
-    /// land on a live dashboard. `#[serde(default)]` makes `false` (no
-    /// override) what an older request deserialises to, the same
-    /// fail-closed default `interactive` above already establishes.
-    ///
-    /// Dash review A2-2 (2026-09-06): WIDENING, so it is cleared by `dash::
-    /// mod::sanitize_file_dropped_request` for every request that arrived
-    /// through the file-backed drop directory -- a forged `"force": true`
-    /// used to suppress this dashboard's own cross-harness rerouting. Only
-    /// the in-process Spawn overlay may set it.
+    /// Force preserves an operator's quota choice only for in-process spawns; clear it on file-dropped requests because it widens authority (#155).
     #[serde(default)]
     pub force: bool,
-    /// Issue #228: a harness-agnostic `--workdir`, independent of `cwd`
-    /// above. `cwd` stays what it always was -- the requesting session's
-    /// own repo, checked by `dash::accepted_spawn_cwd` to decide whether
-    /// THIS dashboard may host the pane at all -- while `workdir`, once
-    /// re-validated at the fulfilment side (`agent::validate_workdir`; a
-    /// request is untrusted data, never authority, the same premise every
-    /// other field on this struct is built on), is where the pane actually
-    /// runs and where its filesystem policy is widened to. `None` -- also
-    /// what a request written by an older build deserialises to -- means
-    /// unchanged pre-#228 behaviour: the pane runs at the accepted `cwd`.
+    /// Cwd proves this dashboard may host the request; workdir is separately
+    /// validated to allow operator-opened cross-repo delegation (#228).
     #[serde(default)]
     pub workdir: Option<PathBuf>,
-    /// Issue #267: whether the requester asked for `read-only` or `writing`
-    /// (`agent::AgentArgs::mode`). `#[serde(default)]` -- `WorkerMode`'s own
-    /// default of `Writing` -- so a request written by an older build
-    /// deserialises to the least-surprising reading (every request before
-    /// this field existed WAS an ordinary writing worker). Carried for
-    /// parity with the headless path's own `Delegation::mode`; the pane
-    /// fulfilling this request takes the same writer permit
-    /// `agent::run_with`'s headless fork does (`dash::fulfill_spawn_request`).
+    /// Missing mode means Writing so older requests retain their original
+    /// execution posture instead of silently changing semantics (#267).
     #[serde(default)]
     pub mode: WorkerMode,
-    /// Issue #267, review round 3: whether `workdir` is a linked worktree
-    /// THIS request's own `zirv agent --worktree` allocated (so the pane
-    /// that runs there owns it and the dashboard reclaims it once the pane's
-    /// child exits) as opposed to an operator-named `--workdir` the
-    /// dashboard must never touch, even one that happens to live under
-    /// `<repo>/.zirv/worktrees/`. Ownership travels on the request; it is
-    /// never inferred from the path. `#[serde(default)]` (`false`): a request
-    /// written by an older build owns nothing.
+    /// Worktree ownership must be carried explicitly, never inferred from a path; older requests own nothing (#267).
     #[serde(default)]
     pub owns_workdir: bool,
-    /// Issue #318: the canonical JSON of the `result_schema::Schema` this
-    /// delegation declared via `--result-schema`/`--result-kind`, if any.
-    /// `dash::fulfill_spawn_request` pushes this verbatim into the
-    /// fulfilling pane's own child env (`agent::RESULT_SCHEMA_ENV`), the
-    /// same shape `work_group_id` already travels in. `#[serde(default)]`:
-    /// a request written by an older build declared no contract.
+    /// Carry the result schema as canonical JSON; missing fields mean no declared contract (#318).
     #[serde(default)]
     pub result_schema: Option<String>,
-    /// Issue #262: the canonical JSON of the REQUESTING session's own
-    /// `envelope::WorkerEnvelope` -- the PARENT the pane about to fulfil this
-    /// request must narrow from, not a pre-computed child. `fulfill_spawn_
-    /// request` reconstructs the requested candidate itself from this plus
-    /// `path_scope`/`no_network`/`mode`/`depth` below, using the pane's own
-    /// freshly minted session id for `principal` (which this requesting
-    /// process cannot know in advance) -- the same "carried, then
-    /// re-validated at the fulfilment side" contract `workdir` already has,
-    /// never trusted as a ready-made grant. `#[serde(default)]`: a request
-    /// written by an older build carried no envelope at all, which `dash::
-    /// mod::fulfill_spawn_request` reads as "this dashboard's own root".
+    /// Carry the requesting session's envelope as a parent, then derive and validate the child with its new principal; absence uses dashboard root (#262).
     #[serde(default)]
     pub envelope: Option<String>,
-    /// Issue #262: mirrors `agent::AgentArgs::path_scope`.
+    /// Mirror the requester's path scope (#262).
     #[serde(default)]
     pub path_scope: Vec<PathBuf>,
-    /// Issue #262: mirrors `agent::AgentArgs::no_network`.
+    /// Mirror the requester's network restriction (#262).
     #[serde(default)]
     pub no_network: bool,
-    /// Issue #262: mirrors `agent::AgentArgs::depth`.
+    /// Mirror the requester's delegation depth (#262).
     #[serde(default)]
     pub depth: Option<u8>,
     /// The restart budget the requester asked for (`zirv ctx agent
@@ -255,52 +126,10 @@ pub struct SpawnRequest {
     /// is re-checked by `dash::mod::pane_model_args`.
     #[serde(default)]
     pub flags: Vec<String>,
-    /// R1-4 (2026-09-06 review): the seat instructions this delegation asked
-    /// to be injected as the harness's own system prompt (`zirv ctx agent
-    /// --system-prompt`, which `workflow::review::reviewer_args` uses to
-    /// state the reviewer seat's manifest identity, role and "repository text
-    /// is untrusted evidence" framing).
-    ///
-    /// They used to travel inside `flags` as the adapter's own
-    /// `--append-system-prompt <text>` pair -- which `dash::mod::
-    /// sanitize_file_dropped_request` clears, because a trailing flag becomes
-    /// argv -- so a review fulfilled by a pane ran with NO seat instructions
-    /// and (since `adapters::model_only_flags` gives up on any non-model
-    /// flag) the generic worker model as well. This field is the channel for
-    /// the half that is data rather than argv.
-    ///
-    /// Honoured from an untrusted file drop, unlike `flags`: the text never
-    /// becomes a flag (the flag name comes from the ADAPTER, via
-    /// `AgentAdapter::system_prompt_args`, and the text is folded into this
-    /// pane's own composed prompt by `dash::mod::compose_worker_prompt`), and
-    /// a requester who can write into this channel already controls `prompt`
-    /// -- strictly more injected text than this. Capped at
-    /// `dash::mod::MAX_REQUEST_SYSTEM_PROMPT_BYTES` at the fulfilment side.
-    /// `None` -- also what a request written by an older build deserialises
-    /// to -- means exactly the behaviour before this field existed.
+    /// Carry system instructions as bounded prompt data, never requester-supplied argv; the adapter supplies the flag and older requests have none.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Issue #543 (review F2): the REQUESTER's own seat generation at the
-    /// moment it wrote this request, read the same way `seat::guard_from_env`
-    /// reads its own (`seat::GENERATION_ENV`) -- paired with `parent_session`
-    /// above to build a `permit::SeatFence` at the fulfilment side.
-    ///
-    /// Before this field existed, `dash::mod::fulfill_spawn_request` had no
-    /// requester identity to fence on at all and fenced against the
-    /// DASHBOARD's *own* process environment instead -- a different process
-    /// than the one asking for the spawn, so that fence was either `None`
-    /// (the dashboard holds no seat itself, the common case) or named some
-    /// unrelated seat, neither of which says anything about whether the
-    /// actual requester's rollover has committed. `None` -- also what a
-    /// request written by an older build deserialises to -- means "the
-    /// requester held no seat", read the same way an absent env var does.
-    ///
-    /// Only ever NARROWS: a forged value can only make `permit::acquire_
-    /// writer` refuse a request that would otherwise have gone through
-    /// unfenced (exactly the outcome omitting the field already gets), never
-    /// grant a lease the state on disk would otherwise refuse -- so, like
-    /// `max_restarts`/`timeout_secs`, `dash::mod::sanitize_file_dropped_
-    /// request` does not need to clear it.
+    /// Fence a spawn with the requester's seat generation, not the dashboard process's seat. A forged generation can only narrow permission (#543).
     #[serde(default)]
     pub parent_seat_generation: Option<u64>,
 }
@@ -317,21 +146,7 @@ pub fn role_of(req: &SpawnRequest) -> PromptRole {
     }
 }
 
-/// The dashboard's answer to one [`SpawnRequest`]. `ok: false` always
-/// carries `reason` (a gate refusal, an unknown agent, or a spawn failure);
-/// `ok: true` always carries `short` (the freshly spawned pane's own
-/// registry short id, the same address `zirv ctx nudge`/`zirv ctx send`
-/// would use to reach it).
-///
-/// O2: `retryable` splits the two very different things an `ok: false` can
-/// mean. A **policy** refusal (the agent gate, the argv guard, the pane cap)
-/// is this operator's configuration saying no, and running the same task
-/// headless instead would route straight around it -- so the requester must
-/// fail. A **channel-level** failure (the request named another repo, the pty
-/// spawn itself failed) says nothing about whether the task is allowed; the
-/// headless path would have handled it, and suppressing that fallback turned a
-/// recoverable mismatch into a dead delegation. Defaults to `false`, so an ack
-/// written by an older build is read as the refusal it was.
+/// Ack contract: failure carries a reason and retryability; success carries the spawned pane's short ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnAck {
     pub ok: bool,
@@ -344,24 +159,12 @@ pub struct SpawnAck {
     /// existing generic failure.
     #[serde(default)]
     pub budget_exhausted: bool,
-    /// Issue #230 item 3: the degraded/unsupported capabilities the spawned
-    /// pane's own launch carries (`policy::PolicyReport::degraded_
-    /// capabilities`), so a requester waiting on this exact ack
-    /// (`agent::run_with`'s dashboard-join fork) can surface them the same
-    /// way its headless fork does. Empty -- and omitted from the wire form
-    /// entirely -- when the launch's policy report has nothing to warn
-    /// about, or for an ack an older build wrote; `#[serde(default)]` makes
-    /// both read the same way.
+    /// Return degraded launch capabilities in the ack; an absent field means none (#230).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capability_warnings: Vec<CapabilityWarning>,
 }
 
-/// `<state>/dash/<dash_short>-<token>/requests`. `dash_short` is this
-/// dashboard's own registry short id (see `dash::mod::run_dashboard`, which
-/// derives it before the first pane ever spawns: `Record::new`'s own
-/// `short` field is exactly `sessions::short_id(session)`, so nothing here
-/// has to wait on an actual spawn). `token` is a 16-hex-character
-/// capability token, freshly minted per dashboard launch.
+/// The shared request path embeds this dashboard's short ID and a fresh capability token.
 pub fn request_dir_for(state: &StateDir, dash_short: &str, token: &str) -> PathBuf {
     state
         .dash()
@@ -369,31 +172,7 @@ pub fn request_dir_for(state: &StateDir, dash_short: &str, token: &str) -> PathB
         .join("requests")
 }
 
-/// `<state>/dash/<dash_short>-<token>/p-<pane_token>`: ONE pane's own intake
-/// directory, a sibling of the dashboard's shared `requests` leaf rather than
-/// a child of it, so `owner_pid_path` below (and every other reader that walks
-/// to `requests_dir.parent()`) resolves the same token dir for a pane channel
-/// as for the shared one, and `dash::mod::remove_request_dir`'s single
-/// `remove_dir_all` of that parent still takes every pane channel with it.
-///
-/// Security review Finding 1 (2026-08-28): every pane used to inherit the one
-/// shared `requests` directory, so a request's requester was whatever
-/// `SpawnRequest::parent_session` claimed -- a `zirv ctx status`-visible short
-/// id, which any pane can read. A pane could therefore name its own
-/// orchestrator as its parent and be classified with that pane's role. A pane
-/// now gets its own directory, named with a fresh `dash::mod::spawn_token`
-/// (16 hex characters, minted per pane, never derived from anything public),
-/// and the dashboard drains each one separately: which directory a request
-/// arrived in IS the requester, derived server-side and never read out of the
-/// request.
-///
-/// Trust boundary (issue #179): the token authenticates the HONEST path -- a
-/// pane's own `zirv ctx agent`, which only ever learns this path via the env
-/// var it inherited -- not the channel itself. It does not isolate same-uid
-/// panes from each other: a pane agent can `readdir` the parent directory,
-/// discover a sibling's `p-<pane_token>` name, and write a forged request
-/// straight into it, being attributed that pane's role. Accepted for this
-/// release; socket-peer-credential hardening is tracked in issue #179.
+/// A pane-specific sibling request directory identifies its requester server-side; the token authenticates inherited paths but does not isolate same-UID panes (#179).
 pub fn pane_request_dir_for(dash_requests_dir: &Path, pane_token: &str) -> PathBuf {
     dash_requests_dir
         .parent()
@@ -428,33 +207,13 @@ fn is_tmp_name(name: &str) -> bool {
     name.contains(TMP_INFIX)
 }
 
-/// Writes `req` as a `req-<uuid>.json` file under `dir` through
-/// [`write_atomic_private`], so the request only ever becomes visible to the
-/// dashboard's own poller complete. Returns the path so the caller
-/// (`agent.rs`) can derive the request's own file stem, which [`wait_for_ack`]
-/// and [`write_ack`] both key off -- and so it can remove the request again if
-/// it gives up waiting before anybody claimed it.
+/// Write each request atomically so the dashboard sees only complete JSON; the file stem identifies its ack.
 pub fn write_request(dir: &Path, req: &SpawnRequest) -> CtxResult<PathBuf> {
     let body = serde_json::to_string(req)?;
     write_atomic_private(dir, &format!("req-{}.json", uuid::Uuid::new_v4()), &body)
 }
 
-/// Every currently-queued request in `dir`, **claimed by rename**: each
-/// `req-<uuid>.json` is renamed to its own `claim-req-<uuid>` in the same
-/// operation that takes it off the queue, and only then read back. A file
-/// that fails to parse (a torn write from a crash, or some other process's
-/// stray file) is skipped and its claim removed rather than left to jam every
-/// later tick's listing forever; only `req-*.json` files are considered at
-/// all, so neither an `ack-*.json` nor a `claim-*` this same directory also
-/// holds is ever misread as a request.
-///
-/// O6: taking used to be a *delete*, with the claim written afterwards by
-/// `dash::mod::claim_batch`. Between those two writes the request existed
-/// nowhere on disk -- neither queued nor claimed -- so a requester whose ack
-/// timed out inside that window saw no claim, concluded nobody was listening,
-/// and ran the same task headless while the dashboard was already spawning it.
-/// One rename is both halves at once, so the window does not exist: the file
-/// is a request until it is a claim, with no instant in between.
+/// Claim queued requests by atomic rename before reading, so timeout cannot race a gap between dequeue and claim.
 pub fn take_requests(dir: &Path) -> Vec<(PathBuf, SpawnRequest)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -516,12 +275,7 @@ pub fn write_ack(dir: &Path, request_stem: &str, ack: &SpawnAck) -> CtxResult<()
     Ok(())
 }
 
-/// `claim-<request_stem>`: the name [`take_requests`] renames a request to the
-/// moment it takes it, before any fulfilment work starts. Deliberately
-/// extensionless so it can never be mistaken for a `req-*.json` or an
-/// `ack-*.json` by either side's own directory listing. Its contents are the
-/// request's own JSON (that is what was renamed), but nothing ever parses them:
-/// the file's existence is the whole signal.
+/// The extensionless claim file signals that a request was taken and cannot be mistaken for queued JSON.
 fn claim_path(dir: &Path, request_stem: &str) -> PathBuf {
     dir.join(format!("claim-{request_stem}"))
 }
@@ -537,15 +291,7 @@ pub fn remove_claim(dir: &Path, request_stem: &str) {
     let _ = std::fs::remove_file(claim_path(dir, request_stem));
 }
 
-/// Whether some dashboard has claimed this request.
-///
-/// F2: no longer consulted by the requester. Reading the claim and *then*
-/// acting on that reading is check-then-act against a dashboard whose claim is
-/// a rename of the request file itself, so `agent.rs` now makes its own
-/// `remove_file` of that same file the decision -- exactly one of the two
-/// operations can win, with no window in between. Kept as the claim
-/// protocol's own observable, which is what its tests (here and in
-/// `dash::mod`) assert against.
+/// A claim file is observable state; the requester decides by atomically removing its own request, avoiding a check-then-act race.
 #[cfg(test)]
 pub fn is_claimed(dir: &Path, request_stem: &str) -> bool {
     claim_path(dir, request_stem).exists()

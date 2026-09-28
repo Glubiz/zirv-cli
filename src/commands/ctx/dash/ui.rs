@@ -1,22 +1,5 @@
 //! Pure renderers for the dashboard: every function in this module takes a
-//! `&mut Frame` plus already-computed data and draws into it. No I/O, no
-//! filesystem, no environment, no clock -- Task 5's event loop assembles the
-//! facts (from panes, the session registry, mail/memory) and calls straight
-//! through here, and every renderer is exercised with `ratatui::backend::
-//! TestBackend` precisely because there is nothing else to stub.
-//!
-//! `SpawnDraft`/`NudgeDraft`/`MailView`/`MemoryView`/`RestoreView` carry
-//! whatever shape their own overlay reducer needs (Tasks 8/9/12, in
-//! `dash::mod`); `SpawnDraft` is still the Task 4 placeholder -- Spawn's own
-//! reducer is out of this plan's scope.
-//!
-//! Issue #202 phase 2b: the dashboard's own visual language -- one cyan
-//! `zirv` brand chip, semantic colour reserved for state, rounded frames, a
-//! live spinner for a working pane, two-tone key hints. Everything else in
-//! this module (in particular [`render_grid`], which mirrors a live child
-//! terminal's own colours verbatim) stays exactly as it was: the theme
-//! migration is about the dashboard's own chrome, never about the harness
-//! output it hosts.
+//! `&mut Frame` and supplied facts; disk and session reads belong to the event loop.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -37,11 +20,7 @@ use super::actions::{self, ActionContext, ActionId, PaletteRow};
 use super::hit::{FrameSnapshot, HintId, Hit};
 use super::pane::PaneState;
 
-/// Dash refresh PR1: one session's own bound workflow, resolved by
-/// `dash::mod::resolve_session_workflow` from its `sessions::Record::
-/// workflow_id`, never from the repo-wide `active_workflow_summary` pointer.
-/// Shared by the sidebar's own 2-line fact block (line 2) and the pane
-/// header's right segment -- the same fact, rendered twice.
+/// Resolve each session's bound workflow from its record, never the repo-wide active pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionWorkflowFact {
     /// `WorkflowKind::as_str()` -- e.g. `"bugfix"`.
@@ -58,27 +37,7 @@ pub struct SessionWorkflowFact {
     pub completed: bool,
 }
 
-/// One enabled harness's cached subscription usage snapshot. No longer read
-/// by the header itself (issue #202 phase 2b dropped the header's own usage
-/// segment for width -- the header now has room only for the harness label,
-/// the live count and the sticky error/notice line), but still filled by
-/// `dash::mod`'s `FactsCache::refresh_if_due` each throttled tick and kept
-/// here so that machinery -- and its own tests -- need no change; a future
-/// surface (the errors overlay, a status line) can read it back without
-/// re-deriving the read. `five_hour`/`seven_day`/`name` are already read by
-/// `assemble_footer_facts`; issue #358 (task T6a) drops the blanket
-/// `#[allow(dead_code)]` this struct used to carry now that it is no longer
-/// landed ahead of every one of its fields' own call sites.
-/// Dash refresh PR1: `window::Window`'s own fields, minus `used_percentage`
-/// (already `HarnessUsage::five_hour`/`seven_day`) and `observed_at` (the
-/// LIMITS block has no use for it). `resets_at` is epoch seconds,
-/// vendor-reported (Claude's statusline, Codex's rate-limit events) -- there
-/// is no cheap, scan-free way for the dashboard's own throttled tick to tell
-/// a vendor reading apart from zirv's own estimate (`window::estimate_
-/// windows`, only reachable through `pace::current_windows`, which sums
-/// transcripts and is exactly the scan/poll this tick must never do), so
-/// this build never marks one `~`-estimated; see `render_limits`'s own doc
-/// comment.
+/// Keep provider usage in cached facts rather than reading it during header rendering (#202).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowDetail {
     pub resets_at: u64,
@@ -91,31 +50,14 @@ pub struct HarnessUsage {
     pub name: &'static str,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
-    /// Dash refresh PR1: the rest of the 5h window's own `window::Window`
-    /// (`resets_at`/`limit_reached`/`overage_covered`) that `five_hour`
-    /// alone drops -- the LIMITS block's own reset line needs all three.
+    /// Keep reset and coverage facts alongside the percentage for the LIMITS block.
     /// `None` exactly when `five_hour` is `None`.
     pub five_hour_detail: Option<WindowDetail>,
-    /// The weekly window's own equivalent of `five_hour_detail`.
+    /// Keep weekly reset and coverage facts alongside `seven_day`.
     pub seven_day_detail: Option<WindowDetail>,
 }
 
-/// The header's live facts.
-///
-/// Dash refresh PR1 round 2: the left side no longer names the dashboard's
-/// own launch identity (`chat.model` moved to the pane header, which stays
-/// on screen for whichever pane is focused rather than the one fixed
-/// identity the whole session launched with) -- it is `zirv`'s own brand
-/// mark plus three session counts: `sessions` (every row the sidebar draws
-/// that is not `Ended`/exited), `working` (`RowState::Working`) and
-/// `needs_you` (`Glyph::NeedsAction`). A zero count omits its whole segment
-/// (never "0 working"), so the row only ever names what is actually true
-/// right now.
-///
-/// `error_count`/`latest_error` are the sticky `⚠` channel (`push_error`'s own
-/// buffer); `notice` is the transient, auto-expiring informational channel
-/// (`push_notice`/`live_notice`) and takes precedence over the error line
-/// while it is fresh, exactly as it did before this phase.
+/// Keep the dashboard's fixed launch identity out of the header; show the focused pane's identity there.
 pub struct HeaderFacts {
     pub hints: HintContext,
     pub sessions: usize,
@@ -124,24 +66,11 @@ pub struct HeaderFacts {
     pub error_count: usize,
     pub latest_error: Option<String>,
     pub notice: Option<String>,
-    /// Issue #354 phase 4: the first-run tip ([`FIRST_RUN_TIP`]), shown in the
-    /// same middle slot as a notice and with the same dim weight, but only on
-    /// this operator's very first dashboard launch and only until any
-    /// prefixed key is used or `Esc` dismisses it. Lowest precedence of the
-    /// three: a real error or a live notice always wins the slot.
+    /// Show the first-run tip in the notice slot only until the operator dismisses it (#354).
     pub tip: Option<&'static str>,
 }
 
-/// Issue #354 phase 4 (finding F15): what a brand-new operator is told, once.
-/// Three facts, in the order they are worth learning -- where the key
-/// reference is, where every action is, and that the roster is clickable.
-///
-/// Review of cc92a56 (finding 3): the two chords are READ OFF the one
-/// action-descriptor table rather than spelled out here. A tip that hard-codes
-/// `^A ?` is a fifth place a chord is written down, and the chord-audit test
-/// (`every_chord_drawn_anywhere_comes_from_the_action_table`) now renders a
-/// header with the tip up, so a rebinding that did not reach this string would
-/// fail the audit instead of misleading a first-time operator.
+/// Point a new operator to help, palette and the prefix key once (#354).
 pub static FIRST_RUN_TIP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let hint = |id: actions::ActionId| match actions::descriptor(id) {
         Some(d) => format!("{} {}", d.chord, d.label),
@@ -155,11 +84,7 @@ pub static FIRST_RUN_TIP: std::sync::LazyLock<String> = std::sync::LazyLock::new
     )
 });
 
-/// What the header's right-hand hint cluster is chosen against. Phase 2 adds
-/// the two attention-derived states the approved contract names
-/// (`needs action` and `ended`) alongside phase 1's plain `alive`; phase 3
-/// adds `restorable`, which is what decides whether the ended cluster's own
-/// `^A r restore` is drawn at all.
+/// Base header hints on the selected row, which may differ from the focused pane.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HintContext {
     /// Whether the selected row is a live pane.
@@ -170,24 +95,14 @@ pub struct HintContext {
     /// Whether the selected row is an ended pane (a retained completed-worker
     /// row, or one reaped and still on screen).
     pub ended: bool,
-    /// Whether the selected row can actually be relaunched -- an ended row
-    /// for which the dashboard still holds the spawn request that created it.
-    /// A row that cannot be restored is not offered `^A r`: phase 3's own
-    /// rule is that a drawn hint always does something (the context menu is
-    /// where an unavailable action is named *and* explained instead).
+    /// Offer restore only for a retained ended row with its original spawn request.
     pub restorable: bool,
-    /// Issue #354 phase 5: the cursor is on the sidebar's summary line, so
-    /// the cluster describes the DASHBOARD -- `inspect` opens the
-    /// dashboard-level inspector, and every per-session chord is dropped.
+    /// Use dashboard-level hints when the summary line is selected (#354).
     pub summary: bool,
 }
 
 impl HintContext {
-    /// The header's own slice of an [`ActionContext`]: the cluster only ever
-    /// needs to know whether the selected row is alive, ended, waiting on the
-    /// operator, and whether its spawn request is still held. Everything else
-    /// an availability rule can ask about is either irrelevant to the four
-    /// chords the cluster draws, or (`attached`, `retained`) implied by them.
+    /// Use the selected row's availability bits to pick actionable header hints.
     pub fn action_context(&self) -> ActionContext {
         ActionContext {
             selected: self.alive || self.ended,
@@ -204,15 +119,7 @@ impl HintContext {
     }
 }
 
-/// Pure: the `(chord, label)` pairs the header offers for `context`, in
-/// display order, at most four (the approved design's own cap).
-///
-/// Issue #354 phase 4: the cluster no longer keeps its own four hard-coded
-/// lists. It picks at most four ids out of the one action-descriptor table
-/// ([`actions::header_ids`]) and prints each descriptor's own `chord`/`label`
-/// -- so a chord drawn here is, by construction, the same chord the help
-/// screen, the palette and the context menu name for the same action, and
-/// it can never be drawn for an action that is currently unavailable.
+/// Derive at most four header hints from the shared action table (#354).
 pub fn header_hints(context: &HintContext) -> Vec<(&'static str, &'static str)> {
     let ctx = context.action_context();
     actions::header_ids(&ctx)
@@ -237,28 +144,12 @@ fn hint_id(key: &str) -> HintId {
     }
 }
 
-/// Pure: where the header actually drew each hint chord, so a click on one can
-/// be turned back into its action.
-///
-/// Derived from [`header_layout`]'s own single pass rather than re-deriving a
-/// right-aligned block: the drawn cluster is right-aligned only while the row
-/// has room for it, and a header shrunk below its fixed content pushes the
-/// chords rightward off the row instead. Recomputing "right edge minus cluster
-/// width" then produced rects sitting on top of the chip and the harness
-/// label, so a click on visible left-hand text fired a header action and each
-/// chord's rect named its neighbour's text (review of bf1474f). A chord no
-/// part of which was drawn gets no rect at all.
+/// Return hint geometry from the same header layout used to draw it, so click targets match.
 pub fn header_hint_regions(area: Rect, facts: &HeaderFacts) -> Vec<(Rect, HintId)> {
     header_layout(facts, area).1
 }
 
-/// Issue #358 (task T6a): one harness's condensed pool status for the
-/// aggregate row's own strip -- `allocator::HarnessState::as_str()`'s own
-/// vocabulary (`"ready"`/`"draining"`/`"hard-blocked"`/`"unknown"`/
-/// `"disabled"`), plus its binding window's raw headroom, `None` when it has
-/// none. Kept as plain strings here (not the `allocator`/`fallback` types
-/// themselves) so this module -- pure `ratatui` rendering, no state-dir or
-/// config dependency of its own -- never has to import either.
+/// Show each configured harness's cached capacity state in the aggregate strip (#358).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessStrip {
     pub name: String,
@@ -266,16 +157,6 @@ pub struct HarnessStrip {
     pub headroom_pct: Option<f64>,
 }
 
-/// The sidebar/grid state a row's leading glyph column renders: [`render_
-/// sidebar`] picks the actual glyph character (and colour) from this plus the
-/// live spinner tick, so nothing above this module needs to know the spinner
-/// frame set at all.
-///
-/// `Unknown` is a view-only registry row this dashboard did not spawn: its
-/// `PaneState` (Working/Idle) genuinely is not observable from here, only
-/// that the process is still alive -- so it gets its own neutral glyph
-/// (`·`), distinct from every state a real pane can report, rather than
-/// guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowState {
     Working,
@@ -284,9 +165,7 @@ pub enum RowState {
     Unknown,
 }
 
-/// Pure: the sidebar row state a pane's own `PaneState` maps to. `Ended`
-/// (any exit code) is always `Dead` -- the exit code itself is not part of
-/// the glyph, exactly as the old `glyph_for` never encoded it either.
+/// Map exited panes to Dead; exit code is reported separately from the glyph.
 pub fn row_state_for(state: &PaneState) -> RowState {
     match state {
         PaneState::Working => RowState::Working,
@@ -331,9 +210,7 @@ const ATTENTION_GLYPHS: [Glyph; 3] = [Glyph::NeedsAction, Glyph::Failed, Glyph::
 /// [`ATTENTION_GLYPHS`] is present.
 const QUIET_GLYPHS: [Glyph; 3] = [Glyph::Working, Glyph::Idle, Glyph::Unknown];
 
-/// Every glyph, attention first -- the order the dashboard inspector's own
-/// counts section lists them in (issue #354 phase 5), which is the two rollup
-/// tiers concatenated rather than a third hand-written order.
+/// Order glyph counts by attention first, matching inspector rollups (#354).
 pub const ALL_GLYPHS: [Glyph; 6] = [
     Glyph::NeedsAction,
     Glyph::Failed,
@@ -364,22 +241,8 @@ impl Glyph {
     }
 }
 
-/// Pure: the [`Glyph`] a row draws, from its cached
-/// [`SessionStatus`](super::super::attention::SessionStatus) when one exists
-/// and from the pane's own [`RowState`] when it does not.
-///
-/// Three rules, in this order:
-///
-/// 1. **An ended pane's exit code decides, not the projection.**
-///    `attention::project` maps every `Lifecycle::Exited` to
-///    `Projection::Failed`, which would paint a worker that finished its job
-///    and exited 0 red. A nonzero exit is `✗`; a clean one is `◆` until the
-///    operator has actually seen it and `●` afterwards.
-/// 2. **Otherwise the projection decides**, one-for-one.
-/// 3. **`Projection::Unknown` -- which is exactly what a missing or
-///    never-written status file reads back as -- falls through to
-///    `RowState`**, so a dashboard with no issue #349 writers anywhere still
-///    renders precisely the phase 1 sidebar rather than a column of `·`.
+/// An ended pane's exit code outranks its projection: a clean exit must not appear failed.
+/// Unknown or absent status falls back to `RowState` rather than guessing.
 pub fn glyph_for(row: &SidebarRow) -> Glyph {
     if let Some(code) = row.exit_code {
         return if code != 0 {
@@ -409,31 +272,7 @@ pub fn glyph_for(row: &SidebarRow) -> Glyph {
     }
 }
 
-/// One sidebar row: a dashboard pane (`attached: true`) or a view-only
-/// registry session this dashboard did not spawn (`attached: false`).
-///
-/// `selected` and `focused` are deliberately two different things (F7).
-/// `selected` is the sidebar cursor, which walks the *combined* row list --
-/// view-only registry rows included, so a nudge can be aimed at a session
-/// this dashboard does not own. `focused` is the pane whose grid is on
-/// screen and whose child receives every un-prefixed keystroke, and it can
-/// only ever be an attached pane. Before F7 the two were one index, so
-/// selecting a view-only row blanked the grid and swallowed all typing.
-///
-/// `age_secs` is `None` when no registry record could be found for this row
-/// (a race between a fresh spawn and its own registration, in practice) --
-/// it renders as [`style::PLACEHOLDER`], never a fabricated `0s`.
-///
-/// `score` (issue #209/v3 §C, restored after #207 dropped it) is this row's
-/// cached rot score -- `score::cached_score`'s own `None` means *unknown*,
-/// never *healthy*, and renders the same dim placeholder a dead row's score
-/// always does regardless of what is cached for it (a dead pane's last
-/// reading is stale, not a live verdict).
-/// Issue #354 added `role`, `model`, `group`, `tree` and `disclosure`: the
-/// row now carries what the approved 44-column contract draws, rather than
-/// the `{short} {harness}` pair it used to. `harness` stays -- the footer,
-/// the focus rule and the usage lookup all still read it -- but it is no
-/// longer a sidebar column of its own.
+/// Keep selected roster cursor distinct from focused input pane, especially for view-only rows.
 #[derive(Clone)]
 pub struct SidebarRow {
     /// Short role label (`orch`, `sub-orch`, `worker`, ...), left-aligned in
@@ -449,29 +288,15 @@ pub struct SidebarRow {
     /// Where the row sits in the tree; set by [`roster_frame`] as it lays the
     /// group out, not by whoever built the row.
     pub tree: TreePos,
-    /// Ordered `(key, value)` facts the `^A i` per-row inspector reads back
-    /// by key (`group`, `branch`, `since`, `budget`, `writer`, `signal`).
-    /// Dash refresh PR1 replaced the sidebar's own 8-line rendering of this
-    /// same vec with the 2-line fact block below (`fact_state`/
-    /// `fact_since_secs`/`workflow`) -- kept here, unrendered by the sidebar
-    /// now, purely because the inspector still has a live use for it; a key
-    /// that fed ONLY the old sidebar block (`model`, `reason`) was dropped
-    /// from this vec entirely rather than kept unused. Filled only for the
-    /// selected row, and only from values already cached -- a disclosure
-    /// line never costs a read.
+    /// Keep inspector facts by stable key rather than reading a rendered sidebar line.
     pub disclosure: Vec<(String, String)>,
     pub short: String,
     pub harness: String,
     pub age_secs: Option<u64>,
     pub score: Option<u32>,
     pub state: RowState,
-    /// Dash refresh PR1: the fact block's own line 1, `{fact_state} ·
-    /// {age}`. The state word -- the composed projection's own word
-    /// (`working`, `needs approval`, ...) when a status exists, else the
-    /// plain `RowState` word (`working`/`idle`/`ended`/`unknown`). Set for
-    /// every row (not only the selected one): the pane header's own right
-    /// segment reads it off the FOCUSED row, which need not be the row the
-    /// sidebar cursor is currently on.
+    /// Set for every row: the pane header reads the focused row, which may
+    /// differ from the selected row. Fall back to `RowState` without status.
     pub fact_state: String,
     /// The fact block/pane-header's own elapsed clock: seconds since the
     /// state word's own last transition (or, with no status, since the row
@@ -488,11 +313,7 @@ pub struct SidebarRow {
     /// column's second-priority glyph (`✉N`, `✉+` above 9) -- a workflow
     /// gate awaiting approval (`⚑`) always wins when both are true.
     pub unread_mail: usize,
-    /// Issue #354 phase 2: this session's composed attention status as of the
-    /// last `FactsCache` refresh (`attention::load`), never a per-frame read.
-    /// `None` means this row was built before the first refresh; a status that
-    /// projects `Unknown` (the shape a missing file loads back as) is treated
-    /// exactly the same way -- see [`glyph_for`].
+    /// Use last cached attention status, never a per-frame disk read (#354).
     pub status: Option<SessionStatus>,
     /// `Some(code)` for a **retained ended row**: a completed pane the roster
     /// keeps on screen after `reap_ended_panes` removed the `Pane` itself.
@@ -502,32 +323,16 @@ pub struct SidebarRow {
     pub attached: bool,
     pub selected: bool,
     pub focused: bool,
-    /// Issue #209/v3 codex review finding 5: `Pane::reachable()` for an
-    /// attached row (whether this pane's own turn-signal socket bound at
-    /// spawn time); `true` for a view-only registry row, which has no
-    /// `Pane` of its own to ask and can never be `focused` anyway (see
-    /// `focused`'s own doc comment) -- the footer is the only reader, and
-    /// it only ever reads this off the focused row.
+    /// Show actual turn-signal reachability for attached panes (#209).
     pub supervised: bool,
-    /// Dash refresh PR2: this row's own orchestrator-seat rollover
-    /// lifecycle, for the badge column -- `None` for every non-orchestrator
-    /// row and for an orchestrator seat with nothing pending or parked.
-    /// `dash::mod` resolves this from the same `seat`/`rollover::runtime`
-    /// reads the footer's own `RolloverFooterFact` uses.
+    /// Share the footer's cached seat state; non-orchestrator rows have no rollover badge.
     pub rollover_badge: Option<RolloverBadge>,
-    /// Dash refresh PR2: this row's own flash overlay style, already
-    /// resolved by the caller from the elapsed time since a flash-worthy
-    /// edge (new mail, a worker finishing) and `dash.motion` -- `None` once
-    /// the flash (900ms) has finished, always `None` under reduced motion.
-    /// Patched onto every span's own style (`with_row_overlay`) rather than
-    /// replacing it, so the row's own glyph/rot colours survive the tint,
-    /// the same convention the selected-row background already follows.
+    /// Absent under reduced motion; overlay the tint rather than replacing
+    /// span styles so glyph and rot colours survive.
     pub flash: Option<Style>,
 }
 
-/// Dash refresh PR2: the two orchestrator-seat rollover states the sidebar
-/// badge column shows -- see [`SidebarRow::rollover_badge`] and
-/// `RolloverFooterFact`, the footer's own richer telling of the same states.
+/// Keep rollover badges limited to actionable pending and parked states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolloverBadge {
     /// The seat is marked pending; the swap fires on the next idle boundary.
@@ -565,8 +370,7 @@ pub enum TreePos {
 }
 
 impl TreePos {
-    /// The row's own ONE-column tree prefix (dash refresh PR1 narrowed this
-    /// from two columns to one, part of the 44 -> 28 column row contract).
+    /// Keep the tree prefix one column wide under the 28-column row contract.
     fn prefix(self) -> &'static str {
         match self {
             Self::Flat => " ",
@@ -576,9 +380,6 @@ impl TreePos {
     }
 }
 
-/// A minimal draft/view struct shared by the overlay seams below. Only what
-/// `render_overlay` needs to draw something today; Task 12 fills in richer
-/// fields as it wires up the restore dialog's own reducer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnDraft {
     pub input: String,
@@ -586,20 +387,7 @@ pub struct SpawnDraft {
     pub cursor: usize,
 }
 
-/// Where a submitted nudge goes: an attached pane this dashboard owns
-/// (`AttachedPane` -- idle-gated visible injection, or queued if the pane is
-/// still `Working`), or a session this dashboard did not spawn
-/// (`ViewOnlySession`, routed through `sessions::run_nudge_with`'s existing
-/// headless marker+mail semantics). `None` when nothing was selected at the
-/// moment `prefix,n` was pressed.
-///
-/// D1: `AttachedPane` names the pane by its **registry short id**, exactly as
-/// `ViewOnlySession` does, not by its index in the live `panes` vector. The
-/// dialog stays open across as many ticks as the operator takes to type, and a
-/// pane reaped (or spawned) in the meantime shifts every index after it -- so
-/// a captured index quietly re-aimed the nudge at whichever pane had slid into
-/// that slot. A short id either still names a live pane at Enter time or names
-/// nothing at all, and "nothing" is a notice, never a misdelivery.
+/// Route nudges by stable registry short ID so pane index changes cannot retarget them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum NudgeTarget {
     #[default]
@@ -622,46 +410,29 @@ pub struct ComposeDraft {
     pub body: String,
 }
 
-/// The mail overlay's own state: every unread message visible to the
-/// dashboard operator (`(path, from_agent, body_preview)`, oldest first --
-/// the same order `mail::list` already returns), which one is selected, and
-/// an in-progress compose draft when the operator is writing a new one
-/// rather than browsing.
+/// Keep unread mail in storage order and preview it without consuming.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailView {
     pub items: Vec<(PathBuf, String, String)>,
     pub cursor: usize,
-    /// Issue #354 phase 3: the shared list viewport's first drawn row. The
-    /// reducer keeps it, `list_dialog_layout` clamps it so the cursor is
-    /// always visible, and it is what makes a 40-message inbox readable in a
-    /// dialog with room for twelve rows.
+    /// Keep one scroll offset for every list dialog so long lists remain navigable (#354).
     pub offset: usize,
     pub compose: Option<ComposeDraft>,
 }
 
-/// What executing a `MailView` reducer's emitted action actually does to
-/// storage -- executed by `dash::mod`'s own `apply_mail_effect`, never by the
-/// reducer itself (the reducer stays pure). `Send`'s `Message` carries
-/// placeholder `from_session`/`from_agent`/`sent` fields the executor
-/// overwrites right before `mail::store`, keeping the reducer itself
-/// identity- and clock-free, the same discipline `rot.rs` and `prompt.rs`
-/// already hold themselves to.
+/// The reducer stays pure; the executor sets sender identity and timestamps before storage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MailEffect {
     Consume(PathBuf),
     Send(Message),
 }
 
-/// Issue #84: the handover picker's own state. `items` is precomputed by
-/// `dash::mod` (every enabled+ready harness crossed with `handover::TIERS`,
-/// each already tier-resolved to a concrete model label) as `(agent, tier,
-/// resolved model)`; `target_short` names the pane the swap applies to,
-/// captured once when the overlay opens the same way `NudgeTarget` is.
+/// Store already-resolved handover choices and the current picker row (#84).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HandoverDraft {
     pub items: Vec<(String, String, String)>,
     pub cursor: usize,
-    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    /// Keep the handover list's first visible row (#354).
     pub offset: usize,
     pub target_short: String,
 }
@@ -675,15 +446,12 @@ pub struct HandoverDraft {
 pub struct MemoryView {
     pub entries: Vec<(String, String, String)>,
     pub cursor: usize,
-    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    /// Keep the mail list's first visible row (#354).
     pub offset: usize,
     pub input: Option<String>,
 }
 
-/// What executing a `MemoryView` reducer's emitted action does to storage --
-/// executed by `dash::mod`'s own `apply_memory_effect`. `Remember` carries
-/// only `key`/`body`: `written_by`/timestamps/`source` are filled in by the
-/// executor the same way `run_remember_with` fills them for the CLI verb.
+/// Keep memory effects pure; the executor supplies author, source and timestamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryEffect {
     Remember { key: String, body: String },
@@ -691,39 +459,23 @@ pub enum MemoryEffect {
     Verify(String),
 }
 
-/// One roster candidate offered in the restore dialog: a human-readable
-/// `label` (title/agent/short, assembled by `dash::mod` from the roster
-/// entry it mirrors) and whether the operator currently has it checked for
-/// restore. Indices into `RestoreView::entries` line up 1:1 with the
-/// `Vec<roster::RosterPane>` candidate list `dash::mod` keeps alongside the
-/// view -- neither list is ever reordered, only toggled -- so an effect that
-/// names indices is enough for the caller to find the roster data back.
+/// Mirror each roster candidate's label and selection state in the restore dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreEntry {
     pub label: String,
     pub checked: bool,
 }
 
-/// The startup restore dialog's own state: every worker pane offered back
-/// from the previous quit's roster (the orchestrator is excluded before this
-/// view is ever built -- see `dash::mod::run_dashboard`'s own doc comment),
-/// each independently checked/unchecked, defaulting to checked so Enter
-/// alone restores everything.
+/// Offer worker candidates once at startup; the orchestrator is created separately.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreView {
     pub entries: Vec<RestoreEntry>,
     pub cursor: usize,
-    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    /// Keep the restore list's first visible row (#354).
     pub offset: usize,
 }
 
-/// One row of the `Ctrl+A e` dialog: an error message, how many times it
-/// repeated consecutively, how long ago the most recent repeat was, and
-/// whether the operator has acknowledged it (issue #354 phase 5).
-///
-/// A snapshot of `dash::mod`'s own `ErrorLog` entry, taken when the overlay
-/// opens -- the dialog does not re-read the buffer while it is up, the same
-/// convention every other overlay here follows.
+/// Show retained error, consecutive repeat count, age and acknowledgement state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorItem {
     pub text: String,
@@ -744,12 +496,9 @@ pub struct ErrorItem {
 pub struct ErrorsView {
     pub items: Vec<ErrorItem>,
     pub cursor: usize,
-    /// The shared list viewport's first drawn row (issue #354 phase 3).
+    /// Keep the errors list's first visible row (#354).
     pub offset: usize,
-    /// A1-3: which entries this snapshot covers -- every kept error whose id
-    /// is below this. Closing the dialog acknowledges exactly those, so an
-    /// error that arrived while the dialog was open keeps holding the sticky
-    /// header line. `0` (the `Default`) covers nothing.
+    /// Acknowledge only error IDs below the dialog snapshot watermark; zero covers none.
     pub mark: u64,
 }
 
@@ -767,13 +516,7 @@ pub struct JevErrorsView {
     pub offset: usize,
 }
 
-/// Issue #354 phase 3: one thing the context menu can do to its target row.
-///
-/// Every variant maps onto machinery the dashboard already has -- an overlay
-/// the keyboard can already open, the roster's own selection/focus move, the
-/// pane shutdown the quit path uses, or a relaunch of the very
-/// `spawnreq::SpawnRequest` that created the row. Nothing here builds an
-/// argv, and nothing here is a new process-launch path (`Command Safety`).
+/// Map context-menu choices to existing dashboard actions (#354).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     /// Open the inspector on the target row.
@@ -975,12 +718,7 @@ impl PaletteMode {
     }
 }
 
-/// Issue #354 phase 4: the palette/help overlay's own state.
-///
-/// `ctx` is the availability snapshot taken when the overlay opened -- the
-/// same convention every other overlay here already follows (mail, memory and
-/// restore do not live-update while open either), and what keeps the rows a
-/// pure function of the view.
+/// Snapshot action availability when opening the shared palette or help dialog (#354).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaletteView {
     pub mode: PaletteMode,
@@ -993,7 +731,7 @@ pub struct PaletteView {
 }
 
 impl PaletteView {
-    /// Pure: the rows this view draws right now.
+    /// Render rows from the current query and action context.
     pub fn rows(&self) -> Vec<PaletteRow> {
         actions::palette_rows(&self.ctx, &self.query)
     }
@@ -1012,9 +750,7 @@ impl PaletteView {
     }
 }
 
-/// What, if anything, sits drawn on top of the grid right now. `QuitConfirm`
-/// carries the titles of every pane still `Working`, so the confirmation
-/// text can name what the operator is about to interrupt.
+/// Overlay owns the grid while open; quit confirmation names still-working panes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Overlay {
     #[default]
@@ -1024,18 +760,11 @@ pub enum Overlay {
     Nudge(NudgeDraft),
     Mail(MailView),
     Memory(MemoryView),
-    /// Issue #84: `Ctrl+A o` -- picks an enabled harness/tier to swap the
-    /// target pane's model or harness to in place.
+    /// Open a focused-pane handover picker with Ctrl+A o (#84).
     Handover(HandoverDraft),
-    /// The startup restore dialog, built once from the previous quit's
-    /// roster (`dash::mod::run_dashboard`); never re-opened later in a
-    /// session's life the way the other overlays are.
+    /// Open the prior roster's restore dialog once at startup.
     Restore(RestoreView),
-    /// Issue #354 phase 4: `Ctrl+A p` (the searchable palette) and
-    /// `Ctrl+A ?`/`h`/`H` (the same list, read-only, as the key reference).
-    /// One overlay for both: the help screen IS the palette without
-    /// Enter-to-run, which is strictly less code than two dialogs that have
-    /// to agree about the same table.
+    /// Use one action list for searchable palette and read-only key reference (#354).
     Palette(PaletteView),
     /// `Ctrl+A e`: the kept-errors overlay.
     Errors(ErrorsView),
@@ -1047,24 +776,14 @@ pub enum Overlay {
     /// acknowledge: these are historical rollup rows, not the dashboard's
     /// own live error buffer, so this carries no `mark`.
     JevErrors(JevErrorsView),
-    /// Issue #354 phase 3: `Ctrl+A c`, a right-click on a row, or the
-    /// header's `actions` hint -- the target row's action menu.
+    /// Open the target row's action menu from prefix, pointer or header hint (#354).
     Menu(MenuView),
-    /// Issue #354 phase 3: `Ctrl+A i`, or the menu's `inspect`/`evidence` --
-    /// the per-row inspector.
+    /// Open the row inspector from prefix or menu (#354).
     Inspector(InspectorView),
 }
 
 impl Overlay {
-    /// Pure: `(cursor, offset, len)` of whichever list this overlay is
-    /// currently showing, or `None` when it is not showing one (a compose or
-    /// edit buffer, a free-text prompt, a cursor-less dialog like help or
-    /// the quit confirmation).
-    ///
-    /// Issue #354 phase 3: this is what lets the shared viewport keys --
-    /// PageUp/PageDown/Home/End and the wheel -- be handled ONCE, for every
-    /// list dialog, without every per-dialog reducer growing a capacity
-    /// argument. Each reducer keeps its own semantics for its own keys.
+    /// Expose list cursor and viewport only for list-shaped overlays.
     pub fn list_state(&self) -> Option<(usize, usize, usize)> {
         match self {
             Overlay::Mail(view) if view.compose.is_none() => {
@@ -1140,20 +859,8 @@ pub(crate) fn header_rows(area_height: u16) -> u16 {
     1.min(area_height)
 }
 
-/// Pure: how many rows each of the frame's fixed (non-body) chrome pieces
-/// get, in `(header, rule_top, rule_bottom, footer)` order -- issue #209/v3
-/// §A4/§D replaces the sidebar's own full rounded box with a full-width rule
-/// above and below the body plus a new footer row, mirroring the header.
-///
-/// Reserved in priority order, each capped at 1.min(remaining): the header
-/// first (unchanged from before this phase), then the footer (the new
-/// signal row this phase adds -- kept as close to the header's own
-/// guarantee as the remaining height allows), then the two rules last,
-/// since they are pure decoration and a terminal too short for all four
-/// should lose the decoration before it loses either signal row. Every
-/// subtraction is guarded (`saturating_sub`/`.min`), so a zero- or one-row
-/// frame degrades to all-zero chrome rather than underflowing -- the
-/// release profile is `panic = "abort"`.
+/// Reserve header and footer before decorative rules so short frames keep signal rows.
+/// Saturating subtraction handles zero-height frames under `panic = "abort"` (#209).
 pub(crate) fn chrome_rows(area_height: u16) -> (u16, u16, u16, u16) {
     let header_h = header_rows(area_height);
     let remaining = area_height.saturating_sub(header_h);
@@ -1165,20 +872,7 @@ pub(crate) fn chrome_rows(area_height: u16) -> (u16, u16, u16, u16) {
     (header_h, rule_top_h, rule_bottom_h, footer_h)
 }
 
-/// Every rect [`layout`] hands the render loop, named rather than
-/// positional: `header`/`sidebar`/`main`/`footer` are drawn into directly;
-/// `rule_top`/`rule_bottom` are the full-width flat rules that replace the
-/// sidebar's old box border (issue #209/v3 §A4), each zero-height on a frame
-/// too short to afford it (see [`chrome_rows`]).
-///
-/// Dash refresh PR1 adds `sidebar_title`/`pane_header` (one shared row: the
-/// sidebar's own ` SESSIONS N` title beside the focused pane's own header)
-/// and `mid_rule` (the `─...┼...─` rule right below them, aligned with the
-/// sidebar/main divider) -- `sidebar`/`main` themselves now start BELOW
-/// those two rows, so a pane's child pty is sized to the grid it actually
-/// gets, never the two rows above it. All three are zero-height on a frame
-/// too short to afford them, the identical `1.min(remaining)` degrade every
-/// other chrome row already uses.
+/// Name each frame rect so rendering and hit testing share geometry.
 pub struct DashLayout {
     pub header: Rect,
     pub rule_top: Rect,
@@ -1195,27 +889,13 @@ pub struct DashLayout {
     pub footer: Rect,
 }
 
-/// Dash refresh PR1: below 100 total columns the session column hides
-/// outright (the header shows sessions as tabs instead, `render_header_
-/// tabs`) -- unless the operator has toggled it back on (`^A b`,
-/// `DashAction::ToggleSidebar`), which holds regardless of width until
-/// toggled again. Pure: `dash::mod`'s own `effective_sidebar_cols` is the
-/// ONE place this feeds `sidebar_cols` for every geometry read (`layout`,
-/// `effective_main`, pty resize) from, recomputed at every point the real
-/// terminal width can change and on the toggle itself, so a narrow
-/// terminal and a forced-visible toggle can never disagree about how wide
-/// the sidebar actually is this frame.
+/// Hide the sidebar below 100 columns unless the operator forced it visible;
+/// layout and PTY sizing must use the same effective width.
 pub fn sidebar_hidden(frame_width: u16, forced_visible: bool) -> bool {
     frame_width < 100 && !forced_visible
 }
 
-/// Splits `area` into every chrome rect a v3 frame draws: one header row, a
-/// full-width top rule, a `sidebar_cols`-wide sidebar with a one-column
-/// divider before the grid, a bottom rule mirroring the top one, and one
-/// footer row (§D) -- see [`DashLayout`] and [`chrome_rows`] for how each
-/// piece's height is decided. Dash refresh PR1: the body's own top two rows
-/// go to the title/pane-header row and the rule below it (see
-/// [`DashLayout`]'s own doc comment) before `sidebar`/`main` get the rest.
+/// Split the frame into header, rules, sidebar, divider, grid and footer.
 pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     let (header_h, rule_top_h, rule_bottom_h, footer_h) = chrome_rows(area.height);
     let header = Rect {
@@ -1237,10 +917,7 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
         .height
         .saturating_sub(header_h + rule_top_h + rule_bottom_h + footer_h);
     let sidebar_w = sidebar_cols.min(area.width);
-    // No sidebar at all (dash refresh PR1's own narrow-terminal hide,
-    // `sidebar_cols` config'd to 0) means no separator column either --
-    // `main` gets the whole frame, not `frame width - 1` for a divider with
-    // nothing to divide.
+    // A hidden sidebar has no separator; give its column back to the pane.
     let separator = if sidebar_w > 0 && area.width > sidebar_w {
         1
     } else {
@@ -1249,10 +926,7 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     let main_x = area.x + sidebar_w + separator;
     let main_w = area.width.saturating_sub(sidebar_w + separator);
 
-    // Reserved in the same priority order every other chrome row already
-    // follows: the title/pane-header row first, the rule below it second --
-    // a terminal too short for both loses the rule before it loses the row
-    // that actually carries information.
+    // Reserve title and rule rows first on short terminals.
     let title_h = 1.min(body_h_total);
     let remaining = body_h_total.saturating_sub(title_h);
     let mid_rule_h = 1.min(remaining);
@@ -1319,13 +993,7 @@ pub fn layout(area: Rect, sidebar_cols: u16) -> DashLayout {
     }
 }
 
-/// Issue #209/v3 §A4/§D: the full-width flat rule that replaces the
-/// sidebar's old box border, drawn once above the body (mirroring the
-/// header) and once below it (mirroring the footer). `divider_col` is the
-/// sidebar's own width -- the rule draws a `┬`/`┴` junction there against
-/// the sidebar/grid divider, `top` selects which junction glyph. Dim,
-/// matching `--t-line` in the approved mock, same as
-/// [`render_sidebar_divider`].
+/// Draw flat full-width rules above and below the body (#209).
 pub fn render_rule(f: &mut Frame, area: Rect, divider_col: u16, top: bool) {
     if area.is_empty() {
         return;
@@ -1347,10 +1015,7 @@ pub fn render_rule(f: &mut Frame, area: Rect, divider_col: u16, top: bool) {
     );
 }
 
-/// Dash refresh PR1: the rule directly below the sidebar's title row and the
-/// focused pane's own header row (`DashLayout::mid_rule`) -- a `┼` junction
-/// at the sidebar/main divider column rather than [`render_rule`]'s own
-/// `┬`/`┴`, since both sides have a row above AND below this one.
+/// Use a crossing junction because both sides of the divider have rows above and below.
 pub fn render_mid_rule(f: &mut Frame, area: Rect, divider_col: u16) {
     if area.is_empty() {
         return;
@@ -1406,27 +1071,7 @@ fn map_color(c: vt100::Color) -> Color {
     }
 }
 
-/// Pure: the header's spans, width-budgeted to `cols`.
-///
-/// Ordered exactly as the design calls for: the ` zirv ` chip, the harness
-/// label (bold, standing in for the generic app name -- see [`HeaderFacts`]'s
-/// own doc comment for why this is `harness` rather than a literal "dash"),
-/// the live/total count (muted), then the one flexible segment -- the sticky
-/// error line or a transient notice -- and finally the hint cluster, always
-/// kept, always on the right. Issue #697 removed select mode (`Ctrl+A v`)
-/// entirely, so there is no longer a `SELECT` marker to reserve room for
-/// here -- the dashboard now keeps its own mouse reporting on for the whole
-/// session (subject only to `dash.mouse`, an operator/config decision, not
-/// a runtime toggle this header would need to reflect).
-///
-/// Only the flexible middle ever loses a character to width pressure: the
-/// fixed chrome (chip, harness, live count, hints) is reserved first, and
-/// what's left over is the message's own ellipsis-truncation budget. A
-/// terminal narrower than the fixed chrome alone still never panics --
-/// `render_header` hands whatever this returns to a `Paragraph`, which clips
-/// to `area` on its own -- but is not going to look polished either; that
-/// floor is well below `chrome::MIN_DASH_COLS` and is accepted the same way
-/// the old header's own extreme-width tests were.
+/// Budget header spans to width with the dashboard mark, counts, notice and hints.
 fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(Rect, HintId)>) {
     let cols = area.width as usize;
 
@@ -1438,13 +1083,7 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
         + hints.len().saturating_sub(1) * 2;
     let gap_before_hints = 2usize;
 
-    // `▌zirv` is the brand mark; the counts after it are `sessions` (always
-    // shown) then `working`/`needs_you`, each only when nonzero -- a zero
-    // count omits its whole segment (never "0 working"), so the row only
-    // ever names what is actually true right now. Every segment is short
-    // and digit-bounded (unlike the old free-text harness/model label this
-    // replaces), so unlike that label this cluster is never itself
-    // ellipsis-truncated; only the flexible middle slot gives up room.
+    // Always show session count; omit zero working and needs-you segments.
     let mut left: Vec<(String, Style)> = vec![
         ("\u{258c}".to_string(), Style::default().fg(Color::Cyan)),
         ("zirv".to_string(), style::tui::title()),
@@ -1544,14 +1183,8 @@ pub fn render_header(f: &mut Frame, area: Rect, facts: &HeaderFacts) {
     );
 }
 
-/// Dash refresh PR1: below the narrow-terminal floor the session column
-/// hides and its own header shows every session as a tab instead --
-/// ` {glyph} {name} {badge} `, the focused tab on the selected row's own
-/// `Color::Indexed(236)` background (dash refresh PR1's own selection
-/// tint, reused here rather than invented again). Same chip and hint
-/// cluster as [`render_header`]; the error/notice middle segment is
-/// dropped in this shape -- there is no room left for it once the tabs and
-/// the hints are both on the row.
+/// When the sidebar is hidden, use header tabs for sessions and omit the
+/// error/notice segment to leave room for tabs and action hints.
 pub fn render_header_tabs(
     f: &mut Frame,
     area: Rect,
@@ -1628,10 +1261,7 @@ pub fn render_header_tabs(
     );
 }
 
-/// Dash refresh PR1: the sidebar's own title row (`DashLayout::sidebar_
-/// title`) -- ` SESSIONS` left, the row count right-aligned. Replaces the
-/// old summary line's `N live` plus rollup cluster; the per-glyph counts
-/// still live in each group header's own rollup.
+/// Show session count in the sidebar title and per-glyph counts in group headers.
 pub fn render_sidebar_title(f: &mut Frame, area: Rect, count: usize) {
     if area.is_empty() {
         return;
@@ -1643,10 +1273,7 @@ pub fn render_sidebar_title(f: &mut Frame, area: Rect, count: usize) {
     );
 }
 
-/// Pure: the pane header's own workflow segment text and style -- `▸ {kind}
-/// › {step} {i}/{n}`, or `▸ {kind} › ✓ done` once `completed`; bold yellow
-/// while `awaiting_approval`, muted otherwise. Shared with nothing else:
-/// unlike the old footer segment this replaces, there is exactly one reader.
+/// Format the pane header's bound workflow once, with approval weight when needed.
 fn pane_header_workflow_span(fact: &SessionWorkflowFact) -> (String, Style) {
     let text = if fact.completed {
         format!("\u{25b8} {} \u{203a} \u{2713} done", fact.kind)
@@ -1692,24 +1319,11 @@ pub struct PaneHeaderFacts {
     /// capitalized here (`capitalize_first`) -- the sidebar keeps it plain.
     pub state_word: String,
     pub age_secs: Option<u64>,
-    /// Dash refresh PR2: a toast slot, between the left facts and the
-    /// workflow segment -- already-resolved text and style (`toast_style`),
-    /// `None` with nothing to show (no recent rollover/finished-worker edge,
-    /// or the toast has already faded past its own 5s). At most one at a
-    /// time, dashboard-wide (`dash::mod` keeps a single slot; "newest
-    /// wins" is enforced there, not here).
+    /// Show at most one resolved toast; the event loop decides which recent edge wins.
     pub toast: Option<(String, Style)>,
 }
 
-/// Dash refresh PR1: the focused pane's own header row (`DashLayout::
-/// pane_header`) -- left ` {harness} ▸ {role} · {model} · {cwd}`, right
-/// `{toast}  ▸ {workflow} › {step} {i}/{n}  {glyph} {State word} {age}` (the
-/// toast and workflow segments each absent without something to show).
-/// Truncates the left side before ever touching the right, since the right
-/// is the part naming what is actually happening right now. Dash refresh
-/// PR2: the state word gets the Claude Code shimmer (`shimmer_spans`)
-/// while `facts.glyph` is [`Glyph::Working`]; `elapsed_ms`/`motion` drive
-/// that alone -- the glyph's own spinner frame is `tick`, unchanged.
+/// Show focused pane identity and workflow in its own pane header.
 pub fn render_pane_header(
     f: &mut Frame,
     area: Rect,
@@ -1782,8 +1396,7 @@ pub fn render_pane_header(
 }
 
 // ---------------------------------------------------------------------
-// Dash refresh PR1: the LIMITS block pinned to the bottom of the session
-// column -- per harness with usage data, two rows per window (5h, wk).
+// Keep the LIMITS block below sessions, with two rows per available window.
 // ---------------------------------------------------------------------
 
 /// Converts a unix timestamp to this offset's own wall-clock time. A
@@ -1805,10 +1418,7 @@ fn limits_hhmm(offset: FixedOffset, ts: u64) -> String {
     to_local(offset, ts).format("%H:%M").to_string()
 }
 
-/// Pure: the reset line's own `{time}` half -- today's bare `HH:MM`, `Ddd
-/// HH:MM` within the next 7 days, else `D Mon`, all read at `offset` so a
-/// reset that lands after local midnight (but before UTC midnight, or vice
-/// versa) still reports the day the operator's own clock sees.
+/// Format LIMITS reset time in the operator's local offset.
 fn limits_reset_time(offset: FixedOffset, resets_at: u64, now: u64) -> String {
     let reset_local = to_local(offset, resets_at);
     let today = to_local(offset, now).date_naive();
@@ -1824,8 +1434,7 @@ fn limits_reset_time(offset: FixedOffset, resets_at: u64, now: u64) -> String {
     }
 }
 
-/// Pure: a duration in `resets_at - now` seconds, spelled `XhYYm` at an hour
-/// or more and `Nm` (never `0m`) under one.
+/// Never display a sub-minute reset countdown as zero minutes.
 fn limits_countdown(resets_at: u64, now: u64) -> String {
     let remaining = resets_at.saturating_sub(now);
     if remaining < 3600 {
@@ -1845,22 +1454,12 @@ pub struct LimitsBlock {
     pub show_harness: bool,
     pub window_label: &'static str,
     pub pct: f64,
-    /// Dash refresh PR2: the bar's own eased fill value (`ease_toward`,
-    /// mod.rs's render loop) -- lags `pct` by up to ~300ms while it moves;
-    /// the percentage TEXT and the tone/reset-line colour stay instant off
-    /// `pct` itself, the same "instant label, eased gauge" split the rot
-    /// track uses. `limits_blocks_from_usage` seeds this equal to `pct`
-    /// (this pure function knows nothing of animation); mod.rs overwrites
-    /// it with the actually-eased value before rendering.
+    /// Ease LIMITS gauge fill while percentage text uses current data.
     pub eased_pct: f64,
     pub detail: WindowDetail,
 }
 
-/// Pure: every LIMITS block worth drawing, one per window that has usage
-/// data at all -- a harness with no vendor reading for a window (`None` on
-/// `HarnessUsage`) contributes nothing for it, and one with neither window
-/// contributes nothing at all. `usages`' own order is kept, 5h before wk
-/// within a harness.
+/// Draw only LIMITS windows with usage data.
 pub fn limits_blocks_from_usage(usages: &[HarnessUsage]) -> Vec<LimitsBlock> {
     let mut blocks = Vec::new();
     for usage in usages {
@@ -1925,12 +1524,7 @@ fn limits_tone(pct: f64, detail: &WindowDetail) -> Style {
     }
 }
 
-/// Pure: the reset line's own text and tone -- `back at HH:MM · Nm` (red)
-/// when the limit is hit, `credits until HH:MM` (magenta) when overage is
-/// covered, `reset at HH:MM · stale` (muted) when `resets_at` is already in
-/// the past (a stale vendor reading, round 2 coordinator review), else
-/// `resets {time}` with `· in {countdown}` appended only for a reset later
-/// today (yellow at 80% or more, else muted).
+/// Choose reset-line text and tone from limit, credit and staleness state.
 fn limits_reset_line(
     offset: FixedOffset,
     pct: f64,
@@ -1952,17 +1546,7 @@ fn limits_reset_line(
             Style::default().fg(Color::Magenta),
         )
     } else if detail.resets_at < now {
-        // Round 2 coordinator review, CONFIRMED: a `resets_at` already in
-        // the past is a stale vendor reading (the window rolled over but a
-        // fresh one has not been reported yet), never a future time to
-        // render as an ordinary `resets HH:MM` -- that reads as if the
-        // reset is still ahead. Always muted, regardless of `pct`: this is
-        // "the number is old", not a percentage-driven state. Kept to
-        // `reset at HH:MM \u{b7} stale` (well under the 28-col sidebar
-        // width, with its own 3-column indent) rather than the longer
-        // `waiting for update` phrasing, which does not fit that row at
-        // all -- `render_limits`'s own `truncate_display` is a last-resort
-        // safety net, never the intended way this line gets short enough.
+        // Treat a reset time in the past as stale vendor data, not a fresh limit window.
         (
             format!(
                 "reset at {} \u{b7} stale",
@@ -1988,11 +1572,8 @@ fn limits_reset_line(
     }
 }
 
-/// Dash refresh PR1: draws the LIMITS block -- ` LIMITS` title, a rule,
-/// then as many `blocks` as `limits_blocks_fitting` said would fit (the
-/// caller is the one that drops blocks under height pressure; this draws
-/// whatever it is handed and nothing more, even if more rows were left
-/// over -- never guesses at the cut itself).
+/// Draw only the blocks selected by the caller's height budget; do not
+/// independently decide which windows to drop.
 ///
 /// No `~` estimate marker anywhere: the only estimator source
 /// (`window::estimate_windows`, via `pace::current_windows`) sums
@@ -2054,10 +1635,8 @@ pub fn render_limits(
 }
 
 // ---------------------------------------------------------------------
-// Dash refresh PR2: the JEV sidebar section, between SESSIONS and LIMITS
-// (mock §03) -- what Jev did in the last 24h, refreshed on its own ~10s
-// cadence (`dash::mod`, never the render path). Hidden entirely with every
-// `[jev]` gate off.
+// JEV facts use their own refresh cadence, never the render path; hide the
+// section entirely when every gate is off.
 // ---------------------------------------------------------------------
 
 /// One site's own bar row -- `{name} {calls} {bar}`, the bar relative to the
@@ -2068,13 +1647,7 @@ pub struct JevSiteBar {
     pub calls: u64,
     /// Out of 6 cells, matching LIMITS' own bar width.
     pub filled: usize,
-    /// Dash refresh PR2: the bar's own eased fill value (`ease_toward`,
-    /// mod.rs's render loop) -- same "instant label (`calls`), eased
-    /// gauge" split `LimitsBlock::eased_pct` uses. Built equal to `filled`
-    /// wherever this struct is constructed outside the render loop itself
-    /// (`dash::mod::jev_section_fact`, and this module's own tests); the
-    /// render loop overwrites it with the actually-eased value before
-    /// rendering.
+    /// Ease gauge fill but show current call count immediately.
     pub eased_filled: f64,
 }
 
@@ -2098,11 +1671,7 @@ pub struct JevErrorRow {
     pub reason: String,
 }
 
-/// Dash refresh PR2: the JEV sidebar section's facts (mock §03), built by
-/// `dash::mod` from `jev::usage_rollup`'s own 24h-windowed read, off the
-/// render path. `dash::mod` simply does not construct one (`DiskFacts::jev`
-/// stays `None`) with every `[jev]` gate off -- that is what hides the
-/// section entirely.
+/// Build JEV facts off the render path; `None` hides the section when all gates are off.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JevSectionFact {
     /// Every configured gate is on, but the credential env var is not set.
@@ -2312,9 +1881,7 @@ pub fn render_jev(
     f.render_widget(Paragraph::new(Text::from(lines)), Rect { height, ..area });
 }
 
-/// Issue #209/v3 §D: the focused session's active `zirv workflow` position,
-/// as much as the footer needs -- the rest of `workflow::ActiveWorkflowSummary`
-/// (attempts, artifacts, review evidence, ...) has no footer segment.
+/// Show the focused session's bound workflow position in the footer (#209).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FooterWorkflow {
     /// This session's repo has no active workflow at all.
@@ -2322,32 +1889,20 @@ pub enum FooterWorkflow {
     Active {
         kind: String,
         step: String,
-        /// The current step is gated on the operator's own approval
-        /// (`WorkflowStatus::AwaitingApproval`) -- Q4: escalates to
-        /// yellow-bold, the same weight unread mail already gets.
+        /// Highlight a workflow step awaiting operator approval.
         gated: bool,
     },
 }
 
-/// The footer's own facts for the focused pane (Q1: focused-only, never one
-/// row per live harness) -- issue #209/v3 §D's new signal row, one below
-/// the grid. `None` when nothing is focused at all (an empty dashboard);
-/// nothing draws.
+/// Build footer facts for the focused pane only (#209).
 pub enum FooterFacts {
     None,
     Alive(FooterAliveFacts),
     Dead(FooterDeadFacts),
 }
 
-/// Dash refresh PR2's own motion switch, mirroring `config::DashMotion` --
-/// this module takes no config dependency (see its own module doc comment),
-/// so `dash::mod` converts. `Full` (default) runs every animation this
-/// module draws: clock-driven spinners, the pane-header shimmer, gauge
-/// easing, pending-rollover breathing, mail/finished-worker row flashes and
-/// toast fades. `Reduced` keeps every STATE change these same functions
-/// report (a spinner still shows working, a gauge still lands on its
-/// target, a toast still appears and expires on schedule) and drops only
-/// the animation between states.
+/// Keep state changes and toast expiry under reduced motion; suppress only
+/// animation between states. The event loop converts from config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     Full,
@@ -2360,14 +1915,7 @@ impl Motion {
     }
 }
 
-/// Pure: one exponential-decay step of `current` toward `target`, `dt_ms`
-/// milliseconds after the previous step -- the caller keeps `current`
-/// across frames (mod.rs's render loop). Settles to within a third of a
-/// point of `target` in about 300ms of real steps (mock §06's own "ease to
-/// new values over about 300ms"), and snaps to `target` outright once the
-/// gap is negligible so a caller never has to special-case "close enough".
-/// Reduced motion returns `target` outright: state changes land instantly,
-/// with no animation at all.
+/// Ease the visual score toward its current target between fact refreshes.
 pub fn ease_toward(current: f64, target: f64, dt_ms: u64, motion: Motion) -> f64 {
     if motion == Motion::Reduced {
         return target;
@@ -2428,13 +1976,7 @@ pub fn pending_pulse_style(elapsed_ms: u64, motion: Motion) -> Style {
     }
 }
 
-/// Pure: `word`'s own characters, each styled from `base_style` alone
-/// (Claude Code's own shimmer, mock §06's own script: a bright sweep moving
-/// through the working verb, one step every ~90ms). The sweep position
-/// starts three columns before the word and ends three past it, so the
-/// highlight visibly enters and leaves rather than teleporting at the
-/// edges. Reduced motion paints the whole word in `base_style` with no
-/// sweep at all.
+/// Style shimmer characters from the base style so animation does not accumulate colors.
 pub fn shimmer_spans(
     word: &str,
     elapsed_ms: u64,
@@ -2462,82 +2004,41 @@ pub fn shimmer_spans(
         .collect()
 }
 
-/// The healthy/attention footer shapes (mock §04's first two examples) --
-/// they differ only in *values*, not in which fields exist.
-///
-/// Dash refresh PR1 dropped `harness`, `usage_five_hour`/`usage_seven_day`
-/// and `workflow` from this struct: the harness/model/workflow facts moved
-/// to the pane header (`ui::PaneHeaderFacts`), and PR2 replaces the usage
-/// pair with the next-action forecast track. The footer keeps only the rot
-/// verdict, mail and supervision now.
+/// Keep footer fields stable across healthy and attention states; only values change.
 pub struct FooterAliveFacts {
     /// `None` when no cached score exists yet for this session -- renders
     /// the same `✻ –` unknown placeholder the wrap bar's own `BarState`
     /// uses for the identical case.
     pub score: Option<u32>,
-    /// Dash refresh PR2: the rot TRACK's own eased fill value -- lags
-    /// `score` by up to ~300ms while it climbs or falls (`ease_toward`,
-    /// mod.rs's render loop); the numeric label stays instant off `score`
-    /// itself. `None` exactly when `score` is (the caller keeps the two in
-    /// lockstep: there is nothing to ease toward with no cached score).
+    /// Ease track fill while the numeric score stays immediate; absent with no score.
     pub eased_score: Option<f64>,
     /// Total unread mail (broadcast + direct) for this session. The mock's
     /// footer shows one unlabeled number, unlike the wrap bar's own
     /// broadcast/direct `+`-split -- `0` renders the dim placeholder.
     pub unread_mail: usize,
-    /// `Pane::reachable()` for the focused pane (issue #209/v3 codex review
-    /// finding 5): whether its own turn-signal socket bound successfully at
-    /// spawn time. `false` is the same "degrades to unsupervised" case
-    /// `Pane::spawn`'s own doc comment describes for a failed bind -- a
-    /// dashboard pane that cannot act on a wake-up is still legitimate and
-    /// visible, but the footer must say so rather than assume every alive
-    /// pane is fine. Not the same signal as `wrap`'s own in-process
-    /// `chrome::BarState::degraded` (there is no dash-observable analogue
-    /// of THAT one -- a supervising *loop* going bad mid-session, as
-    /// opposed to never having bound in the first place), which stays out
-    /// of this issue's scope (§E).
+    /// Use actual turn-signal reachability for the focused pane's supervision label (#209).
     pub supervised: bool,
-    /// Issue #310: this pane's stall latch is currently armed
-    /// (`sessions::stall_marker`, via `DiskFacts::stalled`) -- overrides the
-    /// supervision segment with a `stalled` badge instead of `supervised`/
-    /// `unsupervised` while it holds, and reverts the instant the latch
-    /// clears (observed progress, or the session ended). Takes priority over
-    /// `supervised`: a session can be both reachable and stalled at once,
-    /// and the operator needs to see the more urgent fact.
+    /// An armed stall latch overrides the ordinary supervision label (#310).
     pub stalled: bool,
-    /// Dash refresh PR2: the orchestrator seat's own rollover facts for the
-    /// footer's right-hand segment (mock §02) -- built by `dash::mod` from
-    /// the seat/rollover-runtime records it already reads on the facts-
-    /// refresh cadence (never per frame). `None` for a non-orchestrator
-    /// focus, or whenever rollover itself should show nothing at all (see
-    /// [`RolloverFooterFact`]'s own doc comment for every hidden case).
+    /// Read rollover from cached seat facts, never per frame; absent for a non-orchestrator focus.
     pub rollover: Option<RolloverFooterFact>,
 }
 
-/// Dash refresh PR2: the orchestrator seat's own rollover state for the
-/// footer's right-hand segment (mock §02).
+/// Show only rollover states relevant to the focused orchestrator seat.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RolloverFooterFact {
     /// Headroom is comfortably clear of the rollover floor.
     Distance { floor_pct: f64, headroom_pct: f64 },
     /// Within 10 points of the floor.
     Soon { floor_pct: f64, headroom_pct: f64 },
-    /// The seat is marked pending (`seat::Seat::pending`); the swap fires on
-    /// the next idle boundary. There is no confirmed successor to name at
-    /// this point -- `seat::decide`'s own "idle boundary" wait short-
-    /// circuits before any candidate is even considered (see that
-    /// function's own doc comment) -- so the wording deliberately does not
-    /// claim a target harness the dashboard cannot yet name.
+    /// Show pending rollover without naming an unconfirmed successor.
     Pending,
     /// Parked on its own current harness (no fallback had headroom), waiting
     /// for that harness's own usage window to reset.
     Parked { harness: String, resets_at: u64 },
 }
 
-/// Pure: [`RolloverFooterFact`]'s own footer spans. `now`/`offset` format
-/// `Parked`'s reset time the same way LIMITS does (`limits_hhmm`/
-/// `limits_countdown`); `elapsed_ms`/`motion` drive `Pending`'s breathing
-/// (`pending_pulse_style`).
+/// Render rollover time with the same reset clock format as LIMITS.
 fn rollover_footer_spans(
     fact: &RolloverFooterFact,
     now: u64,
@@ -2591,11 +2092,7 @@ pub struct FooterDeadFacts {
 /// names its own `Segments` alias.
 type FooterSeg = Vec<(String, Style)>;
 
-/// Pure: `workflow`'s own footer text, in its full and width-compressed
-/// forms (§D's drop order compresses the workflow segment before dropping
-/// it outright) -- `(full, compressed)`, both already styled. `None` has
-/// only the one dim `▸ –` form; a gated step's compressed form gains the
-/// `!` suffix mentioned nowhere but the mock's own 44-column example.
+/// Provide full and compressed workflow text so footer width can shrink it before dropping it.
 fn footer_workflow_spans(workflow: &FooterWorkflow) -> (FooterSeg, FooterSeg) {
     match workflow {
         FooterWorkflow::None => {
@@ -2626,18 +2123,7 @@ fn footer_workflow_spans(workflow: &FooterWorkflow) -> (FooterSeg, FooterSeg) {
 /// grammar verbatim (minus the chip, per the mock's own note).
 const FOOTER_SEGMENT_GAP: &str = "   ";
 
-/// Pure: the alive-pane footer's spans, width-budgeted to `cols`. Dash
-/// refresh PR1 dropped the harness/usage/workflow segments entirely (the
-/// first two moved to the pane header; PR2 replaces usage with the
-/// next-action forecast) -- what is left is the rot verdict (`✻ NN {band}`),
-/// PR2's own track and recommendation words, an optional rollover segment,
-/// mail, and supervision, which shrinks to nothing at all while the pane is
-/// healthy and reachable (`Remove the healthy ● supervised segment`) and
-/// only ever shows `▲ unsupervised` or `◆ stalled`. Drop order, most
-/// generous first: the track+recommendation+rollover trio drops before the
-/// verdict's own score number, which is the only PR1-era piece ever
-/// dropped -- the word, mail and supervision are never dropped, unchanged
-/// from PR1.
+/// Budget the focused pane's footer spans to available columns.
 #[allow(clippy::too_many_arguments)]
 fn footer_alive_spans(
     facts: &FooterAliveFacts,
@@ -2674,10 +2160,7 @@ fn footer_alive_spans(
         }
     };
 
-    // Dash refresh PR2: the track eases toward the score (`eased_score`) so
-    // it never jumps once a second; the recommendation words read the
-    // instant, real `score` -- there is no reason to lag a "do this now"
-    // sentence behind its own gauge.
+    // Ease the rot track visually while showing current recommendation text immediately.
     let track: FooterSeg = facts
         .eased_score
         .map(|eased| rot_track_cells(eased, advise_at, compact_at))
@@ -2703,10 +2186,7 @@ fn footer_alive_spans(
         vec![(format!("\u{2709} {}", facts.unread_mail), style)]
     };
 
-    // Issue #310: a stalled latch takes priority over the ordinary
-    // unsupervised segment -- see `FooterAliveFacts::stalled`'s own doc
-    // comment. Healthy and reachable renders NOTHING at all now (dash
-    // refresh PR1): only a problem is worth a segment.
+    // Prioritize stalled over unsupervised; healthy reachable panes show no supervision warning (#310).
     let supervision: FooterSeg = if facts.stalled {
         vec![(
             "\u{25c6} stalled".to_string(),
@@ -2735,9 +2215,7 @@ fn footer_alive_spans(
 }
 
 /// Pure: joins `segments` with [`FOOTER_SEGMENT_GAP`] between each one
-/// present, in order -- an empty segment (dash refresh PR1's healthy-and-
-/// reachable supervision, which is nothing at all) contributes neither text
-/// nor a gap of its own.
+/// present, in order; an empty segment contributes neither text nor a gap.
 fn join_footer_segments(segments: &[&FooterSeg]) -> FooterSeg {
     let mut out = FooterSeg::new();
     for seg in segments.iter().filter(|seg| !seg.is_empty()) {
@@ -2825,13 +2303,7 @@ fn footer_dead_spans(facts: &FooterDeadFacts, cols: u16) -> Vec<Span<'static>> {
     choose_footer_tier(&tiers, cols)
 }
 
-/// Issue #209/v3 §D: the footer signal row, describing whichever pane is
-/// focused. `advise_at`/`compact_at`/`restart_at` are `rot::ScoreConfig`'s
-/// own thresholds, threaded through exactly as [`render_sidebar`] takes the
-/// first two. `now`/`offset` format a `Parked` rollover's reset time;
-/// `elapsed_ms`/`motion` drive a `Pending` rollover's breathing (dash
-/// refresh PR2) -- neither is read for a `Dead` focus, which carries no
-/// rollover fact at all.
+/// Render the focused pane's signal row from cached rot thresholds (#209).
 #[allow(clippy::too_many_arguments)]
 pub fn render_footer(
     f: &mut Frame,
@@ -2861,13 +2333,8 @@ pub fn render_footer(
     );
 }
 
-/// Dash refresh PR1: below the narrow-terminal floor the footer shows the
-/// FOCUSED pane's own harness usage instead of the ordinary verdict/mail/
-/// supervision row -- `5h {pct}% · resets {time}`, since the LIMITS block
-/// that would otherwise carry this is gone along with the rest of the
-/// sidebar. `None` (nothing focused, or that harness has no 5h reading at
-/// all yet) draws nothing, same as [`render_footer`]'s own `FooterFacts::
-/// None`.
+/// Show the focused harness's usage in the narrow footer because the
+/// sidebar LIMITS block is hidden; unknown usage draws nothing.
 pub fn render_footer_narrow_usage(
     f: &mut Frame,
     area: Rect,
@@ -2897,26 +2364,7 @@ pub fn render_footer_narrow_usage(
     );
 }
 
-/// Pure: the roster viewport's first drawn entry, given how many entries the
-/// tree has, how many fit, which one must be visible, and where the viewport
-/// currently sits.
-///
-/// The sidebar used to draw from entry `0` unconditionally, so once the
-/// combined row count (panes plus view-only registry rows) outgrew the
-/// sidebar's height the cursor could walk onto a row that was never drawn --
-/// an invisible selection, and with arrow navigation now moving focus too, a
-/// keyboard that moved to a pane the operator could not see listed.
-///
-/// Issue #354 gives the roster its own viewport: the wheel scrolls `offset`
-/// without touching the selection, so the two genuinely drift apart, and
-/// every keyboard navigation re-reveals the selection through here. The
-/// offset moves the *minimum* distance that brings `index` back inside the
-/// window (so a scrolled-then-navigated roster does not jump), and is always
-/// clamped so the last screenful is as far as it can scroll.
-///
-/// Every subtraction is guarded: `dash.sidebar_cols` and a two-row terminal
-/// both genuinely reach here, and the release profile is `panic = "abort"`, so
-/// an underflow would take the operator's terminal with it.
+/// Keep the selected tree entry inside the roster viewport while preserving wheel offset.
 pub(crate) fn reveal_offset(total: usize, visible: usize, index: usize, offset: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -2945,12 +2393,7 @@ fn glyph_char_for(glyph: Glyph, tick: usize) -> &'static str {
     }
 }
 
-/// The glyph's own colour: cyan for a working pane's spinner, green for a
-/// live-but-idle one, yellow for one waiting on the operator, magenta for one
-/// that finished unnoticed, red for exited/dead, and no colour at all (default
-/// monochrome, matching every view-only row before this phase) for a row
-/// whose state cannot be observed from here. Colour is never the only carrier
-/// -- every glyph above is its own shape too.
+/// Color row glyphs by current work and attention state.
 fn glyph_style_for(glyph: Glyph) -> Style {
     match glyph {
         Glyph::Working => style::tui::accent(),
@@ -3022,20 +2465,7 @@ fn footer_rot_style(band: RotBand) -> Style {
 /// whether it is shown from inside (wrap) or from the dash.
 const ROT_GLYPH: &str = "\u{273b}";
 
-/// Dash refresh PR2: the footer's own 22-column rot track -- 20 cells of 5
-/// points each plus the two `┊` threshold ticks, inserted before the cell at
-/// `advise_at`/`compact_at` (i.e. after `threshold / 5` cells). Filled cells
-/// (`eased_score / 5`, floored) all take the current band's own colour;
-/// empty cells and the two ticks never do -- the ticks are a fixed, dim
-/// reference mark, not part of the verdict itself.
-///
-/// Matches the approved mock's own static examples (`docs/design/mocks/
-/// 2026-09-26-dash-refresh.html` §02: `score.advise_at`/`score.compact_at`
-/// default 40/60, ticks after 8 and 12 cells, floor division throughout).
-/// Its animated §06 demo instead hardcodes ticks at fixed columns 12/16 with
-/// `Math.round` fill -- an inconsistency inside the mock itself between its
-/// own static and animated sections; resolved here in the written spec
-/// text's favour (the configured thresholds, floor division, matching §02).
+/// Insert rot threshold ticks at their scored positions in the 20-cell track.
 fn rot_track_cells(eased_score: f64, advise_at: u32, compact_at: u32) -> FooterSeg {
     let clamped = eased_score.clamp(0.0, 100.0);
     let band = rot_band_for(clamped.round() as u32, advise_at, compact_at);
@@ -3065,7 +2495,7 @@ fn rot_track_cells(eased_score: f64, advise_at: u32, compact_at: u32) -> FooterS
 
 /// Pure: the footer's own "what to do about it" words, shown only once
 /// useful (`score >= compact_at`) -- zirv does not compact or restart a
-/// dashboard pane (operator decision, PR2's own constraint), so these are
+/// dashboard pane, so these are
 /// recommendations for the operator to act on, never a claim of an action
 /// zirv itself will take. `restart_at` and above supersedes the `compact_at`
 /// wording outright rather than showing both.
@@ -3113,7 +2543,7 @@ fn column(text: &str, width: usize, right: bool) -> String {
     }
 }
 
-/// The dash refresh (PR1) 28-column row contract's fixed prefix, in display
+/// The 28-column row contract's fixed prefix, in display
 /// columns: `tree(1) glyph(1) sp name(N) sp harness(6) sp rot(3) sp badge(2)
 /// sp` = 18 + N. `name` takes whatever is left (10 at the default
 /// `sidebar_cols` of 28), so a row always fills `cols` exactly and a
@@ -3123,8 +2553,8 @@ const SIDEBAR_FIXED_COLS: usize = 18;
 /// Pure: the badge column's own text and style, highest priority first -- a
 /// workflow gate awaiting approval (`⚑ `) outranks unread mail (`✉N`, `✉+`
 /// above 9, matching the wrap bar's own convention for an unbounded count).
-/// `None` (rendered as two blank columns) when neither applies. PR2 adds the
-/// lifecycle badges (`⟳ ⇢ ⤓ ⏸`) above mail in this same priority order.
+/// `None` (rendered as two blank columns) when neither applies. Lifecycle
+/// badges (`⟳ ⇢ ⤓ ⏸`) rank above mail.
 fn badge_for(row: &SidebarRow) -> Option<(String, Style)> {
     if row
         .status
@@ -3163,8 +2593,7 @@ fn badge_for(row: &SidebarRow) -> Option<(String, Style)> {
 }
 
 /// Pure: one sidebar row's styled spans under the 28-column contract above.
-/// Colours follow the dash refresh's replacement for #209 §B: a selected
-/// row gets a subtle `Color::Indexed(236)` background rather than REVERSED,
+/// A selected row gets a subtle `Color::Indexed(236)` background rather than REVERSED,
 /// so every glyph (state, rot and badge alike) keeps its own colour under
 /// the tint; keyboard focus adds BOLD; a view-only (unattached) row is DIM.
 fn sidebar_row_parts(
@@ -3229,10 +2658,7 @@ fn sidebar_row_text(row: &SidebarRow, tick: usize, cols: u16) -> String {
         .collect()
 }
 
-/// Issue #209/v3 §A4: the sidebar's own flat divider column -- what used to
-/// be the right edge of its full rounded `Block::bordered()` -- against the
-/// grid. Dim, matching `--t-line` in the approved mock; a full box is now
-/// reserved for the banner and overlays only.
+/// Draw a flat divider between sidebar and grid (#209).
 pub fn render_sidebar_divider(f: &mut Frame, area: Rect) {
     if area.is_empty() {
         return;
@@ -3356,22 +2782,7 @@ pub struct RosterView<'a> {
     pub bands: (u32, u32),
 }
 
-/// Pure: lays the whole roster out -- group tree, session rows and the
-/// selected row's 2-line fact block -- and returns the lines together with
-/// the pointer geometry of exactly those lines. `area` is the session-rows
-/// area alone (`DashLayout::sidebar`): the title row lives in its own rect
-/// now (`DashLayout::sidebar_title`, drawn by `render_sidebar_title`), not
-/// as this function's own row 0.
-///
-/// Session order is spawn order, never re-sorted; a work group takes one
-/// header at the position of its first member, with the lead (its
-/// sub-orchestrator, else the first member) as the first child. The two
-/// outputs are produced in one pass on purpose: geometry derived separately
-/// from the drawing is how a click ends up addressing a row that a collapsed
-/// group or height pressure kept off the screen.
-///
-/// Under height pressure fact-block lines drop before any session row, and
-/// group headers never drop at all.
+/// Lay out visible tree rows and return the same geometry for pointer hit tests.
 pub fn roster_frame(area: Rect, rows: &[SidebarRow], view: &RosterView<'_>) -> RosterFrame {
     let RosterView {
         collapsed,
@@ -3397,10 +2808,7 @@ pub fn roster_frame(area: Rect, rows: &[SidebarRow], view: &RosterView<'_>) -> R
             }
             let closed = collapsed.contains(&group.id);
             let id = Hit::GroupToggle(group.id.clone());
-            // Dash refresh PR1: `▾ {scope}` alone -- the lead/worker-count
-            // text the 44-column contract used to spell out is gone; the
-            // rollup cluster (right-aligned to the row's own badge column)
-            // already says how many members and what state they are in.
+            // Render group scope with a right-aligned rollup cluster.
             let text = aligned_rollup(
                 &format!(
                     "{} {}",
@@ -3453,13 +2861,7 @@ pub fn roster_frame(area: Rect, rows: &[SidebarRow], view: &RosterView<'_>) -> R
     if area.is_empty() {
         return result;
     }
-    // Dash refresh PR1: the old summary line (`N live` plus its own rollup)
-    // is gone -- `DashLayout::sidebar_title` now carries the row count
-    // (`render_sidebar_title`, drawn from a separate rect above `area`, one
-    // row up), and `Hit::SidebarSummary`'s own click target is added
-    // straight onto that rect by `frame_snapshot` rather than through this
-    // frame's own `hits`. `area` is therefore ALL session rows now -- no
-    // row reserved for a title this function no longer draws.
+    // Keep the session count in the sidebar title instead of a duplicate summary row.
     let capacity = area.height as usize;
     let offset = offset.min(entries.len().saturating_sub(capacity));
     let mut detail_room = capacity.saturating_sub(entries.len());
@@ -3486,18 +2888,7 @@ pub fn roster_frame(area: Rect, rows: &[SidebarRow], view: &RosterView<'_>) -> R
     result
 }
 
-/// Pure: one session row as a roster entry -- its hit id, its own line, and
-/// the fact-block lines that belong under it.
-///
-/// Dash refresh PR1: at most 2 lines (replacing the old 8-line disclosure
-/// dump) -- `{fact_state} · {age}`, then `▸ {workflow} › {step} {i}/{n}`
-/// only when this session has a bound workflow. Both hang off the tree's own
-/// `│` for a row that has more siblings below it and off plain indentation
-/// otherwise, so the group's vertical line is never broken by a fact.
-/// `selected_session` is false while the cursor is parked on the summary or
-/// a group header: the roster shows one cursor, so a session row must drop
-/// its selected band (and its fact block with it) while something else owns
-/// it.
+/// Draw at most two session fact lines: state and age, then bound workflow when present.
 fn roster_entry(
     row: &SidebarRow,
     width: u16,
@@ -3590,8 +2981,7 @@ pub fn frame_snapshot(
     overlay: &Overlay,
     tick: usize,
 ) -> FrameSnapshot {
-    // Phase 3: the open dialog's own rows and hints, from the same spec and
-    // the same layout function `render_overlay` draws through.
+    // Use the dialog's own rendered row and hint geometry for pointer targets (#354).
     let overlay_geom = overlay_geometry(
         frame,
         if zoomed { frame } else { layout.main },
@@ -3618,10 +3008,7 @@ pub fn frame_snapshot(
             )
         },
         grid: if zoomed { frame } else { layout.main },
-        // Dash refresh PR1: the sidebar's title row is drawn from its own
-        // rect now (`render_sidebar_title`, not part of `roster.lines`), so
-        // its `Hit::SidebarSummary` click target is added here rather than
-        // coming from `roster.hits` itself.
+        // Give the sidebar title its own summary hit target outside roster lines.
         rows: if zoomed {
             roster.hits.clone()
         } else {
@@ -3675,22 +3062,7 @@ fn cell_in_selection(row: u16, col: u16, start: (u16, u16), end: (u16, u16)) -> 
     }
 }
 
-/// Walks every `vt100` cell in `screen` into `area`'s buffer, cell for cell.
-/// A wide cell's own contents are drawn once and the following column is
-/// skipped, matching how `vt100` itself represents double-width glyphs (the
-/// continuation cell carries no contents of its own).
-///
-/// `selection`, when given, is a normalized `(start, end)` pair of
-/// visible-grid `(row, col)` cells (`dash::mod`'s own click-drag selection,
-/// already ordered by `normalize_selection`) drawn with `Modifier::REVERSED`
-/// layered on top of the cell's own style -- the same tmux-style highlight a
-/// terminal's native selection would have shown, now that mouse reporting
-/// has displaced it (see `term::dash_mouse_on_bytes`).
-///
-/// Deliberately outside this phase's theme migration: this mirrors a live
-/// child terminal's own colours and attributes verbatim, which is not
-/// "dashboard chrome" in the sense the rest of this module's design language
-/// applies to.
+/// Draw each vt100 wide cell once and skip its continuation column.
 pub fn render_grid(
     f: &mut Frame,
     area: Rect,
@@ -3912,11 +3284,7 @@ fn render_dialog(f: &mut Frame, area: Rect, title: &str, lines: &[String]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        // Issue #209/v3 §A2: the shared dialog frame's border was colourless
-        // (the terminal default) -- the approved mock gives every dialog a
-        // dim-cyan border, matching the list-dialog primitive right below.
-        // Not `tui::accent()` itself: that is now bold (§A1), and a bold
-        // border would out-shout the title it is meant to frame.
+        // Use the same dim-cyan border on all dialogs (#209).
         .border_style(dialog_border_style())
         .padding(Padding::horizontal(1))
         .title(Span::styled(title.to_string(), style::tui::accent()));
@@ -3949,22 +3317,13 @@ fn render_draft_dialog(
     render_dialog(f, area, title, &lines);
 }
 
-/// Truncates a body preview to a single-line, human-scanning length, on
-/// display width and with an ellipsis -- the display-width-aware equivalent
-/// of the old byte/char-counting local `preview()`. Shared by the mail and
-/// memory dialogs so a long message or entry never blows out a dialog row.
+/// Truncate preview by display width on one line, with an ellipsis.
 fn preview(text: &str, max_cols: usize) -> String {
     let first_line = text.lines().next().unwrap_or("");
     style::truncate_display_ellipsis(first_line, max_cols).into_owned()
 }
 
-/// One list-dialog row: plain text, an optional leading colour glyph (the
-/// QuitConfirm spinner, in practice -- nothing else in this phase needs
-/// one), an optional checkbox (`Some(_)` shows `[x]`/`[ ]`, `None` shows
-/// neither -- most dialogs have no checkbox at all), and -- phase 3 -- an
-/// optional dim `reason` drawn on the same row after the text, which is how
-/// the context menu says an entry exists but cannot be used right now
-/// without hiding it.
+/// Render a list row with optional glyph, checkbox and disabled reason.
 pub struct ListDialogRow {
     pub text: String,
     pub checked: Option<bool>,
@@ -3991,15 +3350,9 @@ impl ListDialogRow {
     }
 }
 
-/// The shared list-dialog primitive's own input: everything [`render_list_
-/// dialog`] needs to draw one dialog, decoupled from which real overlay it
-/// is drawing -- QuitConfirm, mail/memory browsing, restore, handover, the
-/// help overlay, and phase 3's context menu and inspector all build one of
-/// these rather than each hand-rolling its own `Block`/`Paragraph` pair.
+/// Provide one rendering contract for every list-shaped overlay.
 pub struct ListDialogSpec<'a> {
-    /// Owned rather than borrowed since phase 3: [`list_spec_for`] builds
-    /// every dialog's spec in one place and some titles are formatted
-    /// (`handover → pane a0000003`), which a `&str` field cannot outlive.
+    /// Own formatted dialog titles because the spec factory creates them dynamically.
     pub title: String,
     pub count: Option<usize>,
     pub rows: Vec<ListDialogRow>,
@@ -4007,10 +3360,7 @@ pub struct ListDialogSpec<'a> {
     /// nothing in the dialog is cursor-addressable (the help overlay, an
     /// empty list).
     pub cursor: Option<usize>,
-    /// First row of `rows` drawn. Phase 3: every list dialog scrolls, so a
-    /// 60-entry mail list is no longer a dialog whose bottom half is off the
-    /// screen. Clamped by [`list_dialog_layout`] so `cursor` is always
-    /// visible however stale this is.
+    /// Clamp the first visible row so long dialogs remain scrollable.
     pub offset: usize,
     /// `(key, action)` pairs, rendered two-tone (key bold, action dim,
     /// three spaces between pairs) on the dialog's own PINNED last row, one
@@ -4022,10 +3372,7 @@ pub struct ListDialogSpec<'a> {
     /// Shown, cursor-less, in place of `rows` when it is empty -- "(no
     /// mail)", "(nothing to restore)", and the like.
     pub empty_message: &'a str,
-    /// Issue #354 phase 4: a one-line query input PINNED between the title
-    /// and the list viewport, mirroring the pinned hint row at the bottom.
-    /// `None` for every dialog that has no query of its own -- which is all
-    /// of them except the palette/help overlay.
+    /// Keep palette query pinned above the list viewport so filtering stays visible (#354).
     pub input: Option<String>,
 }
 
@@ -4104,9 +3451,7 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
         return None;
     }
     let content_rows = spec.rows.len().max(1);
-    // +1 blank row above the hint row, +1 the hint row itself, +2 for the
-    // block's own top/bottom border, and +1 more for a pinned query input
-    // when the dialog has one (issue #354 phase 4).
+    // Reserve border, hint, spacer and optional query rows before sizing the list viewport (#354).
     let extra = 2 + 2 + u16::from(spec.input.is_some());
     let h = dialog_row_count(content_rows, extra).min(area.height);
     let w = dialog_width(area.width);
@@ -4130,10 +3475,7 @@ pub fn list_dialog_layout(area: Rect, spec: &ListDialogSpec) -> Option<ListDialo
     // and whatever is left is the list viewport.
     let hint_h = 1.min(inner.height);
     let blank_h = 1.min(inner.height.saturating_sub(hint_h));
-    // Phase 4: the query input is pinned directly under the title, reserved
-    // after the hint row and its spacer -- a palette whose keys are off
-    // screen is the same trap as a modal whose keys are, and the query line
-    // is what the operator is looking at while they type.
+    // Pin the palette query below title so it remains visible while list rows scroll.
     let input_h = if spec.input.is_some() {
         1.min(inner.height.saturating_sub(hint_h + blank_h))
     } else {
@@ -4230,14 +3572,10 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     let border_style = if spec.warn {
         style::tui::warning()
     } else {
-        // Issue #209/v3 §A2: dim-cyan, not the terminal-default colourless
-        // border every dialog drew before.
+        // Give dialogs a dim-cyan border (#209).
         dialog_border_style()
     };
-    // Issue #209/v3 §A3: `{title} · {n}` -- the title keeps its own accent
-    // (or warning) weight and the count is a separate, dim span, replacing
-    // the old single-span `{title} (n)` where the count read at the same
-    // weight as the title itself.
+    // Style title and count separately so warning weight does not color the count (#209).
     let title_spans: Vec<Span<'static>> = match spec.count {
         Some(n) => vec![
             Span::styled(spec.title.clone(), title_style),
@@ -4256,9 +3594,7 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     let inner_width = inner.width as usize;
 
     let mut lines: Vec<Line> = Vec::new();
-    // Phase 4: the pinned query line, drawn before the viewport and counted
-    // by `list_dialog_layout` so the row rects below it are the rects a
-    // click is tested against.
+    // Draw the query before list rows using the same layout rects hit testing uses.
     if let Some(query) = &spec.input
         && geom.input_rows > 0
     {
@@ -4307,14 +3643,7 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
                     .iter()
                     .map(|s| style::display_width(s.content.as_ref()))
                     .sum();
-                // Bug fix (issue #209/v3 §B): the same defect as the
-                // sidebar's selected row (see `render_sidebar`'s own doc
-                // comment) -- patching REVERSED onto a span's own colour
-                // (the QuitConfirm spinner glyph, in practice) swapped that
-                // colour into the background and left the glyph rendered in
-                // the terminal's default foreground instead of reversing
-                // uniformly. Every span on the cursor row drops its own
-                // style and takes the same plain reversed one.
+                // Apply selected-row style without overwriting a span's warning color (#209).
                 let reversed_style = Style::default().add_modifier(Modifier::REVERSED);
                 let mut reversed: Vec<Span> = spans
                     .into_iter()
@@ -4338,16 +3667,7 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     while lines.len() < body_rows {
         lines.push(Line::from(""));
     }
-    // A3-3: the blank spacer only exists when the interior has room for it
-    // ABOVE the hint row -- exactly the `blank_h` [`list_dialog_layout`]
-    // reserves. On a one-row interior the layout puts the hints on that row;
-    // drawing a spacer first pushed them off the bottom, so every click on
-    // the only visible row resolved as a hint that was never on screen.
-    // A3-3: the blank spacer exists only when the interior has room for it
-    // ABOVE the hint row -- exactly the `blank_h` [`list_dialog_layout`]
-    // reserves. On a one-row interior the layout puts the hints on that very
-    // row; drawing a spacer first pushed them off the bottom, so a click on
-    // the only visible row resolved as a hint that was never on screen.
+    // Draw a blank spacer only when list layout reserved it, so hints and pointer rects stay aligned.
     if body_rows + 1 < inner.height as usize {
         lines.push(Line::from(""));
     }
@@ -4394,13 +3714,7 @@ pub enum ListMove {
     End,
 }
 
-/// Pure: the viewport move a key means for EVERY list dialog alike, or
-/// `None` when the key is that dialog's own business.
-///
-/// Deliberately only the paging keys: `j/k` and the arrows already move the
-/// caret inside each dialog's own reducer (and mean something else entirely
-/// in a compose buffer), while PageUp/PageDown/Home/End were unbound in
-/// every dialog before phase 3 and are pure viewport motion everywhere.
+/// Handle paging keys centrally for every list dialog; leave other keys to its reducer.
 pub fn list_page_move(key: KeyEvent) -> Option<ListMove> {
     match key.code {
         KeyCode::PageUp => Some(ListMove::PageUp),
@@ -4436,16 +3750,7 @@ pub fn list_scroll(len: usize, capacity: usize, cursor: usize, offset: usize) ->
     reveal_offset(len, capacity, cursor, offset)
 }
 
-/// Pure: the one place every list-shaped overlay's [`ListDialogSpec`] is
-/// built. `None` for an overlay that is not list-shaped at all -- Nudge's
-/// free-text prompt, and a mail/memory compose-or-edit buffer, which go
-/// through [`render_dialog`] instead.
-///
-/// Phase 3 exists because the spec is now needed TWICE per frame: once to
-/// draw the dialog, and once (through [`list_dialog_layout`], from
-/// [`frame_snapshot`]) to say where its rows and hints landed so a click can
-/// address them. Building it in one function is what keeps the drawn dialog
-/// and the clickable dialog the same dialog.
+/// Build list dialog specs centrally; return none for free-text overlays.
 pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'static>> {
     let cursor_of = |len: usize, cursor: usize| if len == 0 { None } else { Some(cursor) };
     match overlay {
@@ -4491,9 +3796,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
                 .collect(),
             cursor: cursor_of(view.items.len(), view.cursor),
             offset: view.offset,
-            // Issue #209/v3 §A5: shares `MAIL_FOOTER` with the help overlay's
-            // own "dialogs:" listing rather than a second, easily-drifting
-            // copy of the same four hints.
+            // Reuse the mail footer hints in help so the bindings cannot drift (#209).
             footer: MAIL_FOOTER,
             warn: false,
             empty_message: "(no mail)",
@@ -4537,12 +3840,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             empty_message: "(nothing to restore)",
             input: None,
         }),
-        // Issue #84: `draft.items` is already fully resolved
-        // (agent/tier/model), so this only ever formats and marks the cursor
-        // row -- no tier resolution or config reads happen here, matching
-        // this module's own no-I/O contract. The swap's target pane goes in
-        // the title rather than a trailing body row, so it stays visible even
-        // once the item list scrolls.
+        // Format already-resolved handover choices without rereading config (#84).
         Overlay::Handover(draft) => Some(ListDialogSpec {
             title: format!("handover \u{2192} pane {}", draft.target_short),
             count: None,
@@ -4560,9 +3858,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             empty_message: "no enabled, ready harness available to swap to",
             input: None,
         }),
-        // Issue #354 phase 4: the palette and the help screen are one dialog
-        // over one table -- the only difference is whether Enter runs the
-        // selected row or just closes.
+        // Use one action-table dialog for palette and read-only help (#354).
         Overlay::Palette(view) => {
             let rows = view.rows();
             Some(ListDialogSpec {
@@ -4583,10 +3879,7 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
                 input: Some(view.query.clone()),
             })
         }
-        // Issue #354 phase 5: each entry carries its own repeat count and the
-        // age of its most recent repeat in the same dim trailing slot the
-        // context menu uses for a disable reason, and an acknowledged entry
-        // renders dim rather than disappearing.
+        // Show repeated error count and latest age in the list row (#354).
         Overlay::Errors(view) => Some(ListDialogSpec {
             title: "errors".to_string(),
             count: Some(view.items.len()),
@@ -4738,10 +4031,7 @@ pub fn render_center_message(f: &mut Frame, area: Rect, message: &str) {
     );
 }
 
-/// The smallest main rect that can host a dialog and have it read as one: a
-/// bordered box needs two columns and two rows of border before a single cell
-/// of text, and anything narrower than this is a box the operator cannot
-/// recognise as a modal.
+/// Require room for a border plus at least one text cell before drawing a dialog.
 const MIN_OVERLAY_COLS: u16 = 8;
 const MIN_OVERLAY_ROWS: u16 = 3;
 
@@ -4764,15 +4054,10 @@ fn overlay_area(frame: Rect, main: Rect) -> Rect {
     }
 }
 
-/// How wide the palette's own label column is before the chord starts.
-/// Every label in [`actions::ACTIONS`] fits inside it, which a test pins; a
-/// longer one simply pushes its chord one column right rather than
-/// overlapping it.
+/// Keep chord alignment within the label column; tests bound action labels to this width.
 const PALETTE_LABEL_COLS: usize = 16;
 
-/// Pure: one errors-dialog row (issue #354 phase 5). The `\u{d7}n` repeat
-/// count is part of the message itself -- it is the news -- while the age
-/// sits in the dim trailing slot; an acknowledged entry dims whole.
+/// Put repeat count in the error message and age in its dim trailing slot (#354).
 fn error_dialog_row(item: &ErrorItem) -> ListDialogRow {
     let repeats = if item.count > 1 {
         format!(" \u{d7}{}", item.count)
@@ -4813,9 +4098,7 @@ fn palette_dialog_row(row: &PaletteRow) -> ListDialogRow {
             reason: None,
             dim: true,
         },
-        // Review of cc92a56 (finding 1): drawn exactly like an action row so
-        // the listing keeps one shape, but dim and with no reason -- it is
-        // documentation, not a disabled binding.
+        // Render informational notes dim and non-activatable, without a disabled reason.
         PaletteRow::Note { label, chord } => {
             let pad = PALETTE_LABEL_COLS.saturating_sub(style::display_width(label));
             ListDialogRow {
@@ -4852,9 +4135,7 @@ const QUIT_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "quit and shut down"), ("esc
 const MAIL_FOOTER: &[(&str, &str)] = &[
     ("\u{23ce}", "read+consume"),
     ("c", "compose"),
-    // Issue #209/v3 §A5: `j/k` already moved the cursor (shared with every
-    // other list dialog's up/down handling); this only documents it, per
-    // the approved mock's footer.
+    // Document j/k navigation in the mail dialog footer (#209).
     ("j/k", "move"),
     ("esc", "close"),
 ];
@@ -4870,17 +4151,13 @@ const RESTORE_FOOTER: &[(&str, &str)] = &[
     ("esc", "skip"),
 ];
 const HANDOVER_FOOTER: &[(&str, &str)] = &[("\u{23ce}", "swap"), ("esc", "cancel")];
-/// Issue #354 phase 5: `a` acknowledges in place (the entries stay, dimmed,
-/// and the sticky header line clears); `esc`/`enter`/`q` acknowledge and
-/// close, which is what an operator who has read the list has done.
+/// Acknowledge errors in place on a, or acknowledge and close on Esc, Enter or q (#354).
 const ERRORS_FOOTER: &[(&str, &str)] =
     &[("j/k", "scroll"), ("a", "acknowledge"), ("esc/q", "close")];
 /// Click affordance follow-up: the JEV errors dialog's own keys -- read-only
 /// history, so there is nothing to acknowledge, just scroll and close.
 const JEV_ERRORS_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc/q", "close")];
-/// Issue #354 phase 3: the context menu's own keys. `esc` says `back`
-/// rather than `close` because that is what it does -- the previously
-/// focused pane keeps the keyboard, and nothing about the row changed.
+/// Use back for menu Esc because it returns input to the previously focused pane (#354).
 const MENU_FOOTER: &[(&str, &str)] = &[
     ("\u{23ce}", "do"),
     ("esc", "back"),
@@ -4889,11 +4166,7 @@ const MENU_FOOTER: &[(&str, &str)] = &[
 ];
 const INSPECTOR_FOOTER: &[(&str, &str)] = &[("j/k", "scroll"), ("esc", "back")];
 
-/// Issue #354 phase 4. The palette runs what the caret is on; the help
-/// screen is the same list read-only, so its Enter closes instead. Both say
-/// outright that typing filters -- the one thing an operator cannot guess
-/// from a list of rows, and finding F08's whole complaint about the old
-/// static help screen.
+/// Palette Enter runs its row; help Enter closes the read-only listing (#354).
 const PALETTE_FOOTER: &[(&str, &str)] = &[
     ("\u{23ce}", "run"),
     ("esc", "close"),
@@ -4911,9 +4184,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, overlay: &Overlay, tick: usize)
     // frame with no cells at all leaves nothing to draw into, and
     // `render_dialog`/`render_list_dialog`'s own guards cover that.
     let area = overlay_area(f.area(), area);
-    // Phase 3: every list-shaped overlay goes through the one shared
-    // scrollable viewport, built from the one shared spec factory -- which
-    // is also what `frame_snapshot` hit-tests against.
+    // Use one scrollable list spec for drawing and hit testing so row coordinates agree.
     if let Some(spec) = list_spec_for(overlay, tick) {
         render_list_dialog(f, area, &spec);
         return;

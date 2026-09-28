@@ -1,33 +1,9 @@
 //! The dashboard's link to the persistent runtime (issue #489, step N20; the
-//! ownership half of issue #352's "the dashboard is still its own PTY owner"
-//! residual).
+//! ownership half of issue #352).
 //!
-//! With `[session] persistent` on and a runtime listening, the terminals and
-//! the conversations belong to the SERVICE. This module is the one seam
-//! through which the dashboard reaches them: session facts, the attachment
-//! table, a rendered screen, and a native conversation's durable event cursor,
-//! all over the ordinary protocol v1 client. There is no second wire here, no
-//! private frame and no direct call into `session::host`.
-//!
-//! Two things are deliberately NOT here:
-//!
-//! - **Presentation.** Layout, focus, drafts, scroll and colour stay in the
-//!   dashboard, exactly as issue #489's item 4 requires; nothing in this
-//!   module reads or writes any of it, and no protocol method could.
-//! - **A pty.** [`RuntimeLink`] never opens a terminal, never spawns a child
-//!   and never files a registry record. That is the whole point: when the
-//!   runtime owns a session, the dashboard is a client of it.
-//!
-//! The ownership half is wired: `run_dashboard` asks this module whether the
-//! runtime already holds this repository's seat, and refuses to open a second
-//! terminal over it rather than becoming a competing supervisor. The RENDERING
-//! half -- painting a runtime-owned session inside a dashboard pane, through
-//! [`RuntimeLink::screen`] and [`RuntimeLink::events`] -- is step N11 (#480),
-//! which owns pane rendering and is being built in parallel. The transport is
-//! finished and tested here so that step is a pane change rather than a
-//! protocol change; `#![allow(dead_code)]` covers the methods it will call,
-//! the same reasoning `runtime/mod.rs` and `api/client.rs` already document
-//! for their own untouched-but-tested surfaces.
+//! The runtime owns persistent sessions; the dashboard reaches them through
+//! protocol v1 and must not open a competing PTY or registry record (#489).
+//! Presentation state stays in the dashboard.
 #![allow(dead_code)]
 
 use serde_json::json;
@@ -45,8 +21,7 @@ use super::super::state::StateDir;
 /// Who owns a session's terminal or conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
-    /// This process opens the pty and holds the registry record -- everything
-    /// the dashboard did before the persistent runtime existed.
+    /// This process opens the PTY and holds its registry record.
     Dashboard,
     /// The runtime service owns it; the dashboard is a protocol client.
     Runtime,
@@ -245,12 +220,8 @@ impl RuntimeLink {
         Ok(())
     }
 
-    /// Issue #490: the operator's answer to an approval a runtime-owned
-    /// conversation is blocked on. The decision is delivered to the session
-    /// that actually asked -- the dashboard never mints a grant of its own,
-    /// and `request_id` is the runtime's own identifier for the outstanding
-    /// request, so a stale dialog cannot answer a newer question. `note` is
-    /// the "tell the agent what to do differently" text a denial carries.
+    /// Route an approval answer by the runtime's request ID so a stale dialog
+    /// cannot answer a newer request; a denial may carry a note (#490).
     pub fn approve(
         &mut self,
         session_id: &str,
