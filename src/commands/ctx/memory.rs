@@ -521,7 +521,7 @@ pub(crate) struct ScopedEntry<'a> {
 /// symlink at either level pointing anywhere on the filesystem; following it
 /// would read (and, once a later task adds writes, write) outside the
 /// repository the operator thinks they are trusting -- the same escape
-/// `optimize.rs`'s `nested_claude_files` refuses for `CLAUDE.md` discovery.
+/// `surface_collect.rs`'s `nested_claude_files` refuses for `CLAUDE.md` discovery.
 /// `None` reads the same as "does not exist" to every caller here
 /// (`read_entries`'s own `!dir.is_dir()` short circuit), so an unsafe
 /// location is silently treated as an empty bank rather than an error. This
@@ -6028,7 +6028,7 @@ This is part of the body too.\n";
     /// A repository checkout can commit a symlink at `.zirv` pointing
     /// anywhere on the filesystem. Following it would treat an arbitrary
     /// directory elsewhere on this machine as this repo's shared memory --
-    /// the same escape `optimize.rs`'s `nested_claude_files` refuses for
+    /// the same escape `surface_collect.rs`'s `nested_claude_files` refuses for
     /// `CLAUDE.md` discovery.
     #[cfg(unix)]
     #[test]

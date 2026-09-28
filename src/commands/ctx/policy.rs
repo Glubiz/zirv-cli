@@ -374,7 +374,7 @@ impl EffectivePolicy {
     }
 
     /// The failed-config-load fallback (`config::degrade_to_operator_only`,
-    /// used by `optimize.rs`/`hook.rs`): full **Deny** on every capability.
+    /// used by `surface_collect.rs`/`hook.rs`): full **Deny** on every capability.
     /// `EffectivePolicy::default()` (all `Allow`) is the right answer to "no
     /// `[policy]` table was ever written" -- it is the literal truth about an
     /// operator who never opted in. It is the wrong answer to "the config

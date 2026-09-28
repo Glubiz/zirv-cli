@@ -1,15 +1,15 @@
 //! Deterministic drift detection across instruction surfaces (issue #42):
 //! duplicate, contradiction, and precedence/shadowing findings between
 //! zirv's canonical `.zirv/context/` layer (issue #41, `context.rs`) and
-//! every native CLAUDE.md/AGENTS.md surface `optimize::collect_surfaces`
+//! every native CLAUDE.md/AGENTS.md surface `surface_collect::collect_surfaces`
 //! already collects.
 //!
-//! Built entirely on `optimize.rs`'s existing normalization
-//! (`optimize::normalize`/`optimize::statements`, via the shared
-//! `optimize::all_instructions`/`group_by_normalized` helpers `lint_redundancy`
+//! Built entirely on `surface_collect.rs`'s existing normalization
+//! (`surface_collect::normalize`/`surface_collect::statements`, via the shared
+//! `surface_collect::all_instructions`/`group_by_normalized` helpers `lint_redundancy`
 //! also uses) -- lexical/structural only, no model call, in keeping with
 //! issue #42's "prefer deterministic lexical/structural analysis first".
-//! Report-only, the same guarantee `optimize.rs` itself carries: `analyze`
+//! Report-only, the same guarantee `surface_collect.rs` itself carries: `analyze`
 //! takes already-collected `Surface` text and returns `Finding`s only, with
 //! no filesystem write path anywhere in this module for a caller to
 //! accidentally reach.
@@ -38,15 +38,15 @@
 //! too) before either side's token set is built or intersected, and total
 //! emitted pair-findings are capped (`MAX_PAIR_FINDINGS`) with an explicit
 //! truncation note rather than growing unbounded or truncating silently.
-//! `optimize.rs` already bounds the input (`MAX_SURFACES`,
+//! `surface_collect.rs` already bounds the input (`MAX_SURFACES`,
 //! `cfg.optimize.max_surface_bytes`), which is the scope this module
 //! inherits rather than adding its own surface-count cap.
 
 use std::collections::BTreeSet;
 
 use super::context;
-use super::optimize::{self, Finding, Instruction, Layer, Severity, Surface};
 use super::surface::Provider;
+use super::surface_collect::{self, Finding, Instruction, Layer, Severity, Surface};
 
 /// Above this Jaccard token-overlap ratio, two cross-surface instructions are
 /// treated as the same rule in different words. A deliberately conservative
@@ -126,7 +126,7 @@ fn shares_provider_or_canonical(surfaces: &[Surface], a: &Instruction, b: &Instr
 }
 
 /// Every finding this module can produce, over already-collected surfaces.
-/// `surfaces` is normally `optimize::collect_surfaces`'s own output --
+/// `surfaces` is normally `surface_collect::collect_surfaces`'s own output --
 /// canonical and native surfaces mixed, exactly as issue #42 asks for.
 // `zirv context status` (issue #46, `context_status.rs`) is the production
 // consumer, for duplicate/conflict counts.
@@ -144,8 +144,8 @@ pub fn analyze(surfaces: &[Surface]) -> Vec<Finding> {
 /// Additionally reports precedence/shadowing whenever a group's layers span
 /// more than one `context::PrecedenceTier`.
 fn duplicate_findings(surfaces: &[Surface]) -> Vec<Finding> {
-    let all = optimize::all_instructions(surfaces);
-    let (order, groups) = optimize::group_by_normalized(&all);
+    let all = surface_collect::all_instructions(surfaces);
+    let (order, groups) = surface_collect::group_by_normalized(&all);
 
     let mut findings = Vec::new();
     for key in order {
@@ -159,7 +159,7 @@ fn duplicate_findings(surfaces: &[Surface]) -> Vec<Finding> {
         let evidence: Vec<String> = group
             .iter()
             .copied()
-            .map(|i| optimize::evidence_ref(&surfaces[i.surface], i.line))
+            .map(|i| surface_collect::evidence_ref(&surfaces[i.surface], i.line))
             .collect();
         let text = &group[0].text;
 
@@ -219,7 +219,7 @@ fn duplicate_findings(surfaces: &[Surface]) -> Vec<Finding> {
                 evidence,
                 detail: format!(
                     "{} ({}) takes precedence over the other copy of this rule.",
-                    optimize::evidence_ref(&surfaces[winner.surface], winner.line),
+                    surface_collect::evidence_ref(&surfaces[winner.surface], winner.line),
                     winner_tier.label()
                 ),
                 proposed_diff: None,
@@ -246,7 +246,7 @@ struct Profile<'a> {
 /// otherwise a same-meaning-different-harness pair is expected divergence,
 /// not a bug (`"differs-per-harness"`) -- see the module doc.
 fn near_duplicate_and_contradiction_findings(surfaces: &[Surface]) -> Vec<Finding> {
-    let all = optimize::all_instructions(surfaces);
+    let all = surface_collect::all_instructions(surfaces);
     let profiles: Vec<Profile> = all
         .iter()
         .map(|instruction| Profile {
@@ -295,8 +295,8 @@ fn near_duplicate_and_contradiction_findings(surfaces: &[Surface]) -> Vec<Findin
             }
 
             let evidence = vec![
-                optimize::evidence_ref(&surfaces[a.instruction.surface], a.instruction.line),
-                optimize::evidence_ref(&surfaces[b.instruction.surface], b.instruction.line),
+                surface_collect::evidence_ref(&surfaces[a.instruction.surface], a.instruction.line),
+                surface_collect::evidence_ref(&surfaces[b.instruction.surface], b.instruction.line),
             ];
             let is_contradiction = a.negation != b.negation;
             let (a_text, b_text) = (&a.instruction.text, &b.instruction.text);

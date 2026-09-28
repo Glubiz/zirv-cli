@@ -1,7 +1,7 @@
 //! The canonical `.zirv/context/` instruction layer (issue #41): one place a
 //! project's AI working instructions live once for every Zirv-launched
 //! harness, with optional harness-specific additions layered on top.
-//! `super::optimize::collect_surfaces` reads it through `Layer::ContextCommon`/
+//! `super::surface_collect::collect_surfaces` reads it through `Layer::ContextCommon`/
 //! `ContextClaude`/`ContextCodex`; this module owns the file locations and
 //! the deterministic precedence rule between this layer and the native
 //! instruction files (CLAUDE.md/AGENTS.md) it coexists with.
@@ -14,7 +14,7 @@
 //! `remember`/handoff-harvest and recalled by key. Neither is a substitute
 //! for the other -- a `.zirv/context/common.md` rule does not belong in the
 //! memory bank, and a memory fact (e.g. "the staging DB migration needs a
-//! manual grant") does not belong in `common.md`. `optimize.rs`'s own N7
+//! manual grant") does not belong in `common.md`. `surface_collect.rs`'s own N7
 //! boundary (a memory key/body never reaches the judgment model) protects
 //! the same split from the opposite direction: this layer's whole point is
 //! to be read and analysed as instructions, memory's whole point is that it
@@ -31,8 +31,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::optimize::{self, Layer, Surface};
 use super::surface;
+use super::surface_collect::{self, Layer, Surface};
 
 /// The subdirectory holding zirv's own canonical instruction layer.
 pub const CONTEXT_DIR: &str = ".zirv/context";
@@ -94,7 +94,7 @@ impl PrecedenceTier {
 /// policy surfaces are a different dimension entirely -- see `Layer::kind`
 /// and `Layer::is_settings`). Every `Instructions` layer has an opinion here;
 /// `every_instructions_layer_has_a_defined_tier` (below) iterates
-/// `optimize::ALL_LAYERS` rather than a hand-picked subset, so a future
+/// `surface_collect::ALL_LAYERS` rather than a hand-picked subset, so a future
 /// `Instructions`-kind variant added here without a matching arm fails that
 /// test instead of silently falling through the wildcard below.
 pub fn precedence_tier(layer: Layer) -> Option<PrecedenceTier> {
@@ -155,7 +155,7 @@ fn is_singular_agent_md(layer: Layer) -> bool {
 /// group; every other candidate in that group is `Shadowed` by the winner,
 /// unless it is provably the same content (`Duplicate`) or could not be read
 /// as trusted content at all (`Excluded`). Nothing collected is ever dropped
-/// from a `Vec<Resolved>` -- every surface and every `optimize::Exclusion`
+/// from a `Vec<Resolved>` -- every surface and every `surface_collect::Exclusion`
 /// gets exactly one entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -200,7 +200,7 @@ impl Decision {
 
 /// One surface's (or exclusion's) resolution, as `resolve_instruction_
 /// winners` reports it. `path` is the join key back to the caller's own
-/// `optimize::Surface`/`optimize::Exclusion` list -- there is no shared
+/// `surface_collect::Surface`/`surface_collect::Exclusion` list -- there is no shared
 /// numeric index between the two collections this function reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
@@ -362,7 +362,7 @@ fn resolve_import_chain(
 ) -> Option<ImportResolution> {
     let dir = start.path.parent()?;
     let target_str = parse_lone_import(&start.text)?;
-    let mut current = optimize::normalize_lexically(dir, Path::new(&target_str));
+    let mut current = surface_collect::normalize_lexically(dir, Path::new(&target_str));
     let mut visited: Vec<PathBuf> = vec![start.path.clone()];
 
     for _ in 0..MAX_IMPORT_DEPTH {
@@ -385,7 +385,8 @@ fn resolve_import_chain(
                     let Some(next_dir) = next.path.parent() else {
                         return Some(ImportResolution::Resolves(next.path.clone()));
                     };
-                    current = optimize::normalize_lexically(next_dir, Path::new(&next_target));
+                    current =
+                        surface_collect::normalize_lexically(next_dir, Path::new(&next_target));
                 }
                 None => return Some(ImportResolution::Resolves(next.path.clone())),
             },
@@ -399,7 +400,7 @@ fn resolve_import_chain(
 }
 
 /// Resolves same-directory precedence among every collected instruction
-/// surface and every refused candidate (`optimize::Exclusion`), per issue
+/// surface and every refused candidate (`surface_collect::Exclusion`), per issue
 /// #538's file-and-precedence contract: within a (scope, logical directory)
 /// group, the lowest `within_tier_rank` wins (`Included`); every other
 /// member is `Shadowed` by the winner unless it is provably the same content
@@ -414,7 +415,7 @@ fn resolve_import_chain(
 /// is already in `surfaces`/`exclusions`, both collected by the caller.
 pub fn resolve_instruction_winners(
     surfaces: &[Surface],
-    exclusions: &[optimize::Exclusion],
+    exclusions: &[surface_collect::Exclusion],
     repo: &Path,
     home: Option<&Path>,
 ) -> Vec<Resolved> {
@@ -569,8 +570,8 @@ pub fn resolve_instruction_winners(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::ctx::optimize::ALL_LAYERS;
     use crate::commands::ctx::surface::{Kind, Trust};
+    use crate::commands::ctx::surface_collect::ALL_LAYERS;
 
     #[test]
     fn precedence_ranks_canonical_common_below_harness_specific_below_native() {
@@ -588,7 +589,7 @@ mod tests {
         assert!(PrecedenceTier::NativeRepo < PrecedenceTier::NativeNested);
     }
 
-    /// Iterates every `Layer` variant (`optimize::ALL_LAYERS`) rather than a
+    /// Iterates every `Layer` variant (`surface_collect::ALL_LAYERS`) rather than a
     /// hand-picked subset, so a future `Instructions`-kind variant added
     /// without a matching `precedence_tier` arm fails this test instead of
     /// silently falling through that function's wildcard arm (fix round 1,
@@ -896,13 +897,13 @@ mod tests {
             "rules",
         )];
         let exclusions = vec![
-            optimize::Exclusion {
+            surface_collect::Exclusion {
                 layer: Layer::RepoClaudeMd,
                 path: repo.join("CLAUDE.md"),
                 reason: "symlinked instruction file",
                 symlink_target: Some(repo.join("AGENTS.md")),
             },
-            optimize::Exclusion {
+            surface_collect::Exclusion {
                 layer: Layer::RepoZirvMd,
                 path: repo.join("ZIRV.md"),
                 reason: "symlinked instruction file",

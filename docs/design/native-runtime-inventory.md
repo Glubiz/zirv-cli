@@ -250,7 +250,7 @@ installed binary during self-update; never spawns it).
 | Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |
 | Auto-spawn on workflow gate transition | `src/commands/workflow/engine/cli.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
-| `ctx optimize` judgment call | `src/commands/ctx/optimize.rs` | `run_with` | N15 (#484) |  |
+| `ctx optimize` judgment call | `src/commands/ctx/surface_collect.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
 | Harness proxy helper-model intake | `src/commands/ctx/proxy/llm.rs` | `decide` | N15 (#484) | second decider in the proxy's chain: calls `handoff::helper_answer(helper::ROLE_PROXY, ..)`, the same native-first (`helper.rs`) / harness-second (`handoff::run_model`) chokepoint `ctx ask`/`ctx optimize` already reuse |
 | Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec.rs/wrap.rs restart and session-end seams |
@@ -259,7 +259,7 @@ installed binary during self-update; never spawns it).
 | Autoresearch proposer spawn | `src/commands/workflow/research/proposer.rs` | `production_proposer_argv` | harness-backend | issue #802: builds the self-recursion argv (`current_exe agent <harness> "<prompt>" -- --model <model>`) for the optional `[proposer]` round's production spawn; `spawn_and_validate_proposal` is the actual `Command::new`/`.output()` call, and tests substitute a portable stub argv there instead of this function |
 
 Beyond the starter set given in this issue, this pass added: `src/commands/
-ctx/ask.rs` (`run_model`), `src/commands/ctx/optimize.rs` (`run_with`),
+ctx/ask.rs` (`run_model`), `src/commands/ctx/surface_collect.rs` (`run_with`),
 `src/commands/ctx/memory.rs` (`harvest_durable_with_tool_errors`),
 `src/commands/ctx/memory_optimize.rs` (`apply_consolidation`),
 `src/commands/ctx/run_loop.rs`'s second call site (`evaluate_objective_

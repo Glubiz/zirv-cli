@@ -68,7 +68,7 @@ use super::context_lint;
 use super::context_status::{self, StatusArgs};
 use super::prompt;
 use super::state::{self, StateDir};
-use super::{context, drift, optimize};
+use super::{context, drift, surface_collect};
 
 /// A generated compatibility file's first line: stable across every
 /// regeneration (no timestamp, no session-specific detail -- either would
@@ -107,7 +107,7 @@ pub fn is_managed(text: &str) -> bool {
 /// run_with`, this module's own `run_report`) still pass the UNFILTERED
 /// `surfaces` to their own surfaces listing, so sizes/budgets are unaffected
 /// -- only what `drift::analyze` gets to compare narrows.
-pub fn surfaces_for_drift(surfaces: &[optimize::Surface]) -> Vec<optimize::Surface> {
+pub fn surfaces_for_drift(surfaces: &[surface_collect::Surface]) -> Vec<surface_collect::Surface> {
     surfaces
         .iter()
         .filter(|surface| !is_managed(&surface.text))
@@ -117,7 +117,7 @@ pub fn surfaces_for_drift(surfaces: &[optimize::Surface]) -> Vec<optimize::Surfa
 
 /// `<repo>/CLAUDE.md` -- Claude's own native instruction file, read by Claude
 /// Code directly regardless of whether zirv is involved at all. Same fixed
-/// path `optimize::collect_surfaces` reads for `Layer::RepoClaudeMd`; not
+/// path `surface_collect::collect_surfaces` reads for `Layer::RepoClaudeMd`; not
 /// reused directly from there because this module needs the bare path, not a
 /// `Surface`.
 fn native_claude_path(repo: &Path) -> PathBuf {
@@ -125,13 +125,13 @@ fn native_claude_path(repo: &Path) -> PathBuf {
 }
 
 /// `<repo>/AGENTS.md` -- Codex's own native instruction file. Same fixed path
-/// `optimize::collect_surfaces` reads for `Layer::RepoAgentsMd`.
+/// `surface_collect::collect_surfaces` reads for `Layer::RepoAgentsMd`.
 fn native_codex_path(repo: &Path) -> PathBuf {
     repo.join("AGENTS.md")
 }
 
 /// `<repo>/ZIRV.md` -- zirv's own native instruction file (issue #538). Same
-/// fixed root path `optimize::collect_surfaces` reads for `Layer::
+/// fixed root path `surface_collect::collect_surfaces` reads for `Layer::
 /// RepoZirvMd`'s root candidate.
 fn zirv_md_path(repo: &Path) -> PathBuf {
     repo.join("ZIRV.md")
@@ -450,7 +450,8 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
     }
 
     let home = crate::utils::home_dir().ok();
-    let surfaces = optimize::collect_surfaces(home.as_deref(), repo, REPORT_MAX_SURFACE_BYTES);
+    let surfaces =
+        surface_collect::collect_surfaces(home.as_deref(), repo, REPORT_MAX_SURFACE_BYTES);
     let findings = drift::analyze(&surfaces_for_drift(&surfaces));
     if findings.is_empty() {
         writeln!(

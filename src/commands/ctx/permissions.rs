@@ -1330,7 +1330,7 @@ fn absolute_repo_target(repo: &Path, cwd: &Path) -> PathBuf {
 /// directory (`<project-dir>/<session>/subagents/*.jsonl`, per this issue's
 /// own verified layout notes; claude only -- codex has no such concept, so
 /// this is a no-op for it) is pulled in alongside the match itself, mirroring
-/// how `optimize::newest_transcripts` already walks both levels together as
+/// how `surface_collect::newest_transcripts` already walks both levels together as
 /// one flat sample.
 fn session_transcripts(root: &Path, query: &str) -> Vec<PathBuf> {
     let mut matches: Vec<PathBuf> = Vec::new();
@@ -1626,7 +1626,7 @@ fn render_sources_section(files: &[PathBuf]) -> String {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         let project_dir =
-            super::optimize::project_dir_of(path).unwrap_or_else(|| "unknown".to_string());
+            super::surface_collect::project_dir_of(path).unwrap_or_else(|| "unknown".to_string());
         out.push_str(&format!("- session {session} -- project {project_dir}\n"));
     }
     out.push('\n');
@@ -1643,7 +1643,7 @@ pub fn run_audit<W: Write>(args: &AuditArgs, w: &mut W) -> CtxResult<i32> {
     } else {
         scoped_transcript_dirs(agent, args)
             .into_iter()
-            .flat_map(|dir| super::optimize::newest_transcripts(&dir, args.sessions))
+            .flat_map(|dir| super::surface_collect::newest_transcripts(&dir, args.sessions))
             .collect()
     };
     let report = audit_report(agent, &files);
@@ -1835,7 +1835,7 @@ pub fn run_compile<W: Write>(args: &CompileArgs, w: &mut W) -> CtxResult<i32> {
     let env = super::config::env_from_process();
     let agent = resolved_agent(args.agent, &env);
     let files = transcripts_root(agent)
-        .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
+        .map(|root| super::surface_collect::newest_transcripts(&root, args.sessions))
         .unwrap_or_default();
     let report = audit_report(agent, &files);
 
@@ -2073,7 +2073,7 @@ pub fn run<W: Write>(args: &PermissionsArgs, w: &mut W) -> CtxResult<i32> {
     }
 }
 
-/// Shared with `optimize.rs`'s friction pass (issue #132: "surface the same
+/// Shared with `surface_collect.rs`'s friction pass (issue #132: "surface the same
 /// summary in setup/optimization output when approval noise exceeds a
 /// documented threshold"): builds the audit for `agent` over `files` and
 /// returns it only when the noise is worth interrupting the operator about.
@@ -3002,7 +3002,7 @@ pub fn run_propose<W: Write>(args: &ProposeArgs, w: &mut W) -> CtxResult<i32> {
     let state = super::state::StateDir::resolve(&env)?;
     let agent = resolved_agent(args.agent, &env);
     let files = transcripts_root(agent)
-        .map(|root| super::optimize::newest_transcripts(&root, args.sessions))
+        .map(|root| super::surface_collect::newest_transcripts(&root, args.sessions))
         .unwrap_or_default();
     let log_records: Vec<SafetyDecisionRecord> = if matches!(agent, AuditAgent::Claude) {
         log::read_safety_decisions(&state)
@@ -6198,7 +6198,7 @@ mod tests {
         let default_scope = resolve_scope_dirs(&root, AuditAgent::Claude, None, false, &repo_a);
         let default_files: Vec<PathBuf> = default_scope
             .iter()
-            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .flat_map(|d| super::super::surface_collect::newest_transcripts(d, 10))
             .collect();
         assert_eq!(
             default_files,
@@ -6211,7 +6211,7 @@ mod tests {
             resolve_scope_dirs(&root, AuditAgent::Claude, Some(&repo_b), false, &repo_a);
         let repo_files: Vec<PathBuf> = repo_scope
             .iter()
-            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .flat_map(|d| super::super::surface_collect::newest_transcripts(d, 10))
             .collect();
         assert_eq!(
             repo_files,
@@ -6223,7 +6223,7 @@ mod tests {
         let all_scope = resolve_scope_dirs(&root, AuditAgent::Claude, None, true, &repo_a);
         let mut all_files: Vec<PathBuf> = all_scope
             .iter()
-            .flat_map(|d| super::super::optimize::newest_transcripts(d, 10))
+            .flat_map(|d| super::super::surface_collect::newest_transcripts(d, 10))
             .collect();
         all_files.sort();
         let mut expected = vec![dir_a.join("s1.jsonl"), dir_b.join("s2.jsonl")];

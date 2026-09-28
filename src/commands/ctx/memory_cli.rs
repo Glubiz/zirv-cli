@@ -308,7 +308,7 @@ fn scope_label(scope: MemoryScope) -> &'static str {
 }
 
 /// Reports one scope's line: `enabled, N entries, B bytes` or `disabled, N
-/// entries, B bytes` (body bytes only -- the same measure `optimize::
+/// entries, B bytes` (body bytes only -- the same measure `surface_collect::
 /// memory_bank_summary` uses, never header overhead). Counts and bytes are
 /// shown even when the scope is disabled -- disabling a scope must never
 /// hide what it holds, the same "must never trap data" rule `forget`/
@@ -785,7 +785,7 @@ pub fn run_verify<W: Write>(args: &VerifyArgs, w: &mut W) -> CtxResult<i32> {
 /// follows. Resolving an adapter is deferred
 /// until a consolidation pass is actually about to run, so a plain report
 /// (the common case) never fails just because no agent is configured or
-/// available -- mirrors `optimize::run_with`'s own graceful degradation
+/// available -- mirrors `surface_collect::run_with`'s own graceful degradation
 /// when an adapter cannot be resolved.
 pub fn run_optimize_with<W: Write>(
     args: &OptimizeArgs,
@@ -2376,7 +2376,7 @@ mod tests {
     }
 
     /// Every readable file under `root`, sorted, for a before/after
-    /// unchanged-tree assertion -- mirrors `optimize.rs`'s own private
+    /// unchanged-tree assertion -- mirrors `surface_collect.rs`'s own private
     /// `tree_snapshot` test helper (design decision 2's own precedent).
     fn tree_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
         let mut found = Vec::new();

@@ -1909,10 +1909,10 @@ fn render_report<W: Write>(
         }
     }
 
-    // N7: the memory bank's own summary line, reusing `optimize::
+    // N7: the memory bank's own summary line, reusing `surface_collect::
     // memory_bank_summary` (count, oldest age, staleness) rather than a
     // second reader of the same on-disk format.
-    let memory_summary = super::optimize::memory_bank_summary(
+    let memory_summary = super::surface_collect::memory_bank_summary(
         &state,
         &mail_slug,
         crate::commands::ctx::state::now_secs(),

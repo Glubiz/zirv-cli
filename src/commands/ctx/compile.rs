@@ -49,11 +49,11 @@ use serde::Serialize;
 
 use super::adapters::{self, AgentAdapter};
 use super::config::CtxConfig;
-use super::optimize::{self, Layer};
 use super::policy::{self, PolicyReport};
 use super::prompt::{self, ComposedPrompt, PromptRole, PromptSource};
 use super::state::StateDir;
 use super::surface::{ContextSurface, Trust};
+use super::surface_collect::{self, Layer};
 use super::{CtxResult, context, jev, memory, retrieval, task};
 
 /// `log::Decision::action` for a canonical context layer cut by its budget.
@@ -1397,7 +1397,7 @@ fn changed_repo_paths(repo: &Path) -> Vec<String> {
 }
 
 /// Which canonical harness-specific file (if any) applies to `adapter_name`,
-/// paired with the `optimize::Layer` variant that names its provider/kind/
+/// paired with the `surface_collect::Layer` variant that names its provider/kind/
 /// scope. `None` for an adapter this module has no canonical file for yet:
 /// such an adapter still gets the canonical common layer, just no
 /// harness-specific addition on top of it -- the same "optional, no file
@@ -1473,7 +1473,7 @@ fn context_layer_dedupe_pointer(native_file_name: &str) -> String {
 /// adapter with no such file, which then always injects. Same fixed paths
 /// `context_cli`'s own (private) `native_claude_path`/`native_codex_path`
 /// use; duplicated here rather than exposed across the module boundary,
-/// matching the precedent `optimize::collect_surfaces`'s `Layer::
+/// matching the precedent `surface_collect::collect_surfaces`'s `Layer::
 /// RepoClaudeMd`/`Layer::RepoAgentsMd` already set for this exact path pair.
 fn native_context_path(adapter_name: &str, repo: &Path) -> Option<PathBuf> {
     match adapter_name {
@@ -1713,7 +1713,8 @@ fn with_canonical_context_layer(
 
         if dedupe {
             skipped_bytes += raw_bytes;
-            let surface = optimize::Surface { layer, path, text }.context_surface(repo, home);
+            let surface =
+                surface_collect::Surface { layer, path, text }.context_surface(repo, home);
             let trust = surface.trust();
             provenance.push(ContextProvenance {
                 surface,
@@ -1754,10 +1755,10 @@ fn with_canonical_context_layer(
         let delivered_bytes = text.len();
         let display_path = path.display().to_string();
         // `Surface::context_surface` is the existing, already-tested
-        // provider/kind/scope-to-`ContextSurface` mapping `optimize.rs`
+        // provider/kind/scope-to-`ContextSurface` mapping `surface_collect.rs`
         // built for exactly this layer (issue #41/#39) -- reused here rather
         // than re-deriving the same mapping a second way.
-        let surface = optimize::Surface { layer, path, text }.context_surface(repo, home);
+        let surface = surface_collect::Surface { layer, path, text }.context_surface(repo, home);
         let trust = surface.trust();
         // Issue #272 design item 3: maps this layer's ALREADY-computed
         // `surface::Trust` (issue #41/#39's own provenance taxonomy) onto

@@ -67,7 +67,6 @@ pub mod native_worker;
 pub mod obfuscate;
 pub mod obfuscate_store;
 pub mod objective;
-pub mod optimize;
 pub mod output;
 pub(crate) mod output_diff;
 pub(crate) mod output_filters;
@@ -117,6 +116,7 @@ pub mod state;
 pub mod status;
 pub mod supervise;
 pub mod surface;
+pub mod surface_collect;
 pub mod task;
 /// Issue #485 (roadmap N16): the native team's roles, the operator-configured
 /// route each one spends, and the authority a role carries on its own.
@@ -630,7 +630,7 @@ pub enum CtxVerb {
     /// Report usage windows, or tee the statusline to record them.
     Usage(usage::UsageArgs),
     /// Analyse the configuration surfaces that steer every session.
-    Optimize(optimize::OptimizeArgs),
+    Optimize(surface_collect::OptimizeArgs),
     /// Audit, reveal or purge this repository's local sensitive-value vault.
     Obfuscate(obfuscate_store::ObfuscateArgs),
     /// Start an interactive orchestrator session on the resolved adapter.
@@ -861,7 +861,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Run(a) => output::run(a, &mut out),
         CtxVerb::Output(a) => output::run_output(a, &mut out),
         CtxVerb::Usage(a) => usage::run(a, &mut out),
-        CtxVerb::Optimize(a) => optimize::run(a, &mut out),
+        CtxVerb::Optimize(a) => surface_collect::run(a, &mut out),
         CtxVerb::Obfuscate(a) => obfuscate_store::run(a, &mut out),
         CtxVerb::Chat(a) => chat::run(a, &mut out),
         CtxVerb::Agent(a) => agent::run(a, &mut out),
@@ -958,7 +958,7 @@ mod tests {
     /// `ready()`, so its `for adapter in &not_ready` loop body has never
     /// once executed, and by the time this test runs the cache may already
     /// be warmed by an *earlier* test's own `CtxCli::try_parse_from` call
-    /// (this module has several, and so do `optimize.rs`/`usage.rs`), which
+    /// (this module has several, and so do `surface_collect.rs`/`usage.rs`), which
     /// a same-test PATH rig cannot retroactively change. Rigged directly
     /// against `adapters::readiness_note()` instead -- the exact function
     /// `ctx_about()` wraps and caches, so this is the same substance without

@@ -3,7 +3,7 @@
 //! ever starting one.
 //!
 //! **No session, no process, no network.** This module calls only pure or
-//! filesystem-reading functions: `optimize::collect_surfaces` (issues #39/
+//! filesystem-reading functions: `surface_collect::collect_surfaces` (issues #39/
 //! #40/#41), `drift::analyze` (issue #42), `compile::compile` (issue #44,
 //! which itself calls `policy::evaluate`, issue #43), `memory::render_for_
 //! prompt`/`prompt::memory_injection_summary`, `mail::list`, and `handoff::
@@ -58,12 +58,12 @@ use super::drift;
 use super::handoff;
 use super::mail;
 use super::memory;
-use super::optimize::{self, Finding, Layer, Severity, Surface};
 use super::prompt::{self, PromptRole};
 use super::resume;
 use super::state::{StateDir, now_secs, repo_slug};
 use super::surface as surface_mod;
 use super::surface::Kind;
+use super::surface_collect::{self, Finding, Layer, Severity, Surface};
 use crate::style::{self, Tone};
 
 /// Bold section-header line: the same "\ntitle text" shape this module's
@@ -248,7 +248,7 @@ fn render_surface_line<W: Write>(
 /// "Discovered instruction surfaces with byte counts and token estimates;
 /// canonical vs native/harness-specific split" -- one of the acceptance
 /// bullets, rendered directly. `surfaces` is sorted by path before rendering
-/// (determinism requirement): `optimize::collect_surfaces`'s own order is
+/// (determinism requirement): `surface_collect::collect_surfaces`'s own order is
 /// already deterministic, but sorting here makes that a property of this
 /// function rather than an assumption about its caller.
 fn render_instruction_surfaces<W: Write>(
@@ -991,8 +991,8 @@ pub fn run_with<W: Write>(
     )?;
 
     let surfaces =
-        optimize::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
-    let exclusions = optimize::collect_instruction_exclusions(
+        surface_collect::collect_surfaces(home.as_deref(), repo, cfg.optimize.max_surface_bytes);
+    let exclusions = surface_collect::collect_instruction_exclusions(
         home.as_deref(),
         repo,
         cfg.optimize.max_surface_bytes,
