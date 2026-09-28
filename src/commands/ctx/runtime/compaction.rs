@@ -446,7 +446,7 @@ pub fn render_covered(
             break;
         }
     }
-    truncate_chars(&out, limit)
+    truncate_bytes_ellipsis(&out, limit)
 }
 
 /// The deterministic, no-model summary. Always available: it needs no
@@ -585,7 +585,7 @@ pub fn distill(
         summary: DistilledSummary {
             source: DistilledSummary::ROUTE.to_string(),
             model: Some(response.model),
-            text: truncate_chars(&text, budget.max_input_chars),
+            text: truncate_bytes_ellipsis(&text, budget.max_input_chars),
             decisions: Vec::new(),
         },
         usage: response.usage,
@@ -929,7 +929,11 @@ fn latest_state(state: &ConversationState, tool_call: &super::journal::ToolCallI
         .unwrap_or_else(|| "prepared".to_string())
 }
 
-fn truncate_chars(text: &str, limit: usize) -> String {
+/// Truncates `text` to at most `limit` bytes on a char boundary, appending
+/// `…` when it does; renamed from `truncate_chars` (issue #797) since it
+/// caps bytes, not chars, and `handoff::truncate_chars` is a different,
+/// char-counting helper.
+fn truncate_bytes_ellipsis(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
