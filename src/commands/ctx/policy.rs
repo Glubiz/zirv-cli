@@ -1,65 +1,21 @@
 //! zirv's own canonical permissions policy, and the honest translation of it
 //! onto whatever the harness in front of it can actually enforce.
 //!
-//! The policy is stated **once**, in zirv's own vocabulary
-//! ([`EffectivePolicy`], one [`Stance`] per [`Capability`]), and never in a
-//! harness's. Each adapter then answers, per capability and requested stance,
-//! what it can actually deliver ([`AgentAdapter::policy_support`](super::
-//! adapters::AgentAdapter::policy_support) -> [`CapabilityDescriptor`]), and
-//! [`evaluate`] combines the two into a [`PolicyReport`] whose every line
-//! carries one of four honest states: enforced, degraded, unsupported, or
-//! operator-controlled.
+//! Adapters describe verified launch mechanisms; Markdown instructions remain advisory.
+//! Reports distinguish enforced, degraded, unsupported and operator-controlled stances.
 //!
-//! **Markdown instructions are advisory context, never enforcement.** That is
-//! not a comment here, it is the type system: there is no way to build a
-//! [`CapabilityOutcome`] claiming [`Support::Enforced`] from prompt text,
-//! because the only thing that produces an outcome is an adapter naming a
-//! verified per-run *mechanism* it pins on the launch itself.
-//! [`Support::Unsupported`]'s own label says "not enforced (advisory only)",
-//! so a rendered report cannot read as a promise either.
-//!
-//! ## Layering, and why it is not `ctx.toml`'s deep merge
-//!
-//! `CtxConfig`'s other sections are deep-merged (home file, then repo file,
-//! then env), with `REPO_FORBIDDEN` blocking the individual keys a checkout
-//! must not touch at all. Policy cannot use that shape: `REPO_FORBIDDEN` is
-//! all-or-nothing per key, and issue #43 requires a repo to be able to
-//! *narrow* policy while never widening it. So [`resolve`] folds the three
-//! layers the way `crate::settings`'s `[agents]` gate does -- a dedicated
-//! asymmetric fold rather than a merge:
-//!
+//! Repo layers may only narrow policy; operator environment overrides win outright (#43).
 //! ```text
 //! final(capability) = env(capability)                       if set
 //!                   else max(home(capability), repo(capability))
 //! ```
+//! `Stance` orders `Allow < Ask < Deny`, making `max` narrowing by construction.
+//! Network preserves absence separately; host allowlists reject repo widening (#727).
 //!
-//! [`Stance`] is ordered least-to-most restrictive, so `max` *is* narrowing:
-//! a repo may ratchet a stance stricter and can never loosen one, by
-//! construction rather than by a check that could be forgotten. The
-//! environment sits above the fold entirely and wins outright in both
-//! directions -- the same escape hatch, for the same reason, that
-//! `ZIRV_AGENT_<NAME>_ENABLED` gives an operator whose checkout disabled an
-//! agent they need.
-//!
-//! Deterministic and side-effect-free, like `rot.rs`: no clock, no
-//! filesystem, no process env reads (the env layer arrives as an
-//! `EnvLookup` closure the caller owns).
+//! Resolution and evaluation are pure, like `rot.rs`: no clock, no filesystem, no process
+//! env reads -- the env layer arrives as a caller-owned `EnvLookup` closure instead.
 
-// `resolve` has a production caller (`CtxConfig::load`); the evaluation half
-// -- [`evaluate`], [`PolicyReport`] and the descriptor vocabulary the adapters
-// answer with -- does not yet. Issue #43 deliberately splits building this
-// model from consuming it: the context compiler (issue #44) is what pins a
-// stance onto a launch, and `zirv ctx status` (issue #46) is what renders a
-// report. Every item below is exercised by this module's own tests in the
-// meantime, module-wide rather than per item because the whole evaluation
-// surface is in the same position, not a stray unused helper.
-//
-// The same compiler also composes the canonical `.zirv/context/` layer
-// (issue #41, `context.rs`) into a launch -- and that coupling matters here:
-// repo-owned canonical text can describe a permission stance in prose, but
-// describing is not enforcing, so #44 must never let canonical text cause a
-// launch to be reported as `Enforced`/`Degraded` for a capability this
-// module did not itself verify a mechanism for.
+// Canonical repo text is advisory; only verified adapter mechanisms may claim enforcement (#41, #43, #44, #46).
 #![allow(dead_code)]
 
 use super::CtxResult;
@@ -67,33 +23,24 @@ use super::adapters::AgentAdapter;
 use super::config::EnvLookup;
 use serde::{Deserialize, Serialize};
 
-/// One thing zirv's policy has an opinion about. Deliberately harness-neutral:
-/// these are the questions an operator asks ("may this session write outside
-/// the repo?"), not the flags any particular CLI happens to expose.
+/// Harness-neutral permissions, independent of any adapter's flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
-    /// Creating/modifying/deleting files inside the repository checkout.
     RepoFsWrite,
-    /// The same, anywhere else on the machine.
     OutsideRepoFsWrite,
-    /// Running shell commands at all.
     ShellExec,
-    /// Outbound network access from the session.
     Network,
-    /// How much the session may do unattended. `Allow` means approval prompts
-    /// may be bypassed, `Ask` that they must be requested, `Deny` that the
-    /// session must not attempt anything needing approval at all -- a
-    /// read-only session.
+    /// Unattended authority: `Allow` permits bypassing approval, `Ask` requires it,
+    /// `Deny` prohibits operations needing approval.
     Approval,
-    /// `git push`, and history-rewriting/destructive git operations.
+    /// Includes history rewrites and destructive operations, not only pushes.
     GitPushDestructive,
-    /// Which of the harness's own tools (including MCP servers) may run.
+    /// MCP servers share the harness tool gate.
     ToolAccess,
 }
 
 impl Capability {
-    /// Every capability, in the order a report renders them. The single place
-    /// the set is enumerated, so adding one does not mean hunting call sites.
+    /// One ordered capability list keeps every report's coverage and ordering consistent.
     pub const ALL: [Capability; 7] = [
         Capability::RepoFsWrite,
         Capability::OutsideRepoFsWrite,
@@ -117,10 +64,7 @@ impl Capability {
         }
     }
 
-    /// The operator-only override that sits above the home/repo fold. Not an
-    /// `ENV_MAP` entry: policy has its own fold (see the module doc), so its
-    /// env layer is applied by [`resolve`] rather than merged into the shared
-    /// config table.
+    /// Operator override applied by [`resolve`], outside the shared config merge.
     pub fn env_var(self) -> &'static str {
         match self {
             Capability::RepoFsWrite => "ZIRV_CTX_POLICY_REPO_FS_WRITE",
@@ -133,7 +77,6 @@ impl Capability {
         }
     }
 
-    /// Human-readable name for a rendered report.
     pub fn label(self) -> &'static str {
         match self {
             Capability::RepoFsWrite => "repository filesystem writes",
@@ -147,23 +90,15 @@ impl Capability {
     }
 }
 
-/// How restrictive zirv wants one capability to be. **Ordered**
-/// least-to-most restrictive: `Allow < Ask < Deny`, which is what makes
-/// narrowing expressible as `max` (see the module doc) rather than as a
-/// hand-written comparison per capability.
+/// Ordered `Allow < Ask < Deny` so `max` can only narrow permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stance {
-    /// zirv declares no restriction of its own. The harness's own defaults and
-    /// the operator's own harness settings decide -- which is why an `Allow`
-    /// stance always reports as [`Support::OperatorControlled`]: there is
-    /// nothing for zirv to enforce, and claiming otherwise would be a lie in
-    /// the permissive direction.
+    /// Imposes no zirv restriction; the harness and operator settings govern.
     #[default]
     Allow,
-    /// Permitted only with an explicit approval from the operator.
+    /// Approval must come explicitly from the operator.
     Ask,
-    /// Not permitted.
     Deny,
 }
 
@@ -186,13 +121,7 @@ impl Stance {
     }
 }
 
-/// One host `[policy] network_allowlist` may name (issue #727). Shared with
-/// the native execution broker's own `runtime::enforcement::NetworkScope`
-/// rather than duplicated -- the validating constructor
-/// (`NetworkTarget::new`) stays on `enforcement.rs` since it returns that
-/// module's own `BrokerError`; this struct itself is harness-neutral data,
-/// same as every other type in this module. `PartialOrd`/`Ord` are needed for
-/// `enforcement::NetworkScope::Only`'s `BTreeSet<NetworkTarget>`.
+/// Policy and the native broker share destination identity so their scope checks cannot diverge (#727).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "RawNetworkTarget")]
 pub struct NetworkTarget {
@@ -201,19 +130,8 @@ pub struct NetworkTarget {
     pub port: Option<u16>,
 }
 
-/// Deserialization staging shape for [`NetworkTarget`] (review round, issue
-/// #727): TOML/JSON give whatever `scheme`/`host`/`port` an author typed, and
-/// the raw derive would have stored them verbatim -- skipping the exact
-/// validation ([`NetworkTarget::new`], on `runtime::enforcement.rs`) every
-/// PROGRAMMATIC caller (native.rs, `runtime/tools/capability.rs`) already
-/// goes through. Routing `Deserialize` through `TryFrom` below closes that
-/// gap: a `[policy] network_allowlist` entry with a non-http(s) scheme or a
-/// host containing `/ \ @ \0` now hard-errors at parse time instead of
-/// silently becoming an unusable `NetworkTarget`, and `Example.COM.` now
-/// normalizes (lowercase, trailing dot stripped) the same way a programmatic
-/// caller's input would, so a repo layer naming the operator's own host back
-/// in a different case/trailing-dot spelling is still recognized as the same
-/// entry by [`resolve_network_allowlist`]'s `home.contains` check.
+/// Persisted targets must pass the constructor's scheme/host validation too.
+/// Normalize case and trailing dots so aliases cannot disagree in subset checks (#727).
 #[derive(Deserialize)]
 struct RawNetworkTarget {
     scheme: String,
@@ -230,64 +148,19 @@ impl TryFrom<RawNetworkTarget> for NetworkTarget {
     }
 }
 
-/// zirv's canonical policy: one [`Stance`] per [`Capability`], stated once and
-/// translated per harness rather than restated per harness.
-///
-/// Every field defaults to [`Stance::Allow`] -- "zirv declares no restriction
-/// of its own" -- which is the literal truth about zirv before an operator
-/// writes a `[policy]` table, and keeps a default install's behavior exactly
-/// what it was. An operator opts in by naming the stances they want; the
-/// report then says, per harness, which of them are real.
-///
-/// **`network` is the one deliberate exception (2026-08-26, codex approval-
-/// posture round; refined again in the same round's correction pass --
-/// see below).** Every other capability's `Allow` default means "zirv adds
-/// no argv, the harness's own native default governs" -- and every harness's
-/// own native default for the other six capabilities happens to already be
-/// permissive, so that reads as "no restriction". Network is different:
-/// codex's own native default under `--sandbox workspace-write` is *already
-/// closed* (verified: a real launch carries `network_access: false` with no
-/// zirv-added flag at all), so treating an unconfigured `network` the same
-/// as the other six (a plain `Stance` defaulting to `Allow`) would either
-/// widen codex's own native default the moment that mapping was wired up
-/// (if defaulted to `Allow`), or falsely claim zirv itself is denying
-/// network on every unconfigured install (if defaulted to `Stance::Deny` --
-/// this module's own [`evaluate`] would then render a "network: deny" row
-/// nobody asked for, because *codex's own default* is what is closed here,
-/// not a zirv-imposed restriction). `network` is therefore `Option<Stance>`,
-/// not a plain `Stance`: `None` means "no operator layer has ever named
-/// network at all", which [`Default`] gives for free (an `Option`'s own
-/// default), which [`resolve`] preserves as `None` when both layers are
-/// silent (`resolve_network`'s own doc comment), and which [`evaluate`]
-/// reads as "omit this row" rather than reporting a stance zirv never
-/// actually chose. `Some(stance)` means an operator layer did name one, and
-/// is reported exactly like any other capability from there.
-///
-/// `deny_unknown_fields`: a typo'd capability name hard-errors rather than
-/// silently leaving that capability at `Allow`, which is the failure mode a
-/// permissions surface can least afford.
-///
-/// **No longer `Copy`** (issue #727): `network_allowlist` is a `Vec`, so a
-/// caller that used to rely on an implicit copy now needs `.clone()` --
-/// `narrowed_by`'s own body is the one production case, fixed alongside this
-/// field's addition. Every other capability is still a plain `Stance`/
-/// `Option<Stance>`, both `Copy`, so this only costs the type itself the
-/// derive, not any per-field semantics.
+/// Ordinary capabilities default to `Allow` because an absent key must contribute no restriction.
+/// Unknown keys fail parsing so typos cannot silently widen permissions (#727).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub repo_fs_write: Stance,
     pub outside_repo_fs_write: Stance,
     pub shell_exec: Stance,
+    /// Absence must neither open Codex's closed native network default nor claim a zirv-imposed denial.
+    /// Keep `None` distinct from every explicit stance so evaluation can omit the unconfigured row.
     pub network: Option<Stance>,
-    /// Issue #727: host/port destinations the `Network` capability's own
-    /// `Stance` is further scoped to, when non-empty -- see the module doc's
-    /// "Layering" section for the fold (`resolve_network_allowlist`, home/
-    /// repo only, narrow-only, no env layer yet) and
-    /// `AgentAdapter::network_allowlist_support` for what an adapter can
-    /// honestly do with it. Empty (the default) means "no scoping beyond
-    /// `network` itself" -- today's behavior, unaffected by this field's
-    /// existence until an operator sets one.
+    /// Non-empty lists scope `network`; empty means no additional scope.
+    /// Home/repo resolution is narrow-only, with no environment override (#727).
     pub network_allowlist: Vec<NetworkTarget>,
     pub approval: Stance,
     pub git_push_destructive: Stance,
@@ -295,17 +168,8 @@ pub struct EffectivePolicy {
 }
 
 impl EffectivePolicy {
-    /// For `Network`, projects the `Option<Stance>` field down to a plain
-    /// `Stance` by treating "no operator layer ever named it" (`None`) as
-    /// `Deny` -- the same closed answer `resolve_network`'s own "both
-    /// layers silent" case produces, and what codex's own native default
-    /// already does with no zirv-added flag at all. This is a convenience
-    /// for callers that only need "what does zirv want to hold this
-    /// harness to" (the `PolicyReport::render` baseline loop, principally);
-    /// callers that need to tell "never configured" apart from "explicitly
-    /// denied" (`evaluate`, to decide whether to render a row at all) must
-    /// read `self.network` directly instead, which is why `evaluate` does
-    /// not call this method for `Network`.
+    /// Missing network policy answers conservatively as `Deny`; reporters must inspect `.network`
+    /// directly so absence never becomes a claim that zirv explicitly denied network.
     pub fn stance(&self, capability: Capability) -> Stance {
         match capability {
             Capability::RepoFsWrite => self.repo_fs_write,
@@ -318,13 +182,7 @@ impl EffectivePolicy {
         }
     }
 
-    /// No `Network` arm: `network`'s field type (`Option<Stance>`) cannot
-    /// yield a `&mut Stance`, and both callers below (`narrowed_by`'s fold,
-    /// `resolve`'s env-override loop) explicitly skip `Capability::Network`
-    /// and assign `.network` directly instead -- see each one's own doc
-    /// comment for why the ordinary per-capability mechanism is unsound for
-    /// this one field. Reachable only if a future caller adds `Network` to
-    /// one of those loops without also handling it specially first.
+    /// Callers must handle `Network` separately because its optional stance preserves absence.
     fn stance_mut(&mut self, capability: Capability) -> &mut Stance {
         match capability {
             Capability::RepoFsWrite => &mut self.repo_fs_write,
@@ -342,26 +200,10 @@ impl EffectivePolicy {
         }
     }
 
-    /// `self` narrowed by an untrusted layer: per capability, the stricter of
-    /// the two. A `narrower` value that is looser than `self` contributes
-    /// nothing -- there is no code path by which it could, since `max` cannot
-    /// return the smaller of two values. This is the whole privilege-widening
-    /// defense for the repo layer, and it is a property of `Stance`'s
-    /// ordering rather than a check a future edit could drop.
-    ///
-    /// **`Network` is excluded from this loop** (2026-08-26, correction
-    /// round): the proof above depends on `Stance::default()` (`Allow`)
-    /// being both a layer's "I said nothing" value AND the loosest value
-    /// the type can express, which is exactly the property `network`'s own
-    /// `Option<Stance>` deliberately breaks (see `resolve_network`'s own doc
-    /// comment). `.network` is left exactly as `self` had it here; `resolve`
-    /// always overwrites it afterward with `resolve_network`'s own answer,
-    /// so a caller of `narrowed_by` alone (rather than through `resolve`)
-    /// must not read the result's `.network` as meaningful.
+    /// Narrows ordinary stances by `max`; [`resolve`] must separately fold network and its allowlist.
+    /// `max` can never return the smaller of two stances, so this privilege-widening defense is a
+    /// property of `Stance`'s ordering, not a check a future edit could drop.
     pub fn narrowed_by(self, narrower: EffectivePolicy) -> EffectivePolicy {
-        // `.clone()`, not a move: `network_allowlist` (issue #727) is a `Vec`,
-        // which cost `EffectivePolicy` its `Copy` derive, and the loop below
-        // still reads `self` after this line.
         let mut out = self.clone();
         for capability in Capability::ALL {
             if capability == Capability::Network {
@@ -373,16 +215,7 @@ impl EffectivePolicy {
         out
     }
 
-    /// The failed-config-load fallback (`config::degrade_to_operator_only`,
-    /// used by `surface_collect.rs`/`hook.rs`): full **Deny** on every capability.
-    /// `EffectivePolicy::default()` (all `Allow`) is the right answer to "no
-    /// `[policy]` table was ever written" -- it is the literal truth about an
-    /// operator who never opted in. It is the wrong answer to "the config
-    /// could not be read at all" (malformed TOML, a forbidden repo key):
-    /// that is not an operator statement that no restriction is wanted, and
-    /// handing it the widest policy zirv can state is a fail-open on the one
-    /// surface this module exists to keep narrowing-only, now that issue #44
-    /// makes `cfg.policy` load-bearing (attached to every `CompiledContext`).
+    /// Config-load failure denies every capability; an unreadable policy must never become permissive (#44).
     pub fn fail_closed() -> Self {
         EffectivePolicy {
             repo_fs_write: Stance::Deny,
@@ -396,38 +229,20 @@ impl EffectivePolicy {
         }
     }
 
-    /// The stances zirv's own shipped INTERACTIVE projection actually
-    /// delivers, before any `[policy]` table narrows anything -- the spec's
-    /// own defaults table (`docs/superpowers/specs/2026-08-24-cross-harness-
-    /// permissions-design.md`), stated once so `PolicyReport::render` can
-    /// show an operator what an unconfigured interactive launch carries.
-    ///
-    /// Deliberately **not** `EffectivePolicy::default()`, and deliberately
-    /// **not** an input to [`resolve`]'s fold. `Default` means "zirv declares
-    /// no restriction of its own" and is what `narrowed_by`'s widening
-    /// defense rests on; folding this in instead would silently narrow every
-    /// headless launch too, and -- because the fold is a `max` -- would make
-    /// an operator's own `ZIRV_CTX_POLICY_OUTSIDE_REPO_FS_WRITE=allow`
-    /// unexpressible, since `max(Ask, Allow)` is `Ask`. This is a reported
-    /// baseline: it describes what the argv in
-    /// `ClaudeAdapter::default_sandbox_args` amounts to, and nothing decides
-    /// anything from it.
+    /// This is a report-only baseline: folding it into policy would restrict headless launches
+    /// and make some operator `Allow` overrides impossible under the narrowing `max`.
     pub fn interactive_baseline() -> Self {
         EffectivePolicy {
             // `Edit(./**)` is pre-approved on the allow list.
             repo_fs_write: Stance::Allow,
-            // Not pre-approved, so `--permission-mode default` prompts --
-            // where `dontAsk` used to kill the call outright.
+            // `--permission-mode default` prompts for writes outside the pre-approved repo.
             outside_repo_fs_write: Stance::Ask,
-            // Governed per command by `safety.rs`, which is the sole
-            // prompting gate on this posture: the allow set and every
-            // unclassified command run silently, the short ask set prompts,
-            // the deny set is refused by rule.
+            // `safety.rs` is the prompting gate: allowed and unclassified commands run silently;
+            // ask rules prompt and deny rules refuse.
             shell_exec: Stance::Ask,
             // `WebFetch`/`WebSearch` are pre-approved.
             network: Some(Stance::Allow),
-            // No allowlist ships by default -- wholesale `WebFetch` stays the
-            // baseline until an operator opts into scoping it (issue #727).
+            // Host scoping requires operator opt-in (#727).
             network_allowlist: Vec::new(),
             approval: Stance::Ask,
             // Force-push and history rewrites are in the built-in ask set.
@@ -437,38 +252,8 @@ impl EffectivePolicy {
     }
 }
 
-/// Resolves the three policy layers per the module doc's fold: `home`/`repo`
-/// are the `[policy]` tables lifted out of `~/.zirv/ctx.toml` and
-/// `<repo>/.zirv/ctx.toml` (either absent when that file has no `[policy]`
-/// section), and `env` is the operator override that sits above both.
-///
-/// The repo layer can only ever narrow; the environment wins outright in
-/// either direction. An unparseable stance -- in a file or an env var -- is a
-/// hard error rather than a silent fall back to `Allow`: quietly widening a
-/// permissions surface because a value was misspelled is the one outcome this
-/// module exists to prevent.
-///
-/// **`network` is folded separately (2026-08-26, correction round), never
-/// through `narrowed_by`'s ordinary `max`.** The six other capabilities all
-/// share one property `narrowed_by`'s safety proof depends on: `Stance::
-/// default()` (`Allow`) is both a layer's "I said nothing" value AND the
-/// loosest value the type can express, so a layer's silence is provably a
-/// no-op against the fold (`max(x, Allow) == x` always). `network`'s default
-/// answer is `Deny`, not `Allow` -- the loosest value in the type -- so
-/// reusing the same trick (an unmentioned key silently deserializing to
-/// `Stance::Deny` via `EffectivePolicy`'s own `Default`) breaks that proof:
-/// a repo layer that mentions nothing would contribute `Deny` for network
-/// exactly as if it had explicitly denied it, defeating an operator's own
-/// home-level `network = "allow"` even when the repo took no position at
-/// all. `resolve_network` below is the fix -- see its own doc comment.
-///
-/// **`network_allowlist` (issue #727) is folded a third way**, alongside
-/// `network`'s own special-case above: narrow-only, but as a hard error on a
-/// widening attempt rather than `narrowed_by`'s ordinary silent `max` -- see
-/// `resolve_network_allowlist`'s own doc comment. No environment layer yet:
-/// the operator escape hatch every other capability gets via `ZIRV_CTX_*` is
-/// deliberately out of scope for this pass (issue #727's v1), since nothing
-/// yet consumes the resolved list beyond `zirv ctx status`'s own report.
+/// Resolves home/repo narrowing plus operator env overrides; malformed stances hard-error.
+/// Network preserves absent keys; host allowlists reject repo widening and have no env override (#727).
 pub fn resolve(
     home: Option<toml::Value>,
     repo: Option<toml::Value>,
@@ -485,9 +270,6 @@ pub fn resolve(
     resolved.network_allowlist =
         resolve_network_allowlist(home_allowlist.unwrap_or_default(), repo_allowlist)?;
 
-    // `Network` is excluded from this loop and handled separately right
-    // below: its field is `Option<Stance>`, so `stance_mut` cannot name a
-    // `&mut Stance` slot for it (see that method's own doc comment).
     for capability in Capability::ALL {
         if capability == Capability::Network {
             continue;
@@ -528,19 +310,7 @@ fn parse_layer(layer: Option<toml::Value>, origin: &str) -> CtxResult<EffectiveP
         .map_err(|e| format!("{origin}: invalid [policy] section: {e}").into())
 }
 
-/// One `[policy]` layer's raw, unresolved opinion on `network` alone --
-/// `None` when the layer's table (or the whole layer) never mentions the key
-/// at all, distinct from an explicit `network = "allow"`/`"deny"`/`"ask"`.
-/// `EffectivePolicy`/`Stance` cannot carry this distinction (a bare `Stance`
-/// field always deserializes to *some* concrete value, `Stance::default()`
-/// when the key is absent -- see `resolve`'s own doc comment for why that
-/// collapse is exactly the bug this exists to avoid for `network`), so this
-/// is a second, narrow, `Option`-shaped deserialization of the SAME raw TOML
-/// value `parse_layer` already validates -- deliberately not the primary
-/// error path: a malformed layer already fails loudly through `parse_layer`
-/// (called right after this, in `resolve`, with the identical `origin`), so
-/// a parse failure here is either that same error about to be raised again
-/// or genuinely unreachable, never a chance to report something new.
+/// Preserves an absent `network` key so a silent repo cannot override the home stance.
 fn parse_network_layer(layer: &Option<toml::Value>, origin: &str) -> CtxResult<Option<Stance>> {
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -557,46 +327,8 @@ fn parse_network_layer(layer: &Option<toml::Value>, origin: &str) -> CtxResult<O
     Ok(parsed.network)
 }
 
-/// `network`'s own home/repo combination (2026-08-26, correction round;
-/// fixed again the same round -- see below), replacing the ordinary
-/// `narrowed_by` fold for this one field -- see `resolve`'s own doc comment
-/// for why the shared `max`-based mechanism is unsound here.
-///
-/// Returns `None` only when NEITHER layer ever names `network` at all: that
-/// is "no operator opinion exists", which [`EffectivePolicy::default`]
-/// itself now represents the same way, and which [`evaluate`] reads as
-/// "omit the row" rather than a stance zirv chose. The moment either layer
-/// names `network`, the answer is `Some` from there on -- narrowing is
-/// always still possible (a repo naming `ask`/`deny` can still tighten a
-/// silent or `allow` home), but the *distinctness* of `ask` from `deny` is
-/// preserved rather than collapsed, because both feed the same `max` as
-/// home does.
-///
-/// **The bug this fixes (2026-08-26): the previous version only special-
-/// cased `repo == Some(Deny)`, so a repo's explicit `network = "ask"`
-/// fell through to `home`'s own value untouched** -- silently dropping the
-/// repo's narrowing the moment home said `allow` (e.g. home `allow` + repo
-/// `ask` resolved to `Allow`, when the repo layer explicitly asked for no
-/// more than `Ask`). A repo may always narrow, regardless of which
-/// non-`Deny` stance it names; treating `deny` as the only narrowing value
-/// a repo can express was the defect. The fix folds both layers through the
-/// same `Stance` ordering the other six capabilities already use, with each
-/// layer's *own* silent-value substituted before the `max`:
-/// `max(home.unwrap_or(Deny), repo.unwrap_or(Allow))`.
-///
-/// - Home's silence substitutes `Deny` (the operator never opted in, so
-///   nothing pulls the result toward `Allow` on its behalf) -- this is what
-///   keeps "nobody said anything" (`None, None`) from ever landing on
-///   `Allow`, without needing a separate case for it below.
-/// - Repo's silence substitutes `Allow` (a repo that names nothing has no
-///   opinion, so it must never pull the result toward `Deny`/`Ask` on its
-///   own) -- this is what lets home's own explicit `allow` survive a silent
-///   repo (`max(Allow, Allow) == Allow`), which the previous version could
-///   only do by special-casing "home said something" as an unconditional
-///   win; here it falls out of the same formula every other case uses.
-/// - Repo explicitly naming `ask` or `deny` now narrows exactly like the
-///   six generically-folded capabilities do: `max` with home's value can
-///   only move toward the repo's stricter stance, never away from it.
+/// Both silent means `None`; otherwise home silence is `Deny` because the operator never opted in.
+/// Repo silence is neutral (`Allow`), but explicit `Ask` must still narrow home `Allow`.
 fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Option<Stance> {
     if home.is_none() && repo.is_none() {
         return None;
@@ -607,12 +339,7 @@ fn resolve_network(home: Option<Stance>, repo: Option<Stance>) -> Option<Stance>
     ))
 }
 
-/// One `[policy]` layer's raw, unresolved opinion on `network_allowlist`
-/// alone -- `None` when the layer never mentions the key, distinct from an
-/// explicit empty list, the same shape [`parse_network_layer`] uses for
-/// `network` itself and for the identical reason: [`resolve_network_
-/// allowlist`] needs to tell "this layer took no position" apart from
-/// "this layer explicitly named zero targets" before folding.
+/// Preserve absence separately: a silent repo must not erase the operator's allowlist.
 fn parse_network_allowlist_layer(
     layer: &Option<toml::Value>,
     origin: &str,
@@ -632,23 +359,8 @@ fn parse_network_allowlist_layer(
     Ok(parsed.network_allowlist)
 }
 
-/// `network_allowlist`'s own home/repo fold (issue #727) -- narrow-only, but
-/// NOT the silent `max`/subset-intersection every other list-shaped `[policy]`
-/// key in `config.rs` uses (e.g. `narrow_objective_gates`'s "drop whatever the
-/// repo did not also name"). A silent drop is right when a repo checkout's
-/// own opinion is *itself* untrusted data being filtered down to what the
-/// operator already trusted; here the individual VALUES are hostnames the
-/// repo chooses, so a host the operator never granted must fail loudly, the
-/// same as a mistyped `[policy]` stance does in [`resolve`] -- silently
-/// keeping only the intersection would let a compromised repo checkout name
-/// an extra destination and have it quietly vanish from the resolved policy
-/// with no signal that the repo layer overreached at all.
-///
-/// `repo: None` (the layer never mentions the key) keeps the operator's own
-/// list untouched. `repo: Some(list)` may name any subset of `home`,
-/// including the empty list (the repo narrowing the mechanism down to no
-/// scoped hosts at all is always safe); naming anything `home` did not is a
-/// hard error naming the offending host.
+/// A silent repo keeps home's allowlist; an explicit list must be a subset, including empty.
+/// Ungranted destinations hard-error so repo overreach cannot disappear in an intersection (#727).
 fn resolve_network_allowlist(
     home: Vec<NetworkTarget>,
     repo: Option<Vec<NetworkTarget>>,
@@ -668,35 +380,21 @@ fn resolve_network_allowlist(
     Ok(repo)
 }
 
-/// What zirv can honestly promise for one capability on one harness. There is
-/// deliberately no "probably" or "advisory" state that reads as enforcement:
-/// [`Unsupported`](Support::Unsupported) is what an adapter with only prompt
-/// text to offer must report.
+/// Enforcement claims require verified mechanisms; prompt-only support is [`Support::Unsupported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
-    /// zirv pins a verified per-run mechanism, and the harness enforces
-    /// exactly the requested stance.
+    /// A verified per-run mechanism enforces exactly the requested stance.
     Enforced,
-    /// zirv pins a verified mechanism that does not match the request exactly
-    /// -- it restricts something adjacent, broader or narrower -- so the
-    /// stance is only approximately carried. The `mechanism` string on the
-    /// descriptor says how it differs; a report must never round this up to
-    /// "enforced".
+    /// A verified mechanism only approximates the stance; the report must state the difference.
     Degraded,
-    /// No verified per-run mechanism at all. Prompt text can *ask* the session
-    /// to respect the stance, and prompt text is not enforcement.
+    /// No verified per-run mechanism; advisory prompt text is not enforcement.
     Unsupported,
-    /// The harness does enforce this, but from the operator's own settings
-    /// (`.claude/settings.json` permissions, `~/.codex/config.toml`), which
-    /// zirv reads and never rewrites. Also the answer for a [`Stance::Allow`]
-    /// capability, where zirv is imposing nothing in the first place.
+    /// Operator harness settings are read, never rewritten; `Allow` likewise imposes no zirv restriction.
     OperatorControlled,
 }
 
 impl Support {
-    /// Report wording. `Unsupported`'s own label states that it is not
-    /// enforced, so a rendered line cannot be misread as a guarantee even out
-    /// of context.
+    /// Labels must distinguish advisory text from enforcement even out of context.
     pub fn label(self) -> &'static str {
         match self {
             Support::Enforced => "enforced",
@@ -706,30 +404,17 @@ impl Support {
         }
     }
 
-    /// Whether the harness enforces *exactly* the requested stance, with
-    /// nothing left for prompt text or the operator's own settings to carry
-    /// instead. `Degraded` deliberately answers `false` here: a mechanism
-    /// that only approximates the request is real, but it is not the same
-    /// guarantee as `Enforced`, and a report must never treat the two alike
-    /// -- this is the predicate `PolicyReport::unenforced` keys off of. There
-    /// used to be a looser `is_enforced_by_zirv` (true for `Enforced` *or*
-    /// `Degraded`) that `unenforced` was built on; that looser question is
-    /// exactly what let a `Degraded` cell hide from a report as if it were
-    /// `Enforced`, so it was removed rather than kept alongside this one.
+    /// Only exact enforcement qualifies; degraded mechanisms must remain visible as gaps.
     pub fn is_fully_enforced(self) -> bool {
         matches!(self, Support::Enforced)
     }
 }
 
-/// One adapter's answer for one (capability, stance) pair: what it can
-/// deliver, and the verified mechanism it would deliver it with.
+/// Enforcement claims must name a verified mechanism so advisory prose cannot masquerade as a guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityDescriptor {
     pub support: Support,
-    /// The actual verified mechanism, named rather than paraphrased
-    /// (`"--disallowedTools=Write,Edit,Bash,NotebookEdit"`), or -- for the
-    /// three non-`Enforced` states -- why there is no matching one. Goes
-    /// straight into the report, so it is written to be read by an operator.
+    /// Operator-facing mechanism name, or the reason exact enforcement is unavailable.
     pub mechanism: &'static str,
 }
 
@@ -755,11 +440,7 @@ impl CapabilityDescriptor {
         }
     }
 
-    /// `Unsupported` with a specific reason -- for a capability/stance pair
-    /// where a mechanism exists but has been checked and ruled out (e.g. a
-    /// flag that scopes something adjacent, not the capability asked about),
-    /// as opposed to [`advisory_only`](Self::advisory_only)'s generic "no
-    /// mechanism at all" answer.
+    /// A checked-but-unsuitable mechanism needs its specific reason reported, not the generic advisory fallback.
     pub fn unsupported(mechanism: &'static str) -> Self {
         Self {
             support: Support::Unsupported,
@@ -767,10 +448,7 @@ impl CapabilityDescriptor {
         }
     }
 
-    /// The trait default, and the honest answer for any harness/capability
-    /// pair zirv has not verified a mechanism for. Named for what it leaves
-    /// behind: an instruction in the prompt, which no harness is obliged to
-    /// obey.
+    /// Default for unverified harness/capability pairs: prompt text supplies no enforcement guarantee.
     pub fn advisory_only() -> Self {
         Self::unsupported(
             "no verified per-run mechanism; prompt text is advisory context, not enforcement",
@@ -778,7 +456,6 @@ impl CapabilityDescriptor {
     }
 }
 
-/// One rendered row of a [`PolicyReport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapabilityOutcome {
     pub capability: Capability,
@@ -787,46 +464,26 @@ pub struct CapabilityOutcome {
     pub mechanism: &'static str,
 }
 
-/// Issue #230 item 3: one degraded/unsupported capability, shaped to travel
-/// off this process entirely -- into `zirv agent`'s own JSON result, a
-/// dashboard `SpawnAck`, or a report-back mail body -- so a session that
-/// spawned a worker with a real capability gap learns about it as structured
-/// data rather than only from the worker's own (possibly silent) prompt
-/// text. See [`PolicyReport::degraded_capabilities`], the only constructor.
+/// Structured gaps reach the delegator even when the worker never reports them (#230).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityWarning {
     /// [`Capability::label`] -- human-readable, not the `[policy]` key.
     pub capability: String,
-    /// The descriptor's own [`CapabilityDescriptor::mechanism`] text.
     pub mechanism: String,
-    /// The requested stance and what the harness actually delivers for it,
-    /// e.g. `"deny -- degraded (partially enforced)"`.
+    /// Requested stance and delivered support, e.g. `"deny -- degraded (partially enforced)"`.
     pub detail: String,
 }
 
-/// What one policy actually means on one harness, for one launch posture.
-/// Built only by [`evaluate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReport {
     pub adapter: &'static str,
-    /// Which posture this report describes. The same policy on the same
-    /// adapter genuinely means two different things (2026-08-24): an `Ask`
-    /// stance is a real prompt on an interactive launch and a fail-closed
-    /// refusal on a headless one, so a report that did not say which it was
-    /// describing was ambiguous by construction.
+    /// Disambiguates interactive approval prompts from headless fail-closed refusals.
     pub mode: super::adapters::LaunchMode,
     pub outcomes: Vec<CapabilityOutcome>,
 }
 
 impl PolicyReport {
-    /// Every stance zirv asked for that the harness does not fully hold to --
-    /// the lines an operator actually needs to see. This includes `Degraded`
-    /// (a real mechanism that only approximates the request), `Unsupported`
-    /// (only advisory prompt text) and `OperatorControlled` (only the
-    /// operator's own harness settings): none of these is the exact
-    /// guarantee `Enforced` is, so a report must never hide any of them.
-    /// [`partially_enforced`](Self::partially_enforced) narrows this to the
-    /// `Degraded` subset specifically.
+    /// Every non-exact outcome must remain visible; even degraded and operator-controlled stances lack zirv's guarantee.
     pub fn unenforced(&self) -> Vec<&CapabilityOutcome> {
         self.outcomes
             .iter()
@@ -836,11 +493,7 @@ impl PolicyReport {
             .collect()
     }
 
-    /// The subset of [`unenforced`](Self::unenforced) where zirv pins a real,
-    /// verified mechanism that only approximates the requested stance
-    /// (`Support::Degraded`) -- worth calling out on its own, since a
-    /// degraded pin is doing something, unlike `Unsupported` or
-    /// `OperatorControlled`.
+    /// Distinguish partial enforcement from mere advice: a degraded mechanism still imposes real restrictions.
     pub fn partially_enforced(&self) -> Vec<&CapabilityOutcome> {
         self.outcomes
             .iter()
@@ -848,23 +501,8 @@ impl PolicyReport {
             .collect()
     }
 
-    /// Issue #230 item 3: the capabilities THIS report says are actually
-    /// weaker than what the policy asked for, in the narrow sense a
-    /// DELEGATOR needs to hear about at spawn time -- `zirv agent`'s own
-    /// synchronous result, the dashboard's `SpawnAck`, and the report-back
-    /// mail payload all build their warning line from this one method, so
-    /// the three surfaces can never describe one launch's degradation
-    /// differently.
-    ///
-    /// Only [`Support::Degraded`] (a real mechanism that only approximates
-    /// the request) and [`Support::Unsupported`] (no verified mechanism at
-    /// all, prompt text only) count. Deliberately excludes `Enforced`
-    /// (nothing to warn about), `OperatorControlled` (either a
-    /// `Stance::Allow` capability zirv imposed nothing on, or a capability
-    /// only the operator's own harness settings govern -- neither is a
-    /// spawn-time GAP a delegator can act on the way it can act on a
-    /// degraded/unsupported one), and every capability `evaluate` omitted
-    /// entirely (an unconfigured `network`).
+    /// Warn delegators when a zirv enforcement promise is degraded or unsupported (#230).
+    /// Operator-owned settings and unconstrained `Allow` are not failed zirv enforcement promises.
     pub fn degraded_capabilities(&self) -> Vec<CapabilityWarning> {
         self.outcomes
             .iter()
@@ -892,10 +530,7 @@ impl PolicyReport {
                 outcome.mechanism
             ));
         }
-        // Only interactively: the headless baseline is `dontAsk`'s
-        // deny-by-omission, which the per-capability lines above already
-        // describe. Printing an "interactive baseline" under a headless
-        // report would be a claim about a launch this report is not about.
+        // Headless reports must not claim an interactive baseline; their rows describe deny-by-omission.
         if self.mode.is_interactive() {
             out.push_str("  shipped interactive baseline (before any [policy] table):\n");
             let baseline = EffectivePolicy::interactive_baseline();
@@ -911,28 +546,8 @@ impl PolicyReport {
     }
 }
 
-/// Translates one canonical policy onto one adapter, for one launch posture.
-/// Pure: it asks the adapter for descriptors and combines them, and neither
-/// side reads a clock, the filesystem or the environment.
-///
-/// A [`Stance::Allow`] capability is answered here rather than by the adapter:
-/// zirv is imposing nothing, so there is no mechanism to name and nothing an
-/// adapter could usefully say. That is also why every adapter's own
-/// `policy_support` may leave `Allow` to a catch-all arm -- it is never asked.
-///
-/// **`Network` renders no row at all when `policy.network` is `None`**
-/// (2026-08-26, correction round): `None` means no operator layer has ever
-/// named `network`, which is not a stance zirv chose to report -- unlike
-/// every other capability, whose `Stance::default()` (`Allow`) is itself a
-/// real, reportable answer ("operator-controlled, zirv imposes nothing").
-/// Before this, `EffectivePolicy::default()`'s own `network: Stance::Deny`
-/// meant an unconfigured install's report carried a "network: deny" line
-/// implying zirv itself was denying network, when the true state was "no
-/// opinion was ever expressed" -- codex's own native default happens to
-/// already be closed, with no zirv-added flag at all. This is why `Network`
-/// is handled here directly from `policy.network` rather than through the
-/// generic `policy.stance(capability)` call every other capability uses:
-/// `stance()` cannot express "omit this row", only a concrete `Stance`.
+/// Descriptor evaluation must stay free of clock, filesystem and environment reads.
+/// `Allow` imposes nothing; omit absent network so the report never claims an unconfigured denial.
 pub fn evaluate(
     policy: &EffectivePolicy,
     adapter: &dyn AgentAdapter,
@@ -946,16 +561,8 @@ pub fn evaluate(
             } else {
                 policy.stance(capability)
             };
-            // Issue #727: a non-empty `network_allowlist` gets its own
-            // descriptor path, ahead of the ordinary `Stance::Allow` catch-all
-            // right below -- the allowlist is a real (if `Degraded`) scoping
-            // mechanism an adapter may offer even when `network` itself is
-            // `Allow`/`Ask`, so it must not be swallowed by "zirv imposes
-            // nothing" the way an unconfigured `Allow` is. `Deny` is excluded
-            // deliberately: denying network outright leaves nothing for a
-            // host allowlist to scope. An empty allowlist never reaches this
-            // arm, so a launch with none configured renders identically to
-            // before this field existed.
+            // A non-empty allowlist needs its descriptor before the `Allow` catch-all;
+            // `Deny` already blocks all network and needs no host scoping (#727).
             let descriptor = if capability == Capability::Network
                 && stance != Stance::Deny
                 && !policy.network_allowlist.is_empty()
