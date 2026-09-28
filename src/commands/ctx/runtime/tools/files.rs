@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::persist_capture;
 use super::{CapturePayload, ToolError, ToolErrorCode};
 use crate::commands::ctx::output::CompactionScope;
 use crate::commands::ctx::state;
@@ -780,6 +781,29 @@ fn one() -> usize {
 
 fn default_results() -> usize {
     200
+}
+
+impl super::NativeToolClient {
+    pub(super) fn finish_file(&self, mut outcome: FileOutcome) -> Result<Value, ToolError> {
+        if let Some(capture) = outcome.capture.take() {
+            let stored = persist_capture(
+                &self.state,
+                &self.repo,
+                capture,
+                self.limits.process.max_summary_bytes,
+                &self.limits.process.output_filter,
+            )?;
+            let object = outcome.data.as_object_mut().ok_or_else(|| {
+                ToolError::new(ToolErrorCode::Internal, "file result is not an object")
+            })?;
+            object.insert("output_id".into(), Value::String(stored.id));
+            object.insert(
+                "summary".into(),
+                stored.summary.map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+        Ok(outcome.data)
+    }
 }
 
 #[cfg(test)]
