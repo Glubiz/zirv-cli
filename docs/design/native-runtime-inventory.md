@@ -248,7 +248,7 @@ installed binary during self-update; never spawns it).
 | Built-in seat worker dispatch | `src/commands/workflow/agents.rs` | `dispatch_agent` | N15 (#484) | synchronous `.status()` dispatch of a built-in agent seat; the harness half of `workflow agents dispatch` |
 | Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe`; `--runtime native` emits a `zirv agent --runtime native --mode read-only` argv with no adapter flags |
 | Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |
-| Auto-spawn on workflow gate transition | `src/commands/workflow/engine.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
+| Auto-spawn on workflow gate transition | `src/commands/workflow/engine/cli.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
 | `ctx optimize` judgment call | `src/commands/ctx/optimize.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
@@ -265,7 +265,7 @@ ctx/ask.rs` (`run_model`), `src/commands/ctx/optimize.rs` (`run_with`),
 `src/commands/ctx/run_loop.rs`'s second call site (`evaluate_objective_
 after_cycle`, distinct from its main headless spawn),
 `src/commands/workflow/frontend_render.rs` (`launch_visual_reviewer`), and
-`src/commands/workflow/engine.rs` (`spawn_auto_worker`). N07 adds the first
+`src/commands/workflow/engine/cli.rs` (`spawn_auto_worker`). N07 adds the first
 native direct-model call in `src/commands/ctx/provider/anthropic.rs`
 (`perform_blocking`), N08 the second in
 `src/commands/ctx/provider/openai.rs` (`perform_blocking`), and N12 the third
