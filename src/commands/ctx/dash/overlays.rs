@@ -1,0 +1,3956 @@
+//! Overlay reducers: mail, spawn, memory, restore, errors, menu, inspector, palette, quit, handover.
+use super::*;
+
+/// Issue #354 phase 3: relaunches one retained ended row from the very
+/// `spawnreq::SpawnRequest` that created it, through the existing
+/// [`fulfill_spawn_request`] machinery -- the same call `drain_one_channel`
+/// makes for a request that arrives on disk, with the same
+/// `FILE_DROP_TRUSTED_INTERACTIVE` posture and the same requester identity
+/// the original spawn was granted.
+///
+/// Deliberately NOT a stored argv replay and NOT a new process-launch path:
+/// every gate `fulfill_spawn_request` applies (the argv guard, the repo/cwd
+/// acceptance check, workdir confinement, the envelope re-narrowing, the
+/// depth cap, admission and pacing) is re-applied to the relaunch exactly as
+/// it was to the original. The row is dropped from the retained list only
+/// once the relaunch succeeds -- a refusal leaves it on screen with its
+/// reason in the error channel, still restorable.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn restore_ended_row(
+    short: &str,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    retained: &mut VecDeque<EndedRow>,
+    kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+    rows: &[ui::SidebarRow],
+    selected: &mut usize,
+) {
+    let Some(index) = retained.iter().position(|row| row.short == short) else {
+        push_notice(notices, now, format!("restore: no ended row named {short}"));
+        return;
+    };
+    let Some(request) = retained[index].request.clone() else {
+        push_notice(notices, now, format!("restore {short}: {MENU_NO_REQUEST}"));
+        return;
+    };
+    let requested_by = retained[index].requested_by.clone();
+    // A1-2: captured BEFORE the relaunch grows `panes` and shrinks
+    // `retained` -- the two index moves `restore_fixup` folds together.
+    let old_pane_count = panes.len();
+    let restored_row = rows.iter().position(|row| row.short == short);
+    match fulfill_spawn_request(
+        &request,
+        FILE_DROP_TRUSTED_INTERACTIVE,
+        requested_by.as_deref(),
+        panes,
+        nudge_queues,
+        cfg,
+        state,
+        repo,
+        size,
+        requests_dir,
+        errors,
+    ) {
+        Ok((new_short, _, advisory)) => {
+            retained.remove(index);
+            kept_requests.insert(new_short.clone(), (request, requested_by));
+            if let Some(restored_row) = restored_row {
+                *selected = restore_fixup(old_pane_count, panes.len(), restored_row, *selected);
+            }
+            push_notice(notices, now, format!("restored {short} as {new_short}"));
+            // Issue #399: same posture as the fresh-spawn path -- informational,
+            // never the sticky error log.
+            if let Some(text) = advisory {
+                push_notice(notices, now, text);
+            }
+        }
+        Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
+    }
+}
+
+/// Clamps a cursor into `0..len` (or `0` on an empty list) -- shared by every
+/// browsing-mode reducer below so "move past the last row" and "the list
+/// just shrank out from under the cursor" (an item consumed/forgotten while
+/// selected) both land on a valid index.
+pub(super) fn clamp_cursor(cursor: usize, len: usize) -> usize {
+    if len == 0 { 0 } else { cursor.min(len - 1) }
+}
+
+/// One `j`/`k` (or Down/Up) press against a list cursor: `delta` is `+1` for
+/// "down/next", `-1` for "up/previous". Shared by every browsing-mode
+/// reducer that walks a flat list -- issue #202 phase 2b factors the
+/// copy-pasted `clamp_cursor(cursor + 1, len)` / `cursor.saturating_sub(1)`
+/// pair out of the new errors/handover reducers below, plus `restore_
+/// overlay_reduce` (an existing one, updated here to prove the shape holds
+/// there too; `mail_overlay_reduce`/`memory_overlay_reduce` are left as they
+/// were, to keep this change's diff proportional to what it is fixing).
+pub(super) fn move_cursor(cursor: usize, len: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        clamp_cursor(cursor.saturating_add(delta as usize), len)
+    } else {
+        cursor.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+/// Inserts a newline for every compose-style overlay. These reducers keep
+/// the insertion point at the end of the draft, so an unmodified Enter can
+/// follow Claude Code's portable convention by replacing the trailing
+/// backslash immediately before that point.
+pub(super) fn insert_compose_newline(input: &mut String, modifiers: KeyModifiers) -> bool {
+    if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+        input.push('\n');
+        return true;
+    }
+    if !input.ends_with('\\') {
+        return false;
+    }
+    input.pop();
+    input.push('\n');
+    true
+}
+
+/// Pure: one keystroke against the mail overlay's current state. Returns the
+/// overlay's next state (`None` closes it -- Esc while browsing) alongside
+/// any effect the caller must execute against real storage. Esc while
+/// composing cancels only the compose draft, not the whole overlay.
+pub fn mail_overlay_reduce(
+    mut view: ui::MailView,
+    key: KeyEvent,
+) -> (Option<ui::MailView>, Option<ui::MailEffect>) {
+    if let Some(draft) = view.compose.as_mut() {
+        return match key.code {
+            KeyCode::Esc => {
+                view.compose = None;
+                (Some(view), None)
+            }
+            KeyCode::Enter if insert_compose_newline(&mut draft.body, key.modifiers) => {
+                (Some(view), None)
+            }
+            KeyCode::Enter => {
+                if draft.body.trim().is_empty() {
+                    return (Some(view), None);
+                }
+                let to = if draft.to.trim().is_empty() {
+                    "any".to_string()
+                } else {
+                    draft.to.clone()
+                };
+                let body = draft.body.clone();
+                view.compose = None;
+                let msg = mail::Message {
+                    // Placeholders: `apply_mail_effect` overwrites all three
+                    // right before `mail::store` -- see `ui::MailEffect`'s
+                    // own doc comment for why the reducer never touches
+                    // identity or the clock itself.
+                    from_session: String::new(),
+                    from_agent: String::new(),
+                    to,
+                    to_session: None,
+                    sent: 0,
+                    body,
+                };
+                (Some(view), Some(ui::MailEffect::Send(msg)))
+            }
+            KeyCode::Backspace => {
+                draft.body.pop();
+                (Some(view), None)
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                draft.body.push(c);
+                (Some(view), None)
+            }
+            _ => (Some(view), None),
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = clamp_cursor(view.cursor + 1, view.items.len());
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = view.cursor.saturating_sub(1);
+            (Some(view), None)
+        }
+        KeyCode::Char('c') => {
+            view.compose = Some(ui::ComposeDraft::default());
+            (Some(view), None)
+        }
+        KeyCode::Enter => {
+            if view.items.is_empty() {
+                return (Some(view), None);
+            }
+            let (path, _, _) = view.items.remove(view.cursor);
+            view.cursor = clamp_cursor(view.cursor, view.items.len());
+            (Some(view), Some(ui::MailEffect::Consume(path)))
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// What confirming the spawn dialog asks the caller to do. `Submit` has
+/// already been split into its two required halves; `Notice` is a message for
+/// the header, with the dialog left open so the operator can fix what they
+/// typed rather than losing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnEffect {
+    Submit { agent: String, prompt: String },
+    Notice(String),
+}
+
+/// What a spawn line that cannot be used says. Both halves are required: an
+/// agent with no task is not a request, and a task with no agent has nowhere
+/// to go.
+pub(crate) const SPAWN_USAGE_NOTICE: &str =
+    "spawn: type <agent> <prompt>, e.g. `claude fix the failing tests`";
+
+/// Pure: one keystroke against the spawn dialog (`Ctrl+A s`), the same
+/// reducer shape every other overlay in this module already uses. `Enter`
+/// splits the typed line at its first run of whitespace -- first token is the
+/// agent name, the whole remainder is the prompt -- and closes the dialog;
+/// anything missing a half keeps the dialog open with a notice. `Esc`
+/// cancels outright.
+///
+/// Deliberately does **not** re-implement the argv guard, the pane cap or the
+/// agent gate: a submitted draft is routed through the exact same
+/// `fulfill_spawn_request` path a pane's own `zirv ctx agent` request takes,
+/// so there is one place those rules live and one place they can be wrong.
+pub fn spawn_overlay_reduce(
+    mut draft: ui::SpawnDraft,
+    key: KeyEvent,
+) -> (Option<ui::SpawnDraft>, Option<SpawnEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter if insert_compose_newline(&mut draft.input, key.modifiers) => {
+            (Some(draft), None)
+        }
+        KeyCode::Enter => {
+            let line = draft.input.trim();
+            let Some((agent, prompt)) = line.split_once(char::is_whitespace) else {
+                return (
+                    Some(draft),
+                    Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                );
+            };
+            let prompt = prompt.trim();
+            if agent.is_empty() || prompt.is_empty() {
+                return (
+                    Some(draft),
+                    Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                );
+            }
+            (
+                None,
+                Some(SpawnEffect::Submit {
+                    agent: agent.to_string(),
+                    prompt: prompt.to_string(),
+                }),
+            )
+        }
+        KeyCode::Backspace => {
+            draft.input.pop();
+            (Some(draft), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.input.push(c);
+            (Some(draft), None)
+        }
+        _ => (Some(draft), None),
+    }
+}
+
+/// Pure: the same shape as `mail_overlay_reduce`, for the memory bank. `r`
+/// (remember) seeds the edit buffer with the selected entry's current body
+/// so the operator edits rather than retypes; `d`/`v` (forget/verify) act on
+/// the selected entry immediately, no confirmation dialog.
+pub fn memory_overlay_reduce(
+    mut view: ui::MemoryView,
+    key: KeyEvent,
+) -> (Option<ui::MemoryView>, Option<ui::MemoryEffect>) {
+    if let Some(input) = view.input.as_mut() {
+        return match key.code {
+            KeyCode::Esc => {
+                view.input = None;
+                (Some(view), None)
+            }
+            KeyCode::Enter if insert_compose_newline(input, key.modifiers) => (Some(view), None),
+            KeyCode::Enter => {
+                if input.trim().is_empty() {
+                    return (Some(view), None);
+                }
+                let Some((key_name, _, _)) = view.entries.get(view.cursor).cloned() else {
+                    view.input = None;
+                    return (Some(view), None);
+                };
+                let body = input.clone();
+                view.input = None;
+                (
+                    Some(view),
+                    Some(ui::MemoryEffect::Remember {
+                        key: key_name,
+                        body,
+                    }),
+                )
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                (Some(view), None)
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.push(c);
+                (Some(view), None)
+            }
+            _ => (Some(view), None),
+        };
+    }
+
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = clamp_cursor(view.cursor + 1, view.entries.len());
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = view.cursor.saturating_sub(1);
+            (Some(view), None)
+        }
+        KeyCode::Char('r') => {
+            if let Some((_, _, body)) = view.entries.get(view.cursor) {
+                view.input = Some(body.clone());
+            }
+            (Some(view), None)
+        }
+        KeyCode::Char('d') => {
+            if view.entries.is_empty() {
+                return (Some(view), None);
+            }
+            let (key_name, _, _) = view.entries.remove(view.cursor);
+            view.cursor = clamp_cursor(view.cursor, view.entries.len());
+            (Some(view), Some(ui::MemoryEffect::Forget(key_name)))
+        }
+        KeyCode::Char('v') => match view.entries.get(view.cursor) {
+            Some((key_name, _, _)) => {
+                let effect = ui::MemoryEffect::Verify(key_name.clone());
+                (Some(view), Some(effect))
+            }
+            None => (Some(view), None),
+        },
+        _ => (Some(view), None),
+    }
+}
+
+/// Executes a `MailEffect` against real storage -- the only place either
+/// reducer's output actually touches disk. `from_session`/`from_agent` are
+/// this dashboard's own identity (the orchestrator pane's short id and this
+/// session's agent name), stamped onto a `Send` right before `mail::store`.
+pub(super) fn apply_mail_effect(
+    effect: ui::MailEffect,
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    from_session: &str,
+    from_agent: &str,
+    errors: &mut ErrorLog,
+) {
+    let slug = super::state::repo_slug(repo);
+    match effect {
+        ui::MailEffect::Consume(path) => {
+            // Issue #30, item 3: the operator drives this from the
+            // dashboard's own mail overlay, on behalf of the orchestrator
+            // pane's identity (`from_session`), not through `zirv ctx
+            // inbox` -- logged the same as every other on-behalf-of
+            // consumption seam.
+            if let Err(e) =
+                mail::consume_and_log(state, &slug, &path, from_session, "dash", "dash:overlay")
+            {
+                push_error(errors, format!("mail consume: {e}"));
+            }
+        }
+        ui::MailEffect::Send(mut msg) => {
+            msg.from_session = from_session.to_string();
+            msg.from_agent = from_agent.to_string();
+            msg.sent = super::state::now_secs();
+            // Same-repo store: the dashboard composes into its own repo's
+            // mailbox, so sender and destination slug are one and the same
+            // and the sender's own mail limits legitimately apply.
+            if let Err(e) = mail::store_to(state, &slug, &slug, &msg, cfg) {
+                push_error(errors, format!("mail send: {e}"));
+            }
+        }
+    }
+}
+
+/// Executes a `MemoryEffect` against real storage. `written_by` is this
+/// dashboard's own agent name, the same convention `run_remember_with` uses
+/// for `AGENT_ENV`.
+pub(super) fn apply_memory_effect(
+    effect: ui::MemoryEffect,
+    state: &StateDir,
+    repo: &Path,
+    cfg: &CtxConfig,
+    written_by: &str,
+    errors: &mut ErrorLog,
+) {
+    let slug = super::state::repo_slug(repo);
+    match effect {
+        ui::MemoryEffect::Remember { key, body } => {
+            let now = super::state::now_secs();
+            let entry = memory::Entry {
+                key,
+                written_by: written_by.to_string(),
+                written: now,
+                verified: now,
+                source: "explicit".to_string(),
+                body,
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            };
+            if let Err(e) = memory::remember(state, &slug, &entry, cfg) {
+                push_error(errors, format!("memory remember: {e}"));
+            }
+        }
+        ui::MemoryEffect::Forget(key) => {
+            if let Err(e) = memory::forget(state, &slug, &key) {
+                push_error(errors, format!("memory forget: {e}"));
+            }
+        }
+        ui::MemoryEffect::Verify(key) => {
+            if let Err(e) = memory::verify(state, &slug, &key) {
+                push_error(errors, format!("memory verify: {e}"));
+            }
+        }
+    }
+}
+
+/// A single-line preview of a body: its first line, capped short enough to
+/// fit the overlay dialog next to a `from`/`key` label.
+pub(super) fn mail_preview(body: &str) -> String {
+    body.lines().next().unwrap_or("").chars().take(60).collect()
+}
+
+/// Builds a freshly-populated `MailView` from every message currently
+/// visible to the dashboard operator -- `for_agent`/`for_session` both
+/// `None`, the same broad "everything in this repo's mailbox" view
+/// `zirv ctx inbox` gives a human, not the narrow per-session filter a
+/// delivery seam applies. A read error degrades to an empty view rather than
+/// failing the overlay open.
+pub(super) fn build_mail_view(state: &StateDir, repo: &Path) -> ui::MailView {
+    let slug = super::state::repo_slug(repo);
+    let items = mail::list(state, &slug, None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(path, msg)| (path, msg.from_agent, mail_preview(&msg.body)))
+        .collect();
+    ui::MailView {
+        items,
+        cursor: 0,
+        offset: 0,
+        compose: None,
+    }
+}
+
+/// Builds a freshly-populated `MemoryView` from this repo's whole memory
+/// bank. The age wording matches `memory::render_for_prompt`'s own
+/// convention ("written Nd ago, verified Nd ago") so it reads the same
+/// everywhere it appears.
+pub(super) fn build_memory_view(state: &StateDir, repo: &Path) -> ui::MemoryView {
+    let slug = super::state::repo_slug(repo);
+    let now = super::state::now_secs();
+    let entries = memory::list(state, &slug)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, entry)| {
+            let age = format!(
+                "written {}d ago, verified {}d ago",
+                now.saturating_sub(entry.written) / 86_400,
+                now.saturating_sub(entry.verified) / 86_400,
+            );
+            (entry.key, age, entry.body)
+        })
+        .collect();
+    ui::MemoryView {
+        entries,
+        cursor: 0,
+        offset: 0,
+        input: None,
+    }
+}
+
+// Task 12: the startup restore dialog -- same pure-reducer shape as Task 8's
+// mail/memory overlays. `restore_overlay_reduce` never touches a roster or a
+// pane itself; it only tracks which checkboxes are on and, on Enter, reports
+// back *which* entries were checked (by index) for the caller to act on.
+
+/// What confirming the restore dialog (Enter) reports back: the indices,
+/// into whatever candidate list the caller built the view's entries from in
+/// the same order, that were checked at the moment of confirmation. `Esc`
+/// (skip everything) yields no effect at all -- see `restore_overlay_reduce`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreEffect {
+    Confirm(Vec<usize>),
+}
+
+/// Pure: one keystroke against the restore dialog's current state. `Space`
+/// toggles the entry under the cursor; `Enter` closes the dialog and reports
+/// every currently-checked index as a `Confirm` effect (an empty roster, or
+/// everything unchecked, is still a valid confirm -- it simply restores
+/// nothing); `Esc` closes the dialog with no effect, skipping the restore
+/// entirely. Arrow keys and `j`/`k` move the cursor, clamped the same way
+/// every other browsing-mode reducer in this module already is.
+pub fn restore_overlay_reduce(
+    mut view: ui::RestoreView,
+    key: KeyEvent,
+) -> (Option<ui::RestoreView>, Option<RestoreEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => {
+            let checked = view
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.checked)
+                .map(|(i, _)| i)
+                .collect();
+            (None, Some(RestoreEffect::Confirm(checked)))
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, view.entries.len(), 1);
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, view.entries.len(), -1);
+            (Some(view), None)
+        }
+        KeyCode::Char(' ') => {
+            if let Some(entry) = view.entries.get_mut(view.cursor) {
+                entry.checked = !entry.checked;
+            }
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// Issue #354 phase 5: what browsing the kept errors asks the caller to do.
+///
+/// Exactly one thing -- acknowledge the entries this dialog was opened over.
+/// The dialog itself stays pure; the buffer it names lives in the event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorsAck {
+    /// The snapshot's own [`ui::ErrorsView::mark`] -- what the caller passes
+    /// to [`ErrorLog::acknowledge`] so only the entries this dialog actually
+    /// showed are acknowledged.
+    pub mark: u64,
+}
+
+/// Pure: one keystroke against the `Ctrl+A e` errors overlay.
+///
+/// Issue #354 phase 5: an operator who has read the list has, by definition,
+/// seen the errors in it -- so the closing keys acknowledge on the way out,
+/// and `a` acknowledges in place (the entries stay, dimmed, so the list an
+/// operator is still reading does not rearrange under them). Acknowledgement
+/// never deletes: it only stops the sticky header line, until a NEW error --
+/// a different message, or the same one again after the acknowledgement --
+/// arrives.
+pub fn errors_overlay_reduce(
+    mut view: ui::ErrorsView,
+    key: KeyEvent,
+) -> (Option<ui::ErrorsView>, Option<ErrorsAck>) {
+    match key.code {
+        // Issue #354 phase 4 (deliverable D): `Enter` closes it too -- a
+        // read-only list has nothing to activate, and an `Enter` that does
+        // nothing at all is the inconsistency that phase removed.
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            (None, Some(ErrorsAck { mark: view.mark }))
+        }
+        KeyCode::Char('a') => {
+            let mark = view.mark;
+            for item in &mut view.items {
+                item.acked = true;
+            }
+            (Some(view), Some(ErrorsAck { mark }))
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), 1);
+            (Some(view), None)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), -1);
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// Builds the `Ctrl+A e` overlay's own view: every kept error
+/// (`push_error`'s buffer, `MAX_KEPT_ERRORS`), newest first -- a snapshot
+/// taken once when the overlay opens, the same convention every other
+/// overlay here already follows (mail/memory/restore do not live-update
+/// while open either).
+///
+/// Issue #354 phase 5: each row carries its own repeat count, the age of its
+/// most recent repeat and whether it has been acknowledged. `now` is injected
+/// so the age is the caller's clock, not a second one read in here.
+pub(super) fn build_errors_view(errors: &ErrorLog, now: Instant) -> ui::ErrorsView {
+    ui::ErrorsView {
+        items: errors
+            .entries
+            .iter()
+            .rev()
+            .map(|e| ui::ErrorItem {
+                text: e.text.clone(),
+                count: e.count,
+                age_secs: now.saturating_duration_since(e.last).as_secs(),
+                acked: e.acked,
+            })
+            .collect(),
+        cursor: 0,
+        offset: 0,
+        mark: errors.mark(),
+    }
+}
+
+/// Builds `Overlay::JevErrors`' own view (click affordance follow-up)
+/// straight from the JEV sidebar's own cached fact -- never a disk read on
+/// click, only whatever `jev_section_fact` last cached on the 10s JEV
+/// refresh cadence. `None` (the gate off, or `NoKey`) and zero cached
+/// errors both give an empty view; [`ui::list_spec_for`]'s own
+/// `empty_message` is what the operator actually sees for either.
+pub(super) fn build_jev_errors_view(fact: &Option<ui::JevSectionFact>) -> ui::JevErrorsView {
+    let items = match fact {
+        Some(ui::JevSectionFact::Active { errors_detail, .. }) => errors_detail
+            .iter()
+            .map(|row| ui::ErrorItem {
+                text: format!("{} \u{b7} {}", row.site, row.reason),
+                count: 1,
+                age_secs: row.age_secs,
+                acked: false,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    ui::JevErrorsView {
+        items,
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Pure: one keystroke against the JEV errors dialog (click affordance
+/// follow-up) -- read-only history, so browsing is all there is: `j/k`/
+/// arrows move the cursor, `Esc`/`Enter`/`q` close it. No acknowledgement,
+/// unlike `Ctrl+A e`'s own `errors_overlay_reduce`: these rows are a rollup
+/// snapshot, not the dashboard's own live error buffer, so there is nothing
+/// to acknowledge and no `Ack` payload to hand back. Mirrors `inspector_
+/// overlay_reduce`'s own read-only shape.
+pub(super) fn jev_errors_overlay_reduce(
+    mut view: ui::JevErrorsView,
+    key: KeyEvent,
+) -> Option<ui::JevErrorsView> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, view.items.len(), -1);
+            Some(view)
+        }
+        _ => Some(view),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #354 phase 3: the context menu and the inspector.
+// ---------------------------------------------------------------------
+
+/// Everything the context menu decides ONE row's entries from. Assembled at
+/// the moment the menu opens, from values already in hand -- the row the
+/// roster built, the pane behind it (if any), and whether a spawn request was
+/// kept for it -- so the entry matrix itself stays a pure function.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct MenuFacts {
+    short: String,
+    role: String,
+    /// This dashboard owns a live `Pane` for the row.
+    attached: bool,
+    /// The row is a live session (attached, or a view-only registry row).
+    alive: bool,
+    /// The row is an ended pane -- a retained completed worker.
+    ended: bool,
+    /// The exit code of an ended row, when one was recorded.
+    exit_code: Option<i32>,
+    /// The row is one of the retained ended rows the roster keeps, so it can
+    /// be dropped from that list.
+    retained: bool,
+    /// The dashboard still holds the `spawnreq::SpawnRequest` that created
+    /// this row, so it can be relaunched verbatim.
+    has_request: bool,
+    /// The checkout this row runs (or ran) in, when it is known.
+    cwd: Option<String>,
+}
+
+impl MenuFacts {
+    /// The availability slice of these facts, in the shape the one
+    /// action-descriptor table decides against.
+    pub(super) fn action_context(&self) -> actions::ActionContext {
+        actions::ActionContext {
+            selected: true,
+            attached: self.attached,
+            alive: self.alive,
+            ended: self.ended,
+            // The menu never chooses its own entries by the glyph -- every
+            // entry is always present -- so this stays false here.
+            needs_action: false,
+            retained: self.retained,
+            has_request: self.has_request,
+            clean_exit: self.exit_code.unwrap_or(0) == 0,
+            has_cwd: self.cwd.is_some(),
+            // A `MenuFacts` is always a real session row; the summary line
+            // never goes through here (see `selected_action_context`).
+            summary: false,
+        }
+    }
+}
+
+/// Pure: the context menu's entries for one row, in the approved order, each
+/// either available or disabled with a short reason.
+///
+/// Issue #354 phase 4: the order, the entries and every disable reason now
+/// come out of the one action-descriptor table (`actions::menu_actions`)
+/// rather than a second matrix written down here -- so the menu, the header
+/// cluster, the help screen and the palette cannot disagree about what an
+/// action is called or why it is unavailable.
+///
+/// Every entry is ALWAYS present. An operator who cannot see that `restore`
+/// exists cannot learn why it is unavailable, and a menu whose shape changes
+/// per row is a menu whose letters move under the operator's fingers.
+pub(super) fn menu_entries(facts: &MenuFacts) -> Vec<ui::MenuEntry> {
+    let available = actions::menu_actions(&facts.action_context());
+    let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
+    let letters = ui::menu_letters(&order);
+    available
+        .into_iter()
+        .zip(letters)
+        .map(|((action, availability), letter)| ui::MenuEntry {
+            action,
+            disabled: availability.reason().map(str::to_string),
+            letter,
+        })
+        .collect()
+}
+
+/// Builds the context menu for one row. `subject` is what the dialog title
+/// names, so a right-click menu is never mistaken for the selected row's.
+pub(super) fn build_menu_view(facts: &MenuFacts) -> ui::MenuView {
+    ui::MenuView {
+        target: facts.short.clone(),
+        subject: format!("{} \u{b7} {}", facts.short, facts.role),
+        entries: menu_entries(facts),
+        cursor: 0,
+        offset: 0,
+        confirm: None,
+    }
+}
+
+/// Issue #354 phase 5: the context menu over the sidebar's summary line --
+/// the dashboard itself. Same entries in the same order as every other menu
+/// (an operator must never have to learn a second shape), with `inspect` the
+/// one that applies and the rest inert behind [`actions::MENU_SUMMARY_LINE`].
+pub(super) fn build_summary_menu_view() -> ui::MenuView {
+    let ctx = actions::ActionContext {
+        summary: true,
+        ..actions::ActionContext::default()
+    };
+    let available = actions::menu_actions(&ctx);
+    let order: Vec<ui::MenuAction> = available.iter().map(|(action, _)| *action).collect();
+    let letters = ui::menu_letters(&order);
+    ui::MenuView {
+        target: DASHBOARD_TARGET.to_string(),
+        subject: "the dashboard".to_string(),
+        entries: available
+            .into_iter()
+            .zip(letters)
+            .map(|((action, availability), letter)| ui::MenuEntry {
+                action,
+                disabled: availability.reason().map(str::to_string),
+                letter,
+            })
+            .collect(),
+        cursor: 0,
+        offset: 0,
+        confirm: None,
+    }
+}
+
+/// The checkout one row runs (or ran) in: the live pane's own `cwd`, else
+/// the one frozen onto its retained ended row at the reap. `None` for a
+/// view-only registry row, which this dashboard never spawned and whose
+/// working directory it has no record of.
+pub(super) fn row_cwd(
+    short: &str,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+) -> Option<String> {
+    panes
+        .iter()
+        .find(|p| p.short() == short)
+        .map(|p| p.cwd().display().to_string())
+        .or_else(|| {
+            retained
+                .iter()
+                .find(|e| e.short == short)
+                .map(|e| e.cwd.clone())
+        })
+}
+
+/// Assembles the context menu's facts for one already-built roster row.
+pub(super) fn menu_facts_for(
+    row: &ui::SidebarRow,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+) -> MenuFacts {
+    let ended_row = retained.iter().find(|e| e.short == row.short);
+    MenuFacts {
+        short: row.short.clone(),
+        role: row.role.clone(),
+        attached: row.attached,
+        alive: row.state != ui::RowState::Dead && row.exit_code.is_none(),
+        ended: row.state == ui::RowState::Dead || row.exit_code.is_some(),
+        exit_code: row.exit_code,
+        retained: ended_row.is_some(),
+        has_request: ended_row.is_some_and(|e| e.request.is_some()),
+        cwd: row_cwd(&row.short, panes, retained),
+    }
+}
+
+/// What activating a context-menu entry means. The menu itself stays pure:
+/// looking a pane up, opening another overlay, quitting a child or
+/// relaunching a request all happen at the call site, which is the only place
+/// with the panes, the state directory and the kept requests in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEffect {
+    pub target: String,
+    pub action: ui::MenuAction,
+}
+
+/// Pure: one keystroke against the context menu.
+///
+/// `Enter` activates the entry under the caret -- except `stop`, the one
+/// destructive entry, which first raises an inline confirmation on its own
+/// row and only acts on `y` (or a second `Enter`). A disabled entry does
+/// nothing at all: its reason is already on screen. `Esc` closes the menu
+/// without touching focus, and a letter jumps straight to its entry.
+pub fn menu_overlay_reduce(
+    mut view: ui::MenuView,
+    key: KeyEvent,
+) -> (Option<ui::MenuView>, Option<MenuEffect>) {
+    let len = view.entries.len();
+    let activate = |view: ui::MenuView| -> (Option<ui::MenuView>, Option<MenuEffect>) {
+        match view.entries.get(view.cursor) {
+            Some(entry) if entry.enabled() => {
+                let effect = MenuEffect {
+                    target: view.target.clone(),
+                    action: entry.action,
+                };
+                (None, Some(effect))
+            }
+            // A disabled entry is inert: the row already says why.
+            _ => (Some(view), None),
+        }
+    };
+    // The inline stop confirmation owns the keyboard while it is up, so a
+    // stray `j` cannot walk the caret off the entry that is being confirmed
+    // and leave the confirmation pointing at a different row.
+    if let Some(index) = view.confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                view.cursor = index;
+                view.confirm = None;
+                activate(view)
+            }
+            _ => {
+                view.confirm = None;
+                (Some(view), None)
+            }
+        };
+    }
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            (Some(view), None)
+        }
+        KeyCode::Enter => {
+            if view
+                .entries
+                .get(view.cursor)
+                .is_some_and(|e| e.action == ui::MenuAction::Stop && e.enabled())
+            {
+                view.confirm = Some(view.cursor);
+                return (Some(view), None);
+            }
+            activate(view)
+        }
+        KeyCode::Char(c) => match view.entries.iter().position(|e| e.letter == Some(c)) {
+            Some(index) => {
+                view.cursor = index;
+                if view.entries[index].action == ui::MenuAction::Stop
+                    && view.entries[index].enabled()
+                {
+                    view.confirm = Some(index);
+                    return (Some(view), None);
+                }
+                activate(view)
+            }
+            None => (Some(view), None),
+        },
+        _ => (Some(view), None),
+    }
+}
+
+/// The inspector's own section names, once, so `build_inspector_view`, the
+/// `evidence` menu entry and the tests all name the same strings.
+pub(super) const INSPECT_IDENTITY: &str = "identity";
+pub(super) const INSPECT_STATUS: &str = "status";
+pub(super) const INSPECT_EVIDENCE: &str = "evidence";
+pub(super) const INSPECT_BUDGET: &str = "budget";
+pub(super) const INSPECT_WRITER: &str = "writer";
+pub(super) const INSPECT_SIGNAL: &str = "signal";
+pub(super) const INSPECT_ERRORS: &str = "errors";
+
+/// Issue #354 phase 5: the DASHBOARD-level inspector's own section names.
+/// Same dialog, same viewport, same `Esc`; a different subject.
+pub(super) const INSPECT_DASH_HARNESS: &str = "harness";
+pub(super) const INSPECT_DASH_SESSIONS: &str = "sessions";
+pub(super) const INSPECT_DASH_SPEND: &str = "spend";
+pub(super) const INSPECT_DASH_USAGE: &str = "usage";
+pub(super) const INSPECT_DASH_REPO: &str = "repo";
+pub(super) const INSPECT_DASH_DASHBOARD: &str = "dashboard";
+
+/// The `target` a dashboard-level inspector or action menu carries.
+///
+/// Session short ids are exactly eight characters (`sessions::short_id`), so
+/// a nine-character literal can never collide with one -- which is what lets
+/// the menu effect and the inspector both say "this is the dashboard, not a
+/// row" without a second `Option` threaded through every arm.
+pub(super) const DASHBOARD_TARGET: &str = "dashboard";
+
+/// One `key  value` inspector line, with the shared placeholder standing in
+/// for a fact nothing has recorded yet -- never a fabricated value.
+pub(super) fn inspect_line(key: &str, value: Option<String>) -> String {
+    format!(
+        "{key:<12}{}",
+        value
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| style::PLACEHOLDER.to_string())
+    )
+}
+
+/// Builds the inspector over one row, from facts that are already cached.
+///
+/// Nothing here reads the disk, runs git or shells out: `row` is what the
+/// roster already assembled this frame, `status` is the composed
+/// `attention::SessionStatus` the `FactsCache` cadence loaded, `cwd` comes
+/// from the pane (or the retained row) the caller already has, and `errors`
+/// is `push_error`'s own kept buffer.
+pub(super) fn build_inspector_view(
+    row: &ui::SidebarRow,
+    cwd: Option<&str>,
+    errors: &ErrorLog,
+) -> ui::InspectorView {
+    let disclosure = |key: &str| {
+        row.disclosure
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let status = row.status.as_ref();
+    let identity = ui::InspectorSection {
+        name: INSPECT_IDENTITY.to_string(),
+        lines: vec![
+            inspect_line("short", Some(row.short.clone())),
+            inspect_line("harness", Some(row.harness.clone())),
+            inspect_line("model", row.model.clone()),
+            inspect_line("role", Some(row.role.clone())),
+            inspect_line(
+                "group",
+                row.group.as_ref().map(|g| {
+                    format!(
+                        "{} ({})",
+                        g.scope,
+                        if g.lead_short.is_empty() {
+                            style::PLACEHOLDER
+                        } else {
+                            g.lead_short.as_str()
+                        }
+                    )
+                }),
+            ),
+            inspect_line("parent", disclosure("group")),
+            inspect_line("cwd", cwd.map(str::to_string)),
+            // Never run: `branch` stays whatever the roster cached, which is
+            // the placeholder until something else fills it in. Shelling out
+            // to git here would put a subprocess behind a keystroke.
+            inspect_line("branch", disclosure("branch")),
+        ],
+    };
+    let status_section = ui::InspectorSection {
+        name: INSPECT_STATUS.to_string(),
+        lines: vec![
+            inspect_line(
+                "lifecycle",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.lifecycle))),
+            ),
+            inspect_line(
+                "attention",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.attention))),
+            ),
+            inspect_line(
+                "projection",
+                status.map(|s| projection_word(super::attention::project(s))),
+            ),
+            inspect_line(
+                "authority",
+                status.map(|s| spaced_lowercase(&format!("{:?}", s.authority))),
+            ),
+            inspect_line("confidence", status.map(|s| s.confidence.to_string())),
+            inspect_line("since", disclosure("since")),
+            inspect_line("revision", status.map(|s| s.revision.to_string())),
+            inspect_line("exit", row.exit_code.map(|code| format!("exit {code}"))),
+        ],
+    };
+    // The whole point of the inspector: WHY the dashboard believes what it
+    // shows. Both the winning observation's evidence and every authority that
+    // lost this tick's vote, with its own reason.
+    let mut evidence_lines = Vec::new();
+    if let Some(status) = status {
+        if !status.evidence.trim().is_empty() {
+            evidence_lines.push(inspect_line("evidence", Some(status.evidence.clone())));
+        }
+        for skipped in &status.skipped {
+            evidence_lines.push(format!(
+                "skipped     {} \u{b7} {}",
+                spaced_lowercase(&format!("{:?}", skipped.authority)),
+                skipped.reason
+            ));
+        }
+    }
+    let evidence = ui::InspectorSection {
+        name: INSPECT_EVIDENCE.to_string(),
+        lines: evidence_lines,
+    };
+    let budget = ui::InspectorSection {
+        name: INSPECT_BUDGET.to_string(),
+        lines: vec![inspect_line("usage", disclosure("budget"))],
+    };
+    let writer = ui::InspectorSection {
+        name: INSPECT_WRITER.to_string(),
+        lines: vec![inspect_line("permit", disclosure("writer"))],
+    };
+    let signal = ui::InspectorSection {
+        name: INSPECT_SIGNAL.to_string(),
+        lines: vec![
+            inspect_line("transport", disclosure("signal")),
+            inspect_line(
+                "attached",
+                Some(if row.attached { "yes" } else { "no" }.to_string()),
+            ),
+        ],
+    };
+    // Only this pane's own kept errors: the buffer is shared, and every line
+    // `push_error` writes for a pane names its short id.
+    let pane_errors = ui::InspectorSection {
+        name: INSPECT_ERRORS.to_string(),
+        lines: errors
+            .iter()
+            .rev()
+            .filter(|e| e.contains(&row.short))
+            .take(MAX_KEPT_ERRORS)
+            .map(str::to_string)
+            .collect(),
+    };
+    ui::InspectorView {
+        target: row.short.clone(),
+        subject: format!("{} \u{b7} {}", row.short, row.role),
+        sections: vec![
+            identity,
+            status_section,
+            evidence,
+            budget,
+            writer,
+            signal,
+            pane_errors,
+        ],
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Everything the DASHBOARD-level inspector reports (issue #354 phase 5),
+/// all of it already cached: nothing here reads the disk, runs git or shells
+/// out, and a fact that has not been read yet renders the shared placeholder
+/// rather than a fabricated zero.
+pub(super) struct DashboardFacts<'a> {
+    harness: &'a str,
+    short: &'a str,
+    /// This dashboard's own orchestrator seat label (`gen N`).
+    seat: Option<&'a str>,
+    state_dir: String,
+    uptime_secs: u64,
+    /// Mouse reporting is on (the pointer drives the chrome and zirv's own
+    /// click-drag selection); `false` is the operator's own `dash.mouse`
+    /// config turned off entirely, handing the pointer to the terminal.
+    mouse: bool,
+    sidebar_cols: u16,
+    /// How stale the throttled disk facts below are.
+    facts_age_secs: u64,
+    rows: &'a [ui::SidebarRow],
+    spend: Option<AggregateSpendFacts>,
+    usage: &'a [ui::HarnessUsage],
+    pool: &'a [ui::HarnessStrip],
+    /// `(broadcast, direct)` unread for the dashboard's own identity.
+    mail: Option<(usize, usize)>,
+    workflow: Option<&'a workflow::ActiveWorkflowSummary>,
+    /// `(panes whose turn-signal socket bound, attached panes)`.
+    supervised: (usize, usize),
+}
+
+/// Pure: the inspector over the DASHBOARD itself -- what `^A i` opens while
+/// the sidebar's summary line is selected (issue #354 phase 5).
+///
+/// The same [`ui::InspectorView`] the per-row inspector produces, so it draws
+/// through the identical phase-3 scrollable dialog and obeys the identical
+/// `Esc`/`Enter` rule. The summary line's own one-line disclosure (phase 1)
+/// is unchanged: this is the long form, on demand.
+pub(super) fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::InspectorView {
+    let age = |secs: u64| format!("read {} ago", style::format_age(secs));
+    let harness = ui::InspectorSection {
+        name: INSPECT_DASH_HARNESS.to_string(),
+        lines: vec![
+            inspect_line("harness", Some(facts.harness.to_string())),
+            inspect_line("short", Some(facts.short.to_string())),
+            inspect_line("seat", facts.seat.map(str::to_string)),
+            inspect_line("uptime", Some(style::format_age(facts.uptime_secs))),
+        ],
+    };
+    let live = facts
+        .rows
+        .iter()
+        .filter(|r| r.state != ui::RowState::Dead)
+        .count();
+    let mut session_lines = vec![
+        inspect_line("live", Some(live.to_string())),
+        inspect_line("ended", Some((facts.rows.len() - live).to_string())),
+    ];
+    // One line per glyph, always all six: a zero here is a fact (nothing is
+    // waiting), not a missing reading.
+    for glyph in ui::ALL_GLYPHS {
+        let count = facts
+            .rows
+            .iter()
+            .filter(|r| ui::glyph_for(r) == glyph)
+            .count();
+        session_lines.push(inspect_line(
+            glyph.name(),
+            Some(format!("{} {count}", glyph.symbol())),
+        ));
+    }
+    let sessions = ui::InspectorSection {
+        name: INSPECT_DASH_SESSIONS.to_string(),
+        lines: session_lines,
+    };
+    let mut spend_lines = vec![
+        inspect_line(
+            "delegated",
+            facts.spend.map(|s| format!("{} failed", s.failed)),
+        ),
+        inspect_line(
+            "cost",
+            facts
+                .spend
+                .map(|s| super::price::format_usd(s.cost_micros, false)),
+        ),
+    ];
+    // Issue #457: surfaced only when non-zero -- a session where every
+    // message priced cleanly shows no extra line at all, matching the
+    // "quiet unless there is something to flag" convention every other
+    // inspector section here already follows.
+    if let Some(spend) = facts.spend
+        && spend.skipped_messages > 0
+    {
+        spend_lines.push(inspect_line(
+            "unpriced",
+            Some(format!(
+                "{} message(s)/row(s) skipped (no known price)",
+                spend.skipped_messages
+            )),
+        ));
+    }
+    for strip in facts.pool {
+        spend_lines.push(inspect_line(
+            &strip.name,
+            Some(match strip.headroom_pct {
+                Some(pct) => format!("{} \u{b7} headroom {pct:.0}%", strip.state),
+                None => strip.state.clone(),
+            }),
+        ));
+    }
+    if facts.spend.is_some() || !facts.pool.is_empty() {
+        spend_lines.push(inspect_line("as of", Some(age(facts.facts_age_secs))));
+    }
+    let spend = ui::InspectorSection {
+        name: INSPECT_DASH_SPEND.to_string(),
+        lines: spend_lines,
+    };
+    let usage = ui::InspectorSection {
+        name: INSPECT_DASH_USAGE.to_string(),
+        lines: facts
+            .usage
+            .iter()
+            .map(|u| {
+                let pct = |v: Option<f64>| match v {
+                    Some(v) => format!("{v:.0}%"),
+                    None => style::PLACEHOLDER.to_string(),
+                };
+                inspect_line(
+                    u.name,
+                    Some(format!(
+                        "5h {} \u{b7} 7d {}",
+                        pct(u.five_hour),
+                        pct(u.seven_day)
+                    )),
+                )
+            })
+            .collect(),
+    };
+    let repo = ui::InspectorSection {
+        name: INSPECT_DASH_REPO.to_string(),
+        lines: vec![
+            inspect_line(
+                "mail",
+                facts.mail.map(|(broadcast, direct)| {
+                    format!("{broadcast} broadcast \u{b7} {direct} direct")
+                }),
+            ),
+            inspect_line(
+                "workflow",
+                facts.workflow.map(|w| {
+                    let gate = if w.awaiting_approval {
+                        " \u{b7} awaits approval"
+                    } else {
+                        ""
+                    };
+                    format!("{} \u{b7} {}{gate}", w.kind, w.step)
+                }),
+            ),
+            inspect_line(
+                "supervision",
+                Some(format!(
+                    "{} of {} panes",
+                    facts.supervised.0, facts.supervised.1
+                )),
+            ),
+        ],
+    };
+    let dashboard = ui::InspectorSection {
+        name: INSPECT_DASH_DASHBOARD.to_string(),
+        lines: vec![
+            inspect_line("state dir", Some(facts.state_dir.clone())),
+            inspect_line(
+                "mouse",
+                Some(if facts.mouse { "on" } else { "off" }.to_string()),
+            ),
+            inspect_line("sidebar", Some(format!("{} cols", facts.sidebar_cols))),
+            inspect_line("facts", Some(age(facts.facts_age_secs))),
+        ],
+    };
+    ui::InspectorView {
+        target: DASHBOARD_TARGET.to_string(),
+        subject: format!("dashboard \u{b7} {}", facts.short),
+        sections: vec![harness, sessions, spend, usage, repo, dashboard],
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Gathers the dashboard-level inspector's facts out of what is already in
+/// hand: this tick's roster, the throttled [`FactsCache`], and the loop's own
+/// in-memory state. No read of any kind happens here.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dashboard_facts<'a>(
+    harness: &'a str,
+    short: &'a str,
+    rows: &'a [ui::SidebarRow],
+    panes: &[Pane],
+    cache: &'a FactsCache,
+    state: &StateDir,
+    launched_at: Instant,
+    mouse: bool,
+    sidebar_cols: u16,
+    now: Instant,
+) -> DashboardFacts<'a> {
+    DashboardFacts {
+        harness,
+        short,
+        seat: cache.disk.pool_seat.as_deref(),
+        state_dir: state.root().display().to_string(),
+        uptime_secs: now.saturating_duration_since(launched_at).as_secs(),
+        mouse,
+        sidebar_cols,
+        facts_age_secs: now.saturating_duration_since(cache.last_refresh).as_secs(),
+        rows,
+        spend: cache.disk.spend,
+        usage: &cache.disk.usage,
+        pool: &cache.disk.pool_harnesses,
+        mail: cache.disk.mail,
+        workflow: cache.disk.workflow.as_ref(),
+        supervised: (panes.iter().filter(|p| p.reachable()).count(), panes.len()),
+    }
+}
+
+/// Pure: one keystroke against the inspector. Read-only, like the errors
+/// overlay -- there is no effect type, only "still open" or "closed".
+///
+/// Issue #354 phase 4 (deliverable D): `Enter` closes it too. A read-only
+/// report has nothing to activate, and the one rule that now holds in every
+/// dialog is that `Esc` closes and `Enter` confirms -- an `Enter` that does
+/// nothing at all is exactly the inconsistency this phase removes.
+pub fn inspector_overlay_reduce(
+    mut view: ui::InspectorView,
+    key: KeyEvent,
+) -> Option<ui::InspectorView> {
+    let len = view.rows().len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.cursor = move_cursor(view.cursor, len, 1);
+            Some(view)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.cursor = move_cursor(view.cursor, len, -1);
+            Some(view)
+        }
+        _ => Some(view),
+    }
+}
+
+/// What activating a palette row asks the caller to do: run the descriptor
+/// under the caret. The palette itself stays pure -- turning an
+/// [`actions::ActionId`] into either a `DashAction` (a global chord, replayed
+/// through the exact dispatch the keyboard uses) or a `ui::MenuAction`
+/// (a row action, replayed through the exact path the context menu uses)
+/// happens at the call site, which is the only place with the roster, the
+/// panes and the state directory in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteEffect(pub actions::ActionId);
+
+/// Pure: one keystroke against the palette (`^A p`) or the help screen
+/// (`^A ?`), which is the same dialog in read-only mode.
+///
+/// `Esc` closes without running anything. `Enter` runs the caret's own action
+/// -- and in help mode simply closes, since a key reference must never fire
+/// an action an operator only meant to read about. Up/Down move the caret,
+/// skipping section headings; Backspace edits the query and every other
+/// printable character extends it. Nothing typed here is ever forwarded to
+/// the child: an open overlay owns every keystroke, and the palette's query
+/// is the clearest case of why that rule exists.
+pub fn palette_overlay_reduce(
+    mut view: ui::PaletteView,
+    key: KeyEvent,
+) -> (Option<ui::PaletteView>, Option<PaletteEffect>) {
+    let refresh = |view: &mut ui::PaletteView| {
+        let rows = view.rows();
+        // A query that no longer matches what the caret was on puts the
+        // caret back on the first row that does -- never off the end of the
+        // list, and never parked on a heading.
+        if !rows
+            .get(view.cursor)
+            .is_some_and(actions::PaletteRow::selectable)
+        {
+            view.cursor = actions::palette_first(&rows);
+        }
+        // A new query is a new list: back to the top of it.
+        view.offset = 0;
+    };
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Enter => match view.activated() {
+            Some(id) => (None, Some(PaletteEffect(id))),
+            // Help mode, a section heading, a disabled row, or an empty
+            // result: Enter closes rather than doing nothing at all.
+            None => (None, None),
+        },
+        KeyCode::Up => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, -1);
+            (Some(view), None)
+        }
+        KeyCode::Down => {
+            let rows = view.rows();
+            view.cursor = actions::palette_step(&rows, view.cursor, 1);
+            (Some(view), None)
+        }
+        KeyCode::Backspace => {
+            view.query.pop();
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            view.query.push(c);
+            refresh(&mut view);
+            (Some(view), None)
+        }
+        _ => (Some(view), None),
+    }
+}
+
+/// The availability snapshot for whatever row the sidebar cursor is on --
+/// exactly the facts the context menu decides from, so the palette can never
+/// offer an action the menu says is unavailable (or the other way round).
+/// An empty roster yields the default context, in which every row action is
+/// `Hidden` and only the dashboard-wide ones are listed.
+/// Issue #354 phase 5: `summary` is "the cursor is parked on the sidebar's
+/// summary line", where the target is the dashboard itself -- `inspect` still
+/// applies, every per-session action is listed inert with its reason.
+pub(super) fn selected_action_context(
+    rows: &[ui::SidebarRow],
+    selected: usize,
+    panes: &[Pane],
+    retained: &VecDeque<EndedRow>,
+    summary: bool,
+) -> actions::ActionContext {
+    if summary {
+        return actions::ActionContext {
+            summary: true,
+            ..actions::ActionContext::default()
+        };
+    }
+    match rows.get(selected) {
+        Some(row) => menu_facts_for(row, panes, retained).action_context(),
+        None => actions::ActionContext::default(),
+    }
+}
+
+/// Builds the palette (or the help screen, which is the same list read-only)
+/// over whatever row is selected right now. `ctx` is snapshotted here, the
+/// same convention every other overlay follows.
+pub(super) fn build_palette_view(
+    mode: ui::PaletteMode,
+    ctx: actions::ActionContext,
+) -> ui::PaletteView {
+    let mut view = ui::PaletteView {
+        mode,
+        query: String::new(),
+        ctx,
+        cursor: 0,
+        offset: 0,
+    };
+    view.cursor = actions::palette_first(&view.rows());
+    view
+}
+
+/// What confirming/cancelling the quit confirmation dialog means -- pulled
+/// out of the event loop's own match arm (issue #202 phase 2b) so the "which
+/// key does what" decision is a pure, independently testable function; the
+/// actual shutdown sequence (`on_quit`/`render_shutting_down`/
+/// `shutdown_all`/breaking the loop) stays at the call site, since none of
+/// that is expressible from inside a pure reducer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitConfirmEffect {
+    Confirm,
+}
+
+pub fn quit_confirm_reduce(
+    working: Vec<String>,
+    key: KeyEvent,
+) -> (Option<Vec<String>>, Option<QuitConfirmEffect>) {
+    match key.code {
+        KeyCode::Enter => (None, Some(QuitConfirmEffect::Confirm)),
+        KeyCode::Esc => (None, None),
+        _ => (Some(working), None),
+    }
+}
+
+/// What confirming a handover pick means -- the operator's own choice, not
+/// yet applied to a real pane. Pulled out of the event loop's own match arm
+/// (issue #202 phase 2b) the same way `quit_confirm_reduce` was: the actual
+/// swap (looking the target pane up by short id, checking it is `Idle`,
+/// calling `handover_pane`) stays at the call site, since it needs mutable
+/// access to `panes`/`errors` a pure reducer cannot have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoverEffect {
+    Swap {
+        target_short: String,
+        target_agent: String,
+        target_model: String,
+    },
+}
+
+pub fn handover_overlay_reduce(
+    mut draft: ui::HandoverDraft,
+    key: KeyEvent,
+) -> (Option<ui::HandoverDraft>, Option<HandoverEffect>) {
+    match key.code {
+        KeyCode::Esc => (None, None),
+        KeyCode::Up => {
+            draft.cursor = move_cursor(draft.cursor, draft.items.len(), -1);
+            (Some(draft), None)
+        }
+        KeyCode::Down => {
+            draft.cursor = move_cursor(draft.cursor, draft.items.len(), 1);
+            (Some(draft), None)
+        }
+        KeyCode::Enter => match draft.items.get(draft.cursor).cloned() {
+            Some((target_agent, _tier, target_model)) => (
+                None,
+                Some(HandoverEffect::Swap {
+                    target_short: draft.target_short.clone(),
+                    target_agent,
+                    target_model,
+                }),
+            ),
+            None => (Some(draft), None),
+        },
+        _ => (Some(draft), None),
+    }
+}
+
+/// Builds the restore dialog's own view from every roster candidate the
+/// caller already filtered down to workers only (`run_dashboard`'s startup
+/// path excludes `roster::ROLE_ORCHESTRATOR` before this is ever called).
+/// Every entry defaults to checked, so a bare Enter restores the whole
+/// roster -- the common case -- and unchecking is the exception the operator
+/// opts into.
+pub(super) fn build_restore_view(candidates: &[roster::RosterPane]) -> ui::RestoreView {
+    ui::RestoreView {
+        entries: candidates
+            .iter()
+            .map(|pane| ui::RestoreEntry {
+                label: format!("{} {} ({})", pane.title, pane.agent, pane.short),
+                checked: true,
+            })
+            .collect(),
+        cursor: 0,
+        offset: 0,
+    }
+}
+
+/// Pure: how many of `wanted` restore candidates fit alongside `live` panes
+/// already running, and how many are therefore skipped.
+///
+/// R7: restoring bypassed the pane cap entirely -- every other way a pane is
+/// created (the spawn-request channel, the `Ctrl+A s` dialog) goes through
+/// `fulfill_spawn_request`'s check, but the restore dialog spawned straight
+/// from the roster. A stale roster from a busy session could therefore reopen
+/// far more harness processes than `dash.max_panes` allows, at startup, before
+/// the operator had touched anything.
+pub(super) fn restore_budget(live: usize, max_panes: usize, wanted: usize) -> (usize, usize) {
+    let room = max_panes.saturating_sub(live);
+    let take = wanted.min(room);
+    (take, wanted - take)
+}
+
+/// Pure: splits a confirmed restore selection (`RestoreEffect::Confirm`'s own
+/// indices, into `restore_candidates`) into what this launch may actually
+/// spawn -- the first `take` of them, per `restore_budget` -- and the
+/// `RosterPane`s the pane cap forced it to skip.
+///
+/// G3: the skipped indices used to be dropped on the floor at the call site
+/// (`indices.into_iter().take(take)` simply never looked at the rest). The
+/// restore dialog closes on `Confirm` regardless of the cap, `restore_
+/// candidates` itself is never consulted again after this tick, and
+/// `roster::take_roster` already consumed the on-disk roster reading it --
+/// so those sessions were lost for good, not merely left unrestored this
+/// launch. Returned as owned `RosterPane`s, not indices, so the caller can
+/// carry them all the way to `on_quit` (as `deferred_restore`) without
+/// keeping `restore_candidates` borrowed for the rest of the session.
+pub(super) fn partition_restore_selection(
+    indices: Vec<usize>,
+    restore_candidates: &[roster::RosterPane],
+    take: usize,
+) -> (Vec<roster::RosterPane>, Vec<roster::RosterPane>) {
+    let mut to_spawn = Vec::new();
+    let mut deferred = Vec::new();
+    for (position, idx) in indices.into_iter().enumerate() {
+        let Some(candidate) = restore_candidates.get(idx) else {
+            continue;
+        };
+        if position < take {
+            to_spawn.push(candidate.clone());
+        } else {
+            deferred.push(candidate.clone());
+        }
+    }
+    (to_spawn, deferred)
+}
+
+/// Builds the `turn_env` a restored dashboard pane spawns with -- everything
+/// `spawn_restored_pane` pushes ahead of `Pane::spawn`: the base env `build_
+/// turn_env` produces (including the durable interactive-launch pin, when
+/// `candidate` carried one), a fresh spawn-request channel of its own
+/// (Security review Finding 1), and the roster's group binding when the
+/// candidate carried one (Security review Finding 6). Factored out of
+/// `spawn_restored_pane` so the exact fields it adds are pinned directly,
+/// independent of a real pty spawn's behavior -- the same reasoning
+/// `trusted_launch_mode`'s own doc comment gives for testing a launch-mode
+/// decision as a pure function rather than reading a real spawned child's
+/// own environment back.
+///
+/// Issue #160 finding 1, review round (2026-08-28): a restore used to
+/// unconditionally pin `LaunchMode::Interactive`, which handed every worker
+/// pane that survived a dashboard quit+restore cycle an interactive posture
+/// it may have been explicitly REFUSED at spawn time (a file-dropped spawn
+/// request is untrusted and always launches `Headless` --
+/// `FILE_DROP_TRUSTED_INTERACTIVE`). The correct rule (issue #160: "on the
+/// same terms as a freshly spawned one") is to restore whatever launch mode
+/// the pane ORIGINALLY had, recorded on the roster entry at quit time
+/// (`RosterPane::interactive`, `#[serde(default)]` so an old-format roster
+/// entry with the field absent restores fail-closed -- no pin, today's
+/// pre-fix-round behavior -- rather than defaulting to the permissive side).
+///
+/// Returns the built `turn_env` alongside the freshly minted pane channel
+/// path: `spawn_restored_pane` needs both, the env to spawn with and the
+/// path to hand the spawned `Pane` via `set_intake_dir`.
+pub(super) fn restored_pane_turn_env(
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    candidate: &roster::RosterPane,
+    requests_dir: &Path,
+    errors: &mut ErrorLog,
+) -> (Vec<(String, String)>, PathBuf) {
+    let mode = if candidate.interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    };
+    let (mut turn_env, turn_env_err) = build_turn_env(
+        cfg,
+        state,
+        repo,
+        &candidate.agent,
+        &candidate.session_id,
+        mode,
+    );
+    if let Some(e) = turn_env_err {
+        push_error(errors, e);
+    }
+    // Security review Finding 1: a restored pane is a pane like any other and
+    // gets its own channel -- a fresh token, since the one it carried before
+    // the quit died with that dashboard's token directory.
+    let pane_channel = mint_pane_channel(requests_dir, errors);
+    turn_env.push((
+        spawnreq::DASH_REQUESTS_ENV.to_string(),
+        pane_channel.display().to_string(),
+    ));
+    // Security review Finding 6: and the group binding travels back with it,
+    // the same pair `fulfill_spawn_request` pushes for a fresh spawn -- a
+    // restore that dropped it left the pane's own further delegations
+    // ungrouped, outside the child limit and the token ceiling its batch was
+    // launched under.
+    if let Some(group_id) = &candidate.work_group_id {
+        turn_env.push((super::agent::WORK_GROUP_ENV.to_string(), group_id.clone()));
+    }
+    // Issue #249/#250 review (Fix 4): and the parent lineage travels back
+    // with it too, the same pair `fulfill_spawn_request` pushes from
+    // `verified_parent` at first spawn -- a restore that dropped it left the
+    // restored child's own real process env with no `PARENT_SESSION_ENV` at
+    // all, so a nested `zirv ctx` call inside it (e.g. `zirv ctx inbox`)
+    // rendered this same pane's own parent's mail as peer even though this
+    // dashboard's own sweep (`Pane::parent_session`, restored separately via
+    // `set_parent_session`) still labels it steering.
+    if let Some(parent) = &candidate.parent_session {
+        turn_env.push((super::agent::PARENT_SESSION_ENV.to_string(), parent.clone()));
+    }
+    (turn_env, pane_channel)
+}
+
+/// Spawns one roster candidate back as a fresh pane: resolves its
+/// adapter (re-checked against the live gate, same "data, never authority"
+/// discipline `fulfill_spawn_request` already holds a spawn request to --
+/// an agent an operator disabled since the last quit must not come back just
+/// because it was in the roster), builds its argv via `roster::restore_argv`,
+/// and spawns it reusing the roster entry's own `session_id` (so its
+/// registry short id, and the address mail/nudge reach it at, are the same
+/// as before the quit -- restoring is continuing the same session, not
+/// starting a new one with the old one's history).
+///
+/// H3: on either failure path the candidate is pushed into `deferred_restore`
+/// -- the same vec G3 added for candidates the pane cap skipped. Without
+/// this, a candidate whose spawn failed (a harness binary gone missing, an
+/// adapter disabled since the last quit) was already consumed out of the
+/// roster by `roster::take_roster` and, once `errors` scrolled off screen,
+/// gone for good: `on_quit` only ever writes back *live* panes plus whatever
+/// this vec carries, and a failed spawn is neither.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_restored_pane(
+    candidate: &roster::RosterPane,
+    panes: &mut Vec<Pane>,
+    nudge_queues: &mut Vec<VecDeque<String>>,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    repo: &Path,
+    size: (u16, u16),
+    requests_dir: &Path,
+    errors: &mut ErrorLog,
+    deferred_restore: &mut Vec<roster::RosterPane>,
+) {
+    // Issue #490 (roadmap N21 item A): a native pane comes back through the
+    // SAME seam a fresh one opens on -- `open_native_pane`, and therefore
+    // `resolve_attach`. That is the whole point of routing the restore here
+    // rather than reconstructing a session: if the persistent runtime is
+    // still holding this seat's conversation, the restored pane attaches to
+    // it instead of opening a second in-process supervisor over it.
+    if candidate.native {
+        match Pane::spawn_native(
+            cfg,
+            state,
+            &super::config::env_from_process(),
+            repo,
+            sessions::Verb::Dash,
+            candidate.title.clone(),
+            size,
+            native_pane::NativeDashboardSpec {
+                repo: repo.to_path_buf(),
+                role: candidate.role.clone(),
+                route: None,
+                writing: true,
+                provider: None,
+                seat: None,
+                initial_input: None,
+            },
+        ) {
+            Ok(mut pane) => {
+                pane.set_report_to(candidate.report_to.clone());
+                if candidate.report_reminder_sent {
+                    pane.mark_report_reminder_sent();
+                }
+                pane.settled_mail_sent = candidate.settled_mail_sent;
+                pane.set_work_group_id(candidate.work_group_id.clone());
+                pane.set_budget_tokens(candidate.budget_tokens);
+                pane.set_parent_session(candidate.parent_session.clone());
+                panes.push(pane);
+                nudge_queues.push(VecDeque::new());
+            }
+            Err(e) => {
+                push_error(errors, format!("restore {}: {e}", candidate.short));
+                deferred_restore.push(candidate.clone());
+            }
+        }
+        return;
+    }
+    let adapter = match adapters::select(Some(&candidate.agent), &[], cfg) {
+        Ok(adapter) => adapter,
+        Err(e) => {
+            push_error(errors, format!("restore {}: {e}", candidate.short));
+            deferred_restore.push(candidate.clone());
+            return;
+        }
+    };
+    let argv = roster::restore_argv(adapter.as_ref(), candidate);
+    let spec = PaneSpec {
+        agent_name: candidate.agent.clone(),
+        argv,
+        // Security review Finding 6: the role the roster recorded, not a
+        // hardcoded `Worker`. A restored coordinator used to come back
+        // demoted -- refused its own onward delegation by the depth cap, and
+        // no longer able to close the group it still owned. An unrecognised
+        // label (a roster written by a future build) falls back to `Worker`,
+        // the least-privileged reading, exactly as `spawnreq::role_of` does.
+        role: prompt::PromptRole::from_label(&candidate.role).unwrap_or(prompt::PromptRole::Worker),
+        verb: sessions::Verb::Dash,
+        session_id: candidate.session_id.clone(),
+        title: candidate.title.clone(),
+    };
+
+    let (turn_env, pane_channel) =
+        restored_pane_turn_env(cfg, state, repo, candidate, requests_dir, errors);
+
+    match Pane::spawn(
+        spec,
+        state,
+        repo,
+        repo,
+        size,
+        &turn_env,
+        adapter.capabilities().turn_signal,
+        Duration::from_millis(cfg.dash.idle_quiet_ms),
+    ) {
+        Ok(mut pane) => {
+            // F3 (review, PR #116): restore the report-back target and
+            // reminder-sent state the roster carried for this pane.
+            // `set_report_to` always resets `report_reminder_sent` to
+            // `false` (the right default for a *freshly spawned* pane), so
+            // the sent flag is restored afterwards, only when the roster
+            // says it was already true -- a restore resurrects the SAME
+            // logical session, so an already-reminded worker must not be
+            // reminded again (contrast `Pane::handover`'s F5 reset, which
+            // is right for a successor session, not this one).
+            pane.set_report_to(candidate.report_to.clone());
+            if candidate.report_reminder_sent {
+                pane.mark_report_reminder_sent();
+            }
+            pane.settled_mail_sent = candidate.settled_mail_sent;
+            pane.set_intake_dir(pane_channel);
+            pane.set_work_group_id(candidate.work_group_id.clone());
+            pane.set_budget_tokens(candidate.budget_tokens);
+            // Issue #249/#250 review (Fix 4): restores this pane's own
+            // dashboard-side parent lineage (mirrors `restored_pane_turn_
+            // env`'s identical re-export into the restored child's own real
+            // process env, just above).
+            pane.set_parent_session(candidate.parent_session.clone());
+            panes.push(pane);
+            nudge_queues.push(VecDeque::new());
+        }
+        Err(e) => {
+            push_error(errors, format!("restore {}: {e}", candidate.short));
+            deferred_restore.push(candidate.clone());
+        }
+    }
+}
+
+// Task 9: idle-gated visible intervention -- a per-pane nudge queue drained
+// only once the pane is `Idle`, plus a once-per-tick mail sweep that injects
+// swept mail the same visible way. Both share the same read-once discipline
+// mail delivery already holds itself to elsewhere (`exec`/`loop`): a message
+// is only ever marked consumed after it was actually shown to the agent.
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::*;
+    use super::actions::{
+        MENU_ENDED, MENU_EXITED_CLEAN, MENU_NOT_ATTACHED, MENU_NOT_RETAINED, MENU_STILL_RUNNING,
+    };
+    use super::*;
+
+    /// `Esc`, `Enter`, `q` and `a` all acknowledge; only `a` keeps the dialog
+    /// open, and the caret keys acknowledge nothing.
+    #[test]
+    fn the_errors_dialog_acknowledges_on_close_and_on_the_a_hint() {
+        let view = ui::ErrorsView {
+            items: vec![err_item("boom"), err_item("bang")],
+            cursor: 0,
+            offset: 0,
+            mark: 0,
+        };
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            let (next, ack) = errors_overlay_reduce(view.clone(), key(code, KeyModifiers::NONE));
+            assert!(next.is_none(), "{code:?} closes");
+            assert!(ack.is_some(), "{code:?} acknowledges");
+        }
+        let (next, ack) =
+            errors_overlay_reduce(view.clone(), key(KeyCode::Char('a'), KeyModifiers::NONE));
+        let next = next.expect("`a` acknowledges in place, without closing");
+        assert!(ack.is_some());
+        assert!(
+            next.items.iter().all(|i| i.acked),
+            "the rows go dim where they are"
+        );
+        let (next, ack) = errors_overlay_reduce(view, key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(next.expect("still open").cursor, 1);
+        assert!(ack.is_none(), "moving the caret is not reading them");
+    }
+
+    #[test]
+    fn mail_overlay_esc_while_browsing_closes_the_overlay() {
+        let (next, effect) = mail_overlay_reduce(
+            ui::MailView::default(),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_cursor_clamps_within_bounds() {
+        let view = ui::MailView {
+            items: vec![
+                (PathBuf::from("/a"), "claude".to_string(), "one".to_string()),
+                (PathBuf::from("/b"), "codex".to_string(), "two".to_string()),
+            ],
+            cursor: 0,
+            offset: 0,
+            compose: None,
+        };
+
+        let (next, _) = mail_overlay_reduce(view.clone(), key(KeyCode::Down, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.cursor, 1);
+
+        // Past the last row: clamps rather than overflowing.
+        let (next, _) = mail_overlay_reduce(next, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(next.expect("stays open").cursor, 1);
+
+        // Up from row 0 saturates at 0.
+        let (next, _) = mail_overlay_reduce(view, key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(next.expect("stays open").cursor, 0);
+    }
+
+    #[test]
+    fn mail_overlay_c_opens_compose_and_typing_accumulates_the_draft() {
+        let (next, effect) = mail_overlay_reduce(ui::MailView::default(), press('c'));
+        let next = next.expect("stays open");
+        assert!(next.compose.is_some(), "c opens the compose draft");
+        assert!(effect.is_none());
+
+        let (next, _) = mail_overlay_reduce(next, press('h'));
+        let (next, _) = mail_overlay_reduce(next.expect("stays open"), press('i'));
+        let draft = next.expect("stays open").compose.expect("still composing");
+        assert_eq!(draft.body, "hi");
+    }
+
+    #[test]
+    fn mail_overlay_backspace_edits_the_compose_draft() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "hix".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, _) = mail_overlay_reduce(view, key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            next.expect("stays open")
+                .compose
+                .expect("still composing")
+                .body,
+            "hi"
+        );
+    }
+
+    #[test]
+    fn mail_overlay_esc_while_composing_cancels_only_the_draft() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "half-written".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open; only the draft is cancelled");
+        assert!(next.compose.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_empty_compose_body_is_a_noop() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft::default()),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(next.compose.is_some(), "still composing, nothing was sent");
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn mail_overlay_enter_while_composing_emits_a_send_effect() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "heads up".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open");
+        assert!(next.compose.is_none(), "compose closes on submit");
+        match effect {
+            Some(ui::MailEffect::Send(msg)) => {
+                assert_eq!(msg.to, "any");
+                assert_eq!(msg.body, "heads up");
+            }
+            other => panic!("expected a Send effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mail_overlay_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn mail_overlay_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
+    fn mail_overlay_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let view = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: String::new(),
+                body: "line one\\".to_string(),
+            }),
+            ..ui::MailView::default()
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.compose.expect("still composing").body, "line one\n");
+        assert!(effect.is_none(), "backslash+enter must not submit");
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_item_emits_consume_and_removes_it_from_the_list() {
+        let view = ui::MailView {
+            items: vec![(PathBuf::from("/a"), "claude".to_string(), "one".to_string())],
+            cursor: 0,
+            offset: 0,
+            compose: None,
+        };
+        let (next, effect) = mail_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(
+            next.items.is_empty(),
+            "the read item is removed from the view"
+        );
+        assert_eq!(effect, Some(ui::MailEffect::Consume(PathBuf::from("/a"))));
+    }
+
+    #[test]
+    fn mail_overlay_enter_on_an_empty_list_is_a_noop() {
+        let (next, effect) = mail_overlay_reduce(
+            ui::MailView::default(),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(next.is_some());
+        assert!(effect.is_none());
+    }
+
+    fn memory_view(entries: Vec<(&str, &str, &str)>) -> ui::MemoryView {
+        ui::MemoryView {
+            entries: entries
+                .into_iter()
+                .map(|(k, a, b)| (k.to_string(), a.to_string(), b.to_string()))
+                .collect(),
+            cursor: 0,
+            offset: 0,
+            input: None,
+        }
+    }
+
+    #[test]
+    fn memory_overlay_esc_while_browsing_closes_the_overlay() {
+        let (next, effect) = memory_overlay_reduce(
+            ui::MemoryView::default(),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_cursor_clamps_on_an_empty_list() {
+        let (next, _) = memory_overlay_reduce(
+            ui::MemoryView::default(),
+            key(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(next.expect("stays open").cursor, 0);
+    }
+
+    #[test]
+    fn memory_overlay_r_prefills_input_from_the_selected_entrys_body() {
+        let view = memory_view(vec![(
+            "build-cmd",
+            "written 1d ago, verified 1d ago",
+            "cargo build",
+        )]);
+        let (next, effect) = memory_overlay_reduce(view, press('r'));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("cargo build".to_string()));
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_esc_while_editing_cancels_only_the_edit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("half-typed".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        let next = next.expect("overlay stays open");
+        assert!(next.input.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn memory_overlay_enter_while_editing_emits_remember_and_exits_edit_mode() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert!(next.input.is_none());
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Remember {
+                key: "build-cmd".to_string(),
+                body: "new body".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn memory_overlay_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn memory_overlay_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
+    fn memory_overlay_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let mut view = memory_view(vec![("build-cmd", "age", "old body")]);
+        view.input = Some("new body\\".to_string());
+        let (next, effect) = memory_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, Some("new body\n".to_string()));
+        assert!(effect.is_none(), "backslash+enter must not submit");
+    }
+
+    #[test]
+    fn memory_overlay_d_emits_forget_and_removes_the_entry_locally() {
+        let view = memory_view(vec![("drop-me", "age", "body")]);
+        let (next, effect) = memory_overlay_reduce(view, press('d'));
+        let next = next.expect("stays open");
+        assert!(next.entries.is_empty());
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Forget("drop-me".to_string()))
+        );
+    }
+
+    #[test]
+    fn memory_overlay_v_emits_verify_without_changing_the_list() {
+        let view = memory_view(vec![("build-cmd", "age", "body")]);
+        let (next, effect) = memory_overlay_reduce(view, press('v'));
+        let next = next.expect("stays open");
+        assert_eq!(next.entries.len(), 1, "verify does not remove the entry");
+        assert_eq!(
+            effect,
+            Some(ui::MemoryEffect::Verify("build-cmd".to_string()))
+        );
+    }
+
+    // The disk-reading half: `build_mail_view`/`build_memory_view`.
+
+    #[test]
+    fn build_mail_view_lists_every_message_visible_to_the_operator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "s1".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: None,
+                sent: 1,
+                body: "hello world".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+
+        let view = build_mail_view(&state, &repo);
+        assert_eq!(view.items.len(), 1);
+        assert_eq!(view.items[0].1, "claude");
+        assert_eq!(view.items[0].2, "hello world");
+    }
+
+    #[test]
+    fn build_memory_view_lists_every_entry_with_its_age() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let slug = super::super::state::repo_slug(&repo);
+        let now = super::super::state::now_secs();
+        memory::remember(
+            &state,
+            &slug,
+            &memory::Entry {
+                key: "build-cmd".to_string(),
+                written_by: "claude".to_string(),
+                written: now,
+                verified: now,
+                source: "explicit".to_string(),
+                body: "cargo build".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            },
+            &cfg,
+        )
+        .expect("remember");
+
+        let view = build_memory_view(&state, &repo);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].0, "build-cmd");
+        assert_eq!(view.entries[0].2, "cargo build");
+        assert!(view.entries[0].1.contains("written"));
+    }
+
+    // The executor half: `apply_mail_effect`/`apply_memory_effect`.
+
+    /// D2: the identity is derived exactly as `run_dashboard` derives it --
+    /// `sessions::short_id` of the dashboard's own session id -- rather than
+    /// handed in as a literal, so this test would notice the derivation moving
+    /// back to anything pane-dependent.
+    #[test]
+    fn apply_mail_effect_send_stamps_identity_and_stores_the_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let mut errors = ErrorLog::default();
+
+        let session_id = "77777777-2222-4333-8444-555555555555";
+        let dashboard_short = sessions::short_id(session_id);
+        let msg = mail::Message {
+            from_session: String::new(),
+            from_agent: String::new(),
+            to: "any".to_string(),
+            to_session: None,
+            sent: 0,
+            body: "heads up".to_string(),
+        };
+        apply_mail_effect(
+            ui::MailEffect::Send(msg),
+            &state,
+            &repo,
+            &cfg,
+            &dashboard_short,
+            "claude",
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "got errors: {errors:?}");
+
+        let slug = super::super::state::repo_slug(&repo);
+        let listed = mail::list(&state, &slug, None, None).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.from_session, dashboard_short);
+        assert_eq!(listed[0].1.from_agent, "claude");
+    }
+
+    /// A1-3: `Ctrl+A e` acknowledges the errors the operator actually saw.
+    /// An error that arrived AFTER the dialog took its snapshot was never on
+    /// screen, so closing the dialog must leave the sticky `⚠` up for it.
+    #[test]
+    fn acknowledging_the_errors_dialog_never_clears_an_error_it_never_showed() {
+        let now = Instant::now();
+        let mut errors = ErrorLog::default();
+        errors.record("supervisor a failed".to_string(), now);
+        let view = build_errors_view(&errors, now);
+        errors.record("supervisor b failed".to_string(), now);
+
+        let (next, ack) = errors_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none(), "Esc closes the dialog");
+        errors.acknowledge(ack.expect("Esc acknowledges on the way out").mark);
+
+        assert_eq!(
+            errors.sticky_line().as_deref(),
+            Some("supervisor b failed"),
+            "the error that arrived after the snapshot was never seen: {errors:?}"
+        );
+    }
+
+    // F11: the spawn dialog's own reducer.
+
+    fn type_line(line: &str) -> ui::SpawnDraft {
+        let mut draft = ui::SpawnDraft::default();
+        for c in line.chars() {
+            let (next, effect) = spawn_overlay_reduce(draft, press(c));
+            assert!(effect.is_none(), "typing emits no effect");
+            draft = next.expect("typing keeps the dialog open");
+        }
+        draft
+    }
+
+    #[test]
+    fn spawn_dialog_enter_splits_the_agent_from_the_prompt() {
+        let draft = type_line("claude fix the failing tests");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "a submitted dialog closes");
+        assert_eq!(
+            effect,
+            Some(SpawnEffect::Submit {
+                agent: "claude".to_string(),
+                prompt: "fix the failing tests".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn spawn_dialog_shift_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = type_line("claude");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude\n");
+        assert!(effect.is_none(), "shift+enter must not submit");
+    }
+
+    #[test]
+    fn spawn_dialog_alt_enter_inserts_a_newline_and_does_not_submit() {
+        let draft = type_line("claude");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::ALT));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude\n");
+        assert!(effect.is_none(), "alt+enter must not submit");
+    }
+
+    #[test]
+    fn spawn_dialog_backslash_enter_replaces_the_backslash_with_a_newline() {
+        let draft = type_line("claude line one\\");
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.input, "claude line one\n");
+        assert!(effect.is_none(), "backslash+enter must not submit");
+    }
+
+    #[test]
+    fn spawn_dialog_needs_both_an_agent_and_a_prompt() {
+        for line in ["", "   ", "claude", "claude   "] {
+            let draft = type_line(line);
+            let (next, effect) =
+                spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                next.is_some(),
+                "the dialog stays open so the typed text is not lost: {line:?}"
+            );
+            assert_eq!(
+                effect,
+                Some(SpawnEffect::Notice(SPAWN_USAGE_NOTICE.to_string())),
+                "got no notice for {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_dialog_backspace_edits_and_esc_cancels() {
+        let draft = type_line("claudex");
+        let (next, _) = spawn_overlay_reduce(draft, key(KeyCode::Backspace, KeyModifiers::NONE));
+        let draft = next.expect("stays open");
+        assert_eq!(draft.input, "claude");
+
+        let (next, effect) = spawn_overlay_reduce(draft, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none(), "Esc closes the dialog");
+        assert!(effect.is_none(), "and asks for nothing");
+    }
+
+    /// The dialog does not re-implement the argv guard, the pane cap or the
+    /// agent gate: it submits, and the shared `fulfill_spawn_request` path
+    /// refuses. This pins that a flag-shaped prompt does reach that path
+    /// intact (rather than being silently mangled or split into flags here).
+    #[test]
+    fn spawn_dialog_submits_a_flag_shaped_prompt_for_the_shared_guard_to_refuse() {
+        let draft = type_line("claude --dangerously-skip-permissions");
+        let (_, effect) = spawn_overlay_reduce(draft, key(KeyCode::Enter, KeyModifiers::NONE));
+        match effect {
+            Some(SpawnEffect::Submit { prompt, .. }) => {
+                assert_eq!(prompt, "--dangerously-skip-permissions");
+                assert!(
+                    argv_unsafe_prompt(&prompt),
+                    "and the shared guard is what refuses it"
+                );
+            }
+            other => panic!("expected a Submit, got {other:?}"),
+        }
+    }
+
+    // Task 12: the startup restore dialog's pure reducer, `build_restore_view`,
+    // and `on_quit`'s own roster write.
+
+    fn restore_entry(label: &str, checked: bool) -> ui::RestoreEntry {
+        ui::RestoreEntry {
+            label: label.to_string(),
+            checked,
+        }
+    }
+
+    #[test]
+    fn restore_overlay_esc_skips_with_no_effect() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true)],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn restore_overlay_space_toggles_the_entry_under_the_cursor() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true), restore_entry("b", true)],
+            cursor: 1,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, press(' '));
+        let next = next.expect("stays open");
+        assert!(next.entries[0].checked, "untouched entry stays checked");
+        assert!(
+            !next.entries[1].checked,
+            "entry under the cursor toggles off"
+        );
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn restore_overlay_enter_confirms_only_the_checked_indices() {
+        let view = ui::RestoreView {
+            entries: vec![
+                restore_entry("a", true),
+                restore_entry("b", false),
+                restore_entry("c", true),
+            ],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "confirming closes the dialog");
+        assert_eq!(effect, Some(RestoreEffect::Confirm(vec![0, 2])));
+    }
+
+    #[test]
+    fn restore_overlay_enter_with_nothing_checked_still_confirms_an_empty_set() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", false)],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(effect, Some(RestoreEffect::Confirm(Vec::new())));
+    }
+
+    #[test]
+    fn restore_overlay_cursor_clamps_within_bounds() {
+        let view = ui::RestoreView {
+            entries: vec![restore_entry("a", true), restore_entry("b", true)],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, _) = restore_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
+        let next = next.expect("stays open");
+        assert_eq!(next.cursor, 1);
+
+        let (next, _) = restore_overlay_reduce(next, key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            next.expect("stays open").cursor,
+            1,
+            "past the last row clamps rather than overflowing"
+        );
+    }
+
+    // -- issue #354 phase 3: the context menu ------------------------------
+
+    fn menu_facts(short: &str) -> MenuFacts {
+        MenuFacts {
+            short: short.to_string(),
+            role: "worker".to_string(),
+            attached: true,
+            alive: true,
+            ended: false,
+            exit_code: None,
+            retained: false,
+            has_request: false,
+            cwd: Some("D:/repo".to_string()),
+        }
+    }
+
+    /// The enabled/disabled matrix, per row state. Every entry is always
+    /// present -- an operator who cannot see that `restore` exists cannot
+    /// learn why it is unavailable -- and every unavailable one carries a
+    /// reason.
+    #[test]
+    fn the_context_menu_offers_every_entry_and_says_why_each_is_unavailable() {
+        use ui::MenuAction as A;
+
+        // An alive, attached pane: everything that acts on a running child.
+        let alive = menu_entries(&menu_facts("aaaa1111"));
+        for action in [
+            A::Inspect,
+            A::Focus,
+            A::Nudge,
+            A::Mail,
+            A::Handover,
+            A::Stop,
+            A::OpenWorktree,
+            A::Evidence,
+        ] {
+            assert!(entry(&alive, action).enabled(), "{action:?}");
+        }
+        assert_eq!(
+            entry(&alive, A::Restore).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Retry).disabled.as_deref(),
+            Some(MENU_STILL_RUNNING)
+        );
+        assert_eq!(
+            entry(&alive, A::Dismiss).disabled.as_deref(),
+            Some(MENU_NOT_RETAINED)
+        );
+
+        // A view-only registry row: no pane to focus, stop or swap, but a
+        // nudge still reaches it through the headless marker path.
+        let view_only = MenuFacts {
+            attached: false,
+            cwd: None,
+            ..menu_facts("cccc3333")
+        };
+        let entries = menu_entries(&view_only);
+        for action in [A::Focus, A::Handover, A::Stop] {
+            assert_eq!(
+                entry(&entries, action).disabled.as_deref(),
+                Some(MENU_NOT_ATTACHED),
+                "{action:?}"
+            );
+        }
+        assert!(entry(&entries, A::Nudge).enabled());
+        assert_eq!(
+            entry(&entries, A::OpenWorktree).disabled.as_deref(),
+            Some(MENU_NO_CWD)
+        );
+
+        // An ended row with no kept request: restore and retry both say so.
+        let ended_no_request = MenuFacts {
+            attached: false,
+            alive: false,
+            ended: true,
+            exit_code: Some(0),
+            retained: true,
+            has_request: false,
+            ..menu_facts("bbbb2222")
+        };
+        let entries = menu_entries(&ended_no_request);
+        assert_eq!(
+            entry(&entries, A::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, A::Nudge).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert_eq!(
+            entry(&entries, A::Stop).disabled.as_deref(),
+            Some(MENU_ENDED)
+        );
+        assert!(entry(&entries, A::Dismiss).enabled());
+        // The inspector and its evidence section describe any row at all.
+        assert!(entry(&entries, A::Inspect).enabled());
+        assert!(entry(&entries, A::Evidence).enabled());
+
+        // An ended row with a kept request: restore is on, retry is not --
+        // it exited cleanly, so there is no failure to retry.
+        let ended_clean = MenuFacts {
+            has_request: true,
+            ..ended_no_request
+        };
+        let entries = menu_entries(&ended_clean);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert_eq!(
+            entry(&entries, A::Retry).disabled.as_deref(),
+            Some(MENU_EXITED_CLEAN)
+        );
+
+        // An ended row that failed: both are on.
+        let ended_failed = MenuFacts {
+            exit_code: Some(1),
+            ..ended_clean.clone()
+        };
+        let entries = menu_entries(&ended_failed);
+        assert!(entry(&entries, A::Restore).enabled());
+        assert!(entry(&entries, A::Retry).enabled());
+
+        // Whatever the row, the menu is the same shape in the same order.
+        for facts in [alive_facts(), ended_clean.clone(), view_only.clone()] {
+            let entries = menu_entries(&facts);
+            assert_eq!(entries.len(), 11);
+            assert_eq!(
+                entries.iter().map(|e| e.action).collect::<Vec<_>>(),
+                vec![
+                    A::Inspect,
+                    A::Focus,
+                    A::Nudge,
+                    A::Mail,
+                    A::Handover,
+                    A::Stop,
+                    A::Restore,
+                    A::OpenWorktree,
+                    A::Evidence,
+                    A::Retry,
+                    A::Dismiss,
+                ]
+            );
+            for e in &entries {
+                assert!(
+                    e.enabled() || e.disabled.as_ref().is_some_and(|r| !r.trim().is_empty()),
+                    "{:?} is disabled with no reason",
+                    e.action
+                );
+            }
+        }
+    }
+
+    fn alive_facts() -> MenuFacts {
+        menu_facts("aaaa1111")
+    }
+
+    /// The menu is opened for whatever row the gesture named, which is not
+    /// necessarily the selected one -- and the title says which.
+    #[test]
+    fn a_right_click_menu_targets_its_own_row_not_the_selection() {
+        let panes = vec![
+            pane_row("aaaa1111", "claude"),
+            pane_row("bbbb2222", "codex"),
+        ];
+        // Row 0 is selected; the menu is raised on row 1.
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let target = menu_facts_for(&rows[1], &[], &VecDeque::new());
+        let view = build_menu_view(&target);
+        assert_eq!(view.target, "bbbb2222");
+        assert!(
+            view.subject.contains("bbbb2222"),
+            "the menu title names its target: {}",
+            view.subject
+        );
+        assert_eq!(view.cursor, 0);
+        assert!(view.confirm.is_none());
+        // And `^A c` on the selection raises the menu for THAT row instead.
+        let selected = menu_facts_for(&rows[0], &[], &VecDeque::new());
+        assert_eq!(build_menu_view(&selected).target, "aaaa1111");
+    }
+
+    /// Enter activates, a letter jumps AND activates, a disabled entry is
+    /// inert, and Esc closes with no effect at all.
+    #[test]
+    fn the_menu_activates_on_enter_and_on_its_own_letters() {
+        let view = build_menu_view(&alive_facts());
+        // Enter on the first entry (`inspect`).
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('\0'));
+        assert!(next.is_some(), "an unknown key leaves the menu open");
+        assert!(effect.is_none());
+
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none(), "activating closes the menu");
+        assert_eq!(
+            effect,
+            Some(MenuEffect {
+                target: "aaaa1111".to_string(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+
+        // `e` jumps to `evidence` and fires it in one keystroke.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('e'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Evidence));
+
+        // `r` is `restore`, which is disabled for a live pane: the menu stays
+        // open on it and nothing happens.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('r'));
+        let next = next.expect("a disabled entry leaves the menu open");
+        assert_eq!(next.entries[next.cursor].action, ui::MenuAction::Restore);
+        assert!(effect.is_none());
+
+        // A letter no entry claims moves nothing.
+        let (next, effect) = menu_overlay_reduce(view.clone(), press('x'));
+        assert_eq!(next.expect("stays open").cursor, 0);
+        assert!(effect.is_none());
+
+        // Esc closes with no effect -- and the caller never touches focus.
+        let (next, effect) =
+            menu_overlay_reduce(view.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+
+        // j/k walk the menu, clamped at both ends.
+        let (down, _) = menu_overlay_reduce(view.clone(), press('j'));
+        assert_eq!(down.expect("stays open").cursor, 1);
+        let (up, _) = menu_overlay_reduce(view, press('k'));
+        assert_eq!(up.expect("stays open").cursor, 0, "clamps at the top");
+    }
+
+    /// `stop` is the one destructive entry, so it confirms inline first --
+    /// and backing out of the confirmation kills nothing.
+    #[test]
+    fn stop_confirms_inline_before_anything_is_killed() {
+        let view = build_menu_view(&alive_facts());
+        let (armed, effect) = menu_overlay_reduce(view, press('s'));
+        let armed = armed.expect("the confirmation keeps the menu open");
+        assert!(effect.is_none(), "nothing is stopped by arming it");
+        let index = armed.confirm.expect("the confirmation is armed");
+        assert_eq!(armed.entries[index].action, ui::MenuAction::Stop);
+
+        // `n` backs out: still open, still nothing stopped.
+        let (backed_out, effect) = menu_overlay_reduce(armed.clone(), press('n'));
+        let backed_out = backed_out.expect("stays open");
+        assert!(backed_out.confirm.is_none());
+        assert!(effect.is_none());
+        // ... and so does Esc.
+        let (escaped, effect) =
+            menu_overlay_reduce(armed.clone(), key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(escaped.expect("stays open").confirm.is_none());
+        assert!(effect.is_none());
+
+        // `y` confirms.
+        let (next, effect) = menu_overlay_reduce(armed.clone(), press('y'));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+        // A second Enter confirms too.
+        let (next, effect) = menu_overlay_reduce(armed, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(effect.map(|e| e.action), Some(ui::MenuAction::Stop));
+    }
+
+    // -- issue #354 phase 3: restore -----------------------------------------
+
+    /// A retained row that kept its spawn request is restorable and its cwd
+    /// is known, so `restore`, `retry` (it failed) and `open worktree` are
+    /// all on; one that kept nothing says exactly why.
+    #[test]
+    fn a_retained_row_is_restorable_only_while_its_spawn_request_is_kept() {
+        let request = spawn_request("do the work", Path::new("D:/repo"));
+        let mut retained: VecDeque<EndedRow> = VecDeque::new();
+        push_retained_ended(
+            &mut retained,
+            EndedRow {
+                short: "bbb22222".into(),
+                role: "worker".into(),
+                model: None,
+                harness: "claude".into(),
+                group_id: None,
+                parent: None,
+                budget: style::PLACEHOLDER.into(),
+                writer: style::PLACEHOLDER.into(),
+                cwd: "D:/repo".into(),
+                request: Some(request.clone()),
+                requested_by: Some("aaa11111".into()),
+                meta: EndedMeta {
+                    exit_code: 1,
+                    exited_at: 600,
+                    age_secs: Some(300),
+                },
+            },
+            MAX_RETAINED_ENDED_ROWS,
+        );
+        let metas = build_pane_rows(&[], &retained);
+        let rows = assemble_sidebar(&metas, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 900);
+        assert_eq!(
+            row_cwd("bbb22222", &[], &retained).as_deref(),
+            Some("D:/repo")
+        );
+        assert_eq!(row_cwd("nobody", &[], &retained), None);
+
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        assert!(facts.ended && facts.retained && facts.has_request);
+        let entries = menu_entries(&facts);
+        assert!(entry(&entries, ui::MenuAction::Restore).enabled());
+        assert!(entry(&entries, ui::MenuAction::Retry).enabled());
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+        assert!(entry(&entries, ui::MenuAction::OpenWorktree).enabled());
+
+        // Drop the kept request and the two relaunch entries say so, while
+        // the row itself is still there to be inspected and dismissed.
+        retained[0].request = None;
+        let facts = menu_facts_for(&rows[0], &[], &retained);
+        let entries = menu_entries(&facts);
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Restore).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert_eq!(
+            entry(&entries, ui::MenuAction::Retry).disabled.as_deref(),
+            Some(MENU_NO_REQUEST)
+        );
+        assert!(entry(&entries, ui::MenuAction::Dismiss).enabled());
+    }
+
+    /// Renders one overlay into a `width x height` frame and returns what
+    /// landed on the cells -- the same technique `ui`'s own render tests use,
+    /// reached from here so the dashboard inspector can be checked end to end.
+    fn render_overlay_text(width: u16, height: u16, overlay: &ui::Overlay) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| ui::render_overlay(f, f.area(), overlay, 0))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Issue #354 phase 5: the DASHBOARD-level inspector -- every section the
+    /// approved design names, filled from cached facts only.
+    #[test]
+    fn the_dashboard_inspector_reports_every_section_from_cached_facts() {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let usage = vec![ui::HarnessUsage {
+            name: "claude",
+            five_hour: Some(61.0),
+            seven_day: Some(18.0),
+            five_hour_detail: None,
+            seven_day_detail: None,
+        }];
+        let pool = vec![ui::HarnessStrip {
+            name: "claude".to_string(),
+            state: "ready".to_string(),
+            headroom_pct: Some(64.0),
+        }];
+        let workflow = workflow::ActiveWorkflowSummary {
+            kind: "feature",
+            step: "design".to_string(),
+            awaiting_approval: true,
+        };
+        let facts = DashboardFacts {
+            harness: "claude \u{b7} fable",
+            short: "a0000001",
+            seat: Some("gen 3"),
+            state_dir: "D:/state".to_string(),
+            uptime_secs: 840,
+            mouse: true,
+            sidebar_cols: 44,
+            facts_age_secs: 1,
+            rows: &rows,
+            spend: Some(AggregateSpendFacts {
+                failed: 2,
+                cost_micros: 420_000,
+                skipped_messages: 0,
+            }),
+            usage: &usage,
+            pool: &pool,
+            mail: Some((1, 0)),
+            workflow: Some(&workflow),
+            supervised: (1, 1),
+        };
+        let view = build_dashboard_inspector(&facts);
+        assert_eq!(view.target, DASHBOARD_TARGET);
+        assert_eq!(view.subject, "dashboard \u{b7} a0000001");
+        let names: Vec<&str> = view.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                INSPECT_DASH_HARNESS,
+                INSPECT_DASH_SESSIONS,
+                INSPECT_DASH_SPEND,
+                INSPECT_DASH_USAGE,
+                INSPECT_DASH_REPO,
+                INSPECT_DASH_DASHBOARD,
+            ]
+        );
+        let all = view.rows().join("\n");
+        assert!(all.contains("gen 3"), "{all}");
+        assert!(all.contains("14m"), "uptime reads as an age: {all}");
+        // Live/ended plus one line per glyph, every one of the six.
+        for glyph in ui::ALL_GLYPHS {
+            assert!(
+                all.contains(glyph.name()),
+                "missing {}: {all}",
+                glyph.name()
+            );
+        }
+        assert!(all.contains("headroom 64%"), "{all}");
+        assert!(all.contains("$0.42"), "{all}");
+        assert!(all.contains("5h 61%"), "{all}");
+        assert!(all.contains("1 broadcast"), "{all}");
+        assert!(all.contains("awaits approval"), "{all}");
+        assert!(all.contains("1 of 1 panes"), "{all}");
+        assert!(all.contains("D:/state"), "{all}");
+        assert!(all.contains("44 cols"), "{all}");
+    }
+
+    /// Nothing read yet: every unknown cell is the shared placeholder, never
+    /// a fabricated zero, and the dialog still draws at all three approved
+    /// frame sizes.
+    #[test]
+    fn the_dashboard_inspector_is_all_placeholders_and_renders_at_every_frame_size() {
+        let facts = DashboardFacts {
+            harness: "claude",
+            short: "a0000001",
+            seat: None,
+            state_dir: "D:/state".to_string(),
+            uptime_secs: 0,
+            mouse: false,
+            sidebar_cols: 44,
+            facts_age_secs: 0,
+            rows: &[],
+            spend: None,
+            usage: &[],
+            pool: &[],
+            mail: None,
+            workflow: None,
+            supervised: (0, 0),
+        };
+        let view = build_dashboard_inspector(&facts);
+        let all = view.rows().join("\n");
+        assert!(all.contains(style::PLACEHOLDER), "{all}");
+        assert!(
+            all.contains(&inspect_line("mouse", Some("off".to_string()))),
+            "mouse off says so: {all}"
+        );
+        // The usage section has no harnesses at all, so it draws the shared
+        // empty-section placeholder rather than vanishing.
+        assert!(
+            view.sections
+                .iter()
+                .any(|s| s.name == INSPECT_DASH_USAGE && s.lines.is_empty())
+        );
+        let overlay = ui::Overlay::Inspector(view);
+        for (w, h) in [(80u16, 20u16), (120, 40), (200, 50)] {
+            let text = render_overlay_text(w, h, &overlay);
+            // A2-3: the second operand used to repeat the first verbatim, so
+            // the subject the dialog is opened ON was never asserted at all.
+            assert!(text.contains("dashboard"), "{w}x{h}: {text}");
+            assert!(text.contains("a0000001"), "{w}x{h}: {text}");
+            assert!(text.contains("harness"), "{w}x{h}: {text}");
+        }
+    }
+
+    /// Both entry points the approved design names: `^A i` while the summary
+    /// line holds the cursor, and the summary line's own action menu.
+    #[test]
+    fn the_summary_line_opens_the_dashboard_inspector_by_key_and_by_menu() {
+        // The key: `^A i` is the same chord, and the availability table says
+        // it applies with the summary selected.
+        let ctx = selected_action_context(&[], 0, &[], &VecDeque::new(), true);
+        assert!(ctx.summary);
+        assert!(
+            actions::descriptor(actions::ActionId::Inspect)
+                .map(|d| (d.availability)(&ctx))
+                .is_some_and(|a| a.is_enabled())
+        );
+        assert_eq!(
+            actions::descriptor(actions::ActionId::Nudge)
+                .map(|d| (d.availability)(&ctx))
+                .and_then(|a| a.reason()),
+            Some(actions::MENU_SUMMARY_LINE),
+            "a per-session action stays listed, with its reason"
+        );
+        // The menu: every entry is present, `inspect` is the only live one,
+        // and activating it names the dashboard rather than a row.
+        let menu = build_summary_menu_view();
+        assert_eq!(menu.target, DASHBOARD_TARGET);
+        assert_eq!(menu.subject, "the dashboard");
+        assert_eq!(menu.entries.len(), 11);
+        let live: Vec<ui::MenuAction> = menu
+            .entries
+            .iter()
+            .filter(|e| e.enabled())
+            .map(|e| e.action)
+            .collect();
+        // `mail` is dashboard-wide, so it stays live here; every entry that
+        // needs a session is inert with its reason.
+        assert_eq!(live, vec![ui::MenuAction::Inspect, ui::MenuAction::Mail]);
+        let (next, effect) = menu_overlay_reduce(menu, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert_eq!(
+            effect,
+            Some(MenuEffect {
+                target: DASHBOARD_TARGET.to_string(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+    }
+
+    /// A row with no cached status at all still inspects: every section is
+    /// there, filled with the placeholder rather than missing.
+    #[test]
+    fn the_inspector_on_a_row_with_no_facts_yet_is_all_placeholders() {
+        let panes = vec![pane_row("aaaa1111", "claude")];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let view = build_inspector_view(&rows[0], None, &ErrorLog::default());
+        assert_eq!(view.sections.len(), 7);
+        let evidence = view
+            .sections
+            .iter()
+            .find(|s| s.name == INSPECT_EVIDENCE)
+            .expect("evidence section is never dropped");
+        assert!(evidence.lines.is_empty());
+        // An empty section still draws one placeholder row, so the dialog
+        // never silently loses a heading.
+        let drawn = view.rows();
+        let start = view.section_start(INSPECT_EVIDENCE);
+        assert_eq!(drawn[start], format!("{INSPECT_EVIDENCE}:"));
+        assert_eq!(drawn[start + 1], format!("  {}", style::PLACEHOLDER));
+        // Read-only: Esc closes, j/k scroll, nothing else does anything.
+        let (moved, _) = (
+            inspector_overlay_reduce(view.clone(), press('j')).expect("stays open"),
+            (),
+        );
+        assert_eq!(moved.cursor, 1);
+        assert!(inspector_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE)).is_none());
+    }
+
+    #[test]
+    fn build_restore_view_defaults_every_entry_to_checked_and_labels_it() {
+        let candidates = vec![roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: "sess-1".to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
+            short: "aaaa1111".to_string(),
+            title: "wrk claude".to_string(),
+            ..Default::default()
+        }];
+        let view = build_restore_view(&candidates);
+        assert_eq!(view.entries.len(), 1);
+        assert!(view.entries[0].checked);
+        assert!(
+            view.entries[0].label.contains("aaaa1111"),
+            "got {}",
+            view.entries[0].label
+        );
+    }
+
+    /// F6: an orchestrator roster entry never reaches `build_restore_view` or
+    /// `roster::restore_argv`. Its stored `session_id` is zirv's own uuid even
+    /// when the operator pinned the conversation themselves (see
+    /// `chat::dash_orchestrator_pane`), so resuming from it would ask the
+    /// harness for a conversation that never existed under that id -- and the
+    /// fresh launch has already spawned its own orchestrator anyway.
+    #[test]
+    fn the_orchestrator_is_never_offered_for_restore() {
+        let orchestrator = roster::RosterPane {
+            agent: "claude".to_string(),
+            session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            role: roster::ROLE_ORCHESTRATOR.to_string(),
+            short: "aaaa1111".to_string(),
+            title: "orch".to_string(),
+            ..Default::default()
+        };
+        let worker = roster::RosterPane {
+            agent: "codex".to_string(),
+            session_id: "22222222-2222-4333-8444-555555555555".to_string(),
+            role: prompt::PromptRole::Worker.label().to_string(),
+            short: "bbbb2222".to_string(),
+            title: "wrk codex".to_string(),
+            ..Default::default()
+        };
+        let taken = roster::Roster {
+            written: 1_000,
+            panes: vec![orchestrator, worker.clone()],
+        };
+
+        let candidates = restorable_candidates(taken);
+        assert_eq!(
+            candidates,
+            vec![worker],
+            "only workers survive the filter, so only workers ever reach restore_argv"
+        );
+        let view = build_restore_view(&candidates);
+        assert_eq!(view.entries.len(), 1);
+        assert!(
+            !view.entries[0].label.contains("orch"),
+            "and the dialog never offers one either: {:?}",
+            view.entries[0].label
+        );
+    }
+
+    // R7: restoring is creating panes, so it answers to the same cap.
+
+    #[test]
+    fn restore_budget_stops_at_the_pane_cap() {
+        assert_eq!(
+            restore_budget(0, 2, 3),
+            (2, 1),
+            "a roster of three under a cap of two restores two and reports one skipped"
+        );
+        assert_eq!(
+            restore_budget(1, 2, 3),
+            (1, 2),
+            "the orchestrator already occupies a slot"
+        );
+        assert_eq!(
+            restore_budget(2, 2, 3),
+            (0, 3),
+            "a full dashboard restores nothing"
+        );
+        assert_eq!(
+            restore_budget(5, 2, 3),
+            (0, 3),
+            "and saturates rather than wrapping"
+        );
+        assert_eq!(
+            restore_budget(0, 9, 3),
+            (3, 0),
+            "room for everything skips nothing"
+        );
+    }
+
+    /// G3: a confirmed selection under the pane cap is split into what gets
+    /// spawned (the first `take`, per `restore_budget`) and what the cap
+    /// forced this launch to defer -- and the deferred half must still be the
+    /// original `RosterPane`s, not merely dropped indices.
+    #[test]
+    fn partition_restore_selection_defers_what_the_cap_skips() {
+        let candidates = vec![
+            restore_pane("aaaa1111", "11111111-2222-4333-8444-555555555555"),
+            restore_pane("bbbb2222", "22222222-2222-4333-8444-555555555555"),
+            restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555"),
+        ];
+
+        // cap 2, roster 3, confirm all -> 2 to spawn, the third deferred.
+        let (take, _skipped) = restore_budget(0, 2, 3);
+        let (to_spawn, deferred) = partition_restore_selection(vec![0, 1, 2], &candidates, take);
+
+        assert_eq!(to_spawn, vec![candidates[0].clone(), candidates[1].clone()]);
+        assert_eq!(deferred, vec![candidates[2].clone()]);
+    }
+
+    #[test]
+    fn partition_restore_selection_defers_nothing_under_budget() {
+        let candidates = vec![restore_pane(
+            "aaaa1111",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let (take, _skipped) = restore_budget(0, 9, 1);
+        let (to_spawn, deferred) = partition_restore_selection(vec![0], &candidates, take);
+
+        assert_eq!(to_spawn, candidates);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn partition_restore_selection_ignores_a_stale_index() {
+        let candidates = vec![restore_pane(
+            "aaaa1111",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let (to_spawn, deferred) = partition_restore_selection(vec![5], &candidates, 1);
+
+        assert!(to_spawn.is_empty());
+        assert!(deferred.is_empty());
+    }
+
+    /// Issue #160 finding 1, review round (2026-08-28): a restore must
+    /// relaunch a pane "on the same terms as a freshly spawned one" -- a
+    /// worker pane that WAS interactive-pinned at its original spawn
+    /// (`RosterPane::interactive == true`, recorded from `Pane::launch_mode`
+    /// at quit time) gets the pin back on restore. Also FINDING 3: asserts
+    /// all three env pairs `restored_pane_turn_env`'s own doc comment claims
+    /// are pinned directly -- `DASH_REQUESTS_ENV` and `WORK_GROUP_ENV` had
+    /// zero coverage before this round even though the doc comment claimed
+    /// otherwise.
+    #[test]
+    fn restored_pane_turn_env_pins_interactive_when_the_original_pane_was_interactive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.interactive = true;
+        candidate.work_group_id = Some("wg-42".to_string());
+        let cfg = CtxConfig::default();
+        let mut errors = ErrorLog::default();
+
+        let (turn_env, pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            turn_env.contains(&(
+                super::super::adapters::LAUNCH_MODE_ENV.to_string(),
+                super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE.to_string()
+            )),
+            "a restored pane that was originally interactive-pinned must carry the durable \
+             interactive-launch pin again: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                spawnreq::DASH_REQUESTS_ENV.to_string(),
+                pane_channel.display().to_string()
+            )),
+            "a restored pane gets its own fresh spawn-request channel: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                super::super::agent::WORK_GROUP_ENV.to_string(),
+                "wg-42".to_string()
+            )),
+            "the roster's group binding must travel back with the restored pane: {turn_env:?}"
+        );
+    }
+
+    /// Fix 4 (issue #249/#250 review): the roster's own recorded parent
+    /// lineage travels back with a restored pane too, the same way the
+    /// group binding above does -- without this, a quit/restore round-trip
+    /// silently downgraded a genuine worker's steering mail to peer, since
+    /// the restored child's own real process env carried no `PARENT_
+    /// SESSION_ENV` at all.
+    #[test]
+    fn restored_pane_turn_env_carries_the_roster_parent_session_forward() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.parent_session = Some("orch0001".to_string());
+        let cfg = CtxConfig::default();
+        let mut errors = ErrorLog::default();
+
+        let (turn_env, _pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            turn_env.contains(&(
+                super::super::agent::PARENT_SESSION_ENV.to_string(),
+                "orch0001".to_string()
+            )),
+            "the roster's own parent lineage must travel back with the restored pane: \
+             {turn_env:?}"
+        );
+    }
+
+    /// The other half of Fix 4: a roster entry with no recorded parent (an
+    /// old-format entry, or a pane that genuinely never had one) must not
+    /// fabricate one -- no `PARENT_SESSION_ENV` pair at all, the same
+    /// fail-safe shape `restored_pane_turn_env_restores_without_the_pin_for_
+    /// a_non_interactive_worker_pane` proves for the interactive pin.
+    #[test]
+    fn restored_pane_turn_env_carries_no_parent_session_when_the_roster_had_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let candidate = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        assert_eq!(candidate.parent_session, None, "sanity: no recorded parent");
+        let cfg = CtxConfig::default();
+        let mut errors = ErrorLog::default();
+
+        let (turn_env, _pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            !turn_env
+                .iter()
+                .any(|(k, _)| k == super::super::agent::PARENT_SESSION_ENV),
+            "a roster entry with no recorded parent must not fabricate one: {turn_env:?}"
+        );
+    }
+
+    /// The other half of issue #160 finding 1: a worker pane that was
+    /// spawned `Headless` (every file-dropped spawn request --
+    /// `FILE_DROP_TRUSTED_INTERACTIVE` -- is always `Headless`, regardless
+    /// of what a forged `SpawnRequest.interactive` claims) must NOT gain the
+    /// interactive pin just by surviving a dashboard quit+restore cycle.
+    /// Before this fix `spawn_restored_pane` unconditionally pinned
+    /// `LaunchMode::Interactive`, which would have handed every ordinary
+    /// delegated worker an interactive posture it was explicitly refused at
+    /// spawn time.
+    #[test]
+    fn restored_pane_turn_env_restores_without_the_pin_for_a_non_interactive_worker_pane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        // `restore_pane` leaves `interactive` at its `Default` (`false`) --
+        // an ordinary delegated worker pane, never trusted-interactive.
+        let candidate = restore_pane("dddd4444", "44444444-2222-4333-8444-555555555555");
+        assert!(
+            !candidate.interactive,
+            "sanity: the fixture is non-interactive"
+        );
+        let cfg = CtxConfig::default();
+        let mut errors = ErrorLog::default();
+
+        let (turn_env, pane_channel) =
+            restored_pane_turn_env(&cfg, &state, &repo, &candidate, &requests_dir, &mut errors);
+
+        assert!(
+            !turn_env
+                .iter()
+                .any(|(k, _)| k == super::super::adapters::LAUNCH_MODE_ENV),
+            "a worker pane that was never interactive-pinned must not gain the pin on \
+             restore: {turn_env:?}"
+        );
+        assert!(
+            turn_env.contains(&(
+                spawnreq::DASH_REQUESTS_ENV.to_string(),
+                pane_channel.display().to_string()
+            )),
+            "the fresh spawn-request channel is still pushed regardless of launch mode: \
+             {turn_env:?}"
+        );
+    }
+
+    /// H3: a restore candidate whose spawn fails must not simply vanish. It
+    /// was already taken out of the on-disk roster by `roster::take_roster`
+    /// before this launch ever tried to spawn it, so if `spawn_restored_pane`
+    /// only reports an error and does not push the candidate into
+    /// `deferred_restore`, `on_quit` never sees it again and the session is
+    /// lost for good -- the same failure mode G3 fixed for cap-skipped
+    /// candidates, but for spawn-failed ones instead.
+    ///
+    /// Forces the failure through `adapters::select` (an agent name the
+    /// permissive test `CtxConfig` does not recognise) rather than a real
+    /// `Pane::spawn` failure, since that is the deterministic, no-process
+    /// path through the same function -- both of `spawn_restored_pane`'s
+    /// error arms push into `deferred_restore` identically.
+    #[test]
+    fn spawn_restored_pane_writes_a_failed_candidate_back_for_next_launch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.agent = "not-a-real-agent".to_string();
+        let cfg = CtxConfig::default();
+
+        let mut panes = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let mut deferred_restore = Vec::new();
+
+        spawn_restored_pane(
+            &candidate,
+            &mut panes,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert!(panes.is_empty(), "the failed candidate spawned no pane");
+        assert!(
+            errors.iter().any(|e| e.contains("cccc3333")),
+            "the operator is told the restore failed: {errors:?}"
+        );
+        assert_eq!(
+            deferred_restore,
+            vec![candidate],
+            "the failed candidate is carried forward for the next launch's roster"
+        );
+
+        // And it actually round-trips through `on_quit`, same as the
+        // cap-skipped case above.
+        on_quit(&panes, &[], &deferred_restore, &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is still written");
+        assert_eq!(
+            written.panes, deferred_restore,
+            "the spawn-failed candidate is offered again next launch"
+        );
+    }
+
+    /// F3 (review, PR #116): a successfully restored worker pane gets its
+    /// `report_to`/`report_reminder_sent` back from the roster entry that
+    /// named them -- before this fix the roster carried no such fields at
+    /// all, so `spawn_restored_pane` never set `report_to` on the pane it
+    /// spawned and a restored worker's requester silently lost its
+    /// completion reminder for good.
+    ///
+    /// The candidate's own argv is deliberately not a real agent (`ping`
+    /// with extra positional args it will reject and exit on almost
+    /// immediately) -- only the pty spawn itself has to succeed here, the
+    /// same ABSOLUTE rule every other test in this module already follows.
+    #[test]
+    fn spawn_restored_pane_restores_report_to_and_reminder_sent_from_the_roster() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
+        candidate.report_to = Some("aaaa1111".to_string());
+        candidate.report_reminder_sent = true;
+        candidate.settled_mail_sent = true;
+        let cfg = CtxConfig {
+            #[cfg(windows)]
+            agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
+            #[cfg(unix)]
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+
+        let mut panes = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let mut deferred_restore = Vec::new();
+
+        spawn_restored_pane(
+            &candidate,
+            &mut panes,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "a trivially spawnable program must restore cleanly: {errors:?}"
+        );
+        assert_eq!(panes.len(), 1, "the candidate spawned exactly one pane");
+        assert_eq!(
+            panes[0].report_to(),
+            Some("aaaa1111"),
+            "the roster's report_to must reach the restored pane"
+        );
+        assert!(
+            panes[0].report_reminder_sent(),
+            "a restore resurrects the SAME logical session, so an \
+             already-reminded worker must not be reminded again"
+        );
+
+        assert!(
+            panes[0].settled_mail_sent,
+            "the restored session must not send a second settled report"
+        );
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let saved = roster::take_roster(
+            &state,
+            &super::super::state::repo_slug(&repo),
+            super::super::state::now_secs(),
+            999_999,
+        )
+        .expect("saved roster");
+        assert!(saved.panes[0].report_reminder_sent);
+        assert!(saved.panes[0].settled_mail_sent);
+
+        panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Security review Finding 6 (2026-08-28): a restore used to hardcode
+    /// `role: Worker` and push no group binding at all, so a coordinator pane
+    /// came back from a dashboard restart demoted (refused its own onward
+    /// delegation by the depth cap, and no longer able to close the group it
+    /// still owned) and outside the batch it was launched under. Round trip
+    /// here: quit snapshot -> roster -> restore.
+    #[cfg(unix)]
+    #[test]
+    fn a_coordinator_pane_survives_a_snapshot_and_restore_as_a_coordinator() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let session_id = "77777777-2222-4333-8444-555555555555";
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                // A real adapter NAME (the restore path resolves it again),
+                // never a real agent binary -- `cfg.agent_bin` below is what
+                // the restored pane actually launches.
+                agent_name: "claude".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::SubOrchestrator,
+                verb: sessions::Verb::Dash,
+                session_id: session_id.to_string(),
+                title: "sub codex".to_string(),
+            },
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_work_group_id(Some("wg-1".to_string()));
+        let panes = vec![pane];
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is written");
+        assert_eq!(written.panes.len(), 1);
+        assert_eq!(
+            written.panes[0].role,
+            prompt::PromptRole::SubOrchestrator.label(),
+            "the quit snapshot records the role the pane was spawned with"
+        );
+        assert_eq!(
+            written.panes[0].work_group_id.as_deref(),
+            Some("wg-1"),
+            "and the group it belongs to"
+        );
+        assert!(
+            !restorable_candidates(written.clone()).is_empty(),
+            "a coordinator is still offered for restore -- only the orchestrator seat is filtered"
+        );
+
+        let cfg = CtxConfig {
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+        let mut restored = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let mut deferred_restore = Vec::new();
+        spawn_restored_pane(
+            &written.panes[0],
+            &mut restored,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert_eq!(restored.len(), 1, "the candidate restored: {errors:?}");
+        assert_eq!(
+            restored[0].role(),
+            prompt::PromptRole::SubOrchestrator,
+            "a restored coordinator is still a coordinator"
+        );
+        assert_eq!(
+            restored[0].work_group_id(),
+            Some("wg-1"),
+            "and is still bound to its own group"
+        );
+
+        for pane in &mut restored {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Fix 4 (issue #249/#250 review): the full quit -> roster -> restore
+    /// round trip preserves a worker pane's own parent lineage. Mirrors
+    /// `a_coordinator_pane_survives_a_snapshot_and_restore_as_a_coordinator`'s
+    /// own recipe for `work_group_id`, but for `Pane::parent_session`.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_panes_parent_session_survives_a_snapshot_and_restore_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = state.dash().join("aaaa1111-token").join("requests");
+        std::fs::create_dir_all(&requests_dir).expect("mkdir requests");
+
+        let session_id = "99999999-2222-4333-8444-555555555555";
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                agent_name: "claude".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: session_id.to_string(),
+                title: "wrk claude".to_string(),
+            },
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_parent_session(Some("orch0001".to_string()));
+        let panes = vec![pane];
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let slug = super::super::state::repo_slug(&repo);
+        let written = roster::take_roster(&state, &slug, super::super::state::now_secs(), 999_999)
+            .expect("a roster is written");
+        assert_eq!(written.panes.len(), 1);
+        assert_eq!(
+            written.panes[0].parent_session.as_deref(),
+            Some("orch0001"),
+            "the quit snapshot records the pane's own parent session"
+        );
+
+        let cfg = CtxConfig {
+            agent_bin: Some("sleep 3".to_string()),
+            ..Default::default()
+        };
+        let mut restored = Vec::new();
+        let mut nudge_queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let mut deferred_restore = Vec::new();
+        spawn_restored_pane(
+            &written.panes[0],
+            &mut restored,
+            &mut nudge_queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &requests_dir,
+            &mut errors,
+            &mut deferred_restore,
+        );
+
+        assert_eq!(restored.len(), 1, "the candidate restored: {errors:?}");
+        assert_eq!(
+            restored[0].parent_session(),
+            Some("orch0001"),
+            "a restored worker pane's own parent lineage must survive the round trip"
+        );
+
+        for pane in &mut restored {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// A row action with no chord of its own comes back as a menu action --
+    /// the same effect the context menu produces for the same entry.
+    #[test]
+    fn a_chordless_palette_row_runs_through_the_context_menu_path() {
+        let view = typed(
+            open_palette(ui::PaletteMode::Run),
+            "give this row the keyboard",
+        );
+        let (_, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        let descriptor = actions::descriptor(effect.expect("an effect").0).expect("descriptor");
+        assert_eq!(descriptor.dash_action(), None);
+        assert_eq!(descriptor.menu, Some(ui::MenuAction::Focus));
+    }
+
+    /// A disabled row is inert: Enter on it closes the palette with nothing
+    /// to run, exactly as a disabled context-menu entry does nothing.
+    #[test]
+    fn enter_on_a_disabled_palette_row_runs_nothing() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "relaunch an ended row");
+        assert!(
+            view.rows().iter().any(|r| matches!(
+                r,
+                actions::PaletteRow::Action {
+                    disabled: Some(_),
+                    ..
+                }
+            )),
+            "a live row cannot be restored, so the row must be disabled"
+        );
+        assert_eq!(view.activated(), None);
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Esc closes with nothing run. Focus is never touched by any overlay --
+    /// the palette owns no pane index at all, which is what makes "returns
+    /// focus to the previously focused pane" structurally true.
+    #[test]
+    fn esc_closes_the_palette_without_running_anything() {
+        let view = typed(open_palette(ui::PaletteMode::Run), "quit");
+        let (next, effect) = palette_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none());
+        assert!(effect.is_none());
+    }
+
+    /// Backspace edits the query, and a query that no longer matches the
+    /// caret's row moves the caret rather than leaving it off the list.
+    #[test]
+    fn backspace_edits_the_query_and_keeps_the_caret_on_a_real_row() {
+        let mut view = typed(open_palette(ui::PaletteMode::Run), "spawn");
+        assert_eq!(view.query, "spawn");
+        for _ in 0..3 {
+            let (next, _) =
+                palette_overlay_reduce(view, key(KeyCode::Backspace, KeyModifiers::NONE));
+            view = next.expect("backspace never closes the palette");
+        }
+        assert_eq!(view.query, "sp");
+        let rows = view.rows();
+        assert!(rows[view.cursor].selectable(), "{rows:?}");
+    }
+
+    /// Up/Down walk only real rows, never the section headings an empty
+    /// query draws.
+    #[test]
+    fn the_palette_caret_never_lands_on_a_section_heading() {
+        let mut view = open_palette(ui::PaletteMode::Run);
+        for _ in 0..40 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Down, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+        for _ in 0..60 {
+            let (next, _) = palette_overlay_reduce(view, key(KeyCode::Up, KeyModifiers::NONE));
+            view = next.expect("still open");
+            assert!(view.rows()[view.cursor].selectable());
+        }
+    }
+
+    /// Deliverable D: the Esc/Enter matrix, one assertion pair per overlay.
+    ///
+    /// Esc always closes the topmost layer (or cancels an inline confirm or
+    /// compose buffer); Enter always confirms or activates. Deliberately
+    /// left as they are, and asserted here as such: mail/memory compose
+    /// buffers and the menu's inline stop confirmation, where Esc cancels
+    /// that inner layer rather than the whole dialog, and Restore, whose Esc
+    /// is labelled `skip` because closing it IS skipping the restore.
+    #[test]
+    fn every_overlay_closes_on_esc_and_confirms_on_enter() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // QuitConfirm.
+        assert!(quit_confirm_reduce(vec!["w".into()], esc).0.is_none());
+        assert_eq!(
+            quit_confirm_reduce(vec!["w".into()], enter).1,
+            Some(QuitConfirmEffect::Confirm)
+        );
+
+        // Spawn.
+        let draft = ui::SpawnDraft {
+            input: "claude do the thing".into(),
+            items: Vec::new(),
+            cursor: 0,
+        };
+        assert!(spawn_overlay_reduce(draft.clone(), esc).0.is_none());
+        assert!(matches!(
+            spawn_overlay_reduce(draft, enter).1,
+            Some(SpawnEffect::Submit { .. })
+        ));
+
+        // Nudge.
+        let nudge = ui::NudgeDraft {
+            target: ui::NudgeTarget::AttachedPane("aaaa1111".into()),
+            input: "go".into(),
+        };
+        assert!(nudge_overlay_reduce(nudge.clone(), esc).0.is_none());
+        assert!(nudge_overlay_reduce(nudge, enter).1.is_some());
+
+        // Mail: browsing, then its compose buffer (Esc cancels the buffer,
+        // not the overlay -- deliberate, and asserted).
+        let mail = ui::MailView {
+            items: vec![(PathBuf::from("/mail/1.md"), "claude".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            compose: None,
+        };
+        assert!(mail_overlay_reduce(mail.clone(), esc).0.is_none());
+        assert!(matches!(
+            mail_overlay_reduce(mail.clone(), enter).1,
+            Some(ui::MailEffect::Consume(_))
+        ));
+        let composing = ui::MailView {
+            compose: Some(ui::ComposeDraft {
+                to: "any".into(),
+                body: "hi".into(),
+            }),
+            ..mail
+        };
+        let (back, _) = mail_overlay_reduce(composing.clone(), esc);
+        assert!(
+            back.is_some_and(|v| v.compose.is_none()),
+            "Esc cancels the compose buffer, not the whole dialog"
+        );
+        assert!(matches!(
+            mail_overlay_reduce(composing, enter).1,
+            Some(ui::MailEffect::Send(_))
+        ));
+
+        // Memory: the same shape, including its edit buffer.
+        let memory = ui::MemoryView {
+            entries: vec![("k".into(), "1m".into(), "body".into())],
+            cursor: 0,
+            offset: 0,
+            input: None,
+        };
+        assert!(memory_overlay_reduce(memory.clone(), esc).0.is_none());
+        let editing = ui::MemoryView {
+            input: Some("new".into()),
+            ..memory
+        };
+        let (back, _) = memory_overlay_reduce(editing.clone(), esc);
+        assert!(back.is_some_and(|v| v.input.is_none()));
+        assert!(matches!(
+            memory_overlay_reduce(editing, enter).1,
+            Some(ui::MemoryEffect::Remember { .. })
+        ));
+
+        // Restore: Esc closes with no effect (that is what `skip` means),
+        // Enter confirms whatever is checked.
+        let restore = ui::RestoreView {
+            entries: vec![ui::RestoreEntry {
+                label: "w".into(),
+                checked: true,
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        let (next, effect) = restore_overlay_reduce(restore.clone(), esc);
+        assert!(next.is_none() && effect.is_none());
+        assert_eq!(
+            restore_overlay_reduce(restore, enter).1,
+            Some(RestoreEffect::Confirm(vec![0]))
+        );
+
+        // Handover.
+        let handover = ui::HandoverDraft {
+            items: vec![("claude".into(), "worker".into(), "sonnet".into())],
+            cursor: 0,
+            offset: 0,
+            target_short: "aaaa1111".into(),
+        };
+        assert!(handover_overlay_reduce(handover.clone(), esc).0.is_none());
+        assert!(handover_overlay_reduce(handover, enter).1.is_some());
+
+        // Errors: read-only, so Enter closes rather than doing nothing.
+        let errors = ui::ErrorsView {
+            items: vec![err_item("boom")],
+            cursor: 0,
+            offset: 0,
+            mark: 0,
+        };
+        assert!(errors_overlay_reduce(errors.clone(), esc).0.is_none());
+        assert!(errors_overlay_reduce(errors, enter).0.is_none());
+
+        // Inspector: likewise.
+        let inspector = ui::InspectorView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            sections: vec![ui::InspectorSection {
+                name: "identity".into(),
+                lines: vec!["short  aaaa1111".into()],
+            }],
+            cursor: 0,
+            offset: 0,
+        };
+        assert!(inspector_overlay_reduce(inspector.clone(), esc).is_none());
+        assert!(inspector_overlay_reduce(inspector, enter).is_none());
+
+        // Menu: Esc backs out, Enter activates -- and Esc on the inline stop
+        // confirmation cancels only that confirmation.
+        let menu = ui::MenuView {
+            target: "aaaa1111".into(),
+            subject: "aaaa1111 \u{b7} worker".into(),
+            entries: vec![
+                ui::MenuEntry {
+                    action: ui::MenuAction::Inspect,
+                    disabled: None,
+                    letter: Some('i'),
+                },
+                ui::MenuEntry {
+                    action: ui::MenuAction::Stop,
+                    disabled: None,
+                    letter: Some('s'),
+                },
+            ],
+            cursor: 0,
+            offset: 0,
+            confirm: None,
+        };
+        assert!(menu_overlay_reduce(menu.clone(), esc).0.is_none());
+        assert_eq!(
+            menu_overlay_reduce(menu.clone(), enter).1,
+            Some(MenuEffect {
+                target: "aaaa1111".into(),
+                action: ui::MenuAction::Inspect,
+            })
+        );
+        let armed = ui::MenuView {
+            confirm: Some(1),
+            cursor: 1,
+            ..menu
+        };
+        let (back, effect) = menu_overlay_reduce(armed, esc);
+        assert!(
+            back.is_some_and(|v| v.confirm.is_none()) && effect.is_none(),
+            "Esc cancels the inline stop confirmation, not the menu"
+        );
+
+        // Palette and help.
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), esc)
+                .0
+                .is_none()
+        );
+        assert!(
+            palette_overlay_reduce(open_palette(ui::PaletteMode::Run), enter)
+                .1
+                .is_some()
+        );
+        let (next, effect) = palette_overlay_reduce(open_palette(ui::PaletteMode::Help), enter);
+        assert!(
+            next.is_none() && effect.is_none(),
+            "help confirms by closing, and never runs anything"
+        );
+    }
+}
