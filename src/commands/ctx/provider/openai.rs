@@ -20,14 +20,15 @@ use super::adapter::{
     CacheMode, Cancellation, Effort, EventSink, FailureClass, FailureScope, FailureScopeKind,
     FinishReason, ProviderAdapter, ProviderContent, ProviderFailure, ProviderMessageRole,
     ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderTarget, ProviderUsage,
-    RetryHint, ThinkingConfig, ThinkingDisplay, resolve_target,
+    ThinkingConfig, ThinkingDisplay, resolve_target,
 };
 use super::config::NativeConfig;
 use super::credential::{Credential, CredentialStore};
 use super::probe::is_plaintext_non_loopback;
 use super::transport::{
     MAX_ERROR_BODY_BYTES, ResponseLimits, StreamTimeouts, WORKER_READ_POLL,
-    check_response_block_cap, parse_retry_after_ms, read_sse_line, supervise, target_scope,
+    check_response_block_cap, classified_http_failure, error_code, parse_retry_after_ms,
+    read_sse_frame, supervise, target_scope,
 };
 use super::{OpaqueProviderData, Protocol, RouteId};
 use crate::commands::ctx::config::EnvLookup;
@@ -755,46 +756,32 @@ fn parse_sse<R: BufRead>(
     target: &ProviderTarget,
 ) -> Result<ProviderResponse, ProviderFailure> {
     let mut accumulator = Accumulator::default();
-    let mut event_name = String::new();
-    let mut data = String::new();
-    let mut line = String::new();
     let mut limits = ResponseLimits::new();
     loop {
-        let read = read_sse_line(&mut reader, &mut line, "OpenAI", cancellation, target)?;
-        limits.record_bytes("OpenAI", read)?;
-        if read == 0 {
-            if !event_name.is_empty() || !data.is_empty() {
-                process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
-                check_response_block_cap(
-                    "OpenAI",
-                    accumulator.items.len() + accumulator.completed.len(),
-                )?;
-            }
+        let frame = read_sse_frame(
+            &mut reader,
+            &mut limits,
+            "OpenAI",
+            true,
+            cancellation,
+            target,
+        )?;
+        if !frame.event_name.is_empty() || !frame.data.is_empty() {
+            process_sse_event(
+                &frame.event_name,
+                &frame.data,
+                &mut accumulator,
+                sink,
+                target,
+            )?;
+            check_response_block_cap(
+                "OpenAI",
+                accumulator.items.len() + accumulator.completed.len(),
+            )?;
+        }
+        if frame.eof {
             break;
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            if !event_name.is_empty() || !data.is_empty() {
-                process_sse_event(&event_name, &data, &mut accumulator, sink, target)?;
-                check_response_block_cap(
-                    "OpenAI",
-                    accumulator.items.len() + accumulator.completed.len(),
-                )?;
-                event_name.clear();
-                data.clear();
-            }
-            line.clear();
-            continue;
-        }
-        if let Some(value) = trimmed.strip_prefix("event:") {
-            event_name = value.trim_start().to_string();
-        } else if let Some(value) = trimmed.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(value.trim_start());
-        }
-        line.clear();
     }
     finish_response(accumulator, request_id)
 }
@@ -1247,32 +1234,12 @@ fn cancelled() -> ProviderFailure {
     super::transport::cancelled("OpenAI")
 }
 
-fn timeout_failure(saw_event: bool, target: &ProviderTarget) -> ProviderFailure {
-    super::transport::timeout_failure("OpenAI", saw_event, target)
-}
-
-fn transport_failure(message: String, target: &ProviderTarget) -> ProviderFailure {
-    super::transport::transport_failure(message, target)
-}
-
 fn classify_transport_error(
     error: ureq::Error,
     saw_event: bool,
     target: &ProviderTarget,
 ) -> ProviderFailure {
-    if matches!(error, ureq::Error::Timeout(_)) {
-        return timeout_failure(saw_event, target);
-    }
-    transport_failure(format!("OpenAI transport failed: {error}"), target)
-}
-
-fn error_code(value: &Value) -> String {
-    value
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("type").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string()
+    super::transport::classify_transport_error(error, saw_event, "OpenAI", target)
 }
 
 fn classify_http_error(
@@ -1335,18 +1302,19 @@ fn classify_http_error(
             false,
         ),
     };
-    let mut failure = ProviderFailure::new(class, target_scope(target, scope_kind), message);
-    failure.http_status = Some(status);
-    failure.provider_request_id = parsed
+    let request_id = parsed
         .pointer("/error/request_id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or(header_request_id);
-    failure.retry = RetryHint {
-        retryable,
-        after_ms: retry_after_ms,
-    };
-    failure
+    classified_http_failure(
+        status,
+        message,
+        request_id,
+        retry_after_ms,
+        target,
+        (class, scope_kind, retryable),
+    )
 }
 
 fn classify_error_payload(value: &Value, target: &ProviderTarget) -> ProviderFailure {
