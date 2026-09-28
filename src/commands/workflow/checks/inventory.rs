@@ -270,7 +270,7 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
     matches!(
         (path, function),
         (
-            "src/commands/ctx/dash/mod.rs",
+            "src/commands/ctx/dash/spawn_policy.rs",
             "task_prompt_fallback_is_safe"
         ) | (
             "src/commands/ctx/exec.rs",

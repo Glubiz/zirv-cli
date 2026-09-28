@@ -281,7 +281,14 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         "dash",
         SlugEntry::File("roster-", ".json"),
         &[
+            "commands/ctx/dash/delivery.rs",
+            "commands/ctx/dash/facts_cache.rs",
             "commands/ctx/dash/mod.rs",
+            "commands/ctx/dash/overlays.rs",
+            "commands/ctx/dash/pane_rollover.rs",
+            "commands/ctx/dash/reap.rs",
+            "commands/ctx/dash/sidebar_facts.rs",
+            "commands/ctx/dash/spawn_policy.rs",
             "commands/ctx/dash/roster.rs",
             // Issue #490 (roadmap N21). The native pane uses the slug for
             // exactly one thing: asking the persistent runtime whether it

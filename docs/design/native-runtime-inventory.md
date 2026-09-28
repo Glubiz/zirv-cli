@@ -206,8 +206,8 @@ then discarding hits that are trait/adapter definitions (`src/commands/ctx/
 adapters/{claude,codex,copilot,droid,gemini,opencode,pi,qwen}.rs` each
 *define* these methods; they are not call sites), `#[cfg(test)]` fixtures
 that stand a test binary in for `agent_bin` or re-exec `zirv` to test raw-
-argv interception (`agent/run.rs`, `dash/mod.rs`, `fallback.rs`, `pool.rs`,
-`rollover.rs`, `mod.rs`, `main.rs` each have such a test helper -- none is a
+argv interception (`agent/run.rs`, `dash/spawn_policy.rs`, `fallback.rs`,
+`pool.rs`, `rollover.rs`, `mod.rs`, `main.rs` each have such a test helper -- none is a
 production model-calling path), and `update.rs`'s `current_exe()` (swaps the
 installed binary during self-update; never spawns it).
 
@@ -232,7 +232,7 @@ installed binary during self-update; never spawns it).
 | Dash pane initial spawn | `src/commands/ctx/dash/pane.rs` | `spawn` | N11 (#480) |  |
 | Dash pane harness handover | `src/commands/ctx/dash/pane.rs` | `handover` | N16 (#485) | swaps the harness under a live pane, same session identity |
 | Dash pane swap launch builder | `src/commands/ctx/dash/pane.rs` | `build_swap_launch` | N19 (#488) | derives one successor launch (argv, turn env, knobs); shared by the in-place handover and the open-then-retire successor seam (#552) |
-| Dash spawn-request fulfillment | `src/commands/ctx/dash/mod.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
+| Dash spawn-request fulfillment | `src/commands/ctx/dash/spawn_policy.rs` | `fulfill_spawn_request` | N11 (#480) | services a worker/pane spawn request from mail or a dispatch |
 | Headless exec spawn | `src/commands/ctx/exec.rs` | `run_with_clock_inner` | N09 (#478) | `zirv ctx exec`'s main headless spawn via `supervise::spawn_tapped` |
 | Headless in-place resume/compact | `src/commands/ctx/exec.rs` | `compact_in_place` | N09 (#478) | resumes a headless session in place to compact it |
 | Agent loop headless spawn | `src/commands/ctx/run_loop.rs` | `run_with_clock_and_presence` | N09 (#478) | `zirv ctx loop`'s per-cycle headless spawn; `run_with_clock` is now the thin real-`PATH` wrapper over it (issue #690's launch pre-flight takes an injected presence oracle) |
@@ -349,7 +349,7 @@ but are not a production entry point in their own right: test-only argv
 probes/builders already owned by their spawning caller
 (`ctx/exec.rs::headless_resume_launch`/`prompt_delivery_via_stdin`,
 `ctx/run_loop.rs::prompt_delivery_via_stdin`/`zirv_invocation`,
-`ctx/dash/mod.rs::task_prompt_fallback_is_safe`), binary
+`ctx/dash/spawn_policy.rs::task_prompt_fallback_is_safe`), binary
 inspection/self-service (`ctx/measure.rs::current_binary_mtime`,
 `ctx/session/host.rs::resume_argv`, `ctx/session/mod.rs::spawn_service`,
 `ctx/wrap.rs::relaunch_command`), the check's own marker table and scanner
