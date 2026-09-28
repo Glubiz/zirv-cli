@@ -10,12 +10,11 @@
 #   - Command::new("sh"|"bash"|"cmd"|"powershell"|"pwsh")
 #   - unsafe
 #   - .unwrap() / .expect( -- APPROXIMATED as "outside test code": a hit
-#     only counts when the line lands at or above the file's first
-#     `#[cfg(test)]` line (as it stands at HEAD). This is not real Rust
-#     scope analysis -- a `#[cfg(test)]` anywhere later in the file (even
-#     one unrelated to the hunk) silences everything below it, and a stray
-#     doc example inside a doc comment above the marker would still count.
-#     Good enough for an advisory nudge, not a substitute for review.
+#     only counts when the line lands above the `#[cfg(test)]` that opens
+#     the file's `mod tests` (as it stands at HEAD). This is not real Rust
+#     scope analysis -- a stray doc example inside a doc comment above that
+#     marker would still count. Good enough for an advisory nudge, not a
+#     substitute for review.
 #   - reqwest | ureq | TcpStream | TcpListener
 #
 # Usage:
@@ -161,7 +160,11 @@ run_scan() {
 
     cfg_test_line=0
     if [ -f "$file" ]; then
-      cfg_test_line="$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -n1 | cut -d: -f1 || true)"
+      cfg_test_line="$(awk '
+        prevcfg && $0 ~ /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?mod[[:space:]]+tests([[:space:]{]|$)/ { print prevcfg; exit }
+        /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ { prevcfg = NR; next }
+        { prevcfg = 0 }
+      ' "$file" 2>/dev/null || true)"
       [ -z "$cfg_test_line" ] && cfg_test_line=0
     fi
 
@@ -325,6 +328,43 @@ mod tests {
 EOF
   commit_all "$dir" "add an unwrap outside tests"
   check_scenario "unwrap-outside-tests" "$dir" ".unwrap()" ""
+
+  # 2b. An earlier `#[cfg(test)] use` must not hide an unwrap added
+  # before the `#[cfg(test)] mod tests` block -> flagged.
+  dir="$(make_repo unwrap-outside-tests-early-cfg-marker)"
+  base_security_md >"$dir/SECURITY.md"
+  mkdir -p "$dir/src/commands"
+  cat >"$dir/src/commands/thing.rs" <<'EOF'
+#[cfg(test)]
+use std::fmt;
+
+pub fn noop() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ok() {}
+}
+EOF
+  commit_all "$dir" "base"
+  cat >"$dir/src/commands/thing.rs" <<'EOF'
+#[cfg(test)]
+use std::fmt;
+
+pub fn noop() {}
+
+pub fn risky(v: Option<i32>) -> i32 {
+    v.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ok() {}
+}
+EOF
+  commit_all "$dir" "add an unwrap after an early cfg(test) marker"
+  check_scenario "unwrap-outside-tests-early-cfg-marker" "$dir" ".unwrap()" ""
 
   # 3. .unwrap() ADDED inside an existing #[cfg(test)] module -> NOT flagged.
   dir="$(make_repo unwrap-inside-tests)"
