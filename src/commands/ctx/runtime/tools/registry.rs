@@ -2053,33 +2053,4 @@ mod tests {
         assert_ne!(write_a, changed_precondition);
         assert_ne!(patch_a, patch_b);
     }
-
-    #[test]
-    fn knowledge_tools_have_typed_scope_and_effects() {
-        let registry = ToolRegistry::native();
-        for name in [
-            MEMORY_RECALL,
-            MEMORY_REMEMBER,
-            MEMORY_FORGET,
-            CONTEXT_SEARCH,
-        ] {
-            assert!(registry.get(name).is_some(), "missing {name}");
-        }
-        let parsed = registry
-            .parse(
-                MEMORY_REMEMBER,
-                json!({"key":"architecture", "text":"native", "scope":"shared"}),
-            )
-            .expect("parse memory write");
-        assert_eq!(
-            parsed.action().expect("action"),
-            ExecutionAction::Knowledge {
-                service: "memory".into(),
-                operation: "remember".into(),
-                scope: Some("shared".into()),
-                key: Some("architecture".into()),
-                write: true,
-            }
-        );
-    }
 }

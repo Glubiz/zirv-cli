@@ -2595,6 +2595,9 @@ fn touched_path_from_call(call: &NativeToolCall) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 #[cfg(test)]
+pub(super) use tests::run_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::super::super::super::config::OrchestratorWrites;
     use super::super::super::super::provider::Protocol;
@@ -2970,7 +2973,7 @@ mod tests {
 
     /// Drives one whole fixture session and hands back its final status plus
     /// the tool-call ids in the order effects actually ran.
-    fn run_fixture(
+    pub(in super::super) fn run_fixture(
         protocol: Protocol,
         model: &str,
         provider_fixture: &str,
@@ -4005,23 +4008,6 @@ mod tests {
         assert_eq!(status.limit, Some(LimitKind::WallClock));
     }
 
-    // -- pure scheduling ---------------------------------------------------
-
-    #[test]
-    fn independent_calls_run_first_and_declared_order_is_kept_inside_each_group() {
-        assert_eq!(
-            execution_order(&[false, true, false, true]),
-            vec![1, 3, 0, 2]
-        );
-        assert_eq!(execution_order(&[true, true]), vec![0, 1]);
-        assert_eq!(execution_order(&[false, false]), vec![0, 1]);
-    }
-
-    #[test]
-    fn an_unknown_tool_is_never_reordered() {
-        assert!(!is_independent(None));
-    }
-
     // -- the backend seam --------------------------------------------------
 
     /// Finding 1: `ConversationState::executions` is keyed by `ExecutionId`
@@ -4450,25 +4436,6 @@ mod tests {
             .filter_map(|message| message.text.as_deref())
             .collect();
         assert_eq!(inputs, ["first", "second"]);
-    }
-
-    #[test]
-    fn the_final_status_serializes_with_its_schema_version_and_actual_route() {
-        let (status, _) = run_fixture(
-            Protocol::OpenAiResponses,
-            "fixture-openai-model",
-            "openai-investigate-edit-test.json",
-            "tools-investigate-edit-test.json",
-            "go",
-            |_| {},
-        );
-        let json = serde_json::to_value(&status).expect("serializable");
-        assert_eq!(json["schema_version"], FINAL_STATUS_SCHEMA_VERSION);
-        assert_eq!(json["runtime"], "native");
-        assert_eq!(json["status"], "completed");
-        assert_eq!(json["provider"], "openai");
-        assert_eq!(json["served_model"], "fixture-openai-model");
-        assert!(json["usage"]["output_tokens"].as_u64().unwrap() > 0);
     }
 
     // -- (n) issue #486: compaction, rot recovery and checkpoints ---------

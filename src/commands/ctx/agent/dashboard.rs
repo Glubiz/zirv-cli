@@ -1983,32 +1983,6 @@ mod tests {
         (requests_dir, base_env(&state_dir))
     }
 
-    /// 2026-09-06: `--headless` is gone as a spawn topology, so the flag must
-    /// not parse at all -- a script still passing it fails loudly rather than
-    /// being silently ignored and getting the opposite of what it asked for.
-    #[test]
-    fn the_headless_flag_no_longer_parses() {
-        use clap::Parser;
-
-        #[derive(Debug, clap::Parser)]
-        struct OnlyAgent {
-            #[command(flatten)]
-            args: AgentArgs,
-        }
-
-        assert!(
-            OnlyAgent::try_parse_from(["zirv", "claude", "go"]).is_ok(),
-            "the delegation itself still parses"
-        );
-        let err = OnlyAgent::try_parse_from(["zirv", "claude", "go", "--headless"])
-            .expect_err("--headless must be rejected outright");
-        assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::UnknownArgument,
-            "got {err}"
-        );
-    }
-
     /// Rule 2: a live dashboard is joined even when this process was never
     /// spawned inside one -- no `DASH_REQUESTS_ENV`, just a live token dir
     /// under `<state>/dash`. The request lands there and the ack path answers

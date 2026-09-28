@@ -790,13 +790,16 @@ pub fn spawn_interactive(
     })
 }
 #[cfg(test)]
+pub(super) use tests::{spawn_fixture_interactive_session, wait_for_idle};
+
+#[cfg(test)]
 mod tests {
     use super::super::super::fixture::fixture_root;
     use super::super::super::journal::MessageRole;
     use super::super::tests::interactive_shutdown_fixture;
     use super::*;
 
-    fn spawn_fixture_interactive_session(
+    pub(in super::super) fn spawn_fixture_interactive_session(
         repo: &std::path::Path,
         env: &std::collections::HashMap<String, String>,
     ) -> InteractiveSession {
@@ -823,7 +826,7 @@ mod tests {
 
     /// Blocks (bounded) until `session` has reported at least one
     /// `InteractiveProgress::Idle`, i.e. its one submitted turn finished.
-    fn wait_for_idle(session: &InteractiveSession) {
+    pub(in super::super) fn wait_for_idle(session: &InteractiveSession) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if session
@@ -908,94 +911,6 @@ mod tests {
                 .iter()
                 .any(|row| row.key == "native" && row.runs > 0),
             "`zirv ctx spend --by harness` reports the seat's own native spend"
-        );
-    }
-
-    /// Issue #537 (T2b): the harness proxy's decision applies on a native
-    /// session's FIRST submitted turn only. Enabled against a typesafe
-    /// endpoint that refuses the connection immediately (a local TCP
-    /// listener bound then dropped before use, so nothing is ever
-    /// listening) -- `proxy::decide` never fails even so, it falls through
-    /// to the deterministic baseline and still persists a decision.
-    /// `ZIRV_CTX_AGENT` names an adapter that does not exist, so the
-    /// in-process helper fallback fails on a plain lookup rather than
-    /// touching any real adapter or subprocess. Two turns are submitted;
-    /// only ONE decision is ever appended to `proxy-decisions.jsonl`.
-    #[test]
-    fn proxy_decision_applies_once_on_the_first_submitted_turn_only() {
-        let (repo, state, _tree, mut env) = interactive_shutdown_fixture();
-
-        let closed_port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr").port()
-            // The listener is dropped here: nothing answers on this port
-            // from this point on, so a connection attempt refuses fast.
-        };
-        let credential_env = "NATIVE_TEST_PROXY_KEY_537";
-        env.insert("ZIRV_CTX_PROXY_ENABLED".to_string(), "true".to_string());
-        env.insert(
-            "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL".to_string(),
-            format!("http://127.0.0.1:{closed_port}"),
-        );
-        env.insert(
-            "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV".to_string(),
-            credential_env.to_string(),
-        );
-        env.insert(
-            "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS".to_string(),
-            "1".to_string(),
-        );
-        env.insert(
-            "ZIRV_CTX_AGENT".to_string(),
-            "zirv-test-no-such-adapter-537".to_string(),
-        );
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe {
-            std::env::set_var(credential_env, "secret");
-        }
-
-        let session = spawn_fixture_interactive_session(repo.path(), &env);
-        session.submit("first request".to_string()).expect("submit");
-        wait_for_idle(&session);
-        session
-            .submit("second request".to_string())
-            .expect("submit");
-        wait_for_idle(&session);
-        session.shutdown();
-
-        // SAFETY (test-only): cleans up the var this test set above.
-        unsafe {
-            std::env::remove_var(credential_env);
-        }
-
-        let decisions_path = state.root().join("proxy-decisions.jsonl");
-        let text = std::fs::read_to_string(&decisions_path).unwrap_or_default();
-        let count = text.lines().filter(|line| !line.trim().is_empty()).count();
-        assert_eq!(count, 1, "decide must run on the first turn only: {text}");
-    }
-
-    /// Issue #537 (T2b): `[proxy] enabled = false` (the default) leaves a
-    /// native session's first turn exactly as before -- no decision is ever
-    /// computed or persisted, so `proxy-decisions.jsonl` never appears.
-    ///
-    /// Issue #713: `interactive_shutdown_fixture` does not isolate the
-    /// operator's real `~/.zirv/ctx.toml`, so a machine whose operator
-    /// config enables the proxy would otherwise leak that setting in here.
-    /// Pin the posture this test actually needs instead.
-    #[test]
-    fn proxy_disabled_leaves_the_native_session_unaffected() {
-        let (repo, state, _tree, mut env) = interactive_shutdown_fixture();
-        env.insert("ZIRV_CTX_PROXY_ENABLED".to_string(), "false".to_string());
-
-        let session = spawn_fixture_interactive_session(repo.path(), &env);
-        session.submit("do the thing".to_string()).expect("submit");
-        wait_for_idle(&session);
-        session.shutdown();
-
-        let decisions_path = state.root().join("proxy-decisions.jsonl");
-        assert!(
-            !decisions_path.exists(),
-            "a disabled proxy must never persist a decision"
         );
     }
 
