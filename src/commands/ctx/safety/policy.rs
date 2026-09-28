@@ -4,9 +4,7 @@ use super::*;
 
 /// A minimal glob matcher: `*` matches any run of characters (including
 /// none), every other character matches itself literally, case-sensitively
-/// (shell commands are case-sensitive). No `?`, no character classes -- the
-/// small vocabulary issue #83's own examples use (`"rm -rf /*"`, `"git push
-/// --force*"`, `"* | sh"`).
+/// (shell commands are case-sensitive). No `?` or character classes (#83).
 ///
 /// Iterative two-pointer matching with a saved star position (the standard
 /// `fnmatch`-style algorithm), not recursive backtracking: a command string
@@ -15,15 +13,8 @@ use super::*;
 /// stack-depth or exponential-blowup DoS surface. Worst case is `O(pattern
 /// * command)` with no recursion.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    // Issue #106: claude's own documented prefix semantics for a
-    // `<verb> *`-style rule match the bare verb too (`Bash(git *)` "matches
-    // git, git status, git commit" -- adapters/mod.rs's own doc comment),
-    // but the star here otherwise only matches text *after* the literal
-    // space that precedes it, so `"git push --force *"` matched `"git push
-    // --force x"` yet not the bare `"git push --force"` a real invocation
-    // sends with nothing following. Every `verb *` deny pattern was
-    // therefore inert against exactly that bare form. A pattern ending in
-    // `" *"` also matches its own prefix with the trailing `" *"` stripped.
+    // A trailing `" *"` also matches the bare prefix, matching Claude's
+    // `Bash(git *)` semantics and covering bare denied verbs (#106).
     if let Some(prefix) = pattern.strip_suffix(" *")
         && text == prefix
     {
@@ -93,22 +84,8 @@ fn rules_from(patterns: &[String], origin: Origin) -> Vec<Rule> {
         .collect()
 }
 
-/// Issue #313: the repo-narrowing fold for the three loop-breaker
-/// thresholds (`denial_breaker_threshold`/`identical_command_warn_after`/
-/// `identical_command_refuse_after`), mirroring `config.rs`'s own
-/// `narrow_max_nudges` (`home.min(repo.unwrap_or(u32::MAX))`) but with `0`
-/// carrying its own meaning ("disabled") rather than "unbounded", so plain
-/// `min` cannot be used unmodified:
-///
-/// - `home == 0`: the operator disabled this breaker outright. A repo may
-///   only narrow, never re-enable something the operator turned off, so this
-///   stays `0` regardless of what `repo` says (unlike `narrow_max_nudges`,
-///   where `home == 0` is just an ordinary, narrowable value).
-/// - `repo == Some(0)`: a repo trying to set `0` is trying to WIDEN (disable
-///   the breaker), which is never narrowing -- ignored, exactly like a
-///   `None`.
-/// - Otherwise: `home.min(repo)` -- a repo may lower the threshold (fire the
-///   breaker sooner) but never raise it above the operator's own ceiling.
+/// Fold breaker thresholds so a repo can only lower a nonzero operator limit:
+/// home `0` stays disabled, repo `0` is ignored, otherwise take `min` (#313).
 fn narrow_threshold(home: u32, repo: Option<u32>) -> u32 {
     if home == 0 {
         return 0;
@@ -119,18 +96,9 @@ fn narrow_threshold(home: u32, repo: Option<u32>) -> u32 {
     }
 }
 
-/// Resolves the layered `[safety]` policy -- see the module doc for the
-/// fold. `home`/`repo` are the `[safety]` tables lifted out of `~/.zirv/
-/// ctx.toml` and `<repo>/.zirv/ctx.toml` by `CtxConfig::load` (either
-/// absent when that file has no `[safety]` section) before its own deep
-/// merge; `env` is the operator override that sits above both.
-///
-/// `repo`'s own `allow`/`escape_allow`/`default` fields are never read here,
-/// even if present: `config::reject_untrusted_keys` already hard-errors a
-/// repo file that sets any of them before this function is ever reached
-/// (see `REPO_FORBIDDEN`), so by the time a `repo` value arrives here it is
-/// guaranteed not to carry them -- this is defense in depth, not the
-/// primary enforcement.
+/// Resolve home and repo `[safety]` layers with operator env overrides.
+/// Never read repo `allow`, `escape_allow`, or `default`: untrusted policy
+/// cannot widen permissions even if config validation is bypassed.
 pub fn resolve(
     home: Option<toml::Value>,
     repo: Option<toml::Value>,
@@ -180,11 +148,8 @@ pub fn resolve(
         }
     };
 
-    // Issue #147: `escape_allow` gets the identical operator-home-layer-only
-    // treatment as `allow` above (see `REPO_FORBIDDEN`'s `safety.escape_allow`
-    // entry and this arm never reads `repo_layer.escape_allow` -- the same
-    // defense in depth `allow` already has), plus a built-in seed
-    // (`builtin_escape_allow`) `allow` has none of.
+    // Only the operator layer may extend `escape_allow`; seed built-in safe
+    // commands without accepting repo grants (#147).
     let escape_allow = match env("ZIRV_CTX_SAFETY_ESCAPE_ALLOW") {
         Some(raw) => {
             let mut escape_allow = builtin_escape_allow();
@@ -209,30 +174,19 @@ pub fn resolve(
         Some(raw) => Verdict::parse(&raw).ok_or_else(|| {
             format!("ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT: expected allow, ask or deny, got '{raw}'")
         })?,
-        // Home-layer only, exactly like `default` above: this key is
-        // `REPO_FORBIDDEN`, so a repo value can never reach this function --
-        // and this arm never reads `repo_layer.interactive_default`, the
-        // same defense in depth `allow`/`default` already have.
+        // Ignore repo `interactive_default` even if config validation is bypassed.
         None => home_layer.interactive_default.unwrap_or(Verdict::Allow),
     };
 
     let sql = match env("ZIRV_CTX_SAFETY_SQL") {
         Some(raw) => SqlMode::parse(&raw)
             .ok_or_else(|| format!("ZIRV_CTX_SAFETY_SQL: expected on or off, got '{raw}'"))?,
-        // Home-layer only, exactly like `default`/`interactive_default`
-        // above: this key is `REPO_FORBIDDEN`, and this arm never reads
-        // `repo_layer.sql` -- the same defense in depth `allow` already has.
+        // Ignore repo `sql` even if config validation is bypassed.
         None => home_layer.sql.unwrap_or_default(),
     };
 
-    // Issue #313: the two loop breakers' three thresholds get the identical
-    // narrowing fold `config.rs`'s own `narrow_max_nudges` uses for
-    // `verify_on_stop.max_nudges` -- lower is stricter -- via
-    // `narrow_threshold` (this module's own `0`-means-disabled variant of
-    // that fold; see its doc comment). No environment override today: unlike
-    // `deny`/`ask`/`allow`, nothing yet needs an operator escape hatch above
-    // the fold for these, and one can be added later without disturbing this
-    // shape.
+    // Lower nonzero breaker thresholds are stricter; preserve the operator's
+    // disabled (`0`) setting through the repo fold (#313).
     let denial_breaker_threshold = narrow_threshold(
         home_layer.denial_breaker_threshold.unwrap_or(3),
         repo_layer.denial_breaker_threshold,

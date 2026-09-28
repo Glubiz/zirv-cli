@@ -20,30 +20,15 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub const POLICY_FINGERPRINT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_SHA256";
 pub const POLICY_SNAPSHOT_ENV: &str = "ZIRV_CTX_SAFETY_POLICY_FILE";
 
-/// Issue #139: whether the launch-time policy snapshot's verdict for one
-/// command diverges from the currently-resolved policy's own verdict for
-/// the SAME command, and in which direction. `evaluate_with_attestation_
-/// evidence` always keeps the stricter of the two answers -- a repo may
-/// narrow a running session immediately, while an operator widening the
-/// policy takes effect only on the next launch -- but that fold used to be
-/// invisible: the hook's own explanation named the interactive/headless
-/// DEFAULT as if it were the configured posture, while `zirv ctx safety
-/// explain` for the identical command (bypassing attestation entirely)
-/// reported the current, wider policy. This enum is what lets both
-/// surfaces agree and say WHY, instead of silently disagreeing.
+/// Direction of any verdict difference between the launch snapshot and current
+/// policy, so hook and CLI explanations identify the stricter policy (#139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SnapshotDivergence {
     /// The launch snapshot and the current policy agree for this command --
-    /// the common case: no snapshot at all, an invalid/corrupt one (both
-    /// already explained by `AttestedEvaluation::status`), or one whose
-    /// verdict for this command happens to match today's policy.
+    /// no snapshot, an invalid one, or a matching verdict.
     Unchanged,
     /// The pinned launch snapshot's verdict is STRICTER than the current
-    /// policy's own verdict for this command would be: an operator widened
-    /// the policy after this session launched, and the widening has not
-    /// taken effect yet (by design -- see this enum's own doc comment).
-    /// Carries the current policy's own verdict so an explanation can name
-    /// what it would have been.
+    /// policy's verdict; carries that verdict for the explanation.
     SnapshotStricter { current_verdict: Verdict },
 }
 
@@ -63,22 +48,9 @@ pub(super) struct AttestedEvaluation {
     pub(super) divergence: SnapshotDivergence,
 }
 
-/// Issue #168, design decision (c): what an invalid attestation snapshot
-/// (absent one of the two env vars, an unreadable/unparseable file, or a
-/// hash mismatch) now produces INSTEAD of the old blanket `attestation_
-/// failure(mode)` (interactive `Ask`/headless `Deny` on every single
-/// command for the rest of the session, with no way out short of a
-/// restart). A broken snapshot proves nothing about `current` -- the
-/// in-process policy this same launch already resolved from `~/.zirv/
-/// ctx.toml` and any repo `.zirv/ctx.toml` -- so this falls back to
-/// evaluating `current` alone, exactly like the "no attestation configured
-/// at all" case, and best-effort re-materializes the snapshot file at
-/// `snapshot_path` (when one was named) so the NEXT command in this same
-/// session attests cleanly again instead of re-detecting the identical
-/// broken file every time. The re-materialization write failing is
-/// silently ignored: it only ever improves the next call, never gates this
-/// one. `status: "self-healed"` distinguishes this path in the audit log
-/// and from both `"not-present"` and `"valid"`.
+/// Evaluate with the resolved policy when attestation is invalid: a broken
+/// snapshot says nothing about that policy. Repair the snapshot for the next
+/// command on a best-effort basis; report `"self-healed"` in the audit (#168).
 #[allow(clippy::too_many_arguments)]
 fn self_healed_evaluation(
     current: &SafetyPolicy,
@@ -112,12 +84,8 @@ fn self_healed_evaluation(
     }
 }
 
-/// Best-effort rewrite of the policy snapshot file at `path` from `policy` --
-/// the identical body `adapters::claude::launch_settings_path` writes at
-/// launch, reused here (via the same pretty-JSON-plus-trailing-newline
-/// shape) so a self-heal and a fresh launch can never format the snapshot
-/// two different ways. Errors are the caller's to ignore: this is a repair
-/// attempt for the NEXT command, never a gate on the current one.
+/// Rewrite the policy snapshot in the launch format for the next command;
+/// repair errors must not gate the current command (#168).
 fn rematerialize_policy_snapshot(path: &str, policy: &SafetyPolicy) -> std::io::Result<()> {
     let mut body = serde_json::to_string_pretty(policy).map_err(std::io::Error::other)?;
     body.push('\n');
@@ -137,12 +105,8 @@ pub(super) fn evaluate_with_attestation_evidence(
     cwd: Option<&Path>,
 ) -> AttestedEvaluation {
     let now = super::state::now_secs();
-    // Issue #262: parsed once here (this function already reads `env` for
-    // the attestation fingerprint/snapshot, so this is not a new dependency)
-    // and threaded down into every `evaluate_with_scratchpad_roots` call
-    // below -- `evaluate`/`evaluate_with_scratchpad_roots` themselves stay
-    // pure, taking the envelope as an explicit parameter rather than reading
-    // `ENVELOPE_ENV` internally.
+    // Pass the envelope explicitly through evaluation to keep policy evaluation
+    // pure and apply worker scope on every path (#262).
     let envelope = parse_envelope_env(env);
     let envelope = envelope.as_ref();
     let current_fingerprint =

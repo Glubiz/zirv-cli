@@ -12,12 +12,8 @@ use crate::commands::ctx::event::input_hash;
 use crate::commands::ctx::state::StateDir;
 use crate::commands::workflow::verification;
 
-/// Q1: whether this session has already been BLOCKED once by the
-/// missing-tests gate. A separate, persisted fact from `stop_hook_active`:
-/// that flag only breaks the loop within a single stop ATTEMPT (the harness
-/// re-invoking Stop immediately after a block), never across a session's
-/// later, genuinely new stop attempts -- and this gate must fire at most
-/// once per session, full stop, per the task's own contract.
+/// Persist whether the once-per-session missing-tests block was spent;
+/// `stop_hook_active` only prevents reentry within one Stop attempt.
 const MISSING_TESTS_GATE_RECORD_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -27,13 +23,8 @@ struct MissingTestsGateRecord {
     blocked: bool,
 }
 
-// F6 (codex review fix): keyed by `stable_short` (the socket-derived
-// identifier `run_stop`'s own caller already computes -- issue #243, see its
-// doc comment there), NOT the rotating session id -- a supervised restart
-// mints a fresh `SESSION_ENV`/`payload.session_id`, and this gate's own
-// contract above ("at most once per session, full stop") means the whole
-// supervised run, which `stable_short` -- unlike the rotating id -- actually
-// tracks across a restart.
+/// Key the block by stable supervised-run ID, not a session ID that
+/// rotates on internal restart (#243).
 fn missing_tests_gate_record_path(state: &StateDir, stable_short: &str) -> PathBuf {
     // Mirrors `verify_on_stop_record_path`'s own naming/hash scheme, in the
     // same scoring directory.
@@ -149,43 +140,10 @@ fn rust_change_touches_cfg_test(repo: &Path, path: &Path) -> bool {
     diff_touches_line_at_or_after(&String::from_utf8_lossy(&output.stdout), test_line)
 }
 
-/// Q1 (blind-review completion quality): the Stop-hook supervision check for
-/// headless sessions. A blind reviewer scoring 24 headless runs made the same
-/// deduction on ~70% of them regardless of condition -- "the agent added no
-/// tests of its own for the change" -- even though zirv's own engineering
-/// standard already asks for one focused test per behaviour change plus the
-/// unhappy path. This makes a headless session that skips it stop with a
-/// concrete reason to fix that, exactly once, rather than relying on the
-/// prompt alone.
-///
-/// `None` on any doubt at all -- like every other Stop-hook advisory in this
-/// file, a supervision failure here is pure passthrough, never a reason to
-/// fail the hook or the session (CLAUDE.md: "supervision failure is
-/// passthrough"). Fires only when `cfg.missing_tests_gate.enabled`, only for
-/// a HEADLESS session (`adapters::HEADLESS_ENV == "1"` -- an interactive
-/// session, which never sets it, is never blocked by this), and only once
-/// per session (the persisted [`MissingTestsGateRecord`] -- a later call
-/// that finds `blocked` already `true` returns `None` regardless of what
-/// changed since). F6 (codex review fix): "session" here means the whole
-/// supervised run, so `stable_short` is keyed on, not the rotating
-/// `SESSION_ENV`/`payload.session_id` -- see [`missing_tests_gate_record_path`]'s
-/// own doc comment.
-///
-/// F6 residual (review round 2): `stable_short` is `short_id(&payload.
-/// session_id)` (`sessions::short_id`, ASCII-alphanumeric only) whenever no
-/// socket was ever bound -- an unsupervised/`--no-supervise` launch, or the
-/// codex `Notify` path -- and `short_id` degrades to the EMPTY string for a
-/// session id that is itself empty or carries no ASCII-alphanumeric
-/// character at all. Keying `missing_tests_gate_record_path` on that empty
-/// string would hash every such identity-less session onto the SAME record,
-/// letting one unrelated session's `blocked = true` silently suppress the
-/// gate for every other one. `raw_session_id` (`payload.session_id`,
-/// unfiltered -- `input_hash` hashes arbitrary UTF-8 bytes, not just ASCII)
-/// is the fallback key when `stable_short` is empty; when BOTH are empty
-/// there is no identity to key a shared, persisted record on at all, so the
-/// gate is skipped outright -- never blocks, never reads or writes a record
-/// -- rather than risk a cross-session collision. Supervision must never
-/// worsen a session.
+/// Block a headless, test-less completion at most once per supervised
+/// run when enabled. Any I/O or identity doubt fails open. Use the stable
+/// socket ID across restarts, raw session ID if its short form is empty,
+/// and skip the gate if neither identifies the session.
 pub(super) fn missing_tests_gate_reason(
     state: &StateDir,
     repo: &Path,
@@ -231,13 +189,8 @@ pub(super) fn missing_tests_gate_reason(
     if !has_non_test_source_change || has_test_change {
         return None;
     }
-    // Issue 6a (`[jev] missing_tests`, off by default): a decisive "not
-    // owed" answer skips this ONE block without ever persisting it as
-    // blocked -- the record stays untouched, so a later, still-test-less
-    // turn in the same session can still be asked/blocked. Everything else
-    // (gate off, no credential, indecisive, an error, or a decisive but not
-    // strongly "not owed" answer) blocks exactly as the deterministic gate
-    // already does above.
+    // A decisive Jev "tests not owed" answer skips only this attempt; do
+    // not spend the once-per-session block record (#786).
     if missing_tests_owed_jev_says_skip(state, cfg, repo, &changed) {
         return None;
     }
@@ -261,21 +214,12 @@ pub(super) fn missing_tests_gate_reason(
 /// turning one Stop-hook call into an unbounded scan.
 const MISSING_TESTS_OWED_TEST_SCAN_CAP: usize = 50;
 
-/// The noul-probability floor a decisive answer must sit AT OR BELOW before
-/// `missing_tests_owed_jev_says_skip` treats it as "not owed" and skips the
-/// deterministic block. Mirrors [`STOP_VERIFY_MIN_PROBABILITY`]'s own
-/// conservative stance but inverted, and if anything stricter: skipping a
-/// real gate is riskier than one extra (already rare, once-per-session)
-/// false block, so only a strong "not owed" signal -- never merely "leaning
-/// no" -- may skip it.
+/// Require a strongly low probability before skipping a deterministic
+/// missing-tests block.
 const MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY: f64 = 0.1;
 
-/// [`missing_tests_owed_jev_says_skip`]'s own default `(min_confidence,
-/// min_margin)` `decisive()` floor -- named (issue: `zirv ctx jev probe`) so
-/// a later retune targets exactly this constant, the same way every other
-/// tunable site's default floor is now named. Not routed through `jev::
-/// floor`/`[jev.floors]` today: this stays the same fixed pair production
-/// has always used.
+/// Skipping a deterministic test gate is the permissive direction, so
+/// require a decisive Jev answer before doing so.
 pub(crate) const MISSING_TESTS_DEFAULT_FLOOR: (f32, f32) =
     (0.0, crate::commands::ctx::jev::DEFAULT_MIN_MARGIN);
 
@@ -406,11 +350,8 @@ fn missing_tests_owed_facts(repo: &Path, changed: &[PathBuf]) -> Vec<u32> {
 pub(crate) fn missing_tests_questions() -> [crate::commands::ctx::jev::Question; 1] {
     [crate::commands::ctx::jev::Question::metadata_noul(
         "tests_owed",
-        // Kept under `safe_metadata_request`'s own 512-char instructions cap
-        // (checked once by `stop_verify_request_passes_the_metadata_guard`'s
-        // own sibling test below): an oversized instructions string fails
-        // that guard and `ask` never even reaches the network, which reads
-        // as a silent, permanent no-op for this whole gate.
+        // Keep the request under the metadata instruction cap; an oversized
+        // request would silently skip the Jev check.
         "Facts [non-test source files changed, changed-lines bucket (0 <10, 1 <100, 2 <500, 3 \
 larger), repo has test files (0/1), test files mentioning a changed module, doc-only share (0-4, \
 quarters)] describe an uncommitted change with no test update. Is a new test owed? Answer false \
@@ -443,14 +384,8 @@ pub(crate) fn missing_tests_action(
     }
 }
 
-/// Issue 6a: `[jev] missing_tests` (off by default). Asks Jev one metadata-
-/// only Noul question from [`missing_tests_owed_facts`] and returns `true`
-/// only for a DECISIVE, strongly "not owed" answer (at or below
-/// [`MISSING_TESTS_OWED_SKIP_MAX_PROBABILITY`]) -- the one case
-/// `missing_tests_gate_reason` reads as "skip this block". `false` on every
-/// other outcome (the key off, no `[proxy.typesafe]` credential, no answer,
-/// an indecisive answer, or a decisive answer that is not strongly "not
-/// owed"): the deterministic gate then blocks exactly as it always has.
+/// Skip only on a decisive, strongly "not owed" Jev answer; all other
+/// outcomes preserve the deterministic missing-tests gate.
 fn missing_tests_owed_jev_says_skip(
     state: &StateDir,
     cfg: &CtxConfig,

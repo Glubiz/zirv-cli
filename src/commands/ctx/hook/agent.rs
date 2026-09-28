@@ -11,17 +11,10 @@ use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::state::StateDir;
 
-// -- Issue #418: non-claude agent payload projection --------------------
+// -- Non-Claude agent payload projection (#418) -------------------------
 
-/// `pretool`'s own body for every agent. `None`/`Some("claude")` is
-/// byte-for-byte the original claude-only path (`run_pretool` itself,
-/// untouched); any other name projects the payload through
-/// [`crate::commands::ctx::hook_project::project_pretool`], runs the SAME [`run_pretool`]
-/// body against the projected claude-shaped payload, and translates whatever
-/// it printed via [`crate::commands::ctx::hook_project::translate_pretool_envelope`]. Fails
-/// open throughout: an unparseable payload or an unrecognised agent name
-/// leaves stdout empty and exits 0, exactly like `run_pretool` itself does
-/// on a payload it cannot make sense of.
+/// Project non-Claude PreToolUse payloads through the shared guard and
+/// translate verdicts back; unknown or malformed payloads fail open (#418).
 pub fn run_pretool_for_agent<W: Write>(
     w: &mut W,
     stdin: &str,
@@ -52,7 +45,7 @@ pub fn run_pretool_for_agent<W: Write>(
     }
 }
 
-// Issue #466: model-dispatch tools must never receive local vault values.
+// Model-dispatch tools must not receive local vault values (#466).
 pub(crate) const REHYDRATION_TOOLS: &[&str] = &[
     "Bash",
     "PowerShell",
@@ -165,25 +158,9 @@ fn run_pretool_with_rehydration<W: Write>(
         let _ = write!(w, "{existing}");
         return Ok(code);
     };
-    // Issue #769 (compounding issue #466's own fix): `raw["tool_input"]` was
-    // already overwritten with `rehydrated` (the REAL, unmasked value) above,
-    // BEFORE `prepared` was built and handed to the base `run_pretool` call --
-    // that call's own contract has always needed the real value (the
-    // orchestrator-write/reuse guards read real file content), which issue
-    // #466 relied on. Since #769, that base call ALSO runs the consolidated
-    // safety check itself for `Bash`/`PowerShell`, so any `permissionDecision`
-    // it produced for those two tools was decided against the REAL rehydrated
-    // command, and any reason text riding with it may quote that command
-    // verbatim (`safety::explain_text`'s own contract) -- exactly the leak
-    // issue #466 introduced this whole rehydration path to prevent. Dropped
-    // here, for `Bash`/`PowerShell` only, before anything downstream can
-    // forward it: the dedicated recheck a few lines down independently
-    // reaches the identical verdict against the identical real command and
-    // reports it through its own generic-text `Ask`/`Deny` branches, or (for
-    // `Allow`) needs no human-readable reason at all. Every other tool's own
-    // deny reasons (the orchestrator-write guard, the expensive-seat fork
-    // denial) are fixed, hand-authored strings that never quote arbitrary
-    // rehydrated content, so they are untouched.
+    // The base guard needs rehydrated commands, but its safety reason may quote
+    // them. Drop that reason for Bash/PowerShell and use the generic recheck
+    // below so vault values never reach a model-facing envelope (#466, #769).
     if matches!(tool.as_str(), "Bash" | "PowerShell")
         && let Some(hook_output) = envelope
             .get_mut("hookSpecificOutput")
@@ -211,7 +188,7 @@ fn run_pretool_with_rehydration<W: Write>(
         }
     }
     if matches!(tool.as_str(), "Bash" | "PowerShell") {
-        // Issue #466: parallel safety hooks saw placeholders, not this final command.
+        // Recheck the final command; parallel hooks only saw placeholders (#466).
         raw["tool_input"] = rehydrated.clone();
         let verdict = CtxConfig::load(&cwd, env).and_then(|cfg| {
             crate::commands::ctx::safety::run_check_hook_with_verdict(
@@ -259,10 +236,8 @@ fn shared_placeholder_artifact(payload: &serde_json::Value, cwd: &Path) -> bool 
         return false;
     };
     if matches!(tool, "Bash" | "PowerShell") {
-        // Issue #466: a shell write carries no structured path field, so every
-        // token the command mentions is tested as one against the same shared
-        // -artifact rule the structured tools use. Deliberately conservative:
-        // a mention is enough to keep the placeholder unexpanded.
+        // Shell writes have no structured path: conservatively test every token
+        // against the shared artifact rule before expanding placeholders (#466).
         return input
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -288,13 +263,8 @@ fn shared_placeholder_artifact(payload: &serde_json::Value, cwd: &Path) -> bool 
         .any(|path| crate::commands::ctx::obfuscate_store::is_shared_placeholder_path(cwd, path))
 }
 
-/// `posttool`'s own body for every agent. `None`/`Some("claude")` is the
-/// original claude-only path unchanged. `copilot` projects/runs/translates
-/// exactly like [`run_pretool_for_agent`] does. `droid`/`gemini` have no
-/// verified result-replacement contract at all (`Capabilities::
-/// post_tool_hook` is `false` for both -- see their own `native_hooks` doc
-/// comments), so this prints one stderr note and exits 0 rather than
-/// attempting a projection that could never produce a usable envelope.
+/// Project posttool results only where the adapter supports result
+/// replacement; unsupported agents emit no unusable envelope (#418).
 pub fn run_posttool_for_agent<W: Write>(
     w: &mut W,
     stdin: &str,

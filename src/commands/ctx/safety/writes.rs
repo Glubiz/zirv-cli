@@ -2,13 +2,9 @@
 
 use super::*;
 
-/// Issue #168, design decision (a): whether `target` is `/dev/null` or
-/// lexically beneath one of `scratchpad_roots` (already forward-slash
-/// normalized, no trailing separator). A target carrying `$`, a backtick,
-/// `~`, or a shell glob character is never treated as confined -- this
-/// classifier is text-only and cannot know what such a target expands to.
-/// Reused by [`is_curl_or_wget_get_only`] (this task) and by [`write_
-/// targets_confined`] (Task 6).
+/// A target is confined only when literal `/dev/null` or lexically
+/// beneath a scratchpad root; dynamic expansion cannot prove confinement
+/// (#168).
 pub(super) fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> bool {
     if target == "/dev/null" {
         return true;
@@ -16,36 +12,22 @@ pub(super) fn target_is_confined(target: &str, scratchpad_roots: &[String]) -> b
     if target.contains(['$', '`', '~', '*', '?']) {
         return false;
     }
-    // Code review fix round 2 (CRITICAL): a `..` component lexically
-    // escapes any prefix-based root check no matter how the separator
-    // boundary is guarded -- `/tmp/claude/../../etc/passwd` starts with
-    // `/tmp/claude/` and would otherwise pass. Mirrors `strip_known_root_cd_
-    // prefix`'s own `path_token.contains("..")` guard: a plain substring
-    // reject, not lexical resolution -- the literal two-character sequence
-    // is identical whether the surrounding path uses `/` or `\`.
+    // Reject `..` before prefix checks: lexical parent traversal can escape
+    // an otherwise matching scratchpad root.
     if target.contains("..") {
         return false;
     }
     let normalized = target.replace('\\', "/");
-    // Code review fix (CRITICAL): exact match OR root-plus-separator, the
-    // same boundary guard `strip_known_root_cd_prefix` already applies to
-    // its own root comparison -- a plain `starts_with` let a SIBLING
-    // directory whose name merely shares the root's text as a prefix
-    // (`/tmp/claude-evil` against root `/tmp/claude`) ride through as
-    // "confined" with nothing separating the two paths.
+    // Require an exact root or root-plus-separator boundary; a sibling with
+    // the same text prefix is not confined.
     scratchpad_roots.iter().any(|root| {
         !root.is_empty() && (normalized == *root || normalized.starts_with(&format!("{root}/")))
     })
 }
 
-/// Issue #168/#345: scans `segment` (already heredoc-redacted by the caller)
-/// for unquoted path-bearing output redirections: `>`, `>>`, `>|`, `&>`,
-/// `&>>`, Bash's legacy `>&word`, and digit-prefixed forms. Input redirections, process
-/// substitutions, and descriptor duplications name no write target and are
-/// skipped. Command substitutions are scanned recursively because their own
-/// output redirections still write; their closing delimiter is never part of
-/// the target word. `None` means a real output operator had no usable word
-/// after it, so the caller must not guess.
+/// Find unquoted output redirection targets, including fd-prefixed forms.
+/// Skip input/descriptor forms and inspect substitutions recursively; an
+/// output operator without a resolvable target returns None (#168, #345).
 pub(super) fn scan_redirection_targets(segment: &str) -> Option<Vec<String>> {
     scan_redirection_targets_at_depth(segment, 0)
 }
@@ -208,10 +190,8 @@ fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<
     Some(targets)
 }
 
-/// Issue #168, design decision (d): one segment's write targets, or `None`
-/// if this cannot be confidently resolved -- either a dangling redirection
-/// operator ([`scan_redirection_targets`] itself), or a `tee` argument
-/// containing `$`/backtick so it cannot be proven a literal path.
+/// Resolve one segment's write targets; dangling redirections and
+/// dynamic `tee` paths yield no safe conclusion (#168).
 pub(super) fn segment_redirect_targets(segment: &str) -> Option<Vec<String>> {
     let mut targets = scan_redirection_targets(segment)?;
     if let Some(tokens) = path_command_tokens(segment)
@@ -566,25 +546,9 @@ fn substitute_literal_variables(
     out
 }
 
-/// Issue #168, design decision (d): whether every write target across every
-/// segment of `command` is `/dev/null` or beneath one of `scratchpad_roots`.
-/// `None` -- no opinion, exactly today's un-analyzed behavior -- whenever
-/// `scratchpad_roots` is empty, any segment's own targets cannot be
-/// confidently resolved (see [`segment_redirect_targets`]), a target contains
-/// `$`/backtick after resolving earlier same-command literal assignments
-/// (distinct from a target merely containing `~`/a glob
-/// character, which [`target_is_confined`] can confidently call "not
-/// confined" without further ambiguity), or -- CRITICAL -- `command` names
-/// no write target at all (no redirection, no `tee`). That last case matters
-/// because this function's caller only ever widens a verdict when it
-/// returns `Some(true)`: without this guard, ANY command with zero writes
-/// (an ordinary `ssh host uptime`, a bare `2>&1` with nothing
-/// else) would vacuously satisfy "every target is confined" and get widened
-/// to `Allow` just for not writing anywhere at all -- which is not what this
-/// design decision is for (a compound that DOES write, confined to the
-/// scratchpad). `None` here correctly leaves such a command to classify
-/// exactly as it does today. Heredoc bodies are redacted first, the same as
-/// every other classifier in this module.
+/// Prove every actual write target in a command is confined. Return None
+/// for unknown targets or no targets: vacuous success would allow an
+/// arbitrary non-writing command through the scratchpad carve-out (#168).
 pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String]) -> Option<bool> {
     if scratchpad_roots.is_empty() {
         return None;
@@ -613,16 +577,8 @@ pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String])
 
 // -- orchestrator repo-write guard (issues #328/#334) ---------------------
 
-/// Blanks runs of two or more consecutive `<` (a heredoc `<<`/here-string
-/// `<<<` operator) to spaces before `segment` reaches [`segment_write_
-/// targets`] -- that scanner has no heredoc-syntax awareness of its own,
-/// and a heredoc opener's `<<'DELIM'` (left standing by [`redact_single_
-/// quoted_heredocs`], which only blanks the BODY) reads as a second,
-/// dangling INPUT redirect with nothing after it, aborting the scan of the
-/// whole segment and discarding a real `>` write target earlier on the
-/// same line (`cat > README.md <<'EOF'`). A lone `<` is left alone: an
-/// ordinary input redirect, already folded into `segment_write_targets`'s
-/// own targets exactly like today.
+/// Mask heredoc openers before redirect scanning so `<<` does not look
+/// like a dangling input redirect and hide an earlier real write target.
 fn neutralize_heredoc_operator(segment: &str) -> String {
     let chars: Vec<char> = segment.chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -644,16 +600,8 @@ fn neutralize_heredoc_operator(segment: &str) -> String {
     out
 }
 
-/// Resolves `target` through its longest existing filesystem prefix before
-/// forward-slash and `.`/`..` normalization: an absolute target (`/`, `~`, or drive
-/// letter) is normalized as-is; a relative one resolves against `cwd`.
-/// `None` when `target` cannot be confidently resolved at all -- it
-/// carries `$`/a backtick (built through expansion this resolver
-/// cannot resolve), or it is `/dev/null` (never a write target in the
-/// first place). A `~`-prefixed result is left exactly as written -- it is
-/// not a real filesystem-absolute path (expanding it needs `$HOME`, which
-/// this resolver never reads), so [`repo_write_violation`] treats
-/// it as unresolvable rather than feeding it to `repo_root_of`.
+/// Resolve a write target through existing filesystem prefixes. Dynamic
+/// expansion and `~` cannot be proven absolute; `/dev/null` is not a write.
 pub(super) fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
     if target.contains(['$', '`']) || target == "/dev/null" {
         return None;
@@ -709,23 +657,10 @@ pub(super) fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<Strin
     }
 }
 
-/// `target` is a repository write iff its resolved, filesystem-absolute
-/// form ([`resolve_repo_write_target`]) sits inside a git repository
-/// (`repo_root_of` finds a `.git` ancestor for it) AND is not equal to or
-/// nested under that repo's own `.zirv/work` or `.zirv/memory` -- the same
-/// root-plus-separator boundary rule [`target_is_confined`] applies to its
-/// own scratchpad roots. Issue #334 MAJOR fix: which repository owns the
-/// target is answered PER TARGET, not assumed to be the launch repo --
-/// `git repo /a` and `git repo /b/.zirv/work` are two different repos'
-/// scratch areas, and a sibling checkout's own `.zirv/work` never confines
-/// a write into the launch repo, or vice versa. A target under Claude Code's
-/// own harness home (`CLAUDE_CONFIG_DIR`, `$HOME/.claude`, or
-/// `%USERPROFILE%\\.claude`) is likewise not a repository write. A resolved form that is not filesystem-absolute at
-/// all (a `~`-prefixed target) is never even handed to `repo_root_of`: this
-/// module cannot resolve `~` to a real path, so it stays unresolvable rather
-/// than guessed at. Returns `target` unchanged (as originally written) on a
-/// violation, so a caller can report it without leaking a resolved absolute
-/// path.
+/// Report a repository write only for a proven absolute target in its
+/// nearest git repository, outside that repository's own allowed work and
+/// memory roots. Resolve per target, not against the launch repo; preserve
+/// the caller's original path in the report (#334).
 fn repo_write_violation(
     target: &str,
     cwd: &str,
@@ -754,16 +689,8 @@ fn repo_write_violation(
     }
 }
 
-/// The nearest git repository root containing `path` (issue #334): starts
-/// at `path`'s own PARENT directory -- the file itself may not exist yet
-/// (`cp`/`mv`'s destination need not, though `sed -i`'s target usually
-/// does) -- and walks upward looking for a `.git` entry (a directory for
-/// an ordinary checkout, a plain file naming the real gitdir for a linked
-/// worktree -- either counts, `Path::exists` alone answers both). `None`
-/// when no ancestor up to the filesystem root carries one, or `path` has
-/// no parent at all (already the root). The one real filesystem walk in
-/// this guard: [`orchestrator_repo_write_target`] itself stays pure and
-/// takes this as an injected closure so tests can fake it deterministically.
+/// Find the nearest git root from a target's parent, including `.git`
+/// files in linked worktrees; the write target may not exist yet (#334).
 pub(super) fn filesystem_repo_root_of(path: &str) -> Option<String> {
     let mut dir = std::path::Path::new(path).parent()?.to_path_buf();
     loop {
@@ -781,30 +708,14 @@ pub(super) fn filesystem_repo_root_of(path: &str) -> Option<String> {
     }
 }
 
-/// Like [`split_segments`], but each segment also carries whether the
-/// separator immediately before it was a pipe (`|` or `|&`, not `||`) --
-/// issue #334's `git apply`/`git am`/`patch` carve-out needs that. A direct
-/// alias for [`tokenize_segments`], which already returns exactly this
-/// shape.
+/// Split segments with pipe markers so patch-application exemptions can
+/// distinguish pipelines from other shell joins (#334).
 pub(super) fn split_segments_with_pipe_marker(command: &str) -> Vec<(String, bool)> {
     tokenize_segments(command)
 }
 
-/// The sentinel label [`orchestrator_repo_write_target`] reports for a
-/// `git apply`/`git am`/`patch` segment -- `None` for every other `git`
-/// subcommand (`commit`, `merge`, `cherry-pick`, `checkout`, `stash`,
-/// `worktree`, ...), which stay exempt as before: git integration is the
-/// orchestrator seat's own job. These three specifically are NOT exempt on
-/// program name alone, because they apply an arbitrary diff to the working
-/// tree -- the write can land anywhere the diff names, regardless of where
-/// the diff text itself came from (a heredoc, a literal file argument, a
-/// `<` redirect, or bare stdin all count). `subcommand` must be the git
-/// action [`git_action`] resolves -- NOT a raw `tokens.get(1)` -- so a
-/// global option ahead of the verb (`git -C <dir>`, `-c k=v`, `--git-dir=`,
-/// `--work-tree=`, `--namespace=`) can never be mistaken for the verb
-/// itself and slip an actual `apply`/`am` through to the blanket `git`
-/// exemption (issue #334 review round 2, HIGH: `git -C <sibling-worktree>
-/// apply p.diff` used to do exactly that).
+/// Identify `git apply`/`git am`/`patch` as arbitrary worktree writes;
+/// parse git global flags before the action so they cannot hide it (#334).
 fn git_apply_program_label(program: &str, subcommand: Option<&str>) -> Option<&'static str> {
     match (program, subcommand) {
         ("git", Some("apply")) => Some("<git apply>"),
@@ -814,17 +725,8 @@ fn git_apply_program_label(program: &str, subcommand: Option<&str>) -> Option<&'
     }
 }
 
-/// Diff-producing `git` actions (issue #334 review round 2, MEDIUM) whose
-/// output is a legitimate upstream for a piped `git apply`/`git am` -- the
-/// one form that is how the orchestrator seat integrates a worker's diff
-/// rather than authoring one itself (`git -C <wt> diff | git apply`, `git
-/// format-patch --stdout | git am`). Deliberately narrow, not "any `git`
-/// subcommand": `git cat-file -p <sha>:path | git apply` reads an
-/// arbitrary blob, not necessarily a diff, and every other `git` action
-/// (`log` without `-p`, `status`, `commit`, ...) does not reliably produce
-/// patch-shaped output either -- resolved via [`git_action`] the same way
-/// [`git_apply_program_label`]'s own `subcommand` is, so a global option
-/// ahead of the verb cannot hide a non-diff action behind it either.
+/// Only diff-producing git actions qualify as upstream for piped
+/// `git apply`/`git am`; other git output is not a proven patch (#334).
 const GIT_DIFF_PRODUCING_ACTIONS: &[&str] = &[
     "diff",
     "show",
@@ -936,48 +838,11 @@ fn inline_code_has_write_primitive(code: &str) -> bool {
         && INLINE_WRITE_MODE_LITERALS.iter().any(|m| code.contains(m))
 }
 
-/// Issue #334: the first repository file `command` would write from an
-/// orchestrator seat, or `None`. `cwd` is forward-slash normalized, no
-/// trailing slash; `repo_root_of(absolute_path)` returns the nearest git
-/// repository root containing `absolute_path`, or `None` when it names no
-/// repository at all -- production passes a real filesystem walk
-/// ([`filesystem_repo_root_of`]), tests pass a deterministic fake.
-/// Environment lookup is injected; filesystem access is limited to the
-/// shared canonical harness-home containment check and the injected
-/// `repo_root_of` callback.
-///
-/// Scans each of [`split_segments_with_pipe_marker`]'s segments (over the
-/// already heredoc-redacted command) for five write shapes: (a) a
-/// redirect/`tee` target ([`segment_write_targets`]); (b) a `sed`/`perl`
-/// in-place edit's file arguments; (c) the last argument of `cp`/`mv`/
-/// `install`/`rsync`/`ln`; (d) an inline interpreter (`python`/`python3`/
-/// `node`/`ruby`/`perl`/`php`) invoked with `-c`/`-e` whose code contains a
-/// write primitive and mentions none of `cwd`'s own repo's allowed roots;
-/// (e) `git apply`, `git am`, or `patch` ([`git_apply_program_label`]) --
-/// these three apply an arbitrary diff to the working tree, so they are
-/// NEVER exempt on program name alone the way every other `git` subcommand
-/// is, UNLESS the segment is itself piped from an immediately preceding
-/// `git` segment whose OWN action is one of [`GIT_DIFF_PRODUCING_ACTIONS`]
-/// (`git -C <wt> diff | git apply`, `git format-patch --stdout | git am`)
-/// -- the one form that is how the seat integrates a worker's diff rather
-/// than authoring one itself; `git cat-file -p <sha>:path | git apply` is
-/// NOT exempt, a non-diff `git` action is no safer an upstream than a
-/// non-`git` one. Every `git` action -- both the segment's own (for the
-/// apply/am/patch check) and its would-be upstream's (for the pipe
-/// exemption) -- is resolved via [`git_action`], which skips `git`'s own
-/// global options (`-C <dir>`, `-c k=v`, `--git-dir=`, `--work-tree=`,
-/// `--namespace=`) ahead of the verb, so neither can be defeated by one.
-///
-/// Known gaps, documented rather than chased (this classifier is text-only
-/// and argv-scoped, the same declared limits every other classifier in
-/// this module accepts):
-/// - No `cd` tracking: `cd src && sed -i ... lib.rs` resolves `lib.rs`
-///   against `cwd`, not `cwd/src`, and is not caught.
-/// - An inline interpreter write primitive's ambiguity analysis is
-///   narrowed to "does the code mention one of `cwd`'s own repo's allowed
-///   roots" -- it does not attempt to prove a mentioned path is genuinely
-///   outside that repo, or resolve which repo a DIFFERENT mentioned path
-///   belongs to the way (a)-(c)/(e)'s structured targets do.
+/// An orchestrator seat must not directly write any repository, including a
+/// sibling checkout. Check redirects, editors, copy targets and patches;
+/// exempt only patches immediately piped from a diff-producing git action.
+/// This argv-scoped classifier cannot track `cd` or fully prove interpreter
+/// path effects (#334).
 pub(crate) fn orchestrator_repo_write_target(
     command: &str,
     cwd: &str,
@@ -997,12 +862,8 @@ pub(crate) fn orchestrator_repo_write_target(
         .collect();
 
     let sanitized = redact_single_quoted_heredocs(command);
-    // Whether the immediately preceding segment was itself a `git`
-    // invocation whose action is one of `GIT_DIFF_PRODUCING_ACTIONS` --
-    // the only kind of upstream a piped `git apply`/`git am` may be exempt
-    // for. Reset to `false` at the top of every iteration this loop
-    // doesn't explicitly set it in, so it only ever reflects the segment
-    // immediately before the one currently being examined.
+    // Track only the immediately preceding diff-producing git segment;
+    // reset at each other segment before considering a patch-apply exemption.
     let mut previous_diff_producing_git = false;
     for (segment, preceded_by_pipe) in split_segments_with_pipe_marker(&sanitized) {
         let collapsed = collapse_whitespace(&segment);
@@ -1016,11 +877,8 @@ pub(crate) fn orchestrator_repo_write_target(
         };
         let program = sql_program_name(first);
 
-        // Issue #334 review round 2, HIGH: the real git action, skipping
-        // any global option ahead of the verb -- `tokens.get(1)` alone
-        // would read `-C`/`-c`/`--git-dir=.../--work-tree=.../--namespace=`
-        // as the verb and let an actual `apply`/`am` slip past both checks
-        // below via the blanket `git` exemption.
+        // Parse the actual git action past global flags so `apply`/`am` cannot
+        // inherit the blanket exemption for other git commands (#334).
         if program == "git" {
             let action = git_action(&tokens).map(|(_, action)| action.to_ascii_lowercase());
             if let Some(label) = git_apply_program_label(&program, action.as_deref()) {
@@ -1087,13 +945,8 @@ pub(crate) fn orchestrator_repo_write_target(
     None
 }
 
-/// Issue #168, design decision (d): true when every one of `command`'s
-/// normalized executable candidates evaluates to `Allow`, or to the plain,
-/// no-rule-matched mode default -- the check [`write_targets_confined`]'s
-/// caller needs before it will widen a compound's default `Ask` to `Allow`:
-/// an explicit operator/repo `ask` rule, or any `deny` rule, naming one
-/// segment must still win, never be silently overridden just because that
-/// segment also happens to write somewhere confined.
+/// Require every normalized candidate to be allowed or unmatched before
+/// widening a confined-write command; explicit Ask/Deny still wins (#168).
 pub(super) fn every_segment_is_allow_or_unmatched_default(
     policy: &SafetyPolicy,
     command: &str,

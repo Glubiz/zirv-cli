@@ -16,20 +16,8 @@ use crate::commands::ctx::{CtxResult, log};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
 use crate::commands::workflow::engine;
 
-/// UserPromptSubmit is the only hook that can add context to the model, which
-/// is how the marker signal gets installed. `adoption_nudge` (issue #223)
-/// rides as a second line when one is due -- the marker line stays exactly as
-/// it was, so an operator relying on it for the rot signal sees no change.
-///
-/// Issue #225 (steady-state token reduction): the marker sentence is paid,
-/// uncached, on EVERY user turn -- unlike the once-per-session prompt layers
-/// in `prompt.rs`, it cannot ride the provider's cache. It used to be 170
-/// bytes; the shorter wording below keeps the exact same contract (start
-/// every FINAL answer with the marker on line 1, mid-turn notes are exempt,
-/// it is a context-health marker) in <= 90 bytes for the default `[zirv]`
-/// marker. `score.rs`/`rot.rs`'s `marker_miss_rate` only checks for the
-/// marker prefix at the start of a line, never this sentence's wording, so
-/// rewording it here changes no detection logic.
+/// Add marker and due adoption context through UserPromptSubmit. Preserve
+/// the marker line because session rot tracking depends on it (#223).
 pub fn prompt_output(
     marker: &str,
     adoption_nudge: Option<&str>,
@@ -51,8 +39,8 @@ pub fn prompt_output(
                 .then_some(messages)
         })
         .map(|messages| crate::commands::ctx::lifecycle::mail_note(messages.len()));
-    // Issue #478: assembled by the shared prompt service, so a native session
-    // injects the same notes in the same order with no hook in the picture.
+    // Use shared prompt assembly so native and hooked sessions inject notes
+    // in the same order (#478).
     let context = crate::commands::ctx::lifecycle::prompt_notes(
         marker,
         &[adoption_nudge.map(str::to_string), mail],
@@ -69,9 +57,8 @@ pub fn prompt_output(
     .to_string()
 }
 
-/// Issue #785: whether the `[jev] inject` gate defers this prompt's mail
-/// note, using the hook's already-loaded `cfg`; gate off or no credential is
-/// `false` before any fact is computed.
+/// Decide whether Jev injection defers this mail note using loaded config
+/// before building facts (#785).
 fn mail_note_deferred(
     state: &StateDir,
     short: &str,
@@ -112,13 +99,8 @@ fn mail_note_deferred(
 pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
     let repo = payload.repo();
-    // Issue #466: a config-load failure must not block the prompt or lose
-    // the adoption nudge/attention tracking below -- that was this event's
-    // whole behavior before sensitive-data masking existed, and masking is
-    // opt-in (`obfuscate.mode` defaults to `off`), so an unrelated config
-    // problem elsewhere can never regress it. `cfg` falls back to defaults
-    // (`obfuscate.mode == Off`), exactly like this handler's own pre-#466
-    // `.ok()` fallback for the adoption marker.
+    // Config failure must not block a prompt or lose unrelated adoption and
+    // attention signals; optional masking degrades to passthrough (#466).
     let cfg = crate::commands::ctx::config::CtxConfig::load(&repo, env).unwrap_or_default();
 
     // Scope-creep guard: records this prompt's own preservation/limitation
@@ -134,14 +116,8 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
         env,
     );
 
-    // Issue #745: a closed-set, deterministic administrative dispatch that
-    // answers a known-safe read-only request in-process and blocks the
-    // prompt before any model request -- the actual LLM-turn saving this
-    // hook can offer. Checked first: when it matches, nothing else in this
-    // handler (obfuscation, the marker/mail context, attention) runs,
-    // because no model turn happens at all. Gate off, credential missing, no
-    // exact match, or the matched renderer failing -- returns `None` and
-    // falls straight through, byte-identical to today.
+    // Check exact read-only administrative requests first so they can be
+    // answered before model input and without unrelated hook effects (#745).
     if let Some(block) = admin_dispatch_block(&cfg, &repo, env, &prompt_text_from(stdin)) {
         let _ = writeln!(w, "{block}");
         return Ok(0);
@@ -212,9 +188,6 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     }
 
     let adoption_nudge = prompt_adoption_nudge(&repo, &cfg, env);
-    // Issue #753: the one-turn intake discipline note rides the same extra
-    // line as the adoption nudge; `None` on every turn but a substantial
-    // first one.
     let intake_note = intake_discipline_note(&cfg, &payload.session_id, stdin, env);
     let extra = [intake_note, adoption_nudge]
         .into_iter()
@@ -248,10 +221,8 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
-/// Issue #753: the discipline a substantial task gets on its first turn --
-/// the plan/test habits the large-task benchmark rows lost without the
-/// proxy's routing (docs/benchmarks/wrapped-vs-vanilla.md section 4-5). Kept
-/// under 400 bytes: it is paid once per session, never per turn.
+/// One-turn discipline note for a substantial first prompt, capped to
+/// avoid recurring context cost (#753).
 pub(crate) const INTAKE_DISCIPLINE_TEXT: &str = "[zirv intake] Substantial task. Plan ordered, verifiable steps before editing. Write or extend tests first for behaviour changes. Never modify or weaken existing or protected tests to make them pass. Run the full test suite before declaring done. Skills: zirv skill load plan / tdd / verify.";
 
 /// Pure: the intake note for `prompt` -- the proxy's own deterministic,
@@ -278,9 +249,8 @@ fn intake_skipped_for_launch(env: EnvLookup<'_>) -> bool {
         || set(crate::commands::ctx::agent::PARENT_SESSION_ENV)
 }
 
-/// Claims this session's first prompt: `true` exactly once per session,
-/// by atomically creating its marker file. Any I/O doubt is `false` --
-/// inject nothing rather than risk repeating the note every turn.
+/// Atomically claim the first prompt once per session; I/O uncertainty
+/// suppresses the note to avoid repetition.
 fn claim_first_prompt(state: &StateDir, session: &str) -> bool {
     let dir = state.intake();
     if crate::commands::ctx::state::create_private_dir_all(&dir).is_err() {
@@ -301,10 +271,8 @@ fn claim_first_prompt(state: &StateDir, session: &str) -> bool {
     claimed
 }
 
-/// Issue #753: classify a wrapped session's FIRST prompt and, when it is
-/// substantial, return the one-turn discipline note. Every gate (config,
-/// proxy/worker launch, no session id, no state dir, not the first prompt,
-/// classifier refusal) degrades to `None`: this never blocks a prompt.
+/// Return a first-turn note only when all launch and classification gates
+/// are known; uncertainty leaves the prompt unchanged (#753).
 fn intake_discipline_note(
     cfg: &CtxConfig,
     payload_session: &str,
@@ -338,13 +306,9 @@ fn intake_discipline_note(
     Some(note.to_string())
 }
 
-/// Issue #745: prompts this hook can answer without ever asking a model -- a
-/// closed set of already-authorized, read-only administrative operations,
-/// matched by exact string equality after normalization. No arguments are
-/// read from the prompt and no operation takes any beyond `repo`/`env`: a
-/// near-miss, extra words, or an argument anywhere in the prompt matches
-/// nothing here and falls straight through to today's path rather than
-/// attempting a partial match.
+/// Closed set of read-only administrative operations that need no model
+/// request. Match exact normalized text and use only trusted repo/env input
+/// (#745).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminOp {
     CtxStatus,
@@ -412,11 +376,8 @@ impl AdminOp {
     }
 }
 
-/// Trim, lowercase, collapse whitespace runs, and strip one leading `/` --
-/// the exact normalization [`AdminOp::matching`] compares against. Never a
-/// fuzzy match: this is byte-for-byte equality against the *normalized*
-/// string only, so "zirv ctx status now" or "zirv ctx status --json" match
-/// nothing here.
+/// Normalize only case, whitespace and one leading slash; exact equality
+/// prevents arguments or extra words from changing an admin operation.
 fn normalize_admin_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim();
     let trimmed = trimmed.strip_prefix('/').unwrap_or(trimmed);
@@ -441,19 +402,10 @@ fn prompt_text_from(stdin: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Issue #745: answers a closed-set, already-authorized, read-only
-/// administrative request in-process, with a `{"decision":"block","reason":
-/// ...}` `UserPromptSubmit` output that stops the prompt before any model
-/// request -- the actual LLM-turn saving this hook can offer. Active only
-/// when the operator gate (`cfg.jev.admin_dispatch`) is on AND the Jev
-/// credential is present (`jev::available`) -- this feature's own
-/// Jev-optional contract, even though this path never makes a Jev HTTP call:
-/// issue #746's egress boundary (`jev.rs::safe_metadata_request`) forbids
-/// sending prompt text anywhere, so v1's selection is deterministic
-/// exact-match only, and only a static effect row (never a decision/cache
-/// row) is recorded. `None` (gate off, credential missing, no exact match,
-/// or the matched renderer failing) means "run today's path" -- byte-
-/// identical output, no effect row written.
+/// Answer only exact, authorized read-only admin requests in-process and
+/// block their model prompt; other inputs continue unchanged (#745).
+/// Selection stays deterministic exact-match only: #746's egress boundary
+/// forbids sending prompt text to Jev, so this never makes a Jev call.
 fn admin_dispatch_block(
     cfg: &CtxConfig,
     repo: &Path,
@@ -491,25 +443,9 @@ fn admin_dispatch_block(
     )
 }
 
-/// Issue #223: the `UserPromptSubmit` half of the adoption nudge. Unlike the
-/// Stop hook, this never re-scans the transcript -- it only re-reads the
-/// per-session record `adoption_stop_nudge` already maintains and re-checks
-/// `zirv workflow start`/`resume` live, since a workflow can start in another
-/// pane between one Stop and the next prompt. `None` on any doubt at all: no
-/// session identity, no record, not substantial, or neither nudge is due.
-///
-/// The skill nudge is computed alongside the workflow one, sharing the
-/// same delegated-worker exemption, session/record lookup and
-/// `record.substantial` gate, but -- exactly like `adoption_stop_nudge`'s
-/// own copy -- is NOT gated on `cfg.workflow.adoption >= AdoptionPolicy::
-/// Nudge` (the workflow nudge's own top-level gate, moved down into its own
-/// branch below so it no longer shortcuts the whole function) or on
-/// `workflow_active`, only on `cfg.prompt.skill_index`. In practice a
-/// workflow-adoption policy of `Off` still reads as "no skill nudge either",
-/// the same way `adoption_stop_nudge` documents: the Stop hook never folds
-/// fresh transcript bytes while `Off`, so `record.substantial` has nothing
-/// new to say -- this function only ever RE-READS that record, never
-/// re-scans it.
+/// Read the persisted adoption record and current workflow state; only
+/// a due, relevant nudge rides this prompt. Do not rescan the transcript
+/// in the hot hook path (#223).
 pub(super) fn prompt_adoption_nudge(
     repo: &Path,
     cfg: &CtxConfig,

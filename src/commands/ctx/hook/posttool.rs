@@ -29,11 +29,9 @@ pub struct PostToolPayload {
     pub tool_input: PostToolInput,
     pub tool_response: BashToolOutput,
     pub cwd: String,
-    /// Claude's own session id (issue #422's `ledger` `session` column).
+    /// Claude session ID recorded in the compaction ledger (#422).
     pub session_id: String,
-    /// Claude's own tool-call id (issue #422's `ledger` `tool_use_id`
-    /// column), so a savings row can be correlated back to the exact
-    /// `PostToolUse` invocation that produced it.
+    /// Claude tool-call ID for correlating this compaction row (#422).
     pub tool_use_id: String,
 }
 
@@ -65,13 +63,8 @@ fn already_offloaded(text: &str) -> bool {
     crate::commands::ctx::lifecycle::already_offloaded(text)
 }
 
-/// The `updatedToolOutput` envelope. `stderr` is emptied deliberately: the
-/// summary already folds both streams together (they were captured merged),
-/// and leaving the original stderr alongside it would put the very bytes this
-/// hook exists to remove straight back into the model's context.
-/// `interrupted` is carried through from the original -- it is a fact about
-/// the run, not about the output -- and `isImage` is always false, since a
-/// summary is text by construction.
+/// Replace the tool result and clear stderr because the summary already
+/// includes both merged streams; leaving stderr would restore removed bytes.
 pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -114,21 +107,14 @@ fn posttool_additional_context_output(note: &str) -> String {
     .to_string()
 }
 
-/// Merges the scope-guard shell checkpoint's own note into an already-built
-/// `PostToolUse` envelope string (one of `posttool_output`'s/
-/// `posttool_value_output`'s own outputs), or returns it unchanged when
-/// `note` is `None`. Only one JSON object may ever be written per hook call,
-/// so this is the seam every `run_posttool` return path routes through
-/// rather than writing `additionalContext` as a second line: re-parses
-/// rather than threading a `Value` through every caller, which keeps
-/// `posttool_output`/`posttool_value_output` -- and every existing assertion
-/// against their exact shape -- untouched. Fails safe: an envelope that
-/// somehow does not round-trip through JSON is returned as-is, dropping the
-/// note rather than corrupting the envelope claude actually reads.
+/// Merge a scope checkpoint note into the sole PostToolUse JSON envelope;
+/// emitting a second object would make the hook response invalid.
 fn posttool_envelope_with_context(envelope: String, note: Option<&str>) -> String {
     let Some(note) = note else {
         return envelope;
     };
+    // Fails safe: an envelope that does not round-trip through JSON is
+    // returned as-is, dropping the note rather than corrupting the response.
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&envelope) else {
         return envelope;
     };
@@ -144,11 +130,8 @@ fn posttool_envelope_with_context(envelope: String, note: Option<&str>) -> Strin
     value.to_string()
 }
 
-/// The shared tail for every `run_posttool` return point that has no
-/// compaction/obfuscation envelope of its own to attach the scope-guard
-/// shell checkpoint to: writes it alone (standalone `additionalContext`)
-/// when present, otherwise writes nothing at all -- exactly this function's
-/// previous behaviour for every one of those paths.
+/// Emit the scope note alone only when no compaction envelope exists;
+/// PostToolUse accepts one JSON response per call.
 fn posttool_finish<W: Write>(w: &mut W, note: Option<&str>) -> CtxResult<i32> {
     if let Some(note) = note {
         let _ = writeln!(w, "{}", posttool_additional_context_output(note));
@@ -287,35 +270,14 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
     None
 }
 
-/// The compact-output hook (issue #326). Replaces a large `Bash` tool result
-/// with a summary of it, after storing the original verbatim under the state
-/// dir so `zirv ctx output show <id>` can hand any of it back.
-///
-/// Fails open on every path -- an unparseable payload, a non-`Bash` tool, an
-/// image result, a result claude has already offloaded itself, output below
-/// the threshold, a disabled switch, an unresolvable state dir, or a failed
-/// persist -- by printing nothing and exiting 0, which claude reads as "no
-/// replacement, use the original". That ordering matters: nothing is ever
-/// replaced unless the full original is already on disk, so a summary can
-/// never be the only surviving copy. Nothing here may `unwrap`, `expect` or
-/// return `Err`: the release profile is `panic = "abort"`, and a hook that
-/// aborts takes the tool result with it.
-///
-/// Issue #422: every path from a resolved `cwd`/state dir onward also
-/// records one row to `ledger.rs`'s own `compactions` table (fail-open,
-/// `ledger::record`'s own contract), so `zirv ctx savings` can answer how
-/// much this hook has actually saved without re-deriving it from the raw
-/// output-capture files.
+/// Store original Bash output before replacing a large result with a
+/// retrievable summary. Any parse, storage or rendering failure passes the
+/// original output through unchanged (#326). Nothing here may `unwrap`,
+/// `expect` or return `Err`: the release profile is `panic = "abort"`, and
+/// a hook that aborts takes the tool result with it.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
-    // Scope-creep guard (item 1): the tool-agnostic shell-edit checkpoint is
-    // computed first, independent of everything below, so its note can be
-    // merged into whichever envelope this call ends up emitting below --
-    // obfuscation's masked replacement, output compaction's summary, or (when
-    // neither fires) a standalone envelope of its own -- since only one JSON
-    // object may ever be written per hook call. This narrow parse only reads
-    // `tool_name`/`cwd`/`session_id`; the same `PostToolPayload` is parsed
-    // again below for the rest of this function's own, untouched control
-    // flow.
+    // Compute the shell checkpoint before replacement paths branch so its
+    // note joins their sole JSON envelope; PostToolUse accepts one object.
     let shell_checkpoint = serde_json::from_str::<PostToolPayload>(stdin)
         .ok()
         .filter(|payload| matches!(payload.tool_name.as_str(), "Bash" | "PowerShell"))
@@ -336,9 +298,8 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
             )
         });
 
-    // Runs before the Bash-specific parser below: Read/Grep/Glob and custom
-    // tool results have different schemas, but their `tool_response` value
-    // can still be replaced byte-for-byte after recursively masking strings.
+    // Mask non-Bash results before Bash-only parsing; their response schemas
+    // differ but may still carry sensitive strings.
     if let Some(masked) = obfuscated_posttool_response(stdin, env) {
         let _ = writeln!(
             w,
@@ -354,11 +315,8 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         return Ok(0);
     };
 
-    // Issue #456: the tool already ran, so any permission prompt this
-    // session had pending is necessarily resolved. Cleared before the
-    // Bash-only compact-output early return below so it still fires even
-    // though the compaction logic itself never runs for another tool; a
-    // best-effort side channel that never affects that logic either way.
+    // A tool call proves any pending permission prompt has resolved; clear
+    // attention before Bash-only early returns (#456).
     if let Ok(state) = StateDir::resolve(env) {
         clear_resolved_approval(
             &state,
@@ -380,12 +338,8 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         format!("{}\n{}", response.stdout, response.stderr)
     };
 
-    // Issue #422: `cwd`/`state` are resolved once, up front, because every
-    // path below this point records exactly one row to the compaction
-    // ledger before it returns -- a row needs both (`repo` comes from `cwd`,
-    // and the ledger file itself lives under `state`). The two paths that
-    // cannot resolve either (`no cwd`, `no state dir`) are the only ones
-    // that record nothing at all: there is nowhere to key or write a row.
+    // Resolve cwd and state before recording a compaction row at any return
+    // path; skip the row if either cannot be resolved (#422).
     let cwd = if payload.cwd.is_empty() {
         let Ok(cwd) = std::env::current_dir() else {
             return posttool_finish(w, shell_checkpoint.as_deref());
@@ -442,12 +396,8 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         );
         return posttool_finish(w, shell_checkpoint.as_deref());
     }
-    // How much of THIS command's output may be replaced at all. A reader --
-    // `cat`, `sed -n`, `rg`, `git diff`, an operator's own `[output]
-    // verbatim` entry, or zirv's own retrieval surface -- is never compacted:
-    // a model reads that output verbatim before editing against it, so a
-    // head/tail summary would silently corrupt the edit rather than merely
-    // cost tokens.
+    // Compact only output safe to summarize; readers and retrieval commands
+    // need verbatim bytes before the model edits against them.
     let scope = crate::commands::ctx::output::classify_compaction(
         &payload.tool_input.command,
         &cfg.output.verbatim,
@@ -466,21 +416,16 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         crate::commands::ctx::output::CompactionScope::Generic => {
             cfg.output.compact_generic_min_bytes
         }
-        // Issue #412: a unified diff gets its own, generous threshold --
-        // `diff_max_bytes` -- rather than either compaction threshold above,
-        // since above it the replacement is a bounded per-file listing, not
-        // the generic head/tail scan.
+        // Use the diff-specific threshold because oversized diffs get a
+        // per-file listing, not a generic head/tail summary (#412).
         crate::commands::ctx::output::CompactionScope::Diff => cfg.output.diff_max_bytes,
-        // Issue #414: reuses the generic threshold -- the same reasoning as
-        // `Generic` itself, an unrecognised-by-default shape only worth
-        // compacting once it is genuinely large.
+        // Use the generic cutoff for unrecognized output shapes (#414).
         crate::commands::ctx::output::CompactionScope::Shape => {
             cfg.output.compact_generic_min_bytes
         }
     };
-    // Issue #478: the size cutoff is the shared after-tool service's, so a
-    // native session replacing its own large tool result and this hook
-    // replacing claude's agree on when a result is worth compacting.
+    // Use the shared cutoff so native and hooked sessions do not compact
+    // identical output at different sizes (#478).
     if !crate::commands::ctx::lifecycle::should_compact_result(
         combined.len(),
         true,
@@ -508,9 +453,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         scope,
         &cfg.output.filter,
     ) else {
-        // Nothing was stored, so nothing may be replaced: handing back a
-        // summary whose retrieval line names a file that does not exist would
-        // turn this from compression into loss.
+        // Do not replace output unless its original was stored for retrieval.
         record(
             crate::commands::ctx::ledger::Outcome::PersistFailed,
             bytes_in,

@@ -32,18 +32,8 @@ pub(super) fn finding_kinds(findings: &[crate::commands::ctx::obfuscate::Finding
 
 const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 
-/// The short id issue #349's [`crate::commands::ctx::attention`] observations are filed
-/// under -- the same stable short a session's registry record uses
-/// (`sessions::Record::short`), recovered the same way `run_stop`'s own
-/// inline `stable_short` is (via the bound turn-signal socket's file stem,
-/// which does not rotate across an internal restart), falling back to
-/// `sessions::short_id` of whatever session id this hook call carries when
-/// no socket was ever bound (an unsupervised launch, or a hook that fired
-/// before one existed). Deliberately its own small function rather than a
-/// refactor of `run_stop`'s existing inline derivation (no drive-by
-/// refactors) -- this codebase already accepts exactly this kind of
-/// duplication for this exact derivation; see `sessions::short_id`'s own
-/// doc comment.
+/// Prefer the socket's stable short ID for attention observations: hook
+/// session IDs can rotate during an internal restart (#349).
 pub(super) fn attention_short(env: EnvLookup<'_>, session_id_fallback: &str) -> String {
     env(SOCKET_ENV)
         .and_then(|raw| {
@@ -109,19 +99,8 @@ fn web_url_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Program-family for the first executable shell segment, skipping quoted
-/// assignments and structural keywords: `argv[0]` plus the first
-/// non-flag argument that cannot itself carry a credential (a token
-/// starting with `-` such as `-pSECRET`, or one containing `:`/`@`/`=` such
-/// as `user:pass@host` or `KEY=val`). `cd`, `export`, and `printf` have data
-/// operands, not subcommands; `source`/`.` names only the script basename.
-/// A loop with no executable body falls back to its keyword.
-/// Empty input yields an empty string --
-/// callers with a more specific fallback (e.g. the tool name) apply it
-/// themselves. Shared by [`permission_family`]'s `Bash`/`PowerShell` branch
-/// and `safety::audit_hook_decision`'s own `family` field on the
-/// safety-decision record (Change 5a) -- both need the identical
-/// "never leak an argument" rule, so it exists exactly once.
+/// Redacted shell program family shared by permission and safety logs;
+/// exclude flag or credential-shaped operands to avoid leaking arguments.
 pub(crate) fn command_family(command: &str) -> String {
     let mut keyword = String::new();
     for segment in crate::commands::ctx::safety::split_segments(command) {
@@ -253,18 +232,8 @@ pub(super) fn run_permission<W: Write>(
         return Ok(0);
     };
     let short = attention_short(env, &payload.session_id);
-    // Issue #349: the one live choke point for "an operator needs to decide
-    // something" -- this hook only ever fires while Claude is actually
-    // holding for a permission decision. Best-effort, like every other
-    // attention observation: a failure to persist it must never affect the
-    // permission flow this hook only observes.
-    //
-    // Issue #456: `PermissionRequest` and `PermissionDenied` are the same
-    // hook wired twice in `claude.rs` (`zirv ctx hook permission` for both),
-    // distinguished only by `hook_event_name` -- a denial means the prompt is
-    // gone exactly as much as an approval does, so it clears the latch
-    // instead of raising it, through the same guarded helper `run_posttool`/
-    // `run_pretool` use.
+    // Observe live permission prompts without altering their flow. A denial
+    // also clears the prompt latch because the decision is resolved (#349, #456).
     if payload.hook_event_name.as_deref() == Some("PermissionDenied") {
         clear_resolved_approval(
             &state,
@@ -302,44 +271,10 @@ pub(super) fn run_permission<W: Write>(
     Ok(0)
 }
 
-/// Issue #456: clears a still-pending `Attention::Approval` latch the moment
-/// something proves the permission prompt is no longer live -- a
-/// `PostToolUse`/`PreToolUse` hook firing at all (Claude never invokes either
-/// until AFTER a permission decision has been made, so their mere arrival is
-/// proof enough, regardless of which tool prompted or which tool now runs) or
-/// a `PermissionDenied` event.
-///
-/// Guarded on the CURRENTLY PERSISTED attention actually being `Approval`:
-/// `AdapterHook` already outranks every other authority on the attention axis
-/// (see `attention::compose`'s own doc comment on per-axis suppression), so an
-/// observation that asserts `Attention::None` unconditionally would win
-/// regardless of what is currently recorded and could erase a legitimate
-/// `Compacting`/`Quota`/`WorkflowGate`/`WriterConflict` latch left by an
-/// earlier `AdapterHook`/`Supervisor`/`Workflow` observation, just because a
-/// tool happened to run. This call means "the approval prompt specifically is
-/// gone", never "nothing needs attention any more", so the write only ever
-/// happens when an `Approval` latch is actually what would be cleared -- and
-/// the check runs under the ledger lock (`record_if`) so a supervisor
-/// observation landing between check and act cannot be clobbered.
-/// Best-effort like every other attention write in this file: a failure to
-/// read or persist never affects the calling hook's own exit code.
-///
-/// Perf: this runs on EVERY `PreToolUse`/`PostToolUse`/
-/// `PermissionRequest`/`PermissionDenied` hook invocation -- the single
-/// hottest call in the hook fleet, since it fires several times per turn
-/// where every other per-turn hook fires once. `record_if` already skips its
-/// own write once `applies` reads false under the lock, but still pays for
-/// the lock file's open-and-lock round trip to reach that check. An
-/// `Approval` latch is the rare case (a permission prompt is not pending for
-/// most tool calls), so a plain unlocked [`crate::commands::ctx::attention::load`] first
-/// avoids that lock entirely on the common path; only a read that might
-/// actually need clearing falls through to the locked, race-safe
-/// `record_if`, which re-reads and re-checks under the lock exactly as
-/// before -- this pre-check changes nothing about what gets persisted, only
-/// how often the lock is taken to find out there is nothing to do. A stale
-/// or missed read here can only ever skip a clear it would have skipped
-/// anyway on the next call (this hook always runs again), the same
-/// best-effort tolerance `record_if`'s own doc comment already states.
+/// Clear Approval only when it is still the persisted attention state.
+/// Tool hooks and PermissionDenied prove the prompt ended; a locked
+/// conditional write preserves unrelated higher-priority latches. Read
+/// without the lock first to avoid common-path hot-hook latency (#456).
 pub(super) fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
     if crate::commands::ctx::attention::load(state, short).attention
         != crate::commands::ctx::attention::Attention::Approval

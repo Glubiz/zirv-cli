@@ -137,12 +137,8 @@ fn curl_wget_read_only_options(
             "-F" | "--form" | "-T" | "--upload-file" => return false,
             "-K" | "--config" => return false,
             // `-O`/`--remote-name` derives its output filename from the URL
-            // and writes it into the current directory -- there is no
-            // explicit target argument for this classifier to confine at
-            // all, so it can never be proven scratchpad-confined and always
-            // disqualifies, matching the design decision's "-o/-O/--output
-            // allowed only ... under the scratchpad" (an unprovable target
-            // is not a confined one).
+            // and writes it into the current directory; without an explicit target,
+            // scratchpad confinement cannot be proven.
             "-O" | "--remote-name" if scratchpad_roots.is_some() => return false,
             "-o" | "--output" => {
                 let Some(target) = tokens.get(i + 1) else {
@@ -184,12 +180,8 @@ fn curl_wget_read_only_options(
                     return false;
                 }
             }
-            // Every remaining body/upload family, in BOTH tools and in the
-            // separate-token, `=`-joined and suffixed spellings at once:
-            // curl's `--form`/`--form-string`/`--upload-file` and wget's
-            // `--post-data`/`--post-file`/`--body-data`/`--body-file`. A
-            // prefix test, so an unenumerated variant of one of these
-            // families fails CLOSED rather than falling through as GET-only.
+            // Reject all body/upload option families, including joined and suffixed
+            // variants, so unknown variants fail closed instead of qualifying as GET.
             _ if token.starts_with("--form")
                 || token.starts_with("--upload-file")
                 || token.starts_with("--post-data")
@@ -323,31 +315,14 @@ fn curl_wget_read_only_options(
     !query || query_urls > 0
 }
 
-/// Issue #168, design decision (a): the read-only `kubectl` verbs -- `get`/
-/// `describe`/`logs`/`version`/`api-resources` outright, `config view`
-/// (never a bare `config`, which also accepts `set-context`/`use-context`
-/// mutations). Reuses [`first_positional`]/[`KUBE_HELM_VALUE_FLAGS`] so a
-/// global flag ahead of the verb (`kubectl -n prod get pods`) is not
-/// misread as the verb itself.
-///
-/// Code review fix: two narrowings on top of the above, both deliberately
-/// STRICTER than issue #168's own literal examples.
-/// - `get`/`describe` no longer qualify when the resource being fetched is a
-///   Secret (`secret`/`secrets`, alone, comma-joined with other resources,
-///   or `secret/<name>`-qualified) -- reading a Secret's decoded value IS a
-///   credential dump, however read-only the verb otherwise looks.
-/// - `--raw` disqualifies `get`/`describe`/`config` outright: it bypasses
-///   the resource-name check above entirely (an arbitrary API path, not a
-///   resource-type argument) for `get`/`describe`, and `config view --raw`
-///   prints embedded client certs/tokens in full.
+/// Accept read-only kubectl verbs after global flags; reject Secret reads and
+/// `--raw`, which can expose credentials or bypass resource checks (#168).
 fn is_kubectl_read_only(tokens: &[String]) -> bool {
     if tokens.first().map(|t| sql_program_name(t)).as_deref() != Some("kubectl") {
         return false;
     }
-    // Code review fix: the verb's own INDEX, never a `position` search for
-    // its text -- a preceding flag value spelling the same word (`kubectl -n
-    // get get secrets`) otherwise sliced `rest` at the namespace, so the
-    // Secret narrowing below inspected the wrong operand.
+    // Use the verb's index: a preceding flag value may have the same text and
+    // must not shift the operands checked for Secrets.
     let Some(verb_index) = first_positional_index(tokens, KUBE_HELM_VALUE_FLAGS) else {
         return false;
     };
@@ -371,33 +346,10 @@ fn is_kubectl_read_only(tokens: &[String]) -> bool {
     }
 }
 
-/// Issue #168, design decision (a): whether EVERY executable segment of the
-/// retried `command` is a read-only `gh`/`glab` call, a read-only git
-/// subcommand, a GET or Elasticsearch query via `curl`/`wget`, a read-only `kubectl` verb, one of
-/// the existing [`SANDBOX_ESCAPE_BUILTIN_PROGRAMS`], or (issue #329) a
-/// reserved zirv escape-safe segment per [`is_reserved_zirv_escape_safe_
-/// segment`] -- used ONLY on the `--dangerously-disable-sandbox` retry path
-/// (`run_check_hook_mode_with_env`), alongside `is_sandbox_bypass_safe_gh_
-/// command`/`escape_allow_matches`/`is_reserved_zirv_escape_safe`. The zirv
-/// acceptor closes a gap `is_reserved_zirv_escape_safe` leaves open on its
-/// own: that whole-command check requires EVERY segment to be zirv, so a
-/// compound mixing a reserved `zirv ctx` call with a benign read-only filter
-/// (`zirv ctx inbox | tail; zirv ctx status --brief | tail`) cleared
-/// neither check -- the zirv segment failed this function's own per-segment
-/// table (which knew nothing about zirv), and the `| tail` segment failed
-/// the other function's all-zirv requirement. Reuses [`normalize_segments`]'s
-/// own decomposition and [`escape_denied_by_screen`]'s credential/root-scan
-/// gate, exactly like [`escape_allow_matches`] -- a single disqualifying
-/// segment fails the whole command. Never applied when the base verdict is
-/// already `Deny` (see the call site).
-///
-/// Contract note (review on #329): the zirv acceptor imports [`ZIRV_CTX_
-/// ESCAPE_SAFE_VERBS`]' standard, which is "spawns no caller-controlled
-/// subprocess", not "read-only": `send`, `remember`, `forget` and `nudge`
-/// mutate zirv's own mail/memory stores and have qualified for the
-/// unsandboxed retry since issue #168. This function therefore answers
-/// "is every segment safe to retry outside the sandbox", of which read-only
-/// is the common case, not the definition.
+/// Require every segment to be safe outside the sandbox and pass the
+/// credential/root screen; one unsafe segment rejects the command (#168, #329).
+/// Reserved zirv verbs may mutate internal state but spawn no caller-controlled
+/// subprocess, so they qualify alongside read-only commands (#329).
 pub(crate) fn is_read_only_escape_safe(command: &str, scratchpad_roots: &[String]) -> bool {
     let candidates = normalize_segments(command);
     if candidates.is_empty() {
@@ -451,18 +403,8 @@ pub(super) fn mkdir_write_targets(segment: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
-/// Issue #321 item 2: whether ONE executable segment is a genuine,
-/// scratchpad-confined write -- it names at least one write target (a
-/// redirection/`tee` target via [`segment_write_targets`], or an `mkdir`
-/// path via [`mkdir_write_targets`]), every one of those targets is confined
-/// ([`target_is_confined`]), and the segment's OWN verdict (using the
-/// caller's mode-appropriate `fallback`) is `Allow` or the plain, no-rule-
-/// matched default. A segment naming NO write target at all never qualifies
-/// here regardless of its own verdict -- otherwise an arbitrary allowed
-/// invocation with nothing to confine (`gh pr create --title x`, matching
-/// the broad `Bash(gh *)` allow rule) would count as "a write" for free. See
-/// [`is_mixed_confined_write_and_read_only_escape_safe`]'s own doc comment
-/// for how this combines with the read-only half of the carve-out.
+/// Require a real write target, all targets confined to the scratchpad, and
+/// an allowed segment verdict; an allowed command alone is not a write (#321).
 fn is_confined_write_segment(
     policy: &SafetyPolicy,
     segment: &str,
@@ -487,20 +429,9 @@ fn is_confined_write_segment(
     segment_verdict_is_allow_or_unmatched(policy, segment, fallback, scratchpad_roots)
 }
 
-/// Issue #321 item 2: whether EVERY top-level executable segment of
-/// `command` ([`split_segments`] -- the same decomposition [`write_targets_
-/// confined`] uses, deliberately NOT [`normalize_segments`]'s further
-/// recursion, so a `curl ... | sh` pipeline stage stays one unit and its
-/// dangerous half is never independently laundered through either check
-/// below) is either a genuine, scratchpad-confined write
-/// ([`is_confined_write_segment`]) or read-only-escape-safe entirely on its
-/// own ([`is_read_only_escape_safe`] applied to that ONE segment -- which
-/// already covers the read-only `gh`/`glab`, git, curl/wget, and kubectl
-/// forms) AND whose own verdict clears [`segment_verdict_is_allow_or_
-/// unmatched`], and that at least ONE segment is a confined write.
-///
-/// Each segment must also clear policy, and at least one must write;
-/// literal assignment segments may prepare paths but do not count as writes.
+/// Permit mixed commands only when every top-level segment is a confined
+/// write or an independently allowed safe read, and at least one writes.
+/// Keep pipeline stages together so `curl ... | sh` cannot be laundered (#321).
 pub(super) fn is_mixed_confined_write_and_read_only_escape_safe(
     policy: &SafetyPolicy,
     command: &str,
@@ -541,17 +472,8 @@ pub(super) fn is_mixed_confined_write_and_read_only_escape_safe(
     writes > 0
 }
 
-/// Whether ONE segment's own ordinary verdict is `Allow`, or the plain
-/// mode default with no rule matched at all -- the identical standard
-/// [`is_confined_write_segment`] holds its own half of the carve-out to,
-/// factored out so the read-only half cannot skip the policy entirely.
-///
-/// Code review fix: [`is_mixed_confined_write_and_read_only_escape_safe`] is
-/// the one escape carve-out NOT gated on the WHOLE command's verdict already
-/// being `Allow` (by design -- see its doc comment), so without this the
-/// read-only half turned any base-`Ask` command the read-only whitelist
-/// happens to accept into a silent, unsandboxed `Allow`, overriding an
-/// operator's own explicit `ask` rule.
+/// Require each segment to be allowed or unmatched before an escape retry;
+/// a read-only segment must not override an explicit `Ask` rule (#321).
 fn segment_verdict_is_allow_or_unmatched(
     policy: &SafetyPolicy,
     segment: &str,

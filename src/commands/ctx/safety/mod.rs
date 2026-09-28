@@ -1,100 +1,17 @@
 //! zirv's own harness-neutral command safety policy (issue #83).
 //!
-//! Every harness zirv wraps has its own, incompatible way of deciding
-//! whether a command is safe to run unattended (claude's `permissions.allow`/
-//! `permissions.deny` globs plus hooks; codex's `--sandbox`/`--ask-for-
-//! approval` flags plus `.rules` execpolicy files). This module gives zirv a
-//! single, harness-neutral classification (`SafetyPolicy`, [`evaluate`]) that
-//! every adapter then projects onto its own native mechanism, so one
-//! operator setting produces equivalent behaviour everywhere -- the same
-//! shape `policy.rs` already established for the seven-capability
-//! `[policy]` table, applied here to concrete command strings instead of
-//! abstract capabilities.
+//! Harness adapters project this shared command verdict onto their native
+//! permission mechanisms.
 //!
-//! ## Layering, and why it is not `ctx.toml`'s deep merge
+//! `[safety]` layers use a narrowing fold: built-in, home and repo `deny`/`ask`
+//! rules accumulate; only the operator may add `allow` or `escape_allow` or
+//! choose defaults. Environment overrides replace contributions, never built-in
+//! protections. Deny and ask take precedence over allow (#83, #147).
 //!
-//! `[safety]` cannot use the ordinary deep merge (a later layer's array
-//! would simply *replace* an earlier one's) or `REPO_FORBIDDEN`'s
-//! all-or-nothing rejection (issue #83 requires a repo to be able to
-//! *narrow* the policy -- add more `deny`/`ask` entries -- while never
-//! widening it). So [`resolve`] folds the layers the way `policy::resolve`
-//! folds `[policy]`, lifted whole out of `ctx.toml` by `config::CtxConfig::
-//! load` before its own deep merge:
-//!
-//! - **`deny`/`ask`** are additive across layers: the built-in set (derived
-//!   from `adapters::SHIPPED_POSTURE_ASK`/`_DENY`, the same live-verified
-//!   claude posture PR #96 shipped) plus the operator's own `~/.zirv/
-//!   ctx.toml` entries plus the repo's own `.zirv/ctx.toml` entries, all
-//!   unioned. Adding a `deny`/`ask` entry can only ever make a command
-//!   *stricter* to evaluate (deny and ask are both checked before allow --
-//!   see [`evaluate`]), so a repo checkout contributing to either list is
-//!   always safe, the identical reasoning `SandboxConfig::extra_deny`
-//!   already uses.
-//! - **`allow`** may be extended only by the operator's own home layer.
-//!   `config.rs`'s `REPO_FORBIDDEN` table rejects a repo `ctx.toml` that
-//!   sets `safety.allow` at all -- there is no narrowing reading of adding
-//!   an allow entry (unlike `deny`/`ask`, evaluated *after* both), so it is
-//!   forbidden outright rather than folded, mirroring `sandbox.extra_allow`.
-//! - **`escape_allow`** (issue #147) is the identical operator-home-layer-
-//!   only story, one narrower domain down: it clears a family for a
-//!   `--dangerously-disable-sandbox` retry specifically, not the ordinary
-//!   sandboxed path `allow` governs. Also `REPO_FORBIDDEN`, for the same
-//!   widening-only reason. Unlike `allow`, it carries a built-in seed
-//!   (`builtin_escape_allow`) -- the read-only shell-utility families most
-//!   sandbox-escape prompts turned out to be -- gated behind a per-segment
-//!   credential/root-scan screen (`escape_denied_by_screen`) that a family
-//!   match alone can never bypass.
-//! - **`default`** (the verdict for a command matching nothing) is
-//!   `REPO_FORBIDDEN` outright too, for the same reason: it is a single
-//!   scalar with no narrowing direction of its own.
-//! - **Environment** (`ZIRV_CTX_SAFETY_DENY`/`_ASK`/`_ALLOW`/`_DEFAULT`)
-//!   sits above the fold and wins outright, the operator's own escape
-//!   hatch, mirroring `ZIRV_CTX_SANDBOX_EXTRA_DENY`/`_ALLOW`. It replaces
-//!   the operator+repo *contribution* to a list, never the built-in set
-//!   itself: there is no environment variable that removes a built-in
-//!   protection, only ones that add to or replace what an operator/repo
-//!   contributed on top of it.
-//!
-//! ## The matcher is pure
-//!
-//! [`evaluate`] and [`glob_match`] read no clock, filesystem or
-//! environment -- the same discipline `rot.rs` holds its scoring functions
-//! to. [`resolve`] (the layering step, one level up) takes its environment
-//! as an injected closure, exactly like `policy::resolve`, so it stays
-//! deterministic and testable without touching real process state.
-//!
-//! ## Two loop breakers (issue #313)
-//!
-//! A policy verdict alone cannot tell an agent stuck retrying variations of
-//! the same blocked command, or re-running the identical failing command
-//! over and over, to stop -- it can only keep saying "no" the same way each
-//! time. Two additive, narrowing-only breakers sit in the PreToolUse hook
-//! path (`run_check_hook_mode_with_env`), after the ordinary verdict is
-//! final, and change only the TEXT a hook decision carries, never the
-//! verdict family of any existing command:
-//!
-//! - The **consecutive-denial breaker** (`denial_breaker_threshold`) counts
-//!   this session's own trailing run of `Ask`/`Deny` verdicts (via the
-//!   bounded `log::read_recent_safety_decisions`) and, past the threshold,
-//!   prefixes the hook's `permissionDecisionReason` with an explicit "stop
-//!   retrying" instruction -- the original policy explanation stays, joined
-//!   by ` -- `.
-//! - The **identical-failing-command guard** (`identical_command_warn_after`/
-//!   `_refuse_after`) parses the session's own transcript
-//!   (`trailing_same_command_failure_run`) for a trailing run of failures of
-//!   the EXACT SAME command and, past `warn_after`, adds a
-//!   `hookSpecificOutput.additionalContext` warning to an otherwise-`Allow`
-//!   verdict; past `refuse_after`, ONLY in a headless launch, turns that
-//!   `Allow` into a `Deny`. A command already `is_read_only_escape_safe`
-//!   (benign, repeatable inspection) is never guarded.
-//!
-//! Both thresholds fold across layers via `narrow_threshold`: unlike
-//! `allow`/`default`/`sql` (`REPO_FORBIDDEN`, operator-home-layer only,
-//! since there is no narrowing reading of widening either), a repo MAY
-//! lower one of these three -- narrowing is always safe -- but never raise
-//! it above the operator's own ceiling, and an operator's `0` (disabled)
-//! can never be re-enabled by a repo. See `narrow_threshold`'s own doc
-//! comment for the exact fold.
+//! Evaluation is pure; resolution receives environment through an injected
+//! closure. The hook applies denial and repeated-failure breakers after the
+//! ordinary verdict. Breakers may add guidance or refuse an otherwise allowed
+//! headless command, but a repo can only lower nonzero thresholds (#313).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -106,11 +23,7 @@ use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process, split_csv_list};
 use super::envelope;
 
-/// One of the three things zirv's safety policy can say about a command.
-/// Deliberately unrelated to `policy::Stance`: a `Stance` is a *capability*
-/// posture ("may this session write outside the repo"), while a `Verdict` is
-/// a per-command classification -- two different questions issue #83 and
-/// issue #43 each answer.
+/// A per-command verdict, distinct from capability posture (#83).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
@@ -131,12 +44,8 @@ impl Verdict {
         }
     }
 
-    /// The `zirv ctx safety check`/`explain` exit code for this verdict --
-    /// distinct per verdict so a caller can branch on the exit code alone
-    /// without parsing output. `Deny` gets the conventional "blocked" code
-    /// a PreToolUse hook would also use for a hard block (see `hook_output`
-    /// below, though the wired hook itself always exits 0 -- see its own
-    /// doc comment for why).
+    /// Exit code for CLI safety checks; the hook itself exits zero and carries
+    /// its decision in the response payload.
     pub fn exit_code(self) -> i32 {
         match self {
             Verdict::Allow => 0,
@@ -192,19 +101,8 @@ pub struct Rule {
     pub origin: Origin,
 }
 
-/// The fully resolved policy `evaluate` matches a command against --
-/// `resolve`'s output, and what `CtxConfig::safety` holds after `load`.
-/// `Clone`/`PartialEq` mirror `CtxConfig`'s own derives, which this type is
-/// a field of.
-/// Whether the SQL statement classifier ([`sql_outcome`]) participates in
-/// [`evaluate`].
-///
-/// `On` is the shipped default. `Off` is the operator's own escape hatch for
-/// a workflow the classifier prompts on too often, and it is `REPO_FORBIDDEN`
-/// (`config.rs`) for the same reason `safety.allow`/`safety.default`/
-/// `safety.interactive_default` are: turning it off removes the classifier's
-/// `Ask` narrowing, which can only ever make the effective policy looser, so
-/// there is no narrowing reading of `off` for a repo layer to be trusted with.
+/// Whether SQL classification contributes `Ask`; only the operator may
+/// disable it because a repo may not remove a safety narrowing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SqlMode {
@@ -235,61 +133,29 @@ pub struct SafetyPolicy {
     pub deny: Vec<Rule>,
     pub ask: Vec<Rule>,
     pub allow: Vec<Rule>,
-    /// Issue #147: patterns an operator has pre-cleared for a `--dangerously-
-    /// disable-sandbox` retry specifically -- NOT folded into `allow`, which
-    /// governs the sandboxed default path. Matched against every executable
-    /// segment of the retried command (see `escape_allow_matches`), so a
-    /// compound where only one segment qualifies still falls through to the
-    /// ordinary Ask/Deny escalation. Operator-home-layer only, the same
-    /// widening-only reasoning as `allow` -- see the module doc and
-    /// `REPO_FORBIDDEN`'s `safety.escape_allow` entry. Empty by default:
-    /// unlike `allow`, there is no built-in escape set.
+    /// Operator-cleared sandbox escape patterns, separate from ordinary `allow`;
+    /// every executable segment must match or the retry still prompts (#147).
     pub escape_allow: Vec<Rule>,
-    /// The verdict for a command matching no rule on a HEADLESS launch.
-    /// Unchanged: `Ask`, which claude's `dontAsk` mode turns into a refusal.
-    /// Nobody is present to answer, so an unclassified command is an
-    /// unsupervised risk.
+    /// Headless unmatched-command verdict; `Ask` fails closed without an operator.
     pub default: Verdict,
-    /// The verdict for a command matching no rule on an INTERACTIVE launch
-    /// (2026-08-24, primary acceptance criterion). `Allow`: an operator is
-    /// watching, and prompting on every command zirv has not enumerated is
-    /// precisely the endless-prompting failure this whole round exists to
-    /// remove. Operator-overridable (`[safety] interactive_default`,
-    /// `ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT`) and `REPO_FORBIDDEN`: `Allow`
-    /// is the loosest verdict there is, so a checkout that could set it
-    /// could silence every prompt for the session it sits in.
+    /// Interactive unmatched-command verdict; only the operator may set it
+    /// because `Allow` can suppress every unmatched prompt.
     pub interactive_default: Verdict,
     pub sql: SqlMode,
-    /// Issue #313 (consecutive-denial breaker): how many trailing consecutive
-    /// `Ask`/`Deny` verdicts in ONE session (this decision included) before
-    /// the hook's `permissionDecisionReason` stops explaining the policy and
-    /// instead tells the agent outright to stop retrying variations of the
-    /// same command. `0` disables the breaker entirely -- the loosest
-    /// setting, since it means a stuck agent gets no nudge at all. Folded
-    /// narrowing-only across layers (see [`resolve`]'s own fold): a repo may
-    /// LOWER this (fire the breaker sooner) but never raise it or turn a
-    /// disabled breaker back on.
+    /// Consecutive denied decisions before telling the agent to stop retrying;
+    /// `0` disables the breaker and repo layers may only lower it (#313).
     pub denial_breaker_threshold: u32,
-    /// Issue #313 (identical-failing-command guard): how many trailing
-    /// consecutive failures of the EXACT SAME Bash command (same command
-    /// text, from the session's own transcript) before an otherwise-`Allow`
-    /// verdict also carries a warning in `hookSpecificOutput.
-    /// additionalContext`. `0` disables the warning. Same narrowing-only fold
-    /// as `denial_breaker_threshold`.
+    /// Identical Bash failures before warning on an otherwise allowed command;
+    /// `0` disables the warning and repo layers may only lower it (#313).
     pub identical_command_warn_after: u32,
-    /// Issue #313: the same identical-failing-command count at which a
-    /// HEADLESS launch (only) turns the verdict itself into `Deny` instead of
-    /// merely warning -- interactive launches never auto-refuse (an operator
-    /// is watching and can decide for themselves). `0` disables the refusal;
-    /// same narrowing-only fold.
+    /// Identical Bash failures before denying headless retries; interactive
+    /// launches only warn, and `0` disables refusal (#313).
     pub identical_command_refuse_after: u32,
 }
 
 impl Default for SafetyPolicy {
-    /// The built-in policy alone: what an operator who has written no
-    /// `[safety]` table at all gets. "A fresh install already blocks the
-    /// obvious destructive families ... without anyone writing config"
-    /// (issue #83's acceptance) is this, unmodified.
+    /// Keep destructive built-in guards active even with no operator
+    /// `[safety]` table (#83).
     fn default() -> Self {
         SafetyPolicy {
             deny: builtin_deny(),

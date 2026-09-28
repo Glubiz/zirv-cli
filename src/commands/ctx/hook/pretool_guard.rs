@@ -15,18 +15,8 @@ use crate::commands::ctx::state::StateDir;
 // -- PreToolUse: the subagent skill-library pointer (issue #539 chunk F
 // derivative) --------------------------------------------------------------
 
-/// Appended to an allowed `Agent`/`Task` dispatch's `prompt`, once, when
-/// eligible ([`append_skill_pointer`]). Field evidence: a subagent never
-/// inherits its parent's system prompt (and therefore never sees
-/// `prompt::SKILL_INDEX_HEADER`/`skill_index_text`), so nothing today tells a
-/// dispatched worker the skill library exists at all.
-///
-/// This is the library's EXISTENCE and the loading commands, never a
-/// pre-selected skill -- issue #539 chunk F's standing operator decision
-/// (`skill_activation.rs`'s own doc comment) is that zirv may make a skill's
-/// existence deterministic but never the choice to use one, so this text
-/// names no skill id and calls no scorer. ASCII only, no em dashes: every
-/// other hook-adjacent string in this crate is held to that same rule.
+/// Add the skill pointer to eligible subagent prompts: subagents do not
+/// inherit the parent system prompt that contains the skill index.
 pub(super) const SKILL_POINTER_NOTE: &str = "\n\n[zirv skills] This session's harness provides task skills \
 (method and failure modes per task type). If you have a shell: before starting, run `zirv skill \
 list --match \"<your task in a few words>\"`, run `zirv skill load <id>` for any that fits, and \
@@ -81,18 +71,8 @@ fn pretool_pointer_output(updated_input: serde_json::Value) -> String {
     .to_string()
 }
 
-/// The production wrapper for the plain (no model-rewrite) case: an
-/// `Agent`/`Task` dispatch [`pretool_decision`] already allowed outright (or
-/// never even reached, on a seat that guard does not gate at all), so this
-/// hook printed nothing at all before the subagent skill pointer. Resolves
-/// `cfg` from `env`/`payload.cwd` exactly as [`dispatch_tier_override`]
-/// resolves its own, then appends the pointer when [`append_skill_pointer`]
-/// says to. `None` -- meaning stay silent -- on a session with no
-/// `SESSION_ENV` at all (gated the same way [`prompt_adoption_nudge`] gates
-/// on it -- a non-empty value is the one signal common to every seat role
-/// zirv supervises, unlike `SEAT_MODEL_ENV`, which only an orchestrator
-/// carries), any non-dispatch tool, an unresolvable cwd, or an ineligible
-/// prompt.
+/// A subagent still needs the skill pointer when dispatch is otherwise
+/// allowed silently, because it does not inherit the parent's index.
 pub(super) fn skill_pointer_override(
     payload: &PreToolPayload,
     stdin: &str,
@@ -167,34 +147,12 @@ impl OrchestratorWriteOutcome {
     }
 }
 
-/// How many prior "advised" rows this session already has in `log::
-/// read_orchestrator_blocks` before an advisory note surfaces again (issue
-/// #358 T8): the write itself is never blocked by this -- only whether the
-/// hook's own non-blocking note rides along -- so a rate limit here trades
-/// visibility for quiet, never safety for quiet. `0`, `N`, `2N`, ... each
-/// surface a note; everything between stays silent. Shared by both
-/// `hook::run_pretool` (Edit/Write/MultiEdit/NotebookEdit) and `safety::
-/// run_check_hook_mode_with_env` (Bash/PowerShell), which count the SAME
-/// session's rows in the SAME log, so an operator alternating between tool
-/// families still only sees a note every fifth orchestrator write, not
-/// every fifth per family.
+/// Number of prior advisory rows before surfacing another note. Rate
+/// limiting affects only text, never the write verdict (#358).
 pub(super) const ORCHESTRATOR_ADVISORY_RATE: usize = 5;
 
-/// Whether this session's next `Advise`-posture write should carry a
-/// surfaced advisory note, based on how many `outcome == "advised"` rows it
-/// already has. Best-effort like every other log read here: a `StateDir`
-/// that fails to resolve, or a log that fails to read, degrades to `true`
-/// (surface it) rather than silently going quiet -- the annoyance of an
-/// extra note is a far cheaper failure mode than a session that never
-/// learns it should be delegating more.
-///
-/// Only the ledger's TAIL is parsed (`log::read_recent_orchestrator_blocks`):
-/// this runs on every Edit/Write/Bash hook and the file is never rotated, so
-/// a full read would grow without bound on the hottest path there is. A
-/// session whose own rows all sit inside the window -- every ordinary
-/// session -- counts exactly as it did before; one whose rows are older than
-/// the window simply starts its cadence over, which can only surface a note
-/// that would otherwise have been suppressed, never suppress one.
+/// Surface an advisory at the configured interval; failed log reads
+/// default to showing it, without blocking the write (#358).
 pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: &str) -> bool {
     let Ok(state) = StateDir::resolve(env) else {
         return true;
@@ -206,49 +164,25 @@ pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: 
     count % ORCHESTRATOR_ADVISORY_RATE == 0
 }
 
-/// The resolved write TARGET when `payload` is an orchestrator seat's own
-/// in-scope repository write, or `None` when it is outside this guard's
-/// scope entirely (and so gets no [`OrchestratorWriteOutcome`] at all --
-/// not even `Allow` -- because there is nothing here for a posture to act
-/// on). `role` is `SEAT_ROLE_ENV`'s value.
-///
-/// Confinement is anchored on the resolved TARGET, never on `cwd` or the
-/// launch repo: an orchestrator seat has no business editing source in ANY
-/// git repository, including a sibling checkout or a linked worktree of a
-/// repository entirely unrelated to the one it was launched in (review
-/// finding on issue #334) -- so `repo_root_for_target` finds the repo the
-/// target itself sits in, and the exemption is narrowed only against THAT
-/// repo's own `<target_repo>/.zirv/work`/`<target_repo>/.zirv/memory` --
-/// the two roots a worker's own dispatch/handoff/memory writes still need
-/// from this seat. Claude Code's own harness home (`CLAUDE_CONFIG_DIR`, or
-/// `$HOME/.claude`/`%USERPROFILE%\\.claude`) is outside repository-write
-/// classification even when an ancestor carries `.git`. A target that sits in no git repository at all
-/// is outside this guard's scope. Every other gate below is also out of
-/// scope: a non-orchestrator role, a native subagent call (`agent_id` is
-/// non-empty), a tool that is not a [`FILE_MODIFICATION_TOOLS`] entry, or an
-/// empty target (schema drift, not a real write).
+/// An orchestrator seat has no direct repo-write authority, even in sibling
+/// worktrees. Resolve the target's own git root; exempt only that repo's
+/// work/memory roots and Claude's harness home. Subagents are separate seats
+/// and outside this guard (#334).
 fn orchestrator_write_target(
     role: Option<&str>,
     payload: &PreToolPayload,
     cwd: &Path,
     env: EnvLookup<'_>,
 ) -> Option<PathBuf> {
-    // Issue #478: the rule itself lives in `lifecycle.rs` so a native
-    // session's own `file_write`/`apply_patch` call reaches it too; this stays
-    // the translator that resolves claude's `file_path`/`notebook_path`
-    // against `cwd`.
+    // Translate Claude file paths into the shared lifecycle write guard so
+    // native tool calls use the same rule (#478).
     let mut intent = pretool_intent(payload);
     intent.write_target = normalized_write_target(payload, cwd);
     crate::commands::ctx::lifecycle::orchestrator_write_target(role, &intent, env)
 }
 
-/// The whole orchestrator-write guard decision (issue #358 T8): `None` when
-/// [`orchestrator_write_target`] finds this call outside the guard's scope
-/// (nothing to log, nothing to decide); otherwise `Some` of this seat's own
-/// posture applied to that target -- `Deny`/`Advise` carry their own
-/// channel's text, `Allow` carries nothing. `role`/`cwd`/`env` are exactly
-/// [`orchestrator_write_target`]'s own; `posture` is `hook::
-/// orchestrator_write_posture`'s resolved value.
+/// Apply the seat's write posture only to an in-scope repo target;
+/// out-of-scope calls produce no decision or audit row (#358).
 pub fn orchestrator_write_decision(
     role: Option<&str>,
     payload: &PreToolPayload,

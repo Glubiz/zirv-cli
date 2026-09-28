@@ -37,11 +37,8 @@ pub struct CheckArgs {
     /// payload on stdin).
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
-    /// Issue #418: hook mode only -- project a non-claude agent's own native
-    /// `PreToolUse`-equivalent payload onto this hook's claude shape before
-    /// evaluating, then translate the verdict back into that agent's own
-    /// response envelope. Omitted (or `claude`) leaves this byte-for-byte
-    /// identical to the original claude-only hook.
+    /// Adapt a non-Claude hook payload and verdict; omitted or `claude` preserves
+    /// the Claude envelope (#418).
     #[arg(long)]
     pub agent: Option<String>,
 }
@@ -91,10 +88,8 @@ pub(super) fn render_outcome(command: &str, outcome: &Outcome) -> String {
     format!("{head} (`{command}`)")
 }
 
-/// What the verdict actually DOES to a launch in `mode` -- the half an
-/// operator cannot read off the matched rule alone (2026-08-24). Naming the
-/// concrete flag in each sentence is deliberate: an operator debugging "why
-/// did that just prompt" needs the flag to search their own scrollback for.
+/// Explain the launch effect of a verdict, including the flag an operator can
+/// locate in session output.
 fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'static str {
     use super::adapters::LaunchMode;
     match (verdict, mode) {
@@ -120,22 +115,8 @@ fn mode_consequence(verdict: Verdict, mode: super::adapters::LaunchMode) -> &'st
     }
 }
 
-/// Issue #139: `divergence` names, in words, when `outcome` is stricter than
-/// what the current policy would produce for the same command -- see
-/// [`SnapshotDivergence`]'s own doc comment for why this exists. `Unchanged`
-/// (every pre-existing caller, and any attested one whose snapshot agrees
-/// with today's policy) leaves this function's output byte-for-byte what it
-/// was before this parameter existed.
-/// Code review fix: `status` (`AttestedEvaluation.status`) now also drives an
-/// explicit note when it is `"self-healed"` -- previously this function only
-/// ever read `divergence`, so a self-healed evaluation (an invalid, missing,
-/// or hash-mismatched launch attestation, `self_healed_evaluation`) produced
-/// an explanation indistinguishable from an ordinary, fully-verified one.
-/// Both callers -- `hook_output`'s own `permissionDecisionReason` (what an
-/// operator/transcript viewer actually sees for a live decision) and
-/// `run_explain` (`zirv ctx safety explain`, run separately after the fact)
-/// -- now surface it. `"not-present"`/`"valid"` add nothing, matching
-/// today's behavior exactly.
+/// Explain snapshot divergence and self-healing in both hook and CLI output;
+/// `"not-present"` and `"valid"` add no attestation note (#139, #168).
 pub(super) fn explain_text(
     command: &str,
     outcome: &Outcome,
@@ -176,11 +157,8 @@ pub(super) fn explain_text(
              your current policy directly rather than an unverifiable launch snapshot.",
         );
     }
-    // Issue #262: the delegation envelope's own contribution, when one
-    // applies -- printed unconditionally rather than only on the commands it
-    // actually denied, so `zirv ctx safety explain` also answers "what would
-    // this worker's own scope allow" for a command it happens to already
-    // allow for other reasons.
+    // Always show the worker envelope's contribution, even when it allows the
+    // command, so the explanation exposes the worker's scope (#262).
     if let Some(envelope) = envelope {
         let paths = if envelope.paths.is_empty() {
             "none".to_string()
@@ -226,27 +204,13 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
-/// Issue #139: previously bypassed attestation entirely, evaluating only the
-/// currently-resolved policy -- which is exactly why this command and the
-/// hook (`run_check_hook_mode_with_env`, which always goes through
-/// `evaluate_with_attestation_evidence`) could disagree about the identical
-/// command: the hook would report the pinned launch snapshot's stricter
-/// verdict while this reported today's wider one, with no way for the
-/// operator to see why.
-///
-/// Now routed through the SAME evidence function the hook uses, always --
-/// not merely when the attestation env vars happen to be set, since
-/// `evaluate_with_attestation_evidence` itself already degrades correctly
-/// when they are absent (`status: "not-present"`, `divergence: Unchanged`,
-/// `outcome` a plain `evaluate` call): the two ARE the "without the env vars"
-/// case, so this command's behavior is byte-for-byte unchanged when they are
-/// not set, and now agrees with the hook when they are.
+/// Explain with the same attestation fold as the hook so identical commands
+/// receive identical verdicts; absent attestation uses current policy (#139).
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
     let cfg = CtxConfig::load(&args.repo, env)?;
     let command = args.command.join(" ");
-    // Same scratchpad roots the hook computes (`run_check_hook_mode_with_
-    // env`), so this command's VCS narrowing (issue #306) agrees with what
-    // the hook actually decided for the identical command.
+    // Use the hook's scratchpad roots so VCS narrowing agrees with live decisions
+    // (#306).
     let scratchpad_roots = scratchpad_write_roots(&std::env::temp_dir());
     let cwd = std::env::current_dir().ok();
     let cwd = cwd.as_deref();
@@ -258,9 +222,8 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
         &scratchpad_roots,
         cwd,
     );
-    // Issue #262: re-parsed here (rather than threaded out of `evidence`)
-    // purely to print its own contribution -- `evaluate_with_attestation_
-    // evidence` already applied it to `evidence.outcome` internally.
+    // Reparse the envelope only to explain its contribution; evaluation already
+    // applied it to the verdict (#262).
     let envelope = parse_envelope_env(env);
     writeln!(
         w,

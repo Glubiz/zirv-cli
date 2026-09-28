@@ -6,13 +6,8 @@ use super::*;
 // Recovery-aware recursive deletion classifier
 // ---------------------------------------------------------------------
 
-// NON-GOAL (2026-08-24, defense-in-depth residual, filed rather than
-// guessed at): this classifier and `provably_generated_cleanup` below
-// reason about `path` as TEXT only -- a string starting with `node_modules`/
-// `target`/... -- never about what that path actually resolves to on disk.
-// The hook caller checks literal targets and their ancestors for symlinks
-// before returning this fast path's Allow. This pure pipeline itself has
-// no filesystem access; argv-only evaluation still reasons about text.
+// Path classification is lexical; the hook caller must reject symlinked
+// targets and ancestors before allowing generated cleanup.
 pub(super) fn generated_path(path: &str) -> bool {
     let normalized = path
         .trim_matches(['\'', '"'])
@@ -47,13 +42,8 @@ pub(super) fn generated_path(path: &str) -> bool {
     )
 }
 
-/// The deletion program behind `first`, with PowerShell's own aliases
-/// resolved to the cmdlet name -- `ri` is a live alias for `Remove-Item`, so
-/// both spellings must reach the same classifier arm. Shared by
-/// [`is_recursive_delete`] and [`provably_generated_cleanup`] so the two
-/// cannot learn different alias sets. `del`/`erase`/`rmdir`/`rd`/`rm` keep
-/// their own names: those arms already carry the cmd.exe and POSIX flag
-/// semantics that go with each spelling.
+/// Resolve deletion aliases consistently for recursive-delete and generated-cleanup
+/// checks; PowerShell `ri` names `Remove-Item`.
 pub(super) fn normalized_delete_program(first: &str) -> String {
     let program = sql_program_name(first);
     match program.as_str() {
@@ -139,14 +129,8 @@ pub(super) fn provably_generated_cleanup(command: &str) -> bool {
 // Infrastructure/service destructive-action classifier
 // ---------------------------------------------------------------------
 
-/// Every kubectl/helm GLOBAL flag this classifier knows takes its value as a
-/// SEPARATE next token (not attached with `=`) -- so [`first_positional`]
-/// must skip both the flag and its value, not just the flag, or the value
-/// itself gets misread as the verb: `kubectl --context prod delete pod x`
-/// must still find `delete`, not stop at `prod`. `-n`/`--namespace` were the
-/// only two originally handled; this is every other realistic kubectl/helm
-/// global connection/auth flag that also takes a separate value, so a global
-/// flag before the verb can no longer hide it.
+/// Global kubectl/helm flags whose next token is a value, not the verb;
+/// skipping both tokens prevents a flag value from hiding a destructive verb.
 pub(super) const KUBE_HELM_VALUE_FLAGS: &[&str] = &[
     "-n",
     "--namespace",
@@ -172,24 +156,12 @@ pub(super) const KUBE_HELM_VALUE_FLAGS: &[&str] = &[
     "--repository-cache",
 ];
 
-/// The first token after the program name that is not a flag (`-`/`/`
-/// prefixed) and not a cargo `+toolchain` selector (`+nightly`) -- the verb
-/// an orchestrator/distribution classifier reads to decide the action
-/// (`publish`, `delete`, `uninstall`, ...).
-///
-/// `value_flags` names flags whose NEXT token is that flag's VALUE, not a
-/// candidate verb of its own -- without it, `kubectl -n prod delete ...`/
-/// `helm -n prod uninstall ...` would misread the namespace argument itself
-/// (`prod`) as the verb and never reach the real one.
+/// Skip each flag's value so it cannot hide a later destructive verb.
 pub(super) fn first_positional<'a>(tokens: &'a [String], value_flags: &[&str]) -> Option<&'a str> {
     first_positional_index(tokens, value_flags).map(|index| tokens[index].as_str())
 }
 
-/// [`first_positional`]'s own answer as an INDEX. A caller that needs to
-/// slice `tokens` at the positional it found must use this rather than
-/// searching the returned text back up with `position`: a preceding flag
-/// VALUE can spell the same word (`kubectl -n get get secrets`), and the
-/// text search then slices at the namespace instead of the verb.
+/// Return the verb index so a matching flag value cannot shift operand checks.
 pub(super) fn first_positional_index(tokens: &[String], value_flags: &[&str]) -> Option<usize> {
     let mut index = 1usize;
     while index < tokens.len() {
@@ -256,12 +228,8 @@ pub(super) fn is_destructive_orchestrator_action(command: &str) -> bool {
                     ) && pair[1] == verb
                 })
             };
-            // A5 (2026-09-06 audit): a named `rm` tears the resource down as
-            // irrecoverably as the `prune` beside it, and a FORCED top-level
-            // `rm`/`rmi` removes a running container or an in-use image the
-            // daemon would otherwise have refused. A plain `docker rm <id>`
-            // of a stopped container stays silent -- that is ordinary
-            // cleanup the daemon itself already guards.
+            // Named `rm` is destructive; forced `rm`/`rmi` can remove resources the
+            // daemon would otherwise protect. Plain stopped-container cleanup is safe.
             let forced_removal = first_positional(&tokens, &[])
                 .is_some_and(|action| matches!(action.to_ascii_lowercase().as_str(), "rm" | "rmi"))
                 && lower
@@ -275,10 +243,8 @@ pub(super) fn is_destructive_orchestrator_action(command: &str) -> bool {
             noun_verb("prune") || noun_verb("rm") || forced_removal || compose_volumes
         }
         "aws" => {
-            // A5: `s3 rb` removes a bucket and `s3 rm --recursive` empties a
-            // prefix; neither spells a `delete-`/`terminate-` verb, so the
-            // prefix scan below never saw them. A single-object `s3 rm` and
-            // every read verb stay silent.
+            // `s3 rb` removes buckets and recursive `s3 rm` empties prefixes; a
+            // verb-prefix scan does not cover these destructive forms.
             let s3_verb = |verb: &str| {
                 lower
                     .windows(2)
@@ -344,17 +310,8 @@ pub(super) fn is_irreversible_distribution_action(command: &str) -> bool {
             .any(|pair| pair[0] == "nuget" && matches!(pair[1].as_str(), "push" | "delete")),
         "nuget" => action.is_some_and(|action| matches!(action.as_str(), "push" | "delete")),
         "gem" => action.is_some_and(|action| matches!(action.as_str(), "push" | "yank")),
-        // Issue #329: `glab` is GitLab's equivalent forge CLI to `gh` and
-        // shares the same destructive `<noun> delete`/`api ... DELETE`
-        // spellings, so it shares this arm rather than forking a near-
-        // identical copy. Codex review on #329: both CLIs spell every
-        // server-side removal as a positional `delete` verb (`variable`,
-        // `secret`, `issue`, `label`, `cache`, `ssh-key`, `ci` ...), so the
-        // arm matches `delete` in ANY positional slot before the first flag
-        // rather than an enumerated `repo`/`release` pair -- a new noun is
-        // covered by default. `search <kind> delete` is a query for the word,
-        // not a removal, and a `delete` after a flag (`--label delete`) is
-        // that flag's value.
+        // `gh` and `glab` share deletion verbs. Match positional `delete` before
+        // flags so new nouns qualify, but searches and flag values do not (#329).
         "gh" | "glab" => {
             let positionals: Vec<&String> = lower
                 .iter()
@@ -404,18 +361,9 @@ pub(super) fn git_action(tokens: &[String]) -> Option<(usize, &str)> {
     None
 }
 
-/// Issue #306: a `checkout`/`restore` path operand that names one concrete
-/// tracked file or directory rather than the whole tree -- not `.` or `:/`
-/// (git's own "everything from here"/"everything from the repo root"
-/// pathspecs) or a bare `*`, and carrying none of `* ? [` (a glob that could
-/// expand to an unknown, possibly tree-wide, set of paths). Text-only, like
-/// [`target_is_confined`]: this classifier cannot know what a glob expands
-/// to, so it never treats one as concrete.
-/// A path operand that names one concrete file or directory INSIDE the
-/// tree: never a glob, never a `:`-prefixed pathspec (`:/`, `:(top)`), and
-/// never a dot-only spelling of the tree itself or its parent (`.`, `./`,
-/// `..`, `../x`, `/`). Review round 2 on issue #306: `..` and `./` used to
-/// pass, reopening the tree-wide `git clean` bypass for those spellings.
+/// Accept only concrete git path operands inside the tree. Glob and
+/// colon-prefixed pathspecs, tree/parent spellings, and `..` are not bounded
+/// to one tracked file or directory (#306).
 fn is_concrete_vcs_path(path: &str) -> bool {
     if path.contains(['*', '?', '[']) || path.starts_with(':') {
         return false;
@@ -428,15 +376,11 @@ fn is_concrete_vcs_path(path: &str) -> bool {
     !components.is_empty() && !components.contains(&"..")
 }
 
-/// Issue #306: `path` (a `git worktree remove --force` target) lexically
-/// contains a `.claude/worktrees/` or `.zirv/worktrees/` path component --
-/// zirv's own and Claude Code's own agent-worktree roots -- either as a
-/// leading component of a relative path or anywhere in an absolute one.
+/// Match complete `.claude/worktrees/` or `.zirv/worktrees/` components so
+/// similarly named paths cannot inherit the agent-cleanup exception (#306).
 fn is_agent_worktree_root(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    // A `..` component lexically escapes the marker prefix, so a path merely
-    // containing `.claude/worktrees/` can still resolve elsewhere; reject it
-    // before the substring match (mirrors `target_is_confined`'s own guard).
+    // Reject `..` before matching a worktree marker: it can escape the root.
     if normalized.contains("..") {
         return false;
     }
@@ -473,10 +417,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
                 || token == "-d"
                 || token == "--delete"
                 || token.starts_with("--force")
-                // Issue #327: `--mirror` overwrites/deletes every ref on the
-                // remote and `--prune` deletes remote refs that no longer
-                // exist locally -- both are destructive independent of any
-                // `-f`/`--force*` flag.
+// `--mirror` overwrites remote refs and `--prune` deletes them, even
+// without an explicit force flag (#327).
                 || token == "--mirror"
                 || token == "--prune"
                 || token.starts_with(':')
@@ -484,9 +426,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
         }),
         "reset" => lower.iter().any(|token| token == "--hard"),
         "filter-branch" => true,
-        // Issue #306: non-interactive rebase is local and reflog-recoverable
-        // -- only `-i`/`--interactive` (which can rewrite history in ways an
-        // unattended runner cannot review) keeps the Ask.
+        // Interactive rebase requires review; non-interactive rebase is locally
+        // recoverable via the reflog (#306).
         "rebase" => lower.iter().any(|token| {
             matches!(token.as_str(), "-i" | "--interactive" | "-x" | "--exec")
                 || token.starts_with("--exec=")
@@ -499,14 +440,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
                 token == "--force"
                     || (token.starts_with('-') && !token.starts_with("--") && token.contains('f'))
             });
-            // Issue #306: `-x`/`-X` (or a combined short flag containing
-            // either) also removes gitignored files, which are not
-            // recoverable from git history the way a tracked/untracked
-            // build artifact is -- that keeps the Ask regardless of an
-            // explicit path. Without `-x`/`-X`, every path operand naming
-            // one concrete tracked/untracked file or directory narrows a
-            // bare, tree-wide `clean -f` down to Allow; a tree-wide
-            // pathspec (`.`, `:/`) or a glob keeps the Ask.
+            // `-x`/`-X` also remove ignored files, which git cannot recover.
+            // Concrete paths may narrow plain `clean`; tree-wide paths and globs cannot (#306).
             let excludes_ignored = lower.iter().any(|token| {
                 token == "-x"
                     || (token.starts_with('-') && !token.starts_with("--") && token.contains('x'))
@@ -535,12 +470,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
             force && !dry_run && (excludes_ignored || !has_concrete_paths)
         }
         "branch" => {
-            // A FORCED delete, in every spelling of the same operation --
-            // `-D` is only its most compact one, and the pre-existing
-            // `--delete` + `--force` pair only its most verbose. A plain,
-            // non-forced delete is deliberately still silent: git refuses it
-            // outright for an unmerged branch, so it is recoverable work,
-            // not a loss.
+            // Forced branch deletion can discard unmerged commits; plain deletion
+            // refuses unmerged branches and remains recoverable.
             let short_cluster_has = |wanted: char| {
                 args.iter().any(|token| {
                     token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
@@ -570,19 +501,13 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
                 .collect();
             let has_target = !paths.is_empty();
             let would_be_destructive = has_target && (!staged || worktree);
-            // Issue #306: every path operand naming one concrete tracked
-            // file or directory narrows to Allow; a tree-wide pathspec
-            // (`.`, `:/`) or a glob keeps the Ask.
+            // Concrete tracked paths qualify; tree-wide pathspecs and globs do not
+            // bound the affected files (#306).
             would_be_destructive && !paths.iter().all(|path| is_concrete_vcs_path(path))
         }
         "checkout" => {
-            // Issue #327: `-f`/`--force` discards uncommitted local changes
-            // outright, and `-B` force-resets an existing branch (possibly
-            // an unrelated one) to a new start point, clobbering whatever
-            // commits it pointed at -- both keep the Ask independent of the
-            // `-- <paths>` pathspec check below. `-B` is checked against the
-            // ORIGINAL case: `lower` would collapse it into `-b` (plain
-            // "create a new branch", non-destructive).
+            // `-f` discards local changes and `-B` resets an existing branch; both
+            // require Ask. Preserve case so `-B` is distinct from `-b` (#327).
             let force_reset = lower
                 .iter()
                 .any(|token| token == "-f" || token == "--force")
@@ -593,9 +518,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
             match args.iter().position(|token| token == "--") {
                 Some(separator) => {
                     let paths = &args[separator + 1..];
-                    // Issue #306: same narrowing as `restore` above -- concrete
-                    // tracked-file targets are Allow, tree-wide/glob targets
-                    // keep the Ask.
+                    // Concrete tracked-file targets qualify; tree-wide/glob targets do not
+                    // bound the affected files (#306).
                     !paths.is_empty() && !paths.iter().all(|path| is_concrete_vcs_path(path))
                 }
                 None => false,
@@ -609,10 +533,8 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
             if !is_remove || !force {
                 return false;
             }
-            // Issue #306: the target of an agent's own worktree cleanup --
-            // a path under a `.claude/worktrees/`/`.zirv/worktrees/` root,
-            // or one confined to a scratchpad root -- narrows to Allow;
-            // any other `--force` target keeps the Ask.
+            // Allow forced cleanup only under agent worktree or scratchpad roots;
+            // other targets retain Ask (#306).
             match args.iter().skip(1).find(|token| !token.starts_with('-')) {
                 Some(path) => {
                     !(is_agent_worktree_root(path) || target_is_confined(path, scratchpad_roots))
@@ -683,10 +605,8 @@ fn is_local_url(token: &str) -> bool {
         || is_loopback_ipv4(&host)
 }
 
-/// Whether `host` is a literal dotted-quad IPv4 address inside
-/// `127.0.0.0/8` -- the actual loopback block, not merely a string that
-/// STARTS WITH `"127."` (`127.evil.com`/`127.0.0.1.attacker.example` share
-/// that prefix but are remote hosts, not loopback addresses).
+/// Recognize only literal IPv4 addresses in `127.0.0.0/8`; a hostname
+/// beginning with `127.` may still resolve remotely.
 fn is_loopback_ipv4(host: &str) -> bool {
     let parts: Vec<&str> = host.split('.').collect();
     parts.len() == 4
@@ -780,13 +700,8 @@ pub(super) fn sensitive_upload_path(raw: &str) -> bool {
     sensitive_credential_path(raw) || project_secret_path(raw, true)
 }
 
-/// A small cross-shell tripwire for direct access to files whose contents or
-/// mutation would already be a credential compromise by the time a prompt
-/// appeared. Native Claude sandbox support differs by platform, so these
-/// obvious Unix, cmd.exe, and PowerShell spellings receive the same hard-deny
-/// verdict before any adapter projection. Arbitrary interpreter code remains
-/// the containment layer's responsibility; this deliberately does not claim
-/// to be a general shell parser.
+/// Hard-deny direct credential-file access before adapter projection.
+/// Arbitrary interpreter code remains the containment layer's responsibility.
 pub(super) fn is_sensitive_credential_access(command: &str) -> bool {
     is_sensitive_file_access(command, sensitive_credential_path)
 }
@@ -948,10 +863,8 @@ const OPERATOR_CONFIG_DESTINATION_PROGRAMS: &[&str] = &[
 /// place of a trailing positional operand.
 const DESTINATION_FLAGS: &[&str] = &["-destination", "-dest", "-t", "--target-directory"];
 
-/// Splits a `-flag=value`/`-Flag:value` token into its two halves. Both GNU
-/// long options and PowerShell parameters accept the joined spelling, which
-/// carries the write target inside a single token that starts with `-` --
-/// invisible to any scan that filters flags out before looking at paths.
+/// Split joined flag/value tokens so write targets inside options remain
+/// visible to operator-config checks.
 fn joined_flag_value(token: &str) -> Option<(&str, &str)> {
     let rest = token.strip_prefix('-')?;
     let index = rest.find(['=', ':'])?;
@@ -1033,9 +946,8 @@ pub(super) fn is_network_program(program: &str) -> bool {
 pub(super) fn network_outcome(command: &str) -> Option<Outcome> {
     let segments = split_segments(command);
     if segments.len() > 1 {
-        // The candidate fold also submits whole pipelines/lists. A JSON
-        // formatter's flags and operands are not curl's request options.
-        // Keep the most restrictive network request across real segments.
+        // Examine actual request segments: formatter flags in a compound command
+        // must not be interpreted as curl options.
         return segments
             .iter()
             .filter_map(|segment| network_outcome(segment))
@@ -1153,9 +1065,7 @@ pub(super) fn network_outcome(command: &str) -> Option<Outcome> {
         index += 1;
     }
 
-    // `-d`/`--data` with `-G`/`--get` still SENDS that data -- curl turns it
-    // into query-string parameters instead of a body, it does not discard
-    // it -- so a data flag must keep this mutating even under `-G`.
+    // Curl `-G` moves `-d` data to query parameters; it still transmits it.
     if force_get && !explicit_mutating_method && !data_flag_present {
         mutating = false;
     }
@@ -1177,26 +1087,10 @@ pub(super) fn network_outcome(command: &str) -> Option<Outcome> {
     ))
 }
 
-// ---------------------------------------------------------------------
-// SQL statement classifier (2026-08-24, cross-harness permissions design)
-// ---------------------------------------------------------------------
-//
-// Read-only SQL through a database CLI is ordinary read-only work and must
-// not prompt; a write through the same CLI should. Neither question can be
-// answered by `glob_match` over a command string, because the interesting
-// part is inside a quoted argument -- `psql -c '...'` is one opaque token to
-// every other matcher in this module.
-//
-// Explicitly NOT a SQL parser, exactly as `Modules/Command Safety.md` already
-// says of the command splitter: this raises the bar, it is not the only
-// defense, and it is not obfuscation-proof. The asymmetry is deliberate --
-// every uncertainty (an unbalanced quote, an unclosed comment, a statement
-// that is not on argv at all, two statements, a keyword it does not know)
-// resolves to `Ask`. The worst outcome is an unnecessary prompt; an
-// unprompted write is not reachable from here.
-//
-// Pure, like the rest of this module: no clock, no filesystem, no
-// environment.
+// SQL writes inside quoted CLI arguments need statement classification;
+// globs over the command string cannot see them. Ambiguous syntax, hidden
+// input, multiple statements and unknown keywords yield Ask. This is a
+// conservative classifier, not a full SQL parser.
 
 /// The database command-line clients this classifier recognizes, each paired
 /// with the flags that carry an inline statement on it. An empty flag list
@@ -1246,13 +1140,8 @@ pub(super) fn sql_tokens(command: &str) -> Option<Vec<String>> {
             }
             None if c.is_whitespace() => {
                 if started {
-                    // Windows commonly exposes an unquoted executable path
-                    // below `C:\Program Files`. While that is not valid
-                    // shell quoting in general, the CLI corpus deliberately
-                    // requires the recognizable `.exe` basename to survive
-                    // it. Keep only the FIRST drive-qualified token open
-                    // until its executable suffix; SQL statement arguments
-                    // are unaffected.
+                    // Preserve an unquoted Windows drive-qualified executable path through
+                    // its `.exe` suffix so the DB client can still be recognized.
                     let lower = current.to_ascii_lowercase();
                     let drive_path_without_executable_suffix = tokens.is_empty()
                         && current.as_bytes().get(1) == Some(&b':')
@@ -1393,33 +1282,11 @@ fn dollar_quote_open(chars: &[char], i: usize) -> Option<(String, usize)> {
     None
 }
 
-/// Removes `--` line comments and `/* ... */` block comments so a comment
-/// cannot hide a write keyword from [`statement_is_read_only`]. `None` when a
-/// block comment is never closed, a quoted string is never closed, a
-/// dollar-quoted string (PostgreSQL's `$$...$$`/`$tag$...$tag$`) is never
-/// closed, or a trailing backslash escapes past the end of the statement --
-/// every one of those is "cannot see the real statement", so the caller
-/// falls back to `Ask` rather than guess. Each removed comment leaves one
-/// space behind, so two tokens it sat between cannot fuse into one word.
-///
-/// Two escaping conventions are modeled so a comment marker or write keyword
-/// hidden behind them cannot be swallowed as part of an ordinary string that
-/// closed EARLIER than it actually does:
-/// - A backslash inside a `'`/`"`-quoted string always escapes the next
-///   character (MySQL's default `NO_BACKSLASH_ESCAPES`-off behavior) and
-///   never itself closes the string. This is a deliberate superset even for
-///   clients where a bare `''` string does not honor backslash escaping
-///   (e.g. PostgreSQL without an `E'...'` prefix): treating the escape as
-///   real only ever makes the scanner consider MORE of the input to still be
-///   inside the string, which cannot hide a write -- it can only turn a
-///   would-be comment marker into ordinary (still-visible) string content or
-///   leave the string unterminated, both `Ask`, never a wrongly-erased
-///   comment.
-/// - A dollar-quoted string (`$$...$$`/`$tag$...$tag$`) is copied through
-///   verbatim as one opaque region, exactly like a `'`/`"` string, so a `/*`
-///   or `--` INSIDE it is never mistaken for a real comment start and a `;`
-///   or write keyword AFTER its close is never mistaken for still being
-///   inside it.
+/// Strip SQL comments without hiding later write keywords. Unterminated
+/// comments, strings, dollar quotes or escapes return `None` (Ask). Keep a
+/// space where a comment was removed so tokens cannot fuse. Backslash and
+/// doubled-quote handling is conservative across SQL dialects: uncertainty
+/// must prompt, never prove a write read-only.
 fn strip_sql_comments(statement: &str) -> Option<String> {
     let chars: Vec<char> = statement.chars().collect();
     let mut out = String::new();
@@ -1521,28 +1388,11 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
     Some(out)
 }
 
-/// Whether `statement` is PROVABLY a single read-only SQL statement.
-///
-/// Four gates, all of which must pass:
-/// 1. Comments strip cleanly (an unclosed block comment fails).
-/// 2. Exactly one statement: at most one trailing `;`, and no `;` inside what
-///    is left.
-/// 3. It starts with `SELECT`, `EXPLAIN` or `SHOW`. This is what rejects
-///    every CTE outright -- a `WITH` prefix never reaches the read-only
-///    branch, a deliberate SUPERSET of the spec's "no CTE that wraps a
-///    write": proving which CTEs are harmless needs a real parser, and an
-///    unnecessary prompt on a read-only CTE is the acceptable side of that
-///    trade.
-/// 4. No write/exfiltration keyword appears as a whole word anywhere in it.
-///    Word-splitting is on non-alphanumeric-and-not-underscore, so a column
-///    called `system_tables` or `into_bucket` is one word and does not trip
-///    the `system`/`into` entries.
-///
-/// Every failure is a `false`, i.e. `Ask`. False positives (a read-only
-/// statement carrying one of these words in a string literal) cost a prompt;
-/// there is no input for which a write returns `true` short of a keyword this
-/// list does not name -- which is exactly why the shipped deny/ask sets and
-/// the harness's own permission system remain the other layers of defense.
+/// Accept only a provably single read-only SQL statement: clean comments,
+/// at most one trailing semicolon, `SELECT`/`EXPLAIN`/`SHOW` prefix, and no
+/// whole-word write or exfiltration keyword. CTEs require a real parser,
+/// so they prompt. Any uncertainty returns false (Ask); other permission
+/// layers still guard keywords this classifier does not know.
 fn statement_is_read_only(statement: &str) -> bool {
     const READ_ONLY_VERBS: &[&str] = &["select", "explain", "show"];
     const WRITE_WORDS: &[&str] = &[
@@ -1595,15 +1445,8 @@ fn statement_is_read_only(statement: &str) -> bool {
         .any(|word| WRITE_WORDS.contains(&word))
 }
 
-/// The SQL classifier's own opinion about `command`: `Some(Allow)` when the
-/// entire input is provably one read-only statement through a recognized
-/// client, `Some(Ask)` for a recognized client in any other shape, and `None`
-/// when `command` names no recognized client at all -- in which case
-/// [`evaluate`]'s ordinary rule matching (and its launch-mode default) is the
-/// whole answer.
-///
-/// Pure: no clock, filesystem or environment, the same discipline `evaluate`
-/// and `glob_match` hold to.
+/// A recognized DB client with opaque or mutating SQL must Ask; unrelated
+/// programs stay with ordinary policy rather than inheriting SQL rules.
 pub fn sql_outcome(command: &str) -> Option<Outcome> {
     let (verdict, pattern) = match sql_invocation(command)? {
         SqlInvocation::Statement(statement) if statement_is_read_only(&statement) => (

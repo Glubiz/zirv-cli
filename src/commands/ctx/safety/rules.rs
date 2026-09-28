@@ -14,13 +14,8 @@ pub(crate) fn command_pattern_from_bash_rule(rule: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The built-in deny set, derived from `adapters::SHIPPED_POSTURE_DENY`
-/// rather than duplicating it (PR #96's live-verified destructive-family
-/// list: recursive force-delete, force-push/history-rewrite, a download
-/// piped into a shell, privilege escalation, credential-path reads). Order
-/// preserved, so claude's projection can reconstruct the exact original
-/// argv -- see `default_sandbox_args_stays_byte_identical_to_the_pre_
-/// safety_shipped_default` in `adapters::claude`.
+/// Built-in deny rules derived from the shipped adapter posture, in
+/// stable order so projections preserve its exact rule precedence.
 pub fn builtin_deny() -> Vec<Rule> {
     super::adapters::SHIPPED_POSTURE_DENY
         .iter()
@@ -32,51 +27,12 @@ pub fn builtin_deny() -> Vec<Rule> {
         .collect()
 }
 
-/// Harness-neutral base/native-allow patterns for zirv's own case-insensitive
-/// reserved built-ins. `utils::RESERVED_COMMANDS` is the dispatch layer's
-/// source of truth: those names are handled before script lookup, so a repo
-/// script can never shadow them. A non-reserved `zirv <script>` and the
-/// destructive `setup` built-in are deliberately absent.
-///
-/// `ctx` is the one name that does NOT expand to a blanket `zirv ctx *`
-/// (code review fix, critical, issue #224 follow-up): several of its verbs
-/// (`exec`, `wrap`, `chat`, `resume`, `loop`, `agent`, `handover`) spawn a
-/// subprocess of their own with caller-controlled argv that a name-only
-/// pattern cannot see past -- `zirv ctx exec -- <arbitrary command>` matched
-/// `zirv ctx *` and got a base Allow verdict plus a native sandbox exclusion,
-/// i.e. unattended, unsandboxed arbitrary execution. It expands to one
-/// `zirv ctx <verb> *` pattern per [`ctx_base_allow_verbs`] instead, reusing
-/// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`] -- the same list already governing the
-/// `--dangerously-disable-sandbox` retry path -- as the single source of
-/// truth, so the two surfaces cannot drift apart. Every OTHER reserved name
-/// keeps its name-level `zirv <name> *`: its payload is a prompt or a path,
-/// not arbitrary argv.
-///
-/// `agent` and `chat` keep their name-level pattern here even though
-/// [`reserved_zirv_auto_allow_rule`] withholds the base `Allow` verdict when
-/// their forwarded flags pin a weaker posture on the spawned harness (issue
-/// #224 review round 2): a static glob, unlike that function, cannot see the
-/// *content* of the trailing flags, only that the command starts with `zirv
-/// agent`/`zirv chat`. Removing the pattern entirely was considered and
-/// rejected: `launch_settings_value`'s own hook stays SILENT for an `Allow`
-/// verdict under `dontAsk` (`hook_output`), so a plain, safe delegation
-/// needs a matching native `permissions.allow`/`sandbox.excludedCommands`
-/// entry to actually run un-prompted -- dropping the pattern would reopen
-/// issue #224's own original complaint (supervised sessions prompted on
-/// zirv's own built-ins) for the common case.
-///
-/// **Round 3 correction:** keeping this pattern means the SAME native rule
-/// still matches the dangerous, flag-pinning invocation once the hook goes
-/// silent for `Ask` -- silence is not "no opinion", it is "defer to native
-/// settings", and this generated glob cannot narrow itself around the
-/// dangerous case. `evaluate_single` therefore never lets that shape reach a
-/// silent `Ask`: `agent_or_chat_posture_pinning_deny_rule` denies it
-/// outright instead, and a hook `Deny` is tested to emit an explicit
-/// decision in every permission mode -- it cannot be silently outrun by this
-/// pattern the way `Ask` could. This generated pattern is therefore load-
-/// bearing ONLY for the safe delegation case; it must never be relied on to
-/// narrow itself around a dangerous one, which is exactly what letting the
-/// dangerous case reach `Ask` would have required.
+/// Generate native allow patterns only for unshadowable zirv built-ins.
+/// `ctx` uses safe verbs rather than `zirv ctx *`, which would grant
+/// caller-controlled subprocesses base Allow and sandbox exclusion.
+/// `agent`/`chat` need native globs for safe delegation, but posture-weakening
+/// flags receive an explicit hook Deny: silent Ask under `dontAsk` would
+/// leave those same native globs in force (#224).
 pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
     crate::utils::RESERVED_COMMANDS
         .iter()
@@ -121,11 +77,8 @@ const BASE_GATED_RESERVED_BUILTINS: &[&str] = &["setup"];
 /// from the OS sandbox because they select repository-authored children.
 const SANDBOX_CONFINED_RESERVED_BUILTINS: &[&str] = &["test", "verify", "frontend"];
 
-/// The built-in allow set: command families from
-/// `adapters::SHIPPED_POSTURE_ALLOW`, plus the reserved zirv built-ins above.
-/// Keeping the latter out of the static adapter constant avoids restoring
-/// issue #98's over-broad `zirv *` rule while giving every policy projection
-/// the same generated list.
+/// Shipped allow families plus safe reserved zirv patterns; never grant
+/// a blanket `zirv *` rule (#98, #224).
 pub fn builtin_allow() -> Vec<Rule> {
     let mut allow: Vec<Rule> = super::adapters::SHIPPED_POSTURE_ALLOW
         .iter()
@@ -163,25 +116,9 @@ pub fn builtin_ask() -> Vec<Rule> {
         .collect()
 }
 
-/// Matches one already-normalized `command` string against `policy`, deny
-/// first, then ask, then allow -- **first-match-wins within a category, and
-/// a category match always beats a later category**, the same "deny beats
-/// allow" precedence PR #96 verified live for claude's own permission rules
-/// (see `adapters::SHIPPED_POSTURE_ALLOW`'s doc comment). A command matching
-/// nothing gets `policy.default`, with no matched rule to report.
-/// The NARROWING half of [`evaluate_single`]'s precedence: the first explicit
-/// `deny`, else the first explicit `ask`, that `command` matches. `None` means
-/// no narrowing rule names this command at all -- it says nothing about
-/// whether an allow rule, a semantic analyzer, or the unmatched-command
-/// default would have had an opinion.
-///
-/// Factored out for issue #326's transparent-launcher candidate (see
-/// [`evaluate_candidates`]), which must consult exactly this -- an operator's
-/// or repository's own narrowing rule written against the wrapper spelling --
-/// and nothing else. Sharing the loop rather than re-deriving it is what
-/// keeps the two surfaces from drifting: `built_in_structural_rule_matches`
-/// and `narrowing_rule_matches` carry real matching subtleties that a second
-/// copy would lose.
+/// Match explicit Deny before Ask before Allow, with first match winning
+/// within each category. Reuse narrowing matches for transparent wrappers
+/// so they cannot inherit a broader allow from their outer spelling (#326).
 fn explicit_narrowing_outcome(policy: &SafetyPolicy, command: &str) -> Option<Outcome> {
     for (rules, verdict) in [(&policy.deny, Verdict::Deny), (&policy.ask, Verdict::Ask)] {
         if let Some(rule) = rules.iter().find(|rule| {
@@ -207,23 +144,9 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             matched: Some(rule),
         };
     }
-    // A built-in reserved-command pattern (`Origin::BuiltIn` and shaped like
-    // `zirv <reserved-name> ...`) must not grant Allow here a second time --
-    // code review fix (CRITICAL, issue #224 review round 2). `reserved_
-    // zirv_auto_allow_rule` above is the sole, flag-aware authority for
-    // these; `reserved_zirv_command_patterns` still generates a blanket
-    // `zirv agent *`/`zirv chat *` glob for claude's own native settings
-    // projection (a static glob cannot express "except when flags pin a
-    // weaker posture"), and that SAME generated list also seeds this
-    // `policy.allow`. Without this exclusion, `zirv agent claude "x" --
-    // --permission-mode bypassPermissions` fell through the flag-aware
-    // shortcut's `None` straight into this plain glob scan, which still
-    // matched the built-in `"zirv agent *"` pattern and granted Allow
-    // anyway -- silently undoing the shortcut's own narrowing. An
-    // OPERATOR's own explicit allow rule of the same shape is unaffected
-    // (only `Origin::BuiltIn` is excluded): that is the operator's own
-    // informed choice, the same "operator's explicit choice always wins"
-    // rule this module applies everywhere else.
+    // Built-in reserved-name globs are native projections, not a second
+    // authority to grant Allow. Only the flag-aware rule may allow agent/chat;
+    // operator-authored allow entries retain their explicit authority (#224).
     if let Some(rule) = policy.allow.iter().find(|rule| {
         glob_match(&rule.pattern, command)
             && !(rule.origin == Origin::BuiltIn
@@ -234,20 +157,16 @@ fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> O
             matched: Some(rule.clone()),
         };
     }
-    // Code review fix (CRITICAL, issue #224 review round 3): a posture-
-    // pinning `zirv agent`/`zirv chat` invocation that reaches this point
-    // (no operator override matched above) is denied outright rather than
-    // falling through to the ordinary unmatched-command default. See
-    // `agent_or_chat_posture_pinning_deny_rule`'s own doc comment for why
-    // `Ask` was not enough.
+    // Deny posture-weakening agent/chat flags: Ask would be silent under
+    // `dontAsk` and a native reserved-name glob could still allow them (#224).
     if let Some(rule) = agent_or_chat_posture_pinning_deny_rule(command) {
         return Outcome {
             verdict: Verdict::Deny,
             matched: Some(rule),
         };
     }
-    // Code review fix (CRITICAL, issue #224 review round 4, audit finding):
-    // see `artifact_present_server_command_deny_rule`'s own doc comment.
+    // Hard-deny shell-bearing artifact presentations before native allow
+    // patterns can match the reserved name (#224).
     if let Some(rule) = artifact_present_server_command_deny_rule(command) {
         return Outcome {
             verdict: Verdict::Deny,
@@ -304,34 +223,9 @@ fn reserved_zirv_invocation(command: &str) -> Option<(String, Vec<String>)> {
     Some((name, tokens))
 }
 
-/// The `evaluate_single` auto-allow gate for a reserved zirv built-in --
-/// **not** just a name lookup, unlike [`reserved_zirv_command_name`] (still
-/// used by [`narrowing_rule_matches`], where narrower name-only matching can
-/// only ever make a `deny`/`ask` rule stricter, never wider). This function
-/// grants `Allow`, so it must be as narrow as [`reserved_zirv_command_
-/// patterns`]'s projection: every non-`ctx` reserved name auto-allows
-/// unconditionally (its payload is a prompt or a path), but `ctx` only
-/// auto-allows when its verb is in [`ctx_base_allow_verbs`] -- code review
-/// fix (CRITICAL, issue #224 follow-up). Before this fix, `zirv ctx exec --
-/// <arbitrary command>` and `zirv ctx wrap <arbitrary command>` matched on
-/// the reserved name alone and got a base `Allow` verdict (which also drives
-/// claude's native sandbox exclusion, see `adapters::claude::launch_
-/// settings_value`), i.e. unattended, unsandboxed arbitrary execution.
-///
-/// `agent`/`chat` get a further carve-out (code review fix, CRITICAL, issue
-/// #224 review round 2): both forward everything they parse into their own
-/// trailing `flags`/`extra` field (`AgentArgs`/`ChatArgs`, `#[arg(allow_
-/// hyphen_values = true, last = true)]`) verbatim to the spawned harness's
-/// own CLI, and that same flag set can suppress zirv's entire computed
-/// posture prefix outright (`agent::worker_launch_flags` -> `adapters::
-/// policy_launch_args` -> `adapters::flags_pin_policy`). Pre-#224 the flag
-/// author was assumed to be the operator; under an unconditional auto-allow
-/// it can be the supervised model itself, so `zirv agent claude "x" --
-/// --permission-mode bypassPermissions` spawned an unattended worker with a
-/// weakened posture and no prompt anywhere. When this returns `None` for
-/// that shape, `evaluate_single` does not fall all the way through to the
-/// ordinary unmatched-command default -- see `agent_or_chat_posture_
-/// pinning_deny_rule` below for why a plain `Ask` was not enough.
+/// Grant base Allow to reserved zirv names only through flag-aware checks.
+/// `ctx` requires a safe verb; agent/chat flags that weaken spawned posture
+/// cannot inherit native built-in allow patterns (#224).
 fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
     let (name, tokens) = reserved_zirv_invocation(command)?;
     if name != "ctx" {
@@ -369,26 +263,10 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
         })
 }
 
-/// Whether `tokens` (the whole argv of a `zirv ctx ...` invocation) is the
-/// WRITING form of `zirv ctx permissions compile` -- i.e. `compile` without
-/// `--dry-run`.
-///
-/// `compile` is the one `permissions` subcommand that mutates the operator's
-/// own `~/.zirv/ctx.toml`: it unions new `[safety] allow` patterns (and,
-/// with `--escape`, `[safety] escape_allow`) into the home layer, the single
-/// layer a repository is forbidden from contributing to at all. A supervised
-/// model that can run it silently can therefore permanently widen the
-/// operator's policy with no prompt -- the exact escalation `safety.allow`'s
-/// operator-only layering exists to prevent, reached through a command whose
-/// reserved name made it auto-allow. `audit`, `propose` and `compile
-/// --dry-run` write nothing and stay silent.
-///
-/// Shared by [`reserved_zirv_auto_allow_rule`] (so the shortcut withholds
-/// `Allow` in the first place), [`permissions_compile_write_deny_rule`] (so
-/// the fallthrough denies rather than reaching the interactive `Allow`
-/// default) and [`is_reserved_zirv_escape_safe_segment`] (so it cannot ride
-/// an unsandboxed retry either), the same three-surface treatment `zirv
-/// artifact --server-command` already gets, so they cannot drift apart.
+/// Hard-deny writing `permissions compile`: it mutates the operator's home
+/// allow policy, which a supervised model must not widen silently. Share
+/// this predicate across base allow, fallback and unsandboxed retry so none
+/// grants the reserved command a bypass; dry-run remains read-only (#224).
 pub(super) fn is_permissions_compile_write(tokens: &[String]) -> bool {
     if tokens
         .get(2)
@@ -426,38 +304,9 @@ fn permissions_compile_write_deny_rule(command: &str) -> Option<Rule> {
     })
 }
 
-/// The hard floor `evaluate_single` applies to a `zirv agent`/`zirv chat`
-/// invocation whose forwarded flags pin a weaker posture on the spawned
-/// harness, once neither [`reserved_zirv_auto_allow_rule`] nor an
-/// operator's own `~/.zirv/ctx.toml` allow rule of the same shape has
-/// already granted `Allow` -- code review fix (CRITICAL, issue #224 review
-/// round 3), replacing the plain `Ask` fallback this used to reach.
-///
-/// **Why `Ask` was not enough:** under headless `dontAsk`, an `Ask` verdict
-/// makes the safety hook go silent (`hook_output`'s `Verdict::Ask if
-/// dont_ask => return None`) -- but `reserved_zirv_command_patterns` still
-/// has to carry a blanket `Bash(zirv agent *)`/`Bash(zirv chat *)` native
-/// permission rule (and matching sandbox exclusion) for the SAFE delegation
-/// case, since a static glob cannot itself express "except when flags pin a
-/// weaker posture" (see that function's own doc comment). With the hook
-/// silent, that same native rule still matches the DANGEROUS invocation too,
-/// so the escalation would still run -- in precisely the unattended,
-/// unsupervised context this review exists to close. A hook `Deny` is
-/// tested (`hook_output_deny_still_denies_in_every_permission_mode`) to
-/// always emit an explicit decision, in every permission mode, which cannot
-/// be silently outrun by a separately-matching native allow rule the way
-/// `Ask` could. A posture-weakening spawn attempt from a supervised model is
-/// also, on its own terms, an escalation attempt rather than an ambiguous
-/// case worth a prompt -- `Deny` is the semantically correct verdict, not
-/// only the technically enforceable one.
-///
-/// This function carries no operator-override reading of its own -- by the
-/// time `evaluate_single` reaches it, an operator's own explicit allow rule
-/// of the same shape has already had its chance to grant `Allow` first,
-/// preserving the same override this shape already had before this round
-/// (see `evaluate_single`'s own call site). Scans every token past the
-/// reserved name, not only the slice after a literal `--`, mirroring
-/// [`reserved_zirv_auto_allow_rule`]'s own conservative choice.
+/// Hard-deny posture-weakening agent/chat flags unless the operator
+/// explicitly allowed them. Under `dontAsk`, Ask is silent while native
+/// globs still match, so only Deny enforces this boundary (#224).
 fn agent_or_chat_posture_pinning_deny_rule(command: &str) -> Option<Rule> {
     let (name, tokens) = reserved_zirv_invocation(command)?;
     if !matches!(name.as_str(), "agent" | "chat") {
@@ -469,23 +318,9 @@ fn agent_or_chat_posture_pinning_deny_rule(command: &str) -> Option<Rule> {
     })
 }
 
-/// The same hard-floor treatment as [`agent_or_chat_posture_pinning_deny_
-/// rule`], for a second, independently discovered payload -- code review fix
-/// (CRITICAL, issue #224 review round 4, audit finding). `zirv artifact
-/// present --interactive --server-command <text>` (`workflow::artifact::
-/// run_interactive`) runs `<text>` through a real shell (`sh -c`/`cmd /D /S
-/// /C`) with no restriction on its content -- `--server-command` is a named
-/// string flag, not `ctx exec`'s `-- <argv>` shape, but it is the identical
-/// risk: a caller-controlled command handed straight to a shell. The
-/// `--approve` flag this path also checks
-/// (`artifact::presentation_plan_with_native`) is not a real gate here: it
-/// only satisfies an `Ask`-stance `[policy]` capability check, and like
-/// `setup reset --yes` it is a flag the invoking command itself carries, not
-/// evidence of a human. `artifact register`/`list`/`show`, and `present`
-/// without `--server-command`, are unaffected -- their payload is a path,
-/// an id, or (without an explicit server command) a static/harness-native
-/// presentation with no shell involved, so `artifact` keeps its name-level
-/// pattern in `reserved_zirv_command_patterns` for that common case.
+/// Hard-deny `artifact present --server-command`: its text runs through
+/// a shell, and a caller-supplied `--approve` is not human approval. Other
+/// artifact verbs do not carry this executable payload (#224).
 fn artifact_present_server_command_deny_rule(command: &str) -> Option<Rule> {
     let (name, tokens) = reserved_zirv_invocation(command)?;
     if name != "artifact" {
@@ -576,21 +411,8 @@ pub(super) fn verdict_rank(verdict: Verdict) -> u8 {
     }
 }
 
-/// The per-candidate analyzer chain [`evaluate_candidates`]'s own fold loop
-/// applies to every normalized executable candidate -- extracted (issue
-/// #168) so a caller that needs one candidate's own verdict in isolation
-/// (`every_segment_is_allow_or_unmatched_default`, Task 6) can run the
-/// identical chain without a second, drifting copy of these seven analyzer
-/// calls.
-///
-/// `original` is the whole compound `command` this `candidate` was split
-/// from ([`apply_recursive_delete_outcome`]'s own doc comment says why it
-/// needs that: a `cd <dir> && rm -rf <relative target>` candidate loses the
-/// `cd` once `normalize_segments` splits it apart). Every call site that
-/// does not itself track a broader original text passes `candidate` again
-/// here, which is exactly today's behavior -- this parameter only WIDENS an
-/// outcome, never narrows one, so a caller with nothing better to offer than
-/// the candidate itself loses nothing by repeating it.
+/// Reuse the full analyzer chain so isolated segment verdicts cannot drift
+/// from the compound fold; keep its leading `cd` for relative deletes (#168).
 pub(super) fn evaluate_candidate_outcome(
     policy: &SafetyPolicy,
     candidate: &str,
@@ -611,17 +433,9 @@ pub(super) fn evaluate_candidate_outcome(
     apply_find_exec_outcome(candidate, outcome)
 }
 
-/// The candidate fold: the raw command plus every string
-/// [`normalize_segments`] derives from it, resolved to the single most
-/// restrictive [`Outcome`] (deny > ask > allow). Each candidate receives
-/// both the generic policy match and every enabled semantic analyzer before
-/// the fold. Applying semantic analysis only after the fold loses which
-/// executable segment produced the answer and lets a harmless leading
-/// command hide a dangerous nested invocation.
-///
-/// `fallback` is the unmatched-command verdict already chosen for this
-/// launch mode ([`SafetyPolicy::default_verdict`]), so this function itself
-/// has no opinion about which default applies.
+/// Fold the raw command and normalized executable candidates to the
+/// strictest verdict, applying semantic analyzers per candidate so a benign
+/// outer command cannot hide a dangerous nested one.
 pub(super) fn evaluate_candidates(
     policy: &SafetyPolicy,
     command: &str,
@@ -666,23 +480,9 @@ pub(super) fn evaluate_candidates(
 
     let mut worst: Option<(u8, Outcome)> = None;
     for candidate in candidates {
-        // Issue #326: a `zirv ctx run --compact -- <argv>` candidate is a
-        // TRANSPARENT LAUNCHER -- it stores the child's output and prints a
-        // summary, and is otherwise exactly the child. Its inner argv is
-        // already a candidate of its own (`visit_executable_nodes` recurses
-        // into it, so the inner's own shell/env/launcher children are
-        // expanded too), and that inner candidate is what carries the
-        // verdict. The wrapper text itself contributes ONE thing and nothing
-        // else: an explicit narrowing rule someone wrote against the wrapper
-        // spelling.
-        //
-        // Both halves of that are load-bearing. Contributing the wrapper's
-        // unmatched-command fallback would let the wrapper turn an allowed
-        // `cargo test` into an `Ask` merely by wrapping it; contributing an
-        // allow match on the wrapper would let `[safety] allow = ["zirv ctx
-        // run *"]` launder a denied inner command, which is exactly the
-        // widening this whole branch exists to prevent. So: deny/ask only,
-        // and only from a rule that genuinely names it.
+        // `zirv ctx run --compact --` is transparent: its child carries the
+        // verdict. The wrapper contributes only explicit deny/ask rules naming
+        // it, never its fallback or an allow that launders the child (#326).
         let outcome = if unwrap_compact_run_wrapper(&candidate).is_some() {
             match explicit_narrowing_outcome(policy, &candidate) {
                 Some(outcome) => outcome,

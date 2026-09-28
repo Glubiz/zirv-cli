@@ -22,14 +22,8 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-/// Splits `command` on shell separators (`;`, `&`, `&&`, `||`, `|`, `|&`,
-/// newline) while keeping quoted data together, recording whether each
-/// segment was preceded by a pipe (`|`/`|&`) rather than a chain operator --
-/// issue #334's `git apply`/`git am` carve-out needs that. [`split_segments`]
-/// and [`split_segments_with_pipe_marker`] are thin views over this one
-/// scan. `&&`/`||`/`|&` are matched before their lone forms so a two-
-/// character operator is never split in half -- `|&` composes into ONE pipe
-/// marker instead of a stray `|` plus a stray background `&`.
+/// Split shell separators while preserving quoted data and marking pipe
+/// joins. Recognize multi-character operators before their prefixes (#334).
 pub(super) fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments = Vec::new();
@@ -273,11 +267,8 @@ fn literal_command_substitution_word(body: &str) -> Option<String> {
     (!word.is_empty()).then(|| word.clone())
 }
 
-// ---------------------------------------------------------------------
-// Opaque-literal carve-out (issue #136): quoted commit-message arguments
-// and single-quoted heredoc bodies are DATA, never executable structure,
-// and must not be fed through the deny/ask matcher as if they were code.
-// ---------------------------------------------------------------------
+// Quoted commit messages and single-quoted heredocs are data, not code
+// candidates; live substitutions inside them still need classification (#136).
 
 /// Stable placeholder [`redact_opaque_message`] substitutes for a commit-
 /// message argument's value. Deliberately not empty (an empty candidate
@@ -293,30 +284,17 @@ const OPAQUE_MESSAGE_PLACEHOLDER: &str = "<opaque:message>";
 /// comment for why this is non-empty and metacharacter-free.
 const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
 
-/// One whitespace-delimited, quote-aware token found while scanning a
-/// command/segment string, plus its exact `[start, end)` CHAR range (not
-/// byte range -- this module works in `Vec<char>` throughout, matching
-/// [`command_substitution_end`]/[`split_segments`]) in the source text, so a
-/// caller can splice a replacement into that exact span without disturbing
-/// anything else. Quote characters are kept as part of `text`/the span
-/// (never stripped here) so a caller can tell whether the value was quoted
-/// at all.
+/// Quote-aware token with a character span in source text; keep quote
+/// characters so replacements preserve the original syntax.
 pub(crate) struct QuotedToken {
-    /// `pub(crate)`: `learn.rs` reads this to diff two commands token-by-
-    /// token without splitting a quoted argument on its own embedded
-    /// whitespace (issue #425 review). `start`/`end` stay private -- nothing
-    /// outside this module needs the char-index span.
+    /// Shared with command learning so quoted values stay one token (#425).
     pub(crate) text: String,
     start: usize,
     end: usize,
 }
 
-/// Quote-aware whitespace token spans over `chars`. [`token_spans`] and
-/// [`tokenize_quoted`] are thin views over this one scan (issue #421 -- the
-/// two used to be independent, near-identical copies). `escape_aware` keeps
-/// each caller's own PRE-EXISTING answer (only [`tokenize_quoted`] treated a
-/// backslash as an escape) rather than unifying onto one, which could shift
-/// a verdict.
+/// Shared quote-aware token scan; `escape_aware` preserves each caller's
+/// backslash semantics so verdicts do not shift (#421).
 fn whitespace_token_spans(chars: &[char], escape_aware: bool) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0usize;
@@ -364,9 +342,6 @@ fn whitespace_token_spans(chars: &[char], escape_aware: bool) -> Vec<(usize, usi
     spans
 }
 
-/// See [`whitespace_token_spans`], which this is a thin, escape-aware view
-/// over. `pub(crate)`: `learn.rs` reuses this exact tokenizer (issue #425
-/// review) rather than a second, independent copy.
 pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
     whitespace_token_spans(chars, true)
         .into_iter()
@@ -378,12 +353,8 @@ pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
         .collect()
 }
 
-/// Whether `tokens`' leading two tokens name one of the commit-message-
-/// bearing invocations issue #136 scopes this carve-out to: `git commit`,
-/// `git tag`, `git notes`, or `hg commit`. Case-insensitive on the program/
-/// subcommand names only (a real shell resolves `Git`/`GIT` identically on
-/// case-insensitive filesystems); nothing else about the segment is
-/// normalized here.
+/// Redact messages only for known message-bearing invocations; redacting
+/// arbitrary commands could hide executable text from policy matching (#136).
 fn is_message_bearing_invocation(tokens: &[QuotedToken]) -> bool {
     let Some(program) = tokens.first() else {
         return false;
@@ -401,12 +372,8 @@ fn is_message_bearing_invocation(tokens: &[QuotedToken]) -> bool {
     }
 }
 
-/// Narrows `[start, end)` to the INTERIOR of a matching pair of leading/
-/// trailing `'`/`"` quotes, if the span is quoted -- so a redaction keeps the
-/// quote characters themselves (the result still reads as `-m "..."`, not
-/// `-m ...`) and only blanks what was actually inside them. Returns the span
-/// unchanged when it is not quoted (an attached `-mvalue` short form, for
-/// instance, blanks the whole value since there is no quote pair to keep).
+/// Replace only the interior of a quoted value, preserving its delimiters;
+/// unquoted attached values have no delimiters to keep.
 fn value_interior_span(chars: &[char], start: usize, end: usize) -> (usize, usize) {
     if end.saturating_sub(start) >= 2 {
         let first = chars[start];
@@ -418,28 +385,9 @@ fn value_interior_span(chars: &[char], start: usize, end: usize) -> (usize, usiz
     (start, end)
 }
 
-/// Issue #136: when `text`'s leading two tokens name a commit-message-
-/// bearing invocation ([`is_message_bearing_invocation`]) and it carries a
-/// `-m`/`--message` argument -- the separated form (`-m "..."`), the
-/// attached short form (`-m...`), or the joined long form (`--message=...`)
-/// -- returns a copy of `text` with every such argument's VALUE replaced by
-/// [`OPAQUE_MESSAGE_PLACEHOLDER`]. Returns `None` when `text` does not name
-/// one of these invocations, or names one with no message argument at all
-/// (nothing to redact, so the original text is preserved byte-for-byte by
-/// every caller).
-///
-/// Deliberately blunt: a message argument's value is replaced WHOLESALE,
-/// including any `$(...)`/backtick command substitution it happens to
-/// contain, rather than trying to preserve a live substitution span inside
-/// it. This is safe, not a regression against "a `$(...)` inside a
-/// DOUBLE-quoted message must still be classified" (issue #136's own
-/// constraint): this function is only ever applied to the text a caller is
-/// about to push as a DIRECT match candidate ([`visit_executable_nodes`]'s
-/// two `push_candidate` call sites) -- [`command_substitutions`]'s own
-/// extraction always runs against the UNREDACTED original segment text
-/// first, independently of this function, so a live substitution is still
-/// found and recursively classified as its own candidate at `depth + 1`
-/// regardless of what this function does to the surrounding prose.
+/// Redact commit-message values before direct policy matching, while
+/// command substitutions are independently extracted from original text
+/// and still classified as executable candidates (#136).
 fn redact_opaque_message(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     let tokens = tokenize_quoted(&chars);
@@ -500,25 +448,8 @@ fn redact_opaque_message(text: &str) -> Option<String> {
     ))
 }
 
-/// Issue #136 (MINOR fix, review round): whether `token_text` is a
-/// combined short-flag cluster whose message-taking flag is `m` (`-am`,
-/// `-qam`, ...) -- git/hg's combined short-option spelling for the same
-/// `-m` a plain `-m`/`-m<value>` token already covers, so `git commit -am
-/// "msg"` was missing this carve-out's redaction entirely (`"-am".starts_
-/// with("-m")` is false) and reproduced the original false-positive for
-/// that one spelling. Mirrors [`is_inline_command_flag`]'s own "cluster of
-/// ASCII letters" validation, so an unrelated long flag that merely
-/// contains an `m` character somewhere is never mistaken for one -- this is
-/// only ever called on tokens already known to start with a single `-`
-/// (never `--`), the same guard `is_inline_command_flag` applies to its own
-/// cluster check.
-///
-/// Returns `None` when `token_text` is not a single-dash, all-ASCII-letter
-/// cluster ending in (or containing) `m`. Otherwise returns the char index,
-/// WITHIN `token_text`, of the first character after the `m` -- equal to
-/// `token_text.chars().count()` when there is no attached value (the value
-/// is the NEXT token, `-am "msg"`), or an interior index when the value is
-/// attached directly (`-amFoo`).
+/// Locate `m` in a valid combined short-flag cluster, including attached
+/// values, so `-am` message text receives the same redaction as `-m` (#136).
 fn short_message_flag_value_offset(token_text: &str) -> Option<usize> {
     if !token_text.starts_with('-') || token_text.starts_with("--") {
         return None;
@@ -536,11 +467,8 @@ fn short_message_flag_value_offset(token_text: &str) -> Option<usize> {
     None
 }
 
-/// Splices `placeholder` into every `[start, end)` span of `chars`,
-/// preserving everything outside them verbatim. Spans are sorted and any
-/// span that starts before the previous one's end is skipped (defends
-/// against overlap rather than panicking or corrupting output on
-/// pathological input -- this module fails closed on doubt elsewhere too).
+/// Skip overlapping spans rather than corrupting source text or panicking
+/// on a pathological command.
 fn apply_span_redactions(
     chars: &[char],
     mut spans: Vec<(usize, usize)>,
@@ -561,17 +489,8 @@ fn apply_span_redactions(
     out
 }
 
-/// Issue #136 (BLOCKER fix, review round): parses a `<<[-]'DELIM'` heredoc
-/// marker starting exactly at `chars[start]` (`chars[start..start+2]` is
-/// already confirmed to be `<<` by the caller, which only calls this from a
-/// position its own quote/comment state machine has already proven is BARE
-/// text -- see [`redact_single_quoted_heredocs`]'s own doc comment for why
-/// that gate matters). `<<-DELIM` (the tab-stripping form) is recognized
-/// too. Returns the delimiter word and the index just past the closing
-/// quote, or `None` when the text at `start` is not actually this exact
-/// shape (a bare `<<EOF`, a double-quoted `<<"EOF"`, an unterminated quote,
-/// an empty delimiter, or a delimiter that would span a newline) -- the
-/// caller then treats `start` as ordinary `<` text, never guessing.
+/// Parse a bare single-quoted heredoc delimiter, including `<<-`; reject
+/// malformed or differently quoted markers rather than guessing (#136).
 fn parse_single_quoted_heredoc_marker(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start + 2;
     if chars.get(i) == Some(&'-') {
@@ -625,69 +544,17 @@ fn find_heredoc_terminator(
     }
 }
 
-/// Issue #136: blanks the BODY of every single-quoted heredoc (`<<'DELIM'
-/// ... \nDELIM`) in `command`, replacing the literal lines between the
-/// opening marker and the terminator line with
-/// [`OPAQUE_HEREDOC_BODY_PLACEHOLDER`]. A single-quoted heredoc delimiter is
-/// POSIX-literal DATA even when the heredoc feeds a real command's stdin
-/// (`cat <<'EOF' ... EOF`) -- exactly the shape a commit message documenting
-/// dangerous command names by NAME (not running them) legitimately produces
-/// via `git commit -m "$(cat <<'EOF' ...prose... EOF)"`.
-///
-/// **BLOCKER fix (review round, 2026-08-25):** a `<<'DELIM'` marker only
-/// opens a heredoc when it is scanned OUTSIDE any active quote (except a
-/// live `$(...)`, which reopens bare scanning even when textually nested
-/// inside a quote -- see [`redact_heredocs_scan`]'s own doc comment) and
-/// OUTSIDE an unquoted `#` comment. The original line-based scanner had
-/// neither notion -- `# see <<'X' for reference` on one line, `rm -rf /` on
-/// the next, and a line reading just `X` was misread as a real heredoc, and
-/// because this function runs ONCE on the full raw command before anything
-/// else (including [`command_substitutions`]'s own extraction, since by the
-/// time [`normalize_segments`] calls into [`visit_executable_nodes`] the
-/// text it hands it is already heredoc-processed), the live `rm -rf /` line
-/// was blanked to the opaque placeholder in EVERY downstream candidate --
-/// the classifier never saw it, and a `Deny` silently became `Allow`. Same
-/// failure for a fake marker inside an ordinary double-quoted argument
-/// (`echo "see <<'X' here"`). The scan (in [`redact_heredocs_scan`] below)
-/// mirrors the exact quote-tracking state machine [`tokenize_quoted`]/
-/// [`split_segments`] already implement (same escape handling, same
-/// `'`/`"`/`` ` `` quote-char set), extended with one more bit of state --
-/// whether the scanner is inside an unquoted `#` comment, cleared at the
-/// next newline -- so `<<` is only ever inspected as a possible heredoc
-/// opener when both are clear.
-///
-/// Applied once, at the very top of [`normalize_segments`], to the FULL
-/// command text before anything else runs -- so every candidate downstream
-/// sees the opaque body rather than the original prose. `command_
-/// substitutions` itself stays untouched by this function's own code; it
-/// simply never receives the raw heredoc prose. A malformed/truncated
-/// heredoc (no terminator line found) is left alone rather than guessed at
-/// -- the safe failure for this module's "any doubt reads as unsupported"
-/// discipline is to redact nothing, never to redact too much.
+/// Redact only bodies of real single-quoted heredocs. Detect openers
+/// outside quotes and comments; a fake marker must never hide executable
+/// code from all downstream candidates. Unterminated bodies stay visible
+/// rather than risking excessive redaction (#136).
 pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
     redact_heredocs_scan(&chars, 0)
 }
 
-/// The scan [`redact_single_quoted_heredocs`] delegates to, recursive over
-/// `$(...)` spans so a heredoc issued FROM one is still found -- see that
-/// function's own doc comment for the shape this exists to keep passing
-/// (`git commit -m "$(cat <<'EOF' ...prose... EOF)"`, a live substitution
-/// nested inside an outer double-quoted string). A double quote does not
-/// neuter command substitution, so this cannot simply treat "inside any
-/// quote" as "heredoc detection off" -- doing that broke exactly the
-/// shape above (a real single-quoted heredoc that only *reads* as nested
-/// in a quote because of the enclosing `"..."`, when the `$(` right before
-/// it actually reopens live shell syntax). Only a SINGLE-quoted `$(...)`
-/// stays inert, mirroring [`command_substitutions`]'s own established rule
-/// (1086-1092) -- reused here via [`command_substitution_end`], the exact
-/// function `command_substitutions` itself calls to find where such a span
-/// ends, so the two can never disagree about where one stops.
-///
-/// `depth` mirrors every other recursive walk in this module
-/// (`MAX_STRUCTURAL_DEPTH`): a pathological input with many nested
-/// `$(...)` cannot grow this scan's call stack without limit; past the cap
-/// the remaining text is copied through unscanned rather than guessed at.
+/// Recurse into live `$(...)` even inside double quotes to find heredocs;
+/// single quotes suppress substitution. Bound recursion depth (#136).
 fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
     if depth >= MAX_STRUCTURAL_DEPTH {
         return chars.iter().collect();
@@ -771,10 +638,8 @@ fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
         {
             out.extend(chars[i..marker_end].iter());
             i = marker_end;
-            // The rest of the opener's own line is copied verbatim
-            // (unscanned) -- matches this scanner's own scope: only the
-            // first heredoc marker found while bare-scanning is acted
-            // on, exactly like the line-based version this replaces.
+            // Copy the rest of this opener line without scanning it: only
+            // bare text before the marker may introduce a heredoc.
             while i < chars.len() && chars[i] != '\n' {
                 out.push(chars[i]);
                 i += 1;
@@ -1015,28 +880,9 @@ pub(crate) fn is_shell_identifier_assignment(token: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// One layer of `env` prefix unwrapping (issue #132): peels `env`, `env -u
-/// VAR`, `env VAR=value` chains (any mix, any order of `-`-flags and
-/// assignments), `env -C DIR`/`--chdir DIR`/`--chdir=DIR` (2026-08-25 review:
-/// these take a directory argument the way `-u` takes a variable name, so
-/// they must consume it the same two-token way or the directory itself gets
-/// mistaken for the start of the wrapped command), and a bare leading
-/// `VAR=value` assignment chain with no `env` program at all (`FOO=bar zirv
-/// setup profile ...`) -- so classification and command-family grouping see
-/// the underlying command an environment-clean wrapper hides, not the
-/// wrapper's own name or the first assignment token. Mirrors
-/// [`unwrap_pipe_wrapper`]'s own `env` handling (that helper's narrower,
-/// pipe-target-only sibling), generalized into an ordinary one-layer
-/// `Option<String>` unwrap so [`visit_executable_nodes`] can chain it
-/// exactly like [`unwrap_shell_wrapper`]. `None` when `segment` carries no
-/// such prefix at all, when peeling it away would leave nothing behind, OR
-/// when `-S`/`--split-string` is present anywhere in the flags: that option
-/// re-splits its own argument by shell quoting rules into the actual argv,
-/// so the token layout this function assumes (one flag, then either its
-/// value or the wrapped command) does not hold, and guessing would risk
-/// hiding the real command rather than revealing it -- bailing out and
-/// leaving the whole `env -S '...'` segment unclassified-by-this-layer is
-/// the safe failure, not a silent misparse.
+/// Unwrap literal env prefixes and assignments to expose the executed
+/// command. Consume value-taking flags; reject `env -S` because its own
+/// shell re-splitting makes the argv boundary uncertain (#132).
 pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let collapsed = collapse_whitespace(&bare);
@@ -1072,18 +918,8 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     Some(tokens[i..].join(" "))
 }
 
-/// The ordinary process launchers that go on to run some OTHER program.
-/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] already knew this much for a pipe TARGET;
-/// a leading prefix needs three more facts per launcher: which of its own
-/// flags take a SEPARATE value, which flags mean it re-targets an EXISTING
-/// process and launches nothing, and how many positional operands belong to
-/// the launcher itself (`timeout <duration>`, `flock <file>`,
-/// `chrt <priority>`, `taskset <mask>`) before the wrapped command starts.
-///
-/// A flag must never appear in the value list AND leave the positional count
-/// standing when it is the positional it consumes: `taskset -c 0 <cmd>`
-/// spells its CPU list as that one positional, so counting both ate `<cmd>`
-/// itself (review round 1, R3).
+/// Describe launcher flags, retargeting modes and positional operands so
+/// unwrapping reaches the actual program without swallowing it.
 pub(super) struct LauncherPrefix {
     pub(super) program: &'static str,
     pub(super) value_flags: &'static [&'static str],
@@ -1308,24 +1144,8 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
     },
 ];
 
-/// One layer of `docker exec`/`kubectl exec` unwrapping: both run some
-/// OTHER, container-local command -- the same "goes on to run a wrapped
-/// command" shape [`unwrap_launcher_prefix`] already knows, plus a
-/// REQUIRED positional (the container/pod name) between the flags and an
-/// optional `--` separator marking where the inner command starts.
-///
-/// `docker exec [flags] <container> <cmd...>` and `kubectl exec [flags]
-/// <pod> [-n ns] [-c container] [--] <cmd...>` are peeled the same way:
-/// skip the wrapper's own flags (a boolean one alone, a value one plus its
-/// next token), then the first remaining token is the container/pod, then
-/// an optional `--`, then the remainder is the inner command.
-///
-/// `None` whenever the shape does not hold cleanly: no `exec` subcommand,
-/// an unrecognized flag before the positional (this function does not know
-/// whether it takes a value, and guessing risks eating the container/pod
-/// name itself), or nothing left after the positional/separator. Failing to
-/// decode is always the safer answer than mis-identifying where the inner
-/// command starts.
+/// Unwrap container exec only when flags, required pod/container name and
+/// optional `--` leave a clear inner command. Unknown flags fail closed.
 pub(crate) fn unwrap_exec_prefix(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let collapsed = collapse_whitespace(&bare);
@@ -1370,58 +1190,13 @@ pub(crate) fn unwrap_exec_prefix(segment: &str) -> Option<String> {
     (i < tokens.len()).then(|| tokens[i..].join(" "))
 }
 
-/// Issue #326: `zirv ctx run --compact -- <argv...>` is a TRANSPARENT
-/// launcher -- it stores the child's output and prints a summary, and is
-/// otherwise exactly the child. Returns the inner argv, or `None` when
-/// `segment` is not that shape.
-///
-/// Without this, wrapping a command changed its verdict in both directions
-/// and neither was right. `zirv ctx run` is deliberately absent from
-/// [`ZIRV_CTX_ESCAPE_SAFE_VERBS`]/`ctx_base_allow_verbs` (it launches
-/// caller-controlled argv, exactly the shape issue #224's review closed for
-/// `exec`/`wrap`), so the wrapped form matched no rule at all: on a headless
-/// launch an ordinary `cargo test` silently became the unmatched-command
-/// `Ask`, and on an interactive one a wrapped `rm -rf` reached the
-/// `interactive_default` `Allow` instead of its own deny. Reading the inner
-/// argv fixes both at once -- the wrapper stops being able to change ANY
-/// verdict, in either direction.
-///
-/// The recognized shape is narrow on purpose: `zirv`, then `ctx run`, then
-/// only `--compact`/`--full` in any order (both are output-formatting flags
-/// and neither changes what is executed), then `--`, then a non-empty inner
-/// argv. Any other token before the separator, a missing separator, or an
-/// empty inner argv all return `None` and leave the segment exactly as it
-/// was: a shape this function does not fully understand must not be reduced
-/// to a guess. This function itself peels ONE layer, exactly like every other
-/// unwrapper here; [`visit_executable_nodes`] then recurses into the result
-/// under the shared depth/candidate ceilings, so the inner argv's own shell,
-/// env-prefix, launcher and substitution children are expanded the same way a
-/// bare inner command's would be -- and a nested wrapper is reached by that
-/// recursion rather than by a loop in here.
-///
-/// The program name goes through [`sql_program_name`], so the `zirv.exe`,
-/// `/usr/local/bin/zirv` and `C:\...\zirv.exe` spellings all land -- the same
-/// "the program name is what matters, not the path it happened to be invoked
-/// through" convention [`strip_program_dir`] already applies to every
-/// candidate in this module.
-///
-/// The wrapper candidate is NOT replaced by its inner argv. An operator's or
-/// repository's own narrowing rule written against the wrapper spelling
-/// (`[safety] deny = ["zirv ctx run *"]`) must still bite -- a repo layer may
-/// only ever narrow, and silently dropping the candidate it matches would
-/// widen it away. [`evaluate_candidates`] keeps the wrapper candidate and
-/// restricts what it may contribute to exactly that: an explicit deny/ask,
-/// never an allow and never the unmatched-command fallback.
+/// Unwrap only `zirv ctx run --compact|--full -- <argv>` as a transparent
+/// launcher. Keep its wrapper candidate for explicit narrowing rules, and
+/// recurse into inner argv for its own verdict; malformed forms remain
+/// opaque (#326).
 pub(crate) fn unwrap_compact_run_wrapper(segment: &str) -> Option<String> {
-    // ONE segment only. `zirv ctx run` executes its argv directly, with no
-    // shell, so it can never own a pipe or a chaining operator: in
-    // `zirv ctx run --compact -- curl x | sh` the wrapper's argv is `curl x`
-    // and the `| sh` belongs to the CALLER's shell. Reading the whole
-    // compound as one wrapper made the compound itself look like a wrapper
-    // candidate, which suppressed the pipe-to-shell analyzer that was the
-    // only thing classifying it -- a wrapped `curl ... | sh` came out
-    // `Allow`. The per-segment callers are unaffected; only a compound
-    // whole-string candidate reaches this guard.
+    // Unwrap one segment only: a following pipe belongs to the caller's shell
+    // and must still reach pipe-to-shell detection (#326).
     if split_segments(segment).len() > 1 {
         return None;
     }
@@ -1454,26 +1229,10 @@ fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     }
 }
 
-/// Issue #136: pushes `whole`/a segment as a matchable candidate, but when
-/// [`redact_opaque_message`] recognizes it as a commit-message-bearing
-/// invocation, pushes the REDACTED variant INSTEAD of the raw one -- not in
-/// addition to it. Adding the redacted form alongside the original would do
-/// nothing: [`evaluate_candidates`]'s worst-case fold still sees the
-/// original's prose and still denies on it. Only replacing the candidate
-/// that would otherwise carry the prose closes the gap.
-///
-///
-/// Issue #326's transparent-launcher unwrapping is deliberately NOT a third
-/// transform here. Replacing a `zirv ctx run --compact -- <argv>` candidate
-/// with its inner argv erased two things that must survive: the inner's own
-/// shell/env/launcher children (a wrapped `sh -c 'rm -rf ...'` never exposed
-/// the `rm`, because only the display candidate was rewritten while
-/// `visit_executable_nodes` kept walking the original), and any explicit
-/// narrowing rule written against the wrapper spelling. The inner argv is
-/// instead RECURSED into by `visit_executable_nodes` (so it is expanded like
-/// any other nested command), and the wrapper candidate stays in the list
-/// with `evaluate_candidates` restricting what it may contribute. See both of
-/// their doc comments.
+/// Replace opaque commit-message prose in direct candidates, never in
+/// executable extraction input. Preserve wrapper candidates and recurse
+/// into their inner argv so both nested commands and wrapper narrowing
+/// rules remain visible (#136, #326).
 fn push_executable_candidate(candidates: &mut Vec<String>, text: String) {
     let text = redact_opaque_message(&text).unwrap_or(text);
     push_candidate(candidates, strip_program_dir(&text));
@@ -1600,14 +1359,9 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             (!collapsed.is_empty()).then_some((raw_segment, collapsed, preceded_by_pipe))
         })
         .collect();
-    // Pass 1: every segment's own direct candidate FIRST, so a later
-    // dangerous sibling segment (`...; rm -rf /`) is always classified even
-    // when an earlier segment's substitution-splice recursion in pass 2 would
-    // otherwise exhaust MAX_STRUCTURAL_CANDIDATES before this segment.
-    // `derive_segment_candidate` skips a leading shell keyword (`for`, `{`,
-    // `do`, ...) so the BODY command is what gets matched, not the keyword
-    // itself -- see its own doc comment for why `for`/`case` headers are
-    // suppressed entirely instead.
+    // Visit each direct segment before substitutions so a deep earlier
+    // substitution cannot exhaust the candidate cap before a later sibling
+    // dangerous command is classified.
     for (_, collapsed, _) in &segments {
         if let Some(candidate) = derive_segment_candidate(collapsed) {
             push_executable_candidate(candidates, candidate);
@@ -1644,29 +1398,13 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
         if let Some(inner) = unwrap_exec_prefix(collapsed) {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
-        // Issue #326: `zirv ctx run --compact -- <argv>` is a transparent
-        // launcher, so its inner argv is expanded exactly like any other
-        // nested command -- one more recursion under the same depth and
-        // candidate ceilings, never a rewrite of this segment's own
-        // candidate. That is what makes a wrapped `sh -c 'rm -rf ...'` expose
-        // the `rm` the way the bare form always did; rewriting the display
-        // candidate alone left this walk on the original text and the `rm`
-        // was never reached. The wrapper candidate itself stays in the list
-        // and is restricted by `evaluate_candidates`.
+        // Recurse into the transparent launcher's inner argv; retain the outer
+        // candidate for explicit narrowing rules (#326).
         if let Some(inner) = unwrap_compact_run_wrapper(collapsed) {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
-        // ISSUE #136: extraction runs against `raw_segment` -- the
-        // UNREDACTED text (only ever heredoc-sanitized by
-        // `normalize_segments`'s own top-level pass before this
-        // function is ever called, never message-redacted) -- so a
-        // live `$(...)`/backtick substitution inside a commit message
-        // is still found and independently classified at `depth + 1`,
-        // completely unaffected by `push_executable_candidate` above
-        // redacting the SAME segment's own direct-match candidate.
-        // The substitution scanner never sees a redacted string,
-        // because `push_executable_candidate` builds one only for the
-        // candidate list, never for further extraction input.
+        // Extract substitutions from unredacted segment text so live commands
+        // inside opaque message arguments remain independently classified (#136).
         let substitutions = command_substitution_spans(raw_segment);
         for (_, _, inner) in &substitutions {
             visit_executable_nodes(inner, depth + 1, candidates);
@@ -1688,44 +1426,11 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
     }
 }
 
-/// Every executable string [`evaluate`] checks: the raw command first (so a
-/// whole-string pattern like `"* | sh"` is stable), then quote-aware compound
-/// segments, recursively unwrapped inline shells, and command substitutions.
-/// The fixed depth/candidate ceilings keep hook input deterministic and
-/// bounded; encoding, dynamic `eval`, variable expansion and script-file
-/// contents remain outside this lightweight analyzer's declared scope.
-///
-/// Issue #136: `command` is heredoc-sanitized ([`redact_single_quoted_
-/// heredocs`]) ONCE here, at the very top, before it reaches
-/// [`visit_executable_nodes`] or the raw candidate below -- see that
-/// function's own doc comment for why one top-level pass is enough for
-/// every nested candidate too. The raw candidate itself additionally goes
-/// through [`redact_opaque_message`] (mirroring `push_executable_candidate`
-/// exactly): the "raw command" candidate must not carry a commit message's
-/// prose either, or `evaluate_candidates`'s worst-case fold would still deny
-/// on it regardless of what every other candidate says.
-///
-/// Issue #326's transparent-launcher handling deliberately adds no transform
-/// here either: the raw candidate of a bare `zirv ctx run --compact --
-/// <argv>` stays the wrapper text, so an explicit narrowing rule naming that
-/// spelling still matches it, and the inner argv arrives as its own candidate
-/// through [`visit_executable_nodes`]'s recursion instead. See
-/// [`evaluate_candidates`] for what a wrapper candidate is then allowed to
-/// contribute.
-///
-/// `pub(crate)` (issue #155): also the candidate extraction `permit::
-/// is_heavy` reuses, so a heavy command hidden behind `sh -c` or a `&&`
-/// chain is classified by the same matcher this module's own policy checks
-/// use, rather than a second, independently-drifting copy.
-///
-/// The raw candidate is skipped entirely (not seeded at all) when it is a
-/// keyword-led compound ([`is_shell_control_structure`]) -- the same guard
-/// [`visit_executable_nodes`]'s own top-level "whole command" push applies,
-/// for the same reason: this text still has every top-level separator
-/// uncut, so it can never usefully match a program-shaped rule, and an
-/// unmatched compound would otherwise fold to the launch mode's unmatched-
-/// command default regardless of how cleanly every real command underneath
-/// classifies (the exact headless false-positive "change 1" fixes).
+/// Produce bounded executable candidates: raw command, segments and
+/// recursively unwrapped shells, launchers and substitutions. Redact literal
+/// heredoc/message prose before matching, but keep live substitutions and
+/// explicit wrapper narrowing rules. Skip keyword-led raw compounds so an
+/// unmatched wrapper cannot override classified inner commands (#136, #326).
 pub(crate) fn normalize_segments(command: &str) -> Vec<String> {
     let sanitized = redact_single_quoted_heredocs(command);
     let raw_candidate = redact_opaque_message(&sanitized).unwrap_or_else(|| sanitized.clone());

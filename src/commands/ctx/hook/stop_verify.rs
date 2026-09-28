@@ -13,17 +13,12 @@ use crate::commands::ctx::event::NormalizedEvent;
 use crate::commands::ctx::state::StateDir;
 use crate::commands::workflow::adoption::{self};
 
-/// Issue #786: minimum `true` probability before `stop_verify` blocks a Stop.
-/// Basis: jev-belay reached 1% false blocks with the closing TEXT; facts-only
-/// state is untested, so the floor sits well above the default margin.
+/// Require high probability before blocking Stop: facts-only Jev answers
+/// have not been validated against false-block risk (#786).
 const STOP_VERIFY_MIN_PROBABILITY: f64 = 0.9;
 
-/// [`stop_verify_reason`]'s own default `(min_confidence, min_margin)`
-/// `decisive()` floor -- named (issue: `zirv ctx jev probe`) so a later
-/// retune targets exactly this constant, the same way every other tunable
-/// site's default floor is now named. Not routed through `jev::floor`/
-/// `[jev.floors]` today: this stays the same fixed pair production has
-/// always used.
+/// Require a decisive answer before stopping a session; uncertainty must
+/// pass through rather than manufacture a block.
 pub(crate) const STOP_VERIFY_DEFAULT_FLOOR: (f32, f32) =
     (0.0, crate::commands::ctx::jev::DEFAULT_MIN_MARGIN);
 
@@ -75,10 +70,8 @@ const HEDGE_PHRASES: [&str; 12] = [
     "unverified",
 ];
 
-/// Local facts for the closing turn (events after the last human prompt):
-/// `[completion claims, hedges, test-pass claims, question marks, length
-/// bucket, edit calls, shell calls]`. `None` when the turn edited nothing or
-/// the closing message claims nothing -- neither can be a false "done".
+/// Closing-turn facts from claims and tool counts; no edits or completion
+/// claim means there is no false-done signal.
 fn stop_verify_facts(events: &[NormalizedEvent]) -> Option<Vec<u32>> {
     let start = events
         .iter()
@@ -137,12 +130,8 @@ since. Does it present unverified work as finished? Answer false if unsure.",
     )]
 }
 
-/// [`stop_verify_reason`]'s own per-call decision: `"block"` only for a
-/// DECISIVE noul at or above [`STOP_VERIFY_MIN_PROBABILITY`], `"allow"`
-/// otherwise (missing answer, indecisive, unparseable, or a decisive answer
-/// below the probability floor) -- the Stop hook's own fallback outcome
-/// (proceed as if `stop_verify` never ran). Shared with `zirv ctx jev
-/// probe`, which reports exactly this outcome.
+/// Block only for a decisive Jev answer above the probability floor;
+/// missing or uncertain answers let Stop proceed.
 pub(crate) fn stop_verify_action(
     answer: Option<&crate::commands::ctx::jev::Answer>,
     min_confidence: f32,
@@ -160,13 +149,8 @@ pub(crate) fn stop_verify_action(
     }
 }
 
-/// Issue #786 (`[jev] stop_verify`, facts-only stage): only when a check is
-/// owed (`verify_owed`, the verify-on-stop signal) and this turn edited files,
-/// asks one Noul from local counts of the closing message. A decisive `true`
-/// returns the block reason; anything else -- gate off, no credential, no
-/// claim, error, indecisive -- is `None` and the Stop proceeds as today.
-/// `stop_hook_active` is handled by `run_stop`'s own early return, so this
-/// can never block twice in a row.
+/// Check a claimed completion only when verification is owed and this
+/// turn edited files; uncertainty or errors do not block Stop (#786).
 pub(super) fn stop_verify_reason(
     state: &StateDir,
     cfg: &CtxConfig,

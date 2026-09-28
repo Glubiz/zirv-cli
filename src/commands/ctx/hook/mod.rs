@@ -73,26 +73,18 @@ pub enum HookEvent {
     Prompt,
     /// Claude PreCompact hook: record that a compaction is starting.
     PreCompact,
-    /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
-    /// this seat's expensive model, and refuse an orchestrator seat's own
-    /// direct edit of a repository file (issue #334).
+    /// Stop an expensive seat from exporting its model tier or editing repo
+    /// files directly through a tool call (#334).
     Pretool {
-        /// Issue #418: project a non-claude agent's own native `PreToolUse`-
-        /// equivalent payload onto this hook's claude shape before running
-        /// the guard, then translate the verdict back into that agent's own
-        /// response envelope. Omitted (or `claude`) leaves this byte-for-byte
-        /// identical to the original claude-only hook.
+        /// Adapt non-Claude PreToolUse payloads and verdicts through the shared
+        /// guard; omitted agent preserves the Claude envelope (#418).
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Claude PostToolUse hook: replace a large `Bash` tool result with a
-    /// compact, reversible summary before the model ever sees it (issue
-    /// #326). The original output is stored verbatim first.
+    /// Store original Bash output before compaction so a summary cannot
+    /// strand the model without retrievable bytes (#326).
     Posttool {
-        /// Issue #418: same projection/translation as `pretool`'s own
-        /// `--agent`, for copilot's `postToolUse` `modifiedResult` contract.
-        /// Only `copilot` has a supported native compaction envelope; any
-        /// other non-`claude` value exits 0 with nothing on stdout.
+        /// Adapt posttool result replacement only for supported agents (#418).
         #[arg(long)]
         agent: Option<String>,
     },
@@ -102,40 +94,28 @@ pub enum HookEvent {
     Permission,
     /// Claude SessionStart hook: re-inject the latest handoff on resume/clear.
     SessionStart,
-    /// Issue #774: claude's `SubagentStop` hook, fired once a native `Task`
-    /// subagent's own turn ends -- gates a few cheap, deterministic result-
-    /// contract checks against the SUBAGENT's own transcript before its
-    /// report reaches the lead. See [`run_subagent_stop`]'s own doc comment.
+    /// Check a subagent's own transcript before the lead trusts its claimed
+    /// result contract (#774).
     SubagentStop,
     /// Codex notify program: same role as Stop.
     Notify {
         /// Payload, when the agent passes it as an argument instead of stdin.
         payload: Option<String>,
     },
-    /// Aggregate the main decision log, safety/orchestrator-write denials
-    /// and the compaction ledger into one hook-health report (issue #424).
     Audit {
         /// Restrict to rows recorded within this window, e.g. `24h`, `7d`,
         /// `30d`, or a bare number of seconds.
         #[arg(long, default_value = "7d")]
         since: String,
     },
-    /// Issue #420: report the hook-integrity baseline's verdict (Ok/
-    /// Outdated/Missing/Modified/NoBaseline) for every hook slot the current
-    /// binary would install, across both the claude and codex targets.
     Status {
-        /// Replace any `Outdated` entry (byte-identical to a known previous
-        /// zirv shape) with the current binary's own shape. Never touches an
-        /// entry that differs by so much as a byte from every known
-        /// zirv-authored shape.
+        /// Heal only entries byte-identical to a known zirv version; preserve
+        /// operator-modified entries.
         #[arg(long)]
         heal: bool,
     },
-    /// Issue #418: install (or remove) zirv's own native hook entries into
-    /// `<agent>`'s own user-level hooks configuration file -- copilot,
-    /// droid or gemini; see `native_hooks::NativeHooks`/`AgentAdapter::
-    /// native_hooks`. Idempotent: a second `install` with no flags reports
-    /// what is already there and changes nothing.
+    /// Idempotently install or remove native hook entries for an adapter
+    /// in its user-level configuration (#418).
     Install {
         /// A registered adapter name with a native hooks surface
         /// (`AgentAdapter::native_hooks` returning `Some`).
@@ -153,10 +133,8 @@ pub enum HookEvent {
     },
 }
 
-/// `stop_hook_active` is absent from the published field table but is delivered
-/// in practice, so every field is optional with a zero default. `Serialize` is
-/// needed because Task A16 maps a codex notify payload into this shape and hands
-/// it back to `run_stop`.
+/// Optional Stop fields, including the observed `stop_hook_active`;
+/// serializable for Codex notify projection.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HookPayload {
@@ -166,19 +144,12 @@ pub struct HookPayload {
     pub stop_hook_active: bool,
     /// SessionStart only: `"startup" | "resume" | "clear" | "compact"`.
     pub source: String,
-    /// `SubagentStop` only (issue #774, review fix): claude's own unique id
-    /// for the specific subagent dispatch that just finished -- documented
-    /// (code.claude.com/docs/en/agent-sdk/hooks) alongside `agent_
-    /// transcript_path` below. `session_id` above is the LEAD session's own
-    /// id, shared by every subagent dispatched within it ("subagents work
-    /// within a single session"), so it can never distinguish one subagent's
-    /// own completion from another's -- `agent_id` is the field that can.
+    /// Claude's unique SubagentStop dispatch ID; the lead session ID is
+    /// shared by all its subagents and cannot identify this one (#774).
     #[serde(default)]
     pub agent_id: String,
-    /// `SubagentStop` only: the SUBAGENT's own transcript file. `transcript_
-    /// path` above is documented as the LEAD session's main transcript on
-    /// this event, never the subagent's -- reading it for what a subagent
-    /// itself said would silently check the wrong conversation's content.
+    /// SubagentStop transcript path; the ordinary transcript path names the
+    /// lead session, not the subagent (#774).
     #[serde(default)]
     pub agent_transcript_path: String,
 }
