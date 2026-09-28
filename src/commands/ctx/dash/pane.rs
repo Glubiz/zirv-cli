@@ -3163,7 +3163,7 @@ impl Pane {
     ) -> CtxResult<()> {
         // Issue #490 (N21 item A): a handover swaps one WRAPPED harness child
         // for another. A native pane's route moves through the runtime's own
-        // rollover (N19's `rollover_runtime`, which carries the conversation
+        // rollover (N19's `rollover::runtime`, which carries the conversation
         // across a generation), so refusing here is the honest answer rather
         // than silently doing nothing to a pane that has no child at all.
         if !matches!(self.kind, PaneKind::Wrapped(_)) {
@@ -3487,15 +3487,15 @@ impl Pane {
             return Err(error);
         }
         let pending = self.pending_handover.take().ok_or("no staged successor")?;
-        super::super::rollover_runtime::settle_subagents(
+        super::super::rollover::runtime::settle_subagents(
             &self.state_dir,
             repo,
             self.short(),
             Some(self.session_id()),
             if pending.forced_drain {
-                super::super::rollover_runtime::Drain::Forced
+                super::super::rollover::runtime::Drain::Forced
             } else {
-                super::super::rollover_runtime::Drain::Quiesced
+                super::super::rollover::runtime::Drain::Quiesced
             },
             super::super::state::now_secs(),
         );
@@ -3735,7 +3735,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn usage_rollover_keeps_source_until_successor_answers() {
-        use crate::commands::ctx::{rollover, rollover_runtime, seat, window};
+        use crate::commands::ctx::{rollover, seat, window};
         for outcome in ["exit2", "timeout", "ready", "commit-failure", "new-input"] {
             let tmp = tempfile::tempdir().unwrap();
             let state = StateDir::from_root(tmp.path().join("s"));
@@ -3829,7 +3829,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             );
-            let plan = rollover_runtime::plan_successor(
+            let plan = rollover::runtime::plan_successor(
                 crate::commands::ctx::runtime::RuntimeKind::Harness,
                 crate::commands::ctx::runtime::RuntimeKind::Harness,
                 &short,
@@ -3850,13 +3850,13 @@ pub(crate) mod tests {
                 size: (80, 24),
                 native: Default::default(),
             };
-            rollover_runtime::launch_successor(
+            rollover::runtime::launch_successor(
                 &state,
                 &repo,
                 &mut launcher,
                 &plan,
                 Some(session),
-                rollover_runtime::Drain::Quiesced,
+                rollover::runtime::Drain::Quiesced,
                 now,
             )
             .unwrap();

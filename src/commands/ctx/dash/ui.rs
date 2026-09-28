@@ -512,7 +512,7 @@ pub struct SidebarRow {
     /// Dash refresh PR2: this row's own orchestrator-seat rollover
     /// lifecycle, for the badge column -- `None` for every non-orchestrator
     /// row and for an orchestrator seat with nothing pending or parked.
-    /// `dash::mod` resolves this from the same `seat`/`rollover_runtime`
+    /// `dash::mod` resolves this from the same `seat`/`rollover::runtime`
     /// reads the footer's own `RolloverFooterFact` uses.
     pub rollover_badge: Option<RolloverBadge>,
     /// Dash refresh PR2: this row's own flash overlay style, already

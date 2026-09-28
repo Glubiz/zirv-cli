@@ -46,17 +46,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::CtxResult;
-use super::delegation;
-use super::route::{self, BillingPosture, Demand, Ineligible, RouteOffer};
-use super::runtime::RuntimeKind;
-use super::runtime::checkpoint::{self, CheckpointContext, PortableCheckpoint};
-use super::runtime::compaction::{self, ContinuationPlan};
-use super::runtime::journal::{
+use super::super::CtxResult;
+use super::super::delegation;
+use super::super::route::{self, BillingPosture, Demand, Ineligible, RouteOffer};
+use super::super::runtime::RuntimeKind;
+use super::super::runtime::checkpoint::{self, CheckpointContext, PortableCheckpoint};
+use super::super::runtime::compaction::{self, ContinuationPlan};
+use super::super::runtime::journal::{
     CheckpointId, CheckpointKind, ExecutionState, Journal, JournalSessionId,
 };
-use super::seat;
-use super::state::StateDir;
+use super::super::seat;
+use super::super::state::StateDir;
 
 /// Bumped on any shape change to the persisted [`Record`]. A record from a
 /// schema this build does not know is skipped, never repaired -- the same rule
@@ -307,9 +307,9 @@ pub fn reach_boundary(
         .messages
         .iter()
         .rev()
-        .find(|message| message.role == super::runtime::journal::MessageRole::Assistant)
+        .find(|message| message.role == super::super::runtime::journal::MessageRole::Assistant)
         .map(|message| message.sequence)
-        .unwrap_or(super::runtime::journal::SequenceId(0));
+        .unwrap_or(super::super::runtime::journal::SequenceId(0));
     let id = CheckpointId::new(format!("rollover-{}-{}", generation, state.last_sequence.0))?;
     let portable = checkpoint::build(
         &state,
@@ -795,10 +795,10 @@ impl Default for NativeSuccessorSpec {
 /// input it never answered, and any effect it must reconcile before acting.
 fn native_successor_input(
     plan: &SuccessorPlan,
-    note: &super::handoff::Handoff,
-    cfg: &super::config::CtxConfig,
+    note: &super::super::handoff::Handoff,
+    cfg: &super::super::config::CtxConfig,
 ) -> String {
-    let mut text = super::wrap::restart_prompt(note, &cfg.screen.thresholds());
+    let mut text = super::super::wrap::restart_prompt(note, &cfg.screen.thresholds());
     if !plan.acknowledged_input.is_empty() {
         text.push_str(
             "\n\nAcknowledged input the previous session never answered. Treat each line as an \
@@ -825,27 +825,27 @@ fn native_successor_input(
 /// source only after `Ok`, while an error leaves that source untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_native_pane(
-    cfg: &super::config::CtxConfig,
+    cfg: &super::super::config::CtxConfig,
     state: &StateDir,
     repo: &Path,
     cwd: &Path,
-    verb: super::sessions::Verb,
+    verb: super::super::sessions::Verb,
     title: String,
     size: (u16, u16),
-    role: super::prompt::PromptRole,
+    role: super::super::prompt::PromptRole,
     plan: &SuccessorPlan,
-    note: &super::handoff::Handoff,
+    note: &super::super::handoff::Handoff,
     native: &NativeSuccessorSpec,
-) -> Result<super::dash::Pane, SuccessorRefusal> {
+) -> Result<super::super::dash::Pane, SuccessorRefusal> {
     let state_root = state.root().to_str().map(str::to_string);
-    let process_env = super::config::env_from_process();
+    let process_env = super::super::config::env_from_process();
     let env = move |key: &str| {
-        if key == super::state::STATE_ENV {
+        if key == super::super::state::STATE_ENV {
             return state_root.clone();
         }
         process_env(key)
     };
-    super::dash::Pane::spawn_native(
+    super::super::dash::Pane::spawn_native(
         cfg,
         state,
         &env,
@@ -853,7 +853,7 @@ pub fn launch_native_pane(
         verb,
         title,
         size,
-        super::dash::native_pane::NativeDashboardSpec {
+        super::super::dash::native_pane::NativeDashboardSpec {
             repo: cwd.to_path_buf(),
             role: role.label().to_string(),
             route: plan.target_route.clone(),
@@ -1184,9 +1184,9 @@ pub fn load(state: &StateDir, short: &str) -> Option<Record> {
 }
 
 pub fn store(state: &StateDir, record: &Record) -> CtxResult<()> {
-    super::state::create_private_dir_all(&state.sessions())?;
+    super::super::state::create_private_dir_all(&state.sessions())?;
     let json = serde_json::to_string_pretty(record)?;
-    super::state::write_private(&record_path(state, &record.short), &json)?;
+    super::super::state::write_private(&record_path(state, &record.short), &json)?;
     Ok(())
 }
 
@@ -1554,7 +1554,7 @@ mod tests {
                 &session,
                 1,
                 &scope,
-                super::super::runtime::journal::MessageId::new("m1").expect("id"),
+                super::super::super::runtime::journal::MessageId::new("m1").expect("id"),
                 "ship the release".to_string(),
                 false,
                 None,
@@ -1676,7 +1676,7 @@ mod tests {
                 &session,
                 1,
                 &Default::default(),
-                super::super::runtime::journal::MessageId::new("m1").expect("id"),
+                super::super::super::runtime::journal::MessageId::new("m1").expect("id"),
                 "do the thing".to_string(),
                 false,
                 None,
@@ -1707,7 +1707,7 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
-        let cfg = super::super::config::CtxConfig::default();
+        let cfg = super::super::super::config::CtxConfig::default();
 
         let handle = |id: &str| delegation::WorkerHandle {
             delegation: id.to_string(),
@@ -1715,7 +1715,7 @@ mod tests {
             runtime: RuntimeKind::Native,
             worker_session: format!("{id}-worker"),
             short: "seatshrt".to_string(),
-            role: super::super::team::IMPLEMENTER.to_string(),
+            role: super::super::super::team::IMPLEMENTER.to_string(),
             task: Some(format!("task-{id}")),
             group: None,
             objective: None,
@@ -2043,11 +2043,11 @@ mod tests {
         session: &str,
         source: RuntimeKind,
     ) -> (String, Option<JournalSessionId>) {
-        use super::super::runtime::journal::{
+        use super::super::super::runtime::journal::{
             ContentRef, ExecutionId, MessageId, PolicyProvenance, TaskId, TaskReceiptState,
             ToolCallId,
         };
-        let short = super::super::sessions::short_id(session);
+        let short = super::super::super::sessions::short_id(session);
         seat::register(
             state,
             &short,
@@ -2067,7 +2067,7 @@ mod tests {
         let mut record = seat::load(state, &short).expect("seat");
         record.runtime = source;
         seat::store(state, &record).expect("store");
-        super::super::sessions::record_conversation_on(
+        super::super::super::sessions::record_conversation_on(
             state,
             &short,
             &record.agent,
@@ -2586,7 +2586,7 @@ mod tests {
                 RuntimeKind::Native
             };
             assert_eq!(
-                super::super::sessions::native_conversation(
+                super::super::super::sessions::native_conversation(
                     &state,
                     &short,
                     &after.agent,
@@ -2598,7 +2598,7 @@ mod tests {
                 "{moving:?}: the source session's recoverable state survives"
             );
             assert_eq!(
-                super::super::sessions::native_conversation(
+                super::super::super::sessions::native_conversation(
                     &state,
                     &short,
                     &after.agent,
@@ -2626,14 +2626,14 @@ mod tests {
     /// must be internally consistent about them.
     #[test]
     fn a_boundary_whose_prepare_fails_records_the_cancelled_calls_against_the_retained_source() {
-        use super::super::runtime::journal::{
+        use super::super::super::runtime::journal::{
             ExecutionId, MessageId, PolicyProvenance, ToolCallId,
         };
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let session = "5ca11ed0-4444-4000-8000-000000000488";
-        let short = super::super::sessions::short_id(session);
+        let short = super::super::super::sessions::short_id(session);
         seat::register(
             &state,
             &short,
@@ -2826,7 +2826,7 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let state = StateDir::from_root(tmp.path().join("state"));
             let session = format!("f0{:06x}-3333-4000-8000-000000000488", label.len());
-            let short = super::super::sessions::short_id(&session);
+            let short = super::super::super::sessions::short_id(&session);
             seat::register(
                 &state,
                 &short,

@@ -445,7 +445,7 @@ pub fn prepare(
 /// (an operator pinned the seat a tick ago) from a compensating path into a
 /// plain skip. `rollover::evaluate` calls this immediately before reaching the
 /// boundary, and still handles the residual race by recording what it
-/// cancelled (`rollover_runtime::Record::restore`).
+/// cancelled (`rollover::runtime::Record::restore`).
 pub fn may_prepare(state: &StateDir, short: &str) -> CtxResult<()> {
     let _lock = lock_seat(state, short)?;
     admissible(&load(state, short).ok_or_else(|| no_seat(short))?)

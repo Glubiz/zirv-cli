@@ -109,7 +109,7 @@ pub struct SeatView {
     /// a verified return. `None` for a seat that was never displaced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub displaced: Option<String>,
-    /// The last rollover's own record (`rollover_runtime::Record`): trigger,
+    /// The last rollover's own record (`rollover::runtime::Record`): trigger,
     /// direction, decision, outcome, and any reconciliation the successor is
     /// halted on. `None` when this seat has never rolled over.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,7 +278,7 @@ fn seat_view_for(state: &StateDir, record: &seat::Seat) -> SeatView {
                 }
             )
         }),
-        rollover: super::rollover_runtime::load(state, &record.short)
+        rollover: super::rollover::runtime::load(state, &record.short)
             .map(|ledger| ledger.status_line()),
         phase,
         rollover_pending,

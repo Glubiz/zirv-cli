@@ -22,7 +22,7 @@
 //! This module adds NO new sweep semantics of its own.
 //!
 //! Named the "state reconcile pass" in every message this module prints, to
-//! stay unambiguous against `rollover_runtime.rs`/`route.rs`'s own, narrower
+//! stay unambiguous against `rollover/runtime.rs`/`route.rs`'s own, narrower
 //! "reconcile" (resolving an outcome-unknown tool effect) -- an unrelated
 //! concept this module never touches.
 //!

@@ -785,15 +785,15 @@ pub(super) fn mail_flash_targets(
 /// for a commit that happens WHILE this dashboard is watching, never one it
 /// merely discovers on its first read.
 pub(super) fn rollover_committed_toast(
-    current: &Option<super::rollover_runtime::Settlement>,
-    previous: &Option<super::rollover_runtime::Settlement>,
+    current: &Option<super::rollover::runtime::Settlement>,
+    previous: &Option<super::rollover::runtime::Settlement>,
     seen_before: bool,
     source_agent: &str,
 ) -> Option<String> {
     if !seen_before || current == previous {
         return None;
     }
-    let super::rollover_runtime::Settlement::Committed { generation, .. } = current.as_ref()?
+    let super::rollover::runtime::Settlement::Committed { generation, .. } = current.as_ref()?
     else {
         return None;
     };
@@ -1025,14 +1025,14 @@ pub(super) struct SeatHeadroom {
 pub(super) fn rollover_state(
     cfg: &CtxConfig,
     seat: Option<&seat::Seat>,
-    record: Option<&super::rollover_runtime::Record>,
+    record: Option<&super::rollover::runtime::Record>,
     seat_headroom_pct: Option<f64>,
 ) -> Option<RolloverState> {
     if !cfg.fallback.enabled || !cfg.auto_orchestrator_rollover() {
         return None;
     }
     let seat = seat?;
-    if let Some(super::rollover_runtime::Settlement::Parked { until, .. }) =
+    if let Some(super::rollover::runtime::Settlement::Parked { until, .. }) =
         record.and_then(|r| r.settlement.as_ref())
     {
         return Some(RolloverState::Parked {
@@ -2134,7 +2134,7 @@ mod tests {
 
     #[test]
     fn rollover_committed_toast_never_fires_on_the_first_observation() {
-        let committed = Some(super::super::rollover_runtime::Settlement::Committed {
+        let committed = Some(super::super::rollover::runtime::Settlement::Committed {
             route: "codex".to_string(),
             generation: 2,
         });
@@ -2147,7 +2147,7 @@ mod tests {
 
     #[test]
     fn rollover_committed_toast_fires_only_for_a_genuinely_new_commit() {
-        let committed = Some(super::super::rollover_runtime::Settlement::Committed {
+        let committed = Some(super::super::rollover::runtime::Settlement::Committed {
             route: "codex".to_string(),
             generation: 2,
         });
@@ -2164,7 +2164,7 @@ mod tests {
         );
 
         // Not a Committed settlement at all: no toast.
-        let parked = Some(super::super::rollover_runtime::Settlement::Parked {
+        let parked = Some(super::super::rollover::runtime::Settlement::Parked {
             until: 100,
             reason: "no headroom anywhere".to_string(),
         });
