@@ -292,7 +292,7 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
             | ("src/commands/ctx/runtime/harness.rs", "start" | "submit")
             | ("src/commands/ctx/session/host.rs", "resume_argv")
             | ("src/commands/ctx/session/mod.rs", "spawn_service")
-            | ("src/commands/ctx/wrap.rs", "relaunch_command")
+            | ("src/commands/ctx/wrap/relaunch.rs", "relaunch_command")
             | (
                 "src/commands/workflow/checks/inventory.rs",
                 "model_call_marker" | "perform_blocking"

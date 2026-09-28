@@ -226,8 +226,8 @@ installed binary during self-update; never spawns it).
 | Native headless session | `src/commands/ctx/runtime/native/headless.rs` | `run_headless` | N09 (#478) | `zirv ctx exec --runtime native`: resolves the route, builds the direct provider adapter and drives `NativeLoop` to a structured final status |
 | Native interactive dashboard session | `src/commands/ctx/runtime/native/interactive.rs` | `spawn_interactive` | N11 (#480) | `zirv chat --runtime native`: resolves transport/journal/seat/writer exactly like `run_session`, then drives a fresh `NativeLoop` to completion once per submitted turn on a background thread for the pane's whole lifetime |
 | Interactive orchestrator launch | `src/commands/ctx/chat/mod.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
-| Wrap first-launch PTY spawn | `src/commands/ctx/wrap.rs` | `run_with` | harness-backend | initial `zirv ctx wrap` PTY `CommandBuilder` |
-| Wrap mid-session PTY relaunch | `src/commands/ctx/wrap.rs` | `relaunch` | harness-backend | in-place restart after compaction/handoff |
+| Wrap first-launch PTY spawn | `src/commands/ctx/wrap/launch.rs` | `run_with` | harness-backend | initial `zirv ctx wrap` PTY `CommandBuilder` |
+| Wrap mid-session PTY relaunch | `src/commands/ctx/wrap/relaunch.rs` | `relaunch` | harness-backend | in-place restart after compaction/handoff |
 | Dash pane restore | `src/commands/ctx/dash/roster.rs` | `restore_argv` | N11 (#480) | rebuilds a verified resume argv for a restored dashboard pane |
 | Dash pane initial spawn | `src/commands/ctx/dash/pane.rs` | `spawn` | N11 (#480) |  |
 | Dash pane harness handover | `src/commands/ctx/dash/pane.rs` | `handover` | N16 (#485) | swaps the harness under a live pane, same session identity |
@@ -253,7 +253,7 @@ installed binary during self-update; never spawns it).
 | `ctx optimize` judgment call | `src/commands/ctx/surface_collect.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
 | Harness proxy helper-model intake | `src/commands/ctx/proxy/llm.rs` | `decide` | N15 (#484) | second decider in the proxy's chain: calls `handoff::helper_answer(helper::ROLE_PROXY, ..)`, the same native-first (`helper.rs`) / harness-second (`handoff::run_model`) chokepoint `ctx ask`/`ctx optimize` already reuse |
-| Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from exec/mod.rs/wrap.rs restart and session-end seams |
+| Memory durable harvest | `src/commands/ctx/memory.rs` | `harvest_durable_with_tool_errors` | N06 (#475) | issue #37 durable-harvest chokepoint; called from the exec/mod.rs and wrap/pump.rs restart and session-end seams |
 | Memory optimize consolidation | `src/commands/ctx/memory_optimize.rs` | `apply_consolidation` | N06 (#475) | `zirv memory optimize`'s model-assisted merge |
 | Builtin argv-shape checks | `src/commands/workflow/checks/argv.rs` | `headless_cmd` | shared | Notes: probe/check only -- `ZCHK-ARGV-CODEX-EXEC` / `ZCHK-ARGV-CLAUDE-HEADLESS` build argv to inspect it, never spawn |
 | Autoresearch proposer spawn | `src/commands/workflow/research/proposer.rs` | `production_proposer_argv` | harness-backend | issue #802: builds the self-recursion argv (`current_exe agent <harness> "<prompt>" -- --model <model>`) for the optional `[proposer]` round's production spawn; `spawn_and_validate_proposal` is the actual `Command::new`/`.output()` call, and tests substitute a portable stub argv there instead of this function |
@@ -352,7 +352,7 @@ probes/builders already owned by their spawning caller
 `ctx/dash/spawn_policy.rs::task_prompt_fallback_is_safe`), binary
 inspection/self-service (`ctx/measure.rs::current_binary_mtime`,
 `ctx/session/host.rs::resume_argv`, `ctx/session/mod.rs::spawn_service`,
-`ctx/wrap.rs::relaunch_command`), the check's own marker table and scanner
+`ctx/wrap/relaunch.rs::relaunch_command`), the check's own marker table and scanner
 (`workflow/checks/inventory.rs::model_call_marker`/`perform_blocking`), and
 the dormant `ctx/runtime/harness.rs::start`/`submit` backend -- excluded
 only while `runtime::select` has no production caller, a precondition its
