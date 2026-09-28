@@ -172,7 +172,11 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "workflows",
         SlugEntry::Directory,
-        &["commands/workflow/engine.rs"],
+        &[
+            "commands/workflow/engine/cli.rs",
+            "commands/workflow/engine/lifecycle.rs",
+            "commands/workflow/engine/state.rs",
+        ],
     ),
     (
         "verification",
