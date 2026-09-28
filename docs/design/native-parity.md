@@ -119,7 +119,7 @@ means it runs on any supported OS with no provider configured at all.
 | `ctx group` | `ctx::group` + native `group_create`/`group_status` tools | same zirv code | none | `tools::team::tests::a_native_coordinator_runs_a_mixed_team_through_the_shared_services`, `group::tests::a_work_group_round_trips_through_state_and_lists` | `integration` |
 | `ctx handoff` | `handoff::helper_answer` at role `distiller` | `handoff::run_model` + `distiller_cmd` | a route for the `distiller` role | `helper::tests::every_helper_role_answers_with_every_coding_harness_removed_from_path`, `handoff::tests::helper_answer_falls_back_to_the_harness_when_no_native_route_exists` | `ci-matrix` |
 | `ctx handover` | -- | `ctx::handover` swaps one vendor CLI for another | a native seat's model is `[roles]` configuration, not a handover -- there is no vendor CLI under a native seat to swap | -- | `legacy-only` |
-| `ctx hook` | `ctx::hook` | same zirv code | none | `hook::tests::hook_status_reports_no_baseline_before_any_install` | `unit` |
+| `ctx hook` | `ctx::hook` | same zirv code | none | `hook::admin::tests::hook_status_reports_no_baseline_before_any_install` | `unit` |
 | `ctx inbox` | `ctx::mail` + native `wait`/`result` tools | same zirv code | none | `mail::tests::inbox_marks_a_fan_out_message_read_without_removing_it_for_other_sessions` | `unit` |
 | `ctx jev` | `ctx::jev` | same zirv code | none | `jev::tests::available_is_false_when_the_credential_env_is_unset_or_empty`, `jev::tests::status_with_gate_on_and_credential_present_is_active` | `unit` |
 | `ctx kill` | -- | `ctx::sessions::run_kill` terminates a supervised OS process | a native session is interrupted over the runtime protocol; there is no supervised vendor process to signal | -- | `legacy-only` |
