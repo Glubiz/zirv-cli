@@ -582,3 +582,46 @@ pub struct RecompileContext {
     pub cfg: super::super::super::config::CtxConfig,
     pub repo: PathBuf,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::super::provider::Protocol;
+    use super::super::turn::run_fixture;
+    use super::*;
+
+    // -- pure scheduling ---------------------------------------------------
+
+    #[test]
+    fn independent_calls_run_first_and_declared_order_is_kept_inside_each_group() {
+        assert_eq!(
+            execution_order(&[false, true, false, true]),
+            vec![1, 3, 0, 2]
+        );
+        assert_eq!(execution_order(&[true, true]), vec![0, 1]);
+        assert_eq!(execution_order(&[false, false]), vec![0, 1]);
+    }
+
+    #[test]
+    fn an_unknown_tool_is_never_reordered() {
+        assert!(!is_independent(None));
+    }
+
+    #[test]
+    fn the_final_status_serializes_with_its_schema_version_and_actual_route() {
+        let (status, _) = run_fixture(
+            Protocol::OpenAiResponses,
+            "fixture-openai-model",
+            "openai-investigate-edit-test.json",
+            "tools-investigate-edit-test.json",
+            "go",
+            |_| {},
+        );
+        let json = serde_json::to_value(&status).expect("serializable");
+        assert_eq!(json["schema_version"], FINAL_STATUS_SCHEMA_VERSION);
+        assert_eq!(json["runtime"], "native");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["provider"], "openai");
+        assert_eq!(json["served_model"], "fixture-openai-model");
+        assert!(json["usage"]["output_tokens"].as_u64().unwrap() > 0);
+    }
+}

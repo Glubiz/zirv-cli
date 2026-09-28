@@ -214,3 +214,41 @@ impl super::NativeToolClient {
             .map_err(|error| ToolError::new(ToolErrorCode::Internal, error.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        CONTEXT_SEARCH, ExecutionAction, MEMORY_FORGET, MEMORY_RECALL, MEMORY_REMEMBER,
+        ToolRegistry,
+    };
+    use super::*;
+
+    #[test]
+    fn knowledge_tools_have_typed_scope_and_effects() {
+        let registry = ToolRegistry::native();
+        for name in [
+            MEMORY_RECALL,
+            MEMORY_REMEMBER,
+            MEMORY_FORGET,
+            CONTEXT_SEARCH,
+        ] {
+            assert!(registry.get(name).is_some(), "missing {name}");
+        }
+        let parsed = registry
+            .parse(
+                MEMORY_REMEMBER,
+                json!({"key":"architecture", "text":"native", "scope":"shared"}),
+            )
+            .expect("parse memory write");
+        assert_eq!(
+            parsed.action().expect("action"),
+            ExecutionAction::Knowledge {
+                service: "memory".into(),
+                operation: "remember".into(),
+                scope: Some("shared".into()),
+                key: Some("architecture".into()),
+                write: true,
+            }
+        );
+    }
+}

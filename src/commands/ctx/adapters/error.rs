@@ -205,3 +205,177 @@ fn classify_from_hints(hints: ProviderErrorHints<'_>) -> ProviderErrorClass {
         _ => ProviderErrorClass::Other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn api_error_classification_checks_exclusions_before_overflow_patterns() {
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let cases = [
+            (
+                "API Error: prompt is too long: 213462 tokens > 200000 maximum",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "API Error: 413 {\"error\":{\"type\":\"request_too_large\"}}",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Your input exceeds the context window of this model",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Requested token count exceeds the model's maximum context length of 131072 tokens",
+                ProviderErrorClass::Overflow,
+            ),
+            (
+                "Throttling error: Too many tokens, please wait before trying again",
+                ProviderErrorClass::RateLimit,
+            ),
+            (
+                "rate limit: prompt is too long",
+                ProviderErrorClass::RateLimit,
+            ),
+            (
+                "too many requests: request_too_large",
+                ProviderErrorClass::RateLimit,
+            ),
+            // Issue #455: reachability wording no longer lands in the
+            // catch-all -- `service unavailable:` is the provider failing,
+            // a reset connection never reached it at all.
+            (
+                "Service unavailable: request_too_large",
+                ProviderErrorClass::Server,
+            ),
+            ("API Error: connection reset", ProviderErrorClass::Transport),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(
+                super::super::classify_provider_error(
+                    message,
+                    super::super::ProviderErrorHints::default()
+                ),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    /// Issue #455: the reachability classes, including the exact wording the
+    /// observed incident produced, and the structured-hint fallback for a
+    /// row whose text says nothing specific.
+    #[test]
+    fn reachability_errors_are_classified_from_text_then_from_structured_hints() {
+        use crate::commands::ctx::adapters::ProviderErrorHints;
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let text_cases = [
+            (
+                "API Error: Connection refused - a firewall or proxy may be blocking it \
+                 (ConnectionRefused)",
+                ProviderErrorClass::Transport,
+            ),
+            (
+                "API Error: 503 Service Unavailable",
+                ProviderErrorClass::Server,
+            ),
+            ("overloaded_error", ProviderErrorClass::Server),
+            (
+                "API Error: 401 authentication_error",
+                ProviderErrorClass::Auth,
+            ),
+        ];
+        for (message, expected) in text_cases {
+            assert_eq!(
+                super::super::classify_provider_error(message, ProviderErrorHints::default()),
+                expected,
+                "{message}"
+            );
+        }
+
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: Some("server_error"),
+                    status: None,
+                }
+            ),
+            ProviderErrorClass::Server,
+            "a neutral message with error: server_error is a server failure"
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: Some("server_error"),
+                    status: Some(429),
+                }
+            ),
+            ProviderErrorClass::RateLimit,
+            "the status wins over the generic kind"
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Other,
+            "no text match and no hints stays unattributed"
+        );
+    }
+
+    /// Review round 1, finding 3: `Auth` is the one class no cooldown used
+    /// to clear, and it was reachable from ordinary English. A sandbox
+    /// refusing a file write and a transient proxy 404 are not credential
+    /// problems, and codex's `task_complete.error.message` is task text.
+    #[test]
+    fn ordinary_english_and_bare_status_numbers_never_classify_as_auth() {
+        use crate::commands::ctx::adapters::ProviderErrorHints;
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        for message in [
+            "permission denied writing /x",
+            "404 Not Found",
+            "EACCES: permission denied, open '/etc/hosts'",
+            "the tool returned 401 lines of output",
+        ] {
+            assert_eq!(
+                super::super::classify_provider_error(message, ProviderErrorHints::default()),
+                ProviderErrorClass::Other,
+                "{message}"
+            );
+        }
+
+        // The status still reaches `Auth` -- through the structured field,
+        // which is the only place a number is evidence.
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: None,
+                    status: Some(401),
+                }
+            ),
+            ProviderErrorClass::Auth
+        );
+        // A bare 5xx in prose is likewise not evidence on its own; the
+        // words are.
+        assert_eq!(
+            super::super::classify_provider_error(
+                "upstream said 500",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Other
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "internal server error",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Server
+        );
+    }
+}
