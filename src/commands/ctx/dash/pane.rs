@@ -1,27 +1,6 @@
 //! One dashboard pane: a supervised ConPTY/pty child behind its own
-//! `vt100::Parser`, using the same supervision primitives `wrap` uses
-//! (registry record, turn-signal server, env scrub) so a pane is a first-
-//! class session, not a shortcut.
-//!
-//! The PTY spawn follows `wrap.rs`'s own pattern faithfully (see
-//! `wrap.rs:1044-1106`): the cursor-probe answer is written before
-//! `spawn_command` (the Windows console-host deadlock `answer_inherit_
-//! cursor_probe`'s own doc comment explains), `take_writer` is called
-//! exactly once, and the reader thread uses the same 8192-byte buffer. The
-//! one deliberate difference from `wrap`: a pane's bytes go to its reader
-//! channel only, never to this process's own stdout -- the `vt100` parser is
-//! the sole consumer, there is no shared stdout to lock, and a pane never
-//! relaunches in place (a dashboard quits and spawns a fresh pane instead),
-//! so there is no generation counter to guard a stale reader thread either.
-//!
-//! Nothing in the binary drives a `Pane` yet outside this module's own
-//! tests: Task 5's event loop is what constructs `PaneSpec`s and calls
-//! `Pane::spawn`/`drain`/`resize`/`on_turn_signal`/`screen` from a running
-//! dashboard, and Task 4's `ui.rs` renders through `screen()`/`last_line()`.
-//! `#![allow(dead_code)]` covers this module until that wiring lands, the
-//! same reasoning `wrap::read_socket_path` already documents for a single
-//! function: a real API with no in-tree caller yet is not the same thing as
-//! code that should be deleted.
+//! PTY panes mirror wrap's ownership and environment scrub so each child is a
+//! supervised session; native panes use the same dashboard identity.
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
@@ -57,26 +36,7 @@ pub enum PaneBudgetNotice {
     HardStop { used: u64, limit: u64 },
 }
 
-/// What a completed pane delegation needs to reach the cost ledger, gathered
-/// once by `dash::mod::fulfill_spawn_request` (the only place these values
-/// exist) and read back by `dash::mod::account_reaped_pane_spend` once the
-/// pane's own child exits.
-///
-/// 2026-09-06: without this, a delegation the dashboard accepted as a pane
-/// was never logged at all. `agent::run_with` returns at `Dispatch::
-/// Answered` the moment the ack lands -- long before the pane has run, let
-/// alone spent anything -- so the requester's own `log::append_delegation`
-/// call is unreachable on that path, and since headless spawns were removed
-/// that is EVERY delegation made while a dashboard is live.
-///
-/// `requester` is the session this row is attributed to, which is what
-/// `status::spend_status_line` and the dashboard footer filter their "this
-/// session" figures on. It is cost attribution, never authority: the
-/// server-verified `Pane::parent_session` is preferred, but a request that
-/// arrived on the dashboard's own shared drop directory (an orchestrator
-/// seat that is not itself a pane -- the ordinary case) proves no identity
-/// there, and falling back to what the request claimed is the difference
-/// between a row nobody can find and no row at all.
+/// Carry the admitted delegation's ledger data on its pane until reap can record actual spend.
 #[derive(Debug, Clone)]
 pub struct DelegationFacts {
     pub requester: String,
@@ -96,14 +56,7 @@ pub struct DelegationFacts {
 pub struct PaneSpec {
     pub agent_name: String,
     pub argv: Vec<String>,
-    /// Shapes the composed prompt and argv the caller builds *before*
-    /// constructing this spec (the same `prompt::compose` role every other
-    /// supervisor already threads through). Issue #169: also the role this
-    /// pane's own `Pane`/`sessions::Record` is stamped with at spawn time --
-    /// the caller (`dash::mod::fulfill_spawn_request`) has already run this
-    /// value through the depth cap before ever constructing a `PaneSpec`, so
-    /// `Pane::spawn` records it as fact rather than re-deriving or
-    /// re-validating it.
+    /// Keep the resolved role as the authority for prompt, argv and later delegation checks (#155, #169).
     pub role: PromptRole,
     pub verb: Verb,
     /// uuid, minted by the caller: the pane's registry short id and
@@ -113,12 +66,7 @@ pub struct PaneSpec {
     pub title: String,
 }
 
-/// Everything one live swap's successor launch carries, derived once by
-/// [`Pane::build_swap_launch`] (issue #552).
-///
-/// Two consumers, one derivation: [`Pane::handover`] replaces a pane's child
-/// in place with it, and `dash::PaneSuccessorLauncher` hands it to
-/// [`Pane::spawn_on_seat`] when the source pane has no child to replace.
+/// Derive one successor launch for handover and recovery so both use identical seat data (#552).
 pub(crate) struct SwapLaunch {
     pub spec: PaneSpec,
     pub turn_env: Vec<(String, String)>,
@@ -130,14 +78,7 @@ pub(crate) struct SwapLaunch {
     pub idle_quiet: Duration,
 }
 
-/// How long after a turn signal the child may keep producing output without
-/// that output being read as "a new turn started". A harness redraws its own
-/// prompt, its status line and often the whole viewport right after finishing
-/// a turn, and every one of those bytes used to count against the signal.
-///
-/// Mirrors `wrap`'s own injection debounce (`wrap::may_inject`, which requires
-/// `now - last_output >= debounce` before it will type anything): the same
-/// idea, applied to the pane's *state* rather than to one injection decision.
+/// Allow a short redraw grace after a turn signal so prompt output does not count as a new turn.
 pub(crate) const IDLE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Compiled-in fallback for [`Pane::idle_quiet`] when a caller has no
@@ -146,37 +87,7 @@ pub(crate) const IDLE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// test that does not care about this knob still exercises the real default.
 pub(crate) const DEFAULT_IDLE_QUIET: Duration = Duration::from_millis(10_000);
 
-/// Pure: whether the turn signal at `signal_at` still stands as of `now`,
-/// given the child's most recent output at `output_at` -- that is, whether a
-/// turn boundary has been reported and the child has since been quiet for
-/// `debounce`.
-///
-/// O1: `drain` used to clear the signal on **any** byte the child produced, so
-/// a single post-turn repaint latched the pane into `Working` until the *next*
-/// turn signal -- which, for a harness sitting idle at its prompt waiting for
-/// input, never comes.
-///
-/// F1: the first fix for that measured the quiet window from the **signal**,
-/// which was wrong on both sides of the window. Any output landing more than
-/// `debounce` after a signal (a zoom or resize repaint, the operator's own
-/// keystrokes echoing back, an async status line) re-latched the pane into
-/// `Working` until a next signal that never came, killing delivery to it for
-/// the rest of the session; and inside the window it flipped to `Idle` at
-/// `signal + debounce` even while bytes were still streaming, because it never
-/// looked at the output again.
-///
-/// Quiet is therefore measured from the **last output**, exactly as
-/// `wrap::may_inject` already measures it for its own injections
-/// (`now - last_output >= debounce`, `wrap.rs:256-262`): a burst keeps pushing
-/// the deadline out for as long as it lasts, and one debounce after the last
-/// byte the pane is idle again however long the burst ran. The two remaining
-/// cases:
-///
-/// * no signal ever seen -- not idle (unchanged: a pane is `Working` until it
-///   first reports a turn boundary), whatever it has been printing;
-/// * a signal with no output recorded since -- the quiet window runs from the
-///   signal itself, which is the same instant `wrap`'s own `last_output`
-///   starts from when a session begins.
+/// A turn signal remains valid only until later child output outlives the redraw grace.
 pub(crate) fn signal_still_stands(
     signal_at: Option<Instant>,
     output_at: Option<Instant>,
@@ -186,18 +97,11 @@ pub(crate) fn signal_still_stands(
     let Some(signal) = signal_at else {
         return false;
     };
-    // Output from *before* the signal is what the signal already accounted
-    // for, and measuring from it only makes the pane idle sooner, never later.
+    // Ignore output before the turn signal when measuring whether that signal still stands.
     now.duration_since(output_at.unwrap_or(signal)) >= debounce
 }
 
-/// Pure: whether `output_at` is old enough, as of `now`, to count as quiet.
-/// The signal-less half of [`pane_is_idle`] -- mirrors `signal_still_stands`'s
-/// own "no signal ever seen -- not idle" rule: no output ever recorded is not
-/// quiet either, whatever else has happened. A pane still starting up (its
-/// harness has not drawn its first frame yet) is not the same thing as one
-/// sitting quietly at its prompt, and the two must not be confused just
-/// because both currently read `None`/old.
+/// Use output quiet time as the idle signal only for adapters without turn signals.
 pub(crate) fn output_quiescent(output_at: Option<Instant>, now: Instant, quiet: Duration) -> bool {
     let Some(output) = output_at else {
         return false;
@@ -205,25 +109,12 @@ pub(crate) fn output_quiescent(output_at: Option<Instant>, now: Instant, quiet: 
     quiescent_since(output, now, quiet)
 }
 
-/// Finding 5 (review): the elapsed-time arithmetic shared by every
-/// idleness-by-clock decision in this codebase -- `now` counts as quiescent
-/// relative to `latest` once at least `quiet` has passed. [`output_quiescent`]
-/// (above, `Option<Instant>`: "no output ever recorded" reads as not-quiet)
-/// and `wrap::signal_less_mail_ready` (always a concrete `Instant`, already
-/// folded via `.max()`) each wrap this with their own "what counts as
-/// `latest`" logic; the formula itself is kept in exactly one place so the
-/// two could not silently drift out of sync with each other again.
+/// Use saturating elapsed-time arithmetic for every quiescence clock.
 pub(crate) fn quiescent_since(latest: Instant, now: Instant, quiet: Duration) -> bool {
     now.duration_since(latest) >= quiet
 }
 
-/// Pure: the more recent of two optional instants, the one present when only
-/// one is, or `None` when neither is. Used to fold "last child output" and
-/// "last thing *zirv itself* typed into this pane" into one "last activity"
-/// instant for the signal-less quiescence check below -- an injection or an
-/// operator keystroke is exactly as much "not quiet yet" as a byte the child
-/// printed, and whichever happened later is what the quiet window has to run
-/// from.
+/// Take the latest child output or zirv-written input as the quiet-time anchor.
 fn latest_of(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.max(y)),
@@ -232,29 +123,7 @@ fn latest_of(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     }
 }
 
-/// Pure: the signal-less half of [`pane_is_idle`], and what `Pane::drain`
-/// uses to decide whether to retire a pending injection/operator-typing flag
-/// for a signal-less pane. Quiet is measured from the *later* of the child's
-/// last output and zirv's own last local input into the pane
-/// ([`latest_of`]), not from output alone.
-///
-/// H1 (review): `output_at` alone used to be the whole story, but
-/// `inject_visible`/`write_operator_input` only ever run once a pane is
-/// already idle/injectable -- so on the very next `drain()` tick (tens of
-/// milliseconds later), `output_at` had not moved yet (the child has not had
-/// time to respond), the pane still read as "quiet", and the guard that is
-/// supposed to hold `injected_awaiting_turn`/`user_typed_since_turn` for a
-/// full `idle_quiet` window instead cleared it almost immediately. Two
-/// concrete failures that produced: a mail-sweep injection followed within
-/// one tick by an unthrottled second injection from the nudge drain landing
-/// on top of it; and a swept mail line typed straight into an operator's own
-/// unsubmitted, mid-composition prompt, in direct violation of G1's own
-/// contract (`injectable_from`'s whole reason to exist). Folding local input
-/// into the same clock the child's output already uses fixes both: an
-/// injection now starts a fresh quiet window (the child genuinely gets
-/// `idle_quiet` to begin responding before anything else may land), and an
-/// operator's own keystroke holds the pane non-idle for `idle_quiet` after
-/// their *last* one, exactly as intended.
+/// Retire pending injection state only after a signal-less pane has been quiet long enough.
 fn signal_less_quiescent(
     output_at: Option<Instant>,
     local_input_at: Option<Instant>,
@@ -264,28 +133,7 @@ fn signal_less_quiescent(
     output_quiescent(latest_of(output_at, local_input_at), now, quiet)
 }
 
-/// Pure: whether a pane counts as idle right now, branching on whether its
-/// adapter actually has a turn-signal mechanism
-/// (`AgentAdapter::capabilities().turn_signal`).
-///
-/// * `turn_signal_capable`: unchanged from before this branch existed --
-///   [`signal_still_stands`], gated on having seen at least one turn
-///   boundary. A claude-shaped adapter reports one on every turn, so this is
-///   the precise, low-latency signal and stays the only thing consulted for
-///   it. `local_input_at` is not consulted on this branch at all: a
-///   signal-carrying pane's idleness is decided by the signal, exactly as
-///   before this parameter existed.
-/// * signal-less (codex today): `register_turn_signal` is a no-op for it, so
-///   `last_signal_at` never advances past `None` and gating on a signal would
-///   leave such a pane `Working` forever -- the mail sweep and nudge drain,
-///   both gated on `Idle`
-///   (`Pane::injectable`/`dash::mod::is_delivery_eligible`), would then never
-///   reach it at all. Its own pty *output*, and zirv's own last local input
-///   into it, stand in for the signal instead: [`signal_less_quiescent`]
-///   against `dash.idle_quiet_ms` (`Pane::idle_quiet`), independent of
-///   `signal_at` entirely -- a signal-less pane is never consulted on that
-///   axis, so nothing sent to its (unreachable) turn-signal socket could ever
-///   matter to it.
+/// Use turn signals when supported; otherwise infer idle only after output and input settle.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pane_is_idle(
     turn_signal_capable: bool,
@@ -303,26 +151,7 @@ pub(crate) fn pane_is_idle(
     }
 }
 
-/// Pure: a pane's `PaneState` from whether its last turn-boundary signal still
-/// stands ([`signal_still_stands`]), whether the child has exited, and whether
-/// an injection is still waiting for the turn it started to end. Exit always
-/// wins -- a pane that exited mid-turn is still `Ended`, not `Working`.
-///
-/// R3: `injected_awaiting_turn` is what stops two independent injections
-/// landing in the same tick. Injecting a line does not retract the standing
-/// turn signal (the child has not produced anything yet, and the next turn
-/// signal is still seconds away), so without this flag the mail sweep and the
-/// nudge drain -- which run back to back in one tick and both gate on `Idle`
-/// -- each saw the same idle pane and each typed into it.
-///
-/// G1: `user_typed_since_turn` used to be a third parameter here, folding the
-/// operator's own mid-thought typing into this **displayed** state -- so an
-/// operator who pressed a key with no turn signal following it left the pane
-/// rendered `Working` forever (`○`/`●` in the sidebar, and the quit-confirm
-/// dialog always named it as busy), even though nothing was actually running.
-/// The flag is real and still matters, but only for whether an *injection* may
-/// land, never for what glyph a pane renders -- see [`Pane::injectable`],
-/// which is where it moved to.
+/// A pane remains working while an injection or operator input awaits a turn boundary.
 fn state_from(
     signal_stands: bool,
     child_exit: Option<i32>,
@@ -341,22 +170,7 @@ fn state_from(
     }
 }
 
-/// Pure: whether a pane in `state`, with `injected_awaiting_turn` and
-/// `user_typed_since_turn` as they currently stand, may have a line injected
-/// into it right now. `state == Idle` already implies `!injected_awaiting_turn`
-/// ([`state_from`] reports `Working` while an injection is pending), so the
-/// explicit check here is belt-and-suspenders against that invariant changing
-/// out from under this function rather than load-bearing on its own.
-///
-/// G1: the operator-typing half of what `state_from` used to decide on its
-/// own. F1's precondition (`wrap::may_inject`'s own
-/// `!state.user_typed_since_turn`, `wrap.rs:259`) still holds -- an operator
-/// mid-thought at a half-composed prompt must not have an injected line
-/// submit it out from under them -- it is just no longer read off the
-/// **displayed** `PaneState`, so a pane an operator typed into and then left
-/// alone still renders `Idle`, is still named honestly in the quit-confirm
-/// dialog, and simply is not a valid injection target until its next turn
-/// signal clears the flag.
+/// Inject only when idle and no prior injected or operator input is awaiting a turn.
 fn injectable_from(
     state: PaneState,
     injected_awaiting_turn: bool,
@@ -365,8 +179,7 @@ fn injectable_from(
     matches!(state, PaneState::Idle) && !injected_awaiting_turn && !user_typed_since_turn
 }
 
-/// The bottom-most non-blank row of a vt100 screen, right-trimmed. Empty
-/// when the whole screen is blank. Used for the sidebar's one-line preview.
+/// Use the bottom nonblank screen row for sidebar preview.
 fn last_line_of(screen: &vt100::Screen) -> String {
     let (rows, cols) = screen.size();
     for row in (0..rows).rev() {
@@ -384,68 +197,16 @@ fn last_line_of(screen: &vt100::Screen) -> String {
     String::new()
 }
 
-/// Pure: the exact text `inject_visible` writes for one labelled line,
-/// matching the `zirv ▸` announcement channel's own marker
-/// (`announce.rs`'s `Event::line`) so a visible injection reads as coming
-/// from the same voice as everything else zirv narrates to an operator.
-///
-/// R4: deliberately carries **no** control characters of its own. The
-/// framing used to be `"\r\n{line}\r\n"` plus a lone `"\r"`, and the leading
-/// `\r\n` submitted whatever the operator had half-typed at the prompt before
-/// the injected text was ever entered. `wrap::inject_compact` (`wrap.rs:477`)
-/// already establishes this codebase's convention for the same job -- write
-/// the text, then exactly one `\r`, because a TUI submits on carriage return
-/// -- and `inject_visible` follows the same "text, then one `\r`" shape,
-/// though (issue #114) it no longer writes them in the same `write_all`; see
-/// [`INJECTION_SUBMIT_DELAY`] for why.
+/// Mark injected text as a zirv announcement and bound its label and body.
 fn visible_injection_line(label: &str, body: &str) -> String {
     format!("[zirv \u{25b8} {label}] {body}")
 }
 
-/// The minimum gap `inject_visible` leaves between writing an injected line
-/// and the lone `\r` that submits it -- issue #114. Moved to
-/// `crate::commands::ctx::INJECTION_SUBMIT_DELAY` (issue #118) so `wrap`
-/// can share the exact same value rather than pin its own copy; see that
-/// constant's own doc comment for the full paste-fold story.
-///
-/// A hardcoded constant, deliberately not a new `.zirv` config key: an older
-/// installed zirv binary hard-fails on an unknown settings key (see
-/// CLAUDE.md's "This Windows dev machine" notes), so a config knob here
-/// would force a coupled binary-then-config rollout for a value no operator
-/// is expected to ever need to tune.
-///
-/// Review F1/F2 (PR #116): this used to be enforced by blocking the calling
-/// thread for exactly this long inside `write_two_phase_injection`. On the
-/// dashboard that thread is the single UI thread every sweep runs on
-/// (`mail_sweep`, `report_back_reminder_sweep`, `deliver_queued_nudges`, all
-/// iterating every pane in one tick), so a handful of injections in the same
-/// tick could serially freeze redraw and input for the sum of their delays --
-/// up to ~1.35s with nine panes across three sweeps. The gap is now a
-/// *minimum*, not a sleep: `inject_visible` writes phase 1, stamps this
-/// pane's state immediately, and records a deadline (`Self::pending_submit`)
-/// for phase 2. The dashboard's own tick loop (`dash::mod::run_dashboard`,
-/// alongside the sweeps that already run there) drains any pane whose
-/// deadline has passed, so the effective gap may run one tick longer than
-/// this constant under load -- which is fine; nothing about the paste-fold
-/// fix requires the gap to be exact, only that it not collapse to zero.
-///
-/// `wrap`'s own pump loop reuses this constant and `write_submit_cr` below
-/// for its T13 mail-advisory injection, but only into a
-/// `Capabilities::defer_injection_submit` adapter (codex) -- its
-/// `Action::Compact` stays single-burst, because that call site is only
-/// ever reachable for claude (see `wrap::inject_compact`'s own doc comment).
+/// Use the same submit delay as wrap so the child can process the visible
+/// line before a carriage return; a shorter gap can fold it into a paste (#114).
 pub(crate) use super::super::INJECTION_SUBMIT_DELAY;
 
-/// Phase 1 of a deferred visible injection: the labelled line
-/// ([`visible_injection_line`], scrubbed) with **no** control bytes of its
-/// own. Flushed so the bytes have actually left this process before the
-/// caller stamps any state on the strength of this write having happened.
-///
-/// Split from the submitting `\r` ([`write_submit_cr`]) so the two can cross
-/// the pty as genuinely separate writes, spaced by at least
-/// [`INJECTION_SUBMIT_DELAY`] -- see that constant's own doc comment for why
-/// (issue #114) and for why the spacing is now enforced by a deadline the
-/// caller polls rather than a blocking sleep here (review F1/F2).
+/// Flush the visible line without control bytes before scheduling its submit carriage return.
 pub(crate) fn write_injection_phase1(
     writer: &mut dyn Write,
     label: &str,
@@ -457,43 +218,21 @@ pub(crate) fn write_injection_phase1(
     Ok(())
 }
 
-/// Phase 2 of a deferred injection: the lone `\r` that submits whatever
-/// phase 1 already typed -- the *only* control byte either write carries.
-/// Also `wrap`'s own convention (F4, review PR #116): `wrap`'s pump loop
-/// calls this exact function for its `Action::Compact` and T13 mail-advisory
-/// injections, so the two modules cannot drift on what "the submitting
-/// keypress" writes.
-///
-/// Safe to retry: a caller whose write fails (a closed pty, a poisoned lock)
-/// simply calls this again later. Worst case a retry lands after an earlier
-/// attempt actually succeeded despite reporting failure, which types one
-/// extra `\r` into an already-submitted, now-empty composer -- a harmless
-/// no-op keypress, not a second copy of the injected line (phase 1 is never
-/// re-sent by a retry; only this function is).
+/// Submit only after the visible line is flushed; carriage return is the sole
+/// control byte so injected body text cannot send extra terminal commands.
 pub(crate) fn write_submit_cr(writer: &mut dyn Write) -> std::io::Result<()> {
     writer.write_all(b"\r")?;
     writer.flush()?;
     Ok(())
 }
 
-/// Pure: whether a pending submit with deadline `pending` (`None` means none
-/// outstanding) is due to be written as of `now`. Split out of
-/// [`Pane::pending_submit_due`] so the "has the deadline passed" arithmetic
-/// is testable without a real pane or a real clock race -- only
-/// `Instant::now()` plus/minus a `Duration` at the call site.
+/// A deferred submit is due only after its deadline.
 pub(crate) fn submit_is_due(pending: Option<Instant>, now: Instant) -> bool {
     pending.is_some_and(|deadline| now >= deadline)
 }
 
-/// R1-1 (2026-09-06 review): the longest wall clock a pane will ever arm --
-/// 30 days, far past any real delegation and far short of what `Instant`
-/// arithmetic cannot represent. `SpawnRequest::timeout_secs` is untrusted
-/// JSON (`dash::mod::sanitize_file_dropped_request`'s own trust note), and a
-/// forged `18446744073709551615` used to reach `started + Duration::from_
-/// secs(secs)` AFTER the child had already spawned, where the overflow
-/// panicked -- with the release profile's `panic = "abort"`, that one line of
-/// JSON killed the whole dashboard. A ceiling this large is still, for every
-/// honest request, exactly the ceiling that was asked for.
+/// Clamp untrusted timeout seconds before Instant arithmetic; a forged huge
+/// value must not panic the dashboard's release build.
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Pure: the deadline [`Pane::set_timeout`] arms for a `--timeout-secs` of
@@ -510,16 +249,7 @@ pub(crate) fn deadline_for(started: Instant, secs: u64) -> Option<Instant> {
 /// so the agent can tell a message that ended from one that was clipped.
 const TRUNCATION_MARKER: &str = " \u{2026}[truncated]";
 
-/// Pure: `text` with every C0 control character (`\r`, `\n`, `ESC`, and every
-/// other byte below `0x20`) and `DEL` replaced by a single space, runs
-/// collapsed to one space.
-///
-/// R3: this is the only thing standing between an untrusted mail body and the
-/// child's own terminal. An interior `\r` submits the message mid-way and
-/// leaves its tail typed at a fresh prompt as if the operator had written it;
-/// an `ESC` reaches the child TUI as an escape sequence rather than as text.
-/// A control character in text zirv is *relaying* is never meaningful, so it
-/// is replaced rather than escaped: this is quoted input, not a wire format.
+/// Replace C0 controls and DEL before typing untrusted text into a child; carriage return could submit a partial message.
 fn scrub_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_run = false;
@@ -537,15 +267,7 @@ fn scrub_controls(text: &str) -> String {
     out
 }
 
-/// Pure: an untrusted body made safe to type into a child's pty -- scrubbed of
-/// every control character (`scrub_controls`) and capped at `cap` bytes on a
-/// char boundary, with `TRUNCATION_MARKER` appended when anything was cut.
-///
-/// R3: the pane-injection seam applied neither the delivered-mail cap
-/// (`cfg.mail.max_delivered_bytes`) every other mail seam applies nor any
-/// scrub at all, so a stored body -- itself already carrying `mail::store`'s
-/// own literal `"\n[truncated]"` marker once it was long enough -- went into
-/// the pty verbatim.
+/// Scrub controls and cap injected mail on a UTF-8 boundary so untrusted bodies cannot act as terminal input.
 pub(crate) fn body_for_injection(body: &str, cap: usize) -> String {
     let scrubbed = scrub_controls(body);
     if scrubbed.len() <= cap {
@@ -575,16 +297,7 @@ pub(crate) fn body_for_injection(body: &str, cap: usize) -> String {
 /// bound behind that, not the mechanism.
 pub(crate) const MAX_INJECTED_LABEL_BYTES: usize = 192;
 
-/// Pure: the `(label, body)` pair one injection may carry, with **both**
-/// components bounded -- the label by [`MAX_INJECTED_LABEL_BYTES`], the body by
-/// `cap`.
-///
-/// D5: the cap used to apply to the body alone, and the label was typed into
-/// the child's pty at whatever length it happened to be. A mail label is built
-/// from its sender's own `from_agent` -- the string that session had in
-/// `ZIRV_CTX_AGENT`, which is untrusted and unbounded (`mail::header_value`
-/// makes it one line, not a short one) -- so a 100KB agent name went in in full
-/// while the body it introduced was dutifully trimmed to a few hundred bytes.
+/// Bound label and body separately so sender-controlled text cannot displace the trust marker.
 pub(crate) fn capped_injection(label: &str, body: &str, cap: usize) -> (String, String) {
     (
         body_for_injection(label, MAX_INJECTED_LABEL_BYTES),
@@ -633,8 +346,7 @@ pub(crate) fn scroll_offset(current: usize, delta: isize, max: usize) -> usize {
 /// scrollable").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollOutcome {
-    /// Branch (A): the vt100 scrollback offset moved, and is now this many
-    /// rows back from the live view.
+    /// A scrollback offset identifies rows behind the live screen.
     Scrolled(usize),
     /// Branch (A): asked to go further back, but this pane has no more
     /// recorded history.
@@ -733,43 +445,17 @@ fn scroll_parser(parser: &mut vt100::Parser, delta: isize) -> ScrollOutcome {
     }
 }
 
-/// The most bytes one tick feeds the vt100 parsers before it yields back to
-/// the event loop (M10). 256 KiB is many screens' worth of output -- far more
-/// than a redraw ever shows -- so a normal burst still drains in one call,
-/// while a firehose (`cat big.log`) is bounded to this per tick.
-///
-/// Issue #330: this is the budget for the whole tick, shared across every
-/// pane (`dash::drain_shared_budget`), not one each. Per pane it meant eight
-/// workers streaming could put 2 MiB of vt100 parsing between a keystroke and
-/// the `event::poll` that would have read it.
+/// Bound vt100 parsing per tick so one noisy child cannot starve UI input or other panes.
 pub(crate) const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
 
-/// Pure-ish: pumps queued messages from `rx` into `parser` until either the
-/// channel is empty or `budget` bytes have been processed. Returns
-/// `(any, more, used)` -- whether anything was processed, whether the budget
-/// cut the drain short (bytes may still be queued), and how much of the budget
-/// this call actually spent, which is what lets the caller share one budget
-/// across panes. Separated from [`Pane::drain_with_budget`] so the budget
-/// behaviour is testable against a plain `mpsc` channel without a real pty
-/// child.
-///
-/// The budget is checked AFTER a message is taken, not before, so `more` is
-/// only ever `false` when this call actually observed the channel empty (or
-/// disconnected). Review finding 2 turns on that direction being exact:
-/// `Pane::has_pending_output` gates the reap on it, and a pane reaped while
-/// its child's last lines were still queued loses them for good. The cost is
-/// that one call can overshoot its share by at most one message (the reader's
-/// 8 KiB buffer) -- which the pre-check version did too, one message before
-/// crossing the line instead of one after.
+/// Process at most the assigned byte budget and report whether output remains,
+/// so the UI returns next tick instead of one noisy child blocking it.
 fn drain_into(
     rx: &mpsc::Receiver<Vec<u8>>,
     parser: &mut vt100::Parser,
     budget: usize,
 ) -> (bool, bool, usize) {
-    // Final review: a zero share takes nothing. Without this guard the
-    // post-check below would still grant one free message per pane, so a
-    // tick's overshoot would grow with the pane count instead of staying at
-    // one message per pane that actually had a share.
+    // A zero budget must consume nothing; otherwise each pane could overshoot the shared cap.
     if budget == 0 {
         return (false, true, 0);
     }
@@ -799,43 +485,21 @@ fn drain_into(
 pub struct Pane {
     title: String,
     agent_name: String,
-    /// The registry verb this pane was spawned with (`Verb::Chat` for the
-    /// dashboard's own orchestrator pane, `Verb::Dash` for a worker pane) --
-    /// Task 9's mail sweep uses this to tell the two apart: an orchestrator
-    /// pane is never body-injected, only a worker pane is (the trust split
-    /// the spec calls for; `dash::mod::is_delivery_eligible`).
+    /// Mail may be body-injected only into workers; the orchestrator receives a notice.
     verb: Verb,
-    /// Issue #169: the role this pane was ACTUALLY spawned with
-    /// (`PaneSpec::role`), server-side and forgery-proof -- a pane's own
-    /// child cannot widen it after the fact, since nothing here ever reads
-    /// it back from anything the child says. `dash::mod::parent_role_for`
-    /// reads this instead of assuming every live pane is a `Worker`.
+    /// Keep the role granted at spawn as the authority for later delegation checks (#169).
     role: PromptRole,
     session_id: String,
     parser: vt100::Parser,
-    /// Issue #490 (roadmap N21 item A): what actually drives this pane -- the
-    /// wrapped harness's own pty child, or an in-process native conversation.
-    /// Everything outside this field is common to both kinds, which is why
-    /// the dashboard's `Vec<Pane>` did not have to become a `Vec<PaneKind>`
-    /// for a native pane to live in it.
+    /// Separate wrapped PTY ownership from native in-process session ownership (#490).
     kind: PaneKind,
     /// An automatic successor under observation; the source still owns this pane.
     pending_handover: Option<PendingHandover>,
-    /// Issue #330 (review finding 2): whether the last drain left this pane's
-    /// reader channel unfinished -- it stopped on its share of the tick's
-    /// budget rather than on an empty channel. `dash::reap_ended_panes` holds
-    /// an exited pane back while this is set: with the budget now shared
-    /// across panes, an exited pane can easily go a tick with its last lines
-    /// still queued, and reaping it there would drop the one thing the
-    /// operator most needs to see -- what the child said before it died.
+    /// Remember whether channel output remains after this pane's budget share, delaying reap until it drains (#330).
     pending_output: bool,
     guard: SessionGuard,
     state_dir: StateDir,
-    /// When this pane last reported a turn boundary (`on_turn_signal`), and
-    /// when `drain` last saw bytes from the child. `signal_still_stands`
-    /// weighs the two against `IDLE_DEBOUNCE`; see its own doc comment for why
-    /// a single timestamp pair replaced the old "any output clears the signal"
-    /// boolean (O1).
+    /// Keep signal and output timestamps so prompt redraws can be distinguished from a new turn.
     last_signal_at: Option<Instant>,
     last_output_at: Option<Instant>,
     /// Whether this pane's adapter has a real turn-signal mechanism
@@ -849,27 +513,14 @@ pub struct Pane {
     /// the quiet window [`output_quiescent`] measures a signal-less pane's
     /// idleness against. Unread by a signal-carrying pane.
     idle_quiet: Duration,
-    /// When zirv itself last typed into this pane -- a successful
-    /// `inject_visible`, or `write_operator_input` (any keystroke the
-    /// dashboard forwarded). Folded together with `last_output_at` by
-    /// [`signal_less_quiescent`] (via [`latest_of`]) for a signal-less pane's
-    /// idleness and for `drain()`'s flag-clearing: without this, an injection
-    /// or a keystroke -- both of which only ever happen once the pane already
-    /// reads quiet -- left `last_output_at` untouched, so the very next
-    /// `drain()` tick still saw the pane as quiet and immediately cleared the
-    /// flag it had just set (review-caught H1). Unread by a signal-carrying
-    /// pane, same as `idle_quiet`.
+    /// Count zirv-written input as activity when deciding signal-less idle time.
     last_local_input_at: Option<Instant>,
     /// Set by a successful `inject_visible`, cleared by the next turn signal
     /// (`on_turn_signal`): "this pane was handed something to do and has not
     /// reported finishing it yet." See `state_from`'s own doc comment -- this
     /// is what keeps two idle-gated injections out of the same tick.
     injected_awaiting_turn: bool,
-    /// Set by `write_operator_input` (every keystroke the dashboard forwards
-    /// to this pane), cleared by the next turn signal: "the operator is
-    /// mid-thought in this pane." See [`Pane::injectable`]'s own doc comment
-    /// (G1) -- the same precondition `wrap::may_inject` holds before it types
-    /// anything, but gates injection only, not the pane's displayed state.
+    /// Keep operator typing pending until the next turn signal, blocking idle-gated injection.
     user_typed_since_turn: bool,
     exit_code: Option<i32>,
     native_stop_code: Option<i32>,
@@ -881,84 +532,29 @@ pub struct Pane {
     /// that leaves a pane's owner must call `shutdown` explicitly (mirrors
     /// `RawGuard`/`SessionGuard`'s own `done`/`released` fields).
     done: bool,
-    /// Issue #115: the address this worker pane was told, at spawn time, to
-    /// report its outcome back to (`spawnreq::SpawnRequest::requested_by`,
-    /// via `compose_worker_prompt`/`worker_task_prompt`'s report-back
-    /// layer) -- `Some` only when the caller judged the requester
-    /// addressable AND mail delivery enabled, i.e. only when a real
-    /// report-back instruction was actually attached to this pane's launch.
-    /// `None` for the dashboard's own orchestrator pane and for a worker
-    /// pane whose requester could not be named. Set once, by
-    /// `set_report_to`, never by `Pane::spawn` itself -- the caller
-    /// (`fulfill_spawn_request`) already computed `req.requested_by`'s
-    /// addressability for the report-back layer and is the only place that
-    /// answer exists.
+    /// Keep the worker's report-back address for one-shot reminder delivery (#115).
     report_to: Option<String>,
-    /// Security review Finding 1 (2026-08-28): this pane's OWN spawn-request
-    /// intake directory (`spawnreq::pane_request_dir_for`), the one path this
-    /// pane's child tree was told about through `DASH_REQUESTS_ENV`. The
-    /// dashboard drains it separately from every other pane's, so a request
-    /// found here is, server-side, a request from THIS pane -- the identity
-    /// `dash::mod::fulfill_spawn_request` classifies lineage by, instead of
-    /// believing whatever `SpawnRequest::parent_session` claims. `None` for a
-    /// pane with no channel of its own (every test pane, and a spawn whose
-    /// directory could not be created), which can then only ever be the
-    /// requester of nothing.
+    /// Keep the exact directory given through DASH_REQUESTS_ENV; attribution
+    /// is valid only when the child's path and dashboard's drain path match.
     intake_dir: Option<PathBuf>,
-    /// Security review Finding 2 (2026-08-28): the `group::WorkGroup` this
-    /// pane was spawned into (`spawnreq::SpawnRequest::work_group_id`), if
-    /// any. A dashboard-spawned coordinator claims it at spawn and the
-    /// dashboard closes it when this pane's own child exits -- the pane-side
-    /// mirror of `agent::run_with`'s claim/close pair, without which a
-    /// dash-spawned coordinator's group stayed open and unclaimed forever.
-    /// Also what `dash::mod::on_quit` persists into the restore roster, so a
-    /// restored pane comes back inside the same group.
+    /// Keep the admitted work group for closure and restoration.
     work_group_id: Option<String>,
     /// Per-child token ceiling carried by the spawn request. Evaluated from
     /// this pane's transcript with the same `agent::budget_state` and
     /// one-tick hard-stop grace as the headless exec supervisor.
     budget_tokens: Option<u64>,
-    /// Issue #354: the last transcript usage this pane was measured at, kept
-    /// from the budget sweep that already reads it (`apply_budget_usage`) so
-    /// the sidebar's `budget` disclosure line costs nothing extra. `None`
-    /// until the first sweep, and reset on handover -- a successor's usage is
-    /// its own, never its predecessor's.
+    /// Reuse the budget sweep's usage; reset it after handover because a
+    /// successor's spend must never inherit its predecessor's value (#354).
     measured_usage: Option<super::super::event::TranscriptUsage>,
-    /// Issue #354: the model this pane's child was actually launched with,
-    /// read back from the resolved adapter argv (`adapters::last_model_flag`)
-    /// rather than from the spawn request's text -- so the sidebar shows what
-    /// is running, not what was asked for. `None` when the argv pinned no
-    /// model at all (the harness's own default), which renders as the shared
-    /// placeholder rather than a guess.
+    /// Read the launched model from resolved adapter argv, not untrusted request text (#354).
     launch_model: Option<String>,
-    /// Issue #358 (task T3): the id of this pane's own entry in
-    /// `reservation`'s per-provider ledger, if the reservation write at
-    /// spawn time succeeded (best-effort, so `None` also covers a ledger
-    /// error that must never have refused the spawn itself). Settled by
-    /// `account_reaped_pane_spend` once this pane's own child exits, or
-    /// released by `fulfill_spawn_request`'s own `rollback_admission` on a
-    /// pre-spawn refusal -- the pane-side mirror of `work_group_id`'s own
-    /// reserve/settle lifecycle, just keyed by provider instead of group.
+    /// Keep the provider reservation ID until actual spend can settle it (#358).
     reservation_id: Option<String>,
     budget_soft_warned: bool,
     budget_grace_given: bool,
-    /// 2026-09-06: the wall clock this pane's child must finish inside
-    /// (`spawnreq::SpawnRequest::timeout_secs`, i.e. `zirv ctx agent
-    /// --timeout-secs`), or `None` for the unbounded pane every spawn before
-    /// that field existed was. The pane-side mirror of `exec::run_with`'s own
-    /// timeout: the adapter's quit sequence, then `exec::EXIT_TIMEOUT`. Set
-    /// once, right after `Pane::spawn`, the same way `set_budget_tokens` is;
-    /// swept by `dash::mod::enforce_pane_deadlines`.
+    /// Keep the pane's wall-clock deadline from its accepted request.
     deadline: Option<Instant>,
-    /// Issue #249: this pane's own server-verified supervising session
-    /// (`dash::mod::fulfill_spawn_request`'s `verified_parent` -- the
-    /// requester identity the per-pane intake-channel gate already proved,
-    /// never `SpawnRequest::parent_session`, which is unverified data on the
-    /// shared channel). `dash::mod::sweep_one_pane` reads this back to mark
-    /// mail from this session's own parent with the steering trust label
-    /// instead of the ordinary peer one. `None` for the dashboard's own
-    /// orchestrator pane and for any pane whose lineage could not be
-    /// verified.
+    /// Keep the server-verified parent session for steering trust (#249).
     parent_session: Option<String>,
     /// Whether `report_back_reminder_sweep`'s one-shot completion reminder
     /// has already been injected into this pane. Set the moment that
@@ -968,81 +564,23 @@ pub struct Pane {
     /// "once per turn."
     report_reminder_sent: bool,
     pub(crate) settled_mail_sent: bool,
-    /// Issue #379: the `settled_mail_sent` of the stalled-after-compaction
-    /// report -- at most one such mail per pane, ever. Deliberately NOT
-    /// carried across a roster save/restore like `settled_mail_sent` is: a
-    /// restored pane is a fresh dashboard's fresh look at the session, and
-    /// re-reporting a compaction that is somehow STILL wedged is the safe
-    /// direction, where re-reporting a completed one is not (which is why
-    /// the settled flag is persisted and this one is not).
+    /// Send at most one stalled-compaction mail per logical pane (#379).
     pub(crate) stalled_mail_sent: bool,
-    /// Issue #468: `Some((reason, mail_id))` while this pane's next mail
-    /// sweep target (the oldest unread message for a worker's body
-    /// delivery, the newest for an orchestrator's one-line advisory) is
-    /// held back because `attention::project` reports the session
-    /// `Blocked` -- a permission dialog or similar, which `Pane::injectable`
-    /// alone does not see (see `dash::mod::mail_blocked_by_attention`'s own
-    /// doc comment). Sweep logic reads this to log the skip at most once per
-    /// mail id and to pair a later successful delivery with the same id in
-    /// the decision log. Deliberately NOT carried across a roster
-    /// save/restore or persisted anywhere -- like `stalled_mail_sent`, it is
-    /// a fresh dashboard's fresh look at the session, and the mail itself
-    /// (still unread on disk) is what actually matters, not this diagnostic
-    /// pairing.
+    /// Pair attention-blocked mail with its specific message ID for later delivery logging (#468).
     pub(crate) mail_block_log: Option<(&'static str, String)>,
     pub(crate) result_schema: Option<String>,
-    /// Review F1/F2 (PR #116): the deadline for phase 2 of a deferred
-    /// `inject_visible` call -- `Some` from the moment phase 1's write
-    /// succeeds until phase 2's lone `\r` is actually written, `None`
-    /// otherwise. `Pane::pending_submit_due`/`Pane::submit_pending` are what
-    /// the dashboard's tick loop polls and drains; see
-    /// [`INJECTION_SUBMIT_DELAY`]'s own doc comment for why this replaced an
-    /// inline sleep.
+    /// Keep deferred submit deadline until its carriage return is written or cancelled (#116).
     pending_submit: Option<Instant>,
     submit_confirmation: Option<(Instant, bool)>,
     pub(crate) delivery_sender: Option<String>,
     pub(crate) last_injection_at: Instant,
-    /// Issue #160 finding 1, review round (2026-08-28): the `LaunchMode`
-    /// this pane was ACTUALLY spawned with, derived from `turn_env` itself
-    /// (whether it carried the durable interactive-launch pin,
-    /// `adapters::LAUNCH_MODE_ENV`/`LAUNCH_MODE_INTERACTIVE_VALUE`) rather
-    /// than trusted as a separate parameter that could drift out of sync
-    /// with what the child actually inherited. `dash::mod::on_quit` reads
-    /// this back (`launch_mode()`) to roster `RosterPane::interactive`, so a
-    /// restore can relaunch the pane on the same terms it originally had --
-    /// see `restored_pane_turn_env`'s own doc comment for why an
-    /// unconditional restore-as-Interactive was wrong.
+    /// Derive actual launch mode from turn environment for fail-closed restoration (#160).
     launch_mode: super::super::adapters::LaunchMode,
-    /// Issue #264 (EXTRA, Track A residual): the writer permit this pane
-    /// holds for its whole life, when it was spawned with `--mode writing`
-    /// (`spawnreq::SpawnRequest::mode`). `None` for a `read-only` pane, which
-    /// never takes one, and for the dashboard's own orchestrator pane. Set
-    /// once, right after `Pane::spawn`, by [`Pane::set_writer_permit`] --
-    /// the same "computed once, stored once" pattern `set_report_to`/`set_
-    /// work_group_id` already establish. Held as a plain field so it releases
-    /// during shutdown, or automatically (`permit::HeavyPermit::drop`) when it is
-    /// dropped, exactly when the pane's own child tree stops being able to
-    /// write to its checkout -- the fallback release covers every exit
-    /// path (reap, shutdown, or the dashboard process itself exiting).
+    /// Hold the writer permit until this writing pane is reaped (#264).
     writer_permit: Option<super::super::permit::HeavyPermit>,
-    /// Review finding (2026-09), finding 2a: the actual directory this
-    /// pane's child runs in (`spawn`'s own `cwd` parameter, which
-    /// `command.cwd(cwd)` uses directly) -- for a `--worktree` spawn, the
-    /// linked worktree `agent::allocate_worktree` created, never `repo`
-    /// (see `Pane::spawn`'s own doc comment on why the two are kept
-    /// separate). Retained so the dashboard's own pane-reap path
-    /// (`dash::mod::reap_ended_panes`) can tell whether a just-exited
-    /// pane's cwd is one of this repo's own agent-managed worktrees
-    /// (`agent::is_agent_managed_worktree`) and reclaim it -- otherwise
-    /// nothing but the allocating `zirv ctx agent` process's own headless
-    /// fallback path ever did.
+    /// Keep actual child cwd for transcript reads and worktree cleanup.
     cwd: PathBuf,
-    /// Issue #267, review round 3: whether `cwd` is a linked worktree the
-    /// spawning `zirv agent --worktree` allocated for this pane
-    /// (`SpawnRequest::owns_workdir`), which is the only case
-    /// `dash::reap_ended_panes` may reclaim it. Never inferred from the
-    /// path: an operator-named `--workdir` under `.zirv/worktrees/` stays
-    /// the operator's.
+    /// Reclaim a linked worktree only when this pane's request explicitly owns it (#267).
     owns_cwd: bool,
     /// The ledger row this pane owes once its child exits, when it is
     /// fulfilling a delegation at all -- `None` for the dashboard's own
@@ -1051,21 +589,7 @@ pub struct Pane {
     delegation: Option<DelegationFacts>,
 }
 
-/// Issue #490 (roadmap N21 item A): what drives one dashboard pane.
-///
-/// The wrapped variant is the pane the dashboard has always had, with its
-/// process-owning parts moved verbatim into [`PtyPane`]; the native variant
-/// is `dash::native_pane`'s own in-process conversation driver. Everything a
-/// pane carries that is NOT about owning a process -- its title, role, verb,
-/// registry guard, budget, delegation, mail bookkeeping -- stays on [`Pane`]
-/// itself, so the ~164 call sites in `dash::mod` that ask a pane for its
-/// short id, state, spend or address are unchanged by this.
-///
-/// Only the handful of operations that genuinely differ branch on this:
-/// rendering (a vt100 grid versus the native renderer), input (the pty
-/// writer versus the composer), delivery (a visible injection versus the
-/// native submit path), and lifecycle (a quit sequence versus a session
-/// shutdown).
+/// The pane driver owns either a wrapped child or a native session (#490).
 pub enum PaneKind {
     Wrapped(PtyPane),
     Native(Box<super::native_pane::NativePaneRuntime>),
@@ -1077,16 +601,11 @@ pub enum PaneKind {
     Ended,
 }
 
-/// The process-owning half of a wrapped pane, verbatim from what [`Pane`]
-/// used to hold inline.
+/// Keep process-owning state together in the wrapped driver.
 pub struct PtyPane {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// P2/P3: this child's membership in the console-close pid registry and
-    /// its kill-on-close job object. Held for the child's whole life and
-    /// released by `shutdown`/`finish_shutdown` once the child is confirmed
-    /// gone -- so closing the dashboard's window, or killing the dashboard
-    /// outright, takes the pane's agent with it instead of orphaning it.
+    /// Hold the console-close registry and job guard for the child's lifetime so dashboard death cannot orphan it.
     lifecycle: supervise::ChildGuard,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -1109,14 +628,8 @@ fn rollover_receipt_prompt(
     )
 }
 
-/// Issue #681: where a staged successor's turn-signal socket is bound. A hook
-/// files its conversation marker and attention under the socket's file stem
-/// (`hook::run_stop`'s `stable_short`), and the staged socket stays the pane's
-/// socket after commit, so the stem must be the seat's own short. A random
-/// stem sent every later marker to an address nothing reads, leaving the seat
-/// resuming -- and building handoffs from -- the pre-rollover conversation.
-/// The extension is a nonce so the path never collides with the live socket,
-/// and it is no longer than `.sock`, so `signal::check_len` is unaffected.
+/// Keep the staged socket's file stem at the seat short ID: hooks file their
+/// markers under that stem even before the successor commits (#681).
 fn staged_socket_path(state: &StateDir, short: &str) -> PathBuf {
     let live = state.socket_for(short);
     loop {
@@ -1278,23 +791,7 @@ impl Pane {
         }
     }
 
-    /// Issue #490 (roadmap N21 item A): opens a NATIVE pane in the ordinary
-    /// dashboard.
-    ///
-    /// The conversation itself is opened by `dash::native_pane::
-    /// open_native_pane`, which is also what `resolve_attach` routes: an
-    /// operator with the persistent runtime gate on, a runtime that serves
-    /// native conversations and a live native seat for this repository gets a
-    /// runtime-ATTACHED pane, and everything else gets an in-process one.
-    /// That is why a restore comes back through here rather than through a
-    /// second code path of its own -- reopening a seat the runtime already
-    /// holds is exactly the two-supervisors failure `link::RUNTIME_OWNS_IT`
-    /// exists to prevent.
-    ///
-    /// The registry record is filed under the driver's OWN seat short id, so
-    /// the pane's mail/nudge address, the restore roster, the attention
-    /// projection and the budget sweep all key on the same identity the
-    /// native session registered for itself.
+    /// Open a native session through the runtime seam while retaining the dashboard pane identity (#490).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_native(
         cfg: &super::super::config::CtxConfig,
@@ -1386,41 +883,8 @@ impl Pane {
         })
     }
 
-    /// Spawns `spec.argv` behind a ConPTY/pty sized `size` (`(cols, rows)`,
-    /// matching `wrap::window_size`'s own convention), binds this pane's own
-    /// turn-signal socket at `state.socket_for(&spec.session_id)`, and
-    /// registers it in the session registry. `turn_env` is applied after the
-    /// supervision-env scrub, exactly as `wrap`'s own `apply_session_env`
-    /// does -- the caller builds it from `adapter.register_turn_signal`
-    /// against that same deterministic socket path, so the env a pane's
-    /// child inherits and the socket this pane binds always agree.
-    ///
-    /// A bind failure degrades this pane to unsupervised (`reachable:
-    /// false` on its registry record) rather than failing the spawn: a
-    /// dashboard pane that cannot act on a wake-up is still a legitimate,
-    /// visible session, the same call `wrap` makes for `--no-supervise`/a
-    /// failed bind.
-    ///
-    /// `turn_signal_capable`/`idle_quiet` seed [`Pane::turn_signal_capable`]/
-    /// [`Pane::idle_quiet`]: the caller resolves the adapter for
-    /// `spec.agent_name` anyway (to build `argv`/`turn_env`), so it passes
-    /// `adapter.capabilities().turn_signal` and `dash.idle_quiet_ms` straight
-    /// through rather than this module re-resolving the adapter itself.
-    ///
-    /// `cwd` and `repo` are deliberately separate parameters (issue #119,
-    /// code review round): `cwd` is where the child process actually runs
-    /// (`command.cwd(cwd)`) -- for a dashboard-accepted linked `git worktree
-    /// add` sibling, that is the worktree's own path -- while `repo` is the
-    /// identity this pane's `sessions::Record` is stamped with
-    /// (`Record::new(.., repo, ..)`), which drives `repo_slug` and therefore
-    /// every mailbox lookup (`mail_sweep`, `apply_mail_effect`,
-    /// `build_mail_view`, `zirv ctx nudge --to-session`). Those two must stay
-    /// keyed off the *dashboard's own* repo regardless of which worktree the
-    /// pane's argv runs in: the session/state store is shared across every
-    /// pane this dashboard hosts, and a worktree-hosted pane whose `Record`
-    /// pointed at the worktree instead would register under a mailbox slug
-    /// nothing sweeps. Every ordinary (non-worktree) spawn passes the same
-    /// path for both.
+    /// Scrub inherited supervision env before applying this pane's turn env;
+    /// a child must not inherit its dashboard parent's identity.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         spec: PaneSpec,
@@ -1445,14 +909,7 @@ impl Pane {
         )
     }
 
-    /// [`Pane::spawn`], with an optional SEAT to register under (issue #552).
-    ///
-    /// `None` derives the registry short id from the spec's session id, which
-    /// is every ordinary spawn. `Some` is a rollover successor taking over an
-    /// existing seat: it keeps that seat's stable short id -- the address
-    /// mail, `zirv ctx nudge` and `zirv ctx status` resolve, which by design
-    /// does not move across a rollover -- while running a brand-new session
-    /// of its own.
+    /// Use an existing seat ID for a successor, otherwise derive a fresh one from the session (#552).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_on_seat(
         spec: PaneSpec,
@@ -1494,10 +951,7 @@ impl Pane {
         let (program, rest) = argv
             .split_first()
             .ok_or("dashboard pane: empty argv, nothing to spawn")?;
-        // FIX 2a (command-injection defense): a pty pane assembles its own
-        // CommandBuilder, so it never passes through supervise::spawn_tapped's
-        // guard. Apply the same cmd.exe argv-reparse policy here. A no-op off
-        // Windows and for any program that is not the `cmd.exe /c <shim>` form.
+        // Guard PTY argv against Windows command-shim reparsing before spawn.
         super::super::adapters::guard_cmd_shim_reparse(program, rest)?;
         let mut command = CommandBuilder::new(program);
         for arg in rest {
@@ -1506,12 +960,7 @@ impl Pane {
         command.cwd(cwd);
 
         sessions::scrub_supervision_env(&mut command);
-        // Issue #160 finding 1, review round (2026-08-28): derived from
-        // `turn_env`'s own content rather than a separate parameter -- the
-        // single source of truth for what this pane's child actually
-        // inherits is the same `turn_env` slice `command.env` is fed from
-        // below, so there is no second copy that could ever say something
-        // different. See `Pane::launch_mode`'s own doc comment.
+        // Derive launch mode from the same environment given to the child (#160).
         let launch_mode = if turn_env.iter().any(|(k, v)| {
             k == super::super::adapters::LAUNCH_MODE_ENV
                 && v == super::super::adapters::LAUNCH_MODE_INTERACTIVE_VALUE
@@ -1524,16 +973,12 @@ impl Pane {
             command.env(key, value);
         }
 
-        // Taken and answered before the spawn: on Windows the console host
-        // has to be answered before it will service the child at all (see
-        // `wrap::answer_inherit_cursor_probe`'s own doc comment).
+        // Answer Windows console-host cursor inheritance before it services the child.
         let mut first_writer = pair.master.take_writer()?;
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
-        // Fresh seats publish their inbox identity before the host can start
-        // its bridge. An existing seat belongs to a still-running predecessor:
-        // leave its record AND socket intact until the replacement spawns.
+        // Publish a fresh seat's inbox before the host bridge starts; keep an existing predecessor's record until commit.
         let register = || {
             let server = SignalServer::bind(&state.socket_for(&session_id)).ok();
             if let Some(server) = &server {
@@ -1542,7 +987,7 @@ impl Pane {
 
             let mut record =
                 Record::new(&session_id, &agent_name, repo, verb).with_role(role.label());
-            // Issue #552: a rollover successor answers to the seat's own address.
+            // Bind rollover successor reporting to the existing seat address (#552).
             if let Some(seat_short) = seat_short {
                 record = record.with_stable_short(seat_short);
             }
@@ -1569,28 +1014,13 @@ impl Pane {
 
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
-        // P2/P3: adopted on the very next statement after the spawn, ahead of
-        // every `?` below. Two reasons for that placement: it narrows the
-        // window in which a shim's grandchild can appear before the job
-        // assignment lands (see `JobGuard`'s own residual note), and it means
-        // a `Pane::spawn` that fails half way through -- a reader clone, a
-        // writer -- drops this guard and takes the child with it, rather than
-        // returning `Err` and leaving an agent running that nothing holds a
-        // handle to. `process_id` returns `None` on a backend that cannot
-        // report one; there the guard is inert and behaviour is exactly
-        // today's.
+        // Adopt child ownership immediately after spawn before later fallible setup can leak it.
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
         let (server, mut guard) = registered.unwrap_or_else(register);
         if let Some(pid) = child.process_id() {
             guard.adopt_child_pid(pid);
         }
-        // Issue #330: a pane's child is spawned BY the dashboard, so it would
-        // otherwise inherit the operator UI's own priority class and hand it
-        // straight on to every cargo process it runs. The posture is stamped
-        // onto this one child instead (`apply_to_child`, a no-op for the
-        // Orchestrator pane the operator types into), and its own children
-        // inherit it from there. `process_id` returning `None` -- a backend
-        // that cannot report one -- degrades to today's behaviour.
+        // Lower child priority so build work cannot inherit dashboard UI priority (#330).
         if let Some(pid) = child.process_id() {
             super::super::priority::apply_to_child(pid, super::super::priority::posture_for(role));
         }
@@ -1604,10 +1034,7 @@ impl Pane {
         let mut reader = master.try_clone_reader()?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
-            // Issue #330: everything the operator sees of this pane arrives on
-            // this thread, so it is raised for the same reason `wrap`'s own
-            // output thread is -- and here too, because thread priority never
-            // crosses a `spawn`.
+            // Raise pane reader priority for responsive output without blocking the UI (#330).
             super::super::priority::raise_current_thread();
             let mut buf = [0u8; 8192];
             loop {
@@ -1622,13 +1049,7 @@ impl Pane {
             }
         });
 
-        // Issue #358 (task 5): the logical orchestrator seat this pane sits
-        // in -- only ever an orchestrator pane's, since nothing rolls a
-        // worker over. The model comes from `turn_env`, the single source of
-        // truth for what this child actually inherits (the same derivation
-        // `launch_mode` above already makes from it), and `pinned` from the
-        // dashboard process's own environment, which is where an operator's
-        // `ZIRV_CTX_SEAT_PIN` lands.
+        // Register an orchestrator pane's logical seat and model for rollover (#358).
         if role == PromptRole::Orchestrator {
             let seat_model = turn_env
                 .iter()
@@ -1721,43 +1142,14 @@ impl Pane {
         })
     }
 
-    /// Pumps queued reader-channel bytes into the `vt100` parser, up to
-    /// [`DRAIN_BUDGET_BYTES`] per call, and returns `(any, more)`: whether
-    /// any bytes were actually processed this call, and whether the budget
-    /// cut the drain short with bytes still queued -- so the event loop
-    /// knows to come back to this pane next tick rather than blocking on it
-    /// now. Also polls the child's exit status (see `poll_exit`): a pane's
-    /// own output is the natural place to notice it has stopped producing
-    /// any.
-    ///
-    /// M10: the drain used to loop until the channel was empty. A `cat` of a
-    /// large file fills the unbounded channel faster than `vt100` parses it, so
-    /// the drain never returned and the whole event loop -- input included, so
-    /// `Ctrl+A q` too -- was unreachable for the duration. The budget bounds
-    /// one call's work; the remainder waits for the next tick.
-    ///
-    /// HIGH (review): `any` exists on the return so the caller can cancel a
-    /// stale mouse selection the moment new output rewrites this pane's grid
-    /// under it -- see `dash::output_cancels_selection` -- without a second,
-    /// separate probe of whether this call did anything.
+    /// Report budget-cut output as pending so a child that exits with unread
+    /// bytes gets another drain tick before reap.
     pub fn drain(&mut self) -> (bool, bool) {
         let (any, more, _used) = self.drain_with_budget(DRAIN_BUDGET_BYTES);
         (any, more)
     }
 
-    /// [`Pane::drain`] with the caller's own share of this tick's budget, also
-    /// reporting how many bytes it spent.
-    ///
-    /// Issue #330: the event loop hands out one [`DRAIN_BUDGET_BYTES`] across
-    /// all panes per tick (`dash::drain_shared_budget`) instead of that much
-    /// to each, so a busy dashboard's parsing cost -- which is keystroke
-    /// latency, since the tick reaches `event::poll` only afterwards -- no
-    /// longer scales with the number of workers. A pane handed a budget of
-    /// zero still polls its child's exit status and still retires a
-    /// signal-less pane's turn flags; only the parsing waits for the next
-    /// tick, with every unparsed byte left queued exactly where it was. A
-    /// positive share may overshoot by at most one reader message (8 KiB),
-    /// see [`drain_into`].
+    /// Use the caller's share of the shared drain budget and return actual byte spend (#330).
     pub fn drain_with_budget(&mut self, budget: usize) -> (bool, bool, usize) {
         self.poll_exit();
         let (any, more, used) = match &self.kind {
@@ -1770,38 +1162,14 @@ impl Pane {
         };
         self.pending_output = more;
         if any {
-            // O1: recorded, not acted on. Whether these bytes mean "a new turn
-            // started" or "the harness repainted the one that just ended" is
-            // `signal_still_stands`' decision, and it needs the timestamp to
-            // make it.
+            // Record output time; signal_still_stands decides whether it is a redraw or a new turn.
             self.last_output_at = Some(Instant::now());
             // Mail error output is not proof the child survived the confirmation window.
             if self.delivery_sender.is_none() {
                 self.submit_confirmation = None;
             }
         }
-        // A signal-less pane's `on_turn_signal` never fires (its socket is
-        // never written to -- `register_turn_signal` is a no-op for it), so
-        // it is the only place besides a turn signal that clears
-        // `injected_awaiting_turn`/`user_typed_since_turn`. Without this, the
-        // very first `inject_visible` (or the very first forwarded keystroke)
-        // into such a pane would latch it `Working` forever -- exactly the O1
-        // bug this module already fixed once for the signal-carrying case,
-        // recurring on the one axis that case never had to consider.
-        // Quiescence is this pane's only stand-in for a turn boundary, so it
-        // is what retires both flags here, the same job a fresh signal does
-        // in `on_turn_signal`. Runs every tick (not just when `any`), since a
-        // pane that produced nothing at all this tick can still be the tick
-        // its quiet window finally closes.
-        //
-        // H1 (review): checked against `signal_less_quiescent`, not
-        // `output_quiescent(self.last_output_at, ...)` alone -- an injection
-        // or a forwarded keystroke only ever happens while the pane already
-        // reads quiet, so measuring from output alone let the very next
-        // `drain()` tick (tens of milliseconds later, well under `idle_quiet`)
-        // clear the flag it had just set, before the child had any real
-        // chance to respond. Folding `last_local_input_at` in makes the
-        // injection/keystroke itself restart the quiet window.
+        // Retire signal-less typing flags only after output and input become quiet.
         if !self.turn_signal_capable
             && signal_less_quiescent(
                 self.last_output_at,
@@ -1912,23 +1280,8 @@ impl Pane {
         Ok(self.scroll_by(delta))
     }
 
-    /// A mouse *button* press or release, on the same terms as the wheel: the
-    /// child gets it only if it asked for mouse reporting, in its own
-    /// encoding and its own coordinates. Returns whether it was forwarded, so
-    /// a click over a child that never asked is dropped rather than typed at
-    /// it.
-    ///
-    /// The dashboard enables `?1000h` + `?1002h` + `?1006h` at its own
-    /// terminal and deliberately not `?1003h` (`term::dash_mouse_on_bytes`),
-    /// so what can arrive here -- and therefore what a child can be sent --
-    /// is the wheel and button presses/releases, never free-running hover.
-    /// `?1002h` does let a `Drag` event reach the dashboard's own event loop
-    /// now, but `dash::mod` never routes one here: a child that wants mouse
-    /// events gets its click forwarded through this function exactly as
-    /// before, and the drag itself is simply not acted on for it (the same
-    /// "unhandled mouse kind" fate every `Drag` had before `?1002h` was even
-    /// turned on). Only a pane that does *not* want mouse reporting gets
-    /// zirv's own click-drag text selection out of that same event.
+    /// Forward buttons only on a child's grid when it asked for mouse events;
+    /// otherwise a dashboard click must not become child input.
     pub fn forward_mouse_button(
         &mut self,
         button: u8,
@@ -2007,41 +1360,7 @@ impl Pane {
         }
     }
 
-    /// Forwards operator keystrokes into the child's pty and records that the
-    /// operator has typed since this pane's last turn boundary
-    /// (`user_typed_since_turn`), so no idle-gated injection lands in the
-    /// middle of a half-composed prompt. Every keystroke `run_dashboard`
-    /// routes to the focused pane goes through here; `inject_visible`
-    /// deliberately does not, since it is the thing being gated.
-    ///
-    /// The flag is set before the write, not after: a write that failed part
-    /// way through has still put bytes in front of the operator's cursor.
-    ///
-    /// Also snaps this pane back to the live view, the way tmux leaves copy
-    /// mode the moment you type: an operator typing into a pane whose viewport
-    /// is pinned 200 rows up would otherwise see nothing at all happen. This
-    /// is deliberately on the *operator input* seam rather than on
-    /// `write_input`, so an idle-gated `inject_visible` does not yank the view
-    /// out from under someone reading history -- and, for the same reason, new
-    /// output from the child does not either (vt100 keeps a non-zero offset
-    /// pinned to its row as rows retire past it).
-    ///
-    /// H1 (review): also stamps `last_local_input_at`, on the same
-    /// before-the-write terms as `user_typed_since_turn` right above -- a
-    /// signal-less pane's quiescence check folds this in
-    /// ([`signal_less_quiescent`]), so a keystroke now holds such a pane
-    /// non-idle for a full `idle_quiet` window measured from the operator's
-    /// own *last* key, not merely until the next `drain()` tick happens to
-    /// run.
-    ///
-    /// F1/F2 (review, PR #116): flushes a pending deferred submit
-    /// (`Self::pending_submit`) first, best-effort, before the keystroke --
-    /// an operator who starts typing before an injection's own settle
-    /// deadline has elapsed must not have their own text land in the
-    /// composer ahead of the still-unsubmitted injected line. A failed flush
-    /// is not fatal here: `pending_submit` simply stays set and the tick
-    /// loop retries it, and the operator's own keystroke still reaches the
-    /// child either way.
+    /// Forward operator input and mark it pending until the next turn boundary, preventing idle injection.
     pub fn write_operator_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
         if self.has_pending_submit() {
             let _ = self.submit_pending();
@@ -2056,8 +1375,6 @@ impl Pane {
         self.write_input(bytes)
     }
 
-    /// Writes raw bytes into the child's pty, e.g. forwarded key input or
-    /// (Task 9) a visible injected line.
     pub fn write_input(&mut self, bytes: &[u8]) -> CtxResult<()> {
         let mut writer = self
             .writer()?
@@ -2087,10 +1404,7 @@ impl Pane {
     /// `drain`/`on_turn_signal`/`poll_exit` -- no I/O of its own, so it is
     /// cheap enough to call every frame.
     pub fn state(&self) -> PaneState {
-        // Issue #490 (N21 item A): a native pane's state is a FACT its driver
-        // holds (the session state, plus whether an approval is outstanding),
-        // not something inferred from output quiet windows and turn signals a
-        // native conversation does not have.
+        // Native state comes from its session and approval driver, not terminal-output quiet time (#490).
         if let Some(native) = self.native() {
             return match self.exit_code {
                 Some(code) => PaneState::Ended(code),
@@ -2116,11 +1430,7 @@ impl Pane {
         )
     }
 
-    /// Whether this pane may have a line injected into it right now -- the
-    /// mail sweep's and the nudge drain's own eligibility gate. See
-    /// [`injectable_from`] for the full reasoning (G1): `state()` alone is no
-    /// longer enough, because the operator's own mid-thought typing is
-    /// deliberately excluded from it.
+    /// Inject mail or nudges only when pane state and turn signals make typing safe.
     pub fn injectable(&self) -> bool {
         if self.pending_submit.is_some() || self.submit_confirmation.is_some() {
             return false;
@@ -2135,15 +1445,7 @@ impl Pane {
         )
     }
 
-    /// Drains every turn signal currently queued on this pane's socket. Also
-    /// polls the child's exit status, the same as `drain`: a turn boundary
-    /// and a child exit are both "this pane stopped producing on its own",
-    /// and either is a fine place to notice the other.
-    /// A fresh signal also clears `injected_awaiting_turn` and
-    /// `user_typed_since_turn`: the turn an injection (or the operator's own
-    /// typing) started has now ended, so the pane is genuinely idle again and
-    /// eligible for the next one. Both are cleared on a turn boundary for the
-    /// same reason `wrap::InjectionState::on_turn` clears its own.
+    /// Drain queued turn signals and observe child exit on the same pane tick.
     pub fn on_turn_signal(&mut self) {
         self.poll_exit();
         let signalled = self.pty().is_some_and(|pty| {
@@ -2172,10 +1474,7 @@ impl Pane {
         self.guard.short()
     }
 
-    /// Issue #490 (N21 item A): whether the operator's keystrokes go to a pty
-    /// writer or to the native composer/UX router. The dashboard's key
-    /// routing asks this rather than inspecting the kind itself, so a native
-    /// control can never be offered on a wrapped pane by accident.
+    /// Route keys by pane driver: PTY writer for wrapped harnesses, native composer for native sessions (#490).
     pub fn accepts_native_controls(&self) -> bool {
         self.is_native()
     }
@@ -2188,16 +1487,12 @@ impl Pane {
         &self.agent_name
     }
 
-    /// The directory this pane's own child process actually runs in --
-    /// `spawn`'s own `cwd` parameter, verbatim. See the [`Pane::cwd`] field's
-    /// own doc comment for why this is retained (finding 2a's own
-    /// worktree-reclaim check).
+    /// Use the actual child working directory for transcript and worktree policy.
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
     }
 
-    /// The state directory this pane was registered in. Issue #552: a
-    /// rollover successor is opened in the same one the source is in.
+    /// Keep the state directory shared across successor launches at this seat (#552).
     pub(crate) fn state_dir(&self) -> &StateDir {
         &self.state_dir
     }
@@ -2214,17 +1509,7 @@ impl Pane {
         self.owns_cwd = true;
     }
 
-    /// Whether this pane's own turn-signal socket bound successfully at
-    /// spawn time -- `Pane::spawn`'s own doc comment: "a bind failure
-    /// degrades this pane to unsupervised (`reachable: false` on its
-    /// registry record) rather than failing the spawn." Fixed for the
-    /// pane's whole life (the bind is attempted exactly once, in `spawn`),
-    /// so this is always current -- no registry re-read needed the way a
-    /// liveness probe would.
-    ///
-    /// Issue #209/v3 codex review finding 5: the footer's supervision
-    /// segment reads this for the focused pane instead of assuming every
-    /// alive pane is supervised.
+    /// Report reachability only when the turn-signal socket actually bound.
     pub fn reachable(&self) -> bool {
         match &self.kind {
             PaneKind::Wrapped(pty) => pty.server.is_some(),
@@ -2246,13 +1531,7 @@ impl Pane {
         &self.session_id
     }
 
-    /// Issue #115: records the address this pane was told to report its
-    /// outcome back to (`None` if it was not told at all). Meant to be
-    /// called at most once, right after `Pane::spawn`, by the same caller
-    /// that decided whether a report-back instruction was actually attached
-    /// to this pane's launch prompt -- see [`Pane::report_to`]'s own doc
-    /// comment. Also resets `report_reminder_sent`, so a pane freshly given
-    /// a target is always eligible for its one reminder.
+    /// Record the report-back target once after spawn so reminder delivery can use it (#115).
     pub fn set_report_to(&mut self, report_to: Option<String>) {
         self.report_to = report_to;
         self.report_reminder_sent = false;
@@ -2265,12 +1544,8 @@ impl Pane {
         self.report_to.as_deref()
     }
 
-    /// Security review Finding 1: records the spawn-request directory this
-    /// pane's own child tree was handed (`DASH_REQUESTS_ENV`). Called right
-    /// after `Pane::spawn` by the caller that minted the directory and put it
-    /// in this pane's `turn_env` -- the two must always name the same path,
-    /// which is what makes "a request arrived in this directory" mean "this
-    /// pane asked for it". See [`Pane::intake_dir`]'s own field comment.
+    /// Store the directory this child inherited; it must be the same path
+    /// the dashboard later drains to verify requester identity.
     pub fn set_intake_dir(&mut self, dir: PathBuf) {
         self.intake_dir = Some(dir);
     }
@@ -2280,10 +1555,7 @@ impl Pane {
         self.intake_dir.as_deref()
     }
 
-    /// Security review Finding 2: records the work group this pane was
-    /// spawned into. Called right after `Pane::spawn` by the caller that
-    /// already admitted the spawn into that group -- see
-    /// [`Pane::work_group_id`]'s own field comment.
+    /// Store the admitted work group on the pane for closing and restoration.
     pub fn set_work_group_id(&mut self, id: Option<String>) {
         self.work_group_id = id;
     }
@@ -2299,9 +1571,7 @@ impl Pane {
         self.budget_grace_given = false;
     }
 
-    /// Issue #354, the sidebar's `model` column and `model` disclosure line.
-    /// Read-only: nothing outside this module may re-point a live pane's
-    /// model, which would make the row disagree with the running child.
+    /// Expose the model from actual launch argv so sidebar facts match the child (#354).
     pub fn launch_model(&self) -> Option<&str> {
         // A native pane knows its route first-hand; a runtime-attached one
         // honestly knows nothing, and says so rather than guessing.
@@ -2311,8 +1581,7 @@ impl Pane {
         }
     }
 
-    /// Issue #354, the sidebar's `budget` disclosure line: the last usage
-    /// snapshot the budget sweep measured, or `None` before the first one.
+    /// Reuse the budget sweep's measured usage for sidebar disclosure (#354).
     pub fn measured_usage(&self) -> Option<super::super::event::TranscriptUsage> {
         // A native pane's usage is journalled by its own session, so it
         // never waits on the budget sweep's transcript read.
@@ -2322,8 +1591,7 @@ impl Pane {
         }
     }
 
-    /// Issue #354, the sidebar's `writer` disclosure line: whether this pane
-    /// currently holds the repo's write permit.
+    /// Expose whether the pane still holds its writer permit (#354).
     pub fn holds_writer_permit(&self) -> bool {
         self.native()
             .map(super::native_pane::NativePaneRuntime::holds_writer_permit)
@@ -2334,17 +1602,8 @@ impl Pane {
         self.budget_tokens
     }
 
-    /// 2026-09-06: arms this pane's wall clock from the requester's own
-    /// `--timeout-secs`, measured from `started` (the caller passes
-    /// `Instant::now()` right after the spawn). `None` leaves the pane
-    /// unbounded, exactly as before the field existed.
-    ///
-    /// R1-1 (2026-09-06 review): the ceiling arrives on an UNTRUSTED
-    /// `SpawnRequest`, so it goes through [`deadline_for`] rather than a bare
-    /// `started + Duration::from_secs(secs)` -- a request asking for
-    /// `u64::MAX` seconds used to overflow `Instant` and panic, which with
-    /// `panic = "abort"` took the whole dashboard (every other pane's live
-    /// child with it) down from one line of forged JSON.
+    /// Clamp untrusted timeout before adding it to Instant; absent timeout
+    /// leaves the pane unbounded.
     pub fn set_timeout(&mut self, started: Instant, timeout_secs: Option<u64>) {
         self.deadline = timeout_secs.and_then(|secs| deadline_for(started, secs));
     }
@@ -2354,31 +1613,7 @@ impl Pane {
         self.deadline
     }
 
-    /// Stops a pane whose wall clock has run out, the same way
-    /// [`Self::enforce_token_budget`]'s hard stop does: the adapter's quit
-    /// sequence, then `exec::EXIT_TIMEOUT` -- the identical exit code
-    /// `exec::run_with` reports for an inline supervised child that outran
-    /// `--timeout-secs`. `Ok(true)` exactly once, on the sweep that actually
-    /// stopped it: the deadline is disarmed in the same step, so a pane is
-    /// never stopped (or reported) twice, and a child that already ended on
-    /// its own keeps its own exit code.
-    ///
-    /// R1-5 (2026-09-06 review): a child that has ALREADY exited is never
-    /// touched, whatever it exited with. `drain` records an exit the moment
-    /// the child ends and this sweep runs BEFORE `dash::mod::
-    /// reap_ended_panes` does, so a worker that finished cleanly a moment
-    /// before its deadline used to have its `0` rewritten to `EXIT_TIMEOUT`
-    /// -- a successful review or fix reported to its requester as a timeout.
-    ///
-    /// R1-6 (same review): the deadline is disarmed only once the child is
-    /// actually stopped. It used to be cleared FIRST, so a polite quit that
-    /// failed (a poisoned writer mutex, a `quit_child` that could not reap)
-    /// propagated its error while every later sweep skipped this pane
-    /// (`deadline: None`), leaving a live child running unbounded past the
-    /// ceiling that was supposed to stop it. A failed polite quit now
-    /// escalates through [`Self::finish_shutdown`] -- the same escalation
-    /// half the batched-shutdown path uses -- and only an escalation that
-    /// ALSO fails leaves the deadline armed for the next sweep to retry.
+    /// On deadline, use adapter quit sequence and the same timeout exit code as headless workers.
     pub fn enforce_deadline(&mut self, now: Instant, quit_sequence: &str) -> CtxResult<bool> {
         let Some(deadline) = self.deadline else {
             return Ok(false);
@@ -2406,12 +1641,7 @@ impl Pane {
         Ok(true)
     }
 
-    /// Issue #358 (task T3): records the provider-level token-reservation
-    /// ledger entry (`reservation::reserve`) `fulfill_spawn_request` took
-    /// for this pane at spawn time -- called right after `Pane::spawn`, the
-    /// same way [`Self::set_work_group_id`]/[`Self::set_budget_tokens`]
-    /// are, so `account_reaped_pane_spend` can settle it once this pane's
-    /// own child exits.
+    /// Store the provider reservation ID so reap can settle it (#358).
     pub fn set_reservation_id(&mut self, id: Option<String>) {
         self.reservation_id = id;
     }
@@ -2428,11 +1658,8 @@ impl Pane {
         usage: &super::super::event::TranscriptUsage,
         quit_sequence: &str,
     ) -> CtxResult<Option<PaneBudgetNotice>> {
-        // Issue #354: the sweep that reads this usage is the only thing that
-        // reads it, so the sidebar's `budget` disclosure line reuses the same
-        // snapshot rather than measuring again. Recorded before the ceiling
-        // check so it reflects what was actually measured, not what the
-        // budget then decided about it.
+        // Store usage before enforcing the ceiling so sidebar facts reflect
+        // what was measured, even when the sweep then stops the child (#354).
         self.measured_usage = Some(*usage);
         let Some(limit) = self.budget_tokens else {
             return Ok(None);
@@ -2469,11 +1696,7 @@ impl Pane {
         }
     }
 
-    /// Issue #249: records this pane's own server-verified supervising
-    /// session. Called right after `Pane::spawn` by the caller that already
-    /// derived it (`dash::mod::fulfill_spawn_request`'s `verified_parent`),
-    /// the same "computed once, stored once" pattern `set_report_to`/`set_
-    /// work_group_id` already establish.
+    /// Store the server-verified parent for steering mail, never a request-provided claim (#249).
     pub fn set_parent_session(&mut self, parent: Option<String>) {
         self.parent_session = parent;
     }
@@ -2506,13 +1729,7 @@ impl Pane {
         self.pty().and_then(|pty| pty.child.process_id())
     }
 
-    /// Issue #264 (EXTRA): records the writer permit this pane holds for its
-    /// whole life. Called right after `Pane::spawn` by the caller that
-    /// already acquired it (`dash::mod::fulfill_spawn_request`), mirroring
-    /// `set_work_group_id`/`set_parent_session`'s own "acquired by the
-    /// caller, stored here" pattern -- see [`Pane::writer_permit`]'s own
-    /// field comment for why storing it here is what makes it release
-    /// automatically.
+    /// Hold the acquired writer permit for the pane's lifetime (#264).
     pub fn set_writer_permit(&mut self, permit: super::super::permit::HeavyPermit) {
         self.writer_permit = Some(permit);
     }
@@ -2545,77 +1762,29 @@ impl Pane {
         self.verb
     }
 
-    /// The role this pane was ACTUALLY spawned with (issue #169) -- what
-    /// `dash::mod::parent_role_for` reads instead of assuming every live
-    /// pane is a `Worker`. Set once, at `Pane::spawn`, from `PaneSpec::role`;
-    /// nothing here ever revises it from anything the pane's own child says.
+    /// Use the role granted at spawn for later lineage checks (#169).
     pub fn role(&self) -> PromptRole {
         self.role
     }
 
-    /// The `LaunchMode` this pane was ACTUALLY spawned with (issue #160
-    /// finding 1) -- derived once, at `Pane::spawn`, from whether `turn_env`
-    /// carried the durable interactive-launch pin. `dash::mod::on_quit`
-    /// reads this back to roster `RosterPane::interactive`, so a restore
-    /// can relaunch this pane on the same terms it originally had, rather
-    /// than unconditionally as `Interactive`.
+    /// Read launch mode from the child environment so roster restoration preserves actual posture (#160).
     pub fn launch_mode(&self) -> super::super::adapters::LaunchMode {
         self.launch_mode
     }
 
-    /// The sidebar's one-line preview: the bottom-most non-blank row of this
-    /// pane's current screen.
+    /// Preview the bottom-most nonblank visible screen row.
     pub fn last_line(&self) -> String {
         last_line_of(self.screen())
     }
 
-    /// The child's age at its observed exit, before teardown adds any delay.
+    /// Measure child age before teardown adds delay.
     pub fn exited_after(&self) -> Option<Duration> {
         self.exited_after
     }
 
-    /// Writes a visible, clearly-labelled line into the child's own pty --
-    /// `"[zirv ▸ {label}] {body}"` -- and schedules the lone `\r` that
-    /// submits it for at least [`INJECTION_SUBMIT_DELAY`] later (issue #114
-    /// / review F1/F2, PR #116: [`write_injection_phase1`] /
-    /// [`Self::pending_submit`]). Used by Task 9's idle-gated intervention
-    /// (an operator nudge, a swept mail message, or a report-back reminder)
-    /// to put text in front of the agent the same way a human typing at the
-    /// prompt would, rather than any side channel the agent has to know to
-    /// look for.
-    ///
-    /// The caller must have already checked `state() == PaneState::Idle`:
-    /// this method does not gate itself -- writing into a `Working` pane
-    /// would interleave with whatever the agent is already sending, which is
-    /// exactly the failure mode idle-gating exists to prevent.
-    ///
-    /// Returns as soon as phase 1's write lands -- **no sleeping here** (F2:
-    /// this used to block the caller for `INJECTION_SUBMIT_DELAY`, which on
-    /// the dashboard is the single UI thread every sweep shares). On success
-    /// the pane reports `Working` until its next turn signal
-    /// (`injected_awaiting_turn`), so a second idle-gated caller later in the
-    /// same tick sees a busy pane rather than the stale `Idle` this one just
-    /// acted on, and `last_local_input_at`/`pending_submit` are both stamped
-    /// immediately at phase 1 -- not deferred to phase 2 -- so a signal-less
-    /// pane's quiet window and the retry sweeps both see this injection as
-    /// "in flight" the instant it starts, not only once it is fully
-    /// submitted. A failed phase-1 write leaves every flag alone: no bytes
-    /// are known to have reached the child, so no turn is pending and no
-    /// submission is owed; the caller's `Err` surfaces it rather than
-    /// silently limping on.
-    ///
-    /// Phase 2 -- the actual `\r` -- is drained later, by
-    /// [`Self::submit_pending`], called once [`Self::pending_submit_due`]
-    /// says the deadline has passed (`dash::mod::run_dashboard`'s own tick
-    /// loop does this for every pane, every tick) or eagerly by
-    /// [`Self::write_operator_input`] if the operator starts typing into this
-    /// pane before the deadline arrives on its own.
+    /// Write a bounded labelled line first and defer its submit carriage return until the echo settles.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
-        // Issue #490 (N21 item A): delivery to a native pane goes through its
-        // own submit path, never a pty injection -- there is no composer to
-        // type into and no carriage return to send afterwards. It is complete
-        // on the spot (the text is committed to the conversation), so none of
-        // the two-phase submit bookkeeping below applies to it.
+        // Deliver native messages through the native submit path, never PTY control bytes (#490).
         if let PaneKind::Native(native) = &mut self.kind {
             native.deliver(label, body)?;
             let now = Instant::now();
@@ -2662,11 +1831,7 @@ impl Pane {
         )
     }
 
-    /// Whether this pane has ANY deferred injection submission outstanding,
-    /// regardless of whether its deadline has passed yet -- what
-    /// `write_operator_input` checks before an operator's own keystroke
-    /// reaches the composer, so a half-typed injection is never left sitting
-    /// unsubmitted behind whatever the operator types next.
+    /// Block operator input while any deferred injection submit remains outstanding.
     pub(crate) fn has_pending_submit(&self) -> bool {
         self.pending_submit.is_some()
     }
@@ -2696,9 +1861,7 @@ impl Pane {
     }
 
     pub(crate) fn screen_tail(&mut self) -> String {
-        // Issue #490 (N21 item A): a native pane has no vt100 grid; its tail
-        // is the tail of the transcript the same renderer draws, so a stall
-        // report or a screening excerpt describes what the operator sees.
+        // Read native previews from the transcript, since native panes have no vt100 grid (#490).
         if let Some(native) = self.native() {
             let (view, presentation) = native.view();
             let lines = super::native_pane::render_lines(view, presentation);
@@ -2775,12 +1938,7 @@ impl Pane {
         if self.done {
             return Ok(());
         }
-        // A3-1: `done` is set only once the polite quit has actually
-        // succeeded. It used to be set FIRST, so a failure here (a poisoned
-        // writer lock, a `quit_child` that could not reap the child) skipped
-        // every release below AND made `finish_shutdown` -- guarded by the
-        // same flag -- a permanent no-op. A pane whose quit failed is
-        // precisely the pane that still needs escalating.
+        // Mark polite quit complete only after it succeeds so a failed quit can still be retried.
         match &mut self.kind {
             PaneKind::Wrapped(pty) => {
                 let mut writer = pty
@@ -2796,15 +1954,10 @@ impl Pane {
             _ => self.finish_native(),
         }
         self.done = true;
-        // P2/P3: the child is gone (or as gone as `quit_child` could make
-        // it), so it must leave the console-close registry and its job handle
-        // must close -- an explicit call, not `Drop`, because the release
-        // profile is `panic = "abort"`.
+        // Release console-close membership explicitly after child exit; release builds abort without running Drop.
         self.release_lifecycle();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
-        // Issue #358: the seat is an address for a live session, released
-        // alongside every other per-session artifact this pane owns. A
-        // worker pane never registered one, so this is a no-op for it.
+        // Release seat address with other per-session artifacts on shutdown (#358).
         if self.role == PromptRole::Orchestrator {
             super::super::rollover::forget(&self.state_dir, self.guard.short());
         }
@@ -2813,23 +1966,7 @@ impl Pane {
         Ok(())
     }
 
-    /// Ends this pane because a SUCCESSOR has taken its seat (issue #552).
-    ///
-    /// [`Pane::shutdown`] is the wrong verb for a rollover: it releases the
-    /// registry record and forgets the seat, and both of those now belong to
-    /// the successor, which registered under the SAME short id (a seat's
-    /// address does not move across a rollover -- see
-    /// `sessions::SessionGuard::refresh_session`). So the child is ended and
-    /// the lifecycle released exactly as a shutdown would, and the two things
-    /// the successor owns are deliberately left alone:
-    ///
-    /// * the registry record -- this guard `disown`s it rather than deleting
-    ///   the file the successor just wrote;
-    /// * the seat and its rollover record -- `rollover::forget` would drop the
-    ///   very transaction that put the successor there.
-    ///
-    /// The socket path unpublished is this pane's OWN session id, which the
-    /// successor does not share, so that one is an ordinary release.
+    /// Retire a predecessor without releasing the seat or registry identity now owned by its successor (#552).
     pub fn retire_for_successor(&mut self, quit_sequence: &str) {
         self.cancel_handover();
         if self.done {
@@ -2851,13 +1988,7 @@ impl Pane {
         self.writer_permit.take();
     }
 
-    /// M9: the first half of a *batched* shutdown -- sends this pane's harness
-    /// quit sequence and returns immediately, without waiting out any grace.
-    /// A caller shutting down many panes calls this on every pane first, then
-    /// waits on all of them together against one shared budget
-    /// ([`Pane::try_exited`]/[`Pane::finish_shutdown`]), rather than paying a
-    /// full grace period per pane serially. Best-effort and idempotent: a
-    /// no-op once the pane is already `done` or its child has exited.
+    /// Send every pane's quit sequence first, then wait against one shared grace budget.
     pub fn request_quit(&mut self, quit_sequence: &str) {
         if self.done {
             return;
@@ -2889,15 +2020,7 @@ impl Pane {
         self.done = true;
         self.poll_exit();
         if self.exit_code.is_none() {
-            // P1: tree-kill first, narrow kill second. `Child::kill()` is a
-            // `TerminateProcess` against the *direct* child, which for an
-            // npm-installed agent is `cmd.exe /c claude.cmd` -- killing it
-            // left the real `node` agent running with nothing watching it.
-            // The tree-kill is best-effort and its return value is not
-            // evidence of anything, so the narrow kill still runs behind it
-            // and `wait` remains the only proof of death. Never a control
-            // byte into the pty master: conhost broadcasts those to every
-            // client of the pseudoconsole (see `wrap::quit_child`).
+            // Kill the process tree before the direct child on Windows; npm command shims can leave the Node agent behind.
             #[cfg(not(unix))]
             if let Some(pid) = self.child_pid() {
                 supervise::kill_tree(pid);
@@ -2912,9 +2035,7 @@ impl Pane {
         }
         self.release_lifecycle();
         wrap::unpublish_socket_path(&self.state_dir, &self.session_id);
-        // Issue #358: the seat is an address for a live session, released
-        // alongside every other per-session artifact this pane owns. A
-        // worker pane never registered one, so this is a no-op for it.
+        // Release the live seat address when pane shutdown completes (#358).
         if self.role == PromptRole::Orchestrator {
             super::super::rollover::forget(&self.state_dir, self.guard.short());
         }
@@ -2923,21 +2044,7 @@ impl Pane {
         Ok(())
     }
 
-    /// Issue #403: stops this pane's child NOW -- [`Self::finish_shutdown`],
-    /// the escalation half with no quit sequence and no grace -- and records
-    /// `code` as its exit so this tick's `dash::reap_ended_panes` retires the
-    /// row by the one code path that retains it, settles its spend and closes
-    /// its work group. `finish_shutdown` on its own releases the registry
-    /// record, the writer permit and the socket but leaves `exit_code` unset,
-    /// so the pane would linger in `panes` until something else happened to
-    /// observe the child's exit.
-    ///
-    /// No polite quit sequence, unlike [`Self::enforce_deadline`]: this is
-    /// the operator saying kill it, and a pane settled enough to need `zirv
-    /// ctx kill` is precisely the pane that will not answer one. A child that
-    /// had already exited keeps its own exit code. Native panes request
-    /// cancellation without blocking here; [`Self::tick_native`] records the
-    /// requested code only after the worker has actually terminated.
+    /// Stop the owned child immediately and record the deliberate kill code for reap (#403).
     pub fn stop_now(&mut self, code: i32) -> CtxResult<()> {
         self.poll_exit();
         if let PaneKind::Native(native) = &mut self.kind {
@@ -2956,24 +2063,7 @@ impl Pane {
         Ok(())
     }
 
-    /// Everything a live swap's SUCCESSOR launch needs, derived once
-    /// (issue #552).
-    ///
-    /// Lifted verbatim out of [`Pane::handover`]'s own body so the two ways a
-    /// successor can be started share one derivation: `handover` replaces
-    /// this pane's child IN PLACE with it, and `dash::PaneSuccessorLauncher`
-    /// hands it to [`Pane::spawn_on_seat`] when the source is a native pane
-    /// with no child to replace. Nothing about the in-place path changed --
-    /// the same `handover::resolve_swap_launch`/`build_turn_env` seams, the
-    /// same `prompt::interactive_handoff_prompt` delivery, the same resume
-    /// rule -- it is now simply named.
-    ///
-    /// `session_id` is the identity the successor runs under: this pane's own
-    /// for an in-place swap (the conversation moves, the identity does not),
-    /// and a fresh one for a successor that is a new pane. `socket` is the
-    /// turn-signal socket that identity's child should report on -- the live
-    /// server for an in-place swap, and `StateDir::socket_for(session_id)`
-    /// (which `Pane::spawn` goes on to bind) for a fresh one.
+    /// Derive successor launch state once for both handover and recovery paths (#552).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_swap_launch(
         &self,
@@ -2986,13 +2076,7 @@ impl Pane {
         socket: Option<&Path>,
         title: String,
     ) -> CtxResult<SwapLaunch> {
-        // Whether the packet has to ride along with the resume. A swap back
-        // onto the harness this pane is ALREADY running (issue #440's
-        // source recovery) does not: that conversation holds everything the
-        // packet could only summarise, and nothing happened outside it. A
-        // swap onto a DIFFERENT harness whose conversation is being resumed
-        // is a RETURN from a park -- that conversation missed the whole
-        // interim harness's turn, so the packet is exactly what it lacks.
+        // When resuming the same harness conversation, send only role context, not a second handoff packet (#440).
         let same_harness = req.target_agent.eq_ignore_ascii_case(self.agent());
         let carries_handoff = !same_harness;
         let (new_adapter, mut extra) =
@@ -3006,15 +2090,9 @@ impl Pane {
             carries_handoff,
         );
         let new_argv: Vec<String> = {
-            // Issue #220: the same off-argv delivery `wrap`'s own restart uses
-            // -- a handover packet is multi-line too, so on a Windows `.cmd`
-            // install it was refused by `guard_cmd_shim_reparse` below and a
-            // large one could overflow the command line outright.
+            // Deliver multiline handoff text off argv so Windows command-shim reparsing cannot reject it (#220).
             let command = if resuming {
-                // Delta review: claude applies its system-prompt flag per
-                // INVOCATION, so a resumed session keeps its whole
-                // conversation but would lose zirv's role layer for the rest
-                // of its life unless this relaunch carries it again.
+                // Reapply Claude's system-prompt role layer on resume because its flag applies per invocation.
                 extra.extend(super::super::prompt::role_layer_args(
                     new_adapter.as_ref(),
                     role,
@@ -3042,8 +2120,7 @@ impl Pane {
                     };
                     new_adapter.interactive_cmd(Some(&prompt_text), &extra)
                 } else {
-                    // Issue #440's source recovery: the role layer only --
-                    // no handoff text, no positional prompt.
+                    // Source recovery carries the role layer without a new handoff packet (#440).
                     new_adapter.interactive_cmd(None, &extra)
                 }
             } else {
@@ -3066,22 +2143,8 @@ impl Pane {
                 .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
                 .collect()
         };
-        // NON-GOAL residual (2026-08-28, filed rather than silently
-        // omitted): `handover::build_turn_env` does not push the durable
-        // interactive-launch pin, so `self.launch_mode` still reads this
-        // pane's ORIGINAL spawn mode after a handover even though the
-        // successor child below never actually receives the pin either
-        // way. Out of scope for issue #160's fix round, which named exactly
-        // three call sites (`fulfill_spawn_request`, `run_dashboard`'s
-        // first pane, `restored_pane_turn_env`), all in `dash::mod`, not
-        // this one -- a pane that both underwent a handover AND survives a
-        // later dashboard restore is the only case this residual reaches.
-        // Finding #10 (issue #358 review): the successor must carry a
-        // fencing generation of its own -- see `handover::build_turn_env`'s
-        // own doc comment. `req.generation` is the PREPARED generation an
-        // automatic swap's `seat::commit` is about to promote to `Seat::
-        // generation`; a manual swap opens no transaction and never changes
-        // it, so it falls back to whatever is on disk right now.
+        // build_turn_env_at omits the interactive pin; self.launch_mode still
+        // describes the source, so it must not be taken as successor posture (#160).
         let successor_generation = req.generation.or_else(|| {
             super::super::seat::load(&self.state_dir, self.short()).map(|seat| seat.generation)
         });
@@ -3094,17 +2157,7 @@ impl Pane {
             req.target_model.as_deref(),
             successor_generation,
         );
-        // Issue #249/#250 review (Fix 3): `build_turn_env` scrubs and
-        // rebuilds the turn-signal/agent/seat-model env from scratch but has
-        // no knowledge of this pane's own parent lineage, so without this the
-        // successor child's own real process env would carry no
-        // `PARENT_SESSION_ENV` at all -- a nested `zirv ctx` call inside it
-        // (e.g. `zirv ctx inbox`) would then render this same pane's own
-        // parent's mail as ordinary peer mail, even though this dashboard's
-        // own sweep (`Pane::parent_session`, unaffected by a handover) still
-        // labels it steering. Mirrors `dash::mod::fulfill_spawn_request`'s
-        // own push of the identical pair from `verified_parent` at first
-        // spawn.
+        // Re-export server-verified parent lineage after rebuilding turn environment (#249, #250).
         if let Some(parent) = self.parent_session() {
             turn_env.push((
                 super::super::agent::PARENT_SESSION_ENV.to_string(),
@@ -3127,31 +2180,7 @@ impl Pane {
         })
     }
 
-    /// Issue #84: swaps this pane's harness/model in place, keeping its
-    /// registry short id (the same mail/nudge address) --
-    /// only the pty, the child, its job/console-close guard, the writer, the
-    /// reader channel, the vt100 screen, and the turn-signal capability/
-    /// idle-quiet knobs the new adapter carries are replaced. Mirrors
-    /// `Pane::spawn`'s own pty assembly and `wrap::quit_child`'s ask-then-
-    /// escalate shutdown of the old child; resolving the new adapter, its
-    /// argv, and its turn-signal env goes through the exact same
-    /// `handover::resolve_swap_launch`/`build_turn_env` seams
-    /// `wrap::perform_handover_swap` uses, so the two live-swap call sites
-    /// can never drift on what a swap's fresh launch actually carries. The
-    /// handoff packet is delivered by the one seam every restart shares
-    /// (`prompt::interactive_handoff_prompt` over `wrap::restart_prompt`):
-    /// through the successor's system-prompt file when it has one, and on the
-    /// bounded positional/task-prompt channel otherwise, so a target adapter
-    /// with no system-prompt mechanism at all (codex) still receives it.
-    ///
-    /// Automatic transfers stage the new child on a separate socket and
-    /// leave the source intact until `commit_handover` confirms readiness.
-    /// Manual handovers install immediately.
-    ///
-    /// The caller has already decided this is a safe moment to act (`Pane::
-    /// state() == PaneState::Idle`, or the operator's own explicit override)
-    /// before calling this -- this method itself does not gate on idleness,
-    /// the same division of responsibility `inject_visible` already follows.
+    /// Swap harness and model in place while keeping the pane's registry short ID and mail address (#84).
     pub fn handover(
         &mut self,
         cfg: &super::super::config::CtxConfig,
@@ -3161,11 +2190,7 @@ impl Pane {
         repo: &Path,
         size: (u16, u16),
     ) -> CtxResult<()> {
-        // Issue #490 (N21 item A): a handover swaps one WRAPPED harness child
-        // for another. A native pane's route moves through the runtime's own
-        // rollover (N19's `rollover::runtime`, which carries the conversation
-        // across a generation), so refusing here is the honest answer rather
-        // than silently doing nothing to a pane that has no child at all.
+        // Reject wrapped handover for native panes; native rollover belongs to the runtime (#490).
         if !matches!(self.kind, PaneKind::Wrapped(_)) {
             return Err(
                 "dashboard pane: a native pane has no harness child to hand over; its \
@@ -3231,23 +2256,7 @@ impl Pane {
         );
         super::super::mcp::launch::append(&mut new_argv, mcp_args);
 
-        // Finding #2: every fallible step for the *successor* runs first,
-        // before the old child is touched at all. Previously the old child
-        // was quit and its lifecycle released up front, so a later failure
-        // here (a missing adapter binary hitting `guard_cmd_shim_reparse`,
-        // a pty/spawn failure) left a dead pane still pinned to the
-        // dashboard's own pid with no child to show for it. Now, on any
-        // `?` below, `self` is untouched and the old child keeps running.
-        //
-        // Review round 2 (S2): the rollout floor is READ here, before the
-        // successor exists, and only WRITTEN once the swap has committed (see
-        // `forget_transcript_pin` at the end). `resolve_rollout` excludes
-        // every rollout stamped before the floor and codex writes its
-        // `session_meta` the instant it starts, so a floor taken after the
-        // spawn -- with `quit_child`'s grace, up to `QUIT_GRACE` later --
-        // would exclude the successor's OWN rollout and leave the pane blind
-        // for the rest of its life. `wrap::perform_handover_swap` floors
-        // before its own relaunch for the same reason.
+        // Complete every fallible successor step before touching the old child, so failed handover leaves the source live.
         let handover_at = super::super::state::now_secs();
         let (cols, rows) = size;
         let pair = native_pty_system().openpty(PtySize {
@@ -3281,10 +2290,7 @@ impl Pane {
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
-        // Issue #330: the successor gets the posture its predecessor had --
-        // see `Pane::spawn`'s matching call. A handover that skipped this
-        // would silently promote a worker pane back to the dashboard's own
-        // class the first time it changed harness.
+        // Give a successor the predecessor's process priority class (#330).
         if let Some(pid) = child.process_id() {
             super::super::priority::apply_to_child(pid, super::super::priority::posture_for(role));
         }
@@ -3294,7 +2300,7 @@ impl Pane {
         let mut reader = master.try_clone_reader()?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
-            // Issue #330: see `Pane::spawn`'s own reader thread.
+            // Give the successor reader the same priority as a freshly spawned pane (#330).
             super::super::priority::raise_current_thread();
             let mut buf = [0u8; 8192];
             loop {
@@ -3473,8 +2479,7 @@ impl Pane {
                 conversation,
             );
         }
-        // Persist ownership before retiring anything. A failed commit cancels
-        // only the staged child, leaving the source and all its workers alive.
+        // Commit staged ownership before retiring the source; a failed commit cancels only the successor.
         if let Err(error) = super::super::rollover::commit(
             &self.state_dir,
             "dash",
@@ -3539,15 +2544,7 @@ impl Pane {
             signal_seen,
             ..
         } = prepared;
-        // The successor is fully assembled and alive now -- only committing
-        // remains, so it is safe to retire the old child.
-        //
-        // P5 (mirrors `wrap`'s own restart/handover arm): park the record on
-        // the dashboard's own (unquestionably alive) pid for the duration of
-        // the swap, so a concurrent `sessions::list` sweep -- the
-        // dashboard's own ~1s refresh included -- can never delete this very
-        // much live pane's record while the old child is being killed and no
-        // new one exists yet.
+        // Keep the registry record while switching to the assembled successor, then retire the source.
         self.guard.adopt_child_pid(std::process::id());
         if let PaneKind::Wrapped(pty) = &mut self.kind {
             let mut writer_guard = pty
@@ -3557,37 +2554,15 @@ impl Pane {
             let sink: &mut dyn Write = &mut **writer_guard;
             wrap::quit_child(sink, &mut pty.child, &quit_sequence, QUIT_GRACE)?;
         }
-        // The old child is gone (or as gone as `quit_child` could make it),
-        // so it leaves the console-close registry and its job handle closes
-        // -- the same explicit release `shutdown` performs, except this pane
-        // is not itself ending: the new child's own guard, adopted above, is
-        // committed into this pane's new backend right below.
+        // Release the retired child's console-close guard before adopting the successor's guard.
         self.release_lifecycle();
 
         if let Some(child_pid) = child.process_id() {
             self.guard.adopt_child_pid(child_pid);
         }
 
-        // Finding #3 (issue #358 review): this pane's provider-level token
-        // reservation (`fulfill_spawn_request`'s ledger entry, settled by
-        // `account_reaped_pane_spend` on reap) is keyed to the OLD adapter's
-        // provider. Left in place, `account_reaped_pane_spend` derives its
-        // provider from `pane.agent()` -- which from here on names the NEW
-        // adapter -- so it would look the id up in the wrong provider's
-        // ledger, find nothing, and the old entry would sit "outstanding"
-        // against the old provider for the rest of this dashboard's life.
-        // Move it: release the old entry and open a fresh one on the new
-        // provider for the same token ceiling, so exactly one settle later
-        // hits the right ledger.
-        //
-        // Track C (#383) note: deliberately left on the static, name-only
-        // lookup rather than `provider_for_model` -- `Pane` retains no
-        // launched-model field of its own, and `account_reaped_pane_spend`'s
-        // own settle call (`dash/mod.rs`) resolves its provider the same
-        // name-only way from `pane.agent()`. Reserve and settle must stay on
-        // the identical resolution for one pane's whole lifecycle, so both
-        // ends of this pairing wait on `Pane` carrying its own resolved
-        // model before either can safely go per-model.
+        // Settle the source reservation before replacing its provider; reap
+        // derives provider from the successor and must not charge source tokens to it (#358).
         let old_provider =
             super::super::adapters::provider_for_agent_name(Some(&self.agent_name)).to_string();
         if let Some(old_id) = self.reservation_id.take() {
@@ -3638,11 +2613,7 @@ impl Pane {
         self.last_signal_at = signal_seen.then(Instant::now);
         self.launch_model = super::super::adapters::last_model_flag(&new_argv).map(str::to_string);
         self.measured_usage = None;
-        // A3-2: both latches belong to the CHILD, not to this pane -- the
-        // successor is a fresh child with its own fresh transcript, so it
-        // must be able to earn its own soft warning and its own HardStop
-        // grace tick. `set_budget_tokens` has always reset the pair for the
-        // same reason; a swap is the same kind of event.
+        // Reset child-scoped budget warnings and hard-stop grace for a fresh successor.
         self.budget_soft_warned = false;
         self.budget_grace_given = false;
         self.last_output_at = last_output_at;
@@ -3652,32 +2623,16 @@ impl Pane {
         self.exit_code = None;
         self.launched_at = launched_at;
         self.exited_after = None;
-        // F1/F2: the old child's pty is gone, so any deferred `\r` it was
-        // still owed would now write into the successor's composer instead
-        // -- drop it rather than carry it across the swap.
+        // Drop deferred submit from the retired PTY so its carriage return cannot reach the successor.
         self.cancel_submission();
         self.delivery_sender = None;
-        // F5 (review, PR #116): the one-shot report-back reminder is scoped
-        // to a child SESSION, not to this pane's own lifetime across a swap.
-        // A handover keeps `report_to` (the requester is still owed a
-        // report from whichever session is now running in this pane) but a
-        // successor that has not yet reported anything must be eligible for
-        // its own reminder -- unlike a restore (F3), which resurrects the
-        // SAME logical session and must therefore keep its sent flag.
+        // Reset one-shot report reminder for a new child session while retaining its report target (#116).
         self.report_reminder_sent = false;
         self.settled_mail_sent = false;
-        // Issue #468: the dedup key names a mail id in the OLD child's own
-        // inbox view; a successor has a fresh look at the mailbox, same
-        // reasoning as `report_reminder_sent` just above.
+        // Clear old-child mail dedup state when a successor takes over (#468).
         self.mail_block_log = None;
-        // R6: this pane keeps its session id across the swap, so codex's
-        // rollout pin would otherwise keep answering the retired child's file
-        // for every later usage/budget read. Dropped here, after the
-        // successor is committed and nothing below can fail: a swap that
-        // aborted earlier leaves the old child running, and its own pin with
-        // it. S2: the floor it records is `handover_at`, taken before the
-        // successor was spawned, so the successor's own rollout is never the
-        // one excluded.
+        // Clear the old Codex rollout pin only after commit; an aborted swap
+        // leaves the source running and still needs its pinned transcript.
         super::super::adapters::codex::forget_transcript_pin(
             &self.state_dir,
             self.short(),

@@ -1,19 +1,8 @@
 //! Issue #354 phase 5: attention-transition notifications.
 //!
-//! The approved design (`docs/superpowers/specs/2026-09-05-354-dashboard-
-//! design.md`, "Behaviour contract" -> Notifications) asks for exactly one
-//! compact notice when a session's *cached* status transitions into a state
-//! that owes the operator something -- `Blocked`, `Failed` or `DoneUnread` --
-//! suppressed for the pane that already has the keyboard, and deduped per
-//! `(session, attention episode)`.
-//!
-//! Everything here is pure. The reducer never reads the clock, the filesystem
-//! or the config: `now` is injected by the caller (`dash::mod`'s event loop,
-//! on the `FactsCache` cadence and only there), so an identical sequence of
-//! samples always produces an identical sequence of notices. The one impure
-//! thing a notice does -- landing in the header's transient notice channel --
-//! happens at the call site through the existing `push_notice`, so there is
-//! no new UI surface: no toast, no popup, no second row.
+//! A cached transition to `Blocked`, `Failed`, or `DoneUnread` emits one notice
+//! per attention episode, except for the focused pane (#354).
+//! The reducer takes observation time from its caller to remain pure.
 
 use std::collections::HashMap;
 
@@ -88,11 +77,8 @@ fn decorate(word: &str, reason: &str, generic: &str) -> String {
 
 /// One attention-cache sample for one session, as the reducer sees it.
 ///
-/// `previous` is the projection the PREVIOUS cache refresh saw, `None` for a
-/// session this reducer has never sampled (the dashboard's very first tick,
-/// or a pane that has just appeared). Both projections come from the same
-/// `attention::project` the sidebar's glyph column uses, so a notice can
-/// never describe a state the row does not show.
+/// Both projections come from `attention::project` so notices match the row;
+/// `None` means the session has not been sampled yet.
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionSample<'a> {
     pub short: &'a str,

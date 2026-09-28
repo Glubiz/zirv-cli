@@ -1,14 +1,7 @@
 //! Pointer ownership over the geometry of the last completed draw.
 //!
-//! Issue #354 gave the dashboard clickable chrome. Every pointer event is
-//! resolved here, against a [`FrameSnapshot`] captured when that frame was
-//! drawn -- never against the live layout, which may already have moved on by
-//! the time the event is read. The module is deliberately pure: no frame, no
-//! terminal, no clock, so the whole of "what did the operator just click on"
-//! is testable as a function of two integers.
-//!
-//! The dispatch that acts on a [`Hit`] lives in `dash::route_mouse`; this only
-//! answers *what is there*.
+//! Resolve pointer events against the drawn [`FrameSnapshot`], since the live
+//! layout may have changed before the event is read (#354).
 use crossterm::event::KeyCode;
 use ratatui::layout::{Position, Rect};
 
@@ -29,11 +22,9 @@ pub enum HintId {
     Nudge,
     Mail,
     Errors,
-    /// `^A i` -- the per-session inspector (phase 3).
+    /// `^A i` -- the per-session inspector.
     Inspect,
-    /// `^A r` -- relaunch an ended/reaped row from the spawn request the
-    /// dashboard kept for it (phase 3). Only ever drawn for a row that can
-    /// actually be restored; see `ui::HintContext::restorable`.
+    /// `^A r` -- relaunch a restorable row from its retained spawn request.
     Restore,
     Help,
     /// A hint on an OPEN DIALOG's own pinned hint row (`⏎ open`, `esc back`,
@@ -138,17 +129,8 @@ pub struct FrameSnapshot {
 
 /// Pure: what `(x, y)` landed on in the frame `snap` describes.
 ///
-/// Order is the behaviour contract's own layering, outside in: outside the
-/// frame owns nothing; an open overlay owns the entire frame (its own hint
-/// row, its own visible rows, the rest of itself, and the backdrop around
-/// it); then the chrome, nearest-drawn first -- header hints, roster entries,
-/// divider -- and finally the grid.
-///
-/// Phase 3 refines the phase-1 "an overlay consumes everything" rule: the
-/// dialog's own targets are addressable (`OverlayHint` first, since a hint
-/// span sits inside the dialog rect, then `OverlayRow`), everything else
-/// inside it is `Overlay` and everything outside it is `ModalBackdrop` --
-/// both still consumed, neither ever reaching the child.
+/// An open overlay owns the frame: its hint and rows are addressable, while
+/// its backdrop consumes events before they can reach the child (#354).
 pub fn hit_test(snap: &FrameSnapshot, x: u16, y: u16) -> Hit {
     let point = Position::new(x, y);
     let contains = |rect: Rect| !rect.is_empty() && rect.contains(point);

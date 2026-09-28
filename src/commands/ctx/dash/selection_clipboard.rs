@@ -1,15 +1,7 @@
 //! Terminal text selection and OSC 52 clipboard copy.
 use super::*;
 
-/// One informational, auto-expiring header notice: its text and the instant it
-/// stops being shown.
-///
-/// L13: distinct from the sticky `errors` channel (which the header renders
-/// behind a `⚠`). Informational pushes -- "spawned claude as …", "nudge
-/// queued …", "nudge received …" -- used to go through the error channel,
-/// where nothing ever cleared them, so they pinned behind a warning glyph for
-/// the rest of the session. A notice reads as plain text and disappears on its
-/// own a few seconds later.
+/// Informational notices expire; sticky errors remain visible after a notice clears.
 pub(super) struct Notice {
     pub(super) text: String,
     expires_at: Instant,
@@ -86,20 +78,7 @@ pub(super) fn pane_local_mouse(area: Rect, column: u16, row: u16) -> (u16, u16) 
     (col, row)
 }
 
-/// Pure: a frame-relative mouse position translated into the pane's own
-/// visible-grid cell -- 0-based `(row, col)`, in exactly the coordinate space
-/// `vt100::Screen::cell`/`contents_between` use, which already accounts for
-/// the pane's scrollback offset (`Pane::screen`'s own doc comment). The
-/// selection counterpart of [`pane_local_mouse`], which produces the 1-based
-/// xterm-protocol coordinates a *forwarded* mouse report needs instead --
-/// this one is never sent to a child, only used to index the pane's own
-/// grid.
-///
-/// Clamped into the pane's actual grid size (`grid_rows`/`grid_cols`) as
-/// well as `area`: the two are expected to agree (a pane is resized to its
-/// rendered area), but a resize race should degrade to "clamped to the last
-/// known grid" rather than indexing past it. `None` only for a grid that
-/// cannot be indexed at all (zero rows or columns, or an empty area).
+/// Return a zero-based visible-grid cell, clamped to both pane and area size to tolerate resize races.
 pub(super) fn pane_local_cell(
     area: Rect,
     column: u16,
@@ -131,37 +110,7 @@ pub(super) fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), 
     if a <= b { (a, b) } else { (b, a) }
 }
 
-/// A pane-local text selection dragged out with the mouse: the `?1002`
-/// `Drag` events `term::dash_mouse_on_bytes` now enables let the dashboard
-/// offer tmux-style click-drag selection in place of the terminal's own
-/// native one, which enabling any mouse reporting displaced. Issue #697
-/// removed the `!Pane::wants_mouse` gate this used to carry -- the dashboard
-/// now owns click-drag inside every pane, including one whose child has
-/// turned on its own mouse reporting (a plain click still reaches such a
-/// child; see `PendingPress`, which is what decides click from drag before
-/// either a `Selection` or a forwarded click exists).
-///
-/// `anchor`/`end` are 0-based visible-grid `(row, col)` cells, in whichever
-/// order the drag actually went (not yet normalized -- `normalize_selection`
-/// does that at read time, so a drag that moved up or left works the same as
-/// one that moved down or right). `row` is signed and deliberately never
-/// clamped here: they are only meaningful against the pane's scrollback
-/// offset at the moment each was captured (`Pane::screen`'s own doc comment:
-/// `vt100::Screen::cell`/`contents_between` both reinterpret a `(row, col)`
-/// against whatever is presently scrolled into view), and issue #697 asked
-/// for scrolling and selecting to work at the same time -- so rather than
-/// cancelling outright the moment that offset moves, `translate_selection`
-/// shifts `anchor`/`end` by exactly the same delta the scroll just applied
-/// to the pane, keeping them exact. A translated row that has been pushed
-/// above row `0` or past the pane's last row genuinely is off-screen right
-/// now (nothing to highlight, nothing in range to copy from), but the true
-/// value is what a later scroll back the other way needs to land on the
-/// right cell again -- `resolve_selection_range` is the one place that
-/// clamps, and only once something is about to actually index the grid.
-/// `pane_short` names the pane the selection belongs to, not a `panes`
-/// index: an index shifts under a reap (`reap_fixup`), while a short id
-/// still names the same pane or plainly does not match any more, which is
-/// all a stale-selection check needs.
+/// Selection coordinates track the visible grid with signed rows so scrolling can move a selection off-screen and back; pane identity uses a stable short ID (#697).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Selection {
     pub(super) pane_short: String,
@@ -169,16 +118,7 @@ pub(super) struct Selection {
     pub(super) end: (i64, u16),
 }
 
-/// A left press inside a pane's grid whose fate -- a click forwarded to the
-/// child, or a drag that becomes zirv's own [`Selection`] -- is not yet
-/// decided. Issue #697's own click-vs-drag deferral: a plain click must
-/// still reach a harness TUI waiting for one (a button in the Claude Code or
-/// Codex TUI), so a press cannot simply become a selection the instant it
-/// lands the way it used to for a pane the child did not want the mouse on.
-/// Cleared the moment the fate is decided -- promoted into a `Selection`
-/// once the pointer moves past [`DRAG_THRESHOLD_CELLS`] (`past_drag_
-/// threshold`), or replayed as a forwarded press-then-release on an
-/// unmoved-enough `Up` -- so it never lives longer than one gesture.
+/// Defer a left press until movement distinguishes a drag from a click that must reach the child (#697).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingPress {
     pub(super) pane_short: String,
@@ -197,31 +137,17 @@ pub(super) struct PendingPress {
     pub(super) anchor_cell: (u16, u16),
 }
 
-/// How far the pointer must move from a left press, in either axis, before
-/// it counts as a drag rather than a click -- issue #697's own number. A
-/// real mouse routinely reports a cell or so of jitter between a `Down` and
-/// the `Up` that follows it with no drag intended at all, and that jitter
-/// must still forward as a plain click to a harness TUI waiting for one.
+/// Allow small pointer jitter so an ordinary click still reaches the child (#697).
 pub(super) const DRAG_THRESHOLD_CELLS: u16 = 1;
 
-/// Pure: whether a pointer that pressed at `(from_col, from_row)` has moved
-/// far enough, now that it is at `(to_col, to_row)`, to count as a drag
-/// rather than a click -- strictly more than [`DRAG_THRESHOLD_CELLS`] in
-/// either axis. `abs_diff` rather than subtraction: the drag can go in any
-/// direction, and only the magnitude of the move matters here.
+/// Use absolute axis distance so dragging backward cannot underflow; small
+/// motion remains a child click rather than a selection.
 pub(super) fn past_drag_threshold(from_col: u16, from_row: u16, to_col: u16, to_row: u16) -> bool {
     from_col.abs_diff(to_col) > DRAG_THRESHOLD_CELLS
         || from_row.abs_diff(to_row) > DRAG_THRESHOLD_CELLS
 }
 
-/// Pure: the `Selection` a `PendingPress` promotes into, once
-/// `past_drag_threshold` has said this is a drag rather than a click.
-/// `end_cell` is the pane-local cell the pointer is over NOW (already
-/// clamped into the grid by `pane_local_cell`); the anchor is exactly where
-/// the button went down, from `pending.anchor_cell`, never wherever the
-/// drag was first observed to have crossed the threshold. Pulled out of the
-/// event loop so the click-vs-drag promotion is unit-tested without a live
-/// `Pane` or a real terminal.
+/// Anchor a promoted drag at the original press, not where it crossed the threshold.
 pub(super) fn promote_pending_drag(pending: PendingPress, end_cell: (u16, u16)) -> Selection {
     Selection {
         pane_short: pending.pane_short,
@@ -252,13 +178,7 @@ pub(super) fn deferred_click_coords(
     )
 }
 
-/// Pure: which direction, if any, dragging the pointer to frame row `row`
-/// while `main` is the focused pane's own rect should auto-scroll that pane
-/// by -- issue #697's "dragging past the top or bottom edge auto-scrolls"
-/// requirement. `Some(1)` (further back into history, the same sign
-/// `Pane::scroll_by`'s own `delta` already uses) once the pointer is above
-/// the grid's top edge, `Some(-1)` (back toward live) once it is at or past
-/// the bottom edge, `None` anywhere inside it.
+/// Dragging beyond the pane's top or bottom edge scrolls history in that direction (#697).
 pub(super) fn drag_autoscroll_direction(main: Rect, row: u16) -> Option<isize> {
     if main.is_empty() {
         return None;
@@ -272,28 +192,7 @@ pub(super) fn drag_autoscroll_direction(main: Rect, row: u16) -> Option<isize> {
     }
 }
 
-/// Shifts `selection`'s anchor and end by `delta` rows -- the amount
-/// `scrolled_pane_short`'s scrollback offset just moved by -- if the
-/// selection belongs to that pane and there is anything to shift. Replaces
-/// the old `scroll_cancels_selection`: issue #697 asked for scrolling and
-/// selecting to work at the same time, and a `Selection`'s `(row, col)` is
-/// only meaningful against the offset it was captured at (`Pane::screen`'s
-/// own doc comment on `cell`/`contents_between`), so a scroll has to move
-/// the selection's own coordinates by the same amount it just moved the
-/// pane's, not throw the selection away.
-///
-/// Applying this once per actual scroll -- every `Pane::scroll_wheel`/
-/// `scroll_by`/`scroll_page`/`scroll_to_top`/`scroll_to_live` call site, plus
-/// the drag-past-the-edge auto-scroll below -- ends up exactly equivalent to
-/// storing the offset the anchor was captured at once and re-deriving
-/// `anchor_row + (current_offset - captured_offset)` at read time: the sum
-/// of every incremental delta along the way IS that same total delta,
-/// addition being associative. Nothing here needs to remember the original
-/// offset at all, only apply each move as it happens -- which is also why
-/// `Selection` itself carries no offset field of its own.
-///
-/// `row` is left free to go negative or past the pane's own `grid_rows` (see
-/// `Selection`'s own doc comment on why); this never clamps.
+/// Shift selection rows by every scroll delta; leave off-screen rows unclamped so scrolling back restores the same cells (#697).
 pub(super) fn translate_selection(
     selection: &mut Option<Selection>,
     scrolled_pane_short: &str,
@@ -336,23 +235,7 @@ pub(super) fn resolve_selection_range(
     normalize_selection(a, b)
 }
 
-/// The exact text `sel` currently resolves to on `screen` -- the same
-/// `resolve_selection_range` + `contents_between` pair the release-time copy
-/// already runs (see that call site). Reading this once before a pane's
-/// output is drained and again after is how the call site of
-/// `output_cancels_selection` tells "this pane produced output" apart from
-/// "output landed on the rows this selection actually covers", without a
-/// full-screen diff -- the cost is proportional to the selection's own
-/// height, not the screen's.
-///
-/// `None` when any part of `sel` is off-screen right now: `resolve_selection_
-/// range` CLAMPS such a selection to the visible grid, so a snapshot of it
-/// would compare only the visible part and silently ignore changes to the
-/// rest. `translate_selection` keeps the true (unclamped) rows for exactly
-/// the case where the operator scrolls that part back into view later, and a
-/// copy then would take whatever now sits at those coordinates -- so an
-/// off-screen selection must fall back to the unconditional cancel this
-/// comparison exists to avoid, rather than be compared on a partial view.
+/// Snapshot only fully visible selected text; a partial off-screen comparison could miss changed rows and copy stale content.
 pub(super) fn selection_snapshot(screen: &vt100::Screen, sel: &Selection) -> Option<String> {
     let (rows, cols) = screen.size();
     let fully_visible = [sel.anchor.0, sel.end.0]
@@ -365,31 +248,8 @@ pub(super) fn selection_snapshot(screen: &vt100::Screen, sel: &Selection) -> Opt
     Some(screen.contents_between(start.0, start.1, end.0, end.1))
 }
 
-/// Pure: whether newly processed child output on `output_pane_short` is even
-/// a CANDIDATE for cancelling `selection` -- the pane-identity half of the
-/// check. The call site pairs a `true` here with `selection_snapshot`,
-/// before and after the drain, to decide for real.
-///
-/// The unifying invariant behind this and `resize_cancels_selection` is that
-/// a `Selection`'s `(row, col)` coordinates only stay meaningful while the
-/// pane's *visible content* is static -- the reason a scroll no longer
-/// cancels (`translate_selection` keeps it exact instead) is precisely that
-/// a scroll does not change what any given row's content IS, only which row
-/// it is currently drawn at. New output has no such invariant to lean on in
-/// general: new rows scroll the old ones up under the very coordinates a
-/// selection is still using, and a release after that would copy whatever
-/// text now happens to sit there, not what the operator dragged over.
-///
-/// A busy pane -- a streaming response, a prompt redrawing its own status
-/// line -- produces output on nearly every tick, though, almost always far
-/// from whatever is actually selected. Cancelling on every one of those
-/// ticks regardless left a drag that spans more than a single tick unusable
-/// on exactly the panes an operator most wants to copy from: the highlight
-/// would not survive past the tick it started in. Comparing the selection's
-/// own rows before and after (`selection_snapshot`, at the call site) costs
-/// only as much as the selection is tall, so paying it is no longer the
-/// full-screen diff this used to not be worth. Output on a *different* pane
-/// leaves the selection alone regardless.
+/// Cancel only when output changes selected rows: stale coordinates would
+/// otherwise copy text the operator never highlighted.
 pub(super) fn output_cancels_selection(selection: &Selection, output_pane_short: &str) -> bool {
     selection.pane_short == output_pane_short
 }
@@ -440,12 +300,7 @@ pub(super) fn cancel_selection_on_resize(
     }
 }
 
-/// Pure: what releasing the left button does to an in-progress selection --
-/// keep it (now highlighted, with its text copied) or drop it as a bare
-/// click. `Down` then `Up` with no `Drag` in between leaves `end == anchor`,
-/// and a click must never copy: that is the one invariant every terminal's
-/// own native selection already honours, and the operator's expectation
-/// carries straight over.
+/// A bare click has no selection and must not copy text.
 pub(super) fn selection_on_release(sel: Selection) -> (Option<Selection>, bool) {
     if sel.end == sel.anchor {
         (None, false)
@@ -556,16 +411,7 @@ pub(super) fn trim_trailing_whitespace_per_line(text: &str) -> String {
 /// One external clipboard command to try, and the argv it needs.
 type ClipboardCommand = (&'static str, &'static [&'static str]);
 
-/// Which external clipboard command a fallback copy tries on this platform,
-/// in order -- the first one that spawns and accepts the write wins. OSC 52
-/// (`copy_to_host_clipboard`) is silently ignored by some terminals (macOS
-/// Terminal.app is the one on record -- issue #697) with no way for this
-/// dashboard to learn that from the write alone, so the fallback always runs
-/// alongside it rather than only once OSC 52's own write has errored (see
-/// `copy_selection`). `wl-copy` before `xclip` on Linux: a Wayland session
-/// has no X server for `xclip` to reach, so trying the X tool first would
-/// cost every Wayland copy a doomed spawn attempt before falling through to
-/// the one that actually works.
+/// Run platform clipboard fallback even after a successful OSC 52 write, since some terminals silently ignore it; prefer Wayland's wl-copy before X11's xclip (#697).
 pub(super) fn fallback_clipboard_commands() -> &'static [ClipboardCommand] {
     if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
@@ -617,11 +463,7 @@ pub(super) fn spawn_and_write_clipboard(
     }
 }
 
-/// Pure with respect to `spawner`: tries `commands` in order against `text`,
-/// stopping at the first one that succeeds. `false` only when every command
-/// in the list failed (missing from `$PATH`, or rejected the write) -- the
-/// one case [`copy_selection`] must eventually tell the operator the copy
-/// did not land, since silent loss is exactly what issue #697 is about.
+/// Try clipboard commands in order and report failure only if every command fails (#697).
 pub(super) fn copy_via_fallback(
     spawner: &ClipboardSpawner<'_>,
     commands: &[ClipboardCommand],
@@ -706,10 +548,7 @@ pub(super) fn copy_selection(text: String, result_tx: &mpsc::Sender<ClipboardOut
     }
 }
 
-/// Pure: the most recent notice still live as of `now`, if any. The header
-/// prefers a live notice over the sticky error line, so the latest action's
-/// confirmation is what the operator sees while it is fresh; once it expires
-/// the underlying error (if any) shows through again.
+/// Prefer a live transient notice over a sticky error, which reappears when the notice expires.
 pub(super) fn live_notice(notices: &[Notice], now: Instant) -> Option<&str> {
     notices
         .iter()

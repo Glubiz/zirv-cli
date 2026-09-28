@@ -7,9 +7,8 @@
 //! keystroke, whether it goes straight to the active pane's child or gets
 //! swallowed as a dashboard command behind the `Ctrl+A` prefix.
 //! `chat.rs::run_with` calls `run_dashboard` once `chrome::dash_eligible`
-//! says the terminal can carry it (Task 6); every ineligible terminal
-//! (`--simple`, non-terminal stdio, too small, or the dashboard turned off
-//! in config) still reaches today's `wrap::run_with` passthrough instead.
+//! says the terminal can carry it; ineligible terminals (`--simple`, non-terminal
+//! stdio, too small, or dashboard disabled) use `wrap::run_with` passthrough.
 
 pub mod actions;
 pub mod hit;
@@ -98,8 +97,7 @@ pub(crate) use spawn_policy::{
 };
 pub(crate) use terminal_turn::build_turn_env;
 
-/// The one dashboard prefix key, `Ctrl+A`. Not configurable in v1 (recorded
-/// as a deliberate spec deviation in the plan's self-review: YAGNI).
+/// Ctrl+A is the dashboard prefix key.
 pub const PREFIX: (KeyModifiers, KeyCode) = (KeyModifiers::CONTROL, KeyCode::Char('a'));
 
 #[allow(clippy::too_many_arguments)]
@@ -175,21 +173,13 @@ fn run_dashboard_inner(
     first_workflow_id: Option<String>,
 ) -> CtxResult<i32> {
     let mut errors = ErrorLog::default();
-    // Issue #354 phase 5: what the dashboard-level inspector reports as
-    // `uptime`. Taken before any setup so it measures the session, not the
-    // event loop.
+    // Start uptime before setup so it includes startup work (#354).
     let launched_at = Instant::now();
 
-    // Issue #319, design item 4: a conservative startup GC of any `--worktree`
-    // trees this repo's own dead sessions left behind. Best-effort and never
-    // fatal to the dashboard itself -- the same never-make-it-worse posture
-    // the owner-pid write just below already holds to.
+    // Reclaim worktrees owned by dead sessions at startup without blocking dashboard launch (#319).
     let _ = super::worktree::gc(state, repo, &sessions::is_alive, cfg.worktree.idle_ttl_secs);
 
-    // Mutable, and kept current by the `Event::Resize` arm below (F6): the
-    // zoom handler resizes every pane against `full`, so a `full` frozen at
-    // startup would restore panes to the terminal's *launch* geometry after
-    // any resize rather than to what it is now.
+    // Keep terminal geometry current for zoom and pane resizing.
     let (mut term_cols, mut term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // Dash refresh PR1: below 100 total columns the session column hides
     // (`ui::sidebar_hidden`) -- `^A b` forces it back regardless of width.
@@ -216,21 +206,7 @@ fn run_dashboard_inner(
         None => agent_name.clone(),
     };
     let session_id = first.session_id.clone();
-    // Issue #147 amendment: the dashboard's own first (orchestrator) pane is
-    // unconditionally the human-attended session the operator is looking
-    // at -- the same fact `dash_orchestrator_pane`'s hardcoded `LaunchMode::
-    // Interactive` already encodes for this pane's own `policy_launch_args`
-    // call -- so the durable interactive-launch pin is always set here,
-    // never conditioned on a request that does not exist for this pane.
-    // Issue #160 finding 2 (2026-08-28): `build_turn_env` itself now pushes
-    // the pin from the `LaunchMode` passed in, so this call site no longer
-    // pushes it separately.
-    // Issue #490 (roadmap N21 item A): a native first pane spawns no child
-    // process at all, so there is no environment to build for one -- and
-    // resolving a wrapped adapter for `native` would only produce a spurious
-    // error line. Everything below this that a native pane DOES need (the
-    // spawn-request channel, the owner pid, the restore roster) is built the
-    // same way either way.
+    // Treat the first dashboard pane as human-attended for launch policy (#147).
     let prebuilt_native = first_prebuilt.as_ref().is_some_and(Pane::is_native);
     let (mut turn_env, turn_env_err) = if first_native.is_some() || prebuilt_native {
         (Vec::new(), None)
@@ -266,21 +242,14 @@ fn run_dashboard_inner(
     // Issues #328/#334: which seat role this pane runs as, for the same
     // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(super::adapters::seat_role_env(first.role));
-    // Issue #753: `chat::run_dash_branch` answers this key for a
-    // proxy-decided launch; the first pane's hook then skips intake.
+    // Skip hook intake for a proxy-decided launch already handled by the chat branch (#753).
     if env(super::adapters::PROXY_DECIDED_ENV).as_deref() == Some("1") {
         turn_env.push((
             super::adapters::PROXY_DECIDED_ENV.to_string(),
             "1".to_string(),
         ));
     }
-    // Issue #358 (task 5): the seat's fencing generation, so a session an
-    // automatic rollover later supersedes refuses to keep coordinating
-    // (`seat::fence`). The seat itself is registered by `Pane::spawn` below,
-    // which cannot run before this vector exists -- so the generation is read
-    // from whatever record this address already carries (an earlier
-    // dashboard's, restored across a crash), defaulting to the `1` a fresh
-    // `seat::register` is about to create.
+    // Fence automatic rollover by seat generation so a superseded session cannot keep coordinating (#358).
     if first.role == prompt::PromptRole::Orchestrator {
         let generation = super::seat::load(state, &sessions::short_id(&session_id))
             .map(|seat| seat.generation)
@@ -291,11 +260,7 @@ fn run_dashboard_inner(
         ));
     }
 
-    // Task 10: the spawn-request channel. `dashboard_short` is derivable
-    // before any pane has actually spawned -- `Record::new`'s own `short`
-    // field is exactly `sessions::short_id(session)` -- so even the very
-    // first (orchestrator) pane's turn_env can already carry the request
-    // directory, the same as every pane spawned later through a request.
+    // Create the request channel before panes spawn; the dashboard short ID is already known.
     let dashboard_short = sessions::short_id(&session_id);
     let requests_token = spawn_token();
     let requests_dir = spawnreq::request_dir_for(state, &dashboard_short, &requests_token);
@@ -305,32 +270,13 @@ fn run_dashboard_inner(
             format!("dashboard: could not create the spawn-request directory: {e}"),
         );
     }
-    // Security review Finding 1: the orchestrator pane gets its own channel
-    // too -- the operator's own seat is exactly the identity a worker pane
-    // most wants to speak as, so it must be the one identity a worker pane
-    // cannot borrow. Its requests then arrive already attributed to it, which
-    // is what lets it legitimately mint sub-orchestrators.
+    // Give the orchestrator its own request channel so workers cannot claim its identity.
     let first_pane_channel = mint_pane_channel(&requests_dir, &mut errors);
     turn_env.push((
         spawnreq::DASH_REQUESTS_ENV.to_string(),
         first_pane_channel.display().to_string(),
     ));
-    // CROSS-CUTTING: the owner-pid file. `nested_session_evidence` reads it to
-    // tell a live dashboard from a token dir a crashed one leaked; without it,
-    // a leaked dir (plus a surviving pane's inherited `ZIRV_CTX_DASH_REQUESTS`)
-    // would wedge every future `zirv chat`. Written right after the dir exists
-    // and the env is set; removed with the whole token dir on a clean quit.
-    //
-    // Fix round 1 (issue #144, codex): before `agent::try_join_dashboard`
-    // gained its own liveness gate, a failed write here was harmless -- the
-    // directory alone was enough for a request to be joined. Now it means
-    // "no `zirv ctx agent`/`zirv agent` invocation can ever join this
-    // dashboard", silently, for this dashboard's entire lifetime. Never
-    // fatal to the dashboard itself (never-make-it-worse: a dashboard that
-    // works but cannot be joined beats one that failed to start at all over
-    // a write it does not strictly need to run), but the operator has to be
-    // told, the same way the directory-creation failure just above already
-    // is.
+    // Record the owner PID so leaked token directories cannot masquerade as live dashboards.
     if let Err(e) = super::state::write_private(
         &spawnreq::owner_pid_path(&requests_dir),
         &std::process::id().to_string(),
@@ -344,19 +290,10 @@ fn run_dashboard_inner(
             ),
         );
     }
-    // And clear any sibling token dirs a previously-crashed dashboard left
-    // whose owner pid is no longer alive (best-effort). Our own dir, whose pid
-    // we just wrote and is alive, is never swept.
+    // Remove dead sibling token directories while keeping this launch's own directory.
     sweep_stale_token_dirs(state);
 
-    // T10: the same launch-time pacing gate `wrap::run_with` now applies,
-    // reused here for the orchestrator's own first pane -- this is the one
-    // dashboard spawn point that is genuinely safe to block interactively:
-    // it runs before `enable_raw_mode`/`EnterAlternateScreen` below, so
-    // there is no live dashboard input loop yet for a blocking `crossterm`
-    // keypress read to collide with. `fulfill_spawn_request` (worker panes
-    // spawned *during* the live loop) cannot reuse this same blocking
-    // treatment and uses the advisory spawn gate instead.
+    // Apply the interactive pacing gate before spawning the first orchestrator pane.
     if first_prebuilt.is_none() {
         // The `SEAT_MODEL_ENV` `seat_model_env` just pushed onto `turn_env`
         // above -- this pane's own resolved model, for the same reason
@@ -367,22 +304,12 @@ fn run_dashboard_inner(
             .map(|(_, value)| value.as_str());
         let provider =
             super::adapters::provider_for_agent_and_model(Some(&agent_name), first_pane_model);
-        // Before raw mode / the dashboard's own event loop starts (see the
-        // comment above), so a blocking keypress read here cannot collide
-        // with anything -- this is the one dashboard spawn point that may
-        // keep a live poller (`poll: true`), unlike `fulfill_spawn_request`.
+        // Read the pacing response before the dashboard event loop begins reading stdin.
         let gate = super::pace::interactive_gate(state, cfg, provider, true);
         super::wrap::apply_interactive_gate(gate, force_pace)?;
     }
 
-    // Issue #489 (issue #352's PTY-ownership residual): with `[session]
-    // persistent` on and a runtime listening, the terminals belong to the
-    // SERVICE. The dashboard becomes a protocol client of it rather than
-    // opening a second pty over a session that already has a supervisor --
-    // two supervisors on one conversation is exactly what the runtime exists
-    // to prevent. The link is dropped straight away here: it is the ownership
-    // question that matters at this point, and painting a runtime-owned
-    // session inside the dashboard is step N11 (#480).
+    // Refuse a competing dashboard PTY when the persistent runtime already owns this seat (#489).
     if first_prebuilt.is_none()
         && let Some(mut link) = link::RuntimeLink::connect(state, cfg.session.persistent)
     {
@@ -401,15 +328,7 @@ fn run_dashboard_inner(
     }
 
     let size = (main.width.max(1), main.height.max(1));
-    // O7: the request directory exists from here on, so the one startup step
-    // that can still fail outright owes it the same cleanup every other exit
-    // path performs. Before this, a first pane that would not spawn left
-    // `<state>/dash/<short>-<token>/` behind on every attempt.
-    // Issue #490 (roadmap N21 item A): `zirv chat --runtime native` opens its
-    // conversation as the FIRST PANE of the ordinary dashboard rather than in
-    // a loop of its own, so the header, the sidebar, the roster, the mail
-    // sweep, the spawn channel and every other dashboard surface apply to it
-    // unchanged -- and a second, wrapped pane can be spawned beside it.
+    // Clean up the request directory if startup fails after creating it.
     let first_spawn = match first_prebuilt {
         Some(pane) => Ok(pane),
         None => match first_native {
@@ -472,12 +391,7 @@ fn run_dashboard_inner(
     // its own stashes nothing and still starts.
     let _ = term::stash_current_console();
     let _ = term::install_console_restore_handler();
-    // Issue #330: from here on this thread IS the dashboard -- it reads the
-    // operator's keys and paints every frame -- so it is raised above the
-    // below-normal build work the panes it supervises are running. The
-    // dashboard's own PROCESS class stays untouched (see `priority::Posture`):
-    // a worker pane's child is lowered individually at its spawn, precisely
-    // so this UI never has to lower itself to lower them.
+    // Raise dashboard thread priority while it owns input and frame rendering (#330).
     super::priority::raise_current_thread();
     if let Err(e) = enable_raw_mode() {
         abort_setup(&mut panes, cfg, &requests_dir);
@@ -498,35 +412,7 @@ fn run_dashboard_inner(
     // on every exit arm below.
     term::set_dash_active(true);
 
-    // Mouse reporting, which is what makes the wheel scroll a pane's
-    // scrollback, a click reach a child that wants one, and a click-drag
-    // select text out of any pane -- issue #697: the dashboard owns
-    // click-drag selection everywhere now, deferring a press just long
-    // enough to still forward a plain click to a child that wants one
-    // (`Event::Mouse` below, `PendingPress`).
-    //
-    // Written as raw bytes from `term::dash_mouse_on_bytes` rather than
-    // through crossterm's `EnableMouseCapture`, on purpose: that helper also
-    // turns on `?1003`, the free-running any-motion mode, and a probe on a
-    // real Windows Terminal session showed it emitting a
-    // `MouseEventKind::Moved` event for every pointer movement -- dozens from
-    // one sweep across the window, with no button ever held. Those would land
-    // in the same bounded per-tick input drain the operator's keystrokes do
-    // (`MAX_INPUT_DRAIN_PER_TICK`), competing with the keyboard for a mode
-    // nothing here reads. See `term::dash_mouse_on_bytes` for the full
-    // reasoning -- including why `?1002`, the *button*-drag mode, is turned
-    // on despite the same competing-with-the-keyboard concern -- before
-    // changing this.
-    //
-    // Best-effort: a terminal that will not report mouse events still has
-    // `Ctrl+A PageUp`/`Home`, so a failure here is a header notice, never a
-    // failed launch. Undone by `term::dash_reset_bytes` on every exit path --
-    // the ordinary teardown, the panic hook and the external-kill handler
-    // alike -- so it cannot be left switched on. Issue #697 removed the
-    // mid-session `Ctrl+A v` toggle that used to be able to turn it back off
-    // again (`term::dash_mouse_off_bytes`, now gone): once this is on for a
-    // session, it stays on for the session, and `dash.mouse` (checked below)
-    // is the only on/off switch left, decided once, here, at startup.
+    // Enable drag and wheel mouse reporting without motion-only flood.
     if cfg.dash.mouse {
         let mut stdout = io::stdout();
         if let Err(e) = stdout
@@ -540,13 +426,7 @@ fn run_dashboard_inner(
         }
     }
 
-    // Kitty keyboard enhancement: negotiated here, after raw mode/the
-    // alternate screen/mouse reporting are all up and before anything below
-    // starts reading stdin (the event loop, further down, is the first --
-    // see `push_keyboard_enhancement`'s own doc comment for why that
-    // ordering is load-bearing, not incidental). `keyboard_enhancement_pushed`
-    // is threaded through every `teardown_terminal` call from here on so the
-    // matching pop only ever fires when the push actually happened.
+    // Negotiate keyboard enhancement before the input loop reads stdin.
     let keyboard_enhancement_pushed = push_keyboard_enhancement();
 
     // Task 2: the opt-in input diagnostic. `None`, and entirely inert, unless
@@ -572,22 +452,7 @@ fn run_dashboard_inner(
         }
     };
 
-    // Task 12: offer back whatever this repo's previous quit left behind,
-    // once -- a fresh roster within `cfg.dash.roster_max_age_secs` becomes the
-    // startup restore dialog below; anything else (absent, stale, already
-    // offered to some earlier launch) leaves `overlay` at its usual
-    // `Overlay::None` start. The orchestrator entry is filtered out here, not
-    // later: the `first` pane spawned above already *is* this dashboard's
-    // orchestrator, so respawning a roster's own orchestrator entry would
-    // duplicate it.
-    //
-    // R9: deliberately AFTER the terminal is claimed, not before. `take_roster`
-    // consumes the roster on read (read-once, by design), so running it ahead
-    // of `enable_raw_mode`/`EnterAlternateScreen`/`Terminal::new` meant any of
-    // those three failing threw the roster away without ever offering it --
-    // the operator lost the restore outright and the next launch found
-    // nothing. There is nothing to draw before the loop starts anyway: the
-    // dialog is rendered from inside it.
+    // Offer a fresh consumed roster once at startup.
     let repo_slug = super::state::repo_slug(repo);
     let taken_candidates: Vec<roster::RosterPane> = roster::take_roster(
         state,
@@ -597,13 +462,7 @@ fn run_dashboard_inner(
     )
     .map(restorable_candidates)
     .unwrap_or_default();
-    // P4: a roster says what the *previous* dashboard owned, not what is dead.
-    // A dashboard that was killed rather than quit left both a roster and, on
-    // Windows before the job-object backstop, genuinely live pane agents --
-    // and restoring one of those spawns a second agent onto a conversation the
-    // first is still holding. Any candidate whose registry record still names
-    // a live process is skipped, and the skip is announced rather than
-    // silently swallowed: "my pane did not come back" needs a reason attached.
+    // Filter live roster sessions before offering restoration, avoiding duplicate agents.
     let (restore_candidates, still_live) = roster::partition_live(taken_candidates, &|short| {
         super::sessions::short_is_live(state, short)
     });
@@ -614,104 +473,44 @@ fn run_dashboard_inner(
     // names a pane. See `apply_navigation`.
     let mut selected: usize = 0;
     let mut focused: usize = 0;
-    // Issue #354's own sidebar state. `sidebar_offset` is the roster's
-    // viewport, which the wheel moves without touching the selection;
-    // `chrome_selection` holds the cursor while it is on the summary line or
-    // a group header rather than a session row; `collapsed_groups` is which
-    // work groups are folded shut; `frame_snapshot` is the geometry of the
-    // last frame that actually drew, which every pointer event is resolved
-    // against; `reveal_sidebar` asks the next frame to bring the selection
-    // back into the viewport after a keyboard navigation.
+    // Keep sidebar viewport scroll independent of the selected row (#354).
     let mut sidebar_offset = 0usize;
     let mut chrome_selection: Option<Hit> = None;
     let mut collapsed_groups = HashSet::new();
-    // Issue #354 phase 2: completed panes keep a row (oldest dropped past
-    // `MAX_RETAINED_ENDED_ROWS`), and `◆` is only cleared by a render that
-    // actually showed the operator the pane -- see `DoneUnreadAck`.
+    // Retain ended rows and acknowledge their unread output only after a visible render (#354).
     let mut retained_ended: VecDeque<EndedRow> = VecDeque::new();
     let mut done_unread_ack = DoneUnreadAck::default();
-    // Issue #354 phase 5: which attention episode each session was last
-    // announced for. Pure state, fed only on the `FactsCache` cadence.
+    // Deduplicate attention notices by session episode on the facts cadence (#354).
     let mut attention_notices = notify::NoticeReducer::new();
     let mut frame_snapshot = hit::FrameSnapshot::default();
-    // Review of #354 (defect 1, HIGH): the overlay's own identity at the
-    // moment `frame_snapshot` was drawn -- kept in lockstep with it (updated
-    // only where `frame_snapshot` itself is) so `overlay_route_is_current`
-    // always compares the snapshot's geometry against the overlay it was
-    // actually drawn from, never a later one.
+    // Keep overlay identity synchronized with the frame snapshot so stale mouse routes can be rejected (#354).
     let mut frame_snapshot_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut reveal_sidebar = true;
-    // Issue #354 phase 3: the `spawnreq::SpawnRequest` behind every pane this
-    // dashboard fulfilled, by short id -- moved onto the pane's retained
-    // ended row when it is reaped, which is what `restore`/`retry` replay.
-    // The orchestrator pane and a startup-restored pane are deliberately
-    // absent: neither came from a request, and neither can be restored this
-    // way (the menu says `no spawn request kept`).
+    // Retain each pane's original spawn request for restore and retry (#354).
     let mut kept_requests: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> =
         HashMap::new();
-    // Issue #354 phase 3: the last click on a dialog row, for the
-    // double-click-activates rule. `route_mouse` stays pure; this is the only
-    // thing holding a clock.
+    // Keep the last dialog click with a clock for double-click activation (#354).
     let mut last_overlay_click: Option<(usize, Instant)> = None;
-    // Review of 9314156 (finding 2, MEDIUM): the double-click state above is
-    // keyed on a row INDEX, which means nothing outside the dialog it was
-    // clicked in. Without this, single-clicking entry N in one dialog,
-    // closing it and single-clicking entry N in a different one within
-    // `DOUBLE_CLICK` replayed `Enter` and activated an entry the operator
-    // had clicked exactly once. The identity is re-read before every event
-    // and any change -- opened, replaced, closed -- drops the pending click.
+    // Key double-click state by dialog identity and target so a reused row index cannot activate another action.
     let mut last_overlay_ident = overlay_identity(&ui::Overlay::None);
     let mut zoomed = false;
     let mut prefix_armed = false;
-    // Whether the dashboard's mouse reporting is on for this session --
-    // seeded from `cfg.dash.mouse` and, since issue #697 removed the
-    // mid-session `Ctrl+A v` toggle that used to flip it, never changed
-    // again after this: `dash.mouse` is decided once, at startup, and stays
-    // decided for the life of the session.
+    // Keep mouse-capture state for the session after its initial config choice (#697).
     let mouse_capture = cfg.dash.mouse;
     // Tmux-style in-dashboard click-drag text selection (`Selection`'s own
     // doc comment). `None` whenever nothing is selected or highlighted;
     // `Some` both while a drag is in progress and, after release, for
     // whatever stays highlighted until the next `Down` clears it.
     let mut selection: Option<Selection> = None;
-    // Issue #697: a left press inside a pane's grid whose fate -- a click
-    // forwarded to the child, or a drag that becomes the `Selection` above
-    // -- is not yet decided (`PendingPress`'s own doc comment). `None`
-    // whenever no press is currently outstanding.
+    // Defer a pane press until click or drag is known, preserving child clicks (#697).
     let mut pending_press: Option<PendingPress> = None;
-    // Issue #697: where a background clipboard-fallback attempt
-    // (`copy_selection`) reports back once it finishes, so a hung or
-    // missing `pbcopy`/`wl-copy`/`xclip`/`clip.exe` never costs the render
-    // loop anything. Drained once per tick, the same way `facts_refresher`'s
-    // own channel is.
+    // Receive clipboard fallback results without blocking the render loop (#697).
     let (clipboard_tx, clipboard_rx) = mpsc::channel::<ClipboardOutcome>();
-    // Issue #490 (roadmap N21 item A): the native pane key contract's own
-    // Ctrl+C quit-confirmation clock, held by the dashboard because the pane
-    // it belongs to may be swapped out from under it (focus moves, a pane is
-    // reaped). One clock for the roster, not one per pane: an operator only
-    // ever presses Ctrl+C in the pane they are looking at, and arming it in
-    // one pane and confirming it in another must not quit anything.
+    // Hold native Ctrl+C confirmation in dashboard state across pane changes (#490).
     let mut native_ctrl_c: Option<Instant> = None;
-    // The adaptive input-poll wait's own clock (`input_poll_wait`): refreshed
-    // only on a keyboard/mouse event read from crossterm, not on pane output --
-    // a streaming response or an animated spinner must not hold the loop in
-    // the 10ms hot window indefinitely; the operator's own keystroke already
-    // opens it, which is all typing latency needs. Seeded to now, so launch
-    // itself counts as activity and the dashboard starts in the hot window
-    // rather than the flat 50ms idle wait.
+    // Refresh hot-poll time only on operator input, not streaming pane output.
     let mut last_activity = Instant::now();
-    // Issue #354 phase 4 (finding F15): the first-run tip. Shown once, in the
-    // header's middle slot, until any prefixed key is used or Esc dismisses
-    // it.
-    //
-    // Issue #354 phase 5 (phase-4 residual): the flag is written when the tip
-    // is actually DISMISSED, not when it is decided to be shown. A session
-    // that was launched and quit without a single keystroke never read the
-    // tip, and marking it seen at launch is how a first-time operator got
-    // exactly one chance to notice a line they may never have looked at.
-    // Still best effort and still once: a read-only or missing state
-    // directory costs nothing but the tip shown again next launch, never an
-    // error and never a panic.
+    // Show the first-run tip until a prefixed key or Esc dismisses it (#354).
     let mut first_run_tip = !first_run_tip_seen(state);
     let mut overlay = if restore_candidates.is_empty() {
         ui::Overlay::None
@@ -719,11 +518,7 @@ fn run_dashboard_inner(
         ui::Overlay::Restore(build_restore_view(&restore_candidates))
     };
     let mut facts_cache = FactsCache::new(Instant::now());
-    // The machine-wide half of those facts, off this thread entirely: the
-    // registry listing alone is O(every session this machine has ever
-    // registered) plus a synchronous probe per orphan socket, and it used to
-    // run between the operator's keystroke and the `event::poll` that would
-    // have read it. See `FactsSnapshot`.
+    // Refresh machine-wide facts off the UI thread because registry and provider scans can block.
     let facts_refresher = FactsRefresher::spawn(
         state,
         FactsOwner {
@@ -733,17 +528,9 @@ fn run_dashboard_inner(
         },
         cfg,
     );
-    // L13: transient, auto-expiring header notices (info), kept apart from the
-    // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
-    // shows briefly and then clears instead of pinning behind a warning glyph.
+    // Keep transient confirmations separate from sticky errors so successful actions do not pin a warning.
     let mut notices: Vec<Notice> = Vec::new();
-    // Issue #202 phase 2b: the sidebar's own working-pane spinner frame
-    // index (`tick % style::tui::SPINNER_FRAMES.len()`). Dash refresh PR2
-    // moved this off "once per drawn frame" (which sped a spinner up to
-    // ~100fps while typing and slowed it to ~20fps idle) onto `dash_start`'s
-    // own clock, 80ms per frame (mock §06's own script) -- see where it is
-    // set, below the input poll. Reduced motion freezes it at 0: the glyph
-    // itself still says "working", only its own movement stops.
+    // Advance spinner frames with ticks so a throttled draw does not freeze animation.
     #[allow(unused_assignments)]
     let mut render_tick: usize = 0;
     // Dash refresh PR2: `dash.motion`, converted once at launch (see
@@ -789,18 +576,7 @@ fn run_dashboard_inner(
     // "rolled over" toast (a `Committed` settlement that was not there, or
     // was a different generation, last time).
     let mut last_rollover_settlement: Option<super::rollover::runtime::Settlement> = None;
-    // Review fix: both `last_rollover_settlement` above and
-    // `mail_before_refresh` (seeded from `FactsCache`'s still-empty
-    // `mail_by_session` before the very first refresh) look, on tick one,
-    // exactly like "nothing was there before" -- which for a `Committed`
-    // settlement or unread mail that predates this dashboard process is
-    // false: it was already there, this process just had not read it yet.
-    // Without this flag the first real read edge-triggers a "rolled over"
-    // toast off a stale prior settlement and flashes every already-unread
-    // row, the same false-transition mistake the DoneUnread path avoids
-    // for free (its own `previous: Option<Projection>` genuinely means
-    // "never sampled" when absent). Sees exactly one `false` tick, then
-    // stays `true` for the rest of this dashboard's life.
+    // Suppress first-observation mail and rollover notifications; only transitions after startup count.
     let mut seen_first_facts_refresh = false;
     // Dash refresh PR2: the JEV sidebar section's own (much coarser) 10s
     // refresh cadence -- `jev::usage_rollup` is a plain read of two small
@@ -814,31 +590,9 @@ fn run_dashboard_inner(
     // which call it names -- the flash-start clock for that line.
     let mut jev_last_flash_started: Option<Instant> = None;
     let mut jev_last_seen: Option<(String, u64)> = None;
-    // Session-scoped total, review round: every pane `session_id()` this
-    // dashboard has ever hosted, this run -- grow-only, NEVER pruned on
-    // reap, so a worker's own JEV rows keep counting toward the total after
-    // it finishes (see `jev_session_snapshot`'s own doc comment for why a
-    // delegation-ledger closure could not do this safely). Known gaps: a
-    // quit/restore round trip starts a fresh, empty set (an ended pane's
-    // session from a PRIOR dash launch is not carried forward), and a
-    // headless worker that never became a pane of this dashboard is never
-    // added at all.
+    // Keep all session IDs hosted this run so reaped workers remain in session-scoped totals.
     let mut jev_dashboard_sessions: BTreeSet<String> = BTreeSet::new();
-    // Coordinator follow-up: the footer's own rollover distance/soon must
-    // show the exact `source_headroom_pct` the last real `rollover::
-    // evaluate` call computed for this dashboard's orchestrator seat, not
-    // a separately estimated reading -- `None` until that call has run at
-    // least once, which is what hides the distance segment entirely (never
-    // an estimate) before then.
-    //
-    // Review fix: tagged with the seat's own identity (short + generation)
-    // at the moment it was read, and explicitly cleared the instant a
-    // handover fires -- without either, a reading computed for the OLD
-    // seat kept showing (as if it were current) against the NEW seat a
-    // rollover just swapped onto, for up to a whole `evaluate_interval`
-    // (~60s). `rollover_sweep` sets and clears this; the render loop
-    // compares it against `facts_cache.disk.seat_full`'s own current
-    // identity before ever handing it to `rollover_state`.
+    // Cache the exact evaluated seat headroom for the focused footer.
     let mut seat_headroom_pct: Option<SeatHeadroom> = None;
     // Dash refresh PR1: the pane header's own `cwd` field is `~`-shortened
     // against the operator's home directory, resolved once here (an env
@@ -846,17 +600,11 @@ fn run_dashboard_inner(
     let home_dir_display = crate::utils::home_dir()
         .ok()
         .map(|p| p.display().to_string());
-    // Issue #330: which unfocused pane the shared drain budget starts on,
-    // advanced once per tick -- see `drain_shared_budget`.
+    // Rotate the first unfocused pane sharing the drain budget each tick (#330).
     let mut drain_rotation: usize = 0;
-    // Issue #330: when the current iteration started, so the next one can
-    // report how long it took (`KeyLog::tick`'s `dur=` field).
+    // Record tick start for input diagnostic duration (#330).
     let mut last_tick_started = Instant::now();
-    // P4: one line per candidate the liveness check just held back. Pushed
-    // here rather than at the partition above only because `notices` does not
-    // exist yet up there. It says "kept for next launch" because that is now
-    // literally true (see `deferred_restore` below) -- the notice is no longer
-    // the only trace of a candidate this launch decided not to offer.
+    // Report each live roster candidate withheld from restore.
     for pane in &still_live {
         push_notice(
             &mut notices,
@@ -867,10 +615,7 @@ fn run_dashboard_inner(
             ),
         );
     }
-    // H3: the mail sweep is disk-backed (`mail::list` = read_dir + read per
-    // .md) and used to run every 50ms tick; throttled to the same ~1s cadence
-    // as the header facts. Seeded a full interval in the past so the first
-    // tick sweeps immediately (same reasoning as `FactsCache::new`).
+    // Throttle disk-backed mail sweep outside the fast input tick.
     let mut last_mail_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
         .unwrap_or_else(Instant::now);
@@ -879,11 +624,7 @@ fn run_dashboard_inner(
     let mut last_spawn_intake = Instant::now()
         .checked_sub(SPAWN_REQUEST_POLL)
         .unwrap_or_else(Instant::now);
-    // A1-1: the per-pane budget sweep reads (and parses) every budgeted
-    // pane's whole transcript, so it belongs on the same ~1s disk cadence as
-    // the mail sweep and the header facts rather than on the render loop's
-    // own 50ms tick. Seeded a full interval in the past for the same reason
-    // `last_mail_sweep` is: the first tick sweeps immediately.
+    // Run transcript budget parsing on a throttled disk cadence, not the render tick.
     let mut last_budget_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
         .unwrap_or_else(Instant::now);
@@ -897,18 +638,9 @@ fn run_dashboard_inner(
     // the whole dashboard run, not just one tick, so an unchanged inbox is
     // advised once and then left alone until genuinely new mail arrives.
     let mut advised_mail: HashMap<String, mail::AdvisedIds> = HashMap::new();
-    // Issue #358 (task 5): the orchestrator pane's automatic rollover -- its
-    // own (much coarser than `FACTS_THROTTLE`) cadence, and the one seat
-    // transaction that may be open at a time. Seeded with this dashboard's
-    // start so no usage I/O runs while it is still coming up.
+    // Evaluate automatic orchestrator rollover on its own slower cadence (#358).
     let mut last_rollover_eval = Instant::now();
-    // Issue #780: `cfg` above is loaded once at dash start-up and held for
-    // the dashboard's whole life, so a gate reading `cfg.
-    // auto_orchestrator_rollover()` never sees a later `zirv ctx config set
-    // fallback.auto_orchestrator_rollover false` -- see `LiveAutoRollover`'s
-    // own doc comment. Seeded from `cfg`'s own value so the very first tick
-    // (before either `ctx.toml` could possibly have changed) matches what
-    // start-up already decided.
+    // Recheck the auto-rollover config switch on cadence because startup config is held for the session (#780).
     let mut auto_rollover =
         super::rollover::LiveAutoRollover::new(repo, env, cfg.auto_orchestrator_rollover());
     let mut reactive_pending = panes
@@ -918,54 +650,23 @@ fn run_dashboard_inner(
         .and_then(|seat| seat.pending)
         .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
     let mut pending_rollover: Option<(String, u64, Instant)> = None;
-    // R8: see `input_stream_is_dead`.
+    // Quit after an unbroken run of input errors; a successful read resets the count.
     let mut input_errors: usize = 0;
-    // D4: set by the "every pane ended" exit arm, so the closing line is
-    // printed to a terminal that has already been handed back.
+    // Record the all-panes-ended outcome for the closing line after terminal teardown.
     let mut all_panes_ended = false;
-    // F4: every reaped pane's exit code, in reap order -- the empty exit's own
-    // status is a fold over this (`empty_exit_code`).
+    // Fold exit status over every reaped pane's recorded code.
     let mut reaped_codes: Vec<i32> = Vec::new();
-    // G3: every restore candidate the pane cap has forced this session to
-    // skip so far, across however many restore confirmations happen during
-    // it (the spawn dialog is reachable any number of times, not just at
-    // startup) -- carried to every `on_quit` call below so none of them are
-    // lost just because the restore dialog that offered them has long since
-    // closed.
-    //
-    // P4: seeded with the candidates the liveness gate held back, for exactly
-    // the same reason F5 writes `unoffered` back. `take_roster` claims by
-    // rename *before* reading, so a candidate this launch declines to offer is
-    // already consumed -- and a liveness verdict is a probe of a pid, which a
-    // roster up to `roster.max_age_secs` old can genuinely get wrong (the OS
-    // recycles pids). Dropping the candidate on that verdict would destroy the
-    // pane permanently, with a four-second notice as its only trace. Merged
-    // back into the fresh roster instead, so the worst a false "still live"
-    // costs is one launch's restore rather than the session.
+    // Accumulate restore candidates skipped by the pane cap for the next roster.
     let mut deferred_restore: Vec<roster::RosterPane> = still_live;
-    // L19: shorts of panes reaped since the last registry refresh, excluded
-    // from the view-only sidebar rows so a just-released session does not
-    // re-list (and become nudge-targetable) off the up-to-1s-stale snapshot.
+    // Exclude recently reaped shorts from a stale registry snapshot until refresh drops them.
     let mut reaped_recent: HashSet<String> = HashSet::new();
-    // Issue #209/v3 codex review finding 1: the footer's dead-pane fallback
-    // -- see `LastExited`'s own doc comment.
+    // Keep the last exited pane's footer facts available after reap (#209).
     let mut last_exited: Option<LastExited> = None;
-    // Issue #349: this dashboard's own memory of what it last reported for
-    // each pane's `QuietHeuristic` lifecycle -- see `sync_quiet_heuristic_
-    // attention`'s own doc comment for why a per-tick diff against this
-    // (rather than an unconditional write) is what keeps a pane sitting
-    // quietly at `Idle` for an hour from costing more than one write.
+    // Track the last quiet-heuristic observation per pane to avoid redundant attention writes (#349).
     let mut quiet_lifecycle: HashMap<String, super::attention::Lifecycle> = HashMap::new();
 
     let exit_code: i32 = 'main: loop {
-        // Task 2: bumps the tick counter every iteration and writes a line
-        // only when the watched state changed -- so a `prefix_armed` (or
-        // `overlay`) that moves with no keystroke in between is visible as a
-        // `TICK` with no `EVENT` before it. Inert unless the keylog is on.
-        // Issue #330: how long the last iteration took, for the `dur=` field
-        // below. One monotonic clock read per tick, which this loop already
-        // makes several of; the log itself stays entirely inert with the env
-        // var unset.
+        // Log only changed loop state each tick.
         let tick_started = Instant::now();
         let previous_tick = tick_started.saturating_duration_since(last_tick_started);
         last_tick_started = tick_started;
@@ -981,23 +682,14 @@ fn run_dashboard_inner(
                 previous_tick,
             );
         }
-        // Read before the drain below can touch it, so the loop over
-        // `produced_output` can tell "this pane produced output" apart from
-        // "output landed on the rows this selection actually covers" --
-        // `output_cancels_selection`'s own doc comment on why that
-        // distinction now matters. Stable across the drain: `reap_ended_panes`
-        // (which could shift indices) does not run until later this tick.
+        // Snapshot selected text before draining output so cancellation compares the affected rows.
         let selection_before = selection.as_ref().and_then(|sel| {
             panes
                 .iter()
                 .find(|pane| pane.short() == sel.pane_short)
                 .and_then(|pane| selection_snapshot(pane.screen(), sel))
         });
-        // Issue #330: ONE `DRAIN_BUDGET_BYTES` for the whole tick, focused
-        // pane first and the rest round-robin behind it -- not that much per
-        // pane, which with eight streaming workers put up to 2 MiB of vt100
-        // parsing between a keystroke and the `event::poll` that would have
-        // read it. See `drain_shared_budget`.
+        // Share one vt100 byte budget across all panes, focused first with rotating unfocused order (#330).
         let produced_output = drain_shared_budget(
             panes.len(),
             focused,
@@ -1010,15 +702,7 @@ fn run_dashboard_inner(
         );
         drain_rotation = drain_rotation.wrapping_add(1);
         for idx in produced_output {
-            // HIGH (review): live output rewrites this pane's grid rows in
-            // place, under a selection's stale `(row, col)` coordinates --
-            // `translate_selection` never sees this, since the scrollback
-            // offset itself does not move while the pane sits at its live
-            // view. See `output_cancels_selection`. Only cancels for real,
-            // though, when the selection's own rows actually came out
-            // different -- `selection_before` is `None` here whenever there
-            // was nothing selected on this pane to begin with, which
-            // `unchanged` treats the same as "did change" (nothing to keep).
+            // Cancel selection only when child output changes the selected grid rows.
             if let Some(sel) = selection.as_ref()
                 && output_cancels_selection(sel, panes[idx].short())
             {
@@ -1033,13 +717,7 @@ fn run_dashboard_inner(
         for pane in panes.iter_mut() {
             pane.on_turn_signal();
         }
-        // Issue #490 (roadmap N21 item A): a native pane's multi-agent
-        // surfaces (the overview, the usage strip, notices, the worker
-        // inspection) are read from durable records on their OWN cadence, not
-        // on every frame -- a fleet's coordinator graph, delegation receipts,
-        // seat records and pool view are far more expensive than a
-        // conversation's own journal, and none of them change between two
-        // consecutive frames.
+        // Read native multi-agent UI facts from durable runtime records (#490).
         {
             let now = super::state::now_secs();
             for pane in panes.iter_mut() {
@@ -1050,22 +728,9 @@ fn run_dashboard_inner(
                 }
             }
         }
-        // Issue #440: ahead of EVERY step below that can release a seat --
-        // the two enforcement sweeps (`Pane::shutdown`/`stop_now`) and the
-        // reap (`Pane::finish_shutdown`), all of which reach `rollover::
-        // forget`. Settled after any of them, a successor that died was
-        // settled against a seat that no longer existed: `seat::abort`
-        // failed, the prepared transaction ended with no terminal row at
-        // all, and neither the source relaunch nor the park could run.
-        //
-        // Issue #780: unconditional, deliberately NOT gated by
-        // `auto_orchestrator_rollover` (live or otherwise). An operator
-        // disabling the switch must stop any NEW rollover from being
-        // prepared, but a transaction already open when they do must still
-        // reach commit or abort -- gating this on the switch orphaned the
-        // successor pane the moment a disable landed mid-transaction.
-        // `settle_pending_rollover` is a cheap no-op whenever nothing is
-        // pending, so there is no cost to calling it every tick regardless.
+        // Settle before shutdown or reap can forget the seat, or abort cannot
+        // restore a dead successor. Keep settling even if auto-rollover is disabled
+        // mid-transaction; the switch only stops new preparations (#440, #780).
         settle_pending_rollover(
             &mut panes,
             cfg,
@@ -1088,9 +753,7 @@ fn run_dashboard_inner(
             &mut last_deadline_sweep,
             Instant::now(),
         );
-        // R2: an exited pane leaves here -- registry record released, socket
-        // unpublished, nudge queue dropped -- rather than sitting in the
-        // vector as a corpse for the rest of the session.
+        // Remove exited panes after releasing their registry and socket state.
         confirm_pane_submissions(
             &mut panes,
             state,
@@ -1118,9 +781,7 @@ fn run_dashboard_inner(
             push_notice(&mut notices, Instant::now(), line);
         }
 
-        // The geometry any pane spawned during this tick gets -- the terminal
-        // as it is now, at this tick's zoom level. Shared by the request
-        // channel here and the `Ctrl+A s` spawn dialog / restore below.
+        // Use current terminal and zoom geometry for panes spawned during this tick.
         let pane_size = {
             let now_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
             let m = effective_main(
@@ -1130,10 +791,7 @@ fn run_dashboard_inner(
             );
             (m.width.max(1), m.height.max(1))
         };
-        // L17: fulfil pending spawn requests BEFORE the empty-exit decision.
-        // A request arriving on the very tick the last pane ended used to be
-        // stranded -- the dashboard exited first, and the requester burned its
-        // ack timeout against a channel nobody would ever poll again.
+        // Drain pending spawn requests before deciding that an empty dashboard should exit.
         let panes_before_requests = panes.len();
         // ...on its own `SPAWN_REQUEST_POLL` cadence rather than every tick:
         // the directory reads are what cost, and they must not sit between
@@ -1154,23 +812,10 @@ fn run_dashboard_inner(
                 &mut kept_requests,
             );
         }
-        // M4: a request fulfilled this tick appended panes, shifting every
-        // view-only sidebar row (and any selection on one) down.
+        // Shift view-only row selection when a new pane is appended.
         selected = insert_fixup(panes_before_requests, panes.len(), selected);
 
-        // D4: with the last pane gone there is nothing left to supervise, draw
-        // or type into -- `/exit` in the orchestrator used to leave the
-        // operator staring at a blank alternate screen with no pane to press
-        // `Ctrl+A q` in. Out through the ordinary quit path, so the roster is
-        // written and the request directory removed exactly as a keyed quit
-        // would. Reachable only from inside the loop, which the first pane's
-        // own spawn already precedes, so an empty startup is still the
-        // caller's `Err`, not a silent exit 0.
-        //
-        // F5: held off while the startup restore dialog is still unanswered --
-        // the operator has a decision open, and quitting under it would consume
-        // the offer without ever making it. F4: and the exit status is what
-        // actually happened to those panes, not a flat 0.
+        // Quit when no panes remain to supervise, draw or receive input.
         if should_exit_empty(panes.len(), matches!(overlay, ui::Overlay::Restore(_))) {
             on_quit(
                 &panes,
@@ -1195,8 +840,7 @@ fn run_dashboard_inner(
             last_mail_sweep = sweep_now;
             mail_sweep(&mut panes, cfg, state, repo, &mut advised_mail, &mut errors);
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
-            // Issue #115: same cadence as the mail sweep just above -- a
-            // one-shot reminder has no sub-tick latency requirement either.
+            // Run the one-shot report reminder on the mail sweep cadence (#115).
             report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
         // Dash refresh PR2: the JEV sidebar section, on its own coarser
@@ -1223,29 +867,7 @@ fn run_dashboard_inner(
             }
             jev_last_seen = last_now;
         }
-        // Issue #358 (task 5): the orchestrator pane's automatic rollover.
-        // The evaluation half costs a capacity snapshot, so it runs on its own
-        // cadence; its readiness watch (`settle_pending_rollover`, above) is
-        // pure in-memory state and runs every tick, above the reap (issue
-        // #440). This half -- the one that can PREPARE a new transaction --
-        // is a no-op until `fallback.auto_orchestrator_rollover` is on.
-        //
-        // Issue #780: `pending_rollover.is_none()` is checked first so
-        // nothing below runs while a transaction is already open (nothing to
-        // prepare then anyway). The cadence check (`due`, a cheap `Instant`
-        // comparison) runs BEFORE `auto_rollover.is_enabled()` (two `stat`s),
-        // so the live reload only ever costs a syscall once per interval, not
-        // on every tick -- this loop's tick rate can be as low as 10ms.
-        // `last_rollover_eval` advances whenever the cadence comes due,
-        // whether or not the switch is enabled: otherwise a disabled switch
-        // would leave `due()` permanently true and `is_enabled()` would run
-        // every tick again anyway. `auto_rollover.is_enabled()` re-derives
-        // the switch from a fresh layered load, not the dashboard's stale
-        // start-up `cfg` -- so an operator's `zirv ctx config set
-        // fallback.auto_orchestrator_rollover false` takes effect on this
-        // dashboard's very next check, no restart required. A failed reload
-        // never enables it (see `LiveAutoRollover`'s own doc comment), and a
-        // disable always wins over an eval that came due.
+        // Evaluate rollover on a slower cadence but check an open transaction for readiness each tick (#358).
         if pending_rollover.is_none() {
             let eval_due = due_advancing(
                 &mut last_rollover_eval,
@@ -1274,42 +896,17 @@ fn run_dashboard_inner(
             }
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
-        // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
-        // own doc comment.
+        // Drain deferred submit deadlines every tick so carriage returns do not wait for the mail cadence.
         drain_pending_submits(&mut panes, &mut errors, state, cfg, &mut notices);
 
-        // Facts + sidebar rows, computed BEFORE input handling: the Nudge
-        // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
-        // clamp both need this iteration's row layout, not a rendering-only
-        // snapshot taken after the keystroke that needs it.
-        //
-        // D2: `dashboard_short` is this dashboard's own identity, derived once
-        // from its own session id above -- deliberately NOT re-derived from
-        // `panes.first()` here. The orchestrator is only the first pane until
-        // it exits and is reaped; after that the same expression handed the
-        // dashboard a *worker's* short id, and it went on to stamp that
-        // worker's identity onto operator-composed mail (`from_session`),
-        // onto its own spawn requests (`requested_by`) and onto the header's
-        // per-session counts -- or, with no panes left at all, an empty
-        // string.
-        // Issue #354 phase 2: the acknowledgement the LAST frame earned, acted
-        // on here -- off the render path, before this tick's own reads, and at
-        // most once per `(session, revision)`. A write inside `terminal.draw`
-        // would put a state-dir round trip on the hot path for every frame a
-        // done-unread pane stayed focused.
+        // Build rows before input: nudge routing and selection clamps must use
+        // this tick's rows, not a snapshot drawn after the keystroke.
         if let Some(short) = done_unread_ack.take_due() {
             let acked = super::attention::mark_seen_io(state, &short);
-            // Keep the cached copy in step rather than waiting up to a full
-            // `FACTS_THROTTLE` for the glyph to stop saying `◆` at something
-            // the operator has demonstrably now read.
+            // Update cached attention immediately after acknowledgement so the glyph clears in this frame.
             facts_cache.disk.attention.insert(short, acked);
         }
-        // Issue #697: the clipboard fallback runs on its own thread
-        // (`copy_selection`) so a hung or missing
-        // `pbcopy`/`wl-copy`/`xclip`/`clip.exe` never costs the render loop
-        // anything; this is where its outcome, if any finished since the
-        // last tick, turns into the one notice or error the operator
-        // actually sees.
+        // Read clipboard fallback results asynchronously so a missing helper cannot stall drawing (#697).
         while let Ok(outcome) = clipboard_rx.try_recv() {
             match outcome {
                 ClipboardOutcome::Confirmed | ClipboardOutcome::Unconfirmed => push_notice(
@@ -1326,10 +923,7 @@ fn run_dashboard_inner(
             }
         }
         let facts_now = Instant::now();
-        // Dash refresh PR2: snapshotted before the refresh overwrites it, so
-        // a NEW-mail flash can edge-trigger on "this short's own count just
-        // went up" rather than "this short has unread mail" (which would
-        // flash on every tick a session sits unread, not just the arrival).
+        // Snapshot prior mail counts before refresh to detect only newly increased counts.
         let mail_before_refresh = facts_cache.disk.mail_by_session.clone();
         let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
@@ -1361,12 +955,7 @@ fn run_dashboard_inner(
             );
             let previous_attention = facts_cache
                 .refresh_attention(&shorts, &|short| super::attention::load(state, short));
-            // Issue #354 phase 5: one compact notice per transition INTO a
-            // state that owes the operator something. Driven here, on the
-            // cache's own cadence, never per frame -- and through the pure,
-            // clock-injected reducer, so what it decides is a function of the
-            // samples alone. The notice itself goes through the existing
-            // header-middle channel: no toast, no popup, no second row.
+            // Emit one attention notice per transition on the facts cadence, never per frame (#354).
             let focused_short = panes.get(focused).map(|p| p.short().to_string());
             let sample_now = super::state::now_secs();
             for short in &shorts {
@@ -1401,10 +990,7 @@ fn run_dashboard_inner(
                 }
             }
             attention_notices.retain(&shorts);
-            // Dash refresh PR2: new mail (this short's own unread count just
-            // went UP, not merely "is nonzero") flashes its row -- see
-            // `mail_flash_targets`'s own doc comment for the review fix
-            // (nothing flashes on the first real refresh).
+            // Flash only when a session's unread mail count rises.
             for short in mail_flash_targets(
                 &mail_before_refresh,
                 &facts_cache.disk.mail_by_session,
@@ -1413,10 +999,7 @@ fn run_dashboard_inner(
                 flash_started.insert(short, Instant::now());
             }
             flash_started.retain(|short, _| shorts.iter().any(|s| s == short));
-            // Dash refresh PR2: a rollover that just committed -- see
-            // `rollover_committed_toast`'s own doc comment for the review
-            // fix (no toast for a settlement this dashboard merely
-            // DISCOVERS on its first read).
+            // Announce only a rollover that committed after this dashboard began observing it.
             let current_settlement = facts_cache
                 .disk
                 .rollover_record
@@ -1440,10 +1023,7 @@ fn run_dashboard_inner(
             last_rollover_settlement = current_settlement;
             seen_first_facts_refresh = true;
         }
-        // L19: drop any recently-reaped short the registry snapshot no longer
-        // carries -- once a refresh clears the released record, the exclusion
-        // is no longer needed. What remains is the set the (still-stale)
-        // snapshot would otherwise re-list as a ghost view-only row.
+        // Prune recently reaped shorts once the registry snapshot no longer lists them.
         reaped_recent.retain(|short| {
             facts_cache
                 .registry
@@ -1456,14 +1036,9 @@ fn run_dashboard_inner(
             .filter(|(record, _)| !reaped_recent.contains(&record.short))
             .cloned()
             .collect();
-        // A pane can have gone away (or arrived) since the last tick, so both
-        // indices are re-clamped before anything reads them.
+        // Clamp focus and selection after pane arrivals or removals.
         focused = focused.min(panes.len().saturating_sub(1));
-        // Issue #349: once per tick, at the same read `build_pane_rows` right
-        // below is about to make of every pane's `PaneState` -- not inside
-        // `build_pane_rows` itself, which is pure and called a second time
-        // per tick purely to re-render (see its own doc comment), so doing
-        // it there would double-fire for the same tick's own transition.
+        // Sync quiet pane state once per tick before building sidebar rows (#349).
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
         let tick_now = super::state::now_secs();
         for pane in &mut panes {
@@ -1482,12 +1057,7 @@ fn run_dashboard_inner(
         let total_rows = rows.len();
         selected = selected.min(total_rows.saturating_sub(1));
 
-        // HIGH-2: block for the first event (`input_poll_wait`'s adaptive
-        // 10ms/50ms), then drain every event already queued behind it
-        // (bounded) before falling through to the maintenance/redraw at the
-        // bottom of the tick. A 2000-character paste is 2000 key events;
-        // handling them one-per-tick meant 2000 full maintenance passes and
-        // redraws.
+        // Drain a bounded batch of queued input after the first poll, then run maintenance and redraw.
         let mut drained = 0usize;
         while drained < MAX_INPUT_DRAIN_PER_TICK {
             let wait = if drained == 0 {
@@ -1499,18 +1069,9 @@ fn run_dashboard_inner(
                 Ok(true) => {
                     let mut read = event::read();
                     let mut mouse_action = None;
-                    // Issue #354 phase 3: what the context menu decided, if
-                    // anything. Carried out of the overlay dispatch's own
-                    // `match` (which holds `overlay` by value through
-                    // `mem::take`) and applied right after it, where `panes`,
-                    // the retained rows and the kept requests are all
-                    // reachable again.
+                    // Carry menu effects outside overlay reduction before dispatching them (#354).
                     let mut apply_menu_action: Option<(String, ui::MenuAction)> = None;
-                    // Review of 9314156 (finding 2): a pending single click
-                    // belongs to the dialog it was made in. The instant that
-                    // dialog is opened, replaced or closed, the click is
-                    // stale and must never be able to complete a
-                    // double-click somewhere else.
+                    // Clear pending dialog clicks whenever that dialog opens, closes or changes.
                     let overlay_ident = overlay_identity(&overlay);
                     if overlay_ident != last_overlay_ident {
                         last_overlay_click = None;
@@ -1522,30 +1083,14 @@ fn run_dashboard_inner(
                     if matches!(read, Ok(Event::Key(_)) | Ok(Event::Mouse(_))) {
                         last_activity = Instant::now();
                     }
-                    // Task 2: one line per event, before anything acts on it,
-                    // with the arming state and overlay it is about to be
-                    // decided against. Inert unless `ZIRV_CTX_DASH_KEYLOG` is
-                    // set; see `KeyLog`.
+                    // Log each input event before dispatch with its prior prefix and overlay state.
                     if let Some(log) = keylog.as_mut() {
                         log.observe(&read, prefix_armed, &overlay);
                     }
-                    // Issue #354: pointer ownership is decided once, here,
-                    // against the geometry of the frame the operator actually
-                    // clicked on (`frame_snapshot`) -- before the
-                    // `Ok(Event::Mouse(..))` arm further down, which is the
-                    // only path to `Pane::scroll_wheel`,
-                    // `forward_mouse_button` and the in-dashboard selection.
-                    // Anything but `MouseRoute::Grid` is fully handled here
-                    // and the event is then replaced by an inert one, so no
-                    // chrome hit can reach the child. See `route_mouse` for
-                    // the dispatch order itself.
+                    // Route each pointer event against the frame geometry that was drawn (#354).
                     if let Ok(Event::Mouse(mouse)) = read.as_ref() {
                         let mouse = *mouse;
-                        // A fresh left press clears the highlight (and any
-                        // not-yet-decided pending press) wherever it lands:
-                        // the grid arm's own `selection = None`/
-                        // `pending_press = None` is out of reach for a
-                        // chrome click now.
+                        // A fresh press clears prior selection and pending gestures regardless of where it lands.
                         if mouse_capture
                             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         {
@@ -1559,18 +1104,7 @@ fn run_dashboard_inner(
                             !matches!(overlay, ui::Overlay::None),
                             selection.is_some() || pending_press.is_some(),
                         );
-                        // Review of #354 (defect 1, HIGH): `frame_snapshot` is
-                        // shared by every event this drain processes (see
-                        // `HIGH-2` above the drain loop), but the overlay it
-                        // was drawn from can close -- or be replaced -- by an
-                        // earlier event in the very same drain. A later
-                        // queued click that still lands on that now-stale
-                        // snapshot's own overlay hint or row must never
-                        // synthesize the keystroke it names; with the overlay
-                        // it belonged to gone, that synthesized key would
-                        // otherwise fall straight through to
-                        // `write_operator_input` below. See
-                        // `overlay_route_is_current`.
+                        // Reject overlay routes from a frame whose dialog identity is no longer current (#354).
                         let route = if overlay_route_is_current(
                             &route,
                             &overlay,
@@ -1586,10 +1120,7 @@ fn run_dashboard_inner(
                         match route {
                             MouseRoute::Grid | MouseRoute::Consume => {}
                             MouseRoute::Select(id) => {
-                                // Issue #354 phase 2: selecting (or focusing)
-                                // a pane no longer clears its `◆` on its own
-                                // -- only a render that actually showed it
-                                // does, via `DoneUnreadAck`.
+                                // Selecting a pane cannot acknowledge unread output; only showing it can (#354).
                                 (selected, focused) = select_row(&id, &rows, selected, focused);
                                 chrome_selection = None;
                             }
@@ -1615,11 +1146,7 @@ fn run_dashboard_inner(
                                     KeyModifiers::NONE,
                                 )));
                             }
-                            // Issue #354 phase 3: the open dialog's own
-                            // targets. A click moves its caret; a second
-                            // click on the same row inside `DOUBLE_CLICK`
-                            // activates it, by handing the dialog exactly
-                            // the `Enter` the keyboard would have.
+                            // Activate a dialog row only on a second click of that same row within the double-click window (#354).
                             MouseRoute::OverlayRow(index) => {
                                 let now = Instant::now();
                                 let double = last_overlay_click.is_some_and(|(last, at)| {
@@ -1671,17 +1198,7 @@ fn run_dashboard_inner(
                     match read {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                             input_errors = 0;
-                            // Issue #354 phase 3: the shared list viewport's
-                            // own keys, handled ONCE for every list dialog
-                            // before its reducer ever sees them --
-                            // PageUp/PageDown page, Home/End jump, and the
-                            // caret is always revealed. Every dialog's own
-                            // keys (Enter, Esc, j/k, space, letters) stay
-                            // exactly where they were.
-                            //
-                            // Consumed by swapping the keystroke for an inert
-                            // one rather than by `continue`, which would skip
-                            // this drain loop's own `drained += 1`.
+                            // Apply shared viewport keys before individual list reducers (#354).
                             let key = match (ui::list_page_move(key), overlay.list_state()) {
                                 (Some(mv), Some((cursor, offset, len))) => {
                                     let capacity = frame_snapshot.overlay_capacity;
@@ -1694,11 +1211,7 @@ fn run_dashboard_inner(
                                 }
                                 _ => key,
                             };
-                            // Issue #354 phase 4: an open overlay still owns the
-                            // keystroke, but the palette can hand ONE action
-                            // back out (as `mouse_action`) to be run by the
-                            // dispatch below in this same tick -- which is why
-                            // this is two `if`s rather than an if/else.
+                            // Keep overlay ownership of input while allowing a palette action to dispatch once (#354).
                             let overlay_was_open = !matches!(overlay, ui::Overlay::None);
                             if overlay_was_open {
                                 let current = std::mem::take(&mut overlay);
@@ -1760,10 +1273,7 @@ fn run_dashboard_inner(
                                                     // spawn takes the operator's own
                                                     // configured worker default.
                                                     model: None,
-                                                    // A human is, by construction, at
-                                                    // this exact dashboard's own live
-                                                    // TUI right now -- this is the one
-                                                    // spawn path that can honestly say so.
+                                                    // Only a direct action in this live dashboard can assert a human is present for a spawned pane.
                                                     interactive: true,
                                                     // The overlay asks for an agent and
                                                     // a prompt, nothing else: no role,
@@ -1789,53 +1299,19 @@ fn run_dashboard_inner(
                                                     // `zirv ctx agent --force`
                                                     // directly instead.
                                                     force: false,
-                                                    // The overlay has no
-                                                    // `--workdir` of its own
-                                                    // either (issue #228):
-                                                    // this spawn runs at the
-                                                    // dashboard's own repo,
-                                                    // exactly as before that
-                                                    // flag existed.
+                                                    // Overlay spawns use this dashboard's repo as their workdir (#228).
                                                     workdir: None,
-                                                    // The overlay has no
-                                                    // `--mode` of its own
-                                                    // either (issue #267):
-                                                    // this spawn runs as an
-                                                    // ordinary writing
-                                                    // worker, exactly as
-                                                    // before that flag
-                                                    // existed.
+                                                    // Overlay spawns use ordinary writing mode (#267).
                                                     mode: super::permit::WorkerMode::Writing,
                                                     owns_workdir: false,
-                                                    // The overlay has no
-                                                    // `--result-schema`/
-                                                    // `--result-kind` of its
-                                                    // own either (issue
-                                                    // #318): this spawn
-                                                    // declares no contract,
-                                                    // exactly as before
-                                                    // those flags existed.
+                                                    // Overlay spawns declare no result contract (#318).
                                                     result_schema: None,
-                                                    // The overlay has no
-                                                    // `--path-scope`/
-                                                    // `--no-network`/
-                                                    // `--depth` of its own
-                                                    // either (issue #262):
-                                                    // absent `envelope`
-                                                    // reads as "this
-                                                    // dashboard's own
-                                                    // root" at the
-                                                    // fulfilment side.
+                                                    // Overlay spawns inherit the dashboard root envelope without extra path or network flags (#262).
                                                     envelope: None,
                                                     path_scope: Vec::new(),
                                                     no_network: false,
                                                     depth: None,
-                                                    // The overlay asks for an
-                                                    // agent and a prompt: no
-                                                    // supervision ceilings and
-                                                    // no trailing flags, the
-                                                    // same as before those
-                                                    // fields existed.
+                                                    // Overlay spawns carry only the chosen agent and prompt.
                                                     max_restarts: None,
                                                     timeout_secs: None,
                                                     max_tool_calls: None,
@@ -1846,13 +1322,7 @@ fn run_dashboard_inner(
                                                     // prompt this dashboard
                                                     // composes for it.
                                                     system_prompt: None,
-                                                    // No lineage (issue #543):
-                                                    // this spawn IS the
-                                                    // delegation root, same
-                                                    // as `parent_session`
-                                                    // above, so there is no
-                                                    // requester seat to fence
-                                                    // against either.
+                                                    // An overlay spawn is a root delegation with no requester seat to fence (#543).
                                                     parent_seat_generation: None,
                                                 };
                                                 let panes_before_spawn = panes.len();
@@ -1867,25 +1337,7 @@ fn run_dashboard_inner(
                                                 let fulfilled = fulfill_spawn_request(
                                                     &req,
                                                     true,
-                                                    // Fix 5 (issue #249/#250
-                                                    // review): this dashboard's
-                                                    // own session short id,
-                                                    // server-derived right here
-                                                    // in this event loop, never
-                                                    // read from `req` JSON --
-                                                    // the same authority `req`
-                                                    // itself claims no parent
-                                                    // for (this spawn IS the
-                                                    // delegation root). Before
-                                                    // this fix, `requester:
-                                                    // None` meant `verified_
-                                                    // parent` never agreed with
-                                                    // `req.requested_by` (also
-                                                    // `dashboard_short`), so the
-                                                    // report-back layer's
-                                                    // steering-authority promise
-                                                    // never actually fired for
-                                                    // an overlay-spawned pane.
+                                                    // Use the dashboard-derived session ID for parent lineage, never request JSON (#249, #250).
                                                     Some(&dashboard_short),
                                                     &mut panes,
                                                     &mut nudge_queues,
@@ -1896,16 +1348,14 @@ fn run_dashboard_inner(
                                                     &requests_dir,
                                                     &mut errors,
                                                 );
-                                                // M4: keep a view-only selection on the
-                                                // same logical row after the append.
+                                                // Keep a view-only selection on the same logical row after pane insertion.
                                                 selected = insert_fixup(
                                                     panes_before_spawn,
                                                     panes.len(),
                                                     selected,
                                                 );
                                                 match fulfilled {
-                                                    // L13: a spawn confirmation is
-                                                    // information, not a warning.
+                                                    // Report a successful spawn as a transient notice.
                                                     Ok((short, _, advisory)) => {
                                                         push_notice(
                                                             &mut notices,
@@ -1915,10 +1365,7 @@ fn run_dashboard_inner(
                                                                 req.agent
                                                             ),
                                                         );
-                                                        // Issue #399: same posture as
-                                                        // every other spawn
-                                                        // confirmation -- informational,
-                                                        // never the sticky error log.
+                                                        // Report spawn success through the transient notice channel (#399).
                                                         if let Some(text) = advisory {
                                                             push_notice(
                                                                 &mut notices,
@@ -1942,24 +1389,13 @@ fn run_dashboard_inner(
                                             None => ui::Overlay::None,
                                         };
                                         if let Some(RestoreEffect::Confirm(indices)) = effect {
-                                            // R7: the same live-pane cap every other
-                                            // spawn seam enforces. Restoring is still
-                                            // creating panes, and a roster from a busy
-                                            // session must not be able to reopen more
-                                            // of them than `dash.max_panes` allows.
+                                            // Apply the live-pane cap to restores as to fresh spawns.
                                             let (take, skipped) = restore_budget(
                                                 panes.len(),
                                                 cfg.dash.max_panes,
                                                 indices.len(),
                                             );
-                                            // G3: the cap-skipped half is not just
-                                            // dropped -- it is carried in
-                                            // `deferred_restore` so `on_quit` can
-                                            // still offer those sessions to the next
-                                            // launch, even though this dialog closes
-                                            // (and `restore_candidates` stops being
-                                            // consulted) right after this effect is
-                                            // handled.
+                                            // Carry cap-skipped restore candidates into the next roster rather than losing them when the dialog closes.
                                             let (to_spawn, deferred) = partition_restore_selection(
                                                 indices,
                                                 &restore_candidates,
@@ -1980,7 +1416,7 @@ fn run_dashboard_inner(
                                                     &mut deferred_restore,
                                                 );
                                             }
-                                            // M4: restored panes were appended too.
+                                            // Shift view-only selection after restored panes are appended.
                                             selected = insert_fixup(
                                                 panes_before_restore,
                                                 panes.len(),
@@ -2054,7 +1490,7 @@ fn run_dashboard_inner(
                                             );
                                         }
                                     }
-                                    // Issue #84.
+                                    // Use the focused pane's handover picker (#84).
                                     ui::Overlay::Handover(draft) => {
                                         let (next, effect) = handover_overlay_reduce(draft, key);
                                         overlay = match next {
@@ -2074,19 +1510,7 @@ fn run_dashboard_inner(
                                                 Some(idx)
                                                     if panes[idx].state() == PaneState::Idle =>
                                                 {
-                                                    // Finding #2 (issue #358
-                                                    // review): a manual swap
-                                                    // of the very pane an
-                                                    // automatic rollover has
-                                                    // already prepared must
-                                                    // close that open
-                                                    // transaction first --
-                                                    // otherwise `settle_
-                                                    // pending_rollover` later
-                                                    // commits its generation
-                                                    // against whatever
-                                                    // session this manual
-                                                    // swap puts in the pane.
+                                                    // Abort an already-prepared automatic seat transaction before a manual swap of that pane (#358).
                                                     if pending_rollover.as_ref().is_some_and(
                                                         |(short, _, _)| short == panes[idx].short(),
                                                     ) && let Some((short, generation, _)) =
@@ -2145,16 +1569,7 @@ fn run_dashboard_inner(
                                             }
                                         }
                                     }
-                                    // Issue #354 phase 4: the palette and the
-                                    // help screen. Enter on a runnable row
-                                    // replays that descriptor through the
-                                    // EXACT path the keyboard or the context
-                                    // menu already takes -- `mouse_action`
-                                    // for a global chord (the dispatch below
-                                    // runs in the same tick), `apply_menu_
-                                    // action` for a row action. No third
-                                    // dispatch, and nothing the palette can
-                                    // reach that a chord could not.
+                                    // Run palette actions through the same dispatch as their keyboard and menu bindings (#354).
                                     ui::Overlay::Palette(view) => {
                                         let (next, effect) = palette_overlay_reduce(view, key);
                                         overlay = match next {
@@ -2186,10 +1601,7 @@ fn run_dashboard_inner(
                                             }
                                         }
                                     }
-                                    // Issue #354 phase 5: closing (or `a`)
-                                    // acknowledges the kept errors -- the
-                                    // sticky header line clears until a new
-                                    // one arrives; nothing is deleted.
+                                    // Acknowledge displayed errors on close without deleting them (#354).
                                     ui::Overlay::Errors(view) => {
                                         let (next, ack) = errors_overlay_reduce(view, key);
                                         overlay = match next {
@@ -2200,11 +1612,7 @@ fn run_dashboard_inner(
                                             errors.acknowledge(ack.mark);
                                         }
                                     }
-                                    // Issue #354 phase 3: read-only, so there
-                                    // is nothing to apply -- only "still
-                                    // open" or "closed". Closing returns the
-                                    // keyboard to whichever pane already had
-                                    // it: `focused` was never touched.
+                                    // Closing the read-only inspector restores input to the previously focused pane (#354).
                                     ui::Overlay::Inspector(view) => {
                                         overlay = match inspector_overlay_reduce(view, key) {
                                             Some(v) => ui::Overlay::Inspector(v),
@@ -2232,33 +1640,16 @@ fn run_dashboard_inner(
                                         }
                                     }
                                 }
-                                // Task 2: the take/assign pair. An overlay that
-                                // reopens itself (`took=X now=X`) is a key
-                                // swallowed with nothing to show for it; one
-                                // that closes (`now=none`) is the reducer
-                                // having acted.
+                                // Log overlay take and assign separately so a dialog opened then cleared in one event is observable.
                                 if let Some(log) = keylog.as_mut() {
                                     log.overlay_swap(took, &overlay);
                                 }
-                                // Issue #354 phase 3: the context menu's own
-                                // effect. Every arm reuses machinery that
-                                // already exists -- another overlay the
-                                // keyboard can open, the roster's own
-                                // selection move, the quit path's
-                                // `request_quit`, or a replay of the kept
-                                // spawn request through
-                                // `fulfill_spawn_request`. No new
-                                // process-launch path, and no argv is ever
-                                // rebuilt here.
+                                // Dispatch context-menu effects through the same action paths as keyboard bindings (#354).
                                 if let Some((target, action)) = apply_menu_action.take() {
                                     let now = Instant::now();
                                     let row = rows.iter().find(|r| r.short == target).cloned();
                                     let cwd = row_cwd(&target, &panes, &retained_ended);
-                                    // Issue #354 phase 5: the summary line's
-                                    // menu. Only the two dashboard-wide
-                                    // entries are ever enabled there, so this
-                                    // is the whole dispatch; everything else
-                                    // is inert with its reason on screen.
+                                    // Only dashboard-wide actions can run from the summary line's menu (#354).
                                     if target == DASHBOARD_TARGET {
                                         match action {
                                             ui::MenuAction::Inspect => {
@@ -2492,26 +1883,7 @@ fn run_dashboard_inner(
                                     .unwrap_or_else(|| filter_key(prefix_armed, key));
                                 let armed_before = prefix_armed;
                                 prefix_armed = armed;
-                                // Issue #354 phase 4: the first-run tip has
-                                // done its job the moment the operator uses a
-                                // prefixed key -- or says so with Esc. It is
-                                // never shown again in this session, and the
-                                // flag file makes sure it is never shown in
-                                // another one either.
-                                //
-                                // Review of #354 (defect 2, MEDIUM): a bare
-                                // `Esc` with the prefix unarmed is ordinary
-                                // child input (`filter_key` hands it back as
-                                // `ToChild`), so dismissing the tip with it
-                                // used to ALSO forward that same `Esc` to the
-                                // child -- an operator's very first keystroke
-                                // in the dashboard could land in whatever the
-                                // focused pane was doing. This keystroke
-                                // happens once per operator, ever, so it is
-                                // consumed instead; an `Esc` that does not
-                                // dismiss the tip (the tip is already gone, or
-                                // the prefix is armed, whose `ToChild` bytes
-                                // are empty anyway) is unaffected.
+                                // Dismiss the first-run tip after a prefixed key or Esc (#354).
                                 let tip_dismissed_by_esc = first_run_tip
                                     && key.code == KeyCode::Esc
                                     && !matches!(verdict, InputVerdict::Dash(_));
@@ -2520,8 +1892,7 @@ fn run_dashboard_inner(
                                         || key.code == KeyCode::Esc)
                                 {
                                     first_run_tip = false;
-                                    // Phase 5: the write happens HERE, once,
-                                    // at the dismissal -- never at launch.
+                                    // Persist tip dismissal once, when the operator dismisses it, rather than at launch.
                                     mark_first_run_tip_seen(state);
                                 }
                                 // Empty `ToChild`, not `Pending`: the prefix
@@ -2535,32 +1906,17 @@ fn run_dashboard_inner(
                                 } else {
                                     verdict
                                 };
-                                // Task 2: what the loop ACTUALLY stored and
-                                // ACTUALLY decided -- every DashAction, not
-                                // only the interesting ones. Paired with
-                                // `EVENT`'s `armed_before` and the `TICK`
-                                // lines, this is what separates "arming was
-                                // never stored" from "arming was stored and
-                                // then lost before the next keystroke".
+                                // Log the actual stored prefix state and dispatched action after each event.
                                 if let Some(log) = keylog.as_mut() {
                                     log.dispatch(armed_before, prefix_armed, &verdict);
                                 }
                                 match verdict {
-                                    // Issue #354 phase 3: the target is
-                                    // captured at the moment of the gesture --
-                                    // a right-click names whatever row it
-                                    // landed on, which is not necessarily the
-                                    // selected one, and the menu's own title
-                                    // says which.
+                                    // Bind a right-click menu to the row hit by that gesture, not the sidebar selection (#354).
                                     InputVerdict::Dash(
                                         action @ (DashAction::ContextMenu(_)
                                         | DashAction::ContextActions),
                                     ) => {
-                                        // Issue #354 phase 5: the summary
-                                        // line's own menu -- `inspect` opens
-                                        // the dashboard inspector, every
-                                        // per-session entry is listed with
-                                        // its reason.
+                                        // Keep session actions visible but inert in the dashboard summary menu (#354).
                                         let summary_selected = action == DashAction::ContextActions
                                             && chrome_selection == Some(Hit::SidebarSummary);
                                         let target = match action {
@@ -2595,14 +1951,7 @@ fn run_dashboard_inner(
                                             }
                                         }
                                     }
-                                    // Issue #354 phase 3: the inspector over
-                                    // the selected row. Opening it on a
-                                    // retained done-unread row counts as
-                                    // reading that row (see `acknowledge`).
-                                    // Issue #354 phase 5: with the cursor on
-                                    // the summary line the subject is the
-                                    // DASHBOARD, not a row -- same dialog,
-                                    // same viewport, same Esc.
+                                    // Opening an inspector acknowledges a retained done-unread row; summary selection opens dashboard inspection (#354).
                                     InputVerdict::Dash(DashAction::Inspect)
                                         if chrome_selection == Some(Hit::SidebarSummary) =>
                                     {
@@ -2654,11 +2003,7 @@ fn run_dashboard_inner(
                                             ),
                                         }
                                     }
-                                    // Issue #354 phase 3: `^A r` -- the dead
-                                    // footer's own hint, with a binding at
-                                    // last. The hint is not drawn for a row
-                                    // that cannot be restored, so this only
-                                    // has to say so rather than guess.
+                                    // Restore only a retained row whose original spawn request is available (#354).
                                     InputVerdict::Dash(DashAction::RestoreRow) => {
                                         match session_target(
                                             chrome_selection.as_ref(),
@@ -2720,30 +2065,9 @@ fn run_dashboard_inner(
                                         }
                                     }
                                     InputVerdict::Pending => {}
-                                    // Typing always reaches the *focused* pane, never
-                                    // the merely selected sidebar row (F7): walking
-                                    // the sidebar onto a view-only session must not
-                                    // swallow the operator's keystrokes.
-                                    //
-                                    // F1: `write_operator_input`, not `write_input` --
-                                    // it records that the operator has typed since
-                                    // this pane's last turn boundary, which takes the
-                                    // pane out of reach of the idle-gated injectors
-                                    // until it reports the next one. A line injected
-                                    // on top of a half-composed prompt submits it.
+                                    // Send unprefixed input only to the focused pane, and mark operator typing so idle-gated injection waits for the next turn.
                                     InputVerdict::ToChild(bytes) => {
-                                        // Issue #490 (roadmap N21 item A):
-                                        // input routing is the second place a
-                                        // mixed roster parts company. A wrapped
-                                        // pane gets the encoded BYTES through
-                                        // its pty writer; a native pane gets
-                                        // the KEY, through the same router
-                                        // `zirv chat --runtime native` uses --
-                                        // so the composer, the approval dialog
-                                        // and the overview cursor all work
-                                        // identically in either loop, and none
-                                        // of those controls is reachable on a
-                                        // wrapped pane at all.
+                                        // Route wrapped input as PTY bytes and native input through its composer contract (#490).
                                         let routed_native = panes
                                             .get_mut(focused)
                                             .and_then(|pane| pane.native_mut())
@@ -2816,15 +2140,7 @@ fn run_dashboard_inner(
                                             focused,
                                             &mut chrome_selection,
                                         );
-                                        // Issue #354 phase 2: navigation no
-                                        // longer clears the `Unseen` latch.
-                                        // Arrowing past a pane is not reading
-                                        // it, and the old unconditional
-                                        // `mark_seen_io` here cleared `◆` for
-                                        // every row the cursor merely passed
-                                        // over. `DoneUnreadAck` now waits for
-                                        // an unoccluded render of the focused
-                                        // pane instead.
+                                        // Navigation alone cannot acknowledge unread output; only a completed visible render can (#354).
                                     }
                                     // Scrollback, on the focused pane, for every
                                     // terminal that does not deliver wheel events
@@ -2882,8 +2198,7 @@ fn run_dashboard_inner(
                                         zoomed = !zoomed;
                                         let m = effective_main(full, sidebar_cols, zoomed);
                                         let new_size = (m.height.max(1), m.width.max(1));
-                                        // MEDIUM (review): the third resize path
-                                        // -- see `cancel_selection_on_resize`.
+                                        // Cancel a selection before resizing changes its grid coordinates.
                                         cancel_selection_on_resize(
                                             &mut selection,
                                             &panes,
@@ -2941,16 +2256,7 @@ fn run_dashboard_inner(
                                         overlay = ui::Overlay::Spawn(ui::SpawnDraft::default());
                                     }
                                     InputVerdict::Dash(DashAction::Nudge) => {
-                                        // `selected` addresses the combined row list
-                                        // (`rows`, this iteration's): an index below
-                                        // `panes.len()` is an attached pane, at or
-                                        // above it is a view-only registry row named
-                                        // by that same index in `rows`.
-                                        //
-                                        // D1: either way the target is captured as a
-                                        // short id, resolved again at Enter time --
-                                        // `selected` is only used to pick *which*
-                                        // session is meant, here and now.
+                                        // Only a row backed by a live pane can receive child input; view-only rows affect selection but not focus.
                                         let target = match session_target(
                                             chrome_selection.as_ref(),
                                             &rows,
@@ -2967,13 +2273,7 @@ fn run_dashboard_inner(
                                             input: String::new(),
                                         });
                                     }
-                                    // Issue #84: the target is always the
-                                    // *focused* pane -- the one whose grid is
-                                    // on screen and would receive the swap's
-                                    // own fresh child -- not merely the
-                                    // sidebar's `selected` row, which can sit
-                                    // on a view-only session no pane object
-                                    // backs at all.
+                                    // Handover targets the focused pane whose grid and child are on screen (#84).
                                     InputVerdict::Dash(DashAction::Handover) => {
                                         match panes.get(focused).map(|p| p.short().to_string()) {
                                             Some(target_short) => {
@@ -2981,16 +2281,7 @@ fn run_dashboard_inner(
                                                 for agent in adapters::available_adapter_names(cfg)
                                                 {
                                                     for tier in handover::TIERS {
-                                                        // An adapter with no
-                                                        // tier ladder and no
-                                                        // configured override
-                                                        // (finding #6) has
-                                                        // nothing to offer for
-                                                        // this tier -- skip
-                                                        // it rather than
-                                                        // showing a picker
-                                                        // entry that would
-                                                        // fail the swap.
+                                                        // Omit a picker tier when an adapter has neither that tier nor an override.
                                                         if let Ok(model) = handover::resolve_model(
                                                             agent, tier, cfg,
                                                         ) {
@@ -3034,12 +2325,7 @@ fn run_dashboard_inner(
                                             &facts_cache.disk.jev,
                                         ));
                                     }
-                                    // Issue #354 phase 4: help and the palette
-                                    // are one dialog over one table. Both
-                                    // snapshot the selected row's own
-                                    // availability as they open, so a row
-                                    // action is listed with the reason it
-                                    // cannot be used on THIS row.
+                                    // Help and palette share the same action table and snapshot row availability on opening (#354).
                                     InputVerdict::Dash(
                                         action @ (DashAction::Help | DashAction::Palette),
                                     ) => {
@@ -3063,18 +2349,7 @@ fn run_dashboard_inner(
                         }
                         Ok(Event::Resize(cols, term_h)) => {
                             input_errors = 0;
-                            // F6: the loop's own idea of the terminal is updated
-                            // here, not just used locally. The zoom handler and the
-                            // fallback size of every `crossterm::terminal::size`
-                            // call below read these, so leaving them at the startup
-                            // geometry made un-zooming after a resize restore panes
-                            // to the size the terminal had at launch.
-                            // Recomputed from THIS event's own incoming width,
-                            // never the stale value the previous iteration
-                            // left behind -- a resize that crosses the
-                            // narrow-terminal floor must resize every pane
-                            // to the right geometry on this same event, not
-                            // one iteration late.
+                            // Store the new terminal size for zoom and later fallback sizing.
                             sidebar_cols =
                                 effective_sidebar_cols(cfg, cols, sidebar_forced_visible);
                             apply_terminal_resize(
@@ -3090,51 +2365,12 @@ fn run_dashboard_inner(
                                 &mut selection,
                             );
                         }
-                        // The wheel scrolls the FOCUSED pane, whatever the pointer
-                        // happens to be over.
-                        //
-                        // Not a shortcut taken because the coordinates are
-                        // unreliable -- a probe on the operator's own terminal
-                        // confirmed `MouseEvent { kind: ScrollDown, column, row }`
-                        // arrives with real, usable coordinates. It is that there
-                        // is nothing to disambiguate: this dashboard shows exactly
-                        // one pane's grid at a time (`render_grid` is called for
-                        // `panes[focused]` alone) rather than tiling them, so the
-                        // only thing the pointer can be over other than the focused
-                        // pane's grid is the sidebar -- a list of rows, not a
-                        // scrollable grid. Hit-testing would therefore buy nothing
-                        // beyond "do nothing when the pointer is on the left",
-                        // which is a worse wheel, not a better one. Revisit only if
-                        // panes are ever tiled.
-                        //
-                        // Nothing in this arm checks `mouse_capture` directly: when
-                        // `dash.mouse` never wrote `term::dash_mouse_on_bytes()` at
-                        // startup, the terminal was never told to report mouse
-                        // events at all, so `event::read` simply never produces
-                        // `Event::Mouse` in the first place -- the same reason
-                        // nothing gates on it after `dash_reset_bytes` on exit
-                        // either. This arm is only ever reached with
-                        // `mouse_capture` true, and (issue #697) stays true for the
-                        // rest of the session once it is: there is no longer a
-                        // mid-session toggle that could turn it back off.
+                        // There is only one drawn grid, so wheel input always
+                        // scrolls focus; sidebar position cannot name another grid.
+                        // Mouse events arrive only while terminal reporting is on.
                         Ok(Event::Mouse(mouse)) => {
                             input_errors = 0;
-                            // Issue #490 (roadmap N21 item A): #354's
-                            // clickable rows, for a native pane's overview. A
-                            // click inside the panel column selects the agent
-                            // whose rendered lines it landed in and never
-                            // scrolls, submits or forwards anything -- and a
-                            // wrapped pane never reaches it, so the native
-                            // control is not offered where it has no meaning.
-                            //
-                            // PR #545 review finding 3: the WHEEL is routed
-                            // here too. A native pane has no vt100 grid and no
-                            // pty scrollback, so the wrapped path below moved a
-                            // buffer that is never rendered while the
-                            // transcript the operator is looking at sat still.
-                            // Both gestures now reach the one scroll position
-                            // a native pane actually has, the same state its
-                            // own Up/Down/PageUp/PageDown keys move.
+                            // Map native overview clicks to the agent whose rendered row was hit (#490).
                             if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
                             {
                                 match mouse.kind {
@@ -3178,18 +2414,7 @@ fn run_dashboard_inner(
                                 match pane.scroll_wheel(delta, col, row) {
                                     Ok(outcome) => {
                                         let after = pane.scrollback();
-                                        // A wheel notch spun while the left
-                                        // button is still held arrives as its
-                                        // own `ScrollUp`/`ScrollDown` event
-                                        // here, not as a `Drag`, so this is
-                                        // the one place that observes it --
-                                        // translate any selection on this
-                                        // pane by the same amount the offset
-                                        // just moved, mid-drag or already
-                                        // released and highlighted alike
-                                        // (see `translate_selection`; issue
-                                        // #697 replaced the old outright
-                                        // cancel with this).
+                                        // Translate an active selection by the wheel's scroll delta, including mid-drag (#697).
                                         translate_selection(
                                             &mut selection,
                                             pane.short(),
@@ -3214,17 +2439,7 @@ fn run_dashboard_inner(
                                     Err(e) => push_error(&mut errors, format!("scroll: {e}")),
                                 }
                             }
-                            // A click, for a child that asked for mouse
-                            // events -- unlike the wheel, only when the
-                            // pointer is genuinely over that child's grid:
-                            // a click on the sidebar is aimed at the sidebar,
-                            // and a button press is a position, not a
-                            // direction. Dropped entirely for a child that
-                            // never turned mouse reporting on. Left is
-                            // deliberately excluded here (issue #697): its
-                            // press and release are both deferred by the
-                            // click-vs-drag decision below (`PendingPress`)
-                            // instead of forwarding immediately.
+                            // Forward a child mouse click only when it lands inside that pane's grid.
                             let button = match mouse.kind {
                                 MouseEventKind::Down(b) if b != MouseButton::Left => {
                                     Some((mouse_button_code(b), true))
@@ -3248,33 +2463,10 @@ fn run_dashboard_inner(
                                 }
                             }
 
-                            // Issue #697: the dashboard owns click-drag
-                            // selection inside every pane now, including one
-                            // whose child wants mouse reporting -- but a
-                            // plain click must still reach such a child (a
-                            // button in the Claude Code or Codex TUI), so a
-                            // Left press is never forwarded, and never
-                            // starts a `Selection`, the instant it lands.
-                            // Instead it becomes a `PendingPress`, and only
-                            // the next event resolves it: past
-                            // `DRAG_THRESHOLD_CELLS` of movement it is a
-                            // drag (promoted into a `Selection`, never
-                            // forwarded), otherwise release replays it as a
-                            // forwarded press-then-release click.
+                            // Defer a press so a drag becomes dashboard selection while a plain click still reaches the child (#697).
                             match mouse.kind {
                                 MouseEventKind::Down(MouseButton::Left) => {
-                                    // A fresh press always clears whatever was
-                                    // selected or pending before, whether or
-                                    // not this one goes on to start a new
-                                    // selection -- the simplest rule that
-                                    // cannot leave a stale highlight or a
-                                    // stale pending press behind. Deliberately
-                                    // not also cleared by every
-                                    // keyboard-forwarded keystroke (which
-                                    // would mean touching `encode_key`'s many
-                                    // call sites); a click is already the
-                                    // obvious, low-traffic place an operator
-                                    // expects a previous selection to go away.
+                                    // Clear stale selection and pending press on every fresh left press.
                                     selection = None;
                                     pending_press = None;
                                     let main = effective_main(full, sidebar_cols, zoomed);
@@ -3383,17 +2575,7 @@ fn run_dashboard_inner(
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
                                     if let Some(pending) = pending_press.take() {
-                                        // Never crossed the threshold: a
-                                        // click, not a drag. Replay the
-                                        // ORIGINAL press now (deferred this
-                                        // far) and this release, to the same
-                                        // pane. `forward_mouse_button` is
-                                        // itself the `wants_mouse` gate, so a
-                                        // click over a pane that never asked
-                                        // for the mouse simply forwards
-                                        // nothing and does nothing -- the
-                                        // "otherwise do nothing" half of the
-                                        // contract.
+                                        // Replay an unmoved press and release to the same child as a click.
                                         if let Some(pane) = panes.get_mut(focused)
                                             && pane.short() == pending.pane_short
                                         {
@@ -3427,16 +2609,7 @@ fn run_dashboard_inner(
                                         && let Some(pane) = panes.get(focused)
                                         && pane.short() == sel.pane_short
                                     {
-                                        // LOW (review): `.take()` runs before
-                                        // the `pane_short` match above, so a
-                                        // focus change between the promoting
-                                        // `Drag` and this `Up` deliberately
-                                        // drops the selection with no copy
-                                        // rather than releasing it against
-                                        // the wrong (now-focused) pane -- the
-                                        // same "cannot use stale coordinates"
-                                        // call every other cancel in this
-                                        // module makes.
+                                        // Drop a selection if focus changed before its release, since the selected pane no longer owns the gesture.
                                         let (kept, copy) = selection_on_release(sel);
                                         if copy && let Some(s) = kept.as_ref() {
                                             let (rows, cols) = pane.screen().size();
@@ -3454,12 +2627,7 @@ fn run_dashboard_inner(
                                 _ => {}
                             }
                         }
-                        // Issue #490 (roadmap N21 item A): a bracketed paste
-                        // into a native pane goes to its composer as one
-                        // insertion, never key by key -- which is what keeps a
-                        // pasted multi-line block from submitting on its first
-                        // newline. A wrapped pane's child does its own paste
-                        // handling over the pty, unchanged.
+                        // Insert native bracketed paste as one composer operation, preserving multiline text (#490).
                         Ok(Event::Paste(text)) => {
                             input_errors = 0;
                             if let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
@@ -3491,20 +2659,13 @@ fn run_dashboard_inner(
             drained += 1;
         }
 
-        // R8: a console handle that has gone away answers every poll with an
-        // error, instantly -- so the loop spun at full speed forever, pushing
-        // an error string per iteration and never reaching a quit path. There
-        // is no operator left to press `Ctrl+A q`, so the dashboard takes
-        // itself down the ordinary way: roster written, panes shut down with
-        // their own quit sequences, terminal restored.
+        // After persistent console-read errors, quit through normal roster and terminal cleanup instead of spinning.
         if input_stream_is_dead(input_errors) {
             push_error(
                 &mut errors,
                 "dashboard: the input stream stopped answering; quitting".to_string(),
             );
-            // F5: the operator never got to answer the restore dialog and now
-            // never will, so its candidates go back into the roster for the
-            // next launch rather than being overwritten by this quit's own.
+            // Return unanswered restore candidates to the next roster on exit.
             on_quit(
                 &panes,
                 unoffered_candidates(&overlay, &restore_candidates),
@@ -3519,18 +2680,9 @@ fn run_dashboard_inner(
         }
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
-        // Dash refresh PR1: recomputed every iteration, from THIS frame's
-        // real width -- never held over from whatever a previous keystroke
-        // last saw.
+        // Compute sidebar width from this frame's terminal size.
         let next_sidebar_cols = effective_sidebar_cols(cfg, term_size.0, sidebar_forced_visible);
-        // M6: reconcile a resize crossterm coalesced or dropped -- if the real
-        // terminal is not the size the ptys were last set to, apply it now so a
-        // missed SIGWINCH does not leave every pane pinned at the old geometry.
-        // Dash refresh PR1: also reconciles on a sidebar-only change (`^A b`
-        // toggling `sidebar_forced_visible` with no terminal resize at all)
-        // -- the effective main rect changed just as surely as if the
-        // terminal itself had, and every pane's pty must follow it on this
-        // exact frame, not whenever the terminal happens to resize next.
+        // Reconcile terminal size every frame because resize events may be coalesced or missed.
         if term_size != (term_cols, term_rows) || next_sidebar_cols != sidebar_cols {
             sidebar_cols = next_sidebar_cols;
             apply_terminal_resize(
@@ -3550,19 +2702,10 @@ fn run_dashboard_inner(
         }
         let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
         let layout = ui::layout(frame_area, sidebar_cols);
-        // F5: the grid and any overlay are drawn into the *effective* main
-        // rect, which is the whole frame while zoomed. Before this, zoom
-        // resized the pty (so the child re-laid itself out for a full-width
-        // terminal) but kept drawing into the un-zoomed `main` rect and left
-        // the header/sidebar columns blank -- the one thing zoom is for.
+        // Draw the grid and overlay in the effective main rect so zoomed PTY and display geometry agree.
         let main_area = effective_main(frame_area, sidebar_cols, zoomed);
 
-        // Recomputed (facts_cache itself was already refreshed above, before
-        // input handling) so the sidebar's own `.selected` highlight
-        // reflects any selection change the keystroke just made -- cheap and
-        // pure, unlike the disk-backed facts refresh it does not repeat.
-        // `visible_registry` (L19: ghost-reaped rows filtered) is reused from
-        // the pre-input pass -- the snapshot has not changed within the tick.
+        // Rebuild sidebar rows after input changes selection so its highlight is current.
         let rows = assemble_sidebar(
             &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
@@ -3581,16 +2724,7 @@ fn run_dashboard_inner(
         } else {
             0
         };
-        // Dash refresh PR2: the orchestrator seat's own rollover state,
-        // computed once per frame from this same tick's disk-backed reads
-        // (never new I/O) -- shared by the sidebar badge (this seat's own
-        // row) and the footer segment (only when that seat is FOCUSED, see
-        // below).
-        //
-        // Review fix: `seat_headroom_pct` is only trusted when it names the
-        // SAME seat (short + generation) `seat_full` reads as current right
-        // now -- a reading cached for a seat a rollover has since replaced
-        // must never be shown against its successor.
+        // Share one cached seat rollover state across footer and sidebar in this frame.
         let seat_headroom_for_current = seat_headroom_for_current(
             seat_headroom_pct.as_ref(),
             facts_cache.disk.seat_full.as_ref(),
@@ -3630,18 +2764,12 @@ fn run_dashboard_inner(
         eased_rot_score = focused_score_now
             .map(|target| ease_toward_score(eased_rot_score, target, ease_dt_ms, motion));
 
-        // L13: a live notice (info) shows as plain text and takes precedence
-        // while fresh; once it expires the sticky error line (⚠) shows through
-        // again. Only genuine failures reach `errors` now -- informational
-        // confirmations go to `notices`.
+        // Show transient notices before sticky errors, then reveal errors after notices expire.
         let total_live = rows
             .iter()
             .filter(|r| r.state != ui::RowState::Dead)
             .count();
-        // Dash refresh PR1 round 2: the header's own count cluster --
-        // `working` and `needs_you` are subsets of `total_live` ("sessions"
-        // in the drawn text), read off the same tick's own rows so the
-        // header can never disagree with the sidebar it sits above.
+        // Derive header counts from the same live session set to keep subsets consistent.
         let header_working = rows
             .iter()
             .filter(|r| r.state == ui::RowState::Working)
@@ -3658,54 +2786,34 @@ fn run_dashboard_inner(
             errors.sticky_line(),
             live_notice(&notices, Instant::now()).map(str::to_string),
         );
-        // Issue #209/v3 §D: the footer describes whichever pane is focused
-        // (Q1) -- reuses this tick's own sidebar row rather than re-deriving
-        // the same facts a second way (see `assemble_footer_facts`'s own
-        // doc comment). `last_exited` (codex review finding 1) is what makes
-        // the dead-pane variant reachable once `reap_ended_panes` has
-        // already removed the row `focused` used to name.
-        // Issue #354 phase 4: the first-run tip, lowest precedence of the
-        // three things the header's middle slot can carry.
+        // Build the focused pane's footer from this tick's cached sidebar row (#209).
         facts.tip = first_run_tip.then(|| ui::FIRST_RUN_TIP.as_str());
         facts.hints.alive = rows
             .get(selected)
             .is_some_and(|r| r.state != ui::RowState::Dead);
-        // Issue #354 phase 2: the cluster follows the selected row's own
-        // glyph, so a row waiting on the operator offers `^A i`/`^A n` and an
-        // ended one offers only what still applies to it.
+        // Choose action hints from the selected row's actual glyph and availability (#354).
         facts.hints.needs_action =
             rows.get(selected).map(ui::glyph_for) == Some(ui::Glyph::NeedsAction);
         facts.hints.ended = rows
             .get(selected)
             .is_some_and(|r| r.state == ui::RowState::Dead);
-        // Issue #354 phase 3: `^A r restore` is only drawn for a row that
-        // really can be relaunched -- one whose own spawn request the
-        // dashboard still holds. The context menu is where an unavailable
-        // restore is named AND explained; the header only ever offers hints
-        // that do something.
+        // Draw restore only when the row retains a relaunchable request (#354).
         facts.hints.restorable = facts.hints.ended
             && rows.get(selected).is_some_and(|r| {
                 retained_ended
                     .iter()
                     .any(|e| e.short == r.short && e.request.is_some())
             });
-        // Issue #354 phase 5: with the cursor parked on the summary line the
-        // cluster describes the dashboard instead, and offers the one chord
-        // that applies there.
+        // Offer dashboard inspection when the summary line is selected (#354).
         facts.hints.summary = chrome_selection == Some(Hit::SidebarSummary);
         let focused_row = rows.iter().find(|r| r.focused);
-        // Codex review finding 2: the focused pane's OWN mail queue, not
-        // the dashboard's fixed launch identity's -- see `MailMap`'s own
-        // doc comment.
+        // Read the focused pane's own mail count, not the launch pane's count.
         let focused_mail =
             focused_row.and_then(|row| facts_cache.disk.mail_by_session.get(&row.short).copied());
-        // Issue #310: the focused pane's own stall latch, looked up the same
-        // way `focused_mail` is right above.
+        // Read the focused pane's own stall latch (#310).
         let focused_stalled =
             focused_row.is_some_and(|row| facts_cache.disk.stalled.contains(&row.short));
-        // Dash refresh PR2: the rollover segment is orchestrator-seat-only,
-        // and only when that seat is the one FOCUSED right now (`FooterAlive
-        // Facts` is always about the focused pane, never any other row).
+        // Show rollover distance only while the orchestrator seat is focused.
         let footer_rollover = panes
             .get(focused)
             .filter(|p| p.role() == prompt::PromptRole::Orchestrator)
@@ -3731,11 +2839,7 @@ fn run_dashboard_inner(
         );
 
         let bands = (cfg.score.advise_at, cfg.score.compact_at);
-        // Issue #354: the roster owns its own viewport now -- the wheel
-        // scrolls it without moving the cursor -- so the offset is re-pinned
-        // to the selection only when the keyboard actually navigated
-        // (`reveal_sidebar`). A group the selection lands inside is expanded
-        // first: a collapsed group must never hide the row the cursor is on.
+        // Repin sidebar viewport to selection only when keyboard navigation moves it; wheel scrolling is independent (#354).
         if reveal_sidebar
             && chrome_selection.is_none()
             && let Some(group) = rows.get(selected).and_then(|row| row.group.as_ref())
@@ -3750,13 +2854,7 @@ fn run_dashboard_inner(
             bands,
         };
         let mut roster = ui::roster_frame(layout.sidebar, &rows, &view);
-        // The viewport's index space is `roster.row_ids` (tree entries), not
-        // `rows` (sessions): a group header takes a line of its own and a
-        // collapsed group swallows its children's. Dash refresh PR1: the
-        // title line that used to cost the roster its own top row is drawn
-        // from a separate rect now (`DashLayout::sidebar_title`), so the
-        // roster's own capacity is `layout.sidebar.height` outright -- no
-        // `-1` reservation left to make here.
+        // Use tree row IDs for sidebar viewport positions because group headers and collapsed groups alter visible rows.
         let capacity = layout.sidebar.height as usize;
         let reveal_index = reveal_sidebar
             .then(|| {
@@ -3811,10 +2909,7 @@ fn run_dashboard_inner(
             ui::toast_style(started.elapsed().as_millis() as u64, motion)
                 .map(|style| (text.clone(), style))
         });
-        // Dash refresh PR1: the focused pane's own header row -- left
-        // identity, right workflow/state -- replaces `render_focus_rule`'s
-        // old text-in-the-rule treatment. `None` (nothing focused, an empty
-        // dashboard) draws nothing.
+        // Draw focused pane identity and workflow in its pane header; draw nothing without focus.
         let pane_header_facts = focused_row.map(|row| ui::PaneHeaderFacts {
             harness: row.harness.clone(),
             role: row.role.clone(),
@@ -3860,15 +2955,7 @@ fn run_dashboard_inner(
             height: limits_height,
             ..layout.sidebar
         };
-        // Dash refresh PR2: the JEV section sits between the roster and
-        // LIMITS -- vertical priority (spec's own words) is sessions, then
-        // LIMITS, then JEV, so LIMITS' own budget above is computed exactly
-        // as PR1 left it (unaffected by JEV's existence), and JEV gets
-        // whatever is left between the roster's own last drawn row and
-        // wherever LIMITS starts. `jev_fixed_rows` is the title/rule plus
-        // either the one `no key` line or the four `Active` fixed lines
-        // (`calls`/`wait`/`errors`/`last`) -- the section hides entirely the
-        // instant even those do not fit, before a single site row is drawn.
+        // Preserve vertical priority for sessions and limits before JEV by giving limits its own reserved space.
         let jev_available_rows = layout
             .sidebar
             .height
@@ -3938,10 +3025,7 @@ fn run_dashboard_inner(
         // own `divider_col < area.width` check, so it degrades to a bare
         // rule exactly like a frame with no separator column already does.
         let sidebar_hidden_now = layout.sidebar.width == 0;
-        // Dash refresh PR1 round 2: LIMITS reset times read as the
-        // operator's own local wall clock, not UTC -- the one clock read in
-        // this whole draw closure, so every pure formatter below takes the
-        // offset as a plain argument instead of reaching for `Local` itself.
+        // Read local wall clock once for all LIMITS reset times in this frame.
         let local_offset = *chrono::Local::now().offset();
         let rule_divider_col = if sidebar_hidden_now {
             u16::MAX
@@ -4043,14 +3127,7 @@ fn run_dashboard_inner(
                         let (rows, cols) = pane.screen().size();
                         resolve_selection_range(sel, rows, cols)
                     });
-                // Issue #490 (roadmap N21 item A): a native pane draws its own
-                // conversation inside this frame's chrome. Everything around
-                // it -- the header, the sidebar, the rule, the footer, the
-                // overlay -- is the dashboard's and is drawn by the same code
-                // either way, so this is the ONE place the two pane kinds part
-                // company on rendering. `render_native_pane` owns only the
-                // interior, exactly as `render_grid` never draws a border of
-                // its own.
+                // Draw native conversation inside the dashboard's existing chrome (#490).
                 if let Some(native) = pane.native() {
                     let facts = native.status_facts();
                     let (view, presentation) = native.view();
@@ -4071,10 +3148,7 @@ fn run_dashboard_inner(
                     );
                 } else {
                     ui::render_grid(f, main_area, pane.screen(), selection_range);
-                    // Why the grid is not moving, when it is not moving because
-                    // the operator scrolled it. Drawn after the grid so it sits
-                    // on top, and before any overlay so a dialog still owns the
-                    // screen.
+                    // Draw a scrollback notice above the grid but below overlays.
                     ui::render_scroll_marker(f, main_area, pane.scrollback());
                     // HIGH-1: the focused pane's own caret. ratatui hides the
                     // cursor on every frame whose `cursor_position` is left
@@ -4109,11 +3183,7 @@ fn run_dashboard_inner(
             }
             frame_snapshot = next_snapshot;
             frame_snapshot_overlay_ident = next_snapshot_overlay_ident;
-            // Issue #354 phase 2: this frame COMPLETED, so whatever it showed
-            // the operator counts as having been seen. Only the focused pane,
-            // only with no overlay over it, and only at its live scroll
-            // position -- and the acknowledgement itself happens on the next
-            // tick, never here (see `DoneUnreadAck`).
+            // Acknowledge unread output only after a completed frame visibly showed the focused pane without an overlay (#354).
             let focused_pane = panes
                 .get(focused)
                 .map(|pane| (pane.short(), pane.scrollback()));
@@ -4127,15 +3197,9 @@ fn run_dashboard_inner(
 
     teardown_terminal(keyboard_enhancement_pushed);
     restore_panic_hook(&previous_panic_hook);
-    // After the teardown, never before: the alternate screen is gone by now, so
-    // this lands in the operator's own scrollback rather than on a surface
-    // about to be discarded.
+    // Print teardown messages after leaving the alternate screen so they remain in shell scrollback.
     if all_panes_ended {
-        // F4: the header's notice channel is the only place these were ever
-        // shown, and the header goes away with the alternate screen -- so an
-        // operator whose panes all died learned nothing about how or why. The
-        // most recent handful (`MAX_KEPT_ERRORS`) is what the channel kept;
-        // they land in the scrollback, one per line, ahead of the closing line.
+        // Print retained errors into shell scrollback after the alternate screen closes so shutdown failures remain visible.
         for notice in errors.messages() {
             eprintln!("{notice}");
         }
@@ -4144,46 +3208,18 @@ fn run_dashboard_inner(
     Ok(exit_code)
 }
 
-/// The cleanup a failed terminal setup owes the panes that were already
-/// spawned: the orchestrator pane's child exists by the time raw mode is
-/// enabled. R4: all three setup-failure arms used to return `Err` straight
-/// past it, orphaning a live harness process with a registry record still
-/// claiming it was reachable.
-///
-/// P3 changed what a *dropped* `Pane` costs, and the change is worth stating
-/// precisely, because the old comment here is now wrong. A `Pane` holds a
-/// `supervise::ChildGuard`, whose `Drop` closes the child's kill-on-close job
-/// object -- so on Windows, dropping a `Pane` now does reap the child's whole
-/// tree rather than orphaning it. Dropping is no longer a leak.
-///
-/// This call is still very much wanted, for four reasons that `Drop` does not
-/// cover: it walks the adapter's own quit-sequence-then-grace ladder so the
-/// harness gets a chance to exit cleanly and flush its transcript instead of
-/// being shot; it releases the registry record and unpublishes the socket
-/// (`Pane::finish_shutdown`), which `ChildGuard` knows nothing about; the job
-/// object is Windows-only, so unix has nothing but this; and the release
-/// profile is `panic = "abort"`, under which `Drop` does not run at all. The
-/// guard is the backstop, not the plan.
-///
-/// Exactly the quit path's own `shutdown_all`, with the error strings
-/// discarded: there is no header left to show them in and the caller is about
-/// to return an `Err` naming the real failure. O7: and the same request-
-/// directory removal the quit path does, so a failed startup leaves nothing
-/// under `<state>/dash/` either.
+/// On setup failure, finish spawned panes explicitly: Unix has no Windows job
+/// guard, and `panic = "abort"` skips Drop. Flush transcripts and release records.
 fn abort_setup(panes: &mut [Pane], cfg: &CtxConfig, requests_dir: &Path) {
     let mut discarded = ErrorLog::default();
     shutdown_all(panes, cfg, &mut discarded);
     remove_request_dir(requests_dir);
 }
 
-/// The single grace budget a batched shutdown shares across every pane (M9),
-/// matching `wrap::quit_child`'s own per-child `QUIT_GRACE`.
+/// Share one grace across panes so shutdown duration does not grow per child.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Draws a one-line "shutting down N pane(s)…" frame, called right before a
-/// quit path begins tearing panes down (M9). Best-effort: a draw failure just
-/// means the operator sees the last frame a moment longer, which is what used
-/// to happen for the whole grace window anyway.
+/// Draw shutdown progress best-effort before pane teardown.
 fn render_shutting_down(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, pane_count: usize) {
     let msg = format!("shutting down {pane_count} pane(s)\u{2026}");
     let _ = terminal.draw(|f| {
@@ -4192,16 +3228,8 @@ fn render_shutting_down(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, p
     });
 }
 
-/// Shuts down every remaining pane with its own adapter's quit sequence,
-/// best-effort: a shutdown failure is logged into `errors`, never
-/// propagated -- the dashboard is exiting either way.
-///
-/// M9: one shared grace across all panes, not a full grace *per* pane run
-/// serially. Nine stuck panes used to freeze the operator on the alternate
-/// screen for up to 9x5s while `Pane::shutdown` waited out each one's ladder in
-/// turn. Now every pane is asked to quit first (`request_quit`, no wait), then
-/// all are polled for exit within one `SHUTDOWN_GRACE` window, and any
-/// straggler is killed at the end (`finish_shutdown`).
+/// Ask every pane to quit before waiting on one shared grace window;
+/// serial per-pane waits could hold the alternate screen for N timeouts.
 fn shutdown_all(panes: &mut [Pane], cfg: &CtxConfig, errors: &mut ErrorLog) {
     for pane in panes.iter_mut() {
         let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)

@@ -1,22 +1,12 @@
 //! Mail/nudge delivery sweep and injection eligibility.
 use super::*;
 
-/// Pure: whether a pane with `queued` nudges waiting should have the next one
-/// delivered right now -- injectable, and there is something to deliver.
-///
-/// G1: takes `injectable` (`Pane::injectable`) rather than a `&PaneState`.
-/// `PaneState::Idle` alone is no longer sufficient: it deliberately excludes
-/// whether the operator has typed into the pane since its last turn boundary,
-/// so a bare `state == Idle` check here would happily type a nudge on top of
-/// a half-composed prompt.
+/// Deliver a queued nudge only when the pane is injectable and the queue is nonempty.
 pub fn deliverable_now(injectable: bool, queued: usize) -> bool {
     injectable && queued > 0
 }
 
-/// Pops the next queued nudge for one pane if `deliverable_now` allows it;
-/// otherwise leaves the queue untouched. Pure aside from the `VecDeque`
-/// mutation -- no pane, no I/O -- so the FIFO-drain-on-idle rule is testable
-/// without a real spawn.
+/// Pop at most one deliverable nudge, leaving the queue untouched while injection is unsafe.
 pub(super) fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -> Option<String> {
     if deliverable_now(injectable, queue.len()) {
         queue.pop_front()
@@ -25,19 +15,12 @@ pub(super) fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -
     }
 }
 
-/// Thin seam over `Pane::inject_visible` so the mail sweep's "consume only
-/// after a successful visible injection" rule can be exercised without a
-/// real pty writer: `Pane` is the only production implementer; a test-only
-/// double can force an `Err` to prove a failed write leaves the source
-/// message file untouched (C7 discipline -- a message never actually shown
-/// to the agent must not be marked read).
+/// Separate visible injection from consumption so a failed write leaves the
+/// source mail unread and retryable.
 pub(crate) trait Injector {
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()>;
     fn track_delivery_sender(&mut self, _sender: &str) {}
-    /// Issue #468: this pane's own attention-block dedup pairing -- see
-    /// `Pane::mail_block_log`'s own doc comment. Defaults to `None`/no-op for
-    /// an injector double that does not exercise the dedup itself; a fake
-    /// that does must back this with real storage the way `Pane` does.
+    /// Track attention-blocked mail by ID so a later delivery can pair with its skip log (#468).
     fn mail_block_log(&self) -> Option<&(&'static str, String)> {
         None
     }
@@ -62,14 +45,7 @@ impl Injector for Pane {
     }
 }
 
-/// Delivers one mail message visibly into `injector`, consuming the source
-/// file (moving it to `read/`) ONLY if the injection itself returned `Ok`.
-///
-/// `short` is the delivering pane's own registry short id: consumption here
-/// happens on that pane's behalf, not in answer to its own explicit `zirv
-/// ctx inbox` call, so it goes through `mail::consume_and_log` (issue #30)
-/// rather than the bare `consume`, leaving a decision-log trail naming the
-/// mail file and the pane that claimed it.
+/// Consume mail only after visible injection succeeds; the source file remains for retry on failure.
 pub(super) fn deliver_and_consume<I: Injector>(
     injector: &mut I,
     state: &StateDir,
@@ -90,45 +66,16 @@ pub(super) fn deliver_and_consume<I: Injector>(
     )
 }
 
-/// Pure: whether a pane in `verb`, with `injectable` as `Pane::injectable`
-/// currently reports it, is a valid mail-sweep target -- only an attached
-/// *worker* pane (`Verb::Dash`) that may actually be injected into right now.
-/// The orchestrator pane (`Verb::Chat`) is deliberately excluded here, not
-/// just skipped by convention: it is never body-injected, only ever told a
-/// one-line unread-count advisory (the header's own mail segment) -- the
-/// same trust split every other mail delivery seam in this codebase already
-/// holds for an interactive Orchestrator session.
-///
-/// G1: takes `injectable` rather than a `&PaneState` -- see `deliverable_now`'s
-/// own doc comment for why `state == Idle` alone is no longer the right gate.
+/// Inject mail bodies only into idle workers; the orchestrator receives an
+/// advisory instead, preserving the parent/worker trust split.
 pub(crate) fn is_delivery_eligible(verb: sessions::Verb, injectable: bool) -> bool {
     verb == sessions::Verb::Dash && injectable
 }
 
-/// Pure: the label a swept mail message is injected under. Carries the trust
-/// marker every other mail seam in this codebase already frames a delivered
-/// body with (`prompt::with_mail_layer`'s own header): a message from another
-/// session is information about the world, never an instruction to follow.
-///
-/// R3: the pane seam used to inject a bare `"mail from {agent}/{short}"`, so
-/// this was the one delivery path that handed an agent an untrusted body with
-/// no framing at all.
-/// How much of a sender's own agent name the label repeats.
-///
-/// D5: the trust marker is the *tail* of the label, so trimming the finished
-/// label from the right is exactly the wrong end -- a sender with a long enough
-/// `from_agent` could push "information, not instruction" off it and have their
-/// body delivered with no framing at all. The unbounded component is bounded
-/// here instead, before the marker is ever appended, so the marker cannot be
-/// displaced by anything the sender controls.
+/// Keep the untrusted-mail marker in the injection label even when the sender name is long.
 pub(super) const MAX_SENDER_NAME_BYTES: usize = 64;
 
-/// Issue #249: `is_parent` is this pane's OWN `Pane::parent_session` (a
-/// server-verified value derived by the dashboard itself at spawn time --
-/// never anything read out of `from_agent`/`from_session`, which are
-/// sender-controlled) compared against this message's zirv-recorded sender.
-/// `sweep_one_pane` is the only caller and does that comparison; this
-/// function only ever renders the answer.
+/// Treat mail as parent steering only when its recorded sender matches the pane's server-verified parent (#249).
 pub(super) fn mail_injection_label(
     from_agent: &str,
     from_session: &str,
@@ -150,56 +97,19 @@ pub(super) fn mail_injection_label(
     )
 }
 
-/// Issue #468: whether a mail sweep target may be typed into a pane right
-/// now, given `status` (`attention::load`'s own return for this pane), and
-/// the specific [`attention::Attention`] blocking it when it may not.
-///
-/// `Pane::injectable`'s turn-signal gate (the caller's own precondition
-/// before either `sweep_one_pane` or `advise_one_pane` is even reached) is
-/// silent about WHY a pane looks idle: a Claude permission dialog pauses the
-/// harness between the model's own turns, so the turn-signal side can report
-/// idle while the hook-driven attention axis still latches
-/// `Attention::Approval` (see `attention.rs`'s own doc comment on the
-/// `AdapterHook`/`Supervisor` authority split, and #456/#457, which taught
-/// hooks to clear that latch again once the prompt resolves). Typing into a
-/// pane in that state lands as raw keystrokes on the open dialog -- exactly
-/// the "must not answer the prompt" failure this function exists to
-/// prevent.
-///
-/// `Projection::Blocked(Attention::None)` (a bare `Lifecycle::Waiting` with
-/// no named reason) is deliberately NOT treated as blocking: nothing in this
-/// codebase currently latches that combination from a live hook, and
-/// treating it as a mail block would risk silently withholding an ordinary
-/// advisory from a session that is simply waiting on its next prompt.
-///
-/// Issue #479 (roadmap N10) moved the predicate itself to
-/// [`attention::blocking`] so the runtime-neutral delegation mail service
-/// (`ctx::delegation::send`) answers the identical question for a NATIVE
-/// worker that this sweep answers for a legacy pane -- one rule, not two
-/// that can drift apart.
+/// Block typing while hook-driven attention holds a prompt, even if the turn signal reports idle; use the shared predicate (#468, #479).
 pub(super) fn mail_blocked_by_attention(
     status: &super::attention::SessionStatus,
 ) -> Option<super::attention::Attention> {
     super::attention::blocking(status)
 }
 
-/// Pure: the decision-log skip reason named by issue #468's own acceptance
-/// criterion (`approval-open`) for [`attention::Attention::Approval`], and an
-/// analogous reason for every other variant [`mail_blocked_by_attention`] can
-/// return -- so a skip row is never just "blocked" with no way to tell which
-/// latch caused it. Shared with the delegation mail service since issue #479.
+/// Log the specific blocking attention reason rather than a generic skip (#468).
 pub(super) fn mail_block_reason(attention: super::attention::Attention) -> &'static str {
     super::attention::block_reason(attention)
 }
 
-/// Issue #468: the one decision-log row shape for an attention-blocked mail
-/// sweep target, used both for the skip (`action` = `mail-attention-skip`)
-/// and for the delivery that eventually follows one (`action` =
-/// `mail-attention-delivered`). Both rows carry the SAME `mail_id` in
-/// `detail`, so `logs/decisions.jsonl` alone answers "was this message ever
-/// actually shown, and if not, why" without cross-referencing anything else.
-/// Best-effort, like every other decision-log write in this module: a
-/// logging failure must never affect whether the mail sweep itself proceeds.
+/// Use the same mail ID in skip and later delivery rows so the decision log shows whether blocked mail was eventually shown (#468).
 pub(super) fn log_mail_attention_event(
     state: &StateDir,
     session_id: &str,
@@ -222,31 +132,12 @@ pub(super) fn log_mail_attention_event(
     );
 }
 
-/// One pane's share of a mail sweep: **at most one** message, injected
-/// visibly and consumed only if the injection itself succeeded. Returns
-/// whether anything was delivered.
-///
-/// One per tick, not the whole mailbox (F8): the idle gate is evaluated once,
-/// before the first injection, and injecting immediately puts the pane back
-/// to work -- so the second and later messages of a batch used to be typed
-/// into a session that was already mid-turn, which is exactly what the
-/// idle gate exists to prevent. The remainder stays on disk, unread, and the
-/// next tick's sweep sees it again once the pane is genuinely idle.
-///
-/// Takes an `Injector` rather than a `Pane` so the one-per-tick rule is
-/// testable without a real pty, the same seam `deliver_and_consume` already
-/// uses.
-/// `screen_thresholds` (issue #272 review round 1) is the caller's own
-/// resolved `[screen]` config, threaded straight through to
-/// `mail::message_with_delivery_envelope` below, alongside `cfg` itself
-/// (issue #784, that same function's own `[jev] inject_screen` call).
+/// Inject at most one mail body per pane per tick so a burst remains readable;
+/// consume it only after successful injection, leaving failures retryable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_one_pane<I: Injector>(
     injector: &mut I,
-    // Issue #468: this pane's own zirv session id, for the attention-block
-    // decision-log rows below -- the same value `advise_one_pane` already
-    // takes as `session_id`, matching `report_back_reminder_sweep`'s own
-    // `Decision::session` convention.
+    // Use this pane's session ID for attention-block decision-log rows (#468).
     session_id: &str,
     cfg: &CtxConfig,
     state: &StateDir,
@@ -255,8 +146,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
     short: &str,
     cap: usize,
     errors: &mut ErrorLog,
-    // Issue #249: this pane's own `Pane::parent_session` -- server-verified
-    // at spawn time, never anything read out of a message being swept.
+    // Compare against the pane's server-verified parent, never sender-controlled mail fields (#249).
     parent_short: Option<&str>,
     screen_thresholds: &super::screen::Thresholds,
 ) -> bool {
@@ -268,10 +158,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
         }
     };
     let Some((path, msg)) = messages.into_iter().next() else {
-        // Issue #468: nothing unread any more -- if a blocked-mail pairing
-        // was still held (the message was consumed some other way, e.g. a
-        // roster restart or a direct `zirv ctx inbox`), there is no
-        // delivery left to pair it with a decision-log row.
+        // Clear a blocked-mail pairing when its message is no longer unread (#468).
         injector.set_mail_block_log(None);
         return false;
     };
@@ -280,9 +167,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    // Issue #468: the hook-driven attention axis, not just the turn-signal
-    // `injectable` gate the caller already applied -- see
-    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
+    // Check hook-driven attention as well as turn-signal injectability before typing (#468).
     let status = super::attention::load(state, short);
     if let Some(attention) = mail_blocked_by_attention(&status) {
         let reason = mail_block_reason(attention);
@@ -298,9 +183,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
 
     let is_parent =
         parent_short.is_some_and(|parent| sessions::short_id(&msg.from_session) == parent);
-    // D5: label and body share one budget. The label carries the sender's own
-    // `from_agent`, which is untrusted and unbounded, so capping only the body
-    // left the injection as a whole uncapped.
+    // Bound both injected label and body because sender-controlled names could otherwise exceed the injection budget.
     let delivered = mail::message_with_delivery_envelope(
         cfg,
         state,
@@ -317,8 +200,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
     match deliver_and_consume(injector, state, slug, short, &label, &path, &body) {
         Ok(()) => {
             injector.track_delivery_sender(&msg.from_session);
-            // Issue #468: pair a delivery with the skip row logged earlier
-            // for this SAME mail id, if any.
+            // Pair delivery only with the earlier skip for the same mail ID (#468).
             if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
                 && blocked_id == mail_id
             {
@@ -340,32 +222,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
     }
 }
 
-/// Pure: the exact advisory body an orchestrator pane's mail advisory
-/// carries -- `"{count} unread from {agent}/{short} — run `zirv ctx inbox`
-/// now to read (not --peek, which leaves them unread)"`, wrapped by
-/// `Pane::inject_visible` into `"[zirv ▸ mail] {body}"`. Names the sender of
-/// the *newest* unread message (the one that triggered this advisory, per
-/// `advise_one_pane`'s own dedup) and the total unread count, but never a
-/// body: an orchestrator session is never handed message text directly, only
-/// pointed at `zirv ctx inbox` to read it -- the same trust split
-/// `is_delivery_eligible` already draws for a worker pane's own body
-/// delivery, and the same shape `wrap.rs`'s own stderr mail advisory
-/// (`Event::MailWaiting`) already uses for a non-dashboard interactive
-/// session, adapted to the pane-injection seam (this one is typed visibly
-/// into the pane's own pty, not emitted on stderr, since a dashboard
-/// orchestrator pane has no stderr of its own an operator is watching).
-///
-/// Imperative, not merely informational, and explicit about the flag. The
-/// original wording (`"... -- zirv ctx inbox"`) only named the command and
-/// left the model to infer that seeing the name meant "run it now" -- a step
-/// models routinely do not take, so a delivered, unconsumed message could
-/// sit forever while the advisory itself kept re-announcing nothing new (the
-/// count cannot move without a real `zirv ctx inbox` call): to the operator
-/// this looked identical to the message never having arrived. Naming
-/// `--peek` explicitly, rather than assuming the model already knows the
-/// bare default consumes, closes the other half of the same failure: a
-/// model that reaches for `--peek` out of caution re-reads the same message
-/// on every future sweep and never actually clears it.
+/// Tell orchestrators to read unread mail through inbox; advisories do not consume message bodies.
 pub(super) fn orchestrator_mail_advisory_body(
     count: usize,
     from_agent: &str,
@@ -378,32 +235,7 @@ pub(super) fn orchestrator_mail_advisory_body(
     )
 }
 
-/// One orchestrator pane's share of the mail sweep. Unlike `sweep_one_pane`:
-/// never consumes anything (an orchestrator's own `zirv ctx inbox` is the
-/// only thing that consumes for it) and never carries a message body, only
-/// the one-line [`orchestrator_mail_advisory_body`].
-///
-/// Deduplicated against `advised` (keyed by the pane's own zirv session id,
-/// valued by a [`mail::AdvisedIds`] set of ids already advised): re-advises
-/// only once the newest unread message's own file name is not already in
-/// that set, so an unchanged inbox is not re-typed into the pane on every
-/// ~1s sweep tick, and an operator who has not yet run `zirv ctx inbox`
-/// still gets nudged again once something genuinely new shows up.
-///
-/// Finding 3 (review): this used to be a single never-pruned high-water-mark
-/// filename rather than a pruned set, so a new message that reused a
-/// *consumed* message's exact filename (`claim_and_write`'s same-second
-/// collision suffix can reissue a freed name) compared equal to the stale
-/// watermark and was silently never advised. The set is pruned
-/// (`forget_missing`) against the freshly-listed unread ids on every call,
-/// including when the mailbox is momentarily empty -- the same shape
-/// `wrap::MailWatch` already used, which is why it never had this bug -- so
-/// a consumed id is forgotten the moment it disappears, and a later message
-/// reusing that name reads as new again.
-///
-/// Takes an `Injector` rather than a `Pane`, the same seam `sweep_one_pane`
-/// already uses, so the dedup/formatting logic is testable without a real
-/// pty.
+/// Advise an orchestrator about mail without consuming it; only its inbox can do that.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn advise_one_pane<I: Injector>(
     injector: &mut I,
@@ -432,9 +264,7 @@ pub(crate) fn advise_one_pane<I: Injector>(
     entry.forget_missing(ids.iter().map(String::as_str));
 
     let Some((newest_path, newest_msg)) = messages.last() else {
-        // Issue #468: nothing unread any more -- drop any blocked-mail
-        // pairing that was still held; there is no delivery left to pair it
-        // with a decision-log row.
+        // Clear blocked-mail pairing once no unread message remains (#468).
         injector.set_mail_block_log(None);
         return false;
     };
@@ -446,12 +276,7 @@ pub(crate) fn advise_one_pane<I: Injector>(
         return false;
     }
 
-    // Issue #468: the hook-driven attention axis, not just the turn-signal
-    // `injectable` gate the caller already applied -- see
-    // `mail_blocked_by_attention`'s own doc comment for why both are needed.
-    // Checked here, AFTER the `entry.contains` dedup above and BEFORE the
-    // injection, so `attention::load` is only ever paid for a message this
-    // pane has not already been advised about.
+    // Check hook-driven attention before typing an advisory into an apparently idle orchestrator (#468).
     let status = super::attention::load(state, short);
     if let Some(attention) = mail_blocked_by_attention(&status) {
         let reason = mail_block_reason(attention);
@@ -479,8 +304,7 @@ pub(crate) fn advise_one_pane<I: Injector>(
     match injector.try_inject("mail", &body) {
         Ok(()) => {
             entry.insert(&newest_name);
-            // Issue #468: pair a delivery with the skip row logged earlier
-            // for this SAME mail id, if any.
+            // Pair an advisory delivery with the earlier skip for the same mail ID (#468).
             if let Some((reason, blocked_id)) = injector.mail_block_log().cloned()
                 && blocked_id == newest_name
             {
@@ -532,8 +356,7 @@ pub(super) fn mail_sweep(
             let agent = pane.agent().to_string();
             let short = pane.short().to_string();
             let session_id = pane.session_id().to_string();
-            // Issue #249: captured before `pane` is reborrowed mutably as
-            // the `Injector` below.
+            // Capture the parent session before mutably borrowing the pane for injection (#249).
             let parent_short = pane.parent_session().map(str::to_string);
             sweep_one_pane(
                 pane,
@@ -566,16 +389,8 @@ pub(super) fn mail_sweep(
     }
 }
 
-/// Issue #115: whether a freshly spawned worker pane should be told, later,
-/// by `report_back_reminder_sweep`, to report its outcome back to
-/// `req.requested_by` -- `Some(id)` only when the requester is addressable
-/// (`prompt::is_addressable_short`) AND mail delivery is enabled, the same
-/// two conditions `compose_worker_prompt`/`worker_task_prompt` already
-/// require before actually attaching a report-back instruction to a worker
-/// pane's launch prompt. Pure and split out of `fulfill_spawn_request` for
-/// the same testability reason `compose_worker_prompt`/`pane_model_args`
-/// were: whether this pane gets a reminder target is a fact about `req` and
-/// `cfg` alone, not about spawning a pty.
+/// Remind only when the verified report target is addressable; an invalid
+/// requester must not leave a worker with an unusable report command (#115).
 pub(super) fn report_to_for(req: &spawnreq::SpawnRequest, cfg: &CtxConfig) -> Option<String> {
     if cfg.mail.enabled && prompt::is_addressable_short(&req.requested_by) {
         Some(req.requested_by.clone())
@@ -584,9 +399,7 @@ pub(super) fn report_to_for(req: &spawnreq::SpawnRequest, cfg: &CtxConfig) -> Op
     }
 }
 
-/// Issue #115: the exact reminder body `report_back_reminder_sweep` injects.
-/// Names the same command the worker received at launch. The mail ledger gates
-/// reminders even after the requester has consumed the worker's report.
+/// Use the original report command in the one-shot reminder body (#115).
 pub(super) fn report_back_reminder_body(report_to: &str) -> String {
     format!(
         "If you have already sent your report, ignore this. Otherwise, your task session appears \
@@ -657,13 +470,7 @@ pub(super) fn report_back_reminder_sweep(
     }
 }
 
-/// Once-per-tick FIFO drain: for every pane whose queue has something
-/// deliverable right now, injects exactly the next one (never the whole
-/// queue at once -- one visible line per tick keeps the child's input
-/// stream readable). `panes` and `queues` are kept the same length by every
-/// caller that grows `panes` (today, only the initial spawn in
-/// `run_dashboard`; a future spawn seam -- Tasks 10/11 -- must push a
-/// matching `VecDeque::new()` here too).
+/// Drain at most one queued nudge per pane per tick so injection remains visible and FIFO.
 pub(super) fn deliver_queued_nudges(
     panes: &mut [Pane],
     queues: &mut [VecDeque<String>],
@@ -678,18 +485,7 @@ pub(super) fn deliver_queued_nudges(
     }
 }
 
-/// F1/F2 (review, PR #116): drains every pane's deferred injection
-/// submission (`Pane::pending_submit`) whose settle deadline has passed --
-/// the lone `\r` `Pane::inject_visible` no longer writes inline. See
-/// `dash::pane::INJECTION_SUBMIT_DELAY`'s own doc comment for the bug this
-/// replaced: blocking the dashboard's single UI thread for the settle gap
-/// inside every injection meant `mail_sweep`, `report_back_reminder_sweep`
-/// and `deliver_queued_nudges` -- all iterating every pane, all in the same
-/// tick -- could serially freeze redraw and input for the sum of their
-/// delays (up to ~1.35s across nine panes and three sweeps).
-///
-/// Called every tick so echo settling does not wait for the mail sweep's cadence.
-/// A failed write is reported once and cancelled rather than retried indefinitely.
+/// Submit deferred injection after its settle deadline without blocking the UI thread; cancel and report failed writes once (#116).
 pub(super) fn drain_pending_submits(
     panes: &mut [Pane],
     errors: &mut ErrorLog,
@@ -890,14 +686,7 @@ pub(super) fn report_settled_pane_with(
                     tail = format!("contract_failed: invalid result schema: {error}\n\n{tail}")
                 }
             },
-            // Issue #452 (review round 1): no `--result-schema`/`--result-
-            // kind` was declared for this delegation, but the pane's own
-            // final text was recovered from its transcript (`recovered`,
-            // via the `final_message` extraction the caller already ran for
-            // the schema branch above -- reused here, not duplicated).
-            // Persisted the same way an inline no-contract delegation's
-            // report is, via `store_report_only`, so a pane worker's report
-            // is durable on disk exactly like a headless one's.
+            // Persist recovered final text even when no result schema was declared, matching headless report storage (#452).
             None => {
                 let (report, report_truncated) = super::agent::cap_report(Some(&report_text));
                 super::agent::store_report_only(
@@ -930,18 +719,7 @@ pub(super) fn report_settled_pane_with(
     }
 }
 
-/// Issue #379: a pane whose last signal was "a compaction started" and that
-/// has said nothing for `supervise.compact_stall_secs` since. A codex pane
-/// wedged exactly this way -- 18 minutes into a second compaction, with
-/// `zirv ctx status` still reporting "working (user prompt submitted)" and
-/// not one word reaching the session that delegated to it.
-///
-/// Two things happen, both once per pane: a `Supervisor` observation latches
-/// `Attention::Stalled` with the rendered reason, so a `zirv ctx status` run
-/// from ANY other process sees it too (the projection alone is derived, and
-/// nothing outside this dashboard applies the compaction clock to a pane it
-/// cannot see); and the delegating session gets one mail. `now` is the
-/// caller's clock, so the whole decision is testable without waiting.
+/// Latch a stalled compaction in shared attention and mail its supervisor once, using the caller's clock (#379).
 pub(super) fn report_stalled_compaction(
     pane: &mut Pane,
     state: &StateDir,
@@ -962,10 +740,7 @@ pub(super) fn report_stalled_compaction(
     }
     let reason = super::attention::reason_at(&status, now, threshold);
     let quiet_mins = now.saturating_sub(status.last_transition) / 60;
-    // Latched before the mail is attempted, and left latched even when the
-    // pane owes nobody a report: this fires off a per-tick sweep, and a
-    // second observation (or a second mail) would say nothing the first did
-    // not.
+    // Latch before sending because this sweep runs every tick and must not repeat observation or mail.
     pane.stalled_mail_sent = true;
     let _ = super::attention::record(
         state,
@@ -993,33 +768,12 @@ pub(super) fn report_stalled_compaction(
     }
 }
 
-/// Pure: which live pane a short id names right now, or `None` when no pane
-/// carries it any more.
-///
-/// D1: the nudge dialog's target is resolved through this at **Enter** time,
-/// against the pane list as it is then -- not at the moment the dialog opened.
-/// Panes are reaped and spawned from under an open dialog, so the only stable
-/// name for one is its registry short id.
+/// Resolve a short ID against live panes when the nudge is submitted, avoiding stale row indices.
 pub(super) fn pane_index_by_short(shorts: &[&str], short: &str) -> Option<usize> {
     shorts.iter().position(|candidate| *candidate == short)
 }
 
-/// Handles a submitted `NudgeDraft`: an attached pane gets `inject_visible`
-/// immediately if [`Pane::injectable`], or is queued (FIFO, drained by
-/// `deliver_queued_nudges` once it becomes injectable again) otherwise; a
-/// view-only row is routed through the existing headless
-/// `sessions::run_nudge_with` (marker + mail + restart, unchanged). `target
-/// == None` (nothing was selected when the dialog opened) is a no-op.
-///
-/// D1: an `AttachedPane` target that no longer names a live pane is reported
-/// to the operator and injected nowhere. Silently dropping it would be the
-/// second-best outcome; injecting into whatever pane now sits where that one
-/// used to be is the failure this resolution exists to prevent.
-///
-/// H1: gated on `injectable()`, not `state() == Idle` -- a pane can render
-/// `Idle` while the operator is mid-composing in it (`user_typed_since_turn`),
-/// and a nudge submitted right then must queue rather than land on top of the
-/// half-typed prompt, same as the sweep/drain path G1 already covers.
+/// Inject a nudge immediately only when safe; otherwise queue it FIFO for a later sweep.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_nudge(
     target: ui::NudgeTarget,
@@ -1051,8 +805,7 @@ pub(super) fn submit_nudge(
                 }
             } else if let Some(queue) = queues.get_mut(i) {
                 queue.push_back(text.to_string());
-                // L13: informational, not a failure -- goes to the transient
-                // notice channel, not the sticky ⚠ error line.
+                // Send confirmations through transient notices, not sticky errors.
                 push_notice(
                     notices,
                     now,
@@ -1070,9 +823,7 @@ pub(super) fn submit_nudge(
             let mut stdin = std::io::empty();
             match sessions::run_nudge_with(&args, &mut sink, repo, env, &mut stdin) {
                 Err(e) => push_error(errors, format!("nudge: {e}")),
-                // L14: the sink carries the "queued for …" confirmation the
-                // CLI verb prints; surface its first non-empty line as a
-                // notice so a successful view-only nudge is not silent.
+                // Show the sink's first nonempty confirmation line for a queued view-only nudge.
                 Ok(_) => {
                     let confirmation = String::from_utf8_lossy(&sink);
                     let line = confirmation
@@ -1089,28 +840,14 @@ pub(super) fn submit_nudge(
     }
 }
 
-/// What confirming the nudge dialog asks the caller to do: hand `text` to
-/// `submit_nudge` against `target`, exactly as `Enter` already did before
-/// this reducer existed. Unlike `SpawnEffect`, there is no `Notice` case --
-/// blank text on `Enter` is, and always was, a silent no-op (see
-/// `nudge_overlay_reduce`'s own doc comment).
+/// Confirming a nudge passes its text and target to submit_nudge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NudgeSubmit {
     pub(super) target: ui::NudgeTarget,
     pub(super) text: String,
 }
 
-/// Pure: the same reducer shape as `mail_overlay_reduce`/`spawn_overlay_reduce`/
-/// `memory_overlay_reduce`, extracted out of the inline `match key.code` this
-/// overlay used to run directly in `run_dashboard`'s event loop so it can be
-/// unit-tested the same way the other three are. Behavior is unchanged by the
-/// extraction: `Enter` always closes the dialog (`None`) and submits only
-/// when the trimmed input is non-blank -- a blank `Enter` was already a
-/// silent close-without-submitting before this existed, and stays one; this
-/// is the one overlay here that does not reopen with a notice on an empty
-/// submission, unlike `spawn_overlay_reduce`'s `SPAWN_USAGE_NOTICE`.
-/// Shift+Enter/Alt+Enter insert a newline instead of submitting, matching
-/// every other compose-style overlay in this module.
+/// Keep nudge key reduction pure so the event loop applies only its returned effect.
 pub(crate) fn nudge_overlay_reduce(
     mut draft: ui::NudgeDraft,
     key: KeyEvent,
@@ -1145,22 +882,10 @@ pub(crate) fn nudge_overlay_reduce(
     }
 }
 
-/// HIGH-2: the most input events one tick drains before it stops to do its
-/// per-tick maintenance and redraw. A paste is delivered as one key event per
-/// character, so without a per-tick drain the loop ran a full maintenance pass
-/// (per-pane drains, reap, mail sweep, two `terminal::size` calls, a
-/// `read_dir` for spawn requests, two full-screen sidebar scans, a draw) for
-/// every single pasted character. Draining the whole queue in one tick fixes
-/// that; the cap keeps a firehose (a process spewing input) from starving the
-/// maintenance and redraw the same way an unbounded pane drain would (M10).
+/// Cap per-tick input drain so paste avoids per-character maintenance while a flood cannot starve redraw.
 pub(super) const MAX_INPUT_DRAIN_PER_TICK: usize = 4096;
 
-/// How many consecutive `event::poll`/`event::read` failures the dashboard
-/// tolerates before treating the input stream as gone. The loop polls on a
-/// 50ms timeout, but a *failing* poll returns immediately, so this is an
-/// upper bound of about five seconds and in practice much less -- long enough
-/// that a transient error (a resize racing a read, a signal) is ridden out,
-/// short enough that a dead console does not spin forever.
+/// Stop after consecutive input failures; failed polls return immediately and could otherwise spin forever.
 pub(super) const MAX_CONSECUTIVE_INPUT_ERRORS: usize = 100;
 
 /// Pure: whether `consecutive_errors` back-to-back input failures mean the
@@ -1170,25 +895,12 @@ pub(super) fn input_stream_is_dead(consecutive_errors: usize) -> bool {
     consecutive_errors >= MAX_CONSECUTIVE_INPUT_ERRORS
 }
 
-/// The first `event::poll` wait of a tick once no activity (a keyboard or
-/// mouse event read from crossterm) has happened recently -- the old flat
-/// behaviour, cheap on CPU while the operator is idle. Deliberately NOT
-/// refreshed by pane output: a streaming response or an animated spinner is
-/// the normal state of an active dashboard, and holding the loop in the hot
-/// window for that would multiply its wakeup rate for no benefit -- the
-/// operator's own keystroke already opens the window, which is all typing
-/// latency needs.
+/// Use the idle poll wait only after operator input has been quiet; pane output must not keep the loop hot.
 pub(super) const INPUT_POLL_IDLE_WAIT: Duration = Duration::from_millis(50);
 /// The first `event::poll` wait right after activity: short enough that the
 /// repaint showing a child's echo of a keystroke does not lag behind typing.
 pub(super) const INPUT_POLL_HOT_WAIT: Duration = Duration::from_millis(10);
-/// How long after the last activity the loop stays in the hot-poll window
-/// before falling back to [`INPUT_POLL_IDLE_WAIT`]. For that whole window the
-/// entire tick -- not just the poll -- runs at up to ~100/s: every per-pane
-/// drain, the spawn-request `read_dir`, the mail sweep gate check, the sidebar
-/// rebuild, the draw. Bounded and deliberate: 300ms of a busier tick during
-/// active typing is the trade for the fast repaint, and the window closes
-/// back to the cheap 50ms cadence the instant activity stops.
+/// Keep hot polling briefly after user input, not pane output, so streaming output cannot sustain the higher wakeup rate.
 pub(super) const INPUT_POLL_HOT_WINDOW: Duration = Duration::from_millis(300);
 
 /// Pure: the poll wait for this tick's first `event::poll`, given how long ago
@@ -1203,45 +915,17 @@ pub(super) fn input_poll_wait(since_activity: Duration) -> Duration {
     }
 }
 
-/// Pure: whether this tick's reap left the dashboard with nothing to
-/// supervise, which is a quit (D4).
-///
-/// Evaluated only after `reap_ended_panes`, inside the loop -- `run_dashboard`
-/// spawns its first pane before the loop is ever entered and returns `Err` if
-/// that fails, so "no panes" can only ever mean "every pane that existed has
-/// now ended", never "none has started yet".
-///
-/// F5: an unanswered restore dialog holds the exit off. A launch whose panes
-/// all die early (a misconfigured harness binary, say) reached this before the
-/// operator had answered the dialog offering the *previous* session's panes
-/// back -- and quit, taking the offer with it. The dashboard has a question on
-/// screen; idling on it costs nothing, and `Esc` is one keystroke away from the
-/// same exit.
+/// Quit only after reap leaves no panes to supervise.
 pub(super) fn should_exit_empty(live_panes: usize, restore_pending: bool) -> bool {
     live_panes == 0 && !restore_pending
 }
 
-/// Pure: the dashboard's exit code once its last pane is gone -- 1 if any pane
-/// it reaped exited nonzero, else 0.
-///
-/// F4: this arm used to `break 0` unconditionally, so a dashboard whose
-/// sessions all failed reported success to whatever started it. Honest exits
-/// are the same rule `exec::describe_exit` and `wrap` already hold themselves
-/// to; a dashboard is not exempt just because its children were interactive.
+/// Return failure if any reaped pane exited nonzero.
 pub(super) fn empty_exit_code(reaped_codes: &[i32]) -> i32 {
     i32::from(reaped_codes.iter().any(|code| *code != 0))
 }
 
-/// The roster entries a startup restore may actually offer: everything except
-/// the orchestrator.
-///
-/// F6: the `first` `PaneSpec` a launch already built *is* this dashboard's
-/// orchestrator, so respawning a roster's own orchestrator entry would
-/// duplicate it -- and its stored `session_id` is zirv's own uuid even when the
-/// operator pinned the conversation themselves with `--resume`
-/// (`chat::dash_orchestrator_pane`), so resuming from it would ask the harness
-/// for a conversation that never existed under that id. Filtered here, once,
-/// before `build_restore_view` or `roster::restore_argv` ever see a candidate.
+/// Exclude the orchestrator from restore candidates because startup already creates one.
 pub(super) fn restorable_candidates(taken: roster::Roster) -> Vec<roster::RosterPane> {
     taken
         .panes
@@ -1250,17 +934,7 @@ pub(super) fn restorable_candidates(taken: roster::Roster) -> Vec<roster::Roster
         .collect()
 }
 
-/// The `PaneRowMeta` list for every row this dashboard owns, in pane order
-/// followed by its retained ended rows (issue #354 phase 2) in reap order --
-/// shared by the pre-input (routing) and post-input (rendering) calls to
-/// `assemble_sidebar` each tick.
-///
-/// The retained rows come after the live panes rather than staying at the
-/// index the pane held: `focused` indexes into `panes` alone, so anything
-/// appended past its end cannot disturb it, and a completed worker reading as
-/// the most recent thing to have finished is what an operator scanning the
-/// bottom of the roster expects. A retained row that still carries its work
-/// group is still drawn under that group's header, wherever the header sits.
+/// Build one row list for input routing and rendering so retained rows have stable positions (#354).
 pub(super) fn build_pane_rows(panes: &[Pane], ended: &VecDeque<EndedRow>) -> Vec<PaneRowMeta> {
     panes
         .iter()
@@ -1300,14 +974,7 @@ pub(super) fn build_pane_rows(panes: &[Pane], ended: &VecDeque<EndedRow>) -> Vec
         .collect()
 }
 
-/// Issue #349, design point 3: `PaneState` is the dashboard's own quiescence
-/// signal -- the weakest authority, [`super::attention::Authority::
-/// QuietHeuristic`] -- projected onto the shared attention model's
-/// [`super::attention::Lifecycle`]. `Working` stays `Working`; `Idle` means
-/// this pane has gone quiet at its prompt, which reads as `Settled` (the
-/// same "turn ended, waiting for the next one" fact a Claude Stop hook would
-/// report, just inferred from silence instead of told directly); `Ended`
-/// means the child process is gone, `Exited`.
+/// Project quiet pane state at the weakest attention authority so stronger hook observations win (#349).
 pub(super) fn quiet_heuristic_lifecycle(state: PaneState) -> super::attention::Lifecycle {
     match state {
         PaneState::Working => super::attention::Lifecycle::Working,
@@ -1362,10 +1029,7 @@ pub(super) fn sync_quiet_heuristic_attention(
 /// whatever additional panes get spawned along the way. Nesting is the
 /// caller's job (`chat.rs::run_with` checks `sessions::nesting_refusal`
 /// before calling this at all).
-/// Issue #490 (roadmap N21 item A): how often a native pane re-reads the
-/// durable records its overview, usage strip and notices are built from. Two
-/// seconds, not every frame: the records are a fleet's, not a conversation's,
-/// and none of them change between two consecutive 150 ms frames.
+/// Poll native panes on their own cadence instead of every fast dashboard tick (#490).
 pub(super) const NATIVE_RECORD_REFRESH_SECS: u64 = 2;
 
 #[cfg(test)]
