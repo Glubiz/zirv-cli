@@ -273,7 +273,7 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
             "src/commands/ctx/dash/spawn_policy.rs",
             "task_prompt_fallback_is_safe"
         ) | (
-            "src/commands/ctx/exec.rs",
+            "src/commands/ctx/exec/command.rs",
             "headless_resume_launch" | "prompt_delivery_via_stdin"
         ) | ("src/commands/ctx/measure.rs", "current_binary_mtime")
             | (
