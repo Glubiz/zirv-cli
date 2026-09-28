@@ -210,7 +210,7 @@ pub(super) fn route_mouse(
         (Hit::JevErrors, MouseEventKind::Down(MouseButton::Left)) => {
             MouseRoute::Action(DashAction::ShowJevErrors)
         }
-        (Hit::HeaderHint(id) | Hit::FooterHint(id), MouseEventKind::Down(MouseButton::Left)) => {
+        (Hit::HeaderHint(id), MouseEventKind::Down(MouseButton::Left)) => {
             MouseRoute::Action(match id {
                 HintId::Actions => DashAction::ContextActions,
                 HintId::Nudge => DashAction::Nudge,
@@ -218,7 +218,7 @@ pub(super) fn route_mouse(
                 HintId::Errors => DashAction::ShowErrors,
                 HintId::Inspect => DashAction::Inspect,
                 HintId::Restore => DashAction::RestoreRow,
-                // A dialog hint is never in the header/footer cluster; a
+                // A dialog hint is never in the header cluster; a
                 // stray one is the always-safe action rather than a panic.
                 HintId::Help | HintId::DialogKey(_) => DashAction::Help,
             })

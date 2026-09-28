@@ -804,8 +804,8 @@ fn next_char_boundary(s: &str, mut idx: usize) -> usize {
 /// (`InsertText`) has any `\r\n`/`\r` normalized to `\n` first -- Windows
 /// clipboard/terminal paste routinely carries CRLF, and an un-normalized
 /// `\r` would otherwise render as a stray control character rather than a
-/// line break (`resolve_file_refs`/`wrap_line` both assume `\n`-only line
-/// endings, matching every other multiline draft in this module).
+/// line break (`wrap_line` assumes `\n`-only line endings, matching every
+/// other multiline draft in this module).
 pub fn apply_composer_action(state: &mut ComposerState, action: ComposerAction) -> ComposerOutcome {
     match action {
         ComposerAction::Insert(c) => {
@@ -1038,117 +1038,6 @@ fn history_down(state: &mut ComposerState) {
     state.cursor = state.draft.len();
 }
 
-/// One `@token` reference found in a draft, resolved against `workdir`.
-/// `exists` is a plain filesystem check (not a repository-tracked check --
-/// an untracked new file is still a legitimate reference), so a caller
-/// deciding whether to *attach* the file still owes its own read/size
-/// policy; this is purely "does this token look like a real path".
-///
-/// Tested (`resolve_file_refs_finds_existing_and_missing_paths`,
-/// `resolve_file_refs_finds_a_unicode_path`) but not yet called from
-/// `run_native_dashboard`'s own minimal loop -- rendering a live `@`-hint
-/// line needs `composer_lines`/`render_native_pane` to take a workdir,
-/// which is scoped out of this round; see the design note.
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileRef {
-    /// The raw token including the leading `@`.
-    pub token: String,
-    pub path: String,
-    pub exists: bool,
-    pub start: usize,
-    pub end: usize,
-}
-
-/// Scans `text` for `@path` tokens (an `@` followed by non-whitespace) and
-/// resolves each one against `workdir`. Pure aside from the filesystem
-/// `exists` check, which is why this is a plain function rather than part
-/// of [`apply_composer_action`] -- a caller re-runs it on demand (e.g. on
-/// every draft change) rather than this module owning a debounce policy.
-///
-/// PR #531 review finding 2: `workdir.join(path).exists()` alone answers
-/// "does something exist at this joined path", never "does it stay inside
-/// `workdir`" -- `@../../secret` joins and exists just fine while pointing
-/// somewhere the caller never meant to expose. Both sides are canonicalized
-/// (resolving `..`, `.` and symlinks) and the candidate must fall under the
-/// canonical workdir; anything that escapes it -- or that cannot be
-/// canonicalized at all, e.g. because it does not exist -- reads as
-/// `exists: false` rather than being trusted.
-#[allow(dead_code)]
-pub fn resolve_file_refs(text: &str, workdir: &Path) -> Vec<FileRef> {
-    let workdir_canonical = std::fs::canonicalize(workdir).ok();
-    let mut refs = Vec::new();
-    let mut idx = 0usize;
-    while let Some(rel) = text[idx..].find('@') {
-        let start = idx + rel;
-        let mut end = start + 1;
-        while end < text.len() {
-            let ch = text[end..].chars().next().expect("end is a char boundary");
-            if ch.is_whitespace() {
-                break;
-            }
-            end += ch.len_utf8();
-        }
-        if end > start + 1 {
-            let path = text[start + 1..end].to_string();
-            let exists = workdir_canonical
-                .as_deref()
-                .map(|root| path_resolves_under(root, &workdir.join(&path)))
-                .unwrap_or(false);
-            refs.push(FileRef {
-                token: text[start..end].to_string(),
-                path,
-                exists,
-                start,
-                end,
-            });
-        }
-        idx = end.max(start + 1);
-    }
-    refs
-}
-
-/// Whether `candidate` canonicalizes to a path under the already-canonical
-/// `root`. A candidate that fails to canonicalize (missing, a dangling
-/// symlink, a permissions error) is never treated as inside `root` --
-/// refusing is the safe default, not a guess.
-#[allow(dead_code)] // only called by `resolve_file_refs`, itself test-only today
-fn path_resolves_under(root: &Path, candidate: &Path) -> bool {
-    std::fs::canonicalize(candidate)
-        .map(|resolved| resolved.starts_with(root))
-        .unwrap_or(false)
-}
-
-/// Groups a sequence of input chunks (each with the [`Duration`] elapsed
-/// since the previous one landed) into paste blocks: consecutive chunks
-/// less than `gap` apart are joined into one block. This is the
-/// fallback path for a terminal that never sends a single bracketed-paste
-/// event -- crossterm's `Event::Paste` is used directly as one
-/// `ComposerAction::InsertText` when the terminal supports it, and never
-/// needs this coalescing at all. Pure and deterministic given the recorded
-/// gaps, so a large paste's actual arrival timing can be fixture data
-/// rather than a real terminal.
-/// Tested (`coalesce_paste_chunks_joins_only_chunks_within_the_gap`) but not
-/// yet called: `run_native_dashboard`'s loop only ever sees `Event::Paste`
-/// (bracketed paste, the path this function's own doc comment says makes it
-/// unnecessary) or single key presses -- no terminal-capability probe/
-/// fallback path exists yet to decide when a rapid run of `Event::Key`
-/// presses should be coalesced instead.
-#[allow(dead_code)]
-pub fn coalesce_paste_chunks(chunks: &[(String, Duration)], gap: Duration) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (text, elapsed) in chunks {
-        if let Some(last) = out.last_mut()
-            && *elapsed < gap
-        {
-            last.push_str(text);
-            continue;
-        }
-        out.push(text.clone());
-    }
-    out
-}
-
 // =========================================================================
 // Scroll / follow mode
 // =========================================================================
@@ -1315,19 +1204,6 @@ impl NativePresentation {
         if !self.expanded.remove(key) {
             self.expanded.insert(key.to_string());
         }
-    }
-
-    /// Tested (`selection_and_expanded_survive_a_resize_no_op`) but not yet
-    /// called from `run_native_dashboard`'s loop -- no copy mechanism reads
-    /// `selection` yet; see the design note.
-    #[allow(dead_code)]
-    pub fn set_selection(&mut self, start: usize, end: usize) {
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        self.selection = Some((start, end));
     }
 
     /// Marks the transcript as carrying an unread completed result if the
@@ -6155,67 +6031,6 @@ mod tests {
         assert!(state.history.is_empty());
     }
 
-    #[test]
-    fn coalesce_paste_chunks_joins_only_chunks_within_the_gap() {
-        let gap = Duration::from_millis(30);
-        let chunks = vec![
-            ("ab".to_string(), Duration::from_millis(0)),
-            ("cd".to_string(), Duration::from_millis(5)),
-            ("ef".to_string(), Duration::from_millis(200)),
-        ];
-        let out = coalesce_paste_chunks(&chunks, gap);
-        assert_eq!(out, vec!["abcd".to_string(), "ef".to_string()]);
-    }
-
-    #[test]
-    fn resolve_file_refs_finds_existing_and_missing_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("real.rs"), b"fn main() {}").unwrap();
-        let text = "fix @real.rs and also @missing.rs please";
-        let refs = resolve_file_refs(text, dir.path());
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].path, "real.rs");
-        assert!(refs[0].exists);
-        assert_eq!(refs[1].path, "missing.rs");
-        assert!(!refs[1].exists);
-    }
-
-    #[test]
-    fn resolve_file_refs_finds_a_unicode_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = "see @src/\u{65e5}\u{672c}\u{8a9e}.rs";
-        let refs = resolve_file_refs(text, dir.path());
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].path, "src/\u{65e5}\u{672c}\u{8a9e}.rs");
-    }
-
-    /// PR #531 review finding 2: a `@path` that escapes the workdir via `..`
-    /// must never be trusted as "exists", even when it genuinely resolves to
-    /// a real file outside the tree -- and an ordinary in-tree path must
-    /// still resolve.
-    #[test]
-    fn resolve_file_refs_refuses_a_path_that_escapes_the_workdir() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = root.path().join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret"), b"top secret").unwrap();
-
-        let workdir = root.path().join("work");
-        std::fs::create_dir_all(workdir.join("src")).unwrap();
-        std::fs::write(workdir.join("src/lib.rs"), b"fn lib() {}").unwrap();
-
-        let text = "@../outside/secret and @src/lib.rs";
-        let refs = resolve_file_refs(text, &workdir);
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].path, "../outside/secret");
-        assert!(
-            !refs[0].exists,
-            "a path that escapes the workdir must never resolve"
-        );
-        assert_eq!(refs[1].path, "src/lib.rs");
-        assert!(refs[1].exists, "an ordinary in-tree path must resolve");
-    }
-
     // -- scroll / follow mode --------------------------------------------
 
     #[test]
@@ -6295,19 +6110,17 @@ mod tests {
     // -- presentation / persistence ---------------------------------------
 
     #[test]
-    fn selection_and_expanded_survive_a_resize_no_op() {
+    fn expanded_survives_a_resize_no_op() {
         // A "resize" in this design is just a fresh render call at a new
         // width -- nothing in `NativePresentation` is width-dependent, so
-        // proving these fields are untouched by rendering at two different
+        // proving expansion is untouched by rendering at two different
         // widths IS the resize-survival property.
         let mut presentation = NativePresentation::default();
-        presentation.set_selection(1, 3);
         presentation.toggle_expanded("tc-1");
         let view = TranscriptView::default();
         let facts = facts(NativeSessionState::Idle, None, false, false);
         let _ = render_plain(&view, &presentation, &facts, 80);
         let _ = render_plain(&view, &presentation, &facts, 40);
-        assert_eq!(presentation.selection, Some((1, 3)));
         assert!(presentation.expanded.contains("tc-1"));
     }
 

@@ -20,7 +20,7 @@ pub type RowId = String;
 /// A work group's own id (`Pane::work_group_id`).
 pub type GroupId = String;
 
-/// One `^A x label` chord in the header's (or, later, the footer's) hint
+/// One `^A x label` chord in the header's hint
 /// cluster. The cluster is context-sensitive, so the id -- not the position
 /// -- is what a hit reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +74,6 @@ pub enum Hit {
     Divider,
     /// The focused pane's terminal.
     Grid,
-    /// A footer hint chord (none exist yet; see `ui::frame_snapshot`).
-    FooterHint(HintId),
     /// One visible row of an open list dialog, by its index into that
     /// dialog's own full row list (NOT its screen line): click selects,
     /// double-click or Enter activates.
@@ -122,8 +120,6 @@ pub struct FrameSnapshot {
     pub roster: Vec<Hit>,
     /// The header's hint chords and where they were drawn.
     pub header_hints: Vec<(Rect, HintId)>,
-    /// The footer's hint chords, if it ever grows any.
-    pub footer_hints: Vec<(Rect, HintId)>,
     /// Whether this frame was drawn zoomed (no chrome at all).
     pub zoomed: bool,
     /// The open overlay's own rect, if one was open.
@@ -145,8 +141,8 @@ pub struct FrameSnapshot {
 /// Order is the behaviour contract's own layering, outside in: outside the
 /// frame owns nothing; an open overlay owns the entire frame (its own hint
 /// row, its own visible rows, the rest of itself, and the backdrop around
-/// it); then the chrome, nearest-drawn first -- header hints, footer hints,
-/// roster entries, divider -- and finally the grid.
+/// it); then the chrome, nearest-drawn first -- header hints, roster entries,
+/// divider -- and finally the grid.
 ///
 /// Phase 3 refines the phase-1 "an overlay consumes everything" rule: the
 /// dialog's own targets are addressable (`OverlayHint` first, since a hint
@@ -179,11 +175,6 @@ pub fn hit_test(snap: &FrameSnapshot, x: u16, y: u16) -> Hit {
         for (rect, id) in &snap.header_hints {
             if contains(*rect) {
                 return Hit::HeaderHint(*id);
-            }
-        }
-        for (rect, id) in &snap.footer_hints {
-            if contains(*rect) {
-                return Hit::FooterHint(*id);
             }
         }
         for (rect, hit) in &snap.rows {
@@ -222,7 +213,6 @@ mod tests {
                 (Rect::new(0, 13, 44, 1), Hit::SidebarRow("child".into())),
             ],
             header_hints: vec![(Rect::new(180, 0, 20, 1), HintId::Help)],
-            footer_hints: vec![(Rect::new(180, 49, 20, 1), HintId::Errors)],
             ..Default::default()
         }
     }
@@ -238,7 +228,6 @@ mod tests {
             (snap.divider, Hit::Divider),
             (snap.grid, Hit::Grid),
             (snap.header_hints[0].0, Hit::HeaderHint(HintId::Help)),
-            (snap.footer_hints[0].0, Hit::FooterHint(HintId::Errors)),
         ]);
         for (rect, expected) in regions {
             assert_eq!(hit_test(&snap, rect.x, rect.y), expected, "{rect:?}");

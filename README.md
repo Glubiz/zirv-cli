@@ -3330,8 +3330,7 @@ trailing text as a task, starts it) and `/workflow status [id]` shows a
 running workflow's status -- all three rendered through the exact same
 `workflow::engine` writer functions the headless `--json`/text CLI uses
 (issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
-can never disagree about the same state. `@` file references
-(`resolve_file_refs`, containment-checked against the workdir) and a
+can never disagree about the same state. `@` file references and a
 `!`-prefixed shell line are not wired into this loop yet.
 
 `--runtime native` is **not** a separate dashboard any more: the native
