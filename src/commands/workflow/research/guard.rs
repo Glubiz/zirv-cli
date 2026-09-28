@@ -278,7 +278,7 @@ pub const HARD_DENY_PATCH_PATTERNS: &[&str] = &[
     "build.rs",
     ".zirv/**",
     "src/settings.rs",
-    "src/commands/ctx/safety.rs",
+    "src/commands/ctx/safety/**",
     "src/commands/ctx/price.rs",
 ];
 
@@ -627,12 +627,12 @@ mod tests {
 
     #[test]
     fn patch_scope_flags_a_protected_and_an_out_of_scope_path() {
-        let numstat = "1\t1\tsrc/commands/ctx/safety.rs\n2\t0\tsrc/commands/ctx/proxy/decision.rs\n3\t0\tsrc/main.rs\n";
+        let numstat = "1\t1\tsrc/commands/ctx/safety/mod.rs\n2\t0\tsrc/commands/ctx/proxy/decision.rs\n3\t0\tsrc/main.rs\n";
         let paths = parse_numstat(numstat);
         assert_eq!(
             paths,
             vec![
-                "src/commands/ctx/safety.rs".to_string(),
+                "src/commands/ctx/safety/mod.rs".to_string(),
                 "src/commands/ctx/proxy/decision.rs".to_string(),
                 "src/main.rs".to_string(),
             ]
@@ -641,7 +641,7 @@ mod tests {
         let allowed = vec!["src/commands/ctx/proxy/decision.rs".to_string()];
         let violations = validate_patch_scope(&paths, &allowed, &[]);
         assert_eq!(violations.len(), 2);
-        assert_eq!(violations[0].path, "src/commands/ctx/safety.rs");
+        assert_eq!(violations[0].path, "src/commands/ctx/safety/mod.rs");
         assert!(violations[0].reason.contains("hard-denied"));
         assert_eq!(violations[1].path, "src/main.rs");
         assert!(violations[1].reason.contains("outside"));
@@ -649,14 +649,14 @@ mod tests {
 
     /// Regression for issue-review finding R4: a case-sensitive comparison
     /// let a differently-cased spelling of a hard-denied/protected file
-    /// (e.g. `Safety.rs` for `safety.rs`) slip past `validate_patch_scope`
+    /// (e.g. `Safety/mod.rs` for `safety/mod.rs`) slip past `validate_patch_scope`
     /// on a case-insensitive filesystem (Windows, default macOS), because
     /// neither `HARD_DENY_PATCH_PATTERNS` nor the protected set would
     /// literally byte-match it.
     #[test]
     fn patch_scope_matching_is_case_insensitive_for_deny_and_protected() {
         let numstat =
-            "1\t1\tsrc/commands/ctx/Safety.rs\n1\t1\tSRC/COMMANDS/CTX/PROXY/decision.rs\n";
+            "1\t1\tsrc/commands/ctx/Safety/mod.rs\n1\t1\tSRC/COMMANDS/CTX/PROXY/decision.rs\n";
         let paths = parse_numstat(numstat);
         let protected = vec!["src/commands/ctx/proxy/decision.rs".to_string()];
         let violations = validate_patch_scope(&paths, &[], &protected);
