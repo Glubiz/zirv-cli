@@ -189,10 +189,10 @@ pub(super) struct PaneSuccessorLauncher<'a> {
     /// test opens a REAL successor pane against `fixture::FixtureProvider`
     /// in a bare temp repo, the same escape `NativeDashboardSpec::provider`
     /// already documents for itself.
-    pub(super) native: super::rollover_runtime::NativeSuccessorSpec,
+    pub(super) native: super::rollover::runtime::NativeSuccessorSpec,
 }
 
-impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
+impl super::rollover::runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
     fn defers_settlement(&self) -> bool {
         self.req.generation.is_some()
             && !self.pane.is_native()
@@ -201,9 +201,9 @@ impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
 
     fn launch(
         &mut self,
-        plan: &super::rollover_runtime::SuccessorPlan,
-    ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
-        use super::rollover_runtime::SuccessorRefusal;
+        plan: &super::rollover::runtime::SuccessorPlan,
+    ) -> Result<String, super::rollover::runtime::SuccessorRefusal> {
+        use super::rollover::runtime::SuccessorRefusal;
 
         if plan.to != super::runtime::RuntimeKind::Native {
             // A WRAPPED source swaps its child in place: one pane, one
@@ -257,9 +257,9 @@ impl super::rollover_runtime::SuccessorLauncher for PaneSuccessorLauncher<'_> {
 
         // Built BEFORE anything is taken away: a failure here leaves the
         // source pane exactly as it was, still holding the seat with all of
-        // its durable state (`rollover_runtime`'s own item 7).
+        // its durable state (`rollover::runtime`'s own item 7).
         let state = self.pane.state_dir().clone();
-        let successor = super::rollover_runtime::launch_native_pane(
+        let successor = super::rollover::runtime::launch_native_pane(
             self.cfg,
             &state,
             self.repo,
@@ -408,7 +408,7 @@ pub(super) fn handover_pane(
     };
     let size = pane.screen().size();
     // Issue #552: every live swap starts its successor through the ONE
-    // production seam, `rollover_runtime::launch_successor` -- so the
+    // production seam, `rollover::runtime::launch_successor` -- so the
     // direction (harness->harness, harness->native, native->harness,
     // native->native) decides which backend runs, this seat's subagents are
     // settled before anything takes the seat, and an ambiguous tool effect
@@ -418,7 +418,7 @@ pub(super) fn handover_pane(
     } else {
         super::runtime::RuntimeKind::Harness
     };
-    let plan = super::rollover_runtime::plan_successor(
+    let plan = super::rollover::runtime::plan_successor(
         from,
         req.successor_runtime(),
         pane.short(),
@@ -429,7 +429,7 @@ pub(super) fn handover_pane(
         req.target_model.as_deref(),
         req.target_route.as_deref(),
         req.resume_session.as_deref(),
-        super::rollover_runtime::load(state, pane.short())
+        super::rollover::runtime::load(state, pane.short())
             .and_then(|record| record.boundary)
             .as_ref(),
     );
@@ -442,18 +442,18 @@ pub(super) fn handover_pane(
         role,
         repo,
         size: (size.1, size.0),
-        native: super::rollover_runtime::NativeSuccessorSpec::default(),
+        native: super::rollover::runtime::NativeSuccessorSpec::default(),
     };
-    match super::rollover_runtime::launch_successor(
+    match super::rollover::runtime::launch_successor(
         state,
         repo,
         &mut launcher,
         &plan,
         Some(&parent_session),
         if req.structural_only {
-            super::rollover_runtime::Drain::Forced
+            super::rollover::runtime::Drain::Forced
         } else {
-            super::rollover_runtime::Drain::Quiesced
+            super::rollover::runtime::Drain::Quiesced
         },
         super::state::now_secs(),
     ) {
@@ -1664,7 +1664,7 @@ mod tests {
     /// did not delete the registry record the successor just wrote.
     #[test]
     fn a_native_successor_actually_opens_as_a_live_pane_on_the_same_seat() {
-        use super::super::rollover_runtime::{SuccessorLauncher, plan_successor};
+        use super::super::rollover::runtime::{SuccessorLauncher, plan_successor};
         use super::super::runtime::RuntimeKind;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1723,7 +1723,7 @@ mod tests {
 
             let seat_short = source.short().to_string();
             let source_session = source.session_id().to_string();
-            let plan = super::super::rollover_runtime::SuccessorPlan {
+            let plan = super::super::rollover::runtime::SuccessorPlan {
                 acknowledged_input: vec!["finish the migration note".to_string()],
                 ..plan_successor(
                     source_runtime,
@@ -1763,7 +1763,7 @@ mod tests {
                     role: prompt::PromptRole::Orchestrator,
                     repo: repo.path(),
                     size: (24, 80),
-                    native: super::super::rollover_runtime::NativeSuccessorSpec {
+                    native: super::super::rollover::runtime::NativeSuccessorSpec {
                         // A bare temp repo cannot take a writer lease, and
                         // this test is about the successor existing at all.
                         writing: false,
@@ -1822,7 +1822,7 @@ mod tests {
     /// successor registered still present.
     #[test]
     fn a_harness_successor_takes_the_seat_from_a_native_source() {
-        use super::super::rollover_runtime::{SuccessorLauncher, plan_successor};
+        use super::super::rollover::runtime::{SuccessorLauncher, plan_successor};
         use super::super::runtime::RuntimeKind;
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1942,7 +1942,7 @@ mod tests {
                 role: prompt::PromptRole::Orchestrator,
                 repo: repo.path(),
                 size: (24, 80),
-                native: super::super::rollover_runtime::NativeSuccessorSpec::default(),
+                native: super::super::rollover::runtime::NativeSuccessorSpec::default(),
             };
             launcher
                 .launch(&plan)

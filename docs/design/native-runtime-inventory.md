@@ -207,7 +207,7 @@ adapters/{claude,codex,copilot,droid,gemini,opencode,pi,qwen}.rs` each
 *define* these methods; they are not call sites), `#[cfg(test)]` fixtures
 that stand a test binary in for `agent_bin` or re-exec `zirv` to test raw-
 argv interception (`agent/run.rs`, `dash/spawn_policy.rs`, `fallback.rs`,
-`pool.rs`, `rollover.rs`, `mod.rs`, `main.rs` each have such a test helper -- none is a
+`pool.rs`, `rollover/mod.rs`, `mod.rs`, `main.rs` each have such a test helper -- none is a
 production model-calling path), and `update.rs`'s `current_exe()` (swaps the
 installed binary during self-update; never spawns it).
 

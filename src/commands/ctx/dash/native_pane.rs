@@ -3562,7 +3562,7 @@ impl NativePaneRuntime {
         // resume history -- both read straight off the durable store, so a
         // rollover or a compaction that happened while this pane was not
         // looking is still announced exactly once.
-        if let Some(record) = super::super::rollover_runtime::load(&self.state, &self.short)
+        if let Some(record) = super::super::rollover::runtime::load(&self.state, &self.short)
             && record.updated_at > self.announced_rollover_at
         {
             self.announced_rollover_at = record.updated_at;

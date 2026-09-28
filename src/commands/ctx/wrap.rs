@@ -3140,27 +3140,27 @@ struct WrapSwapLauncher<'a> {
     native: Option<super::dash::Pane>,
     launch_native:
         &'a mut dyn FnMut(
-            &super::rollover_runtime::SuccessorPlan,
+            &super::rollover::runtime::SuccessorPlan,
         )
-            -> Result<super::dash::Pane, super::rollover_runtime::SuccessorRefusal>,
+            -> Result<super::dash::Pane, super::rollover::runtime::SuccessorRefusal>,
 }
 
-impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
+impl super::rollover::runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
     fn admits(
         &self,
-        plan: &super::rollover_runtime::SuccessorPlan,
-    ) -> Result<(), super::rollover_runtime::SuccessorRefusal> {
+        plan: &super::rollover::runtime::SuccessorPlan,
+    ) -> Result<(), super::rollover::runtime::SuccessorRefusal> {
         match plan.to {
             super::runtime::RuntimeKind::Harness => Ok(()),
             super::runtime::RuntimeKind::Native if self.native_available && cfg!(unix) => Ok(()),
             super::runtime::RuntimeKind::Native => Err(
-                super::rollover_runtime::SuccessorRefusal::LaunchFailed(format!(
+                super::rollover::runtime::SuccessorRefusal::LaunchFailed(format!(
                     "{}; the seat is parked on its current harness with its handoff stored",
                     super::runtime::NATIVE_COMING_SOON
                 )),
             ),
             super::runtime::RuntimeKind::Unknown => {
-                Err(super::rollover_runtime::SuccessorRefusal::LaunchFailed(
+                Err(super::rollover::runtime::SuccessorRefusal::LaunchFailed(
                     "`zirv ctx wrap` cannot launch an unknown successor runtime; the seat is \
                      parked on its current harness with its handoff stored"
                         .to_string(),
@@ -3171,8 +3171,8 @@ impl super::rollover_runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
 
     fn launch(
         &mut self,
-        plan: &super::rollover_runtime::SuccessorPlan,
-    ) -> Result<String, super::rollover_runtime::SuccessorRefusal> {
+        plan: &super::rollover::runtime::SuccessorPlan,
+    ) -> Result<String, super::rollover::runtime::SuccessorRefusal> {
         if plan.to == super::runtime::RuntimeKind::Harness {
             return Ok(self.session.to_string());
         }
@@ -3298,7 +3298,7 @@ fn perform_handover_swap(
         .generation
         .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation))
         .unwrap_or(1);
-    let plan = super::rollover_runtime::plan_successor(
+    let plan = super::rollover::runtime::plan_successor(
         super::runtime::RuntimeKind::Harness,
         req.successor_runtime(),
         &bar.session_short,
@@ -3307,13 +3307,13 @@ fn perform_handover_swap(
         req.target_model.as_deref(),
         req.target_route.as_deref(),
         req.resume_session.as_deref(),
-        super::rollover_runtime::load(state_dir, &bar.session_short)
+        super::rollover::runtime::load(state_dir, &bar.session_short)
             .and_then(|record| record.boundary)
             .as_ref(),
     );
     let successor_verb = session_guard.record().verb;
-    let mut launch_native = |plan: &super::rollover_runtime::SuccessorPlan| {
-        super::rollover_runtime::launch_native_pane(
+    let mut launch_native = |plan: &super::rollover::runtime::SuccessorPlan| {
+        super::rollover::runtime::launch_native_pane(
             cfg,
             state_dir,
             repo,
@@ -3324,7 +3324,7 @@ fn perform_handover_swap(
             role,
             plan,
             &note,
-            &super::rollover_runtime::NativeSuccessorSpec::default(),
+            &super::rollover::runtime::NativeSuccessorSpec::default(),
         )
     };
     let mut launcher = WrapSwapLauncher {
@@ -3333,16 +3333,16 @@ fn perform_handover_swap(
         native: None,
         launch_native: &mut launch_native,
     };
-    super::rollover_runtime::launch_successor(
+    super::rollover::runtime::launch_successor(
         state_dir,
         repo,
         &mut launcher,
         &plan,
         Some(session.as_str()),
         if req.structural_only {
-            super::rollover_runtime::Drain::Forced
+            super::rollover::runtime::Drain::Forced
         } else {
-            super::rollover_runtime::Drain::Quiesced
+            super::rollover::runtime::Drain::Quiesced
         },
         super::state::now_secs(),
     )
@@ -4738,7 +4738,7 @@ mod tests {
             task: "carry the wrap seat forward".to_string(),
             ..Handoff::default()
         };
-        let plan = super::super::rollover_runtime::plan_successor(
+        let plan = super::super::rollover::runtime::plan_successor(
             RuntimeKind::Harness,
             RuntimeKind::Native,
             "aaaa1111",
@@ -4749,7 +4749,7 @@ mod tests {
             None,
             None,
         );
-        let native = super::super::rollover_runtime::NativeSuccessorSpec {
+        let native = super::super::rollover::runtime::NativeSuccessorSpec {
             writing: false,
             provider: Some(format!(
                 "fixture:{}",
@@ -4758,8 +4758,8 @@ mod tests {
                     .display()
             )),
         };
-        let mut open_native = |plan: &super::super::rollover_runtime::SuccessorPlan| {
-            super::super::rollover_runtime::launch_native_pane(
+        let mut open_native = |plan: &super::super::rollover::runtime::SuccessorPlan| {
+            super::super::rollover::runtime::launch_native_pane(
                 &cfg,
                 &state,
                 repo.path(),
@@ -4779,13 +4779,13 @@ mod tests {
             native: None,
             launch_native: &mut open_native,
         };
-        let successor_session = super::super::rollover_runtime::launch_successor(
+        let successor_session = super::super::rollover::runtime::launch_successor(
             &state,
             repo.path(),
             &mut launcher,
             &plan,
             Some("11111111-2222-4333-8444-555555555555"),
-            super::super::rollover_runtime::Drain::Quiesced,
+            super::super::rollover::runtime::Drain::Quiesced,
             1,
         )
         .expect("an ungated wrap seat launches its native successor");
@@ -4811,7 +4811,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tempfile::tempdir().expect("repo");
         let state = super::super::state::StateDir::from_root(tmp.path().join("state"));
-        let plan = super::super::rollover_runtime::plan_successor(
+        let plan = super::super::rollover::runtime::plan_successor(
             RuntimeKind::Harness,
             RuntimeKind::Native,
             "aaaa1111",
@@ -4823,10 +4823,10 @@ mod tests {
             None,
         );
         let launched = std::cell::Cell::new(false);
-        let mut open_native = |_: &super::super::rollover_runtime::SuccessorPlan| {
+        let mut open_native = |_: &super::super::rollover::runtime::SuccessorPlan| {
             launched.set(true);
             Err(
-                super::super::rollover_runtime::SuccessorRefusal::LaunchFailed(
+                super::super::rollover::runtime::SuccessorRefusal::LaunchFailed(
                     "must not launch".to_string(),
                 ),
             )
@@ -4837,13 +4837,13 @@ mod tests {
             native: None,
             launch_native: &mut open_native,
         };
-        let refusal = super::super::rollover_runtime::launch_successor(
+        let refusal = super::super::rollover::runtime::launch_successor(
             &state,
             repo.path(),
             &mut launcher,
             &plan,
             Some("11111111-2222-4333-8444-555555555555"),
-            super::super::rollover_runtime::Drain::Quiesced,
+            super::super::rollover::runtime::Drain::Quiesced,
             1,
         )
         .expect_err("the gated native successor stays parked");

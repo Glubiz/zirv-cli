@@ -88,7 +88,7 @@ pub(super) struct DiskFacts {
     /// Dash refresh PR2: that same seat's own rollover-runtime record
     /// (`<short>.rollover.json`), read alongside `seat_full` above. `None`
     /// with no rollover history at all for this seat.
-    pub(super) rollover_record: Option<super::rollover_runtime::Record>,
+    pub(super) rollover_record: Option<super::rollover::runtime::Record>,
     /// Dash refresh PR2: the JEV sidebar section's facts, refreshed on its
     /// OWN (much coarser, 10s) cadence -- see `jev_due`/its own call site.
     /// `None` with every `[jev]` gate off, which is also how the section
@@ -638,7 +638,7 @@ impl FactsCache {
         // rollover-runtime settlement -- two small JSON files, both already
         // being read (or immediately adjacent) on this same throttled tick,
         // never per frame.
-        self.disk.rollover_record = super::rollover_runtime::load(state, session_short);
+        self.disk.rollover_record = super::rollover::runtime::load(state, session_short);
         self.disk.seat_full = loaded_seat;
 
         // Issue #264/#457: the aggregate row's own `failed`/`cost` cells --

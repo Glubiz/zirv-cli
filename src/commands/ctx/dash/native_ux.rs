@@ -12,7 +12,7 @@
 //! blocked on, and the rollovers/compactions/reconnects that move a seat
 //! from one session to another underneath all of it. Those are fed by
 //! completely different authorities (`coordinator`, `delegation`, `seat`,
-//! `rollover_runtime`, `pool`), so mixing them into `native_pane` would make
+//! `rollover::runtime`, `pool`), so mixing them into `native_pane` would make
 //! its one clean "journal in, transcript out" contract answer to five more
 //! record types.
 //!
@@ -45,7 +45,7 @@ use crate::style::{self, Tone};
 use super::super::coordinator::{self, NodeState};
 use super::super::delegation;
 use super::super::pool;
-use super::super::rollover_runtime;
+use super::super::rollover;
 use super::super::runtime::RuntimeKind;
 use super::super::seat;
 use super::native_pane::{QueuedInput, ScrollState, StyledLine, StyledSpan};
@@ -1091,7 +1091,7 @@ impl Notice {
 /// with its outcome, the decision, and the settlement -- as one notice. The
 /// tried routes are the part an operator most needs and the part a "switched
 /// model" toast always drops.
-pub fn notice_from_rollover(record: &rollover_runtime::Record) -> Notice {
+pub fn notice_from_rollover(record: &rollover::runtime::Record) -> Notice {
     let mut detail = vec![format!(
         "seat {} generation {} \u{b7} trigger {} \u{b7} {}",
         record.short,
@@ -3313,24 +3313,24 @@ mod tests {
 
     #[test]
     fn a_rollover_notice_names_every_route_that_was_tried() {
-        let record = rollover_runtime::Record {
+        let record = rollover::runtime::Record {
             schema_version: 1,
             short: "s7".to_string(),
-            trigger: rollover_runtime::Trigger::UsageExhaustion,
+            trigger: rollover::runtime::Trigger::UsageExhaustion,
             direction: None,
             source_agent: "opus-5".to_string(),
             source_runtime: "native".to_string(),
             generation: 2,
             decision: "admitted sonnet-4.6".to_string(),
             attempts: vec![
-                rollover_runtime::Attempt {
+                rollover::runtime::Attempt {
                     route: "anthropic/opus-5".to_string(),
                     runtime: "native".to_string(),
                     outcome: "refused".to_string(),
                     detail: "5h window exhausted".to_string(),
                     at: 10,
                 },
-                rollover_runtime::Attempt {
+                rollover::runtime::Attempt {
                     route: "anthropic/sonnet-4.6".to_string(),
                     runtime: "native".to_string(),
                     outcome: "admitted".to_string(),

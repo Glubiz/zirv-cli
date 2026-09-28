@@ -67,8 +67,7 @@ use super::transcript_source;
 use super::window;
 use super::{
     agent, allocator, attention, compile, config, exec, group, jev, log, obfuscate_store, pace,
-    permit, price, reservation, result_schema, rollover, rollover_runtime, screen, session_spend,
-    state,
+    permit, price, reservation, result_schema, rollover, screen, session_spend, state,
 };
 use super::{fallback, handoff, handover, mail, memory, prompt, runtime, score, seat, sessions};
 use crate::commands::workflow;
@@ -789,7 +788,7 @@ fn run_dashboard_inner(
     // against the freshly-read one each throttled tick to edge-trigger the
     // "rolled over" toast (a `Committed` settlement that was not there, or
     // was a different generation, last time).
-    let mut last_rollover_settlement: Option<super::rollover_runtime::Settlement> = None;
+    let mut last_rollover_settlement: Option<super::rollover::runtime::Settlement> = None;
     // Review fix: both `last_rollover_settlement` above and
     // `mail_before_refresh` (seeded from `FactsCache`'s still-empty
     // `mail_by_session` before the very first refresh) look, on tick one,
