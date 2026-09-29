@@ -1,33 +1,8 @@
 //! PR3 (issue #799, dash-refresh design doc section "PR3 -- intake plan
-//! card"): the harness proxy's intake step as a short, visible plan step
-//! instead of a handful of blocking stderr lines.
-//!
-//! Runs as an inline ratatui region (`Viewport::Inline`) on the **normal**
-//! screen -- never the alternate screen -- so it survives the harness's own
-//! full-screen start (issue #701's own fix: the harness's alternate screen
-//! wiped whatever the old stderr lines had printed). On the plain terminal,
-//! before `wrap`/the dashboard ever touch it.
-//!
-//! Flow: a boxed prompt (Enter submits; Shift+Enter/Alt+Enter/Ctrl+J insert a
-//! newline) -> a spinner while [`proxy::decide`] runs on a worker thread (Esc
-//! abandons it, the thread's own result is then just ignored) -> at most one
-//! round of clarification, only when the decision asks (`CLARIFY_THRESHOLD`,
-//! decisively) -> a plan card in plain words with four numbered choices.
-//! `Esc` at ANY point starts the harness without a plan, keeping whatever
-//! task text was already typed. Enter on an EMPTY prompt reaches that same
-//! ending (see [`prompt_submit`]) -- restoring the pre-8c8fc9b7 stderr
-//! editor's own "press Enter with nothing typed to start the full
-//! orchestrator harness" -- and the hint line names it while the buffer is
-//! empty (see [`prompt_hint`]). Every plan card waits for Enter -- no
-//! countdown (operator decision, dash-refresh design doc).
-//!
-//! Kept pure where the design doc asks for it: the key-to-action mappings
-//! ([`text_key_action`], [`plan_key_action`]), the plan-card text builder
-//! ([`build_plan_card`]/[`plan_sentence`]/[`why_line`]), the fallback notice
-//! ([`fallback_notice`]) and the summary line ([`summary_line`]) are all
-//! plain functions of a [`ProxyDecision`], unit-tested below without a
-//! terminal. Only [`run`] itself (and the per-screen `run_*` loops it calls)
-//! touches a real terminal or spawns a thread.
+//! card"): visible proxy intake on the normal screen, never the alternate screen (#701).
+//! Esc abandons any stage while preserving typed text; empty Enter launches without a plan.
+//! At most one clarification round; every plan waits for Enter with no countdown.
+//! Key mappings and text builders are pure; only run and its screen loops touch terminals or spawn threads.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -52,33 +27,20 @@ use crate::commands::ctx::proxy::{self, CLARIFY_THRESHOLD};
 use crate::commands::ctx::state::StateDir;
 use crate::commands::workflow::classify::{Complexity, Intent};
 
-/// The fixed height of the inline region: tall enough for the tallest screen
-/// (the orchestrated plan card, with its extra "Helpers" row and the
-/// fallback notice above it). Shorter screens simply use fewer of these rows
-/// -- top-aligned, the rest left blank -- rather than resizing the region,
-/// which ratatui's own `Viewport::Inline` does not support after
-/// construction (its height is fixed at `Terminal::with_options` time).
+/// Size for the tallest plan: ratatui Inline height is fixed at construction and cannot resize afterward.
 const REGION_HEIGHT: u16 = 18;
 
-/// What the whole intake flow produced.
 pub(crate) enum IntakeOutcome {
-    /// The operator confirmed a plan card (choice 1, 2 or 3).
+    /// Confirmed plan choice.
     Decided {
         decision: Box<ProxyDecision>,
         request: String,
     },
-    /// Esc somewhere in the flow, or nothing ever typed: `request` is
-    /// whatever task text existed at that point (`None` only when the
-    /// operator pressed Esc at an empty prompt).
+    /// Abandoned or empty intake preserves any typed request.
     Unplanned { request: Option<String> },
 }
 
-/// Entry point: runs the whole prompt/sizing/clarify/plan flow on an inline
-/// ratatui region anchored to the current cursor position on `io::stderr()`
-/// (the same stream the old line editor echoed onto, and the one #701 keeps
-/// this off the harness's own alternate screen), restoring the terminal
-/// (raw mode off) on every exit path, including a panicking render (`panic =
-/// "abort"` means `Drop` is not a safety net here -- see `install_panic_hook`).
+/// Restore raw mode on every exit, including panics: panic=abort skips Drop (#701).
 pub(crate) fn run(cfg: &CtxConfig, state: &StateDir, repo: &Path) -> io::Result<IntakeOutcome> {
     enable_raw_mode()?;
     let hook = install_panic_hook();
@@ -104,25 +66,10 @@ pub(crate) fn run(cfg: &CtxConfig, state: &StateDir, repo: &Path) -> io::Result<
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
-/// What the panic hook owes the terminal before the process aborts (`panic =
-/// "abort"` skips `Drop` entirely, so `Terminal`'s own cursor-hiding never
-/// gets put back, and the region's own stale content never gets cleared):
-/// show the cursor again (ratatui hides it on every frame it draws), then
-/// erase from wherever the cursor happens to be down to the end of the
-/// screen. Deliberately NOT a move up to "the region's own top" first: the
-/// region can have scrolled since it was created (a long request, a tall
-/// clarify box), so a guessed offset risks erasing real scrollback above the
-/// crash point instead of only the stale region -- erasing from the
-/// cursor's own current position down is the largest reset that can never
-/// do that. A fixed byte string for the same reason `term::EMERGENCY_RESET`/
-/// `DASH_RESET` are (see that module): cheap and allocation-free, so it
-/// costs nothing to run unconditionally from a panic hook.
+/// Allocation-free panic reset restores the cursor and clears only below it; guessed region offsets could erase scrollback.
 const PANIC_RESET: &[u8] = b"\x1b[?25h\x1b[0J";
 
-/// Mirrors `dash::run_dashboard`'s own `install_panic_hook`/`restore_panic_
-/// hook` pair: a panic mid-render must still leave raw mode off AND the
-/// screen in a usable state before the process aborts, since `panic =
-/// "abort"` skips unwinding (and therefore every `Drop`) entirely.
+/// Restore raw mode and usable display before abort; panic=abort skips unwinding and every Drop.
 fn install_panic_hook() -> std::sync::Arc<PanicHook> {
     let previous: std::sync::Arc<PanicHook> = std::sync::Arc::new(std::panic::take_hook());
     let chained = std::sync::Arc::clone(&previous);
@@ -219,11 +166,7 @@ fn none_if_empty(text: String) -> Option<String> {
     }
 }
 
-/// Issue #537 (A2), carried over verbatim from the old `maybe_clarify`: a Jev
-/// effect naming whether the clarify round was requested, answered or left
-/// unanswered -- only ever recorded when a `Decider::Typesafe` decision is
-/// what asked, since only that decider's own advice is what this measures
-/// the outcome of.
+/// Measure clarification outcomes only when Typesafe advice requested the round (#537).
 fn record_clarification(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -244,21 +187,9 @@ fn record_clarification(
     jev::record_effect(cfg, state, cfg.jev.intake_savings, &effect);
 }
 
-// ---------------------------------------------------------------------
-// Pure: multi-line text buffer and key-action mappings
-// ---------------------------------------------------------------------
+// Pure buffer and key mappings; no terminal access.
 
-/// A multi-line text buffer with an interior cursor, tracked as codepoints
-/// (not bytes) with an embedded `'\n'` for a hard line break -- the prompt
-/// and clarify boxes both edit one of these. `TextBuf` itself only ever
-/// knows about hard breaks; a long line's own soft-wrap (operator report:
-/// PR3 shipped without one, so a long request simply overflowed the box
-/// instead of reflowing inside it -- the earlier "deliberately does not
-/// soft-wrap" scope decision is reversed) is computed separately, at render
-/// time, by [`wrap_display`]/[`wrapped_position`] -- both plain functions of
-/// a display string and a width, so the wrap and the cursor's own wrapped
-/// position can never drift apart from each other, and neither needs a
-/// terminal to test.
+/// Track cursor positions as codepoints and hard breaks; pure render-time wrapping keeps text and cursor aligned.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct TextBuf {
     chars: Vec<char>,
@@ -331,18 +262,8 @@ impl TextBuf {
     }
 }
 
-/// Soft-wraps `text` (which may already hold hard `'\n'` breaks) into rows
-/// that each fit within `width` display cells -- never splitting a
-/// codepoint, and never splitting a hard break across rows either (each
-/// `'\n'`-separated line gets its own run of one or more wrapped rows, even
-/// an empty one). Character-cell wrapping, not ratatui's own word-wrapping
-/// `Wrap`: a library's word-wrap has no public API this could ask "where did
-/// row 2 start", so a self-computed wrap is what keeps this in exact
-/// lockstep with [`wrapped_position`]'s own accounting of where the cursor
-/// then lands -- the two would silently drift apart the moment a real word
-/// wrapped somewhere this did not expect. `width` of 0 is treated as 1 (a
-/// zero-width box would otherwise divide by nothing rather than simply wrap
-/// one codepoint per row).
+/// Share cell wrapping with cursor positioning: library word wrap exposes no row-start mapping.
+/// Preserve hard breaks and codepoints; zero width behaves as one.
 pub(crate) fn wrap_display(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width.max(1));
     let mut rows = Vec::new();
@@ -363,14 +284,7 @@ pub(crate) fn wrap_display(text: &str, width: u16) -> Vec<String> {
     rows
 }
 
-/// Where codepoint index `pos` of `text` lands once [`wrap_display`] wraps
-/// it at the same `width`: `(row, col)`, `col` in display cells (same
-/// CJK/combining-mark distinction the old `EditLine::cells_upto` made,
-/// carried over verbatim). `row`/`col` are both absolute, i.e. before any
-/// scrolling -- see [`scroll_offset`] for making a tall result fit a capped
-/// box. A cursor past the last cell of an exactly full row stays on that
-/// row's last column (a terminal's pending-wrap position), since
-/// [`wrap_display`] never produces the empty row after it.
+/// Use the same cell widths as wrap_display; an exactly full final row keeps the cursor in pending-wrap position.
 pub(crate) fn wrapped_position(text: &str, width: u16, pos: usize) -> (u16, u16) {
     let width = usize::from(width.max(1));
     let at = |row: u16, cells: usize| (row, cells.min(width - 1) as u16);
@@ -402,13 +316,7 @@ pub(crate) fn wrapped_position(text: &str, width: u16, pos: usize) -> (u16, u16)
     at(row, cells)
 }
 
-/// The first visual row to show when `total_rows` wrapped rows need to fit
-/// in `visible_rows` and the cursor sits on absolute row `cursor_row`: `0`
-/// when everything already fits, otherwise however far down keeps
-/// `cursor_row` the LAST visible row rather than letting it scroll off the
-/// bottom unseen (operator report: the box used to stay a fixed 3 rows and
-/// simply clip anything past it, hiding the cursor entirely on a long or
-/// heavily wrapped buffer).
+/// Keep the cursor visible as the last displayed row when wrapped content exceeds the viewport.
 pub(crate) fn scroll_offset(total_rows: u16, visible_rows: u16, cursor_row: u16) -> u16 {
     if visible_rows == 0 || total_rows <= visible_rows {
         return 0;
@@ -417,19 +325,12 @@ pub(crate) fn scroll_offset(total_rows: u16, visible_rows: u16, cursor_row: u16)
     cursor_row.saturating_sub(visible_rows - 1).min(max_offset)
 }
 
-/// How many content rows the box actually shows: every wrapped row when
-/// they all fit within `max_inner_rows` (the inline region's own remaining
-/// height, minus the hint row and the two borders), capped there otherwise
-/// -- this is what makes the box grow with the buffer instead of staying a
-/// fixed 3 rows (operator report), while never growing past what the inline
-/// region actually has room for.
+/// Grow to fit wrapped content without exceeding the inline region's available height.
 pub(crate) fn visible_row_count(total_rows: u16, max_inner_rows: u16) -> u16 {
     total_rows.max(1).min(max_inner_rows.max(1))
 }
 
-/// What one raw key does to a [`TextBuf`] in the prompt/clarify boxes.
-/// `Abandon` (Esc) and `Submit` (Enter) never mutate the buffer -- the
-/// caller decides what to do with them.
+/// Submit and Abandon never mutate the buffer; the caller decides their effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextKeyAction {
     Insert(char),
@@ -445,21 +346,13 @@ pub(crate) enum TextKeyAction {
     Ignored,
 }
 
-/// Ctrl+C, delivered as a literal key event once raw mode has taken `ISIG`
-/// away (the terminal's own SIGINT generation along with it): every screen
-/// maps it to the same "abandon" action Esc already gives, rather than
-/// letting it fall through to `Ignored` the way a bare `Char('c')` +
-/// `CONTROL` otherwise would -- the operator's own reflexive way to bail out
-/// of a CLI prompt must still work here.
+/// Raw mode disables terminal SIGINT generation, so literal Ctrl+C must still abandon every screen.
 fn is_ctrl_c(code: KeyCode, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'C'))
 }
 
-/// Pure: Esc or Ctrl+C always abandons; Ctrl+J always inserts a newline (the
-/// one newline chord every terminal delivers identically, raw mode or not);
-/// Shift+Enter/Alt+Enter insert a newline when the terminal reports the
-/// modifier on the Enter key itself (see the PR report's own note on
-/// Windows Console API modifier delivery); a bare Enter submits.
+/// Pure keys: Esc/Ctrl+C abandon, Ctrl+J inserts newline, bare Enter submits.
+/// Shift/Alt+Enter insert newline only when the terminal delivers the modifier.
 pub(crate) fn text_key_action(code: KeyCode, modifiers: KeyModifiers) -> TextKeyAction {
     if code == KeyCode::Esc || is_ctrl_c(code, modifiers) {
         return TextKeyAction::Abandon;
@@ -483,8 +376,7 @@ pub(crate) fn text_key_action(code: KeyCode, modifiers: KeyModifiers) -> TextKey
     }
 }
 
-/// Applies `action` to `buf`; `true` when the buffer actually changed
-/// (worth a redraw). `Submit`/`Abandon`/`Ignored` never touch `buf`.
+/// Return whether edits require redraw; Submit, Abandon and Ignored never mutate the buffer.
 pub(crate) fn apply_text_key(buf: &mut TextBuf, action: TextKeyAction) -> bool {
     match action {
         TextKeyAction::Insert(c) => {
@@ -505,25 +397,7 @@ pub(crate) fn apply_text_key(buf: &mut TextBuf, action: TextKeyAction) -> bool {
     }
 }
 
-/// What pressing Submit (Enter) does at the top-level prompt: sends `buf`'s
-/// text when it holds any, or -- regression fix -- ends the prompt with
-/// nothing typed, exactly like `Abandon`, when it is empty. The pre-8c8fc9b7
-/// stderr line editor's own `apply_key` submitted an EMPTY line unconditionally
-/// (`KeyCode::Enter => return EditAction::Submit`, no emptiness check), which
-/// `proxy_intake` there read as no request given after a second blank Enter
-/// (its own re-prompt) and started the harness without the proxy -- the
-/// "press Enter repeatedly to start the full orchestrator harness" the
-/// operator reported losing. This inline view has only the one screen (no
-/// re-prompt to ask twice through), so one empty Enter reaches the same
-/// ending Esc already does: `run_prompt` returns `None`, `run_flow` turns
-/// that into `IntakeOutcome::Unplanned { request: None }`, and `proxy_intake`
-/// in `mod.rs` maps THAT to `ProxyIntakeOutcome::Inactive { advisory: None,
-/// request: None }` -- the same silent, no-request path a disabled proxy or
-/// `--simple` already takes, which is what starts the orchestrator harness.
-/// Esc at an empty prompt was never broken (`Abandon` returns `None`
-/// unconditionally) and already reached this identical outcome -- restoring
-/// Submit's own case makes Enter reach it too, rather than adding a second,
-/// differently-worded path to the same place.
+/// Empty Enter must launch the harness without a plan, using the same outcome as empty Esc.
 pub(crate) fn prompt_submit(buf: &TextBuf) -> Option<String> {
     if buf.is_empty() {
         None
@@ -532,11 +406,7 @@ pub(crate) fn prompt_submit(buf: &TextBuf) -> Option<String> {
     }
 }
 
-/// The prompt box's own hint line: while `buf` is empty, Enter and Esc both
-/// end the prompt the same way (see [`prompt_submit`]), so the hint says
-/// that instead of promising a plan that an empty submit never produces;
-/// once anything is typed it reverts to the ordinary "plan and start"
-/// wording.
+/// Empty-buffer hints must describe unplanned launch, not promise a plan with no request.
 fn prompt_hint(buf: &TextBuf) -> &'static str {
     if buf.is_empty() {
         "  \u{23ce}/esc start the full orchestrator \u{b7} shift+\u{23ce} new line"
@@ -545,10 +415,7 @@ fn prompt_hint(buf: &TextBuf) -> &'static str {
     }
 }
 
-/// The plan card's own key handling: `1`-`4` choose directly, Up/Down move
-/// the selection, Enter confirms whatever is currently selected, Esc
-/// abandons -- literally "anywhere", including from inside the choice list
-/// (the design's own wording; there is no separate "back one level" action).
+/// Digits choose, arrows select, Enter confirms, Esc abandons even inside the choice list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanKeyAction {
     Up,
@@ -559,10 +426,7 @@ pub(crate) enum PlanKeyAction {
     Ignored,
 }
 
-/// Any digit is a candidate choose action; the caller (`run_plan`) is what
-/// knows how many choices actually exist this render (see [`PlanCard::
-/// choices`]) and ignores one out of range -- so this never has to know that
-/// count itself. Esc or Ctrl+C abandons, same as every other screen.
+/// Map digits without assuming choice count; the caller rejects out-of-range choices, and Esc/Ctrl+C abandon.
 pub(crate) fn plan_key_action(code: KeyCode, modifiers: KeyModifiers) -> PlanKeyAction {
     if code == KeyCode::Esc || is_ctrl_c(code, modifiers) {
         return PlanKeyAction::Abandon;
@@ -576,10 +440,7 @@ pub(crate) fn plan_key_action(code: KeyCode, modifiers: KeyModifiers) -> PlanKey
     }
 }
 
-/// One of the plan card's numbered choices. Choice 2 ("Start with a
-/// different model") is CONDITIONAL -- see [`PlanCard::choices`] -- so a
-/// choice's number is its position in that list, not a fixed digit of its
-/// own; [`PlanChoice::text`] is the phrase alone, numbered by the caller.
+/// Choice numbers are list positions because DifferentModel is conditional; text carries no fixed digit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanChoice {
     Start,
@@ -599,17 +460,8 @@ impl PlanChoice {
     }
 }
 
-/// Applies choice 2 (a picked seat) or 3 (drop the workflow) to `decision`;
-/// pure clone-and-mutate so it is testable without a terminal. Choice 1
-/// returns `decision` unchanged; choice 4 never reaches this (the caller
-/// returns to the prompt instead). This is the ONLY place `decision.
-/// workflow` is cleared for choice 3 -- `run_with`'s existing `start_proxy_
-/// workflow` reads `decision.workflow` after intake returns, so clearing it
-/// here is what makes "choice 3 starts none" true without any change to
-/// that already-existing call. A picked seat (choice 2) replaces BOTH the
-/// harness and the model: the operator's follow-up made the model list span
-/// every enabled harness, not only the decided one's own ladder, so "a
-/// different model" can mean a different harness too.
+/// Pure choice application must replace both harness and model for a picked seat.
+/// Clearing workflow here ensures NoWorkflow actually prevents workflow startup.
 pub(crate) fn apply_choice(
     mut decision: ProxyDecision,
     choice: PlanChoice,
@@ -630,31 +482,20 @@ pub(crate) fn apply_choice(
     }
 }
 
-// ---------------------------------------------------------------------
-// Pure: plan-card text, fallback notice, clarify wording, summary line
-// ---------------------------------------------------------------------
+// Pure plan text and notices; no terminal access.
 
-/// One row of the plan card, e.g. `("Model", "Sonnet 5, working alone")`.
+/// Label/value pair for one plan-card row.
 pub(crate) type Row = (&'static str, String);
 
-/// Everything the plan card shows, built once from a decision (and, for the
-/// orchestrated "Helpers" row and the workflow row's step count, the live
-/// harness/workflow roster) -- no seat tiers, decider names, domain scores
-/// or confidence numbers anywhere in it (design constraint).
+/// Plan text uses plain words only: no internal tiers, deciders, domain scores or confidence values.
 pub(crate) struct PlanCard {
     pub sentence: String,
     pub seat_rows: Vec<Row>,
     pub workflow_row: Row,
     pub why_row: Row,
-    /// The seats choice 2 would offer -- every enabled harness's own tier
-    /// ladder, minus the already-planned one (see `decision::model_choices`).
-    /// Empty exactly when there is nothing else to offer.
+    /// Enabled seats excluding the planned seat; empty means no alternative can be offered.
     pub model_choices: Vec<proxy::decision::Seat>,
-    /// The numbered choices this card actually shows, in order -- `Start`,
-    /// `DifferentModel` (present only when `model_choices` is non-empty),
-    /// `NoWorkflow`, `EditTask`. A choice's displayed number is `1 +` its
-    /// position here, so omitting `DifferentModel` renumbers the rest
-    /// automatically rather than leaving a gap at "2".
+    /// Start, optional DifferentModel, NoWorkflow, EditTask; number by position so omitted choices leave no gap.
     pub choices: Vec<PlanChoice>,
 }
 
@@ -770,14 +611,7 @@ fn workflow_line(cfg: &CtxConfig, repo: &Path, decision: &ProxyDecision) -> Stri
     }
 }
 
-/// A model id or alias in plain words, prefixed with its harness (operator
-/// follow-up, round 2): `("claude", "sonnet")` -> `Claude \u{b7} Sonnet`,
-/// `("claude", "claude-sonnet-5")` -> `Claude \u{b7} Sonnet 5`, `("codex",
-/// "gpt-5.6-luna")` -> `Codex \u{b7} GPT-5.6 Luna`. Used everywhere BUT the
-/// plan card's own Model/Lead/Helpers rows, which use [`plan_seat_label`]
-/// instead (its own doc comment says why). See [`bare_model_name`] for the
-/// model half's own formatting rules (vendor casing, hyphenated version
-/// numbers).
+/// Readable harness-prefixed model label; plan rows use plan_seat_label for their shorter Claude form.
 pub(crate) fn model_display_name(harness: &str, model: &str) -> String {
     format!(
         "{} \u{b7} {}",
@@ -786,12 +620,7 @@ pub(crate) fn model_display_name(harness: &str, model: &str) -> String {
     )
 }
 
-/// The plan card's own Model/Lead/Helpers row label (operator follow-up,
-/// round 2): plain `Sonnet 5` style -- no harness prefix -- when `harness`
-/// is `claude` (still the overwhelmingly common case, and the one the
-/// original mock's own wording assumed), [`model_display_name`]'s prefixed
-/// form (`Codex \u{b7} GPT-5.6 Terra`) otherwise, since a non-claude seat is
-/// exactly the case where naming the harness is the useful information.
+/// Omit the common Claude prefix on plan rows; name other harnesses where that distinction informs the choice.
 fn plan_seat_label(harness: &str, model: &str) -> String {
     if harness.eq_ignore_ascii_case("claude") {
         bare_model_name(harness, model)
@@ -800,9 +629,7 @@ fn plan_seat_label(harness: &str, model: &str) -> String {
     }
 }
 
-/// `claude` -> `Claude`, `cursor-agent` -> `Cursor Agent`: a harness
-/// registry name in plain title-cased words, for the label half of
-/// [`model_display_name`].
+/// Title-case registry names for display.
 fn harness_display_name(harness: &str) -> String {
     harness
         .split(['-', '_'])
@@ -812,17 +639,7 @@ fn harness_display_name(harness: &str) -> String {
         .join(" ")
 }
 
-/// The model half alone, no harness prefix: strips a leading segment that
-/// names `harness` itself (`claude-sonnet-5` on harness `claude` -> the
-/// `claude` segment, since it says nothing `model_display_name`'s own
-/// harness label does not already say), title-cases the rest, and keeps a
-/// recognized vendor acronym in ITS OWN casing (`gpt` -> `GPT`, "keep vendor
-/// casing" -- the operator's own follow-up) hyphen-joined to the segment
-/// right after it, matching how the vendor itself spells the id (`gpt-5.6-
-/// luna` -> `GPT-5.6 Luna`, not `Gpt 5.6 Luna` or `GPT 5.6 Luna`). A leading
-/// digit's own word is left alone (a version number, not a word to
-/// capitalize). Never empty: an alias with nothing left after stripping (or
-/// this cannot recognize at all) falls back to the raw string.
+/// Remove redundant harness prefixes, preserve vendor acronyms/version spelling, and fall back to the raw id if empty.
 fn bare_model_name(harness: &str, model: &str) -> String {
     let mut segments: Vec<&str> = model.split(['-', '_']).filter(|s| !s.is_empty()).collect();
     if segments
@@ -855,10 +672,7 @@ fn bare_model_name(harness: &str, model: &str) -> String {
     words.join(" ")
 }
 
-/// Vendor words this codebase knows to keep in a specific casing rather than
-/// title-casing generically -- `gpt` is the operator's own named example
-/// (`GPT-5.6 Luna`, never `Gpt`); add more here as they come up, never by
-/// special-casing a whole model id.
+/// Preserve vendor acronym casing without special-casing whole model ids.
 fn vendor_acronym(word: &str) -> Option<&'static str> {
     match word.to_ascii_lowercase().as_str() {
         "gpt" => Some("GPT"),
@@ -866,8 +680,7 @@ fn vendor_acronym(word: &str) -> Option<&'static str> {
     }
 }
 
-/// Title-cases one word, leaving a leading digit's own word alone (a
-/// version number).
+/// Leave leading-digit version words unchanged when title-casing.
 fn title_case_word(word: &str) -> String {
     if word.starts_with(|c: char| c.is_ascii_digit()) {
         return word.to_string();
@@ -879,10 +692,7 @@ fn title_case_word(word: &str) -> String {
     }
 }
 
-/// The yellow `\u{26a0}` warning line and its details line, when `decision.
-/// fallbacks` is non-empty (the configured decider failed or timed out, so a
-/// fallback -- ultimately the deterministic baseline -- produced the plan).
-/// `None` when nothing fell back.
+/// Show fallback details only when a failed or timed-out decider was replaced.
 pub(crate) fn fallback_notice(
     cfg: &CtxConfig,
     decision: &ProxyDecision,
@@ -910,9 +720,7 @@ pub(crate) fn fallback_notice(
     Some((warning, details))
 }
 
-/// The clarify box's reworded question -- plain words, no confidence number
-/// (unlike the old `maybe_clarify`'s `"the request looks ambiguous (0.73)"`,
-/// which this replaces).
+/// Clarify in plain words without exposing confidence scores.
 pub(crate) fn clarify_question(decision: &ProxyDecision) -> &'static str {
     match decision.clarification_category.as_deref() {
         Some("target") => "Which part should change? Name a file, a module or a screen.",
@@ -922,15 +730,7 @@ pub(crate) fn clarify_question(decision: &ProxyDecision) -> &'static str {
     }
 }
 
-/// The one line that stays in scrollback once the region clears:
-/// `\u{273b} zirv planned in {N}s \u{b7} {seat} \u{b7} {workflow}`. `decision.
-/// elapsed_ms` is `decide()`'s own timing (the LAST call, if a clarify round
-/// re-decided) -- rounded up so a near-instant deterministic decision still
-/// reads as at least 1s rather than a slightly odd "planned in 0s".
-/// `started_workflow_id` is `None` for choice 3 (no workflow) and for a
-/// decision that never named one; `run_with` supplies it from the SAME
-/// `start_proxy_workflow` call that already threads it to `proxy::prompt_
-/// layer`.
+/// Leave one scrollback summary using the final decision's elapsed time rounded up to at least one second.
 pub(crate) fn summary_line(decision: &ProxyDecision, started_workflow_id: Option<&str>) -> String {
     let secs = decision.elapsed_ms.div_ceil(1000).max(1);
     let label = plan_seat_label(&decision.orchestrator.harness, &decision.orchestrator.model);
@@ -946,9 +746,7 @@ pub(crate) fn summary_line(decision: &ProxyDecision, started_workflow_id: Option
     format!("\u{273b} zirv planned in {secs}s \u{b7} {seat} \u{b7} {workflow}")
 }
 
-// ---------------------------------------------------------------------
-// Impure: per-screen render + key loops
-// ---------------------------------------------------------------------
+// Terminal rendering and key loops.
 
 const HINT_STYLE: Style = Style::new().fg(Color::DarkGray);
 const BOX_STYLE: Style = Style::new().fg(Color::Cyan);
@@ -967,18 +765,12 @@ fn text_box<'a>(title: &'a str, style: Style) -> Block<'a> {
     block
 }
 
-/// Renders any `Widget` at `area` -- a thin wrapper so the `draw_*` helpers
-/// below read as plain data-to-pixels functions of `(Rect, &mut Buffer)`
-/// rather than needing a live `&mut Frame` (which they don't have: they take
-/// the buffer directly so the same rendering is exercised from a
-/// `TestBackend`-free unit test too, via a bare `Buffer::empty`).
+/// Render into a buffer so drawing remains testable without a live terminal frame.
 fn render(widget: impl ratatui::widgets::Widget, area: Rect, buf: &mut Buffer) {
     ratatui::widgets::Widget::render(widget, area, buf);
 }
 
-/// Renders `block` at `area`, then `content` inside the space it leaves --
-/// returns that inner `Rect` so the caller can place a cursor marker or
-/// further content relative to it.
+/// Return the inner box rectangle so cursor placement shares the rendered geometry.
 fn render_boxed(block: Block<'_>, content: Paragraph<'_>, area: Rect, buf: &mut Buffer) -> Rect {
     let inner = block.inner(area);
     render(block, area, buf);
@@ -1004,20 +796,10 @@ fn run_prompt(terminal: &mut Term, buf: &mut TextBuf) -> io::Result<Option<Strin
     }
 }
 
-/// Renders the boxed prompt: `"> {text}"` soft-wrapped to the box's own
-/// inner width (bug: it used to overflow past the border instead), and a
-/// box that grows with the number of visual rows that text needs -- capped
-/// at whatever `area` (the inline region, minus the hint row this itself
-/// reserves) has room for, scrolling so the cursor's own row always stays
-/// visible rather than clipping it off (bug: it used to stay a fixed 3 rows
-/// and simply clip anything past it). See [`wrap_display`]/
-/// [`wrapped_position`]/[`scroll_offset`]/[`visible_row_count`] for the pure
-/// arithmetic this only ever renders the result of.
+/// Wrap and grow within the available region, scrolling to keep the cursor visible.
 fn draw_prompt(area: Rect, buf: &mut Buffer, line: &TextBuf) {
     let content = format!("> {}", line.text());
-    // The `"> "` marker is 2 codepoints, both ASCII (1 cell each), so the
-    // cursor's own position in `content` is always the buffer's cursor plus
-    // that fixed offset.
+    // The ASCII prompt marker adds two codepoints and two display cells to the cursor offset.
     let cursor_pos = 2 + line.cursor;
     let inner_width = area.width.saturating_sub(2);
     let rows = wrap_display(&content, inner_width);
@@ -1052,12 +834,7 @@ fn draw_prompt(area: Rect, buf: &mut Buffer, line: &TextBuf) {
     }
 }
 
-/// What one `run_sizing` call produces: the decision itself, plus a snapshot
-/// of which harnesses are actually usable right now (operator follow-up,
-/// round 2) -- both computed on the SAME worker thread, once per call, never
-/// re-derived on the UI thread or per frame. See `decision::ready_harness_
-/// names`'s own doc comment for why this rides along with `decide()` rather
-/// than being probed later, synchronously, from the plan card.
+/// Compute the decision and usable-harness snapshot once on the worker thread, never during UI rendering.
 struct Sizing {
     decision: ProxyDecision,
     ready_harnesses: Vec<String>,
@@ -1078,9 +855,7 @@ fn run_sizing(
     std::thread::spawn(move || {
         let decision = proxy::decide(&cfg_owned, &state_root, &repo_owned, &request_owned, false);
         let ready_harnesses = proxy::decision::ready_harness_names(&cfg_owned, &repo_owned);
-        // The receiver may already be gone (Esc abandoned this call): a send
-        // error here just means the result is discarded, exactly as
-        // intended -- never a reason to panic.
+        // Abandoning intake drops the receiver; discard the result rather than panic.
         let _ = tx.send(Sizing {
             decision,
             ready_harnesses,
@@ -1103,8 +878,7 @@ fn run_sizing(
     }
 }
 
-/// Ratatui's own `SPIN` frames, on an 90ms clock -- close to the mock's own
-/// 80ms cadence (see the design doc's motion notes), not redrawn per poll.
+/// Advance spinner frames by a 90ms clock, never by poll count.
 const SPINNER: [char; 10] = [
     '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
     '\u{2807}', '\u{280f}',
@@ -1169,10 +943,7 @@ fn run_clarify(terminal: &mut Term, decision: &ProxyDecision) -> io::Result<Clar
     }
 }
 
-/// Renders the clarify box: the question and the boxed `"> {text}"` answer
-/// both soft-wrapped as one unit, same growth/scroll rules as
-/// [`draw_prompt`] (see its own doc comment) -- the question wraps too, not
-/// just the answer, since both share the same box.
+/// Wrap question and answer together because both occupy the same growing, scrollable box.
 fn draw_clarify(area: Rect, buf: &mut Buffer, question: &str, line: &TextBuf) {
     let content = format!("{question}\n> {}", line.text());
     let cursor_pos = question.chars().count() + 1 + 2 + line.cursor;

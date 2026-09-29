@@ -1,11 +1,6 @@
 //! `zirv ctx chat`: an interactive session launched through the same `wrap`
-//! supervision every other interactive verb uses, but the launch is built
-//! from the resolved adapter rather than from a user-supplied argv (there is
-//! nothing on the command line for `wrap`'s own detection to guess at), and
-//! the session is flagged `PromptRole::Orchestrator` rather than `Worker`:
-//! this is the session a human is talking to directly, so it is the one
-//! allowed to hear about delegating to other harnesses (`zirv ctx send`,
-//! `zirv ctx inbox`, `zirv ctx agent`).
+//! supervision, with argv built by the resolved adapter. The human-facing
+//! orchestrator role receives cross-harness delegation guidance.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -91,38 +86,21 @@ pub struct ChatArgs {
     #[arg(long, default_value_t = false)]
     pub no_proxy: bool,
     /// Extra arguments passed through to the agent, after `--`.
-    //
-    // `allow_hyphen_values`, because what gets passed through here is the
-    // agent's own flags.
     #[arg(allow_hyphen_values = true, last = true)]
     pub extra: Vec<String>,
 }
 
-/// What `run_with` hands to `wrap::run_with`: the resolved agent's own name
-/// (so wrap never has to guess), the argv `interactive_cmd` built, and the
-/// role every chat session carries.
+/// Resolved adapter, argv and role let wrap launch without guessing a command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatLaunch {
     pub agent_name: String,
     pub argv: Vec<String>,
     pub role: PromptRole,
-    /// Always `Verb::Chat`: a chat session's registry record must say so
-    /// rather than falling back to `wrap`'s own default, the same way
-    /// `role` is always `Orchestrator` regardless of resuming or extra
-    /// flags.
+    /// Always register chat as Verb::Chat, even when resumed or passed extra flags.
     pub verb: super::sessions::Verb,
 }
 
-/// Builds the launch from the adapter rather than from any user-supplied
-/// argv: a chat session names no wrapped command on the command line, so
-/// there is nothing for `wrap`'s own detection to guess at. Always
-/// `PromptRole::Orchestrator`: a `chat` session is the one a human is
-/// talking to directly, so it is the one allowed to hear about delegating to
-/// other harnesses.
-///
-/// A pure function of the adapter and the two pieces of caller-supplied
-/// state (the initial prompt, the extra flags), so it is testable without
-/// spawning a pty.
+/// Pure adapter-built interactive launch defaults to Orchestrator so the human-facing seat receives delegation guidance.
 pub fn build_launch(
     adapter: &dyn AgentAdapter,
     initial_prompt: Option<&str>,
@@ -139,37 +117,8 @@ pub fn build_launch(
     }
 }
 
-/// When `adapter` has no verified system-prompt injection mechanism for the
-/// launch shape it is about to use, folds the composed session context onto
-/// the positional initial-prompt slot as a fallback -- the same task-prompt-
-/// text channel `exec.rs`/`run_loop.rs`/`dash::compose_worker_prompt` already
-/// use for exactly this adapter shape (see `prompt::task_prompt_with_
-/// composed_fallback`'s own doc comment for why the task prompt is the one
-/// channel such an adapter has). Whenever the adapter *is* supported, the
-/// composed fallback stays a no-op, but the positional prompt still passes
-/// through the same masking boundary as the fallback path.
-///
-/// `adapter.system_prompt_supported(&[])` (an empty launch) is deliberately
-/// probed here rather than against the eventual full launch argv: this runs
-/// before `build_launch` exists, and `CodexAdapter::system_prompt_supported`'s
-/// own contract is to probe `self.interactive_cmd(None, &[])` when handed an
-/// empty launch, answering the same question (does *this adapter's own
-/// program* resolve to a reparsing shell shim) without needing the real argv
-/// in hand -- `compose_worker_prompt` makes the identical `adapter.system_
-/// prompt_supported(&[])` call for the same reason, a launch that also does
-/// not exist yet at that point.
-///
-/// `simple`/`cfg.prompt.enabled` are not checked directly here: `compile::
-/// compile` already returns `composed: None` for either (mirroring `prompt::
-/// compose`'s own gate), and `task_prompt_with_composed_fallback` is a no-op
-/// when handed `None`, so both degrade to returning `initial_prompt`
-/// unchanged -- the correct answer either way.
-///
-/// `role` (issue #537 T3) is the seat this launch actually runs as --
-/// `PromptRole::Single` for the proxy's own direct/bounded decision,
-/// `Orchestrator` for everything else (see `proxy_prompt_role`) -- so this
-/// fallback composes the SAME layers the launch's own env/hook plumbing
-/// assumes, rather than always hardcoding `Orchestrator`.
+/// Use positional prompt fallback when injection is unsupported; probe the adapter with empty argv before launch exists.
+/// Mask prompts on both paths; compile handles simple/disabled injection, and the resolved role must match env/hooks (#537).
 #[allow(clippy::too_many_arguments)]
 fn orchestrator_initial_prompt(
     adapter: &dyn AgentAdapter,
@@ -210,11 +159,7 @@ fn orchestrator_initial_prompt(
                 task,
             );
         }
-        // Issue #537 (T2a): the harness proxy's own bounded layer, when an
-        // active decision took over this launch -- a no-op for every other
-        // launch (`proxy_layer` is `None`). Every adapter with verified
-        // system-prompt injection gets this layer through `wrap.rs`'s or
-        // `dash_orchestrator_pane`'s own `compile::with_proxy_layer` call.
+        // Unsupported injection needs the same proxy layer that verified launch paths receive (#537).
         let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
         let base = initial_prompt.unwrap_or_default();
         super::prompt::task_prompt_with_composed_fallback(&base, false, compiled.composed.as_ref())
@@ -225,10 +170,7 @@ fn orchestrator_initial_prompt(
         match super::obfuscate_store::protect_text(state, repo, cfg, &text, "chat_initial_prompt") {
             Ok(protected) => Some(protected.0),
             Err(error) => {
-                // Fail closed: never send the unprotected text. This is
-                // rare (obfuscate.mode is off by default) and otherwise
-                // silent, so the operator has something to act on rather
-                // than a session that quietly opened with no initial task.
+                // Fail closed: never send unprotected text; warn when masking drops the initial task.
                 crate::output::warn(format!(
                     "sensitive-data masking failed ({error}); starting without the initial task prompt"
                 ));
@@ -238,18 +180,7 @@ fn orchestrator_initial_prompt(
     }
 }
 
-/// The explicit `--agent`, else the configured default, else the registry's
-/// own fallback rule -- whose aggregated error (naming every disabled or
-/// unready candidate, and why) is the message a chat session with nothing
-/// available shows. Refusing here, before `wrap` is ever reached, is what
-/// keeps an explicitly named disabled agent from touching the terminal at
-/// all: `wrap::run_with` performs the identical `adapters::select` check of
-/// its own before opening a pty, so the same refusal holds even if this
-/// function's own check were ever bypassed.
-///
-/// Also returns the `HarnessRule` that picked the adapter, for the launch
-/// banner: an explicit `--agent` never reaches `resolve_default`, so that
-/// rule cannot come from `DefaultOrigin` alone.
+/// Resolve and refuse disabled/unready adapters before touching the terminal; wrap repeats the guard independently.
 pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
@@ -257,25 +188,13 @@ pub(crate) fn resolve_adapter(
     resolve_adapter_with_presence(cfg, requested, &adapters::liveness_probe)
 }
 
-/// [`resolve_adapter`] with the presence oracle passed in rather than read
-/// off the ambient `PATH` -- the same seam, and for the same reason, as
-/// `adapters::resolve_default_with_presence`'s own doc comment gives: issue
-/// #690 made the last arm's answer depend on what this machine has, so a
-/// test that reads the real `PATH` proves only what the developer happens to
-/// have installed. Threaded through every arm, not just the fallback, so an
-/// injected machine state is the whole truth for a test rather than most of
-/// it; the explicit and configured arms consult it no more than they did
-/// before (`select_with_presence` reaches the oracle only in its own
-/// fallback).
+/// Inject presence for every resolution arm so tests never depend on the developer's installed PATH tools (#690).
 pub(crate) fn resolve_adapter_with_presence(
     cfg: &CtxConfig,
     requested: Option<&str>,
     present: &dyn Fn(&str, &str) -> adapters::Liveness,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
-    // `true`, the `adapter_builds_launch` answer every empty command carries
-    // (`adapters::select` derives exactly this for a `&[]` caller): `chat`
-    // has no wrapped argv at all, so whatever it resolves is a harness zirv
-    // itself would launch.
+    // Empty chat argv means the adapter builds its own launch.
     if requested.is_some() {
         let adapter = adapters::select_with_presence(requested, &[], cfg, true, present)?;
         return Ok((adapter, HarnessRule::Explicit));
@@ -298,16 +217,7 @@ pub(crate) fn resolve_adapter_with_presence(
     }
 }
 
-/// Every known harness in registry order, alongside whether the gate
-/// currently enables it -- the banner's own harness list. A disabled harness
-/// still gets a `(name, false)` entry (its glyph tells the operator it is
-/// there but off); an *enabled* harness whose binary is confirmed absent
-/// (`adapters::adapter_liveness`, the same issue #298 probe the injected
-/// roster gates on) is omitted outright rather than rendered `false` --
-/// absence, not a green light this session cannot actually use. `ready()`
-/// failing, or a probe that cannot reach a confident verdict, both still
-/// count as present: the same fail-open posture `harness_roster_lines`
-/// already holds to.
+/// Show disabled harnesses, omit only confirmed-absent enabled binaries, and retain uncertain/readiness-failed entries (#298).
 fn harness_list(cfg: &CtxConfig) -> Vec<(String, bool)> {
     adapters::ADAPTERS
         .iter()
@@ -327,11 +237,7 @@ fn harness_list(cfg: &CtxConfig) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// `--resume`'s initial prompt: the latest stored handoff, folded in the same
-/// words `zirv ctx resume` uses. When nothing is stored, prints a note and
-/// starts fresh rather than failing the session outright: `--resume` is a
-/// request to continue if there is something to continue from, not a
-/// precondition for starting at all.
+/// Resume opportunistically: missing stored handoff announces a fresh start instead of refusing the session.
 pub fn resolve_initial_prompt<W: Write>(
     resume_requested: bool,
     state: &StateDir,
@@ -343,11 +249,7 @@ pub fn resolve_initial_prompt<W: Write>(
         return Ok(None);
     }
     match handoff::latest_for_repo(state, repo)? {
-        // Issue #281: no session id has been minted for this launch yet at
-        // this point in `chat`'s own flow (unlike `resume::run_with`, which
-        // now mints its session before composing this same prompt) --
-        // `resume_prompt`'s `session` parameter is unused by `working_set`
-        // today, so an empty string costs nothing real.
+        // No session id exists yet; working-set resume composition does not consume that argument (#281).
         Some((_path, found)) => Ok(Some(resume::resume_prompt(
             state,
             repo,
@@ -366,59 +268,25 @@ pub fn resolve_initial_prompt<W: Write>(
     }
 }
 
-/// Issue #537 (T2): what the harness proxy's intake step decided for this
-/// launch, evaluated once, before `resolve_adapter`. PR3 (issue #799):
-/// replaced the blocking stderr prompt with an inline ratatui plan card
-/// (`intake::run`); see that module's own doc comment for the full
-/// prompt/sizing/clarify/plan flow.
+/// Intake outcome resolved once before adapter selection (#537, #799).
 #[derive(Debug, PartialEq)]
 enum ProxyIntakeOutcome {
-    /// The proxy took no part in this launch (a routine skip), OR the
-    /// operator pressed Esc somewhere in the plan-card flow: `request`, when
-    /// present, is whatever task text had already been typed at that point --
-    /// preserved as the launch's own initial prompt rather than thrown away.
-    /// `advisory`, when present, is the one line `run_with` prints on the
-    /// same `zirv \u{25b8}` channel as every other announcement (so it still
-    /// honors `--quiet`).
+    /// Skipped/abandoned intake preserves typed request text; optional advice still honors quiet settings.
     Inactive {
         advisory: Option<String>,
         request: Option<String>,
     },
-    /// Activation succeeded but stdin is not a terminal, so there is
-    /// nowhere to read the task description from: `run_with` refuses the
-    /// whole launch with this message rather than silently skipping the
-    /// proxy (unlike every other `Inactive` case, this one was never given
-    /// a chance to say anything at all).
+    /// Enabled intake without usable stdin must refuse rather than silently skip the requested interaction.
     Refuse { message: String },
-    /// The operator confirmed a plan card (choice 1, 2 or 3): `request` is
-    /// the raw text `decide` classified (folded with any clarification
-    /// answer), carried alongside so it can also become the launch's own
-    /// initial prompt. Boxed: `ProxyDecision` is far larger than every other
-    /// variant here (clippy's `large_enum_variant`), and this variant is
-    /// matched far less often than it is passed around.
+    /// Confirmed decision with clarified request text; boxing keeps the large variant cheap to pass.
     Decided {
         decision: Box<ProxyDecision>,
         request: String,
     },
 }
 
-/// The harness proxy's intake step (issue #537 T2; PR3/#799 rewrite),
-/// evaluated before any dashboard/TUI or `wrap` launch and before
-/// `resolve_adapter`.
-///
-/// `--simple`/`--resume` always skip the proxy outright -- a resumed
-/// session's first prompt is the stored handoff, and `--simple` promises no
-/// zirv-injected step at all -- recording why only when `--proxy` was
-/// explicitly requested (an operator asking for the proxy and silently not
-/// getting it would otherwise look like a bug). Otherwise `proxy::activation`
-/// decides (`--proxy`/`--no-proxy` already folded into `cfg.proxy.enabled`
-/// by the caller): `Err` skips with that reason as the advisory; `Ok` opens
-/// the intake view, refusing outright on a non-tty stdin (there is nowhere
-/// to read a request from) and on a terminal that cannot render it (no VT
-/// output, or stderr itself is not a terminal -- the same posture
-/// `intake_reader` used to gate the old line editor on) -- ratatui's
-/// cursor-movement escapes need VT processing the same way the old
-/// `redraw_edit_line` did, so there is no partial fallback left to offer.
+/// Run intake before adapter resolution or terminal takeover; simple/resume skip it (#537, #799).
+/// Only explicit proxy requests announce those skips; active intake requires terminal input and VT-capable stderr.
 fn proxy_intake(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -438,12 +306,7 @@ fn proxy_intake(
         });
     }
     if let Err(reason) = proxy::activation(cfg) {
-        // Issue #537 review: the plain `[proxy] enabled = false` default --
-        // no flag either way -- must stay byte-identical to today,
-        // announcements included. `cfg.proxy.enabled` here already has
-        // `--proxy`/`--no-proxy` folded in by the caller, so this is exactly
-        // "enabled (by config or --proxy) but not usable"; the disabled
-        // default (or an explicit `--no-proxy`) prints nothing.
+        // Disabled proxy stays silent; announce activation failure only when proxy use was requested (#537).
         let advisory = cfg.proxy.enabled.then_some(reason);
         return Ok(ProxyIntakeOutcome::Inactive {
             advisory,
@@ -478,28 +341,13 @@ fn proxy_intake(
     }
 }
 
-/// The chat-launch overrides an active harness-proxy decision applies:
-/// `cfg.chat.model` (so `extra_with_model`/`SEAT_MODEL_ENV`/the banner all
-/// disclose the SAME model the proxy chose, through the exact seams that
-/// already carry an operator-configured `chat.model` today) and the
-/// requested adapter name, returned for the caller to fold into
-/// `resolve_adapter` in place of `--agent`. Pure and given an already-
-/// computed [`ProxyDecision`] (not `decide` itself), so the effect on a
-/// launch's argv is testable without a pty, a real decider, or a live
-/// `proxy::decide` call.
+/// Purely apply the decided harness/model through shared launch fields so argv and disclosures agree.
 fn apply_proxy_decision(cfg: &mut CtxConfig, decision: &ProxyDecision) -> String {
     cfg.chat.model = Some(decision.orchestrator.model.clone());
     decision.orchestrator.harness.clone()
 }
 
-/// Issue #537 (T3, operator field report): the `PromptRole` this launch's own
-/// prompt/env/hook plumbing runs as. `SeatRole::Single` (a `direct`/`bounded`
-/// decision -- one seat working alone) launches as `PromptRole::Single`
-/// rather than today's hardcoded `Orchestrator`, so it never receives the
-/// harness's orchestrator conventions, the operator's orchestrator `system-
-/// prompt.md`, or the write-guard denial those imply (see `PromptRole::
-/// Single`'s own doc comment). `SeatRole::Orchestrator` and every outcome
-/// that never decided (today's launch, unchanged) keep `Orchestrator`.
+/// Single decisions must omit orchestrator teaching and write guards; all other outcomes retain Orchestrator (#537).
 fn proxy_prompt_role(intake: &ProxyIntakeOutcome) -> PromptRole {
     match intake {
         ProxyIntakeOutcome::Decided { decision, .. } if decision.seat_role == SeatRole::Single => {
@@ -509,18 +357,7 @@ fn proxy_prompt_role(intake: &ProxyIntakeOutcome) -> PromptRole {
     }
 }
 
-/// Issue #703 (follow-up to #702): the model half of the same decision
-/// `proxy_prompt_role` already reads the seat role from. `apply_proxy_
-/// decision`'s `cfg.chat.model` seam (which flows into `extra_with_model`,
-/// the harness argv and the banner) has no equivalent on the native path --
-/// there is no `--model` flag and no harness argv to fold one into. This
-/// hands `native_pane_spec` the decided model as-is, for `NativeDashboardSpec
-/// ::route`: `NativePaneRuntime::spawn` is what validates it against the
-/// operator's own native provider configuration and falls back to the role's
-/// default route for anything that is not an existing, policy-allowed route
-/// name, rather than failing the launch the way an unresolvable explicit
-/// `--route` would. `None` for every outcome but `Decided`, exactly like
-/// `proxy_prompt_role`, which leaves the pane's route untouched.
+/// Native decisions supply route candidates, validated against operator policy at spawn; invalid candidates use role defaults (#702, #703).
 fn proxy_decided_model(intake: &ProxyIntakeOutcome) -> Option<String> {
     match intake {
         ProxyIntakeOutcome::Decided { decision, .. } => Some(decision.orchestrator.model.clone()),
@@ -528,20 +365,7 @@ fn proxy_decided_model(intake: &ProxyIntakeOutcome) -> Option<String> {
     }
 }
 
-/// The harness proxy's own bounded `[zirv proxy]` layer text
-/// (`proxy::prompt_layer`), when [`proxy_intake`] decided this launch;
-/// `None` for every other outcome. Computed once and threaded to every
-/// place that needs it (`orchestrator_initial_prompt`'s fallback,
-/// `dash_orchestrator_pane`, `wrap_args_for`), so the launch shape actually
-/// taken can never disagree with the others about it.
-///
-/// `started_workflow_id` (change 2, wrapper-overhead benchmark): the id
-/// [`start_proxy_workflow`] actually started for this SAME launch, when it
-/// did -- forwarded straight to `proxy::prompt_layer` so the workflow line
-/// names the concrete running instance, not only its kind. It must come
-/// from a workflow start that ran BEFORE this function, which is why
-/// [`start_proxy_workflow`] is now called once at the top of `run_with`,
-/// ahead of every place that reads this text.
+/// Build one proxy layer for every launch shape, after workflow startup so it names the actual instance.
 fn proxy_layer_text(
     intake: &ProxyIntakeOutcome,
     started_workflow_id: Option<&str>,
@@ -554,20 +378,7 @@ fn proxy_layer_text(
     }
 }
 
-/// Starts the proxy's chosen workflow (when [`proxy_intake`] decided one),
-/// once, before any launch shape's own prompt is built -- so the started id
-/// can reach [`proxy_layer_text`] and, through it, every one of the three
-/// launch shapes (change 2, wrapper-overhead benchmark field evidence: a
-/// workflow started in 27/36 replayed runs, never consulted, because
-/// nothing named the running instance or what to do with it). A no-op
-/// (`None`) when the intake never took over this launch.
-///
-/// Issue #537 review: never silently discards an outcome the operator has
-/// no other way to learn about. `announce` is called through the exact same
-/// `zirv \u{25b8}` channel every other proxy line uses (a `Skipped` start or
-/// a `start_workflow_for` error); a `Started` workflow stays silent here,
-/// same as today -- it is only ever reported through the prompt layer or,
-/// on a failed spawn, [`close_proxy_workflow_on_failure`].
+/// Start the workflow once before building prompts; announce skipped/failed starts and never silently discard outcomes (#537).
 fn start_proxy_workflow(
     outcome: &ProxyIntakeOutcome,
     state: &StateDir,
@@ -590,18 +401,7 @@ fn start_proxy_workflow(
     }
 }
 
-/// Runs `spawn`, closing `started_id` (when [`start_proxy_workflow`] named
-/// one) with `"proxy launch failed"` if `spawn` itself returns `Err` -- so a
-/// failed launch never leaves an orphaned workflow reported as this
-/// repository's active one forever. A plain pass-through to `spawn` when no
-/// workflow was started (nothing to close either way). Shared by every
-/// launch shape below that can actually be the LAST one attempted -- the
-/// dashboard pane (pane build included) and the `wrap` fallback -- each
-/// called with the SAME `started_id` from the one [`start_proxy_workflow`]
-/// call at the top of `run_with`. The persistent-runtime spawn is
-/// deliberately NOT wrapped: it always falls through to one of the other two
-/// on failure, so closing the workflow there would leave that live prompt
-/// text naming a workflow this same function had just closed.
+/// Close started workflows only on final launch failure; runtime-attempt failures must leave them live for fallback.
 fn close_proxy_workflow_on_failure<T>(
     started_id: Option<&str>,
     state: &StateDir,
@@ -623,25 +423,8 @@ fn close_proxy_workflow_on_failure<T>(
     result
 }
 
-/// The dashboard launch shape of `run_with` (its `chrome::dash_eligible`
-/// branch): builds the orchestrator pane and runs the dashboard, both
-/// wrapped in the SAME [`close_proxy_workflow_on_failure`] call -- extracted
-/// (review fix, finding 2) so an `Err` from `dash_orchestrator_pane` itself
-/// closes `started_workflow_id` exactly like a failure inside `dash::
-/// run_dashboard` already did; before this fix the pane build sat outside
-/// the wrapper's own `?`, orphaning the started workflow (the engine never
-/// overwrites an active pointer, so it would block every later `zirv chat`
-/// on this repo). This is also the launch shape that actually runs once
-/// `dash_eligible` is true -- nothing after it in `run_with` reuses
-/// `started_workflow_id` -- which is why it, like the `wrap` fallback, is
-/// wrapped at all (contrast the persistent-runtime attempt just above it in
-/// `run_with`, which never is: see [`close_proxy_workflow_on_failure`]'s own
-/// doc comment).
-///
-/// A free function taking every input explicitly, rather than inlined in
-/// `run_with`, so a test can drive this exact composition directly:
-/// `chrome::dash_eligible` requires a real interactive terminal on both
-/// streams, which `cargo test`'s piped stdio never provides.
+/// Wrap pane construction and dashboard startup in one cleanup boundary so either error closes the started workflow.
+/// Explicit inputs make this composition testable without TTY-dependent eligibility.
 #[allow(clippy::too_many_arguments)]
 fn run_dash_branch(
     adapter: &dyn AgentAdapter,
@@ -670,8 +453,7 @@ fn run_dash_branch(
             proxy_layer,
             task,
         )?;
-        // Issue #753: marks the first pane as proxy-decided (see
-        // `adapters::PROXY_DECIDED_ENV`); every other key reads through.
+        // Mark proxy-decided panes so downstream first-prompt handling sees the decision (#753).
         let proxied = |key: &str| {
             if proxy_layer.is_some() && key == super::adapters::PROXY_DECIDED_ENV {
                 Some("1".to_string())
@@ -692,25 +474,8 @@ fn run_dash_branch(
     })
 }
 
-/// Probes stdout for the launch banner: whether it is a terminal at all, its
-/// current size, and whether VT output could be enabled. The returned guard
-/// must outlive the whole session -- it is what keeps VT processing on for
-/// `wrap`'s own raw-mode session that follows -- so callers hold it rather
-/// than letting it drop immediately.
-///
-/// `stdout_is_tty` comes from `IsTerminal` on stdout specifically, not from
-/// whether `window_size` succeeded: on unix that call reads `STDIN_FD`'s own
-/// terminal-ness, so `zirv chat > log` -- stdout redirected, stdin still a
-/// real terminal -- used to still print the banner straight into the log
-/// file. The size itself still has to come from `window_size`: it is the
-/// only source for it either way.
-///
-/// `stdin_is_tty` is a second, independent probe (not derived from
-/// `window_size` succeeding): `ChromeCaps::probe` never needed it -- the
-/// banner and status bar only ever write to stdout -- but `dash_eligible`
-/// does, since the dashboard reads keystrokes from stdin to drive pane
-/// selection and overlays, and a piped stdin can never make a usable session
-/// even when stdout happens to be a terminal.
+/// Keep the VT guard for the entire session; probe stdin and stdout independently.
+/// Unix window-size probes use stdin and cannot prove redirected stdout is a terminal.
 fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -720,57 +485,27 @@ fn probe_terminal() -> (bool, bool, bool, (u16, u16), Option<term::VtGuard>) {
     (stdout_is_tty, stdin_is_tty, vt_ok, size, vt_guard)
 }
 
-/// Issue #540: set by `main.rs`'s `zirv native` alias rewrite
-/// (`rewrite_native_alias_args`) on the process environment, immediately
-/// before it calls `ctx::dispatch` -- never by an operator directly. Read
-/// back here (through the same `EnvLookup` closure every other environment
-/// signal in this function already goes through, e.g. `quiet_env`'s
-/// `ZIRV_CTX_QUIET`) so `run_native_chat` can tell the `zirv native` alias
-/// apart from an explicit `zirv chat --runtime native`, even though both
-/// launch through this exact same function -- there is no second native
-/// launch path anywhere for the alias to have its own copy of. An argv-based
-/// signal (a hidden flag on `ChatArgs`) was the alternative; the environment
-/// was chosen because it needs no new clap surface on a struct an operator's
-/// own `--help` already renders, and it keeps `command_schema.rs`'s
-/// `zirv chat` flag list identical to what an operator can actually pass.
+/// One-shot alias marker shares native dispatch without adding a hidden clap surface (#540).
 pub const NATIVE_ALIAS_ENV: &str = "ZIRV_CTX_NATIVE_ALIAS";
 
-/// The one-time, low-noise notice `run_native_chat` prints on `stderr` when
-/// launched through the `zirv native` alias (see [`NATIVE_ALIAS_ENV`]) --
-/// never for an explicit `zirv chat --runtime native`, and never repeated
-/// per turn or folded into the model's own context.
+/// Alias-only stderr notice, emitted once and never injected into model context.
 pub const NATIVE_ALIAS_BANNER: &str =
     "zirv native is experimental; `zirv chat` remains the stable harness.";
 
-/// Shared verbatim between `run_native_chat`'s own refusal and `zirv native
-/// --help`'s prose (`main.rs`'s `native_help_text`), so the two descriptions
-/// of the same limitation can never drift apart.
+/// Share refusal text with native help so the documented limitation cannot drift.
 pub const NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL: &str = "--runtime native accepts no --agent, --simple, --resume, --pin-harness or trailing \
      arguments -- those are wrapped-harness-only";
 
-/// Same sharing as [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`], for the TTY
-/// requirement.
+/// Share the terminal requirement with native help.
 pub const NATIVE_TTY_REFUSAL: &str =
     "zirv chat --runtime native needs an interactive terminal on both stdin and stdout";
 
-/// `zirv native --help`'s own text (`main.rs` prints this verbatim and exits
-/// 0 for `zirv native --help`/`-h`, before the argv rewrite, so this never
-/// falls through to clap's generated help for the ordinary `chat` verb tree,
-/// which does not mention any of this). Syntax, prerequisites, limitations
-/// and where state/journal live, plus a prominent experimental notice --
-/// the limitations reuse [`NATIVE_WRAPPED_ONLY_FLAGS_REFUSAL`]/
-/// [`NATIVE_TTY_REFUSAL`] verbatim rather than restating them, so this text
-/// and `run_native_chat`'s own refusals can never drift apart.
+/// Native alias help must remain separate from ordinary chat help.
 pub fn native_help_text() -> String {
     format!("{}\n", runtime_kind::NATIVE_COMING_SOON)
 }
 
-/// `zirv chat --runtime native`'s own refusal/dispatch, split out of
-/// `run_with` so the wrapped-harness path above it never has to know this
-/// branch exists. Refuses a runtime value this build does not recognize and
-/// every wrapped-harness-only flag (`--agent`, `--simple`, `--resume`, a
-/// trailing `extra` argv) rather than silently ignoring them -- a flag that
-/// looks accepted but does nothing is worse than a refusal that says why.
+/// Reject unknown runtimes and wrapped-only flags rather than silently accepting ineffective options.
 #[allow(clippy::too_many_arguments)]
 fn run_native_chat<E: Write>(
     runtime: &str,
@@ -784,38 +519,16 @@ fn run_native_chat<E: Write>(
     vt_ok: bool,
 ) -> CtxResult<i32> {
     runtime_kind::require_native_available()?;
-    // Issue #540: printed exactly once -- this function runs once per
-    // process invocation -- and only for the `zirv native` alias spelling,
-    // never for a direct `zirv chat --runtime native` (which never sets
-    // `NATIVE_ALIAS_ENV`). Before the runtime/flag/TTY checks below, so an
-    // operator sees it even when the launch goes on to refuse for some other
-    // reason -- the notice is about which spelling was used, not about
-    // whether the launch succeeds.
+    // Emit the alias notice before launch validation so refusals still identify the experimental spelling (#540).
     if env(NATIVE_ALIAS_ENV).as_deref() == Some("true") {
         writeln!(stderr, "{NATIVE_ALIAS_BANNER}")?;
     }
-    // Review finding (issue #540): the read above is the ONE consumer of
-    // this signal -- clear it from the real process environment immediately
-    // afterward, whether or not it was set, so it never outlives that one
-    // read. Left set, every child this session spawns onward (`wrap.rs`'s
-    // harness PTY, `dash/pane.rs`'s worker panes) would inherit it too,
-    // since neither clears the environment before spawning; harmless today
-    // (nothing else reads this key), but a latent trap for a future reader
-    // who adds one.
-    //
-    // SAFETY: this still runs before `dash::run_dashboard`/`wrap::run_with`
-    // below have spawned anything or handed control to another thread --
-    // `main.rs`'s own `set_var` call (this key's only writer) already
-    // documents why the environment is not read or written concurrently
-    // this early in the process, and nothing between that call and this one
-    // has changed that.
+    // Clear the one-shot alias marker after reading so children cannot inherit it (#540).
+    // SAFETY: no threads have started here, so process-environment access is not concurrent.
     unsafe {
         std::env::remove_var(NATIVE_ALIAS_ENV);
     }
-    // Issue #531 review: this used to reimplement the harness/native decision
-    // inline. Routing through `runtime::selected()` makes it the one place a
-    // `--runtime` flag is turned into a decision, and reusing its own error
-    // text for a value it has never heard of keeps the two from drifting.
+    // Use the shared runtime selector and error text so launch paths cannot drift (#531).
     match runtime_kind::selected(runtime) {
         Ok(RuntimeKind::Native) => {}
         Ok(_) => {
@@ -843,41 +556,19 @@ fn run_native_chat<E: Write>(
         writeln!(stderr, "{NATIVE_TTY_REFUSAL}")?;
         return Ok(1);
     }
-    // `run_with`'s own nesting refusal (F2) already ran, before `cfg` was
-    // even loaded, and covers this branch too -- not repeated here.
+    // Nesting was refused before config loading; that guard also covers native dispatch.
     let state = StateDir::resolve(env)?;
-    // Issue #537 (T2/T3, native seam): the harness proxy's own intake used
-    // to be reachable ONLY from the wrapped path below (`run_with`'s own
-    // call, after `resolve_adapter`'s ChromeCaps/adapter setup) -- a native
-    // launch never ran it at all, and unconditionally hardcoded the
-    // `Orchestrator` seat below even with the proxy enabled and answering
-    // correctly. Called here instead -- after every earlier refusal above
-    // (bogus `--runtime`, a wrapped-only flag, no TTY), exactly where the
-    // wrapped path calls it relative to ITS OWN earlier refusals -- so a
-    // native launch honors the same decision through the same guards; see
-    // `proxy_intake`'s own doc comment for the full skip/refuse/decide
-    // sequence.
+    // Run native intake after runtime/flag/TTY refusals and before pane creation, sharing the wrapped path's guards (#537).
     let intake = proxy_intake(cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
         return Ok(1);
     }
-    // Issue #537 (T3): the seat this launch actually runs as -- `Single` for
-    // the proxy's own direct/bounded decision, `Orchestrator` for every
-    // other outcome -- the SAME mapping `run_with` applies for the wrapped
-    // path, reused rather than re-derived. See `native_pane_spec` for where
-    // it lands.
+    // Share role mapping with wrapped launches so direct decisions stay Single (#537).
     let seat_role = proxy_prompt_role(&intake);
-    // Issue #490 (roadmap N21 item A): the native conversation is the FIRST
-    // PANE of the ordinary dashboard now, not a loop of its own. Everything
-    // the dashboard already provides -- the sidebar roster, the mail sweep,
-    // attention, the spawn-request channel, the restore roster, the footer
-    // spend -- therefore applies to it unchanged, and a wrapped harness pane
-    // can be spawned beside it in the same process.
+    // Use the ordinary dashboard so native conversations share roster, mail, attention and worker panes (#490).
     let session = uuid::Uuid::new_v4().to_string();
-    // Issue #703: the proxy's decided model, threaded alongside the seat role
-    // it was decided together with -- see `proxy_decided_model`'s own doc
-    // comment for why this is a route CANDIDATE rather than a guaranteed one.
+    // Carry the decided model as a route candidate alongside its role; spawn must still validate it (#703).
     let model = proxy_decided_model(&intake);
     let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role, model);
     dash::run_dashboard(
@@ -888,27 +579,13 @@ fn run_native_chat<E: Write>(
         pane_spec,
         Some(native_spec),
         args.force_pace,
-        // The native runtime launch never runs the harness proxy intake, so
-        // it never has a `started_workflow_id` to bind.
+        // This branch starts no workflow to bind.
         None,
     )
 }
 
-/// Issue #537 (T3, native seam): the native pane's own seat spec -- both
-/// `PaneSpec.role` and `NativeDashboardSpec.role` (its string form, via
-/// `PromptRole::label`, the same inverse `dash::mod.rs`'s worker spawn path
-/// already uses for a `requested_role`) come from the ONE `seat_role`
-/// `run_native_chat` already resolved through `proxy_prompt_role` -- never a
-/// hardcoded `Orchestrator` literal. Split out of `run_native_chat` so the
-/// mapping is testable without a real TTY or an actual native session:
-/// `dash::run_dashboard` below it is an interactive loop that would
-/// otherwise need one.
-///
-/// Issue #703: `model` (from `proxy_decided_model`) lands on
-/// `NativeDashboardSpec::route` -- the SAME field `dash::mod.rs`'s worker
-/// spawn path already feeds a delegation's own model alias into. `None`
-/// (every outcome but a decided proxy launch) reproduces today's behaviour
-/// exactly: the role's own configured default route, untouched.
+/// Derive both native pane role fields from one resolved seat; never hardcode Orchestrator (#537).
+/// The optional decided model is a route candidate; absent keeps the role's default (#703).
 fn native_pane_spec(
     repo: &Path,
     session: String,
@@ -936,11 +613,7 @@ fn native_pane_spec(
     )
 }
 
-/// `stderr` is a second, explicit writer -- not `std::io::stderr()` reached
-/// for directly -- so the one diagnostic this function ever prints on its
-/// own (the no-adapter/config error below) stays testable the same way
-/// every message on `w` already is, without resorting to capturing the real
-/// process stream.
+/// Inject stderr separately so refusal diagnostics can be tested without capturing process streams.
 pub fn run_with<W: Write, E: Write>(
     args: &ChatArgs,
     w: &mut W,
@@ -955,65 +628,25 @@ pub fn run_with<W: Write, E: Write>(
     {
         runtime_kind::require_native_available()?;
     }
-    // F2, first of all: before any config load, adapter resolution, terminal
-    // probe or VT mode change. A `chat` started inside an existing agent
-    // session can take that outer session down (see
-    // `sessions::nested_session_evidence`), so it must refuse without having
-    // touched the shared console at all.
-    //
-    // Printed on `stderr` and reported as exit code 1 rather than returned
-    // as an `Err`, matching every other refusal in this function: a returned
-    // `Err` would be printed a second time, unstyled, by `ctx`'s own
-    // dispatch. `wrap::run_with` re-checks this independently (it has no
-    // writer of its own, so it returns the `Err` there), which is what keeps
-    // the guard holding even if this path were bypassed -- and why
-    // `allow_nested` has to be threaded into `WrapArgs` below.
+    // Refuse nesting before config, terminal probes or VT changes because shared-console changes can kill the outer session.
+    // Print once and return exit 1; wrap independently rechecks and must receive the same override.
     if let Some(refusal) = super::sessions::nesting_refusal("chat", env, args.allow_nested) {
         writeln!(stderr, "{refusal}")?;
         return Ok(1);
     }
 
     let mut cfg = CtxConfig::load_for_launch(repo, env)?;
-    // Issue #537 (T2): `--proxy`/`--no-proxy` override `[proxy] enabled` for
-    // this one launch only -- the rest of the activation predicate (the
-    // configured decider, its own credential/model checks) is untouched, so
-    // an operator cannot use the flag to bypass those.
+    // Proxy flags override activation only; they never bypass configured decider readiness checks (#537).
     if args.proxy {
         cfg.proxy.enabled = true;
     } else if args.no_proxy {
         cfg.proxy.enabled = false;
     }
-    // Held for the rest of this function: dropping it early would restore
-    // the console's original VT mode before `wrap`'s own raw-mode session
-    // (which relies on VT already being on) even opens.
+    // Retain the VT guard until the session ends; early Drop would disable VT before raw mode uses it.
     let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
 
-    // Issue #480 (roadmap N11): `--runtime native` branches out to the
-    // structured native pane before any of the wrapped-harness-ONLY setup
-    // below (adapter resolution, `ChromeCaps`, `dash_eligible`) -- none of
-    // it applies to a session with no coding harness and no PTY. `_vt_guard`
-    // stays in scope across this call (it is a `let`-bound local of this
-    // same function, not dropped until `run_with` itself returns), so the
-    // native pane's own `ratatui`/`crossterm` setup sees the same VT mode
-    // `wrap`'s raw-mode session would have.
-    //
-    // Issue #537 (T2/T3, native seam): the harness proxy's own intake used
-    // to be reachable ONLY below, once this function had already committed
-    // to the wrapped path -- a native launch never ran it at all, and
-    // `run_native_chat` always started as a hardcoded `Orchestrator` seat
-    // even with the proxy enabled and answering correctly. `run_native_chat`
-    // now calls `proxy_intake` itself, after its own earlier refusals
-    // (bogus `--runtime`, a wrapped-only flag, no TTY) and before building
-    // its pane spec -- see that function's own doc comment and
-    // `native_pane_spec`. Nothing here has to change to make that happen:
-    // `native` is still decided purely from `args.runtime`/`configured`,
-    // with no state or proxy dependency of its own.
-    //
-    // Issue #491 (roadmap N22): with no `--runtime` at all, the operator's
-    // own `[runtime]` table decides, through the same `runtime::resolve`
-    // ladder `exec`/`agent` use, at the `orchestrator` role this seat runs
-    // as. An unconfigured table resolves to the harness, so the wrapped path
-    // below stays the behaviour of every build before N22.
+    // Resolve runtime before harness-only setup while keeping the VT guard alive across either branch (#480).
+    // Absent runtime uses operator role/default settings and falls back to harness; native intake runs its own guards (#491, #537).
     let configured = runtime_kind::resolve(
         args.runtime.as_deref().unwrap_or(runtime_kind::CONFIGURED),
         &cfg.runtime,
@@ -1027,14 +660,7 @@ pub fn run_with<W: Write, E: Write>(
     {
         writeln!(stderr, "zirv chat: {note}")?;
     }
-    // Issue #593 (roadmap N22): an explicit `--runtime` always wins over the
-    // configured default -- including an explicit `--runtime harness`, which
-    // must launch the ordinary wrapped chat even when `[runtime] default =
-    // "native"`. Only the ABSENCE of the flag falls back to `configured`
-    // (which already folds in `[runtime.roles]`/`[runtime] default`). An
-    // explicit value this build does not recognise (anything but `harness`)
-    // still routes into `run_native_chat`, which re-validates it through
-    // `runtime_kind::selected` and reuses that function's own error text.
+    // Explicit runtime always wins, including harness over a native default; unknown values use shared validation (#593).
     let native = match args.runtime.as_deref() {
         Some(flag) => !flag.eq_ignore_ascii_case(RuntimeKind::Harness.as_str()),
         None => configured.is_ok_and(|choice| choice.kind == RuntimeKind::Native),
@@ -1058,9 +684,7 @@ pub fn run_with<W: Write, E: Write>(
     let chrome = ChromeCaps::probe(stdout_is_tty, vt_ok, size, &cfg.chrome, args.simple, false);
     let state = StateDir::resolve(env)?;
 
-    // Issue #537 (T2): the harness proxy's own intake, before any adapter
-    // resolution or dashboard/wrap launch -- see `proxy_intake`'s own doc
-    // comment for the full skip/refuse/decide sequence.
+    // Resolve intake before adapter selection or dashboard/wrap launch (#537).
     let intake = proxy_intake(&cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
@@ -1070,11 +694,7 @@ pub fn run_with<W: Write, E: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
-    // Issue #537: the decided orchestrator harness overrides `--agent`
-    // outright when the proxy took over this launch (via `apply_proxy_
-    // decision`, which also folds the decided model into `cfg.chat.model`);
-    // every other case keeps today's `--agent`/configured/first-ready
-    // resolution untouched.
+    // An accepted proxy decision overrides the requested harness and model; inactive intake retains normal resolution (#537).
     let mut requested_agent = args.agent.clone();
     match &intake {
         ProxyIntakeOutcome::Inactive {
@@ -1089,12 +709,7 @@ pub fn run_with<W: Write, E: Write>(
             );
         }
         ProxyIntakeOutcome::Decided { decision, .. } => {
-            // PR3 (#799): the old immediate `proxy::announce_line` advisory
-            // (seat tiers, decider name, confidence numbers) is gone -- the
-            // plan card the operator just confirmed already said this in
-            // plain words, and the one line left in scrollback (`intake::
-            // summary_line`, printed below once `started_workflow_id` is
-            // known) is its receipt.
+            // The confirmed plan already discloses the decision; its scrollback summary is the receipt (#799).
             requested_agent = Some(apply_proxy_decision(&mut cfg, decision));
         }
         ProxyIntakeOutcome::Inactive { advisory: None, .. } | ProxyIntakeOutcome::Refuse { .. } => {
@@ -1104,24 +719,8 @@ pub fn run_with<W: Write, E: Write>(
     let (adapter, rule) = match resolve_adapter(&cfg, requested_agent.as_deref()) {
         Ok(found) => found,
         Err(err) => {
-            // Printed once, here, rather than propagated as `Err`: `zirv
-            // ctx`'s own top-level dispatch prints any returned `Err` a
-            // second time, unstyled, through `output::error`. Styling only
-            // when `chrome.colour` (not gating whether this prints at all
-            // on `chrome.banner`, an old bug -- a piped or redirected run
-            // still needs to see why it refused to start) and returning
-            // `Ok(1)` instead is what keeps this to one printed copy;
-            // main.rs's own early-exit branches use the same shape,
-            // printing their own message and choosing the exit code
-            // directly rather than bubbling an error up to be printed
-            // again.
-            //
-            // On `stderr`, not `w`: `w` is stdout, and `zirv chat > log`
-            // must still show the operator *something* on the terminal
-            // when it refuses to start, exactly like `output::error`
-            // elsewhere in this codebase -- an error silently landing only
-            // in a redirected stdout file is indistinguishable from a
-            // session that hung or was killed.
+            // Print refusals once on stderr and return exit 1 to avoid top-level duplicate errors.
+            // Never gate them on the banner: redirected stdout must still leave a visible refusal.
             writeln!(
                 stderr,
                 "{}",
@@ -1130,16 +729,10 @@ pub fn run_with<W: Write, E: Write>(
             return Ok(1);
         }
     };
-    // Issue #537: the decided request stands in for `--resume`'s own
-    // initial-prompt resolution -- both name what the first prompt should
-    // be, and the two never coexist (`proxy_intake` always skips under
-    // `--resume`, so `ProxyIntakeOutcome::Decided` and a real `--resume`
-    // request never race for this slot).
+    // Proxy request and resume handoff cannot compete for the initial prompt because resume always skips intake (#537).
     let initial_prompt = match &intake {
         ProxyIntakeOutcome::Decided { request, .. } => Some(request.clone()),
-        // Esc anywhere in the plan-card flow keeps whatever task text was
-        // already typed rather than discarding it -- see `ProxyIntakeOutcome
-        // ::Inactive`'s own doc comment.
+        // Abandoning the plan preserves typed task text.
         ProxyIntakeOutcome::Inactive {
             request: Some(text),
             ..
@@ -1149,40 +742,12 @@ pub fn run_with<W: Write, E: Write>(
     let resuming = args.resume && initial_prompt.is_some();
     let session = SessionId::new_v4();
 
-    // Bug B (harness parity): an adapter with no verified system-prompt
-    // injection mechanism for this launch shape (codex's own `system_prompt_
-    // supported` narrows to `false` on a Windows shell-shim launch) never
-    // reaches `injection_args_for_session`'s output at all. `dash_
-    // orchestrator_pane` and `wrap::run_with`'s own fallback below both
-    // correctly skip that call for such an adapter, but neither has anywhere
-    // left to deliver the composed context, because the positional
-    // initial-prompt slot `build_launch` bakes into `launch.argv` is already
-    // fixed by the time either of them runs. Every *other* Zirv launch path
-    // (`exec`, `loop`, and the dashboard's own worker panes via `dash::
-    // compose_worker_prompt`) already folds the composed context onto its
-    // task-prompt text as a fallback for exactly this adapter shape; this
-    // Orchestrator launch was the one path that never got the same
-    // treatment, so a codex orchestrator (a standalone `wrap` fallback, or
-    // the dashboard's own orchestrator pane) started with no zirv context at
-    // all -- not even the shipped default layer -- while a claude
-    // orchestrator always gets one. Folded in here, once, before `build_
-    // launch` bakes the positional prompt slot: both branches below reuse
-    // this same `launch`.
-    // Change 2 (wrapper-overhead benchmark): the proxy's chosen workflow is
-    // started ONCE, here, before `proxy_layer_text` (and therefore before
-    // `initial_prompt`/`launch`/`wrap_args` bake it in) -- every one of the
-    // three launch shapes below shares this SAME started id, exactly like
-    // they already share `proxy_layer` itself, so the prompt each of them
-    // eventually carries can name the concrete running instance rather than
-    // only the workflow's kind.
+    // Start the workflow once before prompt/argv construction so all launch shapes name the same live instance.
+    // Compose unsupported-injection fallback before positional argv is fixed; Windows Codex shell shims need this channel.
     let started_workflow_id = start_proxy_workflow(&intake, &state, repo, |text| {
         proxy_announcer.emit_to(stderr, &super::announce::Event::ProxyAdvisory { text });
     });
-    // PR3 (#799): the one line the plan card promised stays in scrollback
-    // once it clears -- printed here, not inside the intake view itself,
-    // because only NOW is the concrete started workflow id (rather than only
-    // its kind) known. Not gated by `--quiet`: it is the receipt of a plan
-    // the operator just confirmed with Enter, not a discretionary advisory.
+    // Print after workflow startup so the receipt names its instance; quiet cannot suppress a confirmed-plan receipt (#799).
     if let ProxyIntakeOutcome::Decided { decision, .. } = &intake {
         writeln!(
             stderr,
@@ -1190,15 +755,9 @@ pub fn run_with<W: Write, E: Write>(
             intake::summary_line(decision, started_workflow_id.as_deref())
         )?;
     }
-    // Issue #537 (T2a): the harness proxy's own bounded layer text, computed
-    // once here and threaded to every place that needs it -- the fallback
-    // just below, `dash_orchestrator_pane` and `wrap_args_for` -- so all
-    // three launch shapes carry exactly the same layer or none at all.
+    // Share one bounded proxy layer across every launch shape (#537).
     let proxy_layer = proxy_layer_text(&intake, started_workflow_id.as_deref());
-    // Issue #537 (T3): the seat this launch actually runs as -- `Single` for
-    // the proxy's own direct/bounded decision, `Orchestrator` for everything
-    // else -- resolved once and threaded to every place a role currently
-    // hardcodes `Orchestrator`, exactly like `proxy_layer` just above.
+    // Resolve the role once so all prompt, env and launch consumers agree (#537).
     let seat_role = proxy_prompt_role(&intake);
     let initial_prompt = orchestrator_initial_prompt(
         adapter.as_ref(),
@@ -1212,17 +771,10 @@ pub fn run_with<W: Write, E: Write>(
         seat_role,
     );
 
-    // Applies to both branches below (the dashboard's orchestrator pane and
-    // the wrap fallback): `chat.model` shapes `zirv chat` generally, not only
-    // the dashboard, so the model flags are folded into the launch's own
-    // extra arguments once, here, before either path reads `launch.argv`.
+    // Resolve model extras before the launch fork so dashboard and wrap use the same argv.
     let extra = extra_with_model(&cfg, adapter.as_ref(), &args.extra);
     let mut launch = build_launch(adapter.as_ref(), initial_prompt.as_deref(), &extra);
-    // Issue #537 (T3): overrides `build_launch`'s own hardcoded `Orchestrator`
-    // default when the proxy decided a Single seat -- every downstream
-    // consumer of `launch.role` (the banner, `dash_orchestrator_pane`,
-    // `wrap::run_with`, `chat_via_runtime`) already threads it through
-    // generically, so this is the one place that has to change.
+    // Override the default role once so every downstream consumer honors Single decisions (#537).
     launch.role = seat_role;
 
     if chrome.banner {
@@ -1234,10 +786,7 @@ pub fn run_with<W: Write, E: Write>(
             resuming: resuming.then(|| "the last stored handoff for this repo".to_string()),
             model: cfg.chat.model.clone(),
         };
-        // `size.0 == 0` only ever means the terminal-size probe itself
-        // failed (`probe_terminal`'s own `unwrap_or((0, 0))`), not a real
-        // zero-width terminal -- treated as "unknown" so the banner falls
-        // back to its compact tier instead of rendering a zero-width box.
+        // Zero width means a failed probe; use the compact banner instead of a zero-width box.
         let banner_cols = (size.0 > 0).then_some(size.0);
         writeln!(
             w,
@@ -1249,21 +798,11 @@ pub fn run_with<W: Write, E: Write>(
     let env = quiet_env(env, args.quiet);
     let env = pin_env(&env, args.pin_harness);
 
-    // Emitted here -- after `quiet_env`, before either launch path -- so the
-    // dashboard branch and the `wrap` fallback disclose identically, and
-    // independently of whether a banner was printed at all.
+    // Disclose after quiet resolution and before dispatch, independently of the banner.
     announce_model_choice(stderr, &cfg, args.quiet);
     announce_harness_choice(stderr, &cfg, args.quiet, adapter.name(), rule);
 
-    // Issue #352: the persistent runtime, when the operator has turned it on
-    // and there is a terminal to attach. Checked before the dashboard branch
-    // because it replaces BOTH launch paths below -- the session is opened on
-    // the runtime and this process becomes a client of it.
-    //
-    // A failure here falls back to the ordinary in-process launch with one
-    // line on stderr rather than failing the invocation: the runtime is
-    // experimental, and an experiment must not be able to stop an operator
-    // from getting a session.
+    // Try persistence before both local paths; experimental-runtime failures must fall back to a usable session (#352).
     if super::session::chat_route(
         cfg.session.persistent,
         args.no_session,
@@ -1271,17 +810,7 @@ pub fn run_with<W: Write, E: Write>(
         stdout_is_tty,
     ) == super::session::ChatRoute::Runtime
     {
-        // Issue #537 (T2a), change 2, review fix: this attempt is NEVER the
-        // last one -- an `Err` here always falls through to either the
-        // dashboard pane or the `wrap` fallback below, both of which still
-        // need `started_workflow_id` to name a LIVE workflow (it is already
-        // baked into `proxy_layer`/`initial_prompt`, which neither of those
-        // branches recomputes). Closing it here on failure, as an earlier
-        // version of this fix did, would launch that live prompt text
-        // against a workflow this same function had just closed. Only the
-        // launch shape that actually runs -- the dashboard pane below, or
-        // the `wrap` fallback at the very end -- is wrapped in `close_proxy_
-        // workflow_on_failure`.
+        // Runtime failure is not final: fallback prompts already name this workflow, so leave it live until final launch failure (#537).
         match super::session::chat_via_runtime(
             &state,
             adapter.name(),
@@ -1327,15 +856,7 @@ pub fn run_with<W: Write, E: Write>(
         );
     }
 
-    // Ineligible because the dashboard is on but the terminal is too small
-    // (every other axis -- both streams a terminal, VT available, not
-    // `--simple` -- already passed): the operator gets one line naming the
-    // floor and how to silence the notice, then the same wrap passthrough
-    // every other ineligible terminal already reaches. `--simple` itself
-    // never reaches here (it is excluded from `dash_eligible`'s failure by
-    // construction: it is checked first there, and it is checked here too so
-    // an explicit `--simple` never prints a notice about a size it was never
-    // going to use anyway).
+    // Announce only size-based dashboard ineligibility; simple mode never intended to use that layout.
     if cfg.dash.enabled
         && !args.simple
         && stdout_is_tty
@@ -1374,26 +895,8 @@ pub fn run_with<W: Write, E: Write>(
     )
 }
 
-/// Discloses a configured model on the `zirv \u{25b8}` announcement channel, once,
-/// before the launch path is chosen. A no-op when no model is configured.
-///
-/// `chat.model` is one of the few keys a **repo** `ctx.toml` may set, and that
-/// exemption was granted on the strength of the choice being visible on
-/// screen. It was not: the only disclosure was `chrome::banner`, and
-/// `chrome.banner` is **not** `REPO_FORBIDDEN` -- so a checked-out repo could
-/// pair `[chrome] banner = false` with `[chat] model = "..."` and select the
-/// model for every session with nothing shown anywhere at all (the `wrap`
-/// fallback carries no other model surface; the dashboard header carries one,
-/// but only the dashboard has one).
-///
-/// `chrome.events` **is** `REPO_FORBIDDEN`, so this line survives any repo
-/// configuration. The operator's own `--quiet`/`ZIRV_CTX_QUIET` still silences
-/// it -- operator over repo, the same asymmetry every other trust decision in
-/// this codebase makes.
-///
-/// `quiet` is passed separately because `cfg` was loaded before `--quiet` was
-/// folded into the environment (`quiet_env`), so `cfg.chrome.events` alone
-/// knows about `ZIRV_CTX_QUIET` and `[chrome] events` but not about the flag.
+/// Repo-settable models require disclosure through repo-unsilenceable events; a hideable banner is insufficient.
+/// Honor operator quiet separately because config was loaded before the flag's env fold.
 fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool) {
     let Some(model) = &cfg.chat.model else {
         return;
@@ -1410,19 +913,7 @@ fn announce_model_choice<E: Write>(stderr: &mut E, cfg: &CtxConfig, quiet: bool)
     );
 }
 
-/// Issue #690: discloses that the harness was chosen because the one ahead
-/// of it in registry order is not installed -- which one was picked, which
-/// one was missing, and how to pin the choice instead of leaving it to this
-/// rule. A no-op for every other `HarnessRule`, so the common case gains no
-/// line at all.
-///
-/// On the same channel, and for the same reason, as `announce_model_choice`
-/// above: `chrome.banner` is not `REPO_FORBIDDEN` and the banner's compact
-/// tiers have no room for this anyway, while `chrome.events` **is**, so this
-/// is a disclosure a repo checkout cannot silence and the operator still
-/// can (`--quiet`/`ZIRV_CTX_QUIET`). Presence is an operator-owned fact and
-/// acting on it is right; acting on it without saying so is what would make
-/// it a silent provider switch.
+/// Disclose installation-based provider fallback through repo-unsilenceable events, with operator quiet still honored (#690).
 fn announce_harness_choice<E: Write>(
     stderr: &mut E,
     cfg: &CtxConfig,
@@ -1446,31 +937,8 @@ fn announce_harness_choice<E: Write>(
     );
 }
 
-/// The dashboard's orchestrator pane, composed prompt and all.
-///
-/// F3: the dashboard branch used to hand `dash::run_dashboard` the bare
-/// `build_launch` argv, so the one session a human actually talks to was the
-/// only session in the whole codebase that got **no** zirv prompt at all --
-/// no shipped default layer, no harness meta-teaching, no user/repo/memory
-/// layers, and no injection log line -- while the `wrap` fallback below and
-/// every worker pane the dashboard spawns all get the full recipe. An
-/// operator could not tell the two launch paths apart from the outside, and
-/// the orchestrator is precisely the session that is supposed to know how to
-/// delegate.
-///
-/// This is `wrap::run_with`'s own recipe, in its order and with its
-/// arguments: `compile::compile` (memory, the derived harness roster --
-/// `adapters::harness_prompt_lines`, only for an `Orchestrator` launch --
-/// `prompt::compose` as an `Orchestrator`, and the canonical `.zirv/context/`
-/// layer on top, issue #44), `merge_command_line_prompt` so an operator's own
-/// `--append-system-prompt` in `--` extras is folded in rather than silently
-/// duplicated, `injection_args_for_session`, then `log_injection`.
-///
-/// Deliberately **no** `prompt::with_mail_layer`, exactly like the `wrap`
-/// path it mirrors: an interactive Orchestrator session is never given mail
-/// bodies, only the one-line unread-count advisory the dashboard header
-/// already carries. Only a headless Worker session (`exec`/`loop`, and the
-/// worker panes `dash::fulfill_spawn_request` builds) is body-delivered.
+/// Match wrap's order: compile, merge explicit prompt, inject, then log (#44).
+/// Interactive orchestrators must never receive mail bodies, only unread counts; workers receive bodies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dash_orchestrator_pane(
     adapter: &dyn AgentAdapter,
@@ -1507,9 +975,7 @@ fn dash_orchestrator_pane_with_task(
     proxy_layer: Option<&str>,
     task: Option<&str>,
 ) -> CtxResult<PaneSpec> {
-    // Issue #44: gathers memory, the derived harness roster and the
-    // canonical `.zirv/context/` layer, and attaches the policy report --
-    // see `compile::compile`'s own doc comment.
+    // Compile context and its policy report together (#44).
     let home = crate::utils::home_dir().ok();
     let mut compiled = super::compile::compile(
         home.as_deref(),
@@ -1533,8 +999,7 @@ fn dash_orchestrator_pane_with_task(
             task,
         );
     }
-    // Issue #537 (T2a): the harness proxy's own bounded layer, when an
-    // active decision took over this launch -- a no-op otherwise.
+    // Apply the bounded proxy layer consistently with other launch paths (#537).
     let compiled = super::compile::with_proxy_layer(compiled, proxy_layer);
     let (mut argv, mut composed) = super::prompt::merge_command_line_prompt(
         adapter,
@@ -1565,22 +1030,8 @@ fn dash_orchestrator_pane_with_task(
         composed.as_ref(),
         adapter.system_prompt_supported(&argv),
     );
-    // Bug B (harness/model parity, 2026-08-22): the same seam every real
-    // launch now calls (`adapters::policy_launch_args`) -- the shipped-
-    // default "sandboxed, no prompts" posture plus any explicit `[policy]`
-    // restriction. This is the dashboard's own orchestrator pane, the
-    // interactive session a human is actually watching, so an approval
-    // prompt here is at least answerable -- but the posture still applies:
-    // "sandboxed, no prompts" is the shipped default for every launch, not
-    // only the unattended ones. `flags_pin_policy` (inside `policy_launch_
-    // args`) scans the argv built so far, so an operator's own explicit
-    // `--sandbox`/`--ask-for-approval`/`--permission-mode`/
-    // `--disallowedTools` (passed after `--` on `zirv chat`) still wins.
-    // Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
-    // `launch.role` (not a hardcoded `Orchestrator`) -- this shared pane
-    // builder also launches `PromptRole::Single` sessions (the proxy's own
-    // direct/bounded decision), which must skip the native skill plugin the
-    // same as a headless Worker does.
+    // Apply the shared sandbox/policy posture while honoring explicit operator flags.
+    // Use the resolved role so Single seats skip the orchestrator-only skill plugin.
     let sandbox_extra = adapters::policy_launch_args(
         cfg,
         adapter,
@@ -1588,12 +1039,7 @@ fn dash_orchestrator_pane_with_task(
         adapters::LaunchMode::Interactive,
         launch.role,
     );
-    // Visible, not silent: the one interactive pane a human is actually
-    // watching gets the same announcement every headless seam does. `Chrome
-    // events`/`--quiet` govern it identically (`cfg.chrome.events`); no
-    // `quiet` parameter reaches this function, so a caller that silenced the
-    // banner (`--quiet` folded into the environment before `CtxConfig::load`
-    // ran) already has `cfg.chrome.events == false` here too.
+    // Announce policy degradation on the same operator-controlled channel as other launches.
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     announcer.emit(&super::announce::Event::SandboxPosture {
@@ -1603,10 +1049,7 @@ fn dash_orchestrator_pane_with_task(
             super::announce::posture_detail(&sandbox_extra)
         },
     });
-    // Issue #420: same seam as every other supervisor-start launch path --
-    // heal any self-healable (`Outdated`) hook entry, then warn at most once
-    // per 24h if something still drifted. Best-effort: no home directory is
-    // not a reason to fail the launch.
+    // Best-effort heal outdated hooks, then warn at most daily; missing home must not prevent launch (#420).
     if let Ok(home) = crate::utils::home_dir() {
         let _ = super::hook_integrity::heal_outdated(state, &home);
         if let Some(summary) = super::hook_integrity::drift_warning_if_due(state, &home) {
@@ -1615,30 +1058,8 @@ fn dash_orchestrator_pane_with_task(
     }
     argv.extend(sandbox_extra);
     argv.extend(prompt_args);
-    // R1: a dashboard pane -- and only a dashboard pane -- pins the harness's
-    // own conversation to zirv's session uuid, so the quit roster's stored id
-    // is the id `AgentAdapter::resume_args` is later asked to resume. The
-    // `wrap` fallback below deliberately does not: its relaunches expect the
-    // harness to mint a fresh conversation each time. Empty for any adapter
-    // with no verified pin flag (codex).
-    //
-    // D3: unless the operator already pinned it themselves. `zirv chat --
-    // --resume <id>` is an explicit instruction about which conversation this
-    // seat is, and appending a fresh `--session-id` on top of it hands the
-    // harness two contradictory ids and gets the launch refused. The
-    // operator's own flag wins.
-    //
-    // F6: the roster then does **not** record the conversation the operator
-    // named. `PaneSpec::session_id` below is zirv's own `session` uuid either
-    // way -- nothing reads the operator's `--resume` value back out of the
-    // argv -- so for a pin-suppressed launch the id in the roster and the
-    // harness's actual conversation id genuinely differ. That is inert only
-    // because this pane is the orchestrator: `dash::on_quit` stamps it
-    // `roster::ROLE_ORCHESTRATOR` and `dash::restorable_candidates` filters
-    // that role out before `roster::restore_argv` is ever called, so no
-    // `--resume <uuid zirv invented>` is ever issued from this entry. A worker
-    // pane has no such escape hatch, which is why `dash::fulfill_spawn_request`
-    // pins unconditionally.
+    // Pin dashboard conversations for roster resume, but preserve explicit operator conversation ids; wrap mints fresh conversations.
+    // Unpinned orchestrator registry ids may differ safely only because restore excludes that role; workers must always pin.
     if !super::exec::pins_an_existing_conversation(&argv, adapter.name()) {
         argv.extend(adapter.session_pin_args(session));
     }
@@ -1653,27 +1074,7 @@ fn dash_orchestrator_pane_with_task(
     })
 }
 
-/// The extra arguments a chat launch is built with: the configured model's
-/// own flags (`AgentAdapter::model_args`) ahead of whatever the operator
-/// passed after `--`. Handing these to `build_launch`/`interactive_cmd` puts
-/// them *after* the positional initial prompt, which is where CLI flags are
-/// still perfectly valid and -- unlike splicing them into an already-built
-/// argv -- is the one placement that cannot land inside a launcher prefix.
-///
-/// R1: this used to splice `model_args` in at `launch_prefix_len()`, which
-/// deliberately counts only the argv the *operator* wrote (program plus
-/// `bin_args`) and explicitly does not count the tokens `ClaudeAdapter::base`
-/// prepends when it has to route an npm-installed `claude.cmd` through
-/// `cmd.exe /c` (see `claude.rs`'s own `launch_prefix_len` doc comment). On
-/// such a launch the real argv prefix is three tokens, not one, so the splice
-/// produced `["cmd.exe", "--model", "fable", "/c", "claude.cmd", ...]` --
-/// `cmd.exe` was handed the model flags and never started the agent at all.
-/// Appending as trailing extras removes the prefix arithmetic entirely, the
-/// same way `wrap::restart_launch_flags`'s output is carried into
-/// `relaunch_command`'s `extra` rather than spliced anywhere.
-///
-/// An adapter with no verified model flag, or no configured model, yields the
-/// operator's own extras unchanged.
+/// Add model flags as trailing extras so they cannot land inside Windows cmd.exe /c launcher prefixes.
 fn extra_with_model(cfg: &CtxConfig, adapter: &dyn AgentAdapter, extra: &[String]) -> Vec<String> {
     let Some(model) = cfg.chat.model.as_deref() else {
         return extra.to_vec();
@@ -1683,13 +1084,7 @@ fn extra_with_model(cfg: &CtxConfig, adapter: &dyn AgentAdapter, extra: &[String
     out
 }
 
-/// The `wrap` invocation a resolved chat launch becomes. Pure, so what does
-/// and does not survive the hand-off is testable without a pty.
-///
-/// `allow_nested` is threaded through rather than re-derived: `wrap::run_with`
-/// runs the same nesting guard again against the same environment, so an
-/// override honored here but dropped here would simply be refused one layer
-/// down.
+/// Pure wrap conversion must preserve allow_nested because wrap independently rechecks the same environment.
 pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch, proxy_layer: Option<String>) -> WrapArgs {
     WrapArgs {
         agent: Some(launch.agent_name),
@@ -1702,14 +1097,7 @@ pub fn wrap_args_for(args: &ChatArgs, launch: ChatLaunch, proxy_layer: Option<St
     }
 }
 
-/// `--quiet` on the `chat` and `agent` verbs is a CLI flag, not an
-/// environment variable, but `CtxConfig::load` (inside `wrap::run_with`)
-/// only ever reads `chrome.events` from config layers and `ZIRV_CTX_QUIET`.
-/// Folding the flag into the same env lookup both already share is simpler
-/// than adding a second, parallel "quiet" parameter to every downstream
-/// signature: it reuses the one config key that already means "silence the
-/// announcement channel", and honors the same operator-overrides-repo
-/// precedence `ZIRV_CTX_QUIET` always has.
+/// Fold quiet into shared env so downstream config loads retain operator-over-repo announcement control.
 pub(crate) fn quiet_env<'a>(
     env: EnvLookup<'a>,
     quiet: bool,
@@ -1723,18 +1111,7 @@ pub(crate) fn quiet_env<'a>(
     }
 }
 
-/// Issue #358 (task 4): the same fold-a-flag-into-the-shared-env-closure
-/// idiom `quiet_env` above already established for `--quiet`, this time for
-/// `--pin-harness` -> `seat::PIN_ENV`. This is deliberately how `--pin-
-/// harness` reaches `seat::pin_from_env` rather than a new field threaded
-/// through `WrapArgs`/`PaneSpec`: the actual `seat::register` call for an
-/// orchestrator session lives inside `wrap.rs`/`dash/pane.rs` (see `seat::
-/// register`'s own doc comment for exactly where), both files this task does
-/// not touch. Once task 5 wires that call in, reading `env(seat::PIN_ENV)`
-/// there already sees this override, because both launch paths this
-/// function's own caller feeds (`wrap::run_with`, `dash::run_dashboard`) are
-/// handed this SAME closure -- no further plumbing needed on the flag's own
-/// path once that call exists.
+/// Fold pin-harness into shared env so both wrap and dashboard seat registration honor the override (#358).
 pub(crate) fn pin_env<'a>(env: EnvLookup<'a>, pin: bool) -> impl Fn(&str) -> Option<String> + 'a {
     move |key: &str| {
         if pin && key == super::seat::PIN_ENV {

@@ -1,29 +1,14 @@
 use super::*;
 
-/// Whether every top-level `|` alternative in `pattern` starts with `^`.
-/// Issue #417: `[[output.filter]]`'s `match_command` is required to be fully
-/// anchored -- `gradle` would also match `my-not-gradle-thing`, which is
-/// almost certainly not what an operator naming a program meant -- and
-/// "starts with `^`" has to be checked per top-level alternative, not on the
-/// pattern as a whole, because `^a|b` is unanchored on its `b` branch even
-/// though the string itself starts with `^`.
-///
-/// Splits on `|` at nesting depth 0 relative to `(...)` groups and outside
-/// any `[...]` character class, honouring `\`-escapes so an escaped `\|` or
-/// `\[` never it self toggles class/group state. A leading `(?flags)` inline
-/// modifier group (e.g. `(?i)^a`) is stripped before the `^` check, since it
-/// is common and does not weaken the anchor. `(^a|b)` -- one top-level
-/// alternative, the whole parenthesized group, which does not itself start
-/// with `^` -- is correctly rejected; `^a|^b`, `(?i)^a` and `^(a|b)` are all
-/// accepted.
+/// Require an anchor on every top-level regex alternative; `^a|b` can match unrelated commands (#417).
+/// Escapes, character classes and nested groups do not split alternatives; harmless leading flags are skipped.
 pub(crate) fn is_fully_anchored(pattern: &str) -> bool {
     split_top_level_alternatives(pattern)
         .into_iter()
         .all(starts_with_anchor)
 }
 
-/// Splits `pattern` on every top-level `|` (see [`is_fully_anchored`]'s own
-/// doc comment for exactly what "top-level" means here).
+/// Split only outside groups and character classes, respecting escapes.
 fn split_top_level_alternatives(pattern: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
@@ -52,12 +37,7 @@ fn split_top_level_alternatives(pattern: &str) -> Vec<&str> {
     parts
 }
 
-/// Whether `alternative` starts with `^` or `\A`, after skipping past zero or
-/// more leading `(?flags)` inline modifier groups (letters/`-` only between
-/// `(?` and `)`, e.g. `(?i)`, `(?is)`, `(?-i)`) -- those do not weaken an
-/// anchor, so `(?i)^a` counts as anchored the same as plain `^a`. `\A` (the
-/// regex crate's "absolute start of haystack" anchor) is accepted alongside
-/// `^` since it anchors even under the `m` flag, where `^` would not.
+/// Accept `^` or `\A` after harmless inline flags; `\A` anchors absolutely even under multiline mode.
 fn starts_with_anchor(alternative: &str) -> bool {
     let mut rest = alternative;
     while let Some(after) = strip_one_inline_flag_group(rest) {
@@ -66,16 +46,7 @@ fn starts_with_anchor(alternative: &str) -> bool {
     rest.starts_with('^') || rest.starts_with("\\A")
 }
 
-/// Review finding: a leading inline flag group is only harmless to strip
-/// past when it does not itself enable the multiline flag `m` -- `(?m)^a` is
-/// NOT fully anchored, because under `m`, `^` matches at the start of every
-/// line, not just the start of the whole haystack (and `hook::run_posttool`
-/// composes a command line that can itself contain embedded newlines, e.g. a
-/// heredoc Bash command). So this only strips a flag group whose `m` is
-/// either absent or explicitly disabled (`(?-m)`); a group that enables `m`
-/// (`(?m)`, `(?im)`, `(?i-m)` does NOT count as enabling it since `-m` wins)
-/// is left in place, which makes `starts_with_anchor` correctly see a `(`,
-/// not a `^`, and reject the pattern as unanchored.
+/// Never strip a flag group enabling `m`: `^` could then match embedded command lines such as heredocs.
 fn strip_one_inline_flag_group(s: &str) -> Option<&str> {
     let body = s.strip_prefix("(?")?;
     let end = body.find(')')?;
@@ -90,11 +61,7 @@ fn strip_one_inline_flag_group(s: &str) -> Option<&str> {
     }
 }
 
-/// Whether an inline flag group's flag list (the text between `(?` and `)`,
-/// e.g. `"im"`, `"i-m"`, `"-m"`) enables the multiline flag `m` -- i.e. `m`
-/// appears before any `-`, or there is no `-` at all and `m` appears. Once a
-/// `-` is seen, every flag after it is being DISABLED, so `(?-m)` and
-/// `(?i-m)` do not enable `m` even though the letter appears in the string.
+/// Flags after `-` are disabled, so merely containing `m` does not enable multiline matching.
 fn flag_group_enables_multiline(flags: &str) -> bool {
     let disable_at = flags.find('-');
     let enabled_part = match disable_at {
@@ -104,26 +71,13 @@ fn flag_group_enables_multiline(flags: &str) -> bool {
     enabled_part.contains('m')
 }
 
-/// Review finding: `is_fully_anchored`'s per-alternative check above is
-/// defeated if ANY inline flag group in the whole pattern enables `m`,
-/// wherever it appears -- not just a leading one `strip_one_inline_flag_
-/// group` walks past. A group later in the pattern (`^a|(?m)^b`) still makes
-/// every subsequent `^` in the SAME regex match at any line start once the
-/// regex crate applies it, so `validate_output_filter_rules` scans the whole
-/// `match_command` string for one, rather than relying solely on the leading-
-/// group walk. Matches `(?flags)` and `(?flags:...)` (a scoped group), since
-/// both syntaxes enable flags for what follows.
+/// Scan every inline and scoped flag group: multiline mode anywhere can bypass command-start anchoring.
 fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
     let mut idx = 0usize;
     while let Some(rel) = pattern[idx..].find("(?") {
         let start = idx + rel + 2;
         let after = &pattern[start..];
-        // The flags body is the run of ASCII letters/`-` right after `(?`;
-        // it is a real inline flag group only when that run is immediately
-        // followed by `)` (`(?flags)`) or `:` (`(?flags:...)`, a scoped
-        // group) -- anything else (`(?:...)`, `(?=...)`, `(?<name>...)`,
-        // ...) is a different construct entirely and must not be misread as
-        // one.
+        // Only `(?flags)` and `(?flags:...)` set flags; do not mistake other group constructs for them.
         let flag_len = after
             .bytes()
             .take_while(|&b| b.is_ascii_alphabetic() || b == b'-')
@@ -136,8 +90,7 @@ fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
         {
             return true;
         }
-        // Advance past this `(?` occurrence (by at least one byte) so a
-        // non-match can't loop forever re-finding the same spot.
+        // Always advance to avoid finding the same non-match forever.
         idx = start + flag_len.max(1);
         if idx > pattern.len() {
             break;
@@ -146,13 +99,7 @@ fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
     false
 }
 
-/// Load-time validation for `[[output.filter]]` (issue #417): every regex
-/// must compile, `match_command` must be fully anchored
-/// ([`is_fully_anchored`]), and no two rules may share a `name` -- every
-/// error names the offending rule so an operator can find it without
-/// guessing which of several is at fault. Called once from `CtxConfig::load`
-/// after the layers are merged; never re-checked at apply time in
-/// `output.rs`, which trusts a config that reached this point.
+/// Validate regexes, command anchors and unique rule names after config merge; apply-time code trusts these bounds (#417).
 pub(crate) fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
     let mut seen_names = std::collections::HashSet::new();
     for rule in rules {
@@ -171,13 +118,8 @@ pub(crate) fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxRes
             )
             .into());
         }
-        // Review finding: checked before the generic anchor check below so
-        // an operator sees the specific, actionable reason -- a leading
-        // `^` under the `m` flag anchors at any LINE start, not the start
-        // of the whole command line, and `hook::run_posttool`'s composed
-        // command line can itself contain embedded newlines (a heredoc Bash
-        // command), so an `m`-enabled match_command can match a line deep
-        // inside an unrelated command.
+        // Reject multiline mode before the generic anchor check to explain the bypass precisely:
+        // `^` could match a heredoc line inside an unrelated command.
         if contains_multiline_enabling_flag_group(&rule.match_command) {
             return Err(format!(
                 "output.filter \"{}\": match_command must not enable the multiline flag (m): \
@@ -227,27 +169,12 @@ pub(crate) fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxRes
     Ok(())
 }
 
-/// SECURITY (command-injection defense): shared charset/length/leading-dash
-/// guard for every argv-bound model string this config exposes (`chat.model`,
-/// `review.claude`, `review.codex`, `worker.claude`, `worker.codex`) -- see
-/// the call site above `chat.model`'s own doc comment for the full Windows
-/// cmd.exe-reparse threat model this defends against. `key` is the dotted
-/// config path named in the returned error, so a caller can tell which of
-/// several model fields failed.
-///
-/// `pub(crate)`: `dash/mod.rs`'s `pane_model_args` also needs this exact
-/// guard, for the same reason -- a dashboard spawn request's `model` reaches
-/// a launch argv just like `worker.claude`/`worker.codex` do, so it gets the
-/// same charset/length/leading-dash check rather than a second, possibly
-/// drifting copy of it.
+/// Shared argv-bound model guard blocks flag injection and Windows cmd.exe reparsing attacks.
+/// Dashboard model requests must use the same charset, length and leading-dash checks.
 pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
     if model.is_empty()
         || model.len() > 128
-        // A leading `-` would let the value pose as its own flag on the
-        // launch argv (`--model --dangerously-skip-permissions`), so it is
-        // rejected even though `-` is otherwise a legal model-id character.
-        // Anchored here rather than dropped from the charset, since a hyphen
-        // mid-id (`claude-opus-5`) is legitimate.
+        // Reject a leading dash so model values cannot become flags; mid-id hyphens remain valid.
         || model.starts_with('-')
         || !model
             .chars()
@@ -262,14 +189,8 @@ pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
     Ok(())
 }
 
-/// Issue #395: load-time validation for one `[endpoint.claude]`/`[endpoint.
-/// codex]` table. Named errors -- `key` prefixes every message with the
-/// dotted table path (`"endpoint.claude"`), so an operator with both tables
-/// misconfigured sees which one failed. Never reads or prints
-/// `credential_env`'s VALUE -- only its own name is validated, and only as a
-/// shell-identifier shape (`AgentAdapter::ready()` is what checks the named
-/// variable actually resolves to a non-empty secret, at launch time, not
-/// here).
+/// Validate endpoint settings with named errors; never read or print the auth variable's value (#395).
+/// Only its shell-identifier name is checked here; adapter readiness resolves it at launch.
 pub(super) fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()> {
     let vendor = super::super::catalogue::vendor(&target.vendor).ok_or_else(|| {
         let known: Vec<&str> = super::super::catalogue::vendors()
@@ -337,9 +258,7 @@ pub(super) fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> Ct
     Ok(())
 }
 
-/// Shared base-URL validation for harness overrides and native provider
-/// endpoints. The metacharacter rule lives in one place so the two config
-/// surfaces cannot drift.
+/// Share URL metacharacter validation so harness and native endpoint defenses cannot drift.
 pub(crate) fn validate_endpoint_base_url(key: &str, base_url: &str) -> CtxResult<()> {
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
         return Err(format!("{key}: base_url must be an http(s) URL, got \"{base_url}\"").into());

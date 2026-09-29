@@ -291,20 +291,13 @@ pub fn run_with<W: Write>(
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    // Issue #725: resolved before anything else below reads a field
-    // `--manifest` can touch -- see `agent_manifest`'s own doc comment for
-    // the trust-boundary rules this merge follows. A no-op when
-    // `args.manifest` is `None`, exactly today's behavior.
+    // Resolve untrusted manifest fields before any consumer reads them (#725).
     let mut owned_args = args.clone();
     super::super::agent_manifest::apply(&mut owned_args)?;
     let args = &mut owned_args;
     validate_flags(&args.flags)?;
     validate_role(&args.role)?;
-    // Issue #479 (roadmap N10): resolved first, and an unknown value is a
-    // hard error here rather than a silent fall back to the harness. Every
-    // check below that reads `args.name` as an ADAPTER name -- the
-    // same-harness refusal, `adapters::select`, cross-harness rerouting --
-    // is meaningless for a native worker, whose `<name>` is a provider route.
+    // Resolve runtime first and reject unknown values; native names are provider routes, not adapters (#479).
     let native = resolve_runtime(args)? == super::super::runtime::RuntimeKind::Native;
     if native && args.goal.is_some() {
         return Err("--goal is available only for the harness runtime".into());
@@ -315,33 +308,17 @@ pub fn run_with<W: Write>(
     if !native && let Some(message) = same_harness_refusal(args, env) {
         return Err(message.into());
     }
-    // Issue #318: resolved up front, before anything else in this
-    // delegation runs -- a bad `--result-schema`/`--result-kind` must fail
-    // loudly here, not surface only once a worker has already burned a run
-    // reporting back into a contract that was never actually well-formed.
+    // Validate the result contract before spending any worker run (#318).
     let result_schema = resolve_result_schema(args)?;
-    // Issue #267: allocating a fresh tree and being told to use a specific
-    // existing one are two different requests -- honouring one over the
-    // other silently would surprise whichever the operator actually meant.
+    // Refuse ambiguous existing-versus-new workdir requests rather than silently choosing one (#267).
     if args.worktree && args.workdir.is_some() {
         return Err("--worktree and --workdir are mutually exclusive".into());
     }
-    // Issue #186: resolve the requested worker model before the spawn gate so
-    // an exhausted/low-headroom seat can be translated to an equivalent tier
-    // on another enabled harness. Issue #319: also moved ahead of `--worktree`
-    // allocation below, which needs it to record ownership and to run
-    // startup GC first.
+    // Resolve state before routing, startup GC and ownership recording (#186, #319).
     let state = super::super::state::StateDir::resolve(env)?;
-    // Issue #358 (task 4): refuses to let a session an automatic orchestrator
-    // rollover already superseded keep coordinating delegation -- see
-    // `seat::fence`'s own doc comment. A no-op for any session with no seat
-    // (every headless delegation itself, and any interactive session not yet
-    // wired to a seat by task 5).
+    // Fence superseded seats before they can coordinate another delegation (#358).
     super::super::seat::fence(&state)?;
-    // Workspace selection must be resolved and its skill references checked
-    // before worktree allocation. A bad name or stale skill therefore cannot
-    // leave even a clean temporary tree behind. The same loaded config is
-    // reused by all later routing and spawn gates.
+    // Resolve workspace names and skills before allocation so invalid references cannot leave temporary trees.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     let manifest_skills = if let Some(id) = args.manifest_agent.as_deref() {
         let home = env("HOME")
@@ -387,10 +364,7 @@ pub fn run_with<W: Write>(
     if let Some(workspace) = selected_workspace {
         super::super::workspace::validate_skills(workspace, repo, env)?;
     }
-    // A workspace clone or setup step is executed by zirv itself, before the
-    // harness child exists to enforce its envelope. Resolve the caller's
-    // envelope before allocating a worktree or taking a writer permit, and
-    // refuse executable workspaces unless their effects fit that grant.
+    // Workspace setup runs before the harness sandbox; check parent authority before allocation or writer admission.
     let parent_envelope = match resolve_parent_envelope(&cfg, env) {
         Ok(envelope) => envelope,
         Err(reason) => {
@@ -424,30 +398,8 @@ pub fn run_with<W: Write>(
             super::super::state::now_secs(),
         )?;
     }
-    // Issue #228: validated and canonicalised before anything else in this
-    // delegation runs -- a bad `--workdir` must fail loudly, up front, not
-    // surface as a confusing sandbox error deep inside a harness's own
-    // child process. The canonical form (not the operator's raw spelling)
-    // is what every downstream use of `args.workdir` below actually reads,
-    // via `routed_args`/`args`'s own overwrite a few lines down.
-    //
-    // Issue #267: `--worktree` resolves to the SAME `canonical_workdir`
-    // binding an explicit `--workdir` would -- allocated once, here, before
-    // either fork of this delegation (a live dashboard pane, or the
-    // headless fallback) reads it, so both see the identical tree.
-    //
-    // Issue #319, design item 4: a conservative startup GC runs immediately
-    // before allocating a new tree -- best-effort, never fatal to this
-    // delegation, so a GC failure never blocks a worker from starting.
-    //
-    // Issue #718: `[worktree]`'s pool cap/TTL are resolved once here, ahead
-    // of `cfg`'s own later load below (timed instead against the
-    // dashboard-join fork) -- the same "extra read of the same layered
-    // config" `exec::run_with`'s own inline-path reload already normalizes
-    // in this module (see the comment on `cfg`'s load a few lines down). A
-    // load failure falls back to the built-in default rather than newly
-    // blocking the GC pass that already ran unconditionally before this
-    // issue existed.
+    // Canonicalize once before dispatch so both paths share the validated workdir (#228, #267).
+    // Startup GC remains best-effort; pool-config reread failure uses defaults instead of blocking allocation (#319, #718).
     let worktree_pool = if args.worktree {
         CtxConfig::load(repo, env)
             .map(|c| c.worktree)
@@ -474,12 +426,7 @@ pub fn run_with<W: Write>(
     } else {
         args.workdir.as_deref().map(validate_workdir).transpose()?
     };
-    // Review finding (2026-09), finding 2b: armed the moment a `--worktree`
-    // is allocated, so every `?`/early return between here and the headless
-    // path's own explicit reclaim (further down) reclaims it too -- see
-    // `WorktreeReclaimGuard`'s own doc comment. `None` for a plain
-    // `--workdir` (or neither): this delegation never allocated that
-    // directory, so it is never this guard's to reclaim.
+    // Arm immediately after allocation to cover every early return; explicit workdirs are never ours to reclaim.
     let mut worktree_guard = WorktreeReclaimGuard::new(
         &state,
         repo,
@@ -502,65 +449,35 @@ pub fn run_with<W: Write>(
         )?,
     };
 
-    // Issue #250: no `--workdir` means the worker stays confined to `repo`
-    // (see `effective_launch_repo`) -- a non-fatal nudge toward `--workdir`
-    // when the brief itself names a path outside it, so the operator finds
-    // out before the worker burns a full run just to report BLOCKED. Never
-    // consulted by the dispatch decision below; only ever prints to stderr.
+    // Warn about external paths before wasting a sandboxed run; this diagnostic never affects dispatch (#250).
     if canonical_workdir.is_none() {
         let home = env("HOME")
             .or_else(|| env("USERPROFILE"))
             .map(PathBuf::from);
         warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
     }
-    // Issue #328: printed on stdout ahead of either fork (pane ack or
-    // inline supervised result) so the delegating session reads it whichever
-    // path runs the task. Issue #452: suppressed under `--json`, which
-    // prints exactly one JSON object and nothing else to stdout.
+    // Expose the hint on both dispatch paths, except JSON stdout must remain a single object (#328, #452).
     if !args.json
         && let Some(hint) = same_harness_hint(args, env)
     {
         writeln!(w, "{hint}")?;
     }
 
-    // `--attach-artifact`: resolved and spliced onto the operator's own
-    // prompt text before anything else below reads `prompt` -- both forks of
-    // this delegation (`try_join_dashboard`'s pane request, and the headless
-    // `ExecArgs::prompt` further down) read the SAME `prompt` binding, so a
-    // worker gets the identical task prompt whichever fork actually runs it.
-    // Fails fast, before any routing/spawn decision, when the operator asked
-    // to attach an artifact that is not there to attach -- see
-    // `resolve_attached_artifact`'s own doc comment for exactly which cases
-    // that covers.
+    // Resolve requested artifacts before routing and share one prompt across both paths; missing context must fail early.
     let prompt = attach_artifact_to_prompt(args, &state, repo, prompt)?;
-    // Issue #318: the OUTPUT CONTRACT block, when a schema was declared --
-    // same seam, same "both forks read this one binding" guarantee as
-    // `--attach-artifact` immediately above.
+    // Both dispatch paths must receive the same output contract (#318).
     let prompt = attach_result_contract_to_prompt(result_schema.as_ref(), prompt);
-    // Issue #317: `--task`'s brief and every parent card's own outcome,
-    // labelled -- same seam, same "both forks read this one binding"
-    // guarantee as `--attach-artifact`/`--result-schema` above. Fails fast
-    // when the named card does not exist in this repository.
+    // Attach shared task context before dispatch and fail early for unknown cards (#317).
     let prompt = attach_task_context_to_prompt(args, &state, repo, prompt, &cfg)?;
 
-    // Issue #223 §E: refuses before any routing/spawn decision below, so an
-    // enforced session never even gets as far as picking a route or joining
-    // a dashboard.
+    // Enforce adoption before any route selection or dashboard join (#223).
     if let Some(message) = adoption_enforcement_refusal(&state, repo, &cfg, env) {
         return Err(message.into());
     }
 
     let now = super::super::state::now_secs();
-    // Issue #317: resolves and claims `--task`'s own card before any
-    // spawn/routing decision below -- refused, with nothing launched, when
-    // the card cannot be claimed (unmet parents, or already running
-    // elsewhere under a live claimant). The claim is recorded under THIS
-    // process's own pid: if everything below this point fails before a
-    // worker ever actually runs, this same `zirv ctx agent` process exits
-    // shortly after returning, so the claim's pid goes dead and a later
-    // `reap`/`claim` attempt (`task::claim_locked`) returns the card to
-    // `Ready` on its own -- never left falsely `Running` forever, and never
-    // silently marked `Done`.
+    // Claim before routing/spawn; unmet dependencies or live claimants refuse (#317).
+    // Use this process PID so a failed launch is reapable, never falsely Running forever or silently Done.
     if let Some(task_id) = &args.task
         && let Err(refusal) = claim_task_for_delegation(&state, repo, &cfg, task_id, env, now)
     {
@@ -581,15 +498,7 @@ pub fn run_with<W: Write>(
         return Ok(2);
     }
 
-    // Issue #479 (roadmap N10): the runtime fork. Everything above this line
-    // -- `--workdir`/`--worktree` allocation, the prompt assembly, the
-    // delegation envelope, the task-card claim -- is shared by both
-    // runtimes and has already happened exactly once. Everything below it is
-    // harness-specific: adapter selection, cross-harness rerouting, the
-    // spawn gate and the dashboard pane fork all assume there is a vendor
-    // CLI to launch, and a native worker has none. `worktree_guard` is
-    // disarmed because the native fork owns the reclaim from here on (it
-    // runs the checkout itself and returns through this same call).
+    // Shared validation/allocation/claim happens once before the native fork; transfer reclaim ownership to it (#479).
     if native {
         worktree_guard.disarm();
         let launch_repo = effective_launch_repo(canonical_workdir.as_deref(), repo);
@@ -621,11 +530,7 @@ pub fn run_with<W: Write>(
         .map(PathBuf::from)
         .and_then(|path| inherited_dashboard_liveness(&path))
         .is_some_and(|liveness| matches!(liveness, super::super::sessions::OwnerLiveness::Live));
-    // 2026-09-06: a delegation is a pane seat whenever ANY live dashboard can
-    // host it, not only when this process was itself spawned inside one --
-    // the same widening `live_join_target` applies below. Reporting only
-    // (`route.detail`/`automatic_route_message`), so the extra directory
-    // read costs nothing a routing decision depends on.
+    // Report pane placement whenever any live dashboard can host it; this extra read does not decide routing.
     let seat = if live_inherited_dashboard
         || super::super::dash::select_live_dash_dir(&super::super::dash::discover_live_dash_dirs(
             &state,
@@ -636,13 +541,7 @@ pub fn run_with<W: Write>(
     } else {
         pace::Seat::Cli
     };
-    // Resolved before `refresh_sources` below (reordered from the original
-    // computation site a few lines down), so the pinned model this
-    // delegation is actually about to request is in hand for
-    // `provider_for_model` rather than falling back to the adapter's static
-    // default -- `headless_worker_flags` is pure over `cfg`/`args`/
-    // `requested_adapter` and does not depend on anything `refresh_sources`
-    // itself touches.
+    // Resolve pure requested-model flags before usage refresh so provider selection uses the actual model pin.
     let requested_command = headless_worker_flags(&cfg, args, requested_adapter.as_ref());
     let requested_model = adapters::last_model_flag(&requested_command);
     let mut refresh_flags = pace::PaceGateFlags::default();
@@ -664,24 +563,13 @@ pub fn run_with<W: Write>(
         tool_calls: args.max_tool_calls,
     };
 
-    // Issue #328 fix: never let cross-harness fallback reroute a low-
-    // headroom dispatch back onto the orchestrator seat's OWN harness --
-    // that is the identical same-harness delegation `same_harness_refusal`
-    // above already refuses through the front door, just reached via the
-    // fallback back door instead (codex sitting at 100% of its 7-day window
-    // used to reroute every `zirv agent codex` straight back onto the
-    // calling claude seat). Not applied under `--force`: the operator
-    // already opted into spending on this exact harness regardless of
-    // headroom, so there is no back door left to close.
+    // Fallback must not bypass the orchestrator's same-harness refusal; authorized force remains exempt (#328).
     let same_harness_exclude = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator")
         && !args.force)
         .then(|| env(adapters::AGENT_ENV))
         .flatten();
 
-    // The delegating session's own registry row is not capacity this
-    // delegation has to compete with -- `pool.rs` and `rollover.rs` already
-    // excluded it, and without it here a `fallback.harness.<name>.max_active
-    // = 1` read as permanently `Draining` for that harness's own dispatches.
+    // Exclude the requester from capacity competition so a max-active of one does not permanently drain its own dispatches.
     let requester = super::super::mail::session_identity(env);
     let base_excludes: Vec<&str> = same_harness_exclude.as_deref().into_iter().collect();
     let route_request = super::super::fallback::RouteRequest {
@@ -696,12 +584,7 @@ pub fn run_with<W: Write>(
     };
     let route =
         super::super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
-    // Issue #455 slice C (finding 1): a half-open route admits exactly ONE
-    // recovery probe, and this is the moment a placement becomes a launch.
-    // Claimed here, BEFORE the route is applied, so a caller that loses the
-    // race re-plans rather than unpicking an applied reroute -- and a
-    // dispatch with nowhere healthy left to go is REFUSED rather than
-    // launched onto the route someone else is already probing.
+    // Claim the half-open route before applying it: only one probe may launch, and losing callers must replan or refuse (#455).
     let claimant = requester
         .clone()
         .unwrap_or_else(|| format!("pid-{}", std::process::id()));
@@ -724,9 +607,7 @@ pub fn run_with<W: Write>(
         }
     };
     let mut routed_args = args.clone();
-    // Issue #228: every downstream read of `routed_args`/`args` (the
-    // dashboard-join request, and `launch_repo` below) must see the
-    // canonical path, never the operator's raw spelling.
+    // Every downstream path must use the canonical workdir, never the raw spelling (#228).
     routed_args.workdir = canonical_workdir.clone();
     let mut route_applied = None;
     if let Some(route) = route
@@ -752,9 +633,7 @@ pub fn run_with<W: Write>(
                 observed_at: route.requested_observed_at,
             },
         );
-        // Issue #358 (task 5): the same reroute, in the capacity-pool
-        // vocabulary, so an operator can read delegation placement and
-        // orchestrator rollover out of one story instead of two.
+        // Use the shared capacity vocabulary for delegation and orchestrator routing records (#358).
         super::super::rollover::record_route(
             &state,
             &parent_session,
@@ -767,12 +646,8 @@ pub fn run_with<W: Write>(
         route_applied = Some(route);
     }
 
-    // The route is final before workspace validation: MCP requirements must
-    // be checked against the adapter that will actually launch, not merely
-    // the originally requested harness. Materialization remains ahead of the
-    // dashboard/headless fork, so neither path can spawn early. A workspace
-    // writing into an existing checkout takes a short-lived writer permit;
-    // a fresh `--worktree` is already unique to this delegation.
+    // Validate MCP requirements against the final routed adapter and materialize before either dispatch path can spawn.
+    // Existing-checkout setup takes a writer permit; newly allocated worktrees are already exclusive.
     let _workspace_ready = if let Some(workspace) = selected_workspace {
         let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
         let root = effective_launch_repo(routed_args.workdir.as_deref(), repo);
@@ -820,23 +695,8 @@ pub fn run_with<W: Write>(
         None
     };
 
-    // Issue #358 (T9): usage headroom is a ranking signal for
-    // `route_new_delegation` above, never a reason to refuse or delay a
-    // spawn -- the pre-launch "harness-reset-wait" deferral that used to sit
-    // here (`earliest_reset_choice`, waiting for an admissible seat's hard
-    // gate to clear before ever reaching a launch) is gone. That same
-    // function still runs the runtime reroute in `exec.rs` (a session that
-    // hits a confirmed limit mid-run) and the seat exhaustion park in
-    // `rollover.rs` -- both genuinely different situations: a session
-    // already spending that the provider itself just refused, not a
-    // delegation that has not started yet.
-    // The pinned model this delegation is actually about to launch with:
-    // `route.model` when `route_new_delegation` rerouted it to a different
-    // harness/model pair above, else the originally requested `--model`
-    // (`requested_model`, resolved before `refresh_sources` above). Both this
-    // reading and the reservation/settlement further down key off the SAME
-    // `provider` local, so a multi-provider adapter's reserve and settle
-    // always land on the same ledger for one delegation.
+    // Headroom ranks new work; it must not refuse or delay an unstarted delegation (#358).
+    // Resolve the effective routed model once so usage, reservation and settlement share the same provider.
     let effective_model = effective_delegation_model(route_applied.as_ref(), requested_model);
     let provider = adapters::provider_for_agent_and_model(Some(&routed_args.name), effective_model);
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
@@ -848,11 +708,7 @@ pub fn run_with<W: Write>(
         eprintln!("zirv ctx agent: {note}");
     }
     if matches!(gate, pace::SpawnGate::Refuse { .. }) {
-        // Issue #349: the REQUESTING session (this process's own caller) is
-        // the one pacing is informing here -- same reasoning as the writer-
-        // permit note below (issue #267). Informational only, kept on the
-        // row because it is a useful signal: the spawn below still happens
-        // regardless of `args.force`, which is now a no-op for this gate.
+        // Quota attention belongs to the requester and is informational; it does not prevent this spawn (#349).
         if let Some(short) = super::super::mail::session_identity(env) {
             let _ = super::super::attention::record(
                 &state,
@@ -869,9 +725,7 @@ pub fn run_with<W: Write>(
                 super::super::state::now_secs(),
             );
         }
-        // `route_new_delegation` (above) already prefers a healthier
-        // harness when one exists; this note only fires when the requested
-        // harness is the one actually about to launch.
+        // Only announce requested-harness pressure when no healthier reroute was applied.
         if route_applied.is_none() {
             eprintln!(
                 "zirv ctx agent: usage at the ceiling on {}; launching anyway -- the provider \
@@ -880,9 +734,7 @@ pub fn run_with<W: Write>(
             );
         }
     } else if let Some(short) = super::super::mail::session_identity(env) {
-        // Issue #349: the gate did not flag this call (`Proceed`/`Warn`) --
-        // clear any `Quota` attention a PRIOR at-the-ceiling call left on
-        // this same requesting session.
+        // Clear stale requester quota attention when this reading no longer reaches the ceiling (#349).
         let _ = super::super::attention::record(
             &state,
             &short,
@@ -897,19 +749,7 @@ pub fn run_with<W: Write>(
         );
     }
 
-    // Issue #170: resolved once, here, before the dashboard-join fork below,
-    // so a pane spawn and the headless fallback both see the identical
-    // answer -- an inherited `WORK_GROUP_ENV` binding, or a freshly minted
-    // scope-bound group. Shadows the caller's own `&AgentArgs` with an owned
-    // copy; every read of `args` below (including inside `try_join_
-    // dashboard`) is unaffected by this rebinding.
-    //
-    // Security review round 2 (Finding 4): deliberately AFTER the spawn gate
-    // above, which refuses without ever reaching a launch -- a `--scope`
-    // group minted ahead of it was left open, unclaimed and childless on disk
-    // for every such refusal. `minted_group` is what this invocation created
-    // itself (never an inherited or explicitly named one), and every path
-    // below that ends without the delegation starting unwinds it.
+    // Resolve one group binding before dispatch; only newly minted groups may be unwound on non-start paths (#170).
     let mut args = routed_args;
     let minted_group = resolve_group_binding(&mut args, &state, env)?;
     let args = &args;
@@ -919,7 +759,7 @@ pub fn run_with<W: Write>(
         }
     };
 
-    // Warn after harness routing and before the pane/headless fork.
+    // Warn after routing but before either launch path so the warning names the actual harness.
     if let Some(warning) = codex_read_only_build_warning(&args.name, args.mode) {
         eprintln!("zirv ctx agent: {warning}");
     } else if cfg!(windows)
@@ -933,19 +773,8 @@ pub fn run_with<W: Write>(
         eprintln!("{warning}");
     }
 
-    // A normal delegation is a visible pane whenever any live dashboard can
-    // host it. Issue #733's hidden synchronous request lets an internal
-    // caller such as workflow review consume the completed result inline;
-    // `--goal` also stays inline so preparation gates the same main process.
-    //
-    // Issue #452: under `--json` the human lines `try_join_dashboard` would
-    // otherwise print (capability warnings, the spawn-ack line, the workdir
-    // hint, a claimed-but-unconfirmed notice, a plain refusal reason) are
-    // captured into `dash_buf` instead of reaching real stdout, and then
-    // discarded -- purely the mechanism that suppresses them, never read
-    // back. The one JSON receipt this delegation prints is built from the
-    // structured `AnswerFacts` alongside `Dispatch::Answered` below
-    // (`dashboard_answer_receipt`), not from this buffer's text.
+    // Synchronous internal callers and goal preparation stay inline to consume completion before proceeding (#733).
+    // JSON suppresses human stdout; receipts use structured AnswerFacts, never captured text (#452).
     let mut dash_buf: Vec<u8> = Vec::new();
     let dispatch = if args.inline || args.goal.is_some() {
         if args.goal.is_some() {
@@ -994,34 +823,10 @@ pub fn run_with<W: Write>(
             }
         }
         Dispatch::Answered(result, facts) => {
-            // Finding 4: the dashboard answered definitively, and only `Ok(0)`
-            // (`answer_for_ack`'s spawned-a-pane arm) means work actually
-            // started. A refusal spawned nothing, so a group minted for it
-            // moments ago holds nothing -- and `discard_if_unused` still
-            // checks that for itself, so the genuinely ambiguous "claimed but
-            // never confirmed" answer cannot delete a group a pane really did
-            // claim.
-            //
-            // Bounded race on `Ok(EXIT_DASH_UNCONFIRMED)`: the dashboard has
-            // already taken the request (so it will not be retried) but a slow
-            // dashboard may not yet have reached `admit_child` on this group
-            // when the discard below runs. If it lands in that window the
-            // still-pristine group is deleted out from under the in-flight
-            // admission, which then finds no group and refuses ("no work
-            // group") instead of spawning. Accepted: a clean refusal here is
-            // preferable to leaving group cleanup dependent on winning a race
-            // with a dashboard that may be arbitrarily slow or may never
-            // answer at all.
+            // Discard only unused minted groups on non-success; a late admission may safely refuse if cleanup wins the race.
             if matches!(result, Ok(0) | Ok(EXIT_DASH_UNCONFIRMED)) {
-                // Review finding (2026-09), finding 2a: a pane was actually
-                // spawned into this worktree -- ownership passes to it, and
-                // `dash::mod::reap_ended_panes` reclaims it once that pane's
-                // child exits. This delegation's own guard must not also try.
-                // Review round 3: the same holds for the unconfirmed answer --
-                // the dashboard has taken the request and may still spawn into
-                // this exact path moments later, so the guard must leave it
-                // alone; a clean directory left behind in that rare race is
-                // preferable to deleting a tree out from under a live spawn.
+                // Disarm on confirmed or unconfirmed admission: the dashboard may still spawn into this tree.
+                // Leaving a clean tree is safer than deleting it under a live spawn; dashboard exit owns reclamation.
                 worktree_guard.disarm();
             }
             if !matches!(result, Ok(0)) {
@@ -1041,16 +846,10 @@ pub fn run_with<W: Write>(
         cfg.chrome.events && !args.quiet,
         console::colors_enabled_stderr(),
     );
-    // Issue #249: resolved from the ORIGINAL, unshadowed `env` parameter --
-    // this delegating session's own identity -- never from anything already
-    // folded below, and never inherited from whatever `PARENT_SESSION_ENV`
-    // this process itself happens to carry (see `parent_session_env`'s own
-    // doc comment for why that would leak a grandparent's id to the worker
-    // about to be launched).
+    // Read parent identity from the original session env, never an inherited grandparent id (#249).
     let worker_parent = super::super::mail::session_identity(env)
         .filter(|id| super::super::prompt::is_addressable_short(id));
-    // Finding 3: the launch below runs under an env lookup that carries this
-    // delegation's own group, so `exec::run_with` can export it to the child.
+    // Export the resolved group into the child launch env so lineage survives inline delegation.
     let quieted = quiet_env(env, args.quiet);
     let grouped = group_env(&quieted, args.group.clone());
     let parented = parent_session_env(&grouped, worker_parent);
@@ -1070,27 +869,15 @@ pub fn run_with<W: Write>(
             parented(key)
         }
     };
-    // Issue #318: same fold, so a headless child sees `RESULT_SCHEMA_ENV`
-    // when this delegation declared a contract (`exec.rs`'s `turn_env_for`
-    // reads it back out of this exact binding).
+    // Export this delegation's result contract to its child (#318).
     let env = result_schema_env(
         &delegated,
         result_schema.as_ref().map(Schema::to_canonical_json),
     );
 
-    // Resolved here, ahead of `exec::run_with`'s own (identical) selection
-    // further down, purely to compute the default worker model this spawn
-    // launches with -- see `worker_launch_flags`. `&[]` for the command: it
-    // only matters to `select` when `name` is `None`, and this call always
-    // passes the delegation target explicitly.
+    // Select the explicit target to compute launch flags; empty command input cannot change a named adapter.
     let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
-    // Issue #228: computed here, ahead of `command`, purely so the extra
-    // writable-root argv appended right below can name the WORKER's own cwd
-    // (an explicit `--workdir`, or `repo` otherwise) rather than this
-    // delegating session's own directory -- see `effective_launch_repo`'s own
-    // doc comment. The later, identically-computed `launch_repo` binding
-    // further down is what `exec::run_with_report` actually launches into;
-    // both reads are the same pure function over the same inputs.
+    // Compute worker cwd before writable-root flags so permissions follow the worker's target, not the delegator (#228).
     let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
     let command = with_headless_extra_writable_roots(
         headless_worker_flags(&cfg, args, adapter.as_ref()),
@@ -1098,24 +885,10 @@ pub fn run_with<W: Write>(
         &launch_repo,
         &state.mail(),
     );
-    // Read back out of the effective argv rather than re-deriving it: this
-    // is whichever of the operator's own `--model`/`-m` passthrough or the
-    // configured/default worker-model prepend actually won.
+    // Read the effective argv so the winning explicit or default model is recorded accurately.
     let model = adapters::last_model_flag(&command).map(str::to_string);
-    // Issue #230 item 3: the same policy evaluation `compile::compile` will
-    // perform again, deep inside `exec::run_with_report` below, for the
-    // headless child's own prompt -- not threaded back out of that call
-    // (`ExecutionReport` carries usage/segments, not a `PolicyReport`), so
-    // this is a second, equally cheap, equally pure `policy::evaluate` call
-    // against the identical `(cfg.policy, adapter, LaunchMode::Headless)`
-    // inputs rather than a plumbing change through `exec.rs`. Computed once
-    // here and reused for both the stdout result line below and the
-    // report-back mail on a failure -- see the `Ok(code)` return at the end
-    // of this function for why it is printed there, not here (F1, review
-    // round): the delegator captures the SYNCHRONOUS RESULT of `zirv agent`
-    // on stdout, not stderr, so an early `eprintln!` here would either be
-    // missed entirely or -- if also kept at the end -- print the same
-    // warning twice.
+    // Evaluate the same pure launch policy once for result and mail warnings (#230).
+    // Print with synchronous stdout results so callers neither miss stderr-only warnings nor receive duplicates.
     let capability_warnings = policy::evaluate(
         &cfg.policy,
         adapter.as_ref(),
@@ -1126,14 +899,7 @@ pub fn run_with<W: Write>(
         .session_id
         .clone()
         .unwrap_or_else(|| SessionId::new_v4().to_string());
-    // Issue #170: this delegation binds `args.group` (if any) to the child
-    // about to run headlessly as its SubOrchestrator -- first-claim-wins, so
-    // a group shared by an operator across several `--group` invocations is
-    // only ever auto-closed by whichever one actually claimed it (below).
-    // Best-effort: a claim failure (a group swept between `resolve_group_
-    // binding` and here) must not fail an otherwise-runnable delegation --
-    // `resolve_worker_budget`, right after this, is what actually enforces
-    // that the named group still exists at all.
+    // First claimant alone may auto-close a group; best-effort ownership never replaces budget admission checks (#170).
     if args.role.as_deref() == Some("sub-orchestrator")
         && let Some(id) = &args.group
     {
@@ -1143,14 +909,11 @@ pub fn run_with<W: Write>(
             &super::super::sessions::short_id(&worker_session),
         );
     }
-    // Issue #155, Phase 5(d): resolved before the launch, not inside
-    // `exec::run_with` -- an unknown or closed `--group` must fail this
-    // delegation outright rather than silently running it unbounded.
+    // Resolve before launch so unknown or closed groups cannot run unbounded (#155).
     let (worker_budget, reserved_ceiling) = match resolve_worker_budget(&env, args) {
         Ok(result) => result,
         Err(e) => {
-            // Finding 4: nothing ran, so a group minted moments ago for this
-            // delegation must not outlive it.
+            // No launch means newly minted groups must be unwound.
             discard_minted_group();
             if super::super::group::is_admission_exhausted(e.as_ref()) {
                 let code = exec::EXIT_BUDGET_EXHAUSTED;
@@ -1185,25 +948,8 @@ pub fn run_with<W: Write>(
             return Err(e);
         }
     };
-    // Issue #358 (task T3): a durable, per-PROVIDER reservation of this
-    // delegation's own token ceiling, independent of `--group`'s own
-    // `reserved_tokens` (which protects one group's budget, not a
-    // provider's machine-wide outstanding total) -- released via
-    // `reservation::release` on every failure path between here and a
-    // genuinely running child, or settled via `reservation::settle` once
-    // the delegation actually completes, mirroring `reserved_ceiling`'s own
-    // reserve/rollback/settle lifecycle exactly. Best-effort like every
-    // other ledger write in this codebase (`group::rollback_admission`'s own
-    // doc comment): a ledger error must never abort a launch this session
-    // already committed to.
-    // Finding #11 (issue #358 review): `reserve_within` checks "is there
-    // room" and reserves atomically, under the SAME ledger lock -- a plain
-    // `reserve` here (placement was computed against a `CapacitySnapshot`
-    // taken well before this point, outside any lock) let two concurrent
-    // admissions both read "room enough" and both reserve, jointly
-    // over-committing the provider. `limit_tokens` is `None` (no check) when
-    // this provider has no configured token budget to convert projected
-    // headroom against.
+    // Atomically check/reserve provider headroom under one lock; stale placement snapshots can overcommit (#358).
+    // Release every failed launch and settle completion; ledger errors remain best-effort rather than aborting committed work.
     let limit_tokens = pace::headroom_limit_tokens(&collector, estimator.as_ref(), now, &cfg.pace);
     let reservation_id = match super::super::reservation::reserve_within(
         &state,
@@ -1215,12 +961,7 @@ pub fn run_with<W: Write>(
     ) {
         Ok(Ok(reservation)) => Some(reservation.id),
         Ok(Err(outstanding)) => {
-            // Never refuses the delegation itself over a ledger accounting
-            // concern -- it simply runs unreserved (like the ledger-error
-            // arm right below), rather than a wrong-provider reservation a
-            // caller-side reroute could not safely commit to from here
-            // without re-deriving the adapter/argv this launch already
-            // settled on above.
+            // Run unreserved on accounting limits: rerouting here would mismatch the adapter and argv already committed to.
             eprintln!(
                 "zirv ctx agent: provider '{provider}' is at its projected headroom limit \
                  ({outstanding} tokens already outstanding); running unreserved rather than \
@@ -1236,16 +977,7 @@ pub fn run_with<W: Write>(
             None
         }
     };
-    // Audit finding G4: the sibling of `discard_minted_group`, for the
-    // invariant stated where the reservation is taken -- released on every
-    // failure path between here and a genuinely running child. The two
-    // pre-launch refusals below (`WorkerEnvelope::narrow`, the writer permit)
-    // unwound the group and returned without it, leaving a refused
-    // delegation's whole ceiling outstanding against the provider until this
-    // process exited; `dash::rollback_admission` already handled the
-    // identical writer refusal correctly. Best-effort like every other ledger
-    // write here, and idempotent, so calling it before a `writeln!` that may
-    // itself fail is safe.
+    // Release on every pre-launch failure; idempotent best-effort cleanup must precede fallible reporting.
     let release_reservation = || {
         if let Some(id) = &reservation_id {
             let _ = super::super::reservation::release(&state, provider, id);
@@ -1265,13 +997,7 @@ pub fn run_with<W: Write>(
         }
     };
 
-    // Issue #262: this worker's own delegation envelope, computed by
-    // narrowing `parent_envelope` against what THIS delegation is asking
-    // for (`--path-scope`/`--no-network`/`--depth`, and `args.mode` for the
-    // read-only/writing split). Refused before any spawn, the same
-    // "nothing ran yet" discipline as the budget/writer-permit refusals
-    // around it: a request that would WIDEN what the parent granted is a
-    // hard error (`envelope::CannotGrow`), never a silent clamp.
+    // Narrow the child grant before spawning; any requested authority growth hard-errors, never silently clamps (#262).
     let child_short = super::super::sessions::short_id(&worker_session);
     let principal = format!("{}/{}", parent_envelope.principal, child_short);
     let requested_envelope = requested_envelope_from_args(
@@ -1303,21 +1029,11 @@ pub fn run_with<W: Write>(
                 return Ok(2);
             }
         };
-    // Issue #267: a `writing` worker holds a writer permit for its WHOLE
-    // lifetime, refused up front -- before any child ever launches -- when
-    // another live writer already holds `launch_repo`'s own tree. A
-    // `read-only` worker never takes one. Held in `writer_permit` for the
-    // rest of this function; dropped explicitly right after the run
-    // finishes (below), rather than waiting for this function's own return,
-    // so the tree frees the moment the work is actually done.
+    // Writing workers require an exclusive checkout permit; read-only workers never take one (#267).
+    // Retain it through execution, contract audit and retry.
     let writer_permit = if args.mode == WorkerMode::Writing {
         let tree = std::fs::canonicalize(&launch_repo).unwrap_or_else(|_| launch_repo.clone());
-        // Issue #543: this process's own seat identity (if any), read the
-        // same way `seat::guard_from_env` does, but fed into the STRICT
-        // `seat::guard` verdict via an explicit `SeatFence` -- an uncommitted
-        // successor delegating a writing worker must not hand that worker a
-        // lease before its own rollover commits, which `guard_from_env`'s
-        // supersession-only check let through.
+        // Use strict seat fencing: an uncommitted successor must not grant a writer lease before rollover commits (#543).
         let identity = super::super::seat::env_seat_identity();
         let fence = identity
             .as_ref()
@@ -1338,9 +1054,7 @@ pub fn run_with<W: Write>(
         ) {
             Ok(writer_permit) => Some(writer_permit),
             Err(refusal) => {
-                // Nothing ran, so a group minted moments ago for this
-                // delegation must not outlive it -- same discipline as
-                // every other pre-launch refusal above.
+                // No worker launched, so unwind only this invocation's minted group and reservation.
                 discard_minted_group();
                 release_reservation();
                 let reason = permit::describe_writer_refusal(
@@ -1349,10 +1063,7 @@ pub fn run_with<W: Write>(
                     cfg.supervise.max_writers,
                     &tree,
                 );
-                // Issue #349: the REQUESTING session (this process's own
-                // caller) is the one that needs to know its delegation was
-                // refused -- the worker session this refusal prevented from
-                // ever existing has no attention row to file it under.
+                // Record refusal on the requester; the prevented worker has no session attention row (#349).
                 if let Some(short) = super::super::mail::session_identity(&env) {
                     let _ = super::super::attention::record(
                         &state,
@@ -1389,17 +1100,7 @@ pub fn run_with<W: Write>(
         None
     };
 
-    // Issue #228: the ONLY place this delegation's headless launch stops
-    // deriving its child process cwd and per-harness sandbox from `repo`
-    // (the delegating session's own directory) and starts deriving them
-    // from an explicit `--workdir` instead -- exactly the same way `exec::
-    // run_with_report`/`build_command` already derive both from whatever
-    // `repo` it is given, so no change to `exec.rs` itself was needed.
-    // `repo` is left untouched everywhere ELSE in this function (the spawn
-    // gate's `cfg`, and `try_join_dashboard`'s own `SpawnRequest::cwd`,
-    // which is the delegating session's own identity, not the worker's
-    // target): only the actual worker launch reads `launch_repo`, computed
-    // above (ahead of `command`) rather than here.
+    // Worker cwd and sandbox use launch_repo; routing config and requester identity retain the delegator repo (#228).
 
     let bootstrap_usage = if args.goal.is_some() {
         match run_goal_bootstrap(
@@ -1519,30 +1220,18 @@ pub fn run_with<W: Write>(
         agent: Some(args.name.clone()),
         session_id: Some(worker_session.clone()),
         transcript: None,
-        // Data, never argv: `run_with` builds the launch from the adapter
-        // itself when the trailing command carries no program name, exactly
-        // as every restart already does. Encoding the prompt into `command`
-        // here only to have `exec::run_with` parse it back out is what would
-        // let a prompt shaped like a flag be misread as one.
+        // Keep prompts as data, never command argv where flag-shaped text could change launch options.
         prompt: Some(prompt),
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
         budget_tokens: remaining_budget,
         max_tool_calls: worker_budget.tool_calls,
-        // Not exposed on `zirv ctx agent` (issue #285 scoped `--objective`
-        // to `exec`/`loop`): a delegated worker's own repository picks up
-        // whatever durable objective is already set for it, if any, via
-        // `compile::compile` on its own.
+        // Workers inherit durable repository objectives through compilation; agent exposes no objective flag (#285).
         objective: None,
-        // Issue #318: cloned, not moved -- the contract retry path below
-        // (when a schema was declared) reuses this SAME flags vector as its
-        // own `extra`, so a resume launch carries the identical policy/
-        // model/writable-root argv the original headless launch did.
+        // Retain identical policy/model/writable-root flags for the bounded contract resume (#318).
         command: command.clone(),
         simple: false,
-        // Issue #358 (task T3): carried through so `exec.rs`'s own
-        // harness-handover restart can move it to the new provider mid-run
-        // -- see `ExecArgs::reservation_id`'s own doc comment.
+        // Carry the reservation id so mid-run handover can move it to the correct provider (#358).
         reservation_id: reservation_id.clone(),
         cancellation: args.cancellation.clone(),
         ..Default::default()
@@ -1552,18 +1241,8 @@ pub fn run_with<W: Write>(
         agent: args.name.clone(),
     });
     let started = std::time::Instant::now();
-    // Re-review (2026-08-27) finding 1: `resolve_worker_budget` above already
-    // admitted this delegation into `--group` (if any) before this fallible
-    // spawn is even attempted -- `exec::run_with` can still fail outright
-    // (e.g. `--max-tool-calls` refused up front for an adapter that cannot
-    // enforce it, issue #155 review finding C2), and a failure here must not
-    // permanently burn the group's admission slot for a child that never
-    // ran. `state` is the same handle resolved above for the spawn gate,
-    // unused since; reused here rather than re-resolved.
-    // `--json` promises that `w` contains exactly one DelegationReceipt.
-    // The exec supervisor also writes human pacing/restart notices to its
-    // writer, so keep those visible on stderr instead of prefixing the JSON
-    // receipt that this function appends after the run.
+    // A failed spawn must roll back prior group admission so work that never ran consumes no slot.
+    // JSON stdout stays one receipt; supervisor pacing/restart notices belong on stderr.
     let execution = if args.json {
         let mut stderr = std::io::stderr();
         exec::run_with_report(&exec_args, &mut stderr, &launch_repo, &env)
@@ -1585,13 +1264,9 @@ pub fn run_with<W: Write>(
                 }
                 release_reservation();
             }
-            // Finding 4: with the admission rolled back the group is pristine
-            // again, so a group this invocation minted for a launch that
-            // never happened is removed rather than left open forever.
+            // After admission rollback, remove only groups this invocation minted for an unstarted launch.
             discard_minted_group();
-            // Issue #317: the worker never actually ran -- same "never
-            // Done, always crash/respawn-guarded" treatment as any other
-            // run that reached completion but failed.
+            // An unstarted worker follows crash/respawn policy, never silent Done (#317).
             finish_task_card(
                 &state,
                 repo,
@@ -1616,14 +1291,7 @@ pub fn run_with<W: Write>(
             return Err(e);
         }
     };
-    // Issue #170: this delegation's scope is done -- successfully or not --
-    // the moment its supervised run exits. The free-text completion contract
-    // remains reviewer-checked; token spend is rolled up below. Closes the
-    // group only when THIS session is the one that
-    // actually claimed it above, never a group some other, concurrent
-    // claimant owns -- an operator's own shared `--group` across several
-    // unrelated invocations must not be closed out from under whichever of
-    // them still has work left.
+    // Close only the group this coordinator actually claimed; concurrent users of a shared group may still have work (#170).
     if args.role.as_deref() == Some("sub-orchestrator")
         && let Some(id) = &args.group
         && let Ok(Some(group)) = super::super::group::load(&state, id)
@@ -1634,56 +1302,24 @@ pub fn run_with<W: Write>(
     }
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Best effort throughout: a delegation that ran must never fail because
-    // its accounting could not be written (issue #155, Phase 2). Issue #186
-    // hardening: exec now reports every vendor-backed segment of one logical
-    // delegation, so a cross-harness continuation is neither charged to the
-    // wrong agent nor omitted from the cost tree.
-    // Issue #452: this delegation's own `--json` receipt state, threaded
-    // through (and, in the common case, set inside) the block below --
-    // declared out here so the final receipt built just before this
-    // function's own `Ok(code)` return can see it regardless of which
-    // branch inside that block actually ran. The defaults describe the
-    // (practically unreachable) case where `StateDir::resolve` itself
-    // fails: nothing was extracted or persisted, so there is no report.
+    // Accounting must never fail completed work; record each vendor-backed segment to avoid mischarging continuation (#155, #186).
+    // Default receipt state carries no report until extraction succeeds (#452).
     let mut delegation_state = DelegationState::ExitedNoReport;
     let mut result_path: Option<PathBuf> = None;
     let mut report_truncated = false;
     let mut mail_delivered = false;
     let mut contract_errors: Vec<String> = Vec::new();
-    // Change 5 follow-up: same "unreachable `StateDir::resolve` failure"
-    // default as the others above -- nothing to report without a state
-    // dir to read the worker's own safety-decision log from.
+    // Without a state directory, there is no safety log from which to report blocks.
     let mut blocked_families: Vec<String> = Vec::new();
 
     if let Ok(state_dir) = super::super::state::StateDir::resolve(&env) {
-        // Change 5 follow-up: this delegation's own worker session is
-        // known here regardless of how the run below turns out, so this
-        // is computed unconditionally rather than duplicated into every
-        // branch -- the same reader `status::blocked_commands_status_line`
-        // uses, scoped to `worker_session` (the id this receipt itself
-        // reports back as `session`), not `final_session`: a cross-harness
-        // restart's later segment would otherwise hide a block from an
-        // earlier one.
+        // Read blocks for the original worker identity so a later cross-harness segment cannot hide earlier denials.
         blocked_families = blocked_family_lines(&state_dir, &worker_session);
         let parent_session = super::super::mail::session_identity(&env).unwrap_or_default();
-        // Issue #317: `--task`'s own completion signal, decided below once
-        // `first_text`/`validated` are known -- both the declared-contract
-        // branch and the no-contract branch (issue #722) unconditionally set
-        // this from their own real outcome, never left at a guess made
-        // before either was known. The no-contract branch still checks
-        // `code` first (a nonzero exit is always `Crash`, whatever
-        // `first_text` says): only a clean exit with nothing usable is
-        // `SilentZero`, the "completed but produced nothing usable" shape
-        // `ExitKind::SilentZero` exists for -- never a silent `Reported`.
+        // Derive task completion from actual report outcomes; nonzero exits crash and clean exits without reports are SilentZero (#317, #722).
         let task_exit_kind: Option<super::super::task::ExitKind>;
 
-        // Issue #452: the final-assistant-text extraction used to live only
-        // inside the `--result-schema` branch below; hoisted out so a plain
-        // delegation (no contract declared) can persist and report its own
-        // worker's final text too, through the identical extraction the
-        // contract path already trusted -- never a second, independently
-        // drifting copy of it.
+        // Use one final-text extraction path for contracted and plain delegations (#452).
         let repo_slug = super::super::state::repo_slug(repo);
         let final_session = execution_report
             .segments
@@ -1695,10 +1331,7 @@ pub fn run_with<W: Write>(
             .last()
             .map(|segment| segment.agent.clone())
             .unwrap_or_else(|| args.name.clone());
-        // Re-selects only when a cross-harness fallback actually landed
-        // this delegation on a different adapter mid-run; the ordinary
-        // case (no restart, or a same-harness restart) reuses `adapter`
-        // as-is rather than paying a second, redundant `select`.
+        // Reselect only after a harness change so extraction uses the adapter that actually finished.
         let reselected = if final_agent_name == args.name {
             None
         } else {
@@ -1722,15 +1355,8 @@ pub fn run_with<W: Write>(
         };
         let first_text = read_last_text(&transcript_path);
 
-        // Issue #318: when a schema was declared, the report-back mail and
-        // its own outcome supersede the plain success/failure report below
-        // entirely -- a worker's report is only ever "done" once it has
-        // been extracted from its own final text and validated, never a
-        // synthetic success just because the supervised run exited 0.
-        // ALWAYS sends mail here, success included: a delegator who asked
-        // for a structural contract needs the result (or exactly why it
-        // failed) whether or not it was watching this delegation
-        // synchronously.
+        // Declared contracts require extracted, validated text, never synthetic success from exit zero (#318).
+        // Always mail the result or failure so asynchronous requesters receive the same completion evidence.
         if let Some(schema) = &result_schema {
             let mut attempts: Vec<Vec<String>> = Vec::new();
             let mut last_candidate = String::new();
@@ -1750,18 +1376,7 @@ pub fn run_with<W: Write>(
                 ]),
             }
 
-            // One bounded retry, only when the adapter that actually ran
-            // this delegation can resume a headless conversation at all
-            // (some adapters still cannot: any still on the trait's own
-            // honest-refusal `headless_resume_cmd` default, e.g. droid,
-            // gemini, pi, opencode, copilot -- codex gained a real one in
-            // issue #303) AND a real target session can be resolved for it
-            // (review round 1: codex's own `resume_target` fails closed when
-            // its minted rollout cannot be recovered, which `headless_
-            // resume_cmd` alone -- a pure argv builder -- has no way to
-            // detect) -- a worker that fails either check gets exactly one
-            // attempt, never a synthetic second chance it cannot
-            // structurally receive.
+            // Retry only with resume support and a recoverable real session; an argv builder alone cannot prove resumability (#303).
             if validated.is_none()
                 && let Some(first_errors) = attempts.first()
                 && result_adapter
@@ -1843,10 +1458,7 @@ pub fn run_with<W: Write>(
             result_path = Some(path.clone());
 
             if !args.json {
-                // Issue #452 (review round 1): restored byte-identical to
-                // the pre-#452 line -- an exact-match consumer must not see
-                // this change -- with `full report: <path>` as its own
-                // following line instead of a suffix on this one.
+                // Keep this line stable for exact-match consumers; report paths belong on a separate following line (#452).
                 writeln!(
                     w,
                     "result: {}",
@@ -1885,11 +1497,7 @@ pub fn run_with<W: Write>(
             if !undeclared.is_empty() {
                 body.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
             }
-            // Issue #452: names where the worker's own full report landed,
-            // so an orchestrator reading `zirv ctx inbox` can open it -- the
-            // body above already embeds the validated JSON or the
-            // contract_failed errors/raw candidate, never the full raw
-            // report text itself.
+            // Link the full stored report from mail without embedding its unbounded raw text (#452).
             body.push_str(&format!("\nfull report: {}", path.display()));
             let to_session = super::super::mail::session_identity(&env)
                 .filter(|id| super::super::prompt::is_addressable_short(id));
@@ -1905,30 +1513,12 @@ pub fn run_with<W: Write>(
                 super::super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg)
                     .is_ok();
         } else {
-            // Issue #452: the no-contract counterpart of the branch above --
-            // no schema was declared, so there is nothing to validate, but
-            // the worker's own final report is still worth persisting: an
-            // orchestrator that only watches mail, or that dispatched under
-            // `--json`, otherwise has no durable record of what a plain
-            // (unvalidated) delegation actually said.
+            // Persist uncontracted final text so mail/JSON-only callers still have a durable report (#452).
             delegation_state = match first_text.as_deref() {
                 Some(_) => DelegationState::Reported,
                 None => DelegationState::ExitedNoReport,
             };
-            // Issue #722: `task_exit_kind` above was decided from
-            // `code == 0` alone, before `first_text` was known -- revise it
-            // here now that both are known, but (orchestrator ruling on
-            // review round 1) `code` still decides first, exactly as it did
-            // before this issue touched this branch: a nonzero exit is
-            // always `Crash`, whether or not some final text happened to be
-            // extractable, because extractable text is not evidence the
-            // worker actually succeeded. Only a clean (`code == 0`) exit
-            // asks `first_text` at all -- `Reported` when there is one,
-            // `SilentZero` (respawn-guarded, same as `Crash`) when there is
-            // not, never a silent `Reported` that closes the card `Done` as
-            // if the worker had actually reported something. The declared-
-            // contract branch above can ignore `code` entirely only because
-            // it first forces `code = exec::EXIT_CONTRACT_FAILED` itself.
+            // Nonzero exit always means Crash, even with text; clean exit without usable text is SilentZero, never Reported (#722).
             task_exit_kind = Some(if code != 0 {
                 super::super::task::ExitKind::Crash
             } else if first_text.is_some() {
@@ -1952,13 +1542,7 @@ pub fn run_with<W: Write>(
                 }
                 result_path = Some(path);
             } else {
-                // Issue #722: previously nothing was ever persisted for a
-                // worker that exited with no extractable report -- reuse
-                // `write_delegation_result` directly (the same writer
-                // `store_result`/`store_report_only` both call) so a durable
-                // post-mortem survives even with nothing to store as the
-                // report, and `result_path`/the `--json` receipt's own
-                // `result_path` are never left empty for this state.
+                // Persist even an absent report so silent exits retain a durable post-mortem and result path (#722).
                 let path = write_delegation_result(
                     &state_dir,
                     repo,
@@ -1981,19 +1565,7 @@ pub fn run_with<W: Write>(
                 && let Some(parent_short) = super::super::mail::session_identity(&env)
                 && super::super::prompt::is_addressable_short(&parent_short)
             {
-                // Issue #227: on a supervisor-detected failure, send a
-                // report-back mail to the spawning session with the same
-                // structured reason the stderr note (`exit_note`) already
-                // carries. The worker's own self-reported "tell your requester
-                // when you're done" instruction (dash panes only, see
-                // `prompt::with_report_back_layer`) never fires when the child
-                // died before reaching it -- a plain headless failure used to
-                // leave the requester with nothing but a bare exit code, no
-                // mail at all. Best-effort: a mail failure must never turn a
-                // completed delegation into a failed one, and this never
-                // touches the success path -- a clean run already has nothing
-                // new to say here (the caller's own `Ok(code)` return is that
-                // report).
+                // Supervisor failure mail covers children unable to self-report; match stderr reasons and never fail completed work on mail errors (#227).
                 let msg = report_back_message(
                     code,
                     &worker_session,
@@ -2008,9 +1580,7 @@ pub fn run_with<W: Write>(
         }
         let outcome = delegation_outcome(code);
         let envelope_sha256 = envelope::digest(&child_envelope).ok();
-        // Issue #317: closes (or respawn-guards) `--task`'s own card now that
-        // this delegation's real outcome is known -- see `finish_task_card`'s
-        // own doc comment for why this never marks a card `Done` silently.
+        // Finish the task only after the real report outcome is known; never silently mark it Done (#317).
         if let Some(exit_kind) = task_exit_kind {
             let failure_signals = (exit_kind == super::super::task::ExitKind::Crash)
                 .then(|| {
@@ -2051,15 +1621,7 @@ pub fn run_with<W: Write>(
                 aggregate_spend,
             );
         }
-        // Finding #4 (issue #358 review): a mid-run harness-handover
-        // restart (`exec::run_with_clock_inner`'s own usage-limit arm) moves
-        // this delegation's reservation to a NEW provider's ledger deep in
-        // the recursive call this `execution_report` came back from --
-        // `provider`/`reservation_id` above only ever name the FIRST
-        // provider this delegation reserved against. `final_reservation`
-        // carries the actual last one when a swap happened at all, so
-        // settling reads it first and falls back to the original pair only
-        // when the run never changed providers.
+        // Settle the final reservation after provider handover; the original pair may name a ledger already left behind (#358).
         let settle_reservation = execution_report
             .final_reservation
             .as_ref()
@@ -2151,10 +1713,7 @@ pub fn run_with<W: Write>(
         };
         print_receipt(w, &receipt)?;
     } else {
-        // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
-        // stdout result, so each warning rides here with capability, mechanism
-        // and detail, only when non-empty. `zirv agent` has no structured/JSON
-        // result form to carry the full `CapabilityWarning` into.
+        // Expose full capability warnings with synchronous stdout results (#230).
         for warning in &capability_warnings {
             writeln!(
                 w,
@@ -2162,10 +1721,7 @@ pub fn run_with<W: Write>(
                 warning.capability, warning.mechanism, warning.detail
             )?;
         }
-        // Change 5 follow-up: same idiom as the capability-warning loop
-        // above -- one line per blocked family, only when non-empty, so
-        // the orchestrator sees this without having to think to run `zirv
-        // ctx status` separately.
+        // Expose blocked families with the result so the requester needs no separate status query.
         for line in &blocked_families {
             writeln!(w, "blocked: {line}")?;
         }
@@ -2174,12 +1730,7 @@ pub fn run_with<W: Write>(
     Ok(code)
 }
 
-// Issue #264 added `task_class` as this function's 8th parameter, over
-// clippy's default 7-argument threshold -- every argument here is already an
-// independent, unrelated piece of one delegation's own completion record
-// (state handle, the report itself, lineage, outcome, mode, and now task
-// class), so bundling them into a struct would only move the same list one
-// level down without making any single call site clearer.
+// Keep independent completion-record inputs explicit; a wrapper would obscure the call sites (#264).
 #[allow(clippy::too_many_arguments)]
 fn append_execution_segments(
     state: &super::super::state::StateDir,
@@ -2236,10 +1787,7 @@ fn append_execution_segments(
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    // Issue #491: same seam as `exec::run` -- the operator's opt-in
-    // `[runtime]` default becomes an explicit backend here, at the CLI entry,
-    // so `run_with` and every receipt below it still see one of exactly two
-    // literal values. A `--role` this delegation names picks the row.
+    // Resolve operator runtime defaults at CLI entry so downstream code sees an explicit backend for this role (#491).
     let choice = super::super::runtime::resolve_for_cli(
         &args.runtime,
         &repo,
