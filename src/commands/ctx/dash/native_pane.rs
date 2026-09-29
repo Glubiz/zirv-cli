@@ -1054,10 +1054,6 @@ impl ComposerMode {
 pub struct NativePresentation {
     pub scroll: ScrollState,
     pub focus: PaneFocus,
-    /// A selected range of transcript item indices (`start..=end`,
-    /// inclusive), for future copy support. Untouched by scrolling/resize --
-    /// only an explicit selection action changes it.
-    pub selection: Option<(usize, usize)>,
     pub expanded: BTreeSet<String>,
     pub composer: ComposerState,
     pub unread: bool,
@@ -1076,7 +1072,6 @@ impl Default for NativePresentation {
         Self {
             scroll: ScrollState::default(),
             focus: PaneFocus::Composer,
-            selection: None,
             expanded: BTreeSet::new(),
             composer: ComposerState::default(),
             unread: false,
@@ -1116,7 +1111,7 @@ impl NativePresentation {
 
 /// The subset of [`NativePresentation`] worth surviving a process restart:
 /// the in-progress draft and anything queued but not yet sent. Scroll,
-/// selection, focus and expanded tool calls are deliberately NOT persisted
+/// focus and expanded tool calls are deliberately NOT persisted
 /// -- they are meaningless once the process that computed them against a
 /// specific viewport is gone, and re-deriving them fresh (follow mode on,
 /// nothing expanded) on reconnect is the same "no false memory" rule
@@ -3082,7 +3077,7 @@ impl NativePaneRuntime {
             .collect();
 
         // Item 4: the seat may have rolled over underneath this pane. Carry
-        // the draft/selection/focus/scrollback across and re-target anything
+        // the draft/focus/scrollback across and re-target anything
         // queued -- never replay it into the retired session.
         if let Some(current) = seats
             .iter()
@@ -4092,14 +4087,13 @@ impl NativePaneRuntime {
         }
     }
 
-    /// Mirrors the composer/selection/focus/scroll state into the continuity
+    /// Mirrors the composer/focus/scroll state into the continuity
     /// record, so a rollover or a reconnect carries the operator's actual
     /// draft rather than a stale copy of it.
     fn sync_continuity(&mut self) {
         self.continuity.draft = self.presentation.composer.draft.clone();
         self.continuity.cursor = self.presentation.composer.cursor;
         self.continuity.queued = self.presentation.composer.queued.clone();
-        self.continuity.selection = self.presentation.selection;
         self.continuity.scroll = self.presentation.scroll;
     }
 
