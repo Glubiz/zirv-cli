@@ -166,12 +166,11 @@ pub enum Decision {
     Duplicate {
         of: PathBuf,
     },
-    /// Review fix (issue #538): this file was shadowed by its directory's
-    /// rank winner, but the WINNER's own content is a lone import of THIS
-    /// file -- so this file's real text is what actually reaches the
-    /// session (under the winner's own provenance, via `Resolved::
-    /// delivers_from` on the winner's entry), not a blank shadow. `by`
-    /// names the winner (the import stub that references it).
+    /// This file was shadowed by its directory's rank winner, but the WINNER's own content
+    /// is a lone import of THIS file -- so this file's real text is what actually reaches
+    /// the session (under the winner's own provenance, via `Resolved::delivers_from` on
+    /// the winner's entry), not a blank shadow. `by` names the winner (the import stub that
+    /// references it) (#538).
     IncludedByReference {
         by: PathBuf,
     },
@@ -210,13 +209,12 @@ pub struct Resolved {
     /// Set only for a singular `AGENT.md` candidate: a diagnostic
     /// recommending rename to `AGENTS.md`, independent of `decision`.
     pub migration: Option<String>,
-    /// Review fix (issue #538): `Some(target)` only on an `Included` winner
-    /// whose own content is a lone import of another already-collected
-    /// surface -- the DELIVERED text for this entry must be read from
-    /// `target`, not from `path`, so a `ZIRV.md` reading `@AGENTS.md`
-    /// actually delivers `AGENTS.md`'s real content instead of the eight
-    /// literal bytes `@AGENTS.md`. `None` in every other case (deliver this
-    /// entry's own text, the ordinary path).
+    /// `Some(target)` only on an `Included` winner whose own content is a lone import of
+    /// another already-collected surface -- the DELIVERED text for this entry must be read
+    /// from `target`, not from `path`, so a `ZIRV.md` reading `@AGENTS.md` actually
+    /// delivers `AGENTS.md`'s real content instead of the eight literal bytes `@AGENTS.md`.
+    /// `None` in every other case (deliver this entry's own text, the ordinary path)
+    /// (#538).
     pub delivers_from: Option<PathBuf>,
 }
 
@@ -345,10 +343,9 @@ enum ImportResolution {
     Resolves(PathBuf),
     Cycle,
     EscapesTrustRoot,
-    /// Review fix (issue #538): a genuinely non-cyclic import chain deeper
-    /// than `MAX_IMPORT_DEPTH` hops -- distinct from `Cycle` (which means a
-    /// path was revisited), so the reported reason does not accuse a
-    /// legitimate long chain of looping when it never did.
+    /// A genuinely non-cyclic import chain deeper than `MAX_IMPORT_DEPTH` hops -- distinct
+    /// from `Cycle` (which means a path was revisited), so the reported reason does not
+    /// accuse a legitimate long chain of looping when it never did (#538).
     DepthExceeded,
 }
 
@@ -374,7 +371,7 @@ fn resolve_import_chain(
         }
         visited.push(current.clone());
         match surfaces.iter().find(|s| paths_equal(&s.path, &current)) {
-            // Item 4 (nit): once matched, resolve to the SURFACE's own
+            // Once matched, resolve to the SURFACE's own
             // canonical on-disk path, not the as-written import string's
             // normalized form -- `@AGENTS.MD` must deliver from the real
             // `/repo/AGENTS.md` a caller's own `surfaces` list (and every
@@ -493,7 +490,7 @@ pub fn resolve_instruction_winners(
         // own content -- `reason` says so), but when its link target IS the
         // exact path of that directory's winner, it is the same content by
         // construction: `Duplicate`, not a blanket `Excluded` (issue #538,
-        // item 3: "a shadowed file ... which is a symlink resolving to the
+        // "a shadowed file ... which is a symlink resolving to the
         // winner").
         let resolves_to_a_winner = exclusion.symlink_target.as_ref().is_some_and(|target| {
             result
@@ -518,22 +515,10 @@ pub fn resolve_instruction_winners(
         });
     }
 
-    // Review fix (issue #538): a WINNER's own content can itself be a lone
-    // import -- the file-and-precedence contract's compatibility-link
-    // pattern (`ZIRV.md` containing exactly `@AGENTS.md`) is a winner doing
-    // this, not a loser. Without this pass, that winner delivered its own
-    // literal stub text and the file it names stayed `Shadowed`, silently
-    // dropping the repository's real instructions. For every `Included`
-    // entry whose own surface text is a lone import resolving (bounded,
-    // cycle- and trust-root-checked, exactly like the loser-side chase
-    // above) to another already-collected surface: record where the winner
-    // must actually deliver its text FROM, and -- when the imported file is
-    // itself one of THIS run's `Resolved` entries and is not already
-    // `Included` -- promote it from `Shadowed`/`Duplicate`/`Excluded` to
-    // `IncludedByReference`, naming the winner. A cycle or a trust-root
-    // escape on the WINNER's own chase is left alone: the winner still
-    // delivers its literal (un-expandable) text, exactly as before this fix,
-    // since there is nothing safe to substitute it with.
+    // Expand lone imports even in the winning file; a compatibility link can be the
+    // selected source (#538).
+    // A cycle or trust-root escape on the winner's own chase is left alone: it still delivers
+    // its literal text, since there is nothing safe to substitute.
     let mut deliveries: Vec<(usize, PathBuf)> = Vec::new();
     for (index, resolved) in result.iter().enumerate() {
         if resolved.decision != Decision::Included {

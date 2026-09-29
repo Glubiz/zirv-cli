@@ -66,13 +66,8 @@ pub struct Handoff {
     pub gotchas: Vec<String>,
 }
 
-/// F2: every list item is run through [`normalize_rendered_line`] first, the
-/// same normalization the `Verification` line already applied only to
-/// itself -- an unnormalized `Done`/`Remaining`/`Files touched`/`Gotchas`
-/// item is exactly as capable of injecting a stray `## ` heading or growing
-/// the handoff unboundedly as an unnormalized verification command was
-/// (review finding F1's fix), and nothing about being a plain list item
-/// instead of the `Verification` line made that any less true.
+/// Normalize every rendered list item so embedded control text cannot change the handoff
+/// structure.
 fn write_list(out: &mut String, heading: &str, items: &[String]) {
     out.push_str(&format!("## {heading}\n"));
     for item in items {
@@ -506,14 +501,14 @@ pub fn labeled_for_injection_with_working_set(
     out
 }
 
-/// Issue #317: appends one line per still-open task card (`task:<id> <state>
+/// Appends one line per still-open task card (`task:<id> <state>
 /// -- <reason>`, `task::open_card_lines`) to `handoff.blocked`, keeping the
 /// v3 `Vec<String>` shape -- durable, real state alongside whatever the
 /// previous session's own transcript-distilled prose already said was
 /// blocking it. Best-effort: `open_card_lines` degrades to an empty list
 /// (never an error) when this repository has no task cards at all, so a
 /// repo that has never used `zirv ctx task` sees `handoff.to_markdown()`
-/// byte-for-byte unchanged.
+/// byte-for-byte unchanged (#317).
 pub fn with_open_task_cards(mut handoff: Handoff, state: &StateDir, repo: &Path) -> Handoff {
     handoff
         .blocked
@@ -536,7 +531,7 @@ fn strip_bullet(line: &str) -> Option<String> {
     None
 }
 
-/// Issue #326 B4: byte cap applied to `Handoff::task`/`verification`/
+/// Byte cap applied to `Handoff::task`/`verification`/
 /// `next_step` at PARSE time (`parse_markdown`), not only at render time.
 /// `normalize_rendered_line`'s own 200-char cap (below) only ever ran on list
 /// bullets and the rendered `Verification` line when `to_markdown` produced
@@ -545,7 +540,7 @@ fn strip_bullet(line: &str) -> Option<String> {
 /// one could still reach a successor session's prompt unbounded. Larger than
 /// [`VERIFICATION_LINE_CHAR_CAP`] on purpose: these three fields carry the
 /// successor's own actual instructions (what to do, whether it passed, what
-/// to do next), not a one-line label, so they get more room before being cut.
+/// to do next), not a one-line label, so they get more room before being cut (#326).
 const PARSED_SCALAR_FIELD_CAP_BYTES: usize = 2048;
 
 /// Truncates `text` to [`PARSED_SCALAR_FIELD_CAP_BYTES`] with an explicit
@@ -629,15 +624,8 @@ pub fn parse_markdown(md: &str) -> Handoff {
 /// make the handoff arbitrarily large.
 const VERIFICATION_LINE_CHAR_CAP: usize = 200;
 
-/// Collapses arbitrary (possibly multi-line, possibly huge) text into a
-/// single, bounded rendered line -- used for the `Verification` section
-/// (review finding F1) and every plain list item (`write_list`, review
-/// finding F2). Rendered raw, a multiline `VerificationOutcome::command`,
-/// error-excerpt line, or list item could inject extra Markdown headings
-/// into the handoff, or make it arbitrarily large. Every run of whitespace
-/// -- including newlines -- collapses to one space; the result is then
-/// capped to [`VERIFICATION_LINE_CHAR_CAP`] characters with a trailing
-/// `...`.
+/// Collapse and cap arbitrary text to one rendered line for verification and list items.
+// Unnormalized text could inject a stray `## ` heading or grow the handoff without bound.
 fn normalize_rendered_line(text: &str) -> String {
     let mut collapsed = String::with_capacity(text.len().min(VERIFICATION_LINE_CHAR_CAP + 3));
     let mut last_was_space = false;
@@ -663,11 +651,10 @@ fn normalize_rendered_line(text: &str) -> String {
     }
 }
 
-/// Issue #455 (review round 2): how much of `StructuralContext::partial_text`
-/// the `PARTIAL` line quotes inline -- shorter than
-/// `VERIFICATION_LINE_CHAR_CAP`/the adapter's own `TOOL_CALL_SUMMARY_CAP`
-/// (both already redacted/capped upstream) purely so the quote reads as a
-/// short excerpt rather than the whole cut-off reply.
+/// How much of `StructuralContext::partial_text` the `PARTIAL` line quotes inline --
+/// shorter than `VERIFICATION_LINE_CHAR_CAP`/the adapter's own `TOOL_CALL_SUMMARY_CAP`
+/// (both already redacted/capped upstream) purely so the quote reads as a short excerpt
+/// rather than the whole cut-off reply (#455).
 const PARTIAL_TEXT_QUOTE_CAP: usize = 80;
 
 /// Cuts `text` (already redacted by the adapter) to
@@ -684,23 +671,9 @@ fn quote_partial_text(text: &str) -> String {
     format!("{truncated}...")
 }
 
-/// Renders a `StructuralContext::last_verification` outcome as the single
-/// line the `Verification` section holds: `"none recorded"` when the
-/// transcript never ran anything recognizable as a build/test/lint command,
-/// a pass note, a fail note carrying up to two error-excerpt lines, or --
-/// when the command's own exit status could not be attributed to the
-/// verification segment specifically (review finding F1: `cargo test ||
-/// true`, `cargo test; echo done`, `cargo test | tee out.log`, and the
-/// like) -- an explicit "outcome unknown" note. `Unknown` is deliberately
-/// never rendered as a pass: a successor session must not read a compound
-/// command's unrelated success as "the tests passed".
-///
-/// The command and every error-excerpt line are run through
-/// [`normalize_rendered_line`] first (review finding F1), and the command is
-/// rendered behind a fixed `command: ` label inside its own backticks: even
-/// though collapsing already guarantees a single line, the label means the
-/// rendered command text can never itself open the line, so it can never be
-/// mistaken for a Markdown heading.
+/// Show the verification segment whose exit status can be attributed to that command.
+// Unknown is never rendered as a pass: a successor must not read a compound command's unrelated
+// success as "the tests passed".
 pub(crate) fn render_verification(outcome: Option<&VerificationOutcome>) -> String {
     match outcome {
         None => "none recorded".to_string(),
@@ -728,15 +701,13 @@ pub(crate) fn render_verification(outcome: Option<&VerificationOutcome>) -> Stri
     }
 }
 
-/// Issue #466: `structural()` copies raw transcript text no model has ever
-/// filtered -- unlike a distilled `Handoff` (safe by construction: the
-/// distiller model never saw anything but placeholders, see
-/// `helper_answer`), this is the one Handoff-producing path with nothing
-/// between the raw transcript and a fresh prompt a restart, resume, or
-/// handover preview goes on to inject. Every field `structural()` fills from
-/// transcript data -- task, progress, verification details, and file paths --
-/// goes through the same `protect_text` boundary every other zirv-composed
-/// prompt does.
+/// `structural()` copies raw transcript text no model has ever filtered -- unlike a
+/// distilled `Handoff` (safe by construction: the distiller model never saw anything but
+/// placeholders, see `helper_answer`), this is the one Handoff-producing path with nothing
+/// between the raw transcript and a fresh prompt a restart, resume, or handover preview
+/// goes on to inject. Every field `structural()` fills from transcript data -- task,
+/// progress, verification details, and file paths -- goes through the same `protect_text`
+/// boundary every other zirv-composed prompt does (#466).
 ///
 /// `structural()` promises to never fail (a restart always has something to
 /// stand on), so a masking failure (state dir or literals file unreadable)
@@ -795,11 +766,10 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "Unknown task (no user prompt found in the transcript)".to_string());
 
-    // Issue #455 review round 2: `assistant_texts` never carries the text
-    // open at the moment of a cut -- the adapter already holds that out,
-    // in `ctx.partial_text` instead -- so `done` needs no popping here. An
-    // earlier, already-closed reply stays in `done` even when a LATER,
-    // unrelated turn is the one that gets cut.
+    // `assistant_texts` never carries the text open at the moment of a cut -- the adapter
+    // already holds that out, in `ctx.partial_text` instead -- so `done` needs no popping
+    // here. An earlier, already-closed reply stays in `done` even when a LATER, unrelated
+    // turn is the one that gets cut (#455).
     let done: Vec<String> = ctx
         .assistant_texts
         .iter()
@@ -807,10 +777,9 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         .filter(|t| !t.is_empty())
         .collect();
 
-    // Issue #455: unresolved tool calls and a cut tail come first -- both
-    // describe an in-flight side effect or reply whose true state a
-    // successor must check before acting, which outranks an ordinary
-    // "these errors were never retried" note.
+    // Unresolved tool calls and a cut tail come first -- both describe an in-flight side
+    // effect or reply whose true state a successor must check before acting, which outranks
+    // an ordinary "these errors were never retried" note (#455).
     let mut remaining: Vec<String> = ctx
         .unresolved_tool_calls
         .iter()
@@ -823,10 +792,9 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         let mut line = format!(
             "PARTIAL: the last reply was cut by {reason}; treat it as incomplete, not as an answer."
         );
-        // Issue #455 review round 2: only present when the cut turn itself
-        // had open text (never an earlier, unrelated reply) -- already
-        // redacted by the adapter; capped again here, shorter, purely for
-        // an inline quote's own readability.
+        // Only present when the cut turn itself had open text (never an earlier, unrelated
+        // reply) -- already redacted by the adapter; capped again here, shorter, purely for
+        // an inline quote's own readability (#455).
         if let Some(partial) = &ctx.partial_text {
             line.push_str(&format!(
                 " Cut text began: \"{}\"",
@@ -841,9 +809,9 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
             .map(|e| format!("Unresolved error: {}", e.lines().next().unwrap_or(e).trim())),
     );
 
-    // Issue #455: a file a still-unresolved call claimed to modify is
-    // marked, never silently presented as a plain, completed edit -- whether
-    // the write actually landed is exactly what is unknown.
+    // A file a still-unresolved call claimed to modify is marked, never silently presented
+    // as a plain, completed edit -- whether the write actually landed is exactly what is
+    // unknown (#455).
     let files_modified: Vec<String> = ctx
         .files_modified
         .iter()
@@ -873,15 +841,14 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
 
 pub const DISTILL_PROMPT_VERSION: &str = "v3";
 
-/// Issue #326 B3: per-item byte cap applied when `distill_prompt` renders one
-/// of its transcript excerpts (`user_messages`/`assistant_texts`/`files_read`/
-/// `files_modified`/`tool_errors`) as a bullet list. `tool_errors` already
-/// carries its own, smaller cap from extraction (`adapters::claude::ERROR_
-/// SNIPPET`, 200 chars) before it ever reaches here, so this is a no-op for
-/// that category in practice -- the other four had no per-item cap at all: a
-/// single oversized item (a huge pasted prompt, a giant assistant reply)
-/// could blow the whole distill prompt's own budget on its own, no matter how
-/// small `StructuralContext::keep_last` kept the *count*.
+/// Per-item byte cap applied when `distill_prompt` renders one of its transcript excerpts
+/// (`user_messages`/`assistant_texts`/`files_read`/ `files_modified`/`tool_errors`) as a
+/// bullet list. `tool_errors` already carries its own, smaller cap from extraction
+/// (`adapters::claude::ERROR_SNIPPET`, 200 chars) before it ever reaches here, so this is
+/// a no-op for that category in practice -- the other four had no per-item cap at all: a
+/// single oversized item (a huge pasted prompt, a giant assistant reply) could blow the
+/// whole distill prompt's own budget on its own, no matter how small
+/// `StructuralContext::keep_last` kept the *count* (#326).
 const BULLET_ITEM_CAP_BYTES: usize = 400;
 
 pub(crate) fn bullets(items: &[String]) -> String {
@@ -938,14 +905,8 @@ Remaining item to Done only when the context below actually shows it happened. P
 file paths, commands, and error text verbatim, never paraphrased. Drop only what the context \
 below demonstrably shows is no longer relevant.";
 
-/// Issue #326 B6: byte budget on the PREVIOUS handoff's own carry-over block
-/// inside `distill_prompt` -- `to_markdown()`'s full render used to be
-/// embedded verbatim with no aggregate cap of its own (only each individual
-/// list item was already bounded, by `normalize_rendered_line`'s 200-char
-/// cap). A handoff carrying enough `Constraints`/`Done`/`Key decisions`/
-/// `Gotchas` entries could still grow the carry-over block itself into the
-/// tens of KB every restart, distinct from (and in addition to) B3's own
-/// per-item cap on the CURRENT session's own transcript excerpts below it.
+/// Cap the previous handoff carry-over as a whole, because per-item limits do not bound
+/// its aggregate size (#326).
 const PREVIOUS_HANDOFF_CAP_BYTES: usize = 8192;
 
 /// The non-protected sections of `prev.to_markdown()`, in the same order
@@ -964,17 +925,8 @@ fn rest_sections_markdown(prev: &Handoff) -> String {
     out
 }
 
-/// Issue #326 B6 (review round 2): item-count cap for a protected LIST
-/// (`remaining`/`blocked`) inside `capped_previous_handoff_markdown`'s
-/// protected block. Those two are unbounded-count lists -- nothing upstream
-/// caps how many items a distilled handoff may carry -- so the protected
-/// block, which the byte budget below never trims, could otherwise grow
-/// without limit on its own even though every individual item is already
-/// bounded to `VERIFICATION_LINE_CHAR_CAP` (200 chars) by `write_list`'s own
-/// `normalize_rendered_line`. Keeps the most recent `PROTECTED_LIST_MAX_
-/// ITEMS` (the tail: whatever a distiller appended last is the most likely
-/// to still be live), with an explicit `[truncated: N older ... item(s)
-/// omitted]` note when anything was actually cut -- never silent.
+/// Cap item counts in protected `remaining` and `blocked` lists to bound the carry-over
+/// (#326).
 const PROTECTED_LIST_MAX_ITEMS: usize = 40;
 
 fn write_protected_list(out: &mut String, heading: &str, items: &[String]) {
@@ -990,34 +942,10 @@ fn write_protected_list(out: &mut String, heading: &str, items: &[String]) {
     ));
 }
 
-/// Issue #326 B6 (review round 1, P1; round 2 item-count follow-up):
-/// `prev.to_markdown()` capped to `budget` bytes -- but `task`/`remaining`/
-/// `blocked`/`verification`/`next_step` (what the successor must do, what is
-/// still outstanding, and whether the last checks actually passed) always
-/// survive, subject only to `PROTECTED_LIST_MAX_ITEMS`' own item-count cap
-/// on `remaining`/`blocked`, never to the byte `budget` below; only the
-/// other, more historical sections (`Constraints`/`Done`/`Key decisions`/
-/// `Files read`/`Files modified`/`Gotchas learned`) are truncated against
-/// `budget` itself, with an explicit "[truncated N bytes]" note, never a
-/// silent cut. `verification` moved into the protected set after review
-/// found it could otherwise be trimmed away alongside `Constraints`/`Done`/
-/// `Key decisions` -- a still-unresolved `FAILED: <test>` is exactly the
-/// kind of fact a generic truncation note must never substitute for; a
-/// successor that never sees it has no reason to re-run the failing check.
-///
-/// This is deliberately NOT a hard ceiling on the whole function's own
-/// output: the protected block's own worst case is `PROTECTED_LIST_MAX_
-/// ITEMS` items per list at up to ~203 bytes each (`write_list`'s 200-char
-/// cap plus its own `"- "`/newline) for `remaining`/`blocked`, PLUS
-/// `task`/`verification`/`next_step` at whatever byte length those three
-/// scalar fields happen to carry -- bounded to `PARSED_SCALAR_FIELD_CAP_
-/// BYTES` (2048 each) when the `Handoff` came from `parse_markdown` (the
-/// ordinary path: every stored/distilled handoff this function is ever
-/// actually called with), but NOT enforced by this function itself for a
-/// `Handoff` built directly with an arbitrarily large scalar field. `budget`
-/// bounds the REST of the document; it does not bound the protected block.
-/// A no-op, returning `prev.to_markdown()` unchanged, when the whole
-/// document already fits.
+/// Keep task, remaining work, blockers, verification, and next step within the capped
+/// carry-over; trim lower-priority history first (#326).
+// Not a hard ceiling: budget bounds the rest of the document, not the protected block. A still-unresolved
+// FAILED test must never be trimmed, or a successor has no reason to re-run it.
 fn capped_previous_handoff_markdown(prev: &Handoff, budget: usize) -> String {
     let full = prev.to_markdown();
     if full.len() <= budget {
@@ -1154,23 +1082,10 @@ fn sanitized_model_stderr(stderr: &[u8], prompt: &str) -> String {
     sanitized.trim().to_string()
 }
 
-/// Turns the operator's own model config into the `model: &str`
-/// `distiller_cmd`/`run_model`/`distill`/`distill_or_structural` all take:
-/// `explicit` (the operator's `handoff.model`/`optimize.model`) if set, else
-/// the resolved adapter's own [`AgentAdapter::default_distiller_model`].
-///
-/// `handoff.model` used to default to the literal `"haiku"` unconditionally,
-/// which reached `codex exec --model haiku` for a codex session and failed
-/// outright, falling back to codex's empty `structural_context` for a
-/// silently near-empty handoff. Every model-taking caller in this module,
-/// `exec.rs`, `wrap.rs`, and `surface_collect.rs` goes through this rather than
-/// reading `cfg.handoff.model`/`cfg.optimize.model` directly, so a third
-/// adapter with its own default (or none) is handled without an edit at any
-/// of those call sites.
-///
-/// Empty (never `None` -- every current caller's `distiller_cmd` reads an
-/// empty model as "omit the flag", not "error") when neither the operator
-/// nor the adapter named one, which is codex's own case today.
+/// Resolve the configured model through the catalogue when no explicit handoff model is
+/// set.
+// Empty (never None) when neither operator nor adapter named one: callers read empty as "omit the flag".
+// A literal "haiku" default once reached `codex exec --model haiku` and failed.
 pub fn resolve_distiller_model(explicit: Option<&str>, adapter: &dyn AgentAdapter) -> String {
     explicit
         .filter(|m| !m.is_empty())
@@ -1493,7 +1408,7 @@ fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>)
     handoff
 }
 
-/// Issue #537 (A4): from a live 2026-09-18 probe.
+/// From a live 2026-09-18 probe (#537).
 pub(crate) const HANDOFF_THIN_FLOOR: f32 = 0.9;
 
 /// Bounded numeric-only metadata state (issue #759's re-projection onto the
@@ -1523,33 +1438,8 @@ fn bounded_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX).min(1_000_000)
 }
 
-/// Issue #537 (A4): `Handoff::is_usable`'s own deterministic check (non-
-/// empty task and next step) already passed by the time this is called --
-/// this only ever NARROWS that further, never marks usable what the
-/// deterministic check already rejected. One advisory call (site
-/// `"handoff"`) asks whether a restarted session could actually continue
-/// from this alone; a confident (`>= HANDOFF_THIN_FLOOR`) `thin` answer says
-/// no. `adequate`, a low-confidence answer, or no answer at all (gate off,
-/// no credential, any transport/parse error -- `jev::advise`'s own contract)
-/// leaves today's usability verdict (`true`, since the caller only reaches
-/// this after `is_usable()` already passed) unchanged.
-///
-/// Issue #759: since issue #746's `jev::safe_metadata_request` egress
-/// boundary, the free-text state this function used to send (task/next-
-/// step/constraints, up to 2 KB each) was rejected before any cache read or
-/// network call -- this gate's own `[jev] supervisor` key was a dead
-/// deny-only fallback end to end. Re-projected onto the same
-/// `_zirv_metadata_only`/`facts` contract every other `[jev]`-gated site
-/// uses: five locally computed integers (see [`HandoffQualityState`]),
-/// never the handoff's own text.
-/// Issue #759: builds the exact `(state, questions)` pair [`jev_handoff_
-/// is_thin`] sends to `jev::advise` -- factored out of that function so a
-/// test can assert directly that this pair passes `jev::safe_metadata_
-/// request` (the egress boundary issue #746 established), rather than only
-/// exercising that boundary indirectly through a fake-server round-trip.
-/// [`handoff_quality_request`]'s own single Choice question, factored out so
-/// `zirv ctx jev probe` can ask the exact same question without a real
-/// `Handoff` to derive facts from.
+/// Use only bounded structural state at this authority boundary; free-form handoff text is
+/// rejected (#537).
 pub(crate) fn handoff_quality_question() -> jev::Question {
     jev::Question::metadata_choice(
         "quality",
@@ -1597,6 +1487,8 @@ pub(crate) fn handoff_thin_action(
     }
 }
 
+// Only ever NARROWS `is_usable()`: a confident thin answer says no; adequate, low confidence or no
+// answer (gate off, transport/parse error) leaves the verdict unchanged.
 fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
     let (advise_state, questions) = handoff_quality_request(handoff);
     let Some(answers) = jev::advise(
@@ -1618,7 +1510,7 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
     handoff_thin_action(answers.get("quality"), min_confidence, min_margin) == "demote"
 }
 
-/// Issue #537 (A4): the gated wrapper around [`distill_or_structural`] for
+/// The gated wrapper around [`distill_or_structural`] for
 /// the one call site that is genuinely on the restart path (`wrap::pump`'s
 /// own `Action::Restart` handling) -- threading `cfg`/`state` into
 /// `distill_or_structural` itself (or into `Handoff::is_usable`) would mean
@@ -1629,7 +1521,7 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
 /// additional confident [`jev_handoff_is_thin`] verdict may demote it to the
 /// same structural fallback an `Err` from `distill` itself already takes;
 /// `"no data"`/`"structural"` results (nothing was distilled to begin with)
-/// and any non-thin or unanswered verdict pass through unchanged.
+/// and any non-thin or unanswered verdict pass through unchanged (#537).
 #[allow(clippy::too_many_arguments)]
 pub fn distill_or_structural_with_jev(
     cfg: &CtxConfig,
@@ -1663,11 +1555,11 @@ pub fn distill_or_structural_with_jev(
     )
 }
 
-/// Issue #783 (`[jev] handoff_select`): one candidate this off-by-default
-/// keep/drop pass may consider -- an entry from an OPTIONAL handoff section
-/// only. `task`/`constraints`/`remaining`/`blocked`/`verification`/`next_
-/// step` are never candidates: the restart path depends on all six, and
-/// [`optional_candidates`] never yields one for them.
+/// One candidate this off-by-default keep/drop pass may consider -- an entry from an
+/// OPTIONAL handoff section only.
+/// `task`/`constraints`/`remaining`/`blocked`/`verification`/`next_step` are never
+/// candidates: the restart path depends on all six, and [`optional_candidates`] never
+/// yields one for them (#783).
 #[derive(Debug, Clone, Copy)]
 enum OptionalItemKind {
     Done,
@@ -1892,14 +1784,13 @@ pub(crate) fn handoff_select_action(
     }
 }
 
-/// Issue #783: an off-by-default (`[jev] handoff_select`) keep/drop pass
-/// over a handoff's OPTIONAL items only -- `done`/`key_decisions`/`files_
-/// read`/`files_modified`/`gotchas`. Mirrors `compile::rerank_memory_
-/// candidates`/`memory::apply_jev_harvest_gate`'s own per-candidate noul
-/// shape exactly (one batched call, one noul question per candidate, only a
-/// margin-gated decisive rejection ever prunes), but never reorders: this is
-/// keep/drop only, so a surviving item keeps its original relative position
-/// within its own section.
+/// An off-by-default (`[jev] handoff_select`) keep/drop pass over a handoff's OPTIONAL
+/// items only -- `done`/`key_decisions`/`files_read`/`files_modified`/`gotchas`. Mirrors
+/// `compile::rerank_memory_candidates`/`memory::apply_jev_harvest_gate`'s own
+/// per-candidate noul shape exactly (one batched call, one noul question per candidate,
+/// only a margin-gated decisive rejection ever prunes), but never reorders: this is
+/// keep/drop only, so a surviving item keeps its original relative position within its own
+/// section (#783).
 ///
 /// Never touches `task`/`constraints`/`remaining`/`blocked`/`verification`/
 /// `next_step` -- [`optional_candidates`] never yields one of those, so this
@@ -1993,7 +1884,7 @@ fn jev_select_optional_handoff_items(
 
 // -- compaction_select (issue #798) -----------------------------------------
 
-/// Issue #798 (`[jev] compaction_select`): one candidate this off-by-default
+/// One candidate this off-by-default
 /// pass may feature by name in a compaction's own focus text -- extracted
 /// directly and deterministically from a `StructuralContext`, never from a
 /// distilled `Handoff`: compaction must stay cheap (one bounded [`jev::
@@ -2004,7 +1895,7 @@ fn jev_select_optional_handoff_items(
 /// different source and a different default direction: a handoff's optional
 /// sections default to KEPT (a decisive drop narrows them), while a
 /// compaction focus text defaults to carrying NO keep list at all (only a
-/// decisive keep verdict, per candidate, ever adds one).
+/// decisive keep verdict, per candidate, ever adds one) (#798).
 #[derive(Debug, Clone, Copy)]
 enum CompactionItemKind {
     FileModified,
@@ -2305,7 +2196,7 @@ const COMPACTION_KEEP_LIST_MAX_ITEMS: usize = 8;
 /// `base_focus` itself.
 const COMPACTION_KEEP_LIST_MAX_CHARS: usize = 600;
 
-/// Issue #798 (`[jev] compaction_select`): appends a short, Jev-chosen keep
+/// Appends a short, Jev-chosen keep
 /// list to `base_focus` (`supervise::COMPACT_FOCUS` at every call site
 /// today) when the gate is on, Jev is available, and at least one candidate
 /// clears a decisive keep verdict. Gate off, no credential, no candidates,
@@ -2314,7 +2205,7 @@ const COMPACTION_KEEP_LIST_MAX_CHARS: usize = 600;
 /// shape every other `[jev]`-gated site uses. Spends exactly one bounded
 /// [`jev::advise`] call, the same budget [`jev_select_optional_handoff_
 /// items`] already spends -- never a distiller call, never a second round
-/// trip.
+/// trip (#798).
 ///
 /// A surviving item keeps [`compaction_candidates`]'s own extraction order
 /// (files, then a failing verification, then operator constraints, then the
@@ -2513,11 +2404,11 @@ pub fn run_with<W: Write>(
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
-    // Issue #690: `select_for_identity` -- the adapter is needed first to
+    // `select_for_identity` -- the adapter is needed first to
     // *parse* the transcript, which `--no-model` never goes beyond. The
     // optional distiller child below still fails with the adapter's own
     // not-found error if its binary really is missing, exactly as it did
-    // before presence was consulted anywhere.
+    // before presence was consulted anywhere (#690).
     let adapter =
         adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
     let jsonl = std::fs::read_to_string(&args.transcript)
@@ -2558,10 +2449,9 @@ pub fn run_with<W: Write>(
             previous.as_ref(),
         )
     };
-    // Issue #317: real, durable task-card state appended alongside whatever
-    // the distilled handoff itself wrote to `Blocked` -- a fresh
-    // orchestrator resuming from this handoff sees the actual open cards,
-    // not only the previous session's own prose.
+    // Real, durable task-card state appended alongside whatever the distilled handoff
+    // itself wrote to `Blocked` -- a fresh orchestrator resuming from this handoff sees the
+    // actual open cards, not only the previous session's own prose (#317).
     let handoff = with_open_task_cards(handoff, &state, repo);
 
     if args.stdout {

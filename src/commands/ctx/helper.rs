@@ -1,44 +1,14 @@
 //! The one native helper-model call (issue #484, roadmap N15).
 //!
-//! Zirv makes model calls that are not the main chat loop: handoff
-//! distillation, `ctx ask`, `ctx optimize`'s judgment, the loop's objective
-//! judge, memory harvest and consolidation, the workflow reviewer and the
-//! built-in agent seats. Before this step every one of them reached a vendor
-//! CLI, so a "native" session still could not run without Claude or Codex on
-//! PATH.
+//! One native helper serves handoff, ask, optimization, judging, memory and review calls.
+//! Each call is a bounded conversation with read-only tools and a text answer.
 //!
-//! This module is the single native replacement for all of them. It is
-//! deliberately ONE service rather than per-call-site provider code: a helper
-//! call is always the same shape -- one bounded conversation, a read-only tool
-//! set, a text answer -- and the interesting decisions (which route, what
-//! budget, what a failure means) belong in one place where they can be
-//! reviewed once.
+//! A role runs natively only when runtime binding and an operator-configured native route
+//! both exist. Otherwise the caller keeps its harness path.
 //!
-//! # Selection
-//!
-//! A helper runs natively when BOTH of two things are true: `role` resolves
-//! to [`runtime::RuntimeKind::Native`] through the same role-aware table
-//! `zirv ctx doctor` and every other launch surface read (`[runtime.roles]`,
-//! then `[runtime] default`, harness when neither is set -- issue #594,
-//! roadmap N22), AND the operator's native provider configuration names a
-//! route for that role (`[roles]` in `~/.zirv/native.toml`, or `--route`).
-//! Otherwise [`available`] reports `false` and the caller keeps its existing
-//! harness path unchanged. A native route with no matching runtime binding is
-//! therefore inert -- the same posture `zirv ctx doctor` already reports for
-//! the role -- so a legacy session is never silently migrated and a native
-//! session never needs a harness binary.
-//!
-//! # Read-only is the broker's decision, not this module's
-//!
-//! A helper session is constructed with NO writer permit. Every repository
-//! write, every outside write, every process with write effects and every
-//! shared-scope knowledge write is then refused by
-//! [`super::runtime::enforcement::ExecutionBroker`] itself, at effect time,
-//! with `BrokerError::WriterPermit` -- not by a convention this module could
-//! forget to apply, and not by a prompt the model could be talked out of.
-//! `ApprovalMode::Headless` means the refusal cannot be approved away either.
-//! There is therefore no read-only enforcement code in this module at all:
-//! the absent permit IS the mechanism.
+//! Read-only authority is enforced by `ExecutionBroker`: helper sessions have no writer
+//! permit, and headless approval cannot grant one.
+// There is no read-only enforcement code in this module: the absent permit IS the mechanism.
 
 use std::path::Path;
 
@@ -212,11 +182,10 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
     // configured route for it would make the deterministic path unreachable on
     // a machine with no provider configuration at all.
     if request.provider.is_none() {
-        // Issue #594 (roadmap N22): the role-aware runtime table gates
-        // FIRST, before any native.toml route lookup -- see
-        // `runtime_role_is_native`. This must agree with `available` above,
-        // since callers such as `handoff::helper_answer` check `available`
-        // and then immediately call `run`.
+        // The role-aware runtime table gates FIRST, before any native.toml route lookup --
+        // see `runtime_role_is_native`. This must agree with `available` above, since
+        // callers such as `handoff::helper_answer` check `available` and then immediately
+        // call `run` (#594).
         if !runtime_role_is_native(request.repo, request.role, env) {
             return Err(HelperError::Unconfigured(format!(
                 "role `{}` is not bound to the native runtime (add it to [runtime.roles] or set \

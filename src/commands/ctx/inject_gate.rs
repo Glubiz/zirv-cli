@@ -25,21 +25,21 @@ pub(crate) const SITE: &str = "inject";
 /// test), i.e. P(defer) > 0.8; facts-only state is untested, so no looser.
 pub(crate) const DEFER_MIN_PROBABILITY: f64 = 0.8;
 
-/// Mail (PTY line or hook note) is never held past this many turns...
+/// Mail (PTY line or hook note) is never held past this many turns..
 pub(crate) const MAIL_MAX_DEFER_TURNS: u32 = 3;
 /// ...or this many seconds since the first deferral / the oldest unread.
 pub(crate) const MAIL_MAX_DEFER_SECS: u64 = 600;
-/// A PTY `/compact` is never held past this many turns...
+/// A PTY `/compact` is never held past this many turns..
 pub(crate) const COMPACT_MAX_DEFER_TURNS: u32 = 3;
 /// ...or this many seconds.
 pub(crate) const COMPACT_MAX_DEFER_SECS: u64 = 900;
-/// A restart+handoff is held for at most one turn...
+/// A restart+handoff is held for at most one turn..
 pub(crate) const RESTART_MAX_DEFER_TURNS: u32 = 1;
 /// ...or this many seconds.
 pub(crate) const RESTART_MAX_DEFER_SECS: u64 = 300;
 /// Rot score at or above which a restart is the hard ceiling: never deferred.
 pub(crate) const RESTART_HARD_CEILING_SCORE: u32 = 90;
-/// The Stop rot advisory is never held past this many Stops...
+/// The Stop rot advisory is never held past this many Stops..
 pub(crate) const STOP_ADVISORY_MAX_DEFER_TURNS: u32 = 3;
 /// ...or this many seconds.
 pub(crate) const STOP_ADVISORY_MAX_DEFER_SECS: u64 = 1800;

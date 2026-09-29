@@ -1,27 +1,13 @@
 //! Issue #455: the durable half of route health -- `<state>/health/
 //! <harness>.json`, one file per harness.
 //!
-//! Everything that decides anything lives in [`super::health`] and is pure;
-//! this module is only the read/write seam plus the one-line decision-log
-//! record each phase change earns. Every failure here is swallowed: a health
-//! file that cannot be read is `Healthy` (routing behaves exactly as it did
-//! before this feature existed), and one that cannot be written is silently
-//! dropped, never an error a supervised session can feel.
+//! Health decisions are pure in `super::health`; this module only persists records.
+//! Read failures default to `Healthy`, and write failures cannot interrupt a session.
 //!
-//! There is no verb for clearing a record: deleting
-//! `<state>/health/<harness>.json` resets that route by hand, and every
-//! phase heals on its own anyway (see [`super::health::Phase`]).
-//!
-//! Every read-modify-write here holds one advisory OS lock per harness,
-//! taken with `try_lock` and skipped when contended (review round 1, finding
-//! 7; round 2, finding 2). Two processes legitimately fold into the
-//! same record -- a dashboard pane's `cached_score` and that same pane's own
-//! Stop hook -- and while row identity already stops a double COUNT, an
-//! unlocked read-modify-write still loses whichever write lands second.
-//! Reuses `state::try_acquire_lock`/`state::FileLock` (issue #728), the same
-//! shared advisory-lock guard every other ctx state store uses, so this
-//! module does not have to re-derive the unix-mode-0600-vs-portable
-//! `OpenOptions` split.
+//! A per-harness `try_lock` covers each read-modify-write. Contention skips the update
+//! because supervision cannot wait on another process's I/O.
+// There is no verb for clearing a record: deleting <state>/health/<harness>.json resets that route
+// by hand, and every phase heals on its own.
 
 use std::path::PathBuf;
 
@@ -74,13 +60,9 @@ fn lock_path(state: &StateDir, key: &RouteKey) -> PathBuf {
     dir(state).join(format!("{}.lock", key.file_stem()))
 }
 
-/// `try_lock`, never `lock` (review round 2, finding 2): this critical
-/// section is reached from `wrap`'s own Stop hook and from both headless
-/// supervisors, and a supervisor may not block on another process's I/O.
-/// A contended lock means a concurrent holder is folding the SAME transcript
-/// rows, so skipping the fold loses nothing -- the same reasoning
-/// `supervise.rs` documents for its own signal handler. Shares `state::
-/// try_acquire_lock` (issue #728) rather than a hand-rolled guard.
+/// Use `try_lock` in supervision paths; contention must degrade routing without blocking
+/// the live session (#728).
+// A contended lock means a concurrent holder is folding the SAME transcript rows, so skipping loses nothing.
 fn lock_route(state: &StateDir, key: &RouteKey) -> CtxResult<super::state::FileLock> {
     super::state::create_private_dir_all(&dir(state))?;
     super::state::try_acquire_lock(&lock_path(state, key))
@@ -119,10 +101,10 @@ fn store(state: &StateDir, key: &RouteKey, health: &RouteHealth, model: Option<&
     let Ok(json) = serde_json::to_string_pretty(&record) else {
         return;
     };
-    // Swallowed in both directions, and deliberately NOT written to stderr:
-    // this runs inside `wrap`'s own supervision of a live PTY session, where
-    // a stray line is a visible defect. A route whose health cannot be
-    // persisted simply behaves as it did before this feature existed.
+    // Deliberately not written to stderr: this runs inside wrap's supervision of a live PTY session,
+    // where a stray line is a visible defect.
+    // Persistence failure leaves route health unavailable and must not interrupt
+    // supervision.
     let _ = super::state::create_private_dir_all(&dir(state))
         .and_then(|()| super::state::write_private(&record_path(state, key), &json));
 }
@@ -137,10 +119,8 @@ pub fn observe_and_persist(
     now: u64,
     policy: &HealthPolicy,
 ) -> Option<Transition> {
-    // Finding 7: the lock covers the load AND the store. A failure to take
-    // it is swallowed like every other I/O failure here -- routing then
-    // behaves as it did before this feature existed, which is strictly
-    // better than a supervised session feeling an error.
+    // Hold the lock across load and store; contention must remain best effort for live
+    // supervision.
     let _lock = lock_route(state, key).ok()?;
     let current = load(state, key, now);
     let (next, transition) = health::observe(&current, observed, now, policy);
@@ -211,10 +191,9 @@ pub fn record_samples_and_persist(
     now: u64,
     policy: &HealthPolicy,
 ) -> Option<Transition> {
-    // Finding 9: a poll with no samples of its own still has to reach a
-    // degrade verdict once a record exists -- its numerator is whatever the
-    // errors folded a moment ago left behind. Only a route with no record at
-    // all and nothing to add is skipped.
+    // A poll with no samples of its own still has to reach a degrade verdict once a record
+    // exists -- its numerator is whatever the errors folded a moment ago left behind. Only
+    // a route with no record at all and nothing to add is skipped.
     if successes.is_empty() && latencies.is_empty() && !record_path(state, key).exists() {
         return None;
     }
@@ -442,11 +421,10 @@ pub fn harness_admission(
 /// `route::FailureRouting` files its evidence under: the endpoint host, the
 /// credential (account), and the credential/model pair.
 ///
-/// Issue #554: this is what "the breaker is keyed per route" means in
-/// practice. The three keys are separate records on purpose -- an endpoint
-/// outage denies every route on that host, a rejected credential denies only
-/// that account, and a model-access failure denies only that model -- so a
-/// caller asking "may this route run" has to consult all three.
+/// This is what "the breaker is keyed per route" means in practice. The three keys are
+/// separate records on purpose -- an endpoint outage denies every route on that host, a
+/// rejected credential denies only that account, and a model-access failure denies only
+/// that model -- so a caller asking "may this route run" has to consult all three (#554).
 pub fn native_route_keys(identity: &super::route::RouteIdentity) -> Vec<RouteKey> {
     use super::health::RouteScope;
 
@@ -598,9 +576,9 @@ pub fn observe_poll(
         return;
     }
     let key = RouteKey::new(harness);
-    // Finding 6: before anything else, so an elapsed cooldown becomes a
-    // persisted `HalfOpen` with its own `health-half-open` line rather than
-    // a phase only ever derived on the fly and never recorded.
+    // Before anything else, so an elapsed cooldown becomes a persisted `HalfOpen` with its
+    // own `health-half-open` line rather than a phase only ever derived on the fly and
+    // never recorded.
     if let Some(transition) = promote_and_persist(state, &key, model, now, policy) {
         log_transition(state, &key, &transition, now, session, verb);
     }

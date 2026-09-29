@@ -137,14 +137,13 @@ pub fn route_env(
 
 // -- Policy fingerprint -------------------------------------------------
 
-/// sha256, first 16 hex chars, over the policy-relevant config subset: `[jev]`
-/// gates/ttl/floors, `[proxy] min_confidence`/`min_margin`, the `[handover]`
-/// ladder, `[headless.effort]`, and `[score]`'s token ratios. Built from a
-/// hand-picked `serde_json::Value` (rather than deriving `Serialize` on the
-/// config structs themselves, which stay load-only) so two configs that agree
-/// on every policy-relevant key -- whatever else differs -- fingerprint
-/// identically; two that disagree on any of them never collide by construction
-/// (the input is exact field values, not a lossy summary).
+/// Sha256, first 16 hex chars, over the policy-relevant config subset: `[jev]`
+/// gates/ttl/floors, `[proxy] min_confidence`/`min_margin`, the `[handover]` ladder,
+/// `[headless.effort]`, and `[score]`'s token ratios. Built from a hand-picked
+/// `serde_json::Value` (rather than deriving `Serialize` on the config structs themselves,
+/// which stay load-only) so two configs that agree on every policy-relevant key -- whatever
+/// else differs -- fingerprint identically; two that disagree on any of them never collide
+/// by construction (the input is exact field values, not a lossy summary).
 pub fn policy_fingerprint(cfg: &CtxConfig) -> String {
     let jev = &cfg.jev;
     let floor = |f: &super::config::JevSiteFloor| serde_json::json!({"min_confidence": f.min_confidence, "min_margin": f.min_margin});
@@ -287,10 +286,8 @@ pub struct Receipt {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
-    /// `run.py`'s own `make_receipt` emits Anthropic's own field spelling,
-    /// `cache_creation_input_tokens`/`cache_read_input_tokens` -- accepted
-    /// here as aliases so a receipt line it writes never silently parses
-    /// with these at 0 (issue-review finding R6).
+    /// Accept Anthropic cache usage field names as aliases so receipts retain their
+    /// measured values.
     #[serde(default, alias = "cache_creation_input_tokens")]
     pub cache_creation_tokens: u64,
     #[serde(default, alias = "cache_read_input_tokens")]
@@ -723,14 +720,7 @@ struct EffectCountRow {
 struct ProxyDecisionCountRow {
     #[serde(default)]
     attribution: Attribution,
-    /// `"typesafe"|"helper"|"deterministic"` (kebab-case, matching
-    /// `proxy::decision::Decider`'s own serde spelling). `#[serde(default)]`
-    /// so a decision persisted before this field is read here still counts
-    /// toward the plain `proxy:decision` bucket, just not the per-decider
-    /// one. Issue #803: `proxy:decision` alone is written even when Jev
-    /// never actually ran (the deterministic decider still appends a row),
-    /// so it cannot prove the production Jev intake path ran --
-    /// `proxy:decider:typesafe`/`proxy:decider:helper` can.
+    /// Missing decider fields default to the plain proxy total for older rows (#803).
     #[serde(default)]
     decider: Option<String>,
 }

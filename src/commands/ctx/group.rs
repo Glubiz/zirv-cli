@@ -29,7 +29,7 @@ pub struct WorkGroup {
     /// Older records predate the meter and therefore start at zero.
     #[serde(default)]
     pub spent_tokens: u64,
-    /// Issue #301: token ceilings promised to admitted children whose spend
+    /// Token ceilings promised to admitted children whose spend
     /// has not yet rolled up into `spent_tokens` -- reserved atomically by
     /// [`admit_child`] in the same locked transaction as the admission
     /// itself, and later either rolled into `spent_tokens` by
@@ -38,17 +38,12 @@ pub struct WorkGroup {
     /// group's entire remaining budget (`token_budget - spent_tokens`),
     /// since neither's spend had rolled up when the other was admitted.
     /// `#[serde(default)]`: an older record predates the reservation and so
-    /// has nothing outstanding.
+    /// has nothing outstanding (#301).
     #[serde(default)]
     pub reserved_tokens: u64,
     #[serde(default)]
     pub deadline_secs: Option<u64>,
-    /// Display-only (issue #155 review finding D2): the terms every child
-    /// must satisfy before the group can close, shown by `zirv ctx group
-    /// status` and nothing else. Nothing parses or enforces it -- there is
-    /// no verified, adapter-agnostic way to check a delegated worker's own
-    /// transcript against free text, so this stays exactly what an operator
-    /// or reviewing orchestrator reads, never a machine-checked gate.
+    /// Status displays these terms; no adapter parses or enforces them (#155).
     pub completion_contract: String,
     pub created_at: u64,
     #[serde(default)]
@@ -60,7 +55,7 @@ pub struct WorkGroup {
     /// [`admit_child`], the sole place any admission is granted.
     #[serde(default)]
     pub admitted_children: u32,
-    /// Issue #170: the session id of the SubOrchestrator this group is bound
+    /// The session id of the SubOrchestrator this group is bound
     /// to -- first-claim-wins (`claim_sub_orchestrator`), so a group either
     /// belongs to no coordinator yet or to exactly one for its whole life.
     /// Drives two things: the group closes automatically once that session's
@@ -69,7 +64,7 @@ pub struct WorkGroup {
     /// from "still open because its coordinator died before it could close
     /// this itself." `None` for a group with no coordinator claim yet -- a
     /// plain one-off batch of workers reporting straight to an Orchestrator,
-    /// or a group written by an older build.
+    /// or a group written by an older build (#170).
     #[serde(default)]
     pub sub_orchestrator_session: Option<String>,
 }
@@ -157,7 +152,7 @@ pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
     Ok(())
 }
 
-/// Issue #317: read-only view of the durable task cards (`task.rs`) belonging
+/// Read-only view of the durable task cards (`task.rs`) belonging
 /// to `group_id` -- a card outlives any one delegation and is tracked
 /// entirely independently of this group's own admission/spend ledger, which
 /// this never reads or touches. A `WorkGroup` record carries no repository of
@@ -166,7 +161,7 @@ pub fn close(state: &StateDir, id: &str, now: u64) -> CtxResult<()> {
 /// requiring a repo to be named up front -- best-effort like every other
 /// reader here: a directory that cannot be read, or a repository with no
 /// cards naming this group, contributes nothing rather than failing the
-/// whole lookup.
+/// whole lookup (#317).
 pub fn cards_for_group(state: &StateDir, group_id: &str) -> Vec<super::task::Card> {
     let Ok(entries) = std::fs::read_dir(state.tasks()) else {
         return Vec::new();
@@ -215,7 +210,7 @@ pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool
 /// admits nowhere in `agent.rs` itself; whichever side actually ends up
 /// spawning is the one that calls this).
 ///
-/// Issue #301: also resolves and reserves this child's own token ceiling, in
+/// Also resolves and reserves this child's own token ceiling, in
 /// the SAME locked transaction as the admission itself -- the group's
 /// `token_budget` minus what has already been spent AND what is already
 /// reserved for other admitted-but-not-yet-settled children, further
@@ -233,7 +228,7 @@ pub fn is_admission_exhausted(error: &(dyn std::error::Error + 'static)) -> bool
 /// since neither's spend had rolled up when the other was admitted. The
 /// caller settles this exact amount later via [`settle_reservation`], or
 /// releases it via [`rollback_admission`] if the spawn it was granted for
-/// never actually happens.
+/// never actually happens (#301).
 ///
 /// The complete read/check/increment/reserve/write transaction is serialized
 /// by the group's interprocess lock, as are every other mutation below it.
@@ -311,22 +306,8 @@ pub fn settle_reservation(state: &StateDir, id: &str, reserved: u64, actual: u64
     create(state, &group)
 }
 
-/// Re-review (2026-08-27) finding 1: rolls back one admission granted by
-/// [`admit_child`] when the spawn/delegation it was granted for turns out to
-/// fail before a child is ever actually launched -- both real choke points
-/// (`agent::run_with`'s headless path, `dash::fulfill_spawn_request`'s pane
-/// path) call this on every failure between a successful `admit_child` and
-/// the point the child is definitely running. Saturating-decrements
-/// `admitted_children`, never below zero, and releases `reserved` (issue
-/// #301: the exact ceiling `admit_child` reserved for this admission, `0`
-/// when it reserved nothing) from `reserved_tokens` the same way.
-///
-/// Best-effort, unlike `admit_child`: logs to stderr and returns rather than
-/// propagating a second error over the original spawn failure that triggered
-/// the rollback -- an operator who already sees a spawn error must not also
-/// see "the state file wouldn't decrement" stacked on top of it. The same
-/// per-group lock as `admit_child`/`close` keeps this rollback from losing a
-/// concurrent mutation.
+/// Roll back a group admission if launch fails before a child starts, preserving the child
+/// limit (#301).
 pub fn rollback_admission(state: &StateDir, id: &str, reserved: u64) {
     let Ok(_lock) = lock_group(state, id) else {
         eprintln!("zirv ctx: failed to lock work group '{id}' for admission rollback");
@@ -349,20 +330,7 @@ pub fn rollback_admission(state: &StateDir, id: &str, reserved: u64) {
     }
 }
 
-/// Security review round 2 (Finding 4): removes a group record that was
-/// minted for a delegation which then never started. `agent::resolve_group_
-/// binding` mints a `--scope` group before the refusal gates downstream of it
-/// have all been passed (a dashboard that refuses the spawn, a budget that
-/// cannot be resolved, a launch that fails outright), and each such refusal
-/// used to leave an open, unclaimed, childless group on disk forever.
-///
-/// Only a PRISTINE group is ever removed -- no admitted child, no coordinator
-/// claim, not already closed -- so anything that did in fact start under it
-/// keeps its record: a dashboard that spawned the pane admits and claims
-/// before this side's ack can time out, which is exactly the ambiguous case
-/// this guard exists for. Returns whether the record was removed, and is
-/// best-effort otherwise: the delegation being unwound is the caller's real
-/// news, never this.
+/// Remove a newly minted group if downstream refusal prevents any child from starting.
 pub fn discard_if_unused(state: &StateDir, id: &str) -> bool {
     let Ok(_lock) = lock_group(state, id) else {
         return false;
@@ -390,13 +358,12 @@ pub fn is_overdue(group: &WorkGroup, now: u64) -> bool {
             .is_some_and(|deadline| now > group.created_at.saturating_add(deadline))
 }
 
-/// Issue #170: binds `group` to `session` as its SubOrchestrator, first-
-/// claim-wins. A no-op (`Ok`, unchanged) when the group is already claimed --
-/// by `session` itself (idempotent: a coordinator that resolves its own
-/// already-bound group again must not error) or by a different one (the
-/// group already belongs to whichever session claimed it first; a second
-/// claimant simply never becomes the one `agent::run_with` auto-closes it
-/// for). Load-modify-write, like every other mutation in this file.
+/// Binds `group` to `session` as its SubOrchestrator, first-claim-wins. A no-op (`Ok`,
+/// unchanged) when the group is already claimed -- by `session` itself (idempotent: a
+/// coordinator that resolves its own already-bound group again must not error) or by a
+/// different one (the group already belongs to whichever session claimed it first; a second
+/// claimant simply never becomes the one `agent::run_with` auto-closes it for).
+/// Load-modify-write, like every other mutation in this file (#170).
 pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxResult<()> {
     let _lock = lock_group(state, id)?;
     let Some(mut group) = load(state, id)? else {
@@ -409,7 +376,7 @@ pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxR
     Ok(())
 }
 
-/// Issue #170: an open group whose claimed SubOrchestrator (`sub_
+/// An open group whose claimed SubOrchestrator (`sub_
 /// orchestrator_session`) is no longer alive -- its own session ended
 /// (crashed, was killed, or the process otherwise vanished) without ever
 /// reaching `agent::run_with`'s own completion path, which is what closes a
@@ -419,7 +386,7 @@ pub fn claim_sub_orchestrator(state: &StateDir, id: &str, session: &str) -> CtxR
 /// "caller supplies `now`" testability shape -- this module has no reason to
 /// depend on `sessions.rs` for a process-liveness check. A group with no
 /// claim yet is never abandoned: nothing has failed to close it, because
-/// nothing has claimed responsibility for closing it.
+/// nothing has claimed responsibility for closing it (#170).
 pub fn is_abandoned(group: &WorkGroup, claimant_alive: bool) -> bool {
     group.closed_at.is_none() && group.sub_orchestrator_session.is_some() && !claimant_alive
 }
@@ -511,11 +478,11 @@ pub fn run_create<W: Write>(
 /// `now` is a parameter (not resolved here) so a caller can render a
 /// deterministic overdue marker in a test -- the same seam `run_create`/
 /// `run_close` already take one for.
-/// Issue #170: whether the session named by `short` (`sessions::Record::
+/// Whether the session named by `short` (`sessions::Record::
 /// short`) is currently live, per the same registry `zirv ctx status`
 /// already reads. A short id with no matching record at all (its own file
 /// swept, or never written) reads as not-alive -- there is nothing left to
-/// call live.
+/// call live (#170).
 pub(crate) fn short_id_is_alive(state: &StateDir, short: &str) -> bool {
     super::sessions::list(state)
         .into_iter()
@@ -552,20 +519,19 @@ fn print_group<W: Write>(
     if is_overdue(group, now) {
         write!(w, " OVERDUE")?;
     }
-    // Issue #170: same display-only spirit -- an abandoned group is not
-    // acted on here, only named, so an operator scanning `zirv ctx status`
-    // can tell "still open because the work continues" apart from "still
-    // open because its coordinator died before it could close this itself".
+    // Same display-only spirit -- an abandoned group is not acted on here, only named, so
+    // an operator scanning `zirv ctx status` can tell "still open because the work
+    // continues" apart from "still open because its coordinator died before it could close
+    // this itself" (#170).
     if let Some(sub) = &group.sub_orchestrator_session
         && is_abandoned(group, short_id_is_alive(state, sub))
     {
         write!(w, " ABANDONED")?;
     }
     writeln!(w)?;
-    // Issue #317: durable task cards are tracked independently of this
-    // group's own admission ledger, so a card naming this group is worth
-    // surfacing here even though `admitted_children` above already answers
-    // how many delegations this group let in.
+    // Durable task cards are tracked independently of this group's own admission ledger, so
+    // a card naming this group is worth surfacing here even though `admitted_children`
+    // above already answers how many delegations this group let in (#317).
     let cards = cards_for_group(state, &group.work_group_id);
     if !cards.is_empty() {
         write!(w, "  tasks:")?;

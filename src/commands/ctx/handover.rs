@@ -42,10 +42,9 @@ use super::{CtxResult, adapters, handoff, sessions};
 /// per harness. Anything else is treated as a literal model id.
 pub const TIERS: [&str; 3] = ["cheap", "standard", "deep"];
 
-/// Issue #381: resolves through `catalogue::tier_model` rather than a
-/// hand-written per-agent match -- `catalogue::vendor` returning `None` for
-/// any agent other than `claude`/`codex` already reproduces the old `_ =>
-/// None` arm without a separate catch-all here.
+/// Resolves through `catalogue::tier_model` rather than a hand-written per-agent match --
+/// `catalogue::vendor` returning `None` for any agent other than `claude`/`codex` already
+/// reproduces the old `_ => None` arm without a separate catch-all here (#381).
 fn tier_default(agent: &str, tier: &str) -> Option<&'static str> {
     let vendor_slug = match agent {
         "claude" => "anthropic",
@@ -80,19 +79,7 @@ fn handover_config_tier<'a>(cfg: &'a CtxConfig, agent: &str, tier: &str) -> Opti
     }
 }
 
-/// Resolves `requested` (a generic tier, or a literal model id) for `agent`.
-/// The operator's own configured override (`cfg.handover`, itself already
-/// env-overridden -- see `handover_config_tier`) wins over the built-in
-/// ladder; a value that is not one of `TIERS` at all (a literal model id)
-/// always passes through verbatim, unresolved.
-///
-/// Finding #6: a *tier word* (`cheap`/`standard`/`deep`) for an agent with
-/// no configured override and no built-in ladder entry used to fall through
-/// to `requested` verbatim too -- silently handing the literal string
-/// `"deep"` to a launch argv as if it were a real model id, for any adapter
-/// this ladder does not (yet) know. That is now an error naming the agent,
-/// so the caller finds out at resolution time rather than watching a launch
-/// fail on a model id nobody actually meant.
+/// Reject an unknown model tier instead of passing it through as a literal model id.
 pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult<String> {
     let tier = requested.trim().to_ascii_lowercase();
     if TIERS.contains(&tier.as_str()) {
@@ -244,10 +231,10 @@ pub struct HandoverRequest {
     /// deserialises to. `resolve_swap_launch` is what actually reads it.
     #[serde(default)]
     pub interactive: bool,
-    /// Issue #358 (task 5): whether this swap was decided by `rollover::
-    /// evaluate` rather than typed by an operator. A manual request always
-    /// wins over an automatic one at the supervisors' own request check, and
-    /// only an automatic one may retry the next candidate on failure.
+    /// Whether this swap was decided by `rollover::evaluate` rather than typed by an
+    /// operator. A manual request always wins over an automatic one at the supervisors' own
+    /// request check, and only an automatic one may retry the next candidate on failure
+    /// (#358).
     #[serde(default)]
     pub automatic: bool,
     /// The seat generation `seat::prepare` reserved for this swap, which
@@ -261,23 +248,21 @@ pub struct HandoverRequest {
     /// so spending the round trip only delays the swap.
     #[serde(default)]
     pub structural_only: bool,
-    /// Issue #440: resume THIS conversation natively rather than starting a
-    /// fresh one, when the target adapter has a verified resume mechanism
-    /// (`AgentAdapter::resume_args`). Set only where the swap is putting a
-    /// session back where it already was -- recovering the source after a
-    /// rollover successor died -- never for an ordinary swap onto a
-    /// different harness, which has no conversation of its own to resume. A
-    /// cold launch carrying the structural packet is the fallback whenever
-    /// the adapter has no resume story, and unsaved in-flight state is
-    /// exactly what that fallback cannot carry.
+    /// Resume THIS conversation natively rather than starting a fresh one, when the target
+    /// adapter has a verified resume mechanism (`AgentAdapter::resume_args`). Set only
+    /// where the swap is putting a session back where it already was -- recovering the
+    /// source after a rollover successor died -- never for an ordinary swap onto a
+    /// different harness, which has no conversation of its own to resume. A cold launch
+    /// carrying the structural packet is the fallback whenever the adapter has no resume
+    /// story, and unsaved in-flight state is exactly what that fallback cannot carry
+    /// (#440).
     #[serde(default)]
     pub resume_session: Option<String>,
-    /// Issue #552: the RUNTIME the successor must actually be started on.
-    /// `harness` (the default, and what every pre-#552 request means) starts
-    /// a supervised harness child; `native` starts a native session on
-    /// [`Self::target_route`]. Without this the live swap seams resolved a
-    /// harness adapter unconditionally, so no rollover direction with a
-    /// native target could ever launch the thing it had decided on.
+    /// The RUNTIME the successor must actually be started on. `harness` (the default, and
+    /// what every pre-#552 request means) starts a supervised harness child; `native`
+    /// starts a native session on [`Self::target_route`]. Without this the live swap seams
+    /// resolved a harness adapter unconditionally, so no rollover direction with a native
+    /// target could ever launch the thing it had decided on.
     #[serde(default)]
     pub target_runtime: Option<String>,
     /// The native route a `target_runtime = native` successor runs. Ignored
@@ -397,10 +382,9 @@ pub fn resolve_swap_launch(
     if let Some(model) = &req.target_model {
         extra.extend(new_adapter.model_args(model));
     }
-    // Issue #440: a source recovery resumes the conversation it already had.
-    // `resumes_conversation` is the single answer both this function and
-    // `Pane::handover` read, so the argv and the prompt decision can never
-    // disagree about whether this launch is a resume.
+    // A source recovery resumes the conversation it already had. `resumes_conversation` is
+    // the single answer both this function and `Pane::handover` read, so the argv and the
+    // prompt decision can never disagree about whether this launch is a resume (#440).
     if let Some(session) = &req.resume_session
         && resumes_conversation(new_adapter.as_ref(), req, carries_handoff)
         && let Some(args) = new_adapter.resume_args(session)
@@ -513,12 +497,12 @@ pub fn build_turn_env_at(
         adapters::AGENT_ENV.to_string(),
         new_adapter.name().to_string(),
     ));
-    // Finding #3 (mirrors `dash::build_turn_env`'s identical patch): a
+    // Mirrors `dash::build_turn_env`'s identical patch: a
     // successor adapter with no turn-signal mechanism at all (codex today)
     // returns an empty `env` from `register_turn_signal` above, which used
     // to leave `SESSION_ENV` entirely unset for a claude->codex swap. A
     // turn-signal-capable adapter (claude) already sets this as part of its
-    // own `setup.env`, so it is added here only when not already present.
+    // own `setup.env`, so it is added here only when not already present (#3).
     if !env.iter().any(|(k, _)| k == adapters::SESSION_ENV) {
         env.push((adapters::SESSION_ENV.to_string(), session_id.to_string()));
     }
@@ -589,9 +573,8 @@ pub fn run_with<W: Write>(
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     let state = StateDir::resolve(env)?;
-    // Issue #358 (task 4): a session an automatic rollover already
-    // superseded must not be able to hand its (already stale) seat off
-    // again -- see `seat::fence`'s own doc comment.
+    // A session an automatic rollover already superseded must not be able to hand its
+    // (already stale) seat off again -- see `seat::fence`'s own doc comment (#358).
     super::seat::fence(&state)?;
 
     let session_id = env(super::adapters::SESSION_ENV)
@@ -664,17 +647,14 @@ pub fn run_with<W: Write>(
         target_runtime: None,
         target_route: None,
     };
-    // T4 (C-3): a previous handover attempt (or an automatic rollover that
-    // wrote one before this fix) can leave an ack sitting next to the
-    // request, and the poll below reads whatever is on disk -- so a brand
-    // new request would be "confirmed" by an answer to an older question.
-    // Discard any stale ack before the request goes out.
+    // Clear stale acknowledgements before writing a new request, or a prior
+    // acknowledgement could satisfy it.
     let _ = take_ack(&state, &short);
     write_request(&state, &short, &req)?;
 
-    // wrap's pump loop ticks on its ordinary ~100ms cadence and checks for a
-    // pending request every tick, so a short poll here is not a busy loop --
-    // it is just waiting out the same cadence from the outside.
+    // Wrap's pump loop ticks on its ordinary ~100ms cadence and checks for a pending
+    // request every tick, so a short poll here is not a busy loop -- it is just waiting out
+    // the same cadence from the outside.
     let deadline = Instant::now() + ack_timeout(&cfg);
     loop {
         if let Some(ack) = take_ack(&state, &short) {

@@ -261,7 +261,7 @@ fn find_near_duplicates(candidates: &[OptimizeCandidate]) -> Vec<Finding> {
     out
 }
 
-/// Issue #773: a lightweight, single-entry duplicate/near-duplicate check
+/// A lightweight, single-entry duplicate/near-duplicate check
 /// against a bank's OTHER existing entries, run at `remember` write time
 /// (`memory::warn_if_duplicate_write`) rather than only via the manual
 /// `zirv memory optimize` this module otherwise exists for. Reuses the
@@ -277,7 +277,7 @@ fn find_near_duplicates(candidates: &[OptimizeCandidate]) -> Vec<Finding> {
 /// whitespace/case) or a near-duplicate (Jaccard word overlap at or above
 /// `NEAR_DUPLICATE_THRESHOLD`) of `new_body` -- empty when there is no
 /// overlap worth a warning. Never blocks or alters a write: the caller
-/// decides what, if anything, to do with a non-empty result.
+/// decides what, if anything, to do with a non-empty result (#773).
 pub(crate) fn duplicate_keys_for(new_body: &str, existing: &[(String, String)]) -> Vec<String> {
     let new_norm = normalize_body(new_body);
     if new_norm.is_empty() {
@@ -791,7 +791,7 @@ pub fn apply_consolidation(
         }
 
         let prompt = consolidation_prompt(&survivor.entry, &others);
-        // Issue #89.
+        //  (#89).
         super::adapters::announce_sandbox_residual_once(adapter, cfg.chrome.events);
         let Ok(answer) = super::handoff::helper_answer(
             super::helper::ROLE_DISTILLER,

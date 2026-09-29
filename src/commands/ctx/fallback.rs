@@ -21,11 +21,10 @@ pub const DELEGATION_ENV: &str = "ZIRV_CTX_DELEGATION";
 pub enum RouteReason {
     Exhausted,
     Predictive,
-    /// Issue #455: the requested route's own health breaker is open. Not a
-    /// capacity reason at all -- the account has headroom, the endpoint is
-    /// what cannot be reached.
+    /// The requested route's own health breaker is open. Not a capacity reason at all --
+    /// the account has headroom, the endpoint is what cannot be reached (#455).
     Unhealthy,
-    /// Slice A: the requested route still answers, but its rolling
+    /// The requested route still answers, but its rolling
     /// transport/server error rate (or, when the operator opted in, its
     /// first-token latency) says a healthy alternative will serve this work
     /// better. Only ever chosen when there IS such an alternative.
@@ -54,22 +53,16 @@ pub struct Route {
     pub requested_observed_at: Option<u64>,
     pub selected_headroom_pct: f64,
     pub selected_headroom_assumed: bool,
-    /// Issue #358: the window `allocator::place` scored the target against,
-    /// when this route came from the adaptive path. `None` on the legacy
-    /// (`adaptive_delegation = false`) path, which has no per-window
-    /// concept -- `detail()` only mentions this when it is `Some`.
+    /// The window `allocator::place` scored the target against, when this route came from
+    /// the adaptive path. `None` on the legacy (`adaptive_delegation = false`) path, which
+    /// has no per-window concept -- `detail()` only mentions this when it is `Some` (#358).
     pub binding_window: Option<String>,
-    /// Issue #358: the target provider's already-reserved tokens at
-    /// selection time (from other in-flight adaptive placements plus, once
-    /// task T3 lands, outstanding provider reservations). `0` on the legacy
-    /// path.
+    /// The target provider's already-reserved tokens at selection time (from other
+    /// in-flight adaptive placements plus, once task T3 lands, outstanding provider
+    /// reservations). `0` on the legacy path (#358).
     pub reserved_tokens: u64,
-    /// Issue #455 (review round 1, finding 10): the route-health breaker's
-    /// own reason, when THAT is why this reroute happened. Without it the
-    /// human line paired a perfectly healthy source headroom with an
-    /// unexplained verdict -- an operator reading "low headroom: source
-    /// headroom 95.0%" has no way to know the endpoint was refusing
-    /// connections. `None` for every capacity-driven route.
+    /// Carry the breaker’s reason with a health reroute, even when usage headroom appears
+    /// healthy (#455).
     pub health_reason: Option<String>,
 }
 
@@ -102,8 +95,8 @@ impl Route {
                 )
             })
             .unwrap_or_default();
-        // Finding 10: the breaker's reason replaces the bare label, since
-        // "route unhealthy" alone says nothing an operator can act on.
+        // The breaker's reason replaces the bare label, since "route unhealthy" alone says
+        // nothing an operator can act on.
         let verdict = match (&self.health_reason, self.reason) {
             (Some(reason), RouteReason::Unhealthy | RouteReason::Degraded) => {
                 format!("{}: {reason}", self.reason.label())
@@ -165,10 +158,8 @@ impl TaskBounds {
                 .is_none_or(|tools| tools <= cfg.fallback.small_task_max_tool_calls)
     }
 
-    /// `pub(crate)`, not module-private: `allocator.rs` (issue #358) needs
-    /// this same per-window conversion to evaluate a `WorkUnit`'s bounds
-    /// against every budgeted window in a `CapacitySnapshot`, not just the
-    /// single reading `candidate_headroom` used to look at here.
+    /// Share per-window conversion with allocator so every budgeted window can bound a
+    /// work unit (#358).
     pub(crate) fn required_headroom_pct(self, cfg: &CtxConfig, window: &str) -> Option<f64> {
         let tokens = self.tokens?;
         let budget = match window {
@@ -198,7 +189,7 @@ pub struct RouteRequest<'a> {
     pub delegation: bool,
     pub bounds: TaskBounds,
     pub now: u64,
-    /// Issue #328 fix: a harness [`best_alternate`]/[`earliest_reset_choice`]
+    /// A harness [`best_alternate`]/[`earliest_reset_choice`]
     /// must never select, compared case-insensitively -- an orchestrator
     /// seat's own harness, so a low-headroom `zirv agent <other-harness>`
     /// cannot be silently rerouted back onto the very same seat
@@ -207,7 +198,7 @@ pub struct RouteRequest<'a> {
     /// caller just lost the race for. Empty for every caller with no such
     /// concept -- a running worker's own vendor-blocked reroute
     /// (`route_blocked_session`) is not an orchestrator-seat delegation and
-    /// excludes nothing extra.
+    /// excludes nothing extra (#328).
     pub exclude: &'a [&'a str],
     /// The requesting session's own identity (`mail::session_identity`'s
     /// shape), excluded from its harness's live `active` count by
@@ -284,14 +275,13 @@ pub fn candidate_allowed_by_capacity(cfg: &CtxConfig, name: &str, bounds: TaskBo
     !cfg.agents.is_capacity_small(name) || bounds.is_small(cfg)
 }
 
-/// Issue #358: builds a [`allocator::CapacitySnapshot`] over every harness
-/// named in `cfg.fallback.order`, plus `requested` when it names a harness
-/// not already in that list -- the only I/O in the whole adaptive scheduling
-/// path, so `allocator.rs` itself never needs a `StateDir`. A caller whose
-/// own requested harness has fallen out of (or was never in) `fallback.order`
-/// still needs a `HarnessCapacity`/`ProviderCapacity` entry for it: rule (a)
-/// of `allocator::place` (keep the requested harness when it is `Ready`) can
-/// only ever fire when `snapshot.harness(&unit.requested)` resolves.
+/// Builds a [`allocator::CapacitySnapshot`] over every harness named in
+/// `cfg.fallback.order`, plus `requested` when it names a harness not already in that list
+/// -- the only I/O in the whole adaptive scheduling path, so `allocator.rs` itself never
+/// needs a `StateDir`. A caller whose own requested harness has fallen out of (or was never
+/// in) `fallback.order` still needs a `HarnessCapacity`/`ProviderCapacity` entry for it:
+/// rule (a) of `allocator::place` (keep the requested harness when it is `Ready`) can only
+/// ever fire when `snapshot.harness(&unit.requested)` resolves (#358).
 ///
 /// `requester` is a session identity (`mail::session_identity`'s own shape),
 /// excluded from every harness's live `active` count so a session never
@@ -341,11 +331,11 @@ pub fn capacity_snapshot(
     }
 
     let sessions = sessions::list(state);
-    // Issue #455: resolved once per snapshot; a route is one harness, so
-    // this is one small file read per harness on the single I/O choke point
-    // every routing decision already flows through.
+    // Resolved once per snapshot; a route is one harness, so this is one small file read
+    // per harness on the single I/O choke point every routing decision already flows
+    // through (#455).
     let health_policy = cfg.fallback.effective_health();
-    // Slice B: one map for the whole snapshot, so a harness sharing its
+    // One map for the whole snapshot, so a harness sharing its
     // configured endpoint host with an open one is denied here too -- the
     // per-route read this replaced could not see a sibling's failure.
     let health = super::health_store::admissions(state, cfg, &names, now, &health_policy);
@@ -738,7 +728,7 @@ fn best_alternate(
     request: RouteRequest<'_>,
     excluded: &[String],
 ) -> Option<(String, String, CandidateHeadroom)> {
-    // Slice B: resolved once for the whole walk, so this path sees the same
+    // Resolved once for the whole walk, so this path sees the same
     // shared-endpoint denials `capacity_snapshot` does.
     let health = super::health_store::admissions(
         state,
@@ -766,14 +756,14 @@ fn best_alternate(
         if !candidate_allowed_by_capacity(cfg, name, request.bounds) {
             continue;
         }
-        // Issue #455: the legacy (non-adaptive) path has no `CapacitySnapshot`
-        // of its own, so route health is consulted here directly -- the same
-        // exclusion `allocator::place` applies for the adaptive path.
+        // The legacy (non-adaptive) path has no `CapacitySnapshot` of its own, so route
+        // health is consulted here directly -- the same exclusion `allocator::place`
+        // applies for the adaptive path (#455).
         let verdict = super::health_store::admission_for(&health, name);
         if verdict.denied().is_some() {
             continue;
         }
-        // Slice A: a degraded alternate is still an alternate, it just loses
+        // A degraded alternate is still an alternate, it just loses
         // every comparison to a healthy one.
         let degraded = verdict.degraded().is_some();
         // Selection is the canonical readiness + agent_bin compatibility gate.
@@ -835,28 +825,9 @@ fn best_alternate(
     best.map(|(_, _, name, model, headroom)| (name, model, headroom))
 }
 
-/// Routes a *new* delegation when the requested harness is already refused by
-/// pacing, or predictively once its measured headroom reaches the configured
-/// low-water mark. Unknown headroom does not trigger predictive steering:
-/// uncertainty is treated conservatively and only affects whether an alternate
-/// may be used after a real refusal/block.
-///
-/// Finding #12 (issue #358 review): in `adaptive_delegation` mode, a
-/// requested harness genuinely `Draining` on CONCURRENCY alone (already at
-/// its own `max_active`, independent of usage headroom) used to never
-/// trigger a reroute -- the `reason` gate below only ever asks "is the
-/// source's usage headroom fine", which a `max_active` harness at low usage
-/// answers "yes" to, so the old code returned `None` before the adaptive
-/// path's own `CapacitySnapshot`/`allocator::classify` (which DOES know
-/// about `max_active`) ever ran. Adaptive mode now ALSO builds that snapshot
-/// and treats the requested harness reading `Draining`/`HardBlocked` there
-/// as a second, independent trigger alongside the usual usage-based one --
-/// neither trigger is required over the other, but at least one still is:
-/// a harness with merely an `Unknown` (no usage data yet) or `Ready`
-/// classification and no usage-based trigger either must still not reroute,
-/// or every ordinary delegation with no usage source at all would
-/// unconditionally bounce to an alternate. The `overage_covered` early
-/// return stays unconditional, in every mode.
+/// Adaptive routing must check concurrency capacity independently of usage headroom (#358).
+// A Draining/HardBlocked concurrency reading is a second trigger; an Unknown/Ready harness with no usage
+// trigger must still not reroute, or every delegation with no usage source would bounce.
 pub fn route_new_delegation(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -873,10 +844,9 @@ pub fn route_new_delegation(
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
     let source_reading =
         pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace);
-    // Finding 5: resolved over every harness `cfg.fallback.order` names, not
-    // the requested one alone -- a shared-endpoint denial is only visible
-    // when the SIBLING's record is in the map too, and the single-name map
-    // this replaced could never see one.
+    // Resolved over every harness `cfg.fallback.order` names, not the requested one alone
+    // -- a shared-endpoint denial is only visible when the SIBLING's record is in the map
+    // too, and the single-name map this replaced could never see one.
     let health_policy = cfg.fallback.effective_health();
     let requested_health = super::health_store::admission_for(
         &super::health_store::admissions(
@@ -890,16 +860,15 @@ pub fn route_new_delegation(
     );
     let health_denial = requested_health.denied().map(str::to_string);
     let health_triggered = health_denial.is_some();
-    // Slice A: the only SOFT trigger. A degraded route still answers, so
+    // The only SOFT trigger. A degraded route still answers, so
     // this reroutes only when a healthy alternative actually exists --
     // `allocator::place`'s rule (a) arbitrates that, which is why the
     // requested harness is deliberately NOT excluded below when degradation
     // is the only thing that fired.
     let degraded_reason = requested_health.degraded().map(str::to_string);
     let degrade_triggered = degraded_reason.is_some();
-    // Finding 4: a covered overage means usage has nothing to say, not that
-    // the endpoint is reachable. An open breaker with a healthy alternative
-    // used to return here and never reroute at all.
+    // Covered overage removes usage pressure, but an open health breaker can still require
+    // rerouting.
     if source_reading.is_some_and(|reading| reading.overage_covered) && !health_triggered {
         return None;
     }
@@ -910,11 +879,7 @@ pub fn route_new_delegation(
             .required_headroom_pct(cfg, reading.window)
             .is_some_and(|required| reading.headroom_pct < required)
     });
-    // Finding 4: a COVERED overage is not usage pressure, so it must not
-    // produce a usage reason either -- before health was evaluated first,
-    // such a reading returned early and never reached this match at all, and
-    // letting it label the route "low headroom" would report the covered
-    // overage as the cause of a reroute route health actually triggered.
+    // Covered overage must not produce a usage reason; health is evaluated independently.
     let headroom_reason = if source_reading.is_some_and(|reading| reading.overage_covered) {
         None
     } else {
@@ -957,7 +922,7 @@ pub fn route_new_delegation(
         // delegation only ever steered at the reserve floor or the hard
         // spawn ceiling, never at the 20% threshold the legacy path honours.
         //
-        // Slice A: NOT for a purely degraded route. Excluding it would force
+        // NOT for a purely degraded route. Excluding it would force
         // the work onto an alternative even when every alternative is just as
         // degraded -- rule (a) already keeps a degraded incumbent in exactly
         // that case, and returns an alternative when a healthy one exists.
@@ -992,7 +957,7 @@ pub fn route_new_delegation(
         None => return None,
     };
     let (selected, model, headroom) = best_alternate(state, cfg, request, &[])?;
-    // Slice A: the legacy path has no rule (a) to arbitrate with, so the same
+    // The legacy path has no rule (a) to arbitrate with, so the same
     // "only move to something better" guarantee is enforced here -- trading a
     // degraded route for an equally degraded one is churn, not a reroute.
     if reason == RouteReason::Degraded
@@ -1032,8 +997,8 @@ pub enum TrialClaim {
     Refused(String),
 }
 
-/// Issue #455 slice C, findings 1 and 2: claims the chosen route's single
-/// half-open recovery trial at the moment a placement becomes a launch.
+/// Claims the chosen route's single
+/// half-open recovery trial at the moment a placement becomes a launch (#455).
 ///
 /// A half-open route admits exactly ONE probe. Whoever claims it launches;
 /// anyone else re-plans once with that route excluded, claims the
@@ -1096,10 +1061,9 @@ pub fn claim_route_trial(
 /// decision: the operator's whole fallback order, plus the requested harness
 /// when it is not in it.
 ///
-/// Finding 5: a shared-endpoint denial is a statement about a PAIR, so the
-/// sibling's record has to be in the map or the alias can never be found.
-/// Asking about the requested harness alone silently disabled the whole
-/// alias rule on this path.
+/// A shared-endpoint denial is a statement about a PAIR, so the sibling's record has to be
+/// in the map or the alias can never be found. Asking about the requested harness alone
+/// silently disabled the whole alias rule on this path.
 fn health_names(cfg: &CtxConfig, requested: &str) -> Vec<String> {
     let mut names = cfg.fallback.order.clone();
     if !names

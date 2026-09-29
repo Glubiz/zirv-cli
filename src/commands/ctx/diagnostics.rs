@@ -391,7 +391,7 @@ fn save_diagnostics_record(path: &Path, record: &DiagnosticsRecord) {
     let _ = super::state::write_private(path, &json);
 }
 
-/// Issue #308 stage 1: the Stop-hook advisory itself.
+/// The Stop-hook advisory itself (#308).
 ///
 /// Strict early-return order, every step of which must fail silently (`None`
 /// on the slightest doubt) -- a diagnostics advisory is never worth turning a

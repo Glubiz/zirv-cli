@@ -72,10 +72,9 @@ pub enum Method {
     SessionWait,
     #[serde(rename = "session.report_status")]
     SessionReportStatus,
-    /// Issue #352: the four attachment verbs plus the screen read. All five
-    /// need a runtime that OWNS the session's terminal, so all five are
-    /// gated on [`Capability::SessionAttach`], which a server without a
-    /// [`super::server::SessionHost`] does not advertise.
+    /// The four attachment verbs plus the screen read. All five need a runtime that OWNS
+    /// the session's terminal, so all five are gated on [`Capability::SessionAttach`],
+    /// which a server without a [`super::server::SessionHost`] does not advertise (#352).
     #[serde(rename = "session.attach")]
     SessionAttach,
     #[serde(rename = "session.detach")]
@@ -86,13 +85,13 @@ pub enum Method {
     SessionResize,
     #[serde(rename = "session.screen")]
     SessionScreen,
-    /// Issue #489: the five native verbs. Submit and steer are NOT here --
-    /// they are `session.send_input`'s existing `submit`/`steer` modes, and a
-    /// second way to say "here is input for this session" would be a second
-    /// authorization path to keep in step with the first. What is here is what
-    /// a native session can do that a pty cannot: cancel a turn without ending
-    /// the session, decide an approval, report a delegated task's outcome,
-    /// read the conversation, and page the durable journal by cursor.
+    /// The five native verbs. Submit and steer are NOT here -- they are
+    /// `session.send_input`'s existing `submit`/`steer` modes, and a second way to say
+    /// "here is input for this session" would be a second authorization path to keep in
+    /// step with the first. What is here is what a native session can do that a pty cannot:
+    /// cancel a turn without ending the session, decide an approval, report a delegated
+    /// task's outcome, read the conversation, and page the durable journal by cursor
+    /// (#489).
     #[serde(rename = "session.interrupt")]
     SessionInterrupt,
     #[serde(rename = "session.approve")]
@@ -182,22 +181,19 @@ pub enum Capability {
     /// `session.report_status`.
     #[serde(rename = "session.report_status")]
     SessionReportStatus,
-    /// Issue #352: `session.attach|detach|takeover|resize|screen` -- the
-    /// surface a client needs when the SERVER owns the terminal rather than
-    /// the client. Advertised only by a server with a runtime host attached
-    /// (`zirv session serve`), never by the bounded in-process reference
-    /// server, so a client negotiates it away instead of discovering the
-    /// difference through a failed round trip.
+    /// `session.attach|detach|takeover|resize|screen` -- the surface a client needs when
+    /// the SERVER owns the terminal rather than the client. Advertised only by a server
+    /// with a runtime host attached (`zirv session serve`), never by the bounded in-process
+    /// reference server, so a client negotiates it away instead of discovering the
+    /// difference through a failed round trip (#352).
     #[serde(rename = "session.attach")]
     SessionAttach,
-    /// Issue #489: `session.interrupt|approve|task_result|history|journal` --
-    /// the surface a client needs when the session on the other end is a
-    /// NATIVE conversation rather than a supervised harness process.
-    /// Advertised only by a server with a native host attached (`zirv session
-    /// serve`), so a client that never heard of native sessions negotiates the
-    /// whole surface away instead of discovering it through a failed round
-    /// trip, and a client that knows it disables it locally against an older
-    /// server.
+    /// `session.interrupt|approve|task_result|history|journal` -- the surface a client
+    /// needs when the session on the other end is a NATIVE conversation rather than a
+    /// supervised harness process. Advertised only by a server with a native host attached
+    /// (`zirv session serve`), so a client that never heard of native sessions negotiates
+    /// the whole surface away instead of discovering it through a failed round trip, and a
+    /// client that knows it disables it locally against an older server (#489).
     #[serde(rename = "session.native")]
     SessionNative,
     /// `events.subscribe`.
@@ -303,14 +299,13 @@ pub enum InputMode {
     Submit,
     /// Mid-turn steering, where the backend supports it.
     Steer,
-    /// Issue #352: the literal bytes go to the session's terminal, exactly as
-    /// typed -- control characters, arrow keys and all. Only the CONTROLLER
-    /// of an attached session may send this, and only a server with a
-    /// runtime host has a terminal to send it to; every other server answers
-    /// `unsupported`. It is a separate mode rather than a separate method
-    /// because a raw keystroke is still "input for this session", and giving
-    /// it its own method would mean a second authorization path to keep in
-    /// step with this one.
+    /// The literal bytes go to the session's terminal, exactly as typed -- control
+    /// characters, arrow keys and all. Only the CONTROLLER of an attached session may send
+    /// this, and only a server with a runtime host has a terminal to send it to; every
+    /// other server answers `unsupported`. It is a separate mode rather than a separate
+    /// method because a raw keystroke is still "input for this session", and giving it its
+    /// own method would mean a second authorization path to keep in step with this one
+    /// (#352).
     Raw,
     #[serde(other)]
     Unknown,
@@ -713,10 +708,9 @@ pub enum ApiEvent {
     SessionEnded {
         session_id: String,
     },
-    /// Issue #352: the controller seat for a session changed hands. Emitted
-    /// on every grant, release and takeover, so a takeover is VISIBLE to
-    /// every observer rather than only to the two clients involved.
-    /// `controller` is `null` when the seat is now empty.
+    /// The controller seat for a session changed hands. Emitted on every grant, release and
+    /// takeover, so a takeover is VISIBLE to every observer rather than only to the two
+    /// clients involved. `controller` is `null` when the seat is now empty (#352).
     ControllerChanged {
         #[serde(default)]
         controller: Option<String>,
@@ -806,9 +800,9 @@ const GENERATION_IN: FieldSpec = FieldSpec {
     required: false,
     doc: "pin the call to this session generation; a newer one is refused with stale_generation",
 };
-/// Issue #352. Caller-chosen and caller-owned: the server never invents one,
-/// so a client that reconnects under the same id resumes its own attachment
-/// rather than accumulating ghosts.
+/// Caller-chosen and caller-owned: the server never invents one, so a client that
+/// reconnects under the same id resumes its own attachment rather than accumulating ghosts
+/// (#352).
 const CLIENT_ID: FieldSpec = FieldSpec {
     name: "client_id",
     ty: "string",
@@ -833,12 +827,8 @@ const COLS_IN: FieldSpec = FieldSpec {
     required: false,
     doc: "the controller's own terminal width; ignored for an observer",
 };
-/// Issue #489. Optional on the wire and enforced conditionally: a native
-/// session that NOBODY has attached to is driven by whoever can reach the
-/// owner-only endpoint, exactly as it was before this issue. The moment any
-/// client attaches, seats exist to arbitrate, and every mutation must name a
-/// `client_id` that holds the controller seat -- so an observer cannot mutate
-/// by attaching, and cannot mutate by omitting the field either.
+/// A native session without an attachment uses endpoint ownership; once attached, only its
+/// controller may mutate it (#489).
 const CONTROLLER_ID: FieldSpec = FieldSpec {
     name: "client_id",
     ty: "string",
@@ -1022,11 +1012,10 @@ pub static METHODS: &[MethodSpec] = &[
                 required: true,
                 doc: "the launch prompt; never echoed back in session facts",
             },
-            // Issue #352: what an operator wrote after `--`. Optional and
-            // defaulted, so every v1 caller that never sent it -- including
-            // the frozen fixtures -- is unaffected; a server that ignored it
-            // would silently drop the flags a `zirv chat -- --foo` launch
-            // depends on.
+            // What an operator wrote after `--`. Optional and defaulted, so every v1 caller
+            // that never sent it -- including the frozen fixtures -- is unaffected; a
+            // server that ignored it would silently drop the flags a `zirv chat -- --foo`
+            // launch depends on (#352).
             FieldSpec {
                 name: "extra_args",
                 ty: "string[]",
@@ -1120,9 +1109,9 @@ pub static METHODS: &[MethodSpec] = &[
                 required: true,
                 doc: "",
             },
-            // Issue #489: present only for a session a native host owns, where
-            // the acknowledgement is durable and therefore has an identity to
-            // report. A pty session's keystroke has neither.
+            // Present only for a session a native host owns, where the acknowledgement is
+            // durable and therefore has an identity to report. A pty session's keystroke
+            // has neither (#489).
             FieldSpec {
                 name: "message_id",
                 ty: "string",

@@ -37,13 +37,7 @@ const SCHEMA_VERSION: i64 = 1;
 /// months.
 const RETENTION_DAYS: u64 = 90;
 
-/// [`record`] runs the retention `DELETE` on only one write in this many --
-/// a per-write gate on the INSERTED ROW ID (review finding F6; a `ts %
-/// PRUNE_EVERY == 0` gate re-ran the sweep on every single call inside a
-/// burst that shared one matching wall-clock second) rather than a scheduled
-/// sweep, so `hook::run_posttool` (a hot path: every large `Bash` result
-/// reaches it) pays the cost of a prune scan on exactly one write in 64, not
-/// every write whose timestamp happens to land on a multiple of it.
+/// Gate retention on inserted row id so bursts do not trigger a sweep on every write.
 const PRUNE_EVERY: u64 = 64;
 
 /// How `hook::run_posttool` disposed of one `Bash` tool result -- the
@@ -109,21 +103,10 @@ pub struct CompactionRow<'a> {
     pub retrieval_id: Option<&'a str>,
 }
 
-/// Opens (creating if absent) `<state>/ledger.sqlite`, ensuring the
-/// `compactions` table and its `ts` index exist. Never migrates: today
-/// there is exactly one schema version, stamped via `PRAGMA user_version`
-/// only on a fresh file.
-///
-/// Review finding F7: the pragma/DDL batch and the `user_version` write used
-/// to run on EVERY call -- both CREATE statements plus a write to the
-/// database header -- for every `Bash` result that reaches `hook::
-/// run_posttool`, including every one below its compaction threshold. Now
-/// runs only when the file did not already exist before this call, or (a
-/// stray zero-byte file, or a previous run that crashed between creating it
-/// and running the schema step) `user_version` still reads its
-/// freshly-created-file default of `0`. A steady-state call -- the file
-/// exists and already carries this module's own `SCHEMA_VERSION` -- opens
-/// and returns, leaving the header and `sqlite_master` untouched.
+/// Stamp schema version only for a newly created database; existing files may contain a
+/// different schema.
+// Runs the schema step only for a new file, or one whose user_version is still 0 (a crash between
+// creating it and the schema step); never migrates.
 fn open(state: &StateDir) -> rusqlite::Result<rusqlite::Connection> {
     let root = state.root();
     let _ = state::create_private_dir_all(root);

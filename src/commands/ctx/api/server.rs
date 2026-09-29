@@ -53,10 +53,9 @@ const MAX_SUBSCRIBER_BACKLOG: usize = MAX_EVENTS;
 /// How many idempotency keys the server remembers, evicted oldest-first.
 const MAX_IDEMPOTENCY: usize = 256;
 
-/// Issue #489: the hard bound on one `session.history` or `session.journal`
-/// page. Fan-out has to be bounded at the server, not by a client's own
-/// politeness: a cursor read of an hour-long conversation would otherwise
-/// serialize the whole journal into one frame.
+/// The hard bound on one `session.history` or `session.journal` page. Fan-out has to be
+/// bounded at the server, not by a client's own politeness: a cursor read of an hour-long
+/// conversation would otherwise serialize the whole journal into one frame (#489).
 const MAX_PAGE: usize = 256;
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
@@ -94,7 +93,7 @@ impl SessionSource for RegistrySource {
     }
 }
 
-/// Issue #352: the seam to a runtime that OWNS the sessions' terminals.
+/// The seam to a runtime that OWNS the sessions' terminals (#352).
 ///
 /// `ApiServer` deliberately holds no pty, no child process and no vt100
 /// parser of its own: it is the protocol, and the protocol must not grow a
@@ -146,9 +145,8 @@ pub trait SessionHost: Send + Sync + std::fmt::Debug {
     fn stop(&self, session_id: &str) -> Result<bool, ApiError>;
 }
 
-/// Issue #489: the seam to the runtime that owns the NATIVE conversations,
-/// the exact counterpart of [`SessionHost`] for sessions that have a journal
-/// instead of a pseudoterminal.
+/// The seam to the runtime that owns the NATIVE conversations, the exact counterpart of
+/// [`SessionHost`] for sessions that have a journal instead of a pseudoterminal (#489).
 ///
 /// It is a second trait rather than more methods on [`SessionHost`] because
 /// the two own genuinely different things: a pty host can be resized, typed
@@ -282,9 +280,9 @@ struct Inner {
     /// in flight", and the client driving a session knows better. Every
     /// other field still comes from the source on every refresh.
     reported: BTreeMap<String, SessionState>,
-    /// Issue #352: the controller seat this server last ANNOUNCED for each
-    /// session, so `controller_changed` is emitted once per real change
-    /// rather than once per attachment call.
+    /// The controller seat this server last ANNOUNCED for each session, so
+    /// `controller_changed` is emitted once per real change rather than once per attachment
+    /// call (#352).
     controllers: BTreeMap<String, Option<String>>,
     live_attachments: BTreeSet<(String, String)>,
 }
@@ -336,16 +334,14 @@ pub struct ApiServer {
     inner: Mutex<Inner>,
     backend: Mutex<Option<Box<dyn RuntimeBackend + Send>>>,
     source: Box<dyn SessionSource>,
-    /// Issue #352. `None` for every server issue #353 shipped, which is why
-    /// the attachment capability is negotiated away rather than advertised
-    /// and then refused.
+    /// `None` for every server issue #353 shipped, which is why the attachment capability
+    /// is negotiated away rather than advertised and then refused (#352).
     host: Mutex<Option<Arc<dyn SessionHost>>>,
-    /// Issue #489. `None` for every server that owns no native conversations,
-    /// which is why the native capability is negotiated away rather than
-    /// advertised and then refused.
+    /// `None` for every server that owns no native conversations, which is why the native
+    /// capability is negotiated away rather than advertised and then refused (#489).
     native: Mutex<Option<Arc<dyn NativeHost>>>,
-    /// Issue #352. Serialises "mutate the host's attachment table, then
-    /// announce the controller it produced" into one critical section.
+    /// Serialises "mutate the host's attachment table, then announce the controller it
+    /// produced" into one critical section (#352).
     ///
     /// The two pieces of state involved live behind two different mutexes --
     /// the HOST's session table and this server's `controllers` cache -- and
@@ -392,10 +388,10 @@ impl ApiServer {
         server
     }
 
-    /// Issue #352: hands this server the runtime that owns the terminals.
-    /// Called once, by `session::service`, before the listener binds --
-    /// attaching a host mid-flight would let two connections disagree about
-    /// which capabilities were advertised to them.
+    /// Hands this server the runtime that owns the terminals. Called once, by
+    /// `session::service`, before the listener binds -- attaching a host mid-flight would
+    /// let two connections disagree about which capabilities were advertised to them
+    /// (#352).
     pub fn attach_host(&self, host: Arc<dyn SessionHost>) {
         match self.host.lock() {
             Ok(mut guard) => *guard = Some(host),
@@ -414,9 +410,9 @@ impl ApiServer {
         }
     }
 
-    /// Issue #489: hands this server the runtime that owns the native
-    /// conversations. Called once, by `session::service`, before the listener
-    /// binds -- same rule, and same reason, as [`Self::attach_host`].
+    /// Hands this server the runtime that owns the native conversations. Called once, by
+    /// `session::service`, before the listener binds -- same rule, and same reason, as
+    /// [`Self::attach_host`] (#489).
     pub fn attach_native(&self, native: Arc<dyn NativeHost>) {
         match self.native.lock() {
             Ok(mut guard) => *guard = Some(native),
@@ -781,10 +777,9 @@ impl ApiServer {
             surface: UiSurface,
             cwd: String,
             prompt: String,
-            /// Issue #352: the operator's own trailing arguments. Defaulted,
-            /// so a caller that never sends them is unchanged -- but parsed,
-            /// because dropping them silently is how `zirv chat -- --model x`
-            /// quietly became `zirv chat`.
+            /// The operator's own trailing arguments. Defaulted, so a caller that never
+            /// sends them is unchanged -- but parsed, because dropping them silently is how
+            /// `zirv chat -- --model x` quietly became `zirv chat` (#352).
             #[serde(default)]
             extra_args: Vec<String>,
         }
@@ -800,11 +795,10 @@ impl ApiServer {
             prompt: params.prompt,
             extra_args: params.extra_args,
         };
-        // Issue #489: a native spec goes to the native host when there is one.
-        // Checked BEFORE the pty host, because `session.start` is one verb for
-        // both kinds of session -- a client that had to know which runtime it
-        // was talking to before it could ask for a session would not be
-        // speaking one protocol.
+        // A native spec goes to the native host when there is one. Checked BEFORE the pty
+        // host, because `session.start` is one verb for both kinds of session -- a client
+        // that had to know which runtime it was talking to before it could ask for a
+        // session would not be speaking one protocol (#489).
         if spec.runtime == RuntimeKind::Native
             && let Some(native) = self.native()
         {
@@ -822,9 +816,9 @@ impl ApiServer {
             );
             return Ok(json!({ "session": facts }));
         }
-        // Issue #352: a runtime that owns terminals answers `session.start`
-        // itself. Checked before the backend, and only when a host is
-        // attached at all, so the server issue #353 shipped is unaffected.
+        // A runtime that owns terminals answers `session.start` itself. Checked before the
+        // backend, and only when a host is attached at all, so the server issue #353
+        // shipped is unaffected (#352).
         if let Some(host) = self.host() {
             let facts = host.start(&spec)?;
             let mut inner = self.lock();
@@ -877,15 +871,14 @@ impl ApiServer {
         if facts.state == SessionState::Ended {
             return Ok(json!({ "stopped": false }));
         }
-        // Issue #352: a session the runtime host owns is stopped through the
-        // host's own child-termination ladder. This is the ONE path that ends
-        // a session -- `session.detach` and a dropped connection never reach
-        // it, which is what "client disconnection never terminates an agent"
-        // means in code rather than in prose.
+        // A session the runtime host owns is stopped through the host's own
+        // child-termination ladder. This is the ONE path that ends a session --
+        // `session.detach` and a dropped connection never reach it, which is what "client
+        // disconnection never terminates an agent" means in code rather than in prose
+        // (#352).
         match (self.native_owner(&facts.session_id), self.host(), handle) {
-            // Issue #489: a native conversation ends through its own host, so
-            // its journal is completed and its registry record released by the
-            // same code that filed them.
+            // A native conversation ends through its own host, so its journal is completed
+            // and its registry record released by the same code that filed them (#489).
             (Some(native), _, _) => {
                 native.stop(&facts.session_id)?;
             }
@@ -963,9 +956,8 @@ impl ApiServer {
             generation: params.generation,
         };
         let (facts, handle) = self.resolve(&target)?;
-        // Issue #489: a native conversation's input is recorded durably by its
-        // own host, under the caller's idempotency key, before this method can
-        // report it accepted.
+        // A native conversation's input is recorded durably by its own host, under the
+        // caller's idempotency key, before this method can report it accepted (#489).
         if let Some(native) = self.native_owner(&facts.session_id) {
             let steering = match params.mode {
                 InputMode::Submit => false,
@@ -1005,10 +997,9 @@ impl ApiServer {
                 "duplicate": ack.duplicate,
             }));
         }
-        // Issue #352: raw bytes belong to the terminal, so they go to the
-        // runtime host and never to a `RuntimeBackend` -- a backend has no
-        // keyboard. Handled before the handle lookup below, because a
-        // host-owned session has no backend handle at all.
+        // Raw bytes belong to the terminal, so they go to the runtime host and never to a
+        // `RuntimeBackend` -- a backend has no keyboard. Handled before the handle lookup
+        // below, because a host-owned session has no backend handle at all (#352).
         if params.mode == InputMode::Raw {
             let Some(client_id) = params.client_id.as_deref() else {
                 return Err(ApiError::new(
@@ -1094,18 +1085,11 @@ impl ApiServer {
     // Native sessions (issue #489)
     // -----------------------------------------------------------------
 
-    /// Issue #489's controller rule, in one place so all five native
-    /// mutations cannot enforce it five different ways.
-    ///
-    /// A session NOBODY has attached to is driven by whoever can reach the
-    /// owner-only endpoint -- which is exactly the rule that applied before
-    /// this issue, and the rule a headless `zirv ctx exec` needs. The moment
-    /// any client attaches, seats exist to arbitrate between them, and every
-    /// mutation must name a `client_id` holding the controller seat. That
-    /// closes both halves of "observers cannot mutate state": an observer
-    /// naming itself is refused because it is not the controller, and an
-    /// observer omitting the field is refused because a session with clients
-    /// requires one.
+    /// Enforce controller authority for every native mutation (#489).
+    /// An unattached session uses endpoint ownership; once attached, each
+    /// mutation must name the client holding the controller seat.
+    // An observer naming itself is refused (not the controller) and one omitting client_id is
+    // refused too (a session with clients requires one), so an observer cannot mutate either way.
     fn native_controller_check(
         &self,
         native: &dyn NativeHost,
@@ -1359,9 +1343,9 @@ impl ApiServer {
         // Held across both the host mutation and the announcement: see
         // `attachment_gate`.
         let gate = self.attachment_gate();
-        // Issue #489: the attachment surface is one surface for both kinds of
-        // session. A native conversation has seats and no terminal, so the
-        // size is simply not passed on -- there is nothing to resize.
+        // The attachment surface is one surface for both kinds of session. A native
+        // conversation has seats and no terminal, so the size is simply not passed on --
+        // there is nothing to resize (#489).
         let attachment = match self.native_owner(&params.session_id) {
             Some(native) => native.attach(&params.session_id, &params.client_id, params.mode)?,
             None => self.with_host(|host| {
@@ -1793,16 +1777,16 @@ struct TargetParams {
     generation: Option<u64>,
 }
 
-/// Issue #352: what `detach`, `takeover` and `screen` all take.
+/// What `detach`, `takeover` and `screen` all take (#352).
 #[derive(Debug, Deserialize)]
 struct ClientParams {
     session_id: String,
     client_id: String,
 }
 
-/// Issue #489: what a native mutation that carries no payload of its own
-/// takes. `client_id` is optional on the wire and enforced conditionally --
-/// see [`ApiServer::native_controller_check`].
+/// What a native mutation that carries no payload of its own takes. `client_id` is optional
+/// on the wire and enforced conditionally -- see [`ApiServer::native_controller_check`]
+/// (#489).
 #[derive(Debug, Deserialize)]
 struct NativeParams {
     session_id: String,
@@ -1812,7 +1796,7 @@ struct NativeParams {
     client_id: Option<String>,
 }
 
-/// Issue #489: what the two cursor reads take.
+/// What the two cursor reads take (#489).
 #[derive(Debug, Deserialize)]
 struct CursorParams {
     session_id: String,
@@ -1824,9 +1808,9 @@ struct CursorParams {
     limit: Option<usize>,
 }
 
-/// Issue #489: the two terminal-shaped attachment verbs refused for a native
-/// conversation, by name rather than by a confusing "this server owns no
-/// terminals" from a server that owns plenty -- just not one for this session.
+/// The two terminal-shaped attachment verbs refused for a native conversation, by name
+/// rather than by a confusing "this server owns no terminals" from a server that owns
+/// plenty -- just not one for this session (#489).
 fn no_terminal_here(is_native: bool, verb: &str) -> Result<(), ApiError> {
     if !is_native {
         return Ok(());

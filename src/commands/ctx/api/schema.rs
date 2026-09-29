@@ -439,8 +439,8 @@ fn object_schema(fields: &[FieldSpec]) -> Value {
         "type": "object",
         "properties": Value::Object(properties),
         "required": Value::Array(required),
-        // Issue #353: "unknown fields ignored". Saying so in the schema keeps
-        // a generated client from rejecting a frame a later build extended.
+        // "unknown fields ignored". Saying so in the schema keeps a generated client from
+        // rejecting a frame a later build extended (#353).
         "additionalProperties": true
     })
 }

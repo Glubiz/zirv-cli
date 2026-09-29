@@ -61,7 +61,7 @@ pub struct LearnArgs {
     pub dry_run: bool,
 }
 
-/// A correction must recur at least this many times overall...
+/// A correction must recur at least this many times overall..
 const MIN_OCCURRENCES: usize = 3;
 /// ...across at least this many distinct sessions, so a streak inside one
 /// long session (the exact case `rot.rs`'s own repeat detector already
@@ -214,12 +214,8 @@ impl TokenDiff {
         }
     }
 
-    /// Redacted through `pace::redact_for_log` (issue #425 review, round 2):
-    /// belt and braces alongside [`diff_looks_secret`] filtering a
-    /// secret-shaped diff out of [`find_corrections`] entirely -- this is
-    /// the LAST place raw diff text turns into something written to disk
-    /// (`learned_key`) or printed (`--dry-run`), so it redacts on its own
-    /// rather than trusting every caller to have filtered already.
+    /// Redact diff text at the last rendering seam, even when candidate filtering already
+    /// screened it (#425).
     fn key_fragment(&self) -> String {
         match self {
             TokenDiff::Substitute { from, to, .. } => format!(
@@ -265,17 +261,10 @@ fn diff_matches_class(class: ErrorClass, diff: &TokenDiff) -> bool {
     }
 }
 
-/// Whether any token this diff touches looks secret-shaped under
-/// `pace::redact_for_log` (issue #425 review, round 2): with quote-aware
-/// tokens, the differing token itself can be a whole secret-bearing
-/// argument (`"Authorization: Bearer sk-OLD"` -> `"Authorization: Bearer
-/// sk-NEW"`, classified `PermissionDenied` -- a class `diff_matches_class`
-/// deliberately leaves unconstrained, since a wrong path or missing
-/// argument fix can land anywhere). A secret ROTATION is never a learnable
-/// command correction -- it is not a mistake anyone should be reminded not
-/// to repeat -- so a diff that redacts to something different than it
-/// started as is rejected here, before it ever reaches a group, a memory
-/// key, or a printed line.
+/// Screen the differing quote-aware argument itself; a sensitive value can be embedded in
+/// one argument (#425).
+// A secret rotation is never a learnable correction: a diff that redacts differently is rejected before
+// any group, memory key or printed line.
 fn diff_looks_secret(diff: &TokenDiff) -> bool {
     diff.changed_tokens()
         .into_iter()

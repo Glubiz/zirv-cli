@@ -542,8 +542,6 @@ pub fn style_no_adapter_error(raw: &str, colour: bool) -> String {
     out
 }
 
-// T12b: the reserved bottom status bar.
-
 use super::rot::Verdict;
 
 /// A placeholder for a value that is not yet known -- an en dash, never a

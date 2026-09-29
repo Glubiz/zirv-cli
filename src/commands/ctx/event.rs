@@ -164,21 +164,9 @@ impl TranscriptUsage {
     }
 }
 
-/// The only currency the rot engine and supervisors understand.
-///
-/// `AssistantFinal` is emitted for every assistant message: `text` holds the
-/// concatenated text blocks and is empty for tool-only or thinking-only
-/// messages. The marker signal groups by turn and takes the last non-empty
-/// text; the token gate takes the most recent event's `input_tokens`
-/// regardless of text, so mid-turn token growth is visible.
-///
-/// Issue #455: `Transport`, `Server` and `Auth` split the reachability
-/// failures out of what used to be the catch-all `Other`. They are what
-/// `health.rs` reasons about -- a route that cannot be connected to has full
-/// usage headroom and zero capacity, which no headroom reading can express.
-/// `Overflow` still belongs to rot (the session's own context), `RateLimit`
-/// to `pace` (the account's own capacity), and `Other` remains genuinely
-/// unattributed and changes no routing decision.
+/// Keep `Transport`, `Server`, and `Auth` distinct so route health can act on the failing
+/// hop (#455).
+// Overflow belongs to rot, RateLimit to pace; Other is unattributed and changes no routing decision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderErrorClass {
@@ -274,13 +262,13 @@ pub enum NormalizedEvent {
     AssistantFinal {
         text: String,
         input_tokens: u64,
-        /// Issue #293: same rules as `TurnStart::at_ms`.
+        /// Same rules as `TurnStart::at_ms` (#293).
         at_ms: Option<u64>,
     },
     ToolCall {
         name: String,
         input_hash: u64,
-        /// Issue #293: same rules as `TurnStart::at_ms`.
+        /// Same rules as `TurnStart::at_ms` (#293).
         at_ms: Option<u64>,
     },
     ToolResult {
@@ -388,19 +376,9 @@ pub enum NormalizedEvent {
         new_bytes: u64,
         core_bytes: u64,
     },
-    /// Issue #455: `at` is the transcript ROW's own timestamp in epoch
-    /// seconds and `id` its own row identity (claude's `uuid`; a
-    /// timestamp-plus-content fingerprint for codex, whose rollout rows
-    /// carry no id of their own). Both `None` for a row that states
-    /// neither.
-    ///
-    /// Review round 1, finding 2: route health stamped observations with
-    /// wall-clock `now`, so a poll that re-read a transcript from offset 0
-    /// (a missing or version-bumped checkpoint) folded months-old error
-    /// rows into the current window and opened the breaker on a healthy
-    /// harness. `id` additionally makes an observation idempotent across
-    /// two supervisors reading the same rows. `rot.rs` reads neither field
-    /// and its verdicts are unchanged by them.
+    /// Use each transcript row’s timestamp and identity so rereading a row cannot create a
+    /// new health observation (#455).
+    // `id` also makes an observation idempotent across supervisors reading the same rows; rot.rs reads neither field.
     ProviderError {
         class: ProviderErrorClass,
         at: Option<u64>,
@@ -450,24 +428,21 @@ pub struct Capabilities {
     /// `RotState::score`, so capacity reaches the rot engine without adding
     /// a single fs, clock or env read to a module that must stay pure.
     pub context_window_tokens: Option<u64>,
-    /// Issue #418: whether this agent's own CLI has a documented, user-level
-    /// hooks configuration file zirv can install a `PreToolUse`-equivalent
-    /// guard into (the orchestrator-write guard, the expensive-seat subagent
-    /// guard, and `zirv ctx safety check`'s command-safety verdict), wired
-    /// through `native_hooks::NativeHooks`/`AgentAdapter::native_hooks`. Only
-    /// claude, copilot, droid and gemini are `true`; codex, opencode, pi and
-    /// qwen have no verified native hook surface at all and stay at the
-    /// `Capabilities::default()` `false`.
+    /// Whether this agent's own CLI has a documented, user-level hooks configuration file
+    /// zirv can install a `PreToolUse`-equivalent guard into (the orchestrator-write guard,
+    /// the expensive-seat subagent guard, and `zirv ctx safety check`'s command-safety
+    /// verdict), wired through `native_hooks::NativeHooks`/`AgentAdapter::native_hooks`.
+    /// Only claude, copilot, droid and gemini are `true`; codex, opencode, pi and qwen have
+    /// no verified native hook surface at all and stay at the `Capabilities::default()`
+    /// `false` (#418).
     pub pre_tool_hook: bool,
-    /// Issue #418: whether this agent's own hooks contract can replace a
-    /// tool's result before the model sees it (claude's `PostToolUse`
-    /// `updatedToolOutput`, copilot's `PostToolUse` `modifiedResult`), the
-    /// mechanism the compaction hook (`hook::run_posttool`) depends on. `true`
-    /// only for claude and copilot: droid's docs state `PostToolUse` cannot
-    /// replace output at all, and gemini's `AfterTool` only carries
-    /// `additionalContext`, not a result replacement -- see `droid.rs`'s and
-    /// `gemini.rs`'s own `native_hooks` doc comments for the DOCS-ONLY
-    /// citations.
+    /// Whether this agent's own hooks contract can replace a tool's result before the model
+    /// sees it (claude's `PostToolUse` `updatedToolOutput`, copilot's `PostToolUse`
+    /// `modifiedResult`), the mechanism the compaction hook (`hook::run_posttool`) depends
+    /// on. `true` only for claude and copilot: droid's docs state `PostToolUse` cannot
+    /// replace output at all, and gemini's `AfterTool` only carries `additionalContext`,
+    /// not a result replacement -- see `droid.rs`'s and `gemini.rs`'s own `native_hooks`
+    /// doc comments for the DOCS-ONLY citations (#418).
     pub post_tool_hook: bool,
 }
 
@@ -492,44 +467,28 @@ pub struct StructuralContext {
     /// confirmed passed. Rendered by `handoff::structural`'s `Verification`
     /// section.
     pub last_verification: Option<VerificationOutcome>,
-    /// Issue #455 (partial-stream reconciliation): every tool call the
-    /// adapter saw BEGIN in the scanned range whose result never arrived --
-    /// a `tool_use`/`custom_tool_call` id with no paired `tool_result`/
-    /// `custom_tool_call_output`. A rollover triggered mid-turn drops these
-    /// silently otherwise, and the successor session can neither confirm
-    /// the side effect happened nor safely assume it did not. Capped at
-    /// [`UNRESOLVED_TOOL_CALL_CAP`], newest last.
+    /// Every tool call the adapter saw BEGIN in the scanned range whose result never
+    /// arrived -- a `tool_use`/`custom_tool_call` id with no paired `tool_result`/
+    /// `custom_tool_call_output`. A rollover triggered mid-turn drops these silently
+    /// otherwise, and the successor session can neither confirm the side effect happened
+    /// nor safely assume it did not. Capped at [`UNRESOLVED_TOOL_CALL_CAP`], newest last
+    /// (#455).
     pub unresolved_tool_calls: Vec<UnresolvedToolCall>,
-    /// Issue #455: set when the scanned range's last assistant activity did
-    /// not finish -- a provider-error row with no later successful
-    /// assistant row (both adapters), or, where the transcript shape gives
-    /// a verified marker, a stream that ended mid-turn. Independent of
-    /// `partial_text` below: this is always set on a cut, `partial_text`
+    /// Set when the scanned range's last assistant activity did not finish -- a
+    /// provider-error row with no later successful assistant row (both adapters), or, where
+    /// the transcript shape gives a verified marker, a stream that ended mid-turn.
+    /// Independent of `partial_text` below: this is always set on a cut, `partial_text`
     /// only when there was actually open text at the moment of the cut.
-    /// `handoff::structural` renders this as a `PARTIAL` note in
-    /// `remaining`.
+    /// `handoff::structural` renders this as a `PARTIAL` note in `remaining` (#455).
     pub tail_cut: Option<String>,
-    /// Issue #455 (review round 2): the assistant text that was still OPEN
-    /// -- pushed by an assistant row whose own turn had not yet reached a
-    /// boundary (a `tool_result`/user row, or a successful `end_turn`) --
-    /// at the exact moment `tail_cut` was set. `None` when the cut turn
-    /// itself carried no text (e.g. a bare `tool_use`/`custom_tool_call`
-    /// with nothing else), which must never be confused with "no cut
-    /// happened" (`tail_cut` is the signal for that). The adapter keeps
-    /// this text OUT of `assistant_texts` entirely -- an EARLIER, already-
-    /// closed reply (one a later assistant row or tool result followed)
-    /// stays in `assistant_texts`/`done` untouched even when a cut happens
-    /// afterward, because only the text open at the moment of the cut is
-    /// actually incomplete. Already redacted and capped by the adapter
-    /// (`adapters::redacted_tool_summary`, the same helper `UnresolvedToolCall
-    /// ::summary` uses) before it ever reaches this struct.
+    /// Carry only assistant text open at the cut boundary; do not treat an earlier
+    /// completed reply as partial (#455).
     pub partial_text: Option<String>,
-    /// Issue #455: the subset of `files_modified` whose only introducing
-    /// tool call is itself present in `unresolved_tool_calls` -- the call
-    /// claimed to modify the file, but its result never arrived, so whether
-    /// the write actually happened is unknown. `handoff::structural` renders
-    /// these with an `(unconfirmed)` suffix instead of as a plain, completed
-    /// edit.
+    /// The subset of `files_modified` whose only introducing tool call is itself present in
+    /// `unresolved_tool_calls` -- the call claimed to modify the file, but its result never
+    /// arrived, so whether the write actually happened is unknown. `handoff::structural`
+    /// renders these with an `(unconfirmed)` suffix instead of as a plain, completed edit
+    /// (#455).
     pub unconfirmed_files_modified: Vec<String>,
 }
 
@@ -569,17 +528,10 @@ pub struct ToolInvocation {
     pub error_text: String,
 }
 
-/// Whether a [`VerificationOutcome`]'s status could actually be attributed
-/// to its command, or merely could not be (review finding F1): a shell's
-/// reported exit status describes the LAST simple command it ran, so a
-/// verification marker that is not in that position (`cargo test; echo
-/// done`, `cargo test | tee out.log`) or that only ran conditionally
-/// (`true || cargo test`, which never even ran the test) tells us nothing
-/// about whether the verification itself passed or failed. `Unknown` is
-/// deliberately its own state rather than a bare `Option<bool>` collapsing
-/// into `errored: false`, because "the wrapper reported success" and "we
-/// have no idea what the wrapper's status even measured" must never render
-/// the same way to a successor session.
+/// A shell status belongs to its last simple command; attribute a verification result only
+/// when that command is the verification run.
+// Unknown is its own state, never errored=false: "wrapper reported success" and "status measured
+// something else" must not render alike to a successor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationStatus {
     Passed,
@@ -680,15 +632,8 @@ fn strip_leading_wrappers<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
     &words[idx..]
 }
 
-/// Whether `command`'s text looks like a build/test/lint run. A marker must
-/// match at the START of a shell segment (after stripping leading wrapper
-/// words/assignments), not merely appear anywhere in the command -- so
-/// `echo cargo test`, `rg "cargo test"`, and `git grep cargo test` do not
-/// count as a `cargo test` run, while `sudo make check`, `RUST_LOG=debug
-/// cargo test`, `(cargo test) | tee out.log`, and `cd crate && make test`
-/// still do (review finding). Markers still match at word boundaries within
-/// that leading position, so `cmake --build .`, `chmod +x make_release.sh`,
-/// and `cat Makefile` do not count as a `make` run (earlier review finding).
+/// Match verification markers at shell-segment starts and word boundaries, avoiding
+/// incidental mentions in arguments.
 pub fn looks_like_verification(command: &str) -> bool {
     let lower = command.to_lowercase();
     split_into_segments(&lower)
@@ -724,22 +669,10 @@ fn segment_matches_verification_marker(segment: &str) -> bool {
     })
 }
 
-/// Whether `command`'s reported exit status can actually be attributed to
-/// its LAST verification-marker segment (review finding F1). A shell's exit
-/// status is always the LAST simple command's, so:
-/// - a `&&` chain ending in the verification segment is fine (`cd x &&
-///   cargo test`) -- attributable;
-/// - any `||` anywhere in the command makes it unattributable, since `a ||
-///   cargo test` only runs the test when `a` fails, and `cargo test ||
-///   true` reports `true`'s status regardless of the test;
-/// - a `;`, newline, or trailing `|` after the verification segment
-///   (`cargo test; echo done`, `cargo test | tee out.log`) is
-///   unattributable too, since the reported status is whatever ran last.
-///
-/// Implemented as "the LAST segment (after lowercasing) matches a
-/// verification marker, and the command contains no `||`" -- deliberately
-/// simple, like every other check in this module: a fingerprint, not a
-/// shell parser.
+/// Attribute shell exit status only to the last verification segment; later commands can
+/// replace that status.
+// Attributable only if the LAST segment matches a marker and there is no `||`: `cargo test || true`
+// reports `true`'s status.
 fn verification_segment_is_attributable(command: &str) -> bool {
     let lower = command.to_lowercase();
     if lower.contains("||") {

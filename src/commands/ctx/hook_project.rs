@@ -80,20 +80,8 @@ fn find_present<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|key| value.get(key))
 }
 
-/// Looks up the first of `keys` present in `value`. `Ok(None)` when none of
-/// `keys` is present at all. `Ok(Some(s))` when the first present key holds
-/// a string. `Err(())` when the first present key holds something that is
-/// NOT a string.
-///
-/// Review round (#418): the `Err` case matters. The original version of this
-/// lookup folded "missing" and "wrong type" into the same `None` (via
-/// `and_then(Value::as_str)`), so a malformed non-claude payload -- e.g.
-/// `"cwd": 7` instead of a string -- silently read as "cwd absent" and
-/// projected as the empty string, the same as a payload that never mentioned
-/// `cwd` at all. A recognized field present with the wrong JSON type must
-/// fail the whole projection instead (see [`optional_str`]/[`project_pretool`]'s
-/// own callers), not be coerced into a default that looks identical to
-/// "nothing was there."
+/// Distinguish an absent field from a recognized field of the wrong type; the latter must
+/// fail the whole projection rather than default to empty (#418).
 fn get_str_checked<'a>(value: &'a Value, keys: &[&str]) -> Result<Option<&'a str>, ()> {
     match find_present(value, keys) {
         None => Ok(None),
@@ -121,19 +109,8 @@ fn map_tool_name<'a>(native: &'a str, table: &[(&'static str, &'static str)]) ->
         .unwrap_or(native)
 }
 
-/// Builds the claude-shaped `PreToolPayload`/`HookToolPayload` JSON both
-/// `hook::run_pretool` and `safety::run_check_hook_mode_with_env` already
-/// parse (both structs are `#[serde(default)]` throughout, so the fields
-/// this never sets -- `agent_id`, `permission_mode`, `transcript_path`,
-/// subagent-dispatch fields -- simply take their zero default, exactly as an
-/// older/partial claude payload would). `None` on unrecognised JSON, an
-/// unknown `agent` name, a missing `tool_name`, `tool_input`/`toolArgs`
-/// present but not an object, or `cwd`/`session_id`/`command`/`file_path`
-/// present but not a string (review round #418: a recognized field with the
-/// wrong JSON type fails the whole projection rather than being silently
-/// coerced into the empty string a genuinely absent field gets -- see
-/// [`get_str_checked`]'s own doc comment). The caller's own fail-open
-/// contract (`Ok(0)`, no output) applies from there.
+/// Reject recognized fields with non-string values instead of treating them as absent
+/// (#418).
 pub(crate) fn project_pretool(agent: &str, raw: &str) -> Option<String> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let (fields, table): (&FieldNames, &[(&'static str, &'static str)]) = match agent {
@@ -172,31 +149,10 @@ pub(crate) fn project_pretool(agent: &str, raw: &str) -> Option<String> {
     Some(projected.to_string())
 }
 
-/// Translates the claude `hookSpecificOutput` envelope `hook::run_pretool`/
-/// `safety::run_check_hook_mode_with_env` produced (`claude_envelope`, the
-/// exact stdout text those bodies wrote, or `None` when they printed
-/// nothing) into `agent`'s own documented response shape.
-///
-/// Only `"deny"` and `"ask"` `permissionDecision`s ever produce output for a
-/// non-claude agent: an `"allow"` (with or without `additionalContext`) or
-/// an `updatedInput` rewrite both collapse to plain allow (`None`, meaning
-/// "print nothing") here, since none of the three agents' own documented
-/// contracts have a verified non-blocking advisory or rewrite channel this
-/// module can trust -- see this module's own doc comment.
-///
-/// **`"ask"` (review round #418) does not collapse to silence -- silence
-/// means allow on all three agents, and a would-be prompt read as a silent
-/// allow is the wrong failure direction for a confirmation gate.** Copilot
-/// and droid both document `permissionDecision: "allow"|"deny"|"ask"`, so
-/// `ask` passes straight through with its reason (copilot's own TOP-LEVEL
-/// envelope; droid's claude-identical `hookSpecificOutput` one). Gemini's
-/// own contract has no `ask` concept at all, so an `ask` there fails CLOSED
-/// instead, translated to `{"decision":"deny","reason":"zirv: confirmation
-/// required -- <reason>"}` rather than being silently dropped.
-///
-/// `None` also on a claude envelope this function cannot parse, an unknown
-/// `agent`, an unrecognised decision, or no envelope at all: fail open,
-/// matching every hook body's own contract.
+/// Preserve an `ask` decision as a user approval request; silence would allow the tool to
+/// continue (#418).
+// Only deny and ask ever produce output; allow and updatedInput collapse to plain allow (no verified
+// non-blocking channel). Gemini has no ask concept, so ask fails closed there as a deny.
 pub(crate) fn translate_pretool_envelope(
     agent: &str,
     claude_envelope: Option<String>,
@@ -290,24 +246,10 @@ pub(crate) fn project_posttool_copilot(raw: &str) -> Option<String> {
     Some(projected.to_string())
 }
 
-/// Translates claude's `PostToolUse` `updatedToolOutput` envelope into
-/// copilot's own `modifiedResult` shape. `None` on no envelope, an
-/// unparseable one, or any agent other than `"copilot"` -- droid and gemini
-/// get no `posttool` hook installed at all (`Capabilities::post_tool_hook`),
-/// and `run_posttool_for_agent` never calls this for them.
-///
-/// `native_raw` is copilot's own ORIGINAL `postToolUse` stdin (the same text
-/// [`project_posttool_copilot`] was given) -- review round #418: this
-/// function now preserves that payload's own `toolResult.resultType`/
-/// `tool_result.result_type` in the translated `modifiedResult.resultType`
-/// rather than always hardcoding `"success"`, since a `"failure"` result
-/// compacted through this hook must not silently read as a success to
-/// copilot's own harness. Defaults to `"success"` when `native_raw` does not
-/// parse, carries no such field, or that field is not a string -- unlike
-/// `project_posttool_copilot`'s own fields, a malformed `resultType` here is
-/// cosmetic (it only affects how copilot LABELS an already-compacted
-/// result), so it degrades to the same default an absent field gets rather
-/// than failing the whole translation and losing the compaction outright.
+/// Only Copilot receives the translated post-tool result; other agents retain their native
+/// result (#418).
+// modifiedResult keeps the native resultType (default "success"): a failure compacted through this
+// hook must not read as success to copilot. A malformed resultType is cosmetic and takes the default.
 pub(crate) fn translate_posttool_envelope(
     agent: &str,
     native_raw: &str,
