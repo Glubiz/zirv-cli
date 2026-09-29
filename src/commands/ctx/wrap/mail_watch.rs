@@ -2,39 +2,17 @@
 
 use super::*;
 
-/// How often the pump looks in the mailbox for a message that arrived while
-/// the session was already running (T13).
-///
-/// Deliberately far coarser than `PUMP_POLL`: this is the only filesystem
-/// read on the pump's own tick path (the bar's reads are throttled separately,
-/// by `BAR_THROTTLE`), and a wake-up two seconds late costs an orchestrator
-/// nothing, while a `read_dir` every 100ms would be permanent load on a
-/// session `wrap` has promised never to make worse.
+/// Mail polling is coarser than the pump tick to keep filesystem reads off
+/// the hot path; a late advisory is harmless.
 pub(super) const MAIL_POLL: Duration = Duration::from_secs(2);
 
-/// The most bytes of *sender-supplied* text one advisory line may carry per
-/// identity field. `from_agent` is whatever the sending session had in
-/// `ZIRV_CTX_AGENT` -- untrusted and unbounded, and `mail::header_value` only
-/// guarantees it is *one* line, not a short one -- and the short id is derived
-/// from an equally untrusted session id. Roomy enough that no honest value
-/// reaches it; the same reasoning as `dash::pane`'s own label budget.
+/// Cap sender-controlled identity text before typing it into a child pty.
 const MAX_MAIL_IDENTITY_BYTES: usize = 48;
 
-/// Whether this session polls the mailbox at all. Every gate is checked
-/// before anything touches the filesystem:
-///
-/// * `mail.enabled = false` -- an operator who turned mail off must never be
-///   told mail is waiting, the same rule `mail::unread_counts` already applies
-///   to the bar and to delivery. Nothing is read, so behaviour is exactly what
-///   it was before there was a poll arm at all.
-/// * no registered identity -- `sessions::short_id` came back empty, so this
-///   session cannot be the addressee of anything and has no honest
-///   per-session view of the mailbox to read.
-/// * degraded -- `--no-supervise` (set at construction) and every later
-///   `note_failure` both promise pure passthrough, so the mailbox is not even
-///   read on such a session's behalf. The status bar's own `mail 2+1` segment
-///   is not gated on this, so an operator watching a degraded session is
-///   still told what is waiting.
+/// Poll only for a registered, supervised session with mail enabled;
+/// degraded sessions promise pure passthrough and do not read the mailbox.
+/// The status bar's own unread count is not gated on this, so an operator
+/// watching a degraded session is still told what is waiting.
 pub(super) fn mail_polling_enabled(
     mail_enabled: bool,
     session_short: &str,
@@ -43,14 +21,8 @@ pub(super) fn mail_polling_enabled(
     mail_enabled && !session_short.is_empty() && !degraded
 }
 
-/// The unread messages this session may actually see, oldest first, or `None`
-/// under exactly the conditions `mail::unread_counts` returns `None` for
-/// (mail disabled, or a read error). An unreadable mailbox is silently
-/// ignored rather than degrading or interrupting the session.
-///
-/// Strictly read-only: `wrap` never consumes mail. Consumption moves a
-/// message into `read/`, where no other session will ever find it, and that
-/// belongs to the session's own `zirv ctx inbox`.
+/// List visible unread mail without consuming it; read errors are ignored
+/// so the interactive session keeps running.
 pub(super) fn unread_mail_for_session(
     state: &super::state::StateDir,
     repo: &Path,
@@ -70,20 +42,12 @@ pub(super) fn unread_mail_for_session(
     .ok()
 }
 
-/// Everything the advisory needs out of one unread message -- the file name
-/// it is deduped on, and who sent it -- and deliberately nothing else.
-///
-/// This is the seam where bodies are dropped: nothing downstream of
-/// `mail_facts` holds a body at all, so no later mistake can type one into
-/// the child. An interactive session is *told that* mail arrived; reading it
-/// stays a deliberate `zirv ctx inbox`.
+/// Keep only message identity and sender; bodies must not cross the seam
+/// into a pty advisory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailFacts {
-    /// The message's file name, which `mail::store` makes unique per message
-    /// (zero-padded seconds plus sender, `_NNN` on a same-second collision).
-    /// Identity, not count, is what the advisory dedupes on: consuming one
-    /// message and receiving another leaves the count unchanged, and a
-    /// watermark over counts cannot see that transition at all.
+    /// Unique file identity for deduplication; counts alone miss replacement
+    /// of one consumed message with another.
     pub id: String,
     pub from_agent: String,
     pub from_short: String,
@@ -104,15 +68,8 @@ pub(super) fn mail_facts(unread: &[(PathBuf, super::mail::Message)]) -> Vec<Mail
         .collect()
 }
 
-/// One identity field made safe to type into a child's pty: every control
-/// character replaced by a single space (runs collapsed), then capped on a
-/// char boundary at `MAX_MAIL_IDENTITY_BYTES`.
-///
-/// An interior `\r` is the one that matters: it would submit the advisory
-/// early and leave its tail typed at a fresh prompt as if the operator had
-/// written it. An `ESC` would reach the child TUI as an escape sequence
-/// rather than as text. A control character in text zirv is *relaying* is
-/// never meaningful, so it is replaced rather than escaped.
+/// Sanitize control characters and cap text before typing it into a pty;
+/// a carriage return could submit early and escape could control the TUI.
 fn advisory_identity(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_run = false;
@@ -134,19 +91,8 @@ fn advisory_identity(raw: &str) -> String {
     crate::utils::truncate_bytes(trimmed, Some(MAX_MAIL_IDENTITY_BYTES))
 }
 
-/// The advisory as the wrapped agent sees it, in the same labelled shape the
-/// dashboard's own visible injections use (`dash::pane`'s
-/// `[zirv ▸ {label}] {body}`), so a line typed into a session reads as coming
-/// from the same voice as everything else zirv narrates.
-///
-/// `count` is the session's total unread, the same number the status bar
-/// shows, so the two never disagree.
-///
-/// Issue #249: `is_parent` -- whether the newest unread message's sender
-/// (already resolved and sanitized by the caller, via `MailWatch::decide`
-/// comparing against `agent::parent_identity`) is this session's own
-/// supervising session -- swaps the closing clause for the steering variant.
-/// `advisory_identity` still sanitizes both identity fields either way.
+/// Render one labelled advisory with the same unread count as the bar.
+/// Parent identity changes only the closing clause and is sanitized too. (#249)
 pub fn mail_advisory_line(
     count: usize,
     from_agent: &str,
@@ -167,10 +113,7 @@ pub fn mail_advisory_line(
     )
 }
 
-/// The exact bytes one advisory injection writes: the line, then exactly one
-/// `\r` to submit it -- `inject_compact`'s own convention, and (after
-/// `advisory_identity`'s scrub) the only control byte in the whole write,
-/// which is what makes an injection exactly one submission.
+/// Write the advisory followed by exactly one submit carriage return.
 fn mail_advisory_bytes(
     count: usize,
     from_agent: &str,
@@ -182,11 +125,7 @@ fn mail_advisory_bytes(
     bytes
 }
 
-/// Phase 1 of a deferred mail advisory (issue #118): the labelled line with
-/// no control bytes of its own, flushed alone -- `mail_advisory_bytes`'s own
-/// text half, minus the trailing `\r` it appends for the single-burst path.
-/// See `write_mail_advisory`'s own doc comment for when this is used instead
-/// of that single write.
+/// Write the text phase alone when submission must be deferred. (#118)
 fn write_mail_advisory_phase1(
     sink: &mut dyn Write,
     count: usize,
@@ -200,44 +139,29 @@ fn write_mail_advisory_phase1(
     Ok(())
 }
 
-/// What one mail poll concluded. Both non-empty arms carry the ids they
-/// covered, so the pump commits them only once the corresponding write
-/// actually landed.
+/// Poll outcome carries ids, committed only after the relevant output lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailAction {
-    /// Nothing new, or everything new has already been said.
+    /// No output is owed for the current unread set.
     None,
-    /// Type one advisory line into the child: something new arrived and the
-    /// child is idle at a turn boundary.
+    /// Verified idle permits a child advisory; ids commit only after writing.
     Inject {
         count: usize,
         from_agent: String,
         from_short: String,
         ids: Vec<String>,
     },
-    /// Not safe to type right now, so say it on the `zirv ▸` channel instead
-    /// and keep the injection owed for a later poll.
+    /// Operator-only fallback while pty injection is unsafe.
     Announce { count: usize, ids: Vec<String> },
 }
 
-/// The pump's mail bookkeeping: when it last looked, and which messages have
-/// already been advised about (and how).
-///
-/// `injected` is the terminal state -- the session itself has been told, so
-/// that message is done. `announced` only records that the operator was told
-/// on stderr while the child was busy; the injection stays owed, and is
-/// retried at every later poll until it lands, which is why an announcement
-/// never moves an id into `injected`.
+/// Announced ids still need injection; only injected ids are complete.
 #[derive(Debug, Default)]
 pub struct MailWatch {
     last_poll: Option<Instant>,
     injected: super::mail::AdvisedIds,
     announced: super::mail::AdvisedIds,
-    /// Issue #118: a `defer_injection_submit` adapter's still-owed
-    /// mail-advisory `\r` (`write_mail_advisory`'s phase 2) and the deadline
-    /// it is due -- `dash::pane`'s own `pending_submit` field, mirrored here
-    /// for the same reason: the pump loop's drain has to be able to answer
-    /// "is this due yet" without a real clock in a pure test.
+    /// Deferred submit and deadline for the current advisory. (#118)
     pending_submit: Option<Instant>,
 }
 
@@ -251,29 +175,20 @@ impl MailWatch {
         self.last_poll = Some(now);
     }
 
-    /// Drops bookkeeping for messages that are no longer unread -- consumed
-    /// by this session's own `zirv ctx inbox`, or pruned by `mail::store_to`.
-    /// Keeps both sets bounded by what is actually in the mailbox, and means
-    /// a file name that somehow came back is treated as the new message it
-    /// looks like rather than as one already advised. Finding 3 (review):
-    /// this is the id-set/prune shape `mail::AdvisedIds` now shares with the
-    /// dashboard's own orchestrator advisory.
+    /// Retain only ids still unread, so deduplication stays bounded.
     pub(super) fn forget_missing(&mut self, current: &[MailFacts]) {
         let ids: Vec<&str> = current.iter().map(|facts| facts.id.as_str()).collect();
         self.injected.forget_missing(ids.iter().copied());
         self.announced.forget_missing(ids.iter().copied());
     }
 
-    /// Pure: what to do about `current`, given what has already been advised
-    /// and whether the child may be typed into right now (`may_inject`).
-    /// Mutates nothing, so a write that fails commits nothing either.
+    /// Pure decision; a failed write commits no advisory state.
     pub(super) fn decide(&self, current: &[MailFacts], may_inject: bool) -> MailAction {
         let unadvised: Vec<&MailFacts> = current
             .iter()
             .filter(|facts| !self.injected.contains(&facts.id))
             .collect();
-        // Oldest first out of `mail::list`, so the last one is the newest
-        // arrival: the sender worth naming on a line that has room for one.
+        // Name the newest sender while preserving oldest-first delivery.
         let Some(newest) = unadvised.last() else {
             return MailAction::None;
         };
@@ -300,26 +215,10 @@ impl MailWatch {
         }
     }
 
-    /// Records an announcement **only when it actually reached the
-    /// operator** (`Announcer::try_emit`'s own answer).
-    ///
-    /// R5: this used to be an unconditional `commit_announced` right after an
-    /// `Announcer::emit` that returns `()` and quietly swallows both a
-    /// disabled channel (`--quiet`, `[chrome] events = false`) and a failed
-    /// stderr write. `announced` then said "the operator has been told" about
-    /// a line nobody ever saw, and since `announced` suppresses the next
-    /// poll's announcement, the advisory was never repeated either. For an
-    /// adapter with no turn-signal mechanism `may_inject` never becomes true
-    /// at all, so this channel is that advisory's *only* surface: one
-    /// swallowed emit meant it was never injected and never announced --
-    /// lost, permanently, on a session that had no other way to hear about
-    /// it. (The message itself was never at risk: it stays unread in the
-    /// mailbox and keeps counting in the status bar. This is about the
-    /// advisory surface, not durable state.)
-    ///
-    /// Leaving the ids unannounced on a failure is the whole fix: the next
-    /// poll simply tries again, and `injected` is untouched either way, so
-    /// the injection stays owed exactly as before.
+    /// Commit an announcement only after it reaches the operator; a quiet
+    /// or failed output must remain eligible for retry. (#118) For an
+    /// adapter with no turn-signal mechanism this channel is the advisory's
+    /// only surface, so a swallowed emit here would lose it permanently.
     pub(super) fn note_announcement(&mut self, ids: &[String], landed: bool) {
         if landed {
             self.commit_announced(ids);
@@ -332,18 +231,13 @@ impl MailWatch {
         }
     }
 
-    /// Whether an earlier deferred injection's `\r` is still owed at all,
-    /// regardless of whether its deadline has passed -- what
-    /// `write_mail_advisory` checks before a *new* injection's own phase 1,
-    /// so two advisories can never interleave into one garbled line.
+    /// An owed submit blocks another advisory from starting, preventing
+    /// interleaved text.
     fn has_pending_submit(&self) -> bool {
         self.pending_submit.is_some()
     }
 
-    /// Whether a deferred injection's `\r` is due to be written as of `now`
-    /// -- `dash::pane::submit_is_due`'s own pure check, reused rather than
-    /// reimplemented (the two share `INJECTION_SUBMIT_DELAY` already, so
-    /// there is no reason for the due-check itself to drift apart too).
+    /// Pure due check shared with dashboard injection timing.
     pub(super) fn pending_submit_due(&self, now: Instant) -> bool {
         super::dash::pane::submit_is_due(self.pending_submit, now)
     }
@@ -357,30 +251,9 @@ impl MailWatch {
     }
 }
 
-/// Writes one mail advisory into `writer` (issue #118), single-burst
-/// (`mail_advisory_bytes`) or split into `write_mail_advisory_phase1` plus a
-/// deferred `dash::pane::write_submit_cr`, by whether `defer`
-/// (`Capabilities::defer_injection_submit`) is set for the wrapped adapter.
-///
-/// The single-burst shape is the pre-#118 behavior, byte-for-byte unchanged
-/// -- a turn-signal-capable adapter's composer (claude) submits a same-burst
-/// trailing `\r` correctly, so there is nothing to defer against. The
-/// deferred shape mirrors `dash::pane::inject_visible`: phase 1 lands and
-/// `MailWatch::pending_submit` is armed for `INJECTION_SUBMIT_DELAY` later,
-/// which the pump loop's own periodic drain (see the mail poll arm's call
-/// site) submits once due. If an earlier deferred injection's own `\r` is
-/// still owed when this one starts, it is flushed first
-/// (best-effort -- a failed flush here just leaves it for the next tick's
-/// drain to retry, same as always), so the two writes can never interleave
-/// into one line the child would read as a single, garbled submission.
-///
-/// Returns whether this call's own text landed -- the same "was the child
-/// actually told" signal the caller's `MailWatch::commit_injected`/
-/// `note_announcement` branch on, regardless of which shape wrote it. A
-/// deferred write is marked advised (`commit_injected`) at this, its
-/// phase-1, moment -- not once the drain's own `\r` lands -- the same
-/// bookkeeping moment `dash::pane::inject_visible` already commits its own
-/// pane state at.
+/// Inject in one burst or defer the submit by adapter capability. Flush an
+/// earlier owed submit first so advisory lines cannot interleave. (#118)
+/// Report whether this advisory text landed; that is when its id is committed.
 pub(super) fn write_mail_advisory(
     mail_watch: &mut MailWatch,
     writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,

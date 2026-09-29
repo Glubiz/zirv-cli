@@ -53,71 +53,36 @@ pub fn run_with(
         return Err("no command to wrap; pass it after --".into());
     }
 
-    // F2, before anything reads config, resolves an adapter, or touches the
-    // terminal: an interactive supervisor started *inside* another agent's
-    // session can take that outer session down (see
-    // `sessions::nested_session_evidence`). Returned as an `Err` rather than
-    // printed here, because `run_with` deliberately has no writer of its own
-    // (see this function's doc comment); `ctx`'s dispatch prints it on
-    // stderr through `output::error`.
+    // Reject nesting before config or terminal work: an inner interactive
+    // supervisor can take down its outer session.
     if let Some(refusal) = super::sessions::nesting_refusal("wrap", env, args.allow_nested) {
         return Err(refusal.into());
     }
 
     let cfg = CtxConfig::load_for_launch(repo, env)?;
-    // Announcements are gated by `cfg.chrome.events` (which already folds in
-    // `--quiet`, `ZIRV_CTX_QUIET` and `[chrome] events`), never by whether
-    // the terminal is big enough or colour-capable for the banner and bar: a
-    // piped stderr in CI still wants these lines. `--no-supervise` is the one
-    // exception: it promises pure passthrough ("no scoring, no injection"),
-    // so nothing about supervision has anything to narrate either.
+    // Event announcements follow config even with piped stderr; pure
+    // passthrough suppresses them.
     let announcer = if args.no_supervise {
         Announcer::silent()
     } else {
         Announcer::new(cfg.chrome.events, console::colors_enabled_stderr())
     };
     let agent_name = args.agent.as_deref().or(cfg.agent.as_deref());
-    // Selection happens here so an unknown or unverified agent fails before the
-    // terminal is touched.
-    // T84: `adapter` is `mut` so a live `zirv ctx handover` swap (see the
-    // handover request check inside `pump`) can replace the boxed trait
-    // object in place -- every existing `adapter.<method>()` call site below
-    // and inside `pump` keeps working unchanged, since method resolution
-    // auto-derefs through `&mut Box<dyn AgentAdapter>` exactly as it does
-    // through `&dyn AgentAdapter`.
+    // Resolve a verified adapter before touching the terminal; a live swap
+    // may replace this adapter in place.
     let mut adapter = adapters::select(agent_name, &args.command, &cfg)?;
-    // The pinned model this wrapped launch actually spawns with, if the
-    // wrapped command names one -- the same `last_model_flag` scan `exec`'s
-    // own `execution_model` and `seat_model_env` use, read directly off
-    // `args.command` rather than `cfg.chat.model`: unlike the seat-model env
-    // guard (see `seat_cfg_model` below), a launch's provider bucketing may
-    // honestly use the operator's configured chat model too, but here the
-    // wrapped argv is already in hand and is the more direct source. Recomputed
-    // wherever the pinned model can change (a harness handover) rather than
-    // reused across the whole session.
+    // Read the model from the wrapped argv and recompute it on handover;
+    // provider accounting must follow the model actually spawned.
     let launch_model = adapters::last_model_flag(&args.command);
 
-    // `select` defaults to claude when detection finds nothing to back it,
-    // which is fine for a caller (like `exec`) that already gates every
-    // claude-specific behavior on `command_matches_adapter`. `wrap` must not
-    // spawn a command it can only guess is claude and then start typing
-    // claude-only escape sequences (`/exit\r`, `/compact ...`) into it: an
-    // undetected command with no explicit `--agent` fails loudly here,
-    // before the terminal is ever touched, instead of running silently
-    // unsupervised.
-    //
-    // `--no-supervise` and `--simple` are exempt: both promise pure
-    // passthrough, neither injects anything or types into the child, so there
-    // is nothing left for a wrong guess to get wrong.
+    // Do not guess an adapter for a command zirv may type into; its control
+    // sequences could reach the wrong program. Passthrough modes are exempt.
     let passthrough_only = args.no_supervise || args.simple;
     if !passthrough_only
         && agent_name.is_none()
         && !adapters::command_matches_adapter(adapter.as_ref(), false, &args.command)
     {
         let program = args.command.first().map(String::as_str).unwrap_or("");
-        // Named generically rather than hardcoding one adapter: the actual
-        // options come from the registry (gate-enabled and `ready()` right
-        // now), so a second working adapter shows up here without an edit.
         let available = adapters::available_adapter_names(&cfg);
         let agent_hint = if available.is_empty() {
             "pass --agent <name>".to_string()
@@ -135,15 +100,8 @@ pub fn run_with(
     let state_dir = super::state::StateDir::resolve(env)?;
     let session = session.unwrap_or_else(super::event::SessionId::new_v4);
 
-    // Issue jev-relay: unlike `exec`, `wrap`'s own `session` never gets
-    // reminted mid-run (a harness handover keeps the same id, see
-    // `relaunch`'s own doc comment), so the relay is started exactly once
-    // here and held for this whole interactive supervisor's lifetime --
-    // `_jev_relay_handle`'s drop (at `run_with`'s return, whichever arm)
-    // stops it. `start` itself is a no-op `None` (no bind at all) whenever
-    // no `[jev]` gate is on or there is no credential, and never blocks this
-    // function's own startup: binding is fast local filesystem/pipe setup,
-    // and the accept loop moves to its own thread before `start` returns.
+    // This interactive session retains its id across swaps, so one relay
+    // lasts its lifetime; relay startup never blocks launch.
     let _jev_relay_handle = jev_relay::start(
         &cfg.proxy.typesafe,
         jev::any_gate_enabled(&cfg.jev),
@@ -151,35 +109,9 @@ pub fn run_with(
         session.as_str(),
     );
 
-    // T10: the launch-time pacing gate -- before this fix, `wrap` (and, by
-    // extension, `zirv ctx chat`'s orchestrator and every dashboard pane,
-    // which launch through this same function) never consulted `pace` at
-    // all, so an operator's dashboard-heavy workload had no proactive
-    // protection whatsoever, only the reactive `scan_for_limit` catching a
-    // vendor-imposed limit after the fact. Deliberately placed before any
-    // pty/terminal work below (never on the redraw path, which stays
-    // network-free per CLAUDE.md) and skipped outright for `--no-supervise`,
-    // whose whole promise is "nothing supervisory happens" -- `--simple`
-    // does NOT skip it (its own doc comment already promises "supervision,
-    // pacing and hooks still apply").
-    //
-    // Also gated on both stdin *and* stdout being real terminals, the same
-    // double-check `chrome::dash_eligible` already makes for the same
-    // reason: this is the interactive-session launch path, and a
-    // non-interactive `wrap` invocation is out of scope for it -- `exec`/
-    // `loop` are the supervisors for headless work, and already gate
-    // correctly. Issue #358 (T9): `apply_interactive_gate` itself no longer
-    // blocks or prompts for either `Pause` or `Refuse` -- it prints the note
-    // and launches -- so this check is no longer load-bearing for avoiding a
-    // hang under piped test stdio, but the interactive/headless distinction
-    // it draws is still the right one to gate on.
-    //
-    // `interactive_launch` is also the real signal `compile`/`policy_
-    // launch_args` below need (2026-08-24 hardening): before this, both
-    // hardcoded `LaunchMode::Interactive` regardless of whether stdio was
-    // actually a terminal, so a non-tty `wrap` invocation (piped stdio, a
-    // CI runner, a script) got the permissive interactive posture instead
-    // of failing closed to `Headless`.
+    // Pace before pty work only for supervised interactive terminals. Use
+    // the same terminal signal for prompt policy; piped launches fail closed
+    // to headless policy. (#358)
     let interactive_launch = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !args.no_supervise && interactive_launch {
         let gate = pace::interactive_gate(
@@ -191,25 +123,15 @@ pub fn run_with(
         apply_interactive_gate(gate, args.force_pace)?;
     }
 
-    // `--no-supervise` promises pure passthrough (its own help text says so),
-    // and so does a wrapped command that matches no adapter: injecting this
-    // adapter's flags into a program that may not be it would leak them into
-    // its output.
+    // Passthrough and unrecognized commands must not receive adapter flags.
     let skip_injection = passthrough_only
         || !adapters::command_matches_adapter(
             adapter.as_ref(),
             agent_name.is_some(),
             &args.command,
         );
-    // Still needed standalone below: `pump`'s own best-effort memory-harvest
-    // call on a restart (unrelated to prompt composition, which `compile`
-    // now owns) reads this same slug.
+    // Pump needs the same repository slug for restart harvest.
     let memory_slug = super::state::repo_slug(repo);
-    // Issue #44: gathers memory, the derived harness roster and the
-    // canonical `.zirv/context/` layer, and attaches the policy report;
-    // issue #537 (T2a) folds the harness proxy's own bounded layer on top
-    // when `chat::wrap_args_for` set one -- see `compiled_context_for_
-    // launch`'s own doc comment.
     let compiled = compiled_context_for_launch(
         repo,
         skip_injection,
@@ -220,9 +142,8 @@ pub fn run_with(
         launch_mode_from_interactive(interactive_launch),
         args.proxy_layer.as_deref(),
     );
-    // The wrapped command's own argv may already carry the adapter's
-    // system-prompt flag; merge it in rather than letting `prompt_args` below
-    // silently override it with a second occurrence.
+    // Merge an existing operator-supplied system prompt flag before adding
+    // another one.
     let (launch_command, mut composed) = super::prompt::merge_command_line_prompt(
         adapter.as_ref(),
         &args.command,
@@ -256,35 +177,14 @@ pub fn run_with(
         composed.as_ref(),
         adapter.system_prompt_supported(&launch_command),
     ));
-    // Stripping the user's own --append-system-prompt (see
-    // merge_command_line_prompt) can empty the argv even though args.command
-    // itself was not empty at the top of this function, e.g. `wrap -- --
-    // append-system-prompt foo` with nothing else. That must be an error, not
-    // a panic on a hot path where release is panic = "abort".
+    // Removing the operator prompt flag may empty argv; reject that case
+    // without panicking in this abort-on-panic launch path.
     let (program, rest) = launch_command
         .split_first()
         .ok_or("no command to wrap; pass it after --")?;
-    // Bug B (harness/model parity, 2026-08-22): the same seam every real
-    // launch now calls (`adapters::policy_launch_args`) -- the shipped-
-    // default "sandboxed, no prompts" posture plus any explicit `[policy]`
-    // restriction. Computed once, from `rest` (the wrapped command's own
-    // trailing argv, whether zirv-built via `chat.rs::build_launch` or a
-    // hand-typed `zirv ctx wrap -- <command>`), and reused for both the
-    // first launch and every restart below (`relaunch_extra`), exactly like
-    // `prompt_args` already is. `flags_pin_policy` reads `rest`, so an
-    // operator's own explicit `--sandbox`/`--ask-for-approval`/
-    // `--permission-mode`/`--disallowedTools` still wins.
-    //
-    // Deliberately **not** gated on `skip_injection` (which also folds in
-    // `args.simple`): `--simple` promises no *injected instruction text*,
-    // and the sandbox posture is a safety flag layer, not instruction text
-    // (see `chat.rs`'s own `--simple` test for the identical call). It is
-    // gated on the two reasons `skip_injection` exists for that *do* apply
-    // here: `--no-supervise`'s own contract is pure passthrough (nothing
-    // zirv-added at all), and a wrapped command that does not actually
-    // match this adapter must never receive this adapter's flags -- the
-    // same leakage risk `skip_injection` exists to prevent for `prompt_
-    // args`.
+    // Reuse policy flags on restarts; explicit operator policy wins. Simple
+    // still applies safety flags, while passthrough and mismatched commands
+    // must receive no adapter flags.
     let policy_skip = args.no_supervise
         || !adapters::command_matches_adapter(
             adapter.as_ref(),
@@ -302,11 +202,7 @@ pub fn run_with(
             role,
         )
     };
-    // Visible, not silent: the shipped-default posture (or the operator's
-    // own opt-out/override) is announced once, here, at session start -- not
-    // re-announced on a restart, since `policy_extra` is computed once above
-    // and simply reused by `relaunch_extra`. A no-op under `--no-supervise`
-    // (`announcer` is `Announcer::silent()` there already).
+    // Announce the effective policy once per session.
     announcer.emit(&super::announce::Event::SandboxPosture {
         detail: if policy_extra.is_empty() {
             "not applied (operator flags, an unmatched wrapped command, --no-supervise, or \
@@ -316,22 +212,16 @@ pub fn run_with(
             super::announce::posture_detail(&policy_extra)
         },
     });
-    // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn
-    // at most once per 24h if something still drifted. Best-effort: no home
-    // directory is not a reason to fail the launch. A no-op under
-    // `--no-supervise` in effect too (`announcer` is `Announcer::silent()`
-    // there), though the heal itself still runs -- fixing a drifted hook
-    // entry is not "supervision".
+    // Heal hooks best-effort and warn at most daily; unavailable home state
+    // must not fail launch. (#420)
     if let Ok(home) = crate::utils::home_dir() {
         let _ = super::hook_integrity::heal_outdated(&state_dir, &home);
         if let Some(summary) = super::hook_integrity::drift_warning_if_due(&state_dir, &home) {
             announcer.emit(&super::announce::Event::HookIntegrity { summary });
         }
     }
-    // Issue #222: codex has no per-command approval mechanism zirv can
-    // pre-clear the way #224 pre-approves reserved claude built-ins, so an
-    // interactive launch under a prompting posture gets a one-time advisory
-    // naming the config fix instead.
+    // Codex cannot pre-clear individual commands, so a prompting posture
+    // needs one advisory naming the configuration path. (#222, #224)
     if !policy_skip && interactive_launch && adapter.name() == "codex" {
         let posture = adapters::codex::resolve_codex_approval_posture(
             &crate::utils::home_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -349,9 +239,8 @@ pub fn run_with(
     } else {
         match super::signal::SignalServer::bind(&state_dir.socket_for(session.as_str())) {
             Ok(server) => {
-                // Published per session (F5): the pre-F5 global file meant a
-                // second supervisor overwrote the first one's entry, and a
-                // reader then found somebody else's socket under it.
+                // Publish per session so concurrent supervisors retain their
+                // own socket addresses.
                 publish_socket_path(&state_dir, session.as_str(), server.path());
                 Some(server)
             }
@@ -367,38 +256,10 @@ pub fn run_with(
         }
     };
 
-    // Registered here, after the bind, rather than earlier: the record has to
-    // say whether this session can act on a wake-up, and only the bind
-    // result knows.
-    //
-    // N6/NEW-3: `wrap` claims nudge markers exclusively from its turn-signal
-    // arm (`if let Some(server) = server && ...`), so with no socket --
-    // `--no-supervise`, or a bind that failed -- a marker written for this
-    // session is never claimed, and the nudge silently does nothing forever.
-    // The first fix for that dropped such sessions from the registry
-    // entirely, which cured the silent nudge by making the session
-    // *invisible*: it disappeared from `zirv ctx status` too, so an operator
-    // whose `wrap` had failed to bind could not see it running at all.
-    // Recorded as `reachable: false` instead -- `status` shows it as
-    // `unreachable`, and `nudge` refuses it with a reason.
-    //
-    // Keyed on the socket rather than on `--no-supervise`/`--simple` as
-    // such: `--simple` only skips prompt injection, still binds a socket and
-    // still claims markers, so it stays a legitimate (advisory) target; and
-    // a bind failure under a plain `wrap` is exactly as unreachable as
-    // `--no-supervise` is.
-    //
-    // Best-effort, released right after `pump` returns below -- `wrap`'s own
-    // control flow always funnels through that one point, unlike `exec`'s
-    // scattered early returns, so a single release suffices here.
-    // Issue #139: recorded so `zirv ctx status` can compare this launch's
-    // pinned policy against whatever the repo/operator layers resolve to
-    // right now and surface a "policy snapshot stale" line when they
-    // diverge -- see `sessions::Record::safety_policy_sha256`'s own doc
-    // comment. `policy_fingerprint` is pure and deterministic, so this is
-    // guaranteed to match whatever fingerprint `ClaudeAdapter::launch_
-    // settings_path` embedded in this same launch's own settings file,
-    // since both are computed from the identical `cfg.safety` value.
+    // Register after bind: only the socket result proves this session can
+    // claim nudges. Preserve unreachable sessions in status, and release the
+    // record after pump exits. (#139)
+    // Record launch policy so status can detect later drift.
     let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
     let record = super::sessions::Record::new(session.as_str(), adapter.name(), repo, verb)
         .with_safety_policy_sha256(safety_policy_sha256)
@@ -410,24 +271,17 @@ pub fn run_with(
     };
     let mut session_guard = super::sessions::SessionGuard::register(&state_dir, record);
 
-    // Deliberately not derived from `session`: that id belongs to wrap, not to
-    // the agent it spawns, so a derived path names a file nobody ever writes.
+    // Wrap owns a different session id from the agent, so deriving the
+    // transcript path from it would name an unwritten file.
     let mut transcript = TranscriptSource::new(env(TRANSCRIPT_ENV).map(PathBuf::from));
 
     let (cols, rows) = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
-    // Probed (and, on success, held) ahead of `RawGuard::enter` below: the
-    // chrome eligibility decision (in particular whether the bar may draw at
-    // all) needs to know this before the pty is even sized, and the bar's
-    // own escape sequences need VT on regardless of whether the wrapped
-    // command is itself claude or codex. Restored explicitly alongside
-    // `raw`, at the one place this function ever leaves the pump.
+    // Probe VT before pty sizing and restore it explicitly with raw mode;
+    // bar escape sequences require it regardless of adapter.
     let mut vt_guard = super::term::enable_vt_output().ok();
     let vt_ok = vt_guard.is_some();
-    // `IsTerminal` on stdout specifically, not `window_size(STDIN_FD)`'s own
-    // success: on unix that probes stdin's own fd, so `zirv chat > log` (or
-    // `wrap`) left stdin attached to a real terminal still banered straight
-    // into the redirected file. The size itself still comes from
-    // `window_size`, which is the only source `wrap` has for it.
+    // Check stdout itself: stdin can still be a terminal when stdout is
+    // redirected, and banner escapes must not enter the file.
     let stdout_is_tty = std::io::stdout().is_terminal();
     let chrome = super::chrome::ChromeCaps::probe(
         stdout_is_tty,
@@ -445,11 +299,10 @@ pub fn run_with(
         pixel_height: 0,
     })?;
 
-    // FIX 2a (command-injection defense): the first-launch pty assembly does
-    // not pass through supervise::spawn_tapped's guard either, so apply the
-    // same cmd.exe argv-reparse policy over the full downstream argv -- the
-    // wrapped command's own args plus zirv's injected prompt args, which carry
-    // repo-sourced text. A no-op off Windows and for any non-shim program.
+    // Command-injection defense: the first-launch pty assembly does not pass
+    // through `supervise::spawn_tapped`'s guard either, so apply the same
+    // cmd.exe argv-reparse policy here, over the full downstream argv
+    // including repository-sourced prompt text.
     let mut child_args: Vec<String> = rest.to_vec();
     super::mcp::launch::append(
         &mut child_args,
@@ -476,14 +329,8 @@ pub fn run_with(
     }
     command.cwd(repo);
 
-    // Kept for the relaunch too: a fresh session with no socket to report on
-    // would leave the rest of the run unsupervised.
-    // `AGENT_ENV` is exported unconditionally, unlike the turn-signal env
-    // (which needs a bound socket): it names the same fact `ctx.toml`'s own
-    // `agent` config key would, so a nested `zirv ctx ...` call inside this
-    // session's own children defaults to this session's own harness. Kept in
-    // `turn_env` (despite the name) because a relaunch reuses this exact
-    // vector, and the freshly relaunched session needs it too.
+    // Export this session's harness on every launch, even without a socket,
+    // so nested commands inherit the correct default.
     let mut turn_env: Vec<(String, String)> = server
         .as_ref()
         .map(|server| {
@@ -499,53 +346,26 @@ pub fn run_with(
         })
         .unwrap_or_default();
     turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
-    // Issue #147 amendment: the durable interactive-launch pin
-    // (`adapters::LAUNCH_MODE_ENV`), set from the identical `interactive_
-    // launch` signal `policy_extra` above already used to pick this
-    // launch's `LaunchMode` -- never re-derived, so the two can never
-    // disagree about whether this session is interactive. `None` for a
-    // headless wrap: nothing is added, matching every other absent-signal
-    // case the hook already fails closed on.
+    // Pin the same launch mode used by policy flags; absent headless signals
+    // must fail closed in the hook. (#147)
     if let Some((key, value)) =
         adapters::launch_mode_pin_env(launch_mode_from_interactive(interactive_launch))
     {
         turn_env.push((key, value));
     }
-    // The seat this session sits in, for the `zirv ctx hook pretool` guard
-    // running inside it. Orchestrator or (issue #537 T3) Single only, and
-    // preferring an operator's own `--model`/`--model=` passthrough in `rest`
-    // (the same flag vector this launch actually spawns with) over
-    // `cfg.chat.model`; see `adapters::seat_model_env`. Kept in `turn_env`
-    // for the same reason `AGENT_ENV` is: a relaunch reuses this exact
-    // vector, and the fresh session sits in the same seat.
-    //
-    // Only a `chat` launch may fall back to `cfg.chat.model`: that is `chat`'s
-    // own knob, spliced into the argv it hands us (`chat::extra_with_model`),
-    // so for that caller the fallback and `rest` agree anyway. The bare `wrap`
-    // verb never applies it, and became an Orchestrator (so it reaches this at
-    // all) only once the role also picked its prompt layers -- claiming a
-    // configured model this launch did not spawn with would have the guard
-    // refuse dispatches at a tier the session is not actually on.
+    // The hook seat model must match the spawned argv; bare wrap cannot use
+    // chat's configured model when it did not launch with it. (#537)
     let seat_cfg_model = match verb {
         super::sessions::Verb::Chat => cfg.chat.model.as_deref(),
         _ => None,
     };
     turn_env.extend(adapters::seat_model_env(role, rest, seat_cfg_model));
-    // Issues #328/#334: which seat role this session runs as, for the same
-    // guard -- unlike `seat_model_env`, unconditional for every role.
     turn_env.extend(adapters::seat_role_env(role));
-    // Issue #753: a proxy-decided launch tells its hook not to re-run intake.
     if args.proxy_layer.is_some() {
         turn_env.push((adapters::PROXY_DECIDED_ENV.to_string(), "1".to_string()));
     }
-    // Issue #358 (task 5): the logical orchestrator seat this session sits
-    // in. Registered here rather than beside `SessionGuard::register` above
-    // (where `seat::register`'s own wiring note points) for one reason: the
-    // seat records which MODEL is answering at this address, and that is not
-    // resolved until `seat_model_env` just above has run. Registration still
-    // happens before the child exists, which is all the fencing generation
-    // riding in `turn_env` below actually needs. Worker sessions register no
-    // seat at all: nothing ever rolls one over.
+    // Register the logical seat after resolving its actual model and before
+    // spawning the child, so its fencing generation is current. (#358)
     if role == PromptRole::Orchestrator {
         let seat_model = turn_env
             .iter()
@@ -563,24 +383,15 @@ pub fn run_with(
             super::state::now_secs(),
         ) {
             Ok(seat) => {
-                // A supervisor that died mid-swap leaves the seat stuck in
-                // `Prepared`, refusing every future rollover; recovery runs
-                // before this launch's own generation is exported so the env
-                // below cannot name a generation the recovery just moved.
-                // `None` unconditionally: a supervisor is only running this
-                // line because the previous one is gone, and a successor it
-                // had prepared died with it. Nothing that outlived the crash
-                // could still be answering at this address.
+                // Recover a prepared seat before exporting its generation;
+                // nothing from the crashed supervisor remains live here.
                 let recovered = super::rollover::on_startup(&state_dir, &seat.short, &|_| None);
                 turn_env.push(super::seat::generation_env(
                     recovered.as_ref().unwrap_or(&seat),
                 ));
             }
-            // Logged, never `note_failure`: a seat that could not be
-            // registered costs this session automatic rollover and nothing
-            // else, whereas degrading the supervisor would also silence
-            // compaction, restarts and mail for a feature the operator may
-            // not even have turned on.
+            // Seat registration failure only disables automatic rollover;
+            // do not degrade unrelated supervision.
             Err(e) => {
                 let _ = super::log::append(
                     &state_dir,
@@ -601,32 +412,17 @@ pub fn run_with(
             }
         }
     }
-    // Scrubbed before any of it is applied -- see `apply_session_env`. When
-    // the bind above failed, `turn_env` carries only `AGENT_ENV`, and the
-    // scrub is the only thing standing between this child and the outer
-    // session's identity.
+    // Scrub inherited session identity even when socket bind failed.
     apply_session_env(&mut command, &turn_env);
 
-    // One writer, shared: the stdin pump and (from Task C4) the injector both
-    // need it, and `take_writer` can only be called once. Its contents (not
-    // the Arc itself) get swapped out on a restart, so every holder of this
-    // Arc transparently starts writing to the fresh pty.
-    //
-    // Taken before the spawn rather than after it, because on Windows the
-    // console host has to be answered before it will service the child at all
-    // -- see `CURSOR_POSITION_REPORT`.
+    // Share the one pty writer across input and injection, and take it
+    // before spawn so Windows console-host probes can be answered.
     let mut first_writer = pair.master.take_writer()?;
     answer_inherit_cursor_probe(&mut *first_writer);
     let writer = std::sync::Arc::new(std::sync::Mutex::new(first_writer));
 
-    // Issue #330, and the last statement before the child exists: a Windows
-    // priority class is inherited AT CREATION, so this is the only point at
-    // which one call can still reach the whole tree this launch is about to
-    // become. `role` is the same one that picked this session's prompt layers
-    // -- both `wrap` and `chat` are Orchestrators, so in practice this raises
-    // this supervisor's own threads and deliberately leaves the process class
-    // (which the child, and any build the operator starts from this seat,
-    // would inherit) exactly where it was. See `priority::Posture`.
+    // Windows child priority is inherited at creation; set the supervisor
+    // posture here without raising the child process class. (#330)
     super::priority::apply_process(super::priority::posture_for(role));
 
     let mut child = pair.slave.spawn_command(command).map_err(|error| {
@@ -637,23 +433,16 @@ pub fn run_with(
             error
         )
     })?;
-    // P2/P3: adopted the instant the child exists -- registered for the
-    // console-close sweep and put in a kill-on-close job, so neither closing
-    // the window nor killing zirv outright can orphan the agent.
+    // Adopt the child immediately so console close or supervisor death
+    // cannot orphan it.
     let mut child_guard = super::supervise::ChildGuard::adopt(child.process_id());
-    // P5: the registry record was filed above with `std::process::id()` --
-    // zirv's own pid, which stays alive exactly as long as the wrapper rather
-    // than as long as the agent. Point it at the child, the same override
-    // `dash::pane::Pane::spawn` makes. `pump` re-points it after every
-    // relaunch.
+    // The registry initially names zirv; point it at the actual child and
+    // repeat after every relaunch.
     if let Some(child_pid) = child.process_id() {
         session_guard.adopt_child_pid(child_pid);
     }
-    // Issue #281: the launch prompt is baked into this spawn's own argv, not
-    // typed as pty input, so it never reaches the `PumpEvent::Input` arm
-    // `pump` stamps a turn's start from -- this is the only edge that
-    // observes the FIRST turn beginning. Turn 1: the very first thing this
-    // session does.
+    // The launch prompt enters through argv, so this is the only edge that
+    // can mark the first turn in flight. (#281)
     session_guard.stamp_in_flight(verb.as_str(), 1);
 
     let reader = pair.master.try_clone_reader()?;
@@ -662,14 +451,9 @@ pub fn run_with(
     // never reports a false PtyClosed for the pty that replaced it.
     let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Guards every write to the real stdout: the output thread's own
-    // child-byte writes, and (T12b) the bar's assembled redraw buffer. One
-    // `Mutex<()>` rather than wrapping `Stdout` itself, since both writers
-    // already hold their own handle and only need to serialize *when* they
-    // write, not share the handle.
+    // Serialize child output with bar redraws on real stdout.
     let stdout_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
 
-    // PTY to stdout.
     spawn_output_thread(
         reader,
         tx.clone(),
@@ -678,39 +462,27 @@ pub fn run_with(
         stdout_lock.clone(),
     );
 
-    // Armed for the pty just opened, and re-armed by `pump` for every pty a
-    // restart opens after it.
+    // Re-arm the console probe filter for every new pty.
     let cpr_filter = std::sync::Arc::new(std::sync::Mutex::new(CprFilter::default()));
     cpr_filter
         .lock()
         .map_err(|_| "cpr filter poisoned")?
         .arm(Instant::now());
 
-    // stdin to PTY. Accepted race (issue #118 follow-up): this drain has no
-    // owed-CR flush of its own, unlike `Pane::write_operator_input`, so an
-    // operator keystroke landing inside a deferred injection's narrow
-    // pending window can merge into that not-yet-submitted advisory line.
-    // Deliberately not fixed -- a deferred injection only ever starts once
-    // the transcript is idle-quiet, which keeps the window narrow, and the
-    // failure mode is a garbled advisory line, never a lost or misdirected
-    // submit. This input hot path must stay failure-free, so no
-    // cross-thread state is added here to guard against it.
+    // Operator input can meet a deferred advisory before its submit; the
+    // idle gate keeps this window narrow and the input path failure-free.
+    // The worst result is a garbled advisory, so no cross-thread lock is added. (#118)
     let input_tx = tx.clone();
     let input_writer = std::sync::Arc::clone(&writer);
     let input_filter = std::sync::Arc::clone(&cpr_filter);
     let input_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let input_stop_for_thread = std::sync::Arc::clone(&input_stop);
     let input_thread = std::thread::spawn(move || {
-        // Issue #330: the operator's own keystrokes travel on this thread and
-        // nothing else does. Raised for the same reason (and with the same
-        // per-thread caveat) as the output thread's own raise.
+        // Raise only this keystroke thread, leaving child process priority. (#330)
         super::priority::raise_current_thread();
         let mut buf = [0u8; 4096];
         let mut stdin = std::io::stdin();
-        // #206. Owned by this thread rather than shared: a relaunch swaps the
-        // pty behind `input_writer` but never restarts this pump, so a paste
-        // being accumulated when the child is replaced is still delivered
-        // whole, to the new pty.
+        // Keep paste state across pty replacement so a pending paste stays whole. (#206)
         let mut paste = PasteGuard::default();
         loop {
             if input_stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
@@ -729,18 +501,15 @@ pub fn run_with(
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     let now = Instant::now();
-                    // The console host's own probe was already answered
-                    // synthetically; the terminal's duplicate answer must not
-                    // reach the agent as keystrokes.
+                    // The synthetic console-host reply already handled this probe.
                     let filtered = {
                         let Ok(mut filter) = input_filter.lock() else {
                             return;
                         };
                         filter.filter(&buf[..n], now)
                     };
-                    // #206: and a bracketed paste reaches the agent's composer
-                    // as one write, so its newlines stay newlines instead of
-                    // submitting a turn per line.
+                    // Forward a bracketed paste in one write so its newlines
+                    // cannot submit separate turns. (#206)
                     let bytes = paste.filter(filtered.as_ref(), now);
                     if bytes.is_empty() {
                         continue;
@@ -776,13 +545,8 @@ pub fn run_with(
         (cols, rows),
         cfg.pace.collector_max_age_secs,
     );
-    // C5: `raw.is_some()` as well as `bar.chrome.bar`. `RawGuard::enter` is
-    // what stashes the console modes and installs the emergency restore
-    // handler (F4), so when it failed there is nothing armed to undo a
-    // scroll region -- writing one anyway would fence off the terminal's
-    // last row with no handler able to put it back, which is strictly worse
-    // than having no bar. A failed `enter` also means this is not a real
-    // terminal in the first place, so the bar has nothing to draw on.
+    // A bar requires RawGuard's emergency restore handler; without it, a
+    // scroll region could strand the terminal in a fenced state.
     if bar.chrome.bar && raw.is_some() {
         let region = super::chrome::scroll_region_sequence(bar.rows);
         let region_ok = match stdout_lock.lock() {
@@ -795,31 +559,17 @@ pub fn run_with(
             }
             Err(_) => false,
         };
-        // Same degrade-on-failure as every other bar write: a scroll region
-        // that never actually got set must not leave the bar thinking it is
-        // still safely confining the child.
+        // If the scroll region write failed, the bar cannot assume it is active.
         bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
-        // F4: from here the real console has a scroll region fencing off its
-        // last row, so an external kill owes it a `CSI r` on the way out.
-        // Only when the write actually landed -- a region that was never set
-        // needs no reset.
+        // Only an installed scroll region owes an emergency reset.
         super::term::set_bar_active(region_ok);
     }
 
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
     let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
-    // Carried into `relaunch_command` too, so a restart does not silently drop
-    // the injected prompt the first command already carries.
-    //
-    // Not the raw argv: a restart is a deliberate escape from the conversation
-    // that rotted, so anything pinning the launch to it (`--continue`,
-    // `--resume <id>`, `--session-id <id>`, `--fork-session`, and their
-    // `=`-bound spellings) has to go, or `wrap -- claude --continue` relaunches
-    // straight back into the session it was leaving and burns the restart
-    // budget doing it. `exec` already worked this out; this is that same
-    // function, and the positional prompt it also strips is one `relaunch`
-    // regenerates from the handoff anyway.
+    // Keep prompt injection across restarts, but strip conversation pins:
+    // a restart must leave the rotted conversation.
     let relaunch_extra: Vec<String> = policy_extra
         .iter()
         .cloned()
@@ -827,15 +577,10 @@ pub fn run_with(
         .chain(prompt_args.iter().cloned())
         .collect();
 
-    // T84: owned rather than borrowed from `cfg`/`adapter` at the call site,
-    // so a live handover swap inside `pump` can update it in place for
-    // whatever the *new* adapter's own distiller default is -- otherwise a
-    // rot-triggered restart after a handover would keep quoting the
-    // predecessor's model name to a distiller that may not even recognise it.
+    // Own this model so a later swap can use the successor's distiller.
     let mut distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
-    // Issue #249: this session's own supervising session, if any -- resolved
-    // once, from `env` alone, and passed straight through to every poll.
+    // Resolve the supervising session once from this launch environment. (#249)
     let parent_short = super::agent::parent_identity(env);
     let mut native_successor = None;
     let exit = pump(
@@ -877,25 +622,17 @@ pub fn run_with(
     let _ = input_thread.join();
     #[cfg(not(unix))]
     drop(input_thread);
-    // P2/P3: `pump` only ever returns once the child has exited (every arm
-    // waits on it), so the pid leaves the console-close registry and the job
-    // handle closes here, explicitly -- `panic = "abort"` means `Drop` is no
-    // safety net. Before `session_guard.release()` purely for symmetry with
-    // the order they were taken in.
+    // Release the child job explicitly after exit; panic = "abort" means
+    // Drop cannot be relied on for cleanup.
     child_guard.release();
     if native_successor.is_some() {
         session_guard.disown();
     } else {
         session_guard.release();
     }
-    // Paired with `publish_socket_path` above, at the same single point every
-    // other per-session artifact is released: a dead supervisor's file must
-    // not linger to be picked as "the newest" by a later `read_socket_path`
-    // that has no session id of its own.
+    // Unpublish the socket at exit so a reader cannot select a dead endpoint.
     unpublish_socket_path(&state_dir, session.as_str());
-    // Issue #358: the seat is an address for a live session, and this one is
-    // over. Released at the same single point as every other per-session
-    // artifact so a dead seat record can never be read as a live one.
+    // Release the seat address when its session ends. (#358)
     if role == PromptRole::Orchestrator && native_successor.is_none() {
         super::rollover::forget(&state_dir, &super::sessions::short_id(session.as_str()));
     }
@@ -921,15 +658,8 @@ pub fn run_with(
     match exit {
         Ok(code) => Ok(code),
         Err(e) => {
-            // Item 6 audit: `w` is stdout in production, the same stream the
-            // wrapped session's own pty bytes are already occupying -- a
-            // rare internal pump failure (a `try_wait`/`wait` I/O error) used
-            // to print its only diagnostic there, where it could be scrolled
-            // off, overwritten by the child's own next redraw, or -- for
-            // `zirv chat > log` -- land only in a redirected file instead of
-            // the operator's own terminal. `output::error` matches
-            // `output::error`'s own stream and styling, the same fix as
-            // chat.rs's no-adapter diagnostic (item 1).
+            // Report pump I/O errors on stderr; stdout carries child pty
+            // bytes and may be redirected away from the operator.
             crate::output::error(format!("zirv ctx wrap: {e}"));
             Ok(1)
         }

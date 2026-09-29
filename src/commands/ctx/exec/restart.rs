@@ -7,38 +7,21 @@ pub const EXIT_ROT_EXHAUSTED: i32 = 75;
 /// Wall-clock timeout with no restarts left.
 pub const EXIT_TIMEOUT: i32 = 76;
 
-/// A `--budget-tokens`/`--max-tool-calls` ceiling was reached (issue #155,
-/// Phase 5(d)). Unlike the two codes above, this is never followed by a
-/// restart: a budget checkpoints the run once and stops it for good.
+/// Budget ceiling stops permanently without restart. (#155)
 pub const EXIT_BUDGET_EXHAUSTED: i32 = 77;
 
-/// Issue #227: the restart budget is spent while every restart kept hitting
-/// a transient provider capacity/overload error (`pace::CAPACITY_PATTERNS`).
-/// Distinct from `EXIT_ROT_EXHAUSTED`: the session itself never rotted, the
-/// provider just could not serve it -- retried within budget with a short
-/// backoff (`capacity_backoff_secs`) before landing here.
+/// Capacity retries exhausted; distinct from a rotting session. (#227)
 pub const EXIT_CAPACITY_EXHAUSTED: i32 = 78;
 
-/// Issue #227: the provider reported the account itself is out of usable
-/// credits/quota (`pace::ACCOUNT_EXHAUSTED_PATTERNS`) -- a hard, non-
-/// retryable condition. Never follows a restart: burning the budget cannot
-/// fix a billing problem, so this fires on the very first occurrence.
+/// Account exhaustion is not retryable; restarting cannot restore quota. (#227)
 pub const EXIT_ACCOUNT_EXHAUSTED: i32 = 79;
 
-/// Issue #267: a `--mode writing` delegation was refused before it ever
-/// launched, because the tree it would write to already has a live writer
-/// permit and `--worktree` was not given to allocate an isolated one
-/// instead. Never follows a restart -- like `EXIT_BUDGET_EXHAUSTED`, this
-/// stops the run before it starts, not mid-flight -- and unlike every other
-/// code above it IS retryable: the same delegation typically succeeds once
-/// the other writer finishes, or immediately with `--worktree`.
+/// Writer permit busy before launch; retry after it frees or use a separate
+/// worktree. (#267)
 pub const EXIT_WRITER_BUSY: i32 = 80;
 
-/// Issue #310 (3a): the progress clock latched, one steering nudge got no
-/// observed progress within the grace period, and the restart budget is
-/// spent -- distinct from `EXIT_TIMEOUT`/`EXIT_ROT_EXHAUSTED` so the
-/// restart-chain breaker (3b) can count this as its own `stalled` failure
-/// class rather than folding it into `crash`.
+/// Progress stayed stalled after one nudge and restart budget was spent;
+/// keep this failure class separate from rot and timeout. (#310)
 pub const EXIT_STALLED: i32 = 81;
 
 /// The worker exited cleanly but its final report failed the result contract or named
@@ -57,12 +40,7 @@ pub(crate) const EXIT_CODES: &[(i32, &str)] = &[
     (EXIT_CONTRACT_FAILED, "EXIT_CONTRACT_FAILED"),
 ];
 
-/// The supervisor reports its own outcomes through the same `i32` an agent's
-/// exit code arrives on, so "exited with code 75" reads as something the
-/// agent did rather than as zirv giving up. Shared by `zirv ctx agent`
-/// (agent.rs) and script `agent:` steps (agent_command.rs), which both
-/// delegate to this supervisor and want the same wording for the same three
-/// outcomes.
+/// Distinguish supervisor-owned exit codes from a child's identical code.
 pub fn describe_exit(code: i32) -> String {
     match code {
         EXIT_ROT_EXHAUSTED => "the session kept rotting and the restart budget ran out".to_string(),
@@ -93,11 +71,7 @@ pub fn describe_exit(code: i32) -> String {
     }
 }
 
-/// Issue #227: backoff before retrying a headless worker that failed on a
-/// transient provider capacity error -- 15s/30s/60s, capped at 60s for a
-/// fourth or later attempt. `attempt` is 1-based: the restart about to be
-/// made (`restarts` after it is incremented). Pure, so the schedule is
-/// table-tested without a real clock.
+/// Pure capacity retry schedule, capped after the third attempt. (#227)
 pub(super) fn capacity_backoff_secs(attempt: u32) -> u64 {
     match attempt {
         0 => 0,
@@ -107,15 +81,7 @@ pub(super) fn capacity_backoff_secs(attempt: u32) -> u64 {
     }
 }
 
-/// C3: the consecutive-nudge budget after one supervised run.
-///
-/// `[supervise] max_nudges` has always been documented as bounding
-/// *consecutive* nudge restarts -- "a session cannot be interrupted
-/// indefinitely" -- but the counter was only ever incremented, so it actually
-/// bounded nudges for the whole lifetime of the run. A session nudged three
-/// times across an hour, doing real work between each, could never be nudged
-/// again. Progress (a turn boundary reported by the session itself) ends the
-/// consecutive run and restores the budget.
+/// Reset consecutive-nudge budget when this session reports progress.
 pub fn nudges_after(used: u32, progressed: bool) -> u32 {
     if progressed { 0 } else { used }
 }

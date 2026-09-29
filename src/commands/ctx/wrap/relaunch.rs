@@ -2,20 +2,14 @@
 
 use super::*;
 
-/// Finding #7: `handover::take_request`'s own cadence gate, the same "is it
-/// due yet" shape as [`MailWatch::due`] above but tracked in its own
-/// `Option<Instant>` (the pump loop's `last_handover_poll`) rather than
-/// folded into `MailWatch` itself -- a session with mail polling
-/// disabled/degraded must not also starve its handover-request check, and
-/// vice versa. `None` (never polled yet) is always due, exactly like `due`.
+/// Poll handover independently of mail so disabling mail cannot starve
+/// handover requests.
 pub(super) fn handover_poll_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= MAIL_POLL)
 }
 
-/// Automatic rollover follows collector cadence except while a reactive
-/// cause is pending, when it retries every minute to enforce the force grace.
-/// Unlike [`handover_poll_due`], `None` is NOT due: the pump seeds this with
-/// its own start instant so no usage I/O happens during session startup.
+/// Delay rollover I/O until after startup; retry pending reactive causes
+/// more often to enforce force grace.
 pub(super) fn rollover_eval_due(
     last: Option<Instant>,
     now: Instant,
@@ -28,13 +22,8 @@ pub(super) fn rollover_eval_due(
     })
 }
 
-/// Issue #780: [`rollover_eval_due`], but also advances `*last` whenever the
-/// cadence comes due -- regardless of whether the caller goes on to find the
-/// switch disabled. Without this, a disabled `fallback.auto_orchestrator_
-/// rollover` would leave `*last` stale forever, so this cheap check alone
-/// would keep reporting "due" on every subsequent tick and the caller's
-/// `auto_rollover.is_enabled()` (two `stat`s) would run every tick again --
-/// exactly the syscall storm this issue is about avoiding.
+/// Advance cadence even when rollover is disabled, avoiding config reads
+/// on every pump tick. (#780)
 pub(super) fn rollover_eval_due_advancing(
     last: &mut Option<Instant>,
     now: Instant,
@@ -48,22 +37,14 @@ pub(super) fn rollover_eval_due_advancing(
     due
 }
 
-/// Whether this session was launched interactively, read back from the
-/// durable launch-mode pin its own `turn_env` carries -- the same derivation
-/// `dash::pane::Pane::spawn` makes from the identical vector, rather than a
-/// second copy of the fact that could drift from it. An automatic rollover's
-/// successor must launch on the same terms its predecessor did.
+/// Use the durable launch-mode pin so a successor inherits the same mode.
 pub(super) fn interactive_from_turn_env(turn_env: &[(String, String)]) -> bool {
     turn_env.iter().any(|(key, value)| {
         key == adapters::LAUNCH_MODE_ENV && value == adapters::LAUNCH_MODE_INTERACTIVE_VALUE
     })
 }
 
-/// This launch's own pinned model, read back out of `turn_env` -- the same
-/// `SEAT_MODEL_ENV` lookup `seat::register`'s call sites already duplicate
-/// inline in a few places in this file. Used to resolve
-/// `AgentAdapter::provider_for_model` wherever a call site has `turn_env` in
-/// hand but no separately-resolved model variable of its own.
+/// Resolve the pinned model from the launch environment for provider choice.
 pub(super) fn seat_model_from_turn_env(turn_env: &[(String, String)]) -> Option<&str> {
     turn_env
         .iter()
@@ -71,20 +52,14 @@ pub(super) fn seat_model_from_turn_env(turn_env: &[(String, String)]) -> Option<
         .map(|(_, value)| value.as_str())
 }
 
-/// One open automatic rollover: the seat generation `rollover::evaluate`
-/// reserved, the signal count at the moment the successor was launched, and
-/// when that happened -- everything [`rollover::successor_readiness`] needs
-/// to decide whether the successor has earned the seat yet.
+/// Open transaction state needed to judge successor readiness.
 pub(super) struct PendingRollover {
     pub(super) generation: u64,
     pub(super) signals_at_swap: u64,
     pub(super) started: Instant,
 }
 
-/// Wrap's own automatic rollover evaluation. Returns a request to be run
-/// through the exact same seam a manual `zirv ctx handover` takes; `None` --
-/// including for a parked seat -- means this tick changes nothing, and the
-/// session simply keeps running under supervision.
+/// Evaluate rollover through the same swap seam as a manual handover.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn automatic_rollover_request(
     state_dir: &super::state::StateDir,
@@ -97,8 +72,7 @@ pub(super) fn automatic_rollover_request(
     interactive: bool,
 ) -> Option<super::handover::HandoverRequest> {
     let now = super::state::now_secs();
-    // A parked seat is asked first: its window may have elapsed, in which
-    // case the best harness may no longer be the one it is sitting on.
+    // Reevaluate parked seats before choosing a harness.
     if let Some(req) = super::rollover::on_resume(state_dir, cfg, "wrap", short, now, interactive) {
         return Some(req);
     }
@@ -117,9 +91,7 @@ pub(super) fn automatic_rollover_request(
         // rollover_sweep` reads this evaluation's own headroom back.
         &mut None,
     );
-    // Anything but a plain `Skip` is worth a line: it is the only record of
-    // why the seat did (or deliberately did not) move. A `Skip` is the
-    // steady state of every healthy session and would be pure noise.
+    // Log nontrivial decisions; steady-state Skip would be noise.
     if !matches!(evaluation, super::rollover::Evaluation::Skip(_)) {
         let _ = super::log::append(
             state_dir,
@@ -141,10 +113,7 @@ pub(super) fn automatic_rollover_request(
     }
 }
 
-/// Thin delegate to `mail::unread_counts` (moved there in Task 7 so the
-/// dashboard's header facts can share it too): the T12b bar's own
-/// `mail 2+1` rendering reads the `(broadcast, direct-to-this-session)`
-/// split this returns.
+/// Read broadcast and direct mail counts for the status bar.
 pub(super) fn unread_mail_counts(
     state: &super::state::StateDir,
     repo: &Path,
@@ -155,31 +124,15 @@ pub(super) fn unread_mail_counts(
     super::mail::unread_counts(state, repo, agent, session_short, mail_enabled)
 }
 
-/// Capability-gated two-phase, the same shape [`write_mail_advisory`] uses
-/// for the T13 mail-advisory injection, and for the same reason: this site
-/// IS reachable for a `defer_injection_submit` adapter (codex), not only
-/// for claude. `Action::Compact`/`Action::Restart` fire only once
-/// `may_inject` is true, which requires `state.signals_seen > 0` -- and
-/// codex's own adapter never advances that counter itself -- but a live
-/// handover (`perform_handover_swap`) can swap the adapter in place
-/// mid-pump-loop without resetting that supervision state, so a
-/// pre-handover claude session's Compact verdict can still fire this
-/// against a freshly swapped-in codex child. Claude's composer submits a
-/// same-burst trailing `\r` correctly, so `defer` is `false` there; a
-/// codex successor needs the same paste-fold protection
-/// `write_mail_advisory` already gives its mail advisory.
+/// Submit compaction in two phases for adapters that defer carriage return;
+/// a handover can change adapter without resetting turn-signal state. (#118)
 pub fn inject_compact(
     sink: &mut dyn Write,
     compact_command: &str,
     focus: &str,
     defer: bool,
 ) -> CtxResult<()> {
-    // A TUI submits on carriage return, not newline. Built as a full string
-    // first and written in one `write_all` call, the same convention
-    // `mail_advisory_bytes`/`write_mail_advisory_phase1` use -- `write!`
-    // directly on a generic sink can fragment one format string across
-    // several `write_all` calls, which would blur the phase boundary this
-    // function depends on.
+    // Build one write so the carriage-return phase boundary stays intact.
     let text = compact_prompt(compact_command, focus);
     if !defer {
         sink.write_all(format!("{text}\r").as_bytes())?;
@@ -188,20 +141,15 @@ pub fn inject_compact(
     }
     sink.write_all(text.as_bytes())?;
     sink.flush()?;
-    // A plain blocking sleep is fine here, unlike `write_mail_advisory`'s
-    // non-blocking arm-and-drain: the pump loop calls `verify_compaction`
-    // immediately after this and blocks there anyway, so there is no
-    // responsiveness cost to blocking inline first.
+    // Verification already blocks here, so waiting for deferred submit
+    // does not add a responsiveness cost.
     std::thread::sleep(INJECTION_SUBMIT_DELAY);
     sink.write_all(b"\r")?;
     sink.flush()?;
     Ok(())
 }
 
-/// `screen_thresholds` (issue #272 review round 2) is the caller's own
-/// resolved `[screen]` config, threaded straight through to
-/// `handoff::labeled_for_injection` -- a single added parameter, no other
-/// change to this function's own logic.
+/// Pass the resolved screen thresholds to handoff labelling. (#272)
 pub fn restart_prompt(handoff: &Handoff, screen_thresholds: &super::screen::Thresholds) -> String {
     format!(
         "The previous session in this terminal ran out of usable context and was restarted by \
@@ -241,19 +189,8 @@ pub fn note_failure(
     }
 }
 
-/// Issue #310 parity for `wrap`'s own rot restart. `exec` records every respawn
-/// on the cross-process restart chain and refuses to auto-resume once the
-/// breaker trips; `wrap`'s `Action::Restart` arm recorded nothing and asked
-/// nothing, so a session that rots, restarts, and rots again immediately kept
-/// relaunching forever -- and did it under a per-process budget `wrap` does not
-/// have either. Same chain key (the repo slug) and same class (`Crash`, which
-/// is where a rot-triggered restart belongs: neither a stall nor a vendor-side
-/// condition) as `exec`, so the two supervisors share one breaker over one
-/// repository rather than each keeping half a picture.
-///
-/// `Some(boots)` means "do not relaunch"; the caller degrades to passthrough.
-/// Everything about the decision lives here so the PTY arm that calls it stays
-/// the only part that needs a real terminal to exercise.
+/// Refuse another rot restart once the repository restart chain trips;
+/// the caller then degrades to passthrough. (#310)
 pub(super) fn tripped_restart_chain(
     state: &StateDir,
     repo: &Path,
@@ -274,7 +211,6 @@ pub(super) fn tripped_restart_chain(
     }
 }
 
-/// Polls until `child` exits or `deadline` passes, returning whether it exited.
 fn wait_for_exit(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     deadline: Instant,
@@ -288,44 +224,14 @@ fn wait_for_exit(
     Ok(false)
 }
 
-/// Ask the TUI to quit, then escalate. A TUI that will not leave politely is
-/// killed rather than left running under a supervisor that has moved on.
-///
-/// Two rungs, deliberately: the adapter's own quit sequence, then
-/// `child.kill()`. There is **no Ctrl-C rung**, and one must never be added
-/// back (F1).
-///
-/// Writing `\x03` into the pty master is not a signal to *this* child. On
-/// Windows the master is a ConPTY, and conhost turns that byte into a console
-/// control event that it broadcasts to **every** process attached to the
-/// pseudoconsole -- and portable-pty 0.9.0 spawns without
-/// `CREATE_NEW_PROCESS_GROUP`, so there is no group to narrow the broadcast
-/// to. A `wrap` that had been launched inside another zirv session therefore
-/// took the *outer* session's agent down with the child it meant to quit.
-/// (On unix the byte is only marginally better behaved: the line discipline
-/// delivers SIGINT to the whole foreground process group of that pty.)
-///
-/// `child.kill()` is the narrow primitive that has none of that reach: a
-/// `TerminateProcess`/`kill` against the one handle this supervisor owns.
-/// Note that portable-pty's Windows `do_kill` inverts its own success check
-/// and `kill` swallows the result, so a failed kill is invisible here -- see
-/// Known Issues; that is a reason to be conservative about what else we try,
-/// not a reason to reach for a console-wide broadcast.
-///
-/// P1: on Windows the escalation rung is now a **tree**-kill by pid
-/// (`supervise::kill_tree`, the same native process-tree walk `exec`/`loop`
-/// use) run *before* the narrow `child.kill()`. `TerminateProcess`
-/// against the direct child is not enough for an npm-installed agent, where
-/// that direct child is `cmd.exe /c claude.cmd` and the agent itself is a
-/// `node` grandchild: quitting a session -- or restarting one on a rot verdict
-/// -- left that grandchild alive, and a freshly spawned replacement then ran
-/// alongside it on the same repo. The tree-kill is by **pid only**, so it is
-/// neither a shell invocation nor a console broadcast; it is not a substitute
-/// for the narrow kill (it can fail to open the process) and its result is
-/// not evidence of anything. `wait_for_exit`/`wait` stay the only proof of
-/// death. Unix is untouched: portable-pty does
-/// `setsid` + `TIOCSCTTY` there, so the child is a session leader and dies
-/// with its pty.
+/// Ask the TUI to quit, then kill its tree and direct child if needed.
+/// Never send Ctrl-C into the pty: console control events can reach other
+/// processes attached to the Windows pseudoconsole. The tree-kill runs first
+/// because an npm-installed agent's direct child is `cmd.exe`, with the agent
+/// itself a `node` grandchild a direct kill would miss; unix needs none of
+/// this, since the child is already its pty's session leader. Prove exit by
+/// wait, not by `child.kill()`'s own result: portable-pty's Windows
+/// `do_kill` inverts its success check, so a failed kill is invisible here.
 pub fn quit_child(
     sink: &mut dyn Write,
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -350,18 +256,8 @@ pub fn quit_child(
     Ok(())
 }
 
-/// Builds a child's supervision environment: scrub first, then set whatever
-/// this supervisor actually owns. The single place both the initial launch
-/// and every relaunch go through, so the scrub cannot be forgotten on one of
-/// them (F3).
-///
-/// The scrub is unconditional, and that is the whole point. `turn_env` is
-/// empty whenever the socket bind failed -- and without the scrub the child
-/// then inherited the *outer* session's `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`
-/// straight out of this process's environment (`CommandBuilder::new` seeds
-/// itself from `std::env::vars_os`), so its hooks reported turn boundaries
-/// into a supervisor that belonged to somebody else's session. "No socket of
-/// my own" has to degrade to unsupervised, never to supervised-by-another.
+/// Scrub inherited supervision identity before applying this session's
+/// values; a failed bind must leave the child unsupervised.
 pub(super) fn apply_session_env(builder: &mut CommandBuilder, turn_env: &[(String, String)]) {
     super::sessions::scrub_supervision_env(builder);
     for (key, value) in turn_env {
@@ -369,12 +265,8 @@ pub(super) fn apply_session_env(builder: &mut CommandBuilder, turn_env: &[(Strin
     }
 }
 
-/// Pumps one pty master's output to stdout for as long as `generation` still
-/// matches `my_generation`. A restart opens a fresh inner pty rather than
-/// respawning onto the old one (verified: once its session-leader child has
-/// exited, this platform refuses a second `spawn_command` on that slave with
-/// EBADF), so the old reader thread outlives its pty by a little and must
-/// never mistake that pty's own closure for the current one's.
+/// Pump only the current pty generation; an old reader may outlive a
+/// relaunch and must not report its closure as the new pty's.
 pub(super) fn spawn_output_thread(
     mut reader: Box<dyn Read + Send>,
     tx: mpsc::Sender<PumpEvent>,
@@ -383,10 +275,8 @@ pub(super) fn spawn_output_thread(
     stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     std::thread::spawn(move || {
-        // Issue #330: this thread carries every byte the operator SEES. On a
-        // machine saturated by below-normal worker builds it must be picked
-        // the moment the pty has output, so it is raised here rather than
-        // inherited -- thread priority never crosses a `spawn`.
+        // Raise the output thread itself so worker load does not delay
+        // visible bytes; thread priority is not inherited. (#330)
         super::priority::raise_current_thread();
         let still_current =
             || generation.load(std::sync::atomic::Ordering::SeqCst) == my_generation;
@@ -401,27 +291,13 @@ pub(super) fn spawn_output_thread(
                     return;
                 }
                 Ok(n) => {
-                    // A restart may have superseded this thread while the
-                    // read was in flight. Bytes read from an abandoned pty
-                    // must never reach stdout (they would interleave with
-                    // the current generation's own output on the same
-                    // stdout handle) or the event channel (a stale Output
-                    // could refresh `last_output` for the wrong pty). But
-                    // the thread must keep draining rather than exit here:
-                    // the old pty's session may still be alive mid-quit,
-                    // and leaving its output buffer to back up is exactly
-                    // what stalls that child's own exit (see quit_child's
-                    // tests, which needed the identical drain to unblock).
+                    // Keep draining a superseded pty to unblock its child,
+                    // but never forward stale bytes or events to this session.
                     if !still_current() {
                         continue;
                     }
-                    // Held only around the write itself (T12b): the same
-                    // lock the bar's own redraw takes, so one assembled bar
-                    // buffer can never land in the middle of a child-byte
-                    // write and vice versa. A poisoned lock (a panic
-                    // elsewhere while holding it) still yields its guard --
-                    // the child's own output must never be dropped because
-                    // some unrelated code panicked while holding this lock.
+                    // Serialize each child write with bar redraws; recover
+                    // poisoned locks so child output is never dropped.
                     let write_result = {
                         let _guard = stdout_lock.lock().unwrap_or_else(|e| e.into_inner());
                         stdout.write_all(&buf[..n]).and_then(|()| stdout.flush())
@@ -441,11 +317,8 @@ pub(super) fn spawn_output_thread(
     });
 }
 
-/// Opens a brand-new inner pty sized to the current window and spawns the
-/// adapter's interactive command into it with the handoff as the initial
-/// prompt. The old pty cannot be reused for this (see `spawn_output_thread`),
-/// so a restart always moves the wrapped agent to a fresh one; the outer
-/// side (the user's own terminal, the raw-mode guard) is untouched.
+/// Relaunch on a fresh inner pty; the operator terminal and raw-mode guard
+/// remain in place.
 type RelaunchedSession = (
     portable_pty::PtyPair,
     Box<dyn portable_pty::Child + Send + Sync>,
@@ -453,17 +326,10 @@ type RelaunchedSession = (
     Box<dyn Write + Send>,
 );
 
-/// The handoff plus whatever the user themselves wrapped: `wrap -- claude
-/// --model opus` has to come back as an opus session, not a default one.
-///
-/// Issue #220: the handoff no longer goes on argv when the adapter can take it
-/// through the system-prompt file `extra` already names -- a restart prompt is
-/// always multi-line, and on a Windows npm `.cmd` install `guard_cmd_shim_
-/// reparse` refused every one of them (`\n` is a cmd.exe metacharacter), so the
-/// rot restart this whole supervisor exists for could never fire there. The
-/// returned `extra` is `extra` with that one flag repointed, never mutated in
-/// place: each restart re-derives it from the launch's own composed file, so
-/// the handoff cannot compound across restarts.
+/// Preserve operator flags and deliver the handoff through the adapter's
+/// prompt file when available, avoiding Windows shim argv reparsing. (#220)
+/// Returned `extra` is rebuilt fresh from the launch's own file each call,
+/// never mutated in place, so a handoff cannot compound across restarts.
 fn relaunch_command(
     adapter: &dyn AgentAdapter,
     handoff: &Handoff,
@@ -489,18 +355,8 @@ fn relaunch_command(
     adapter.interactive_cmd(Some(&prompt), &args)
 }
 
-/// The user's own flags, minus everything a restart regenerates for itself.
-///
-/// Delegates to `exec::extra_launch_flags` rather than reimplementing it: both
-/// verbs have to agree on what escaping a rotted session means, and `exec`
-/// already covers `--session-id`, `--resume`, `-c`, `--continue`,
-/// `--fork-session` and their `=`-bound spellings.
-///
-/// `wrap`'s argv always names the program it spawns -- an empty one is rejected
-/// before this is reached -- so the prefix is the adapter's own launch prefix,
-/// with the same fallback `exec` uses for an argv that opens with a flag. No
-/// `known_prompt`: wrap's initial prompt is positional, and the leading
-/// positionals are dropped by `extra_launch_flags` on shape alone.
+/// Preserve operator flags but remove conversation pins through the same
+/// filter exec uses; a restart must leave the rotted conversation.
 pub(super) fn restart_launch_flags(
     adapter: &dyn AgentAdapter,
     launch_command: &[String],
@@ -516,13 +372,8 @@ pub(super) fn restart_launch_flags(
     super::exec::extra_launch_flags(launch_command, prefix, None, adapter.name())
 }
 
-/// Item 5 (regression fix): the pty size a restart's fresh session opens at
-/// -- reserved when the bar is still alive, exactly like the initial launch
-/// and every ordinary resize while it stays that way, so a mid-session
-/// restart cannot hand the child the reserved row the bar is about to keep
-/// drawing over. The raw terminal size otherwise (the bar was never
-/// eligible, or has already degraded, in which case the pty tracks full
-/// size like a bar-less session -- see B1's `resize_decision`).
+/// Reserve the status-bar row on a fresh pty only while the bar is active;
+/// a degraded bar gives the child the full terminal size.
 pub(super) fn relaunch_size(bar: &BarRuntime, terminal_size: (u16, u16)) -> (u16, u16) {
     super::chrome::reserved_pty_size(terminal_size, bar.active())
 }
@@ -556,11 +407,10 @@ pub(super) fn relaunch(
     );
     super::mcp::launch::append(&mut extra, mcp_args);
     let command = relaunch_command(adapter, handoff, &extra, screen_thresholds, state, session);
-    // FIX 2a (command-injection defense): the relaunch rebuilds its own
-    // CommandBuilder from the adapter's Command, so -- like the first launch
-    // below and the dashboard pane -- it must clear the cmd.exe argv-reparse
-    // guard itself rather than rely on supervise::spawn_tapped (the pty path
-    // never reaches it). A no-op off Windows and for any non-shim program.
+    // Command-injection defense: this pty path never reaches
+    // `supervise::spawn_tapped`'s guard, so reapply the cmd.exe argv-reparse
+    // policy here over the full downstream argv. A no-op off Windows and for
+    // any non-shim program.
     {
         let program = command.get_program().to_string_lossy().to_string();
         let args: Vec<String> = command
@@ -574,14 +424,12 @@ pub(super) fn relaunch(
         builder.arg(arg);
     }
     builder.cwd(repo);
-    // Without this the fresh session has no socket to report turn boundaries
-    // on, and supervision would silently end at the first restart. Scrubbed
-    // first either way -- see `apply_session_env`.
+    // Reapply this session's socket after scrubbing inherited identity;
+    // otherwise supervision ends at the first restart.
     apply_session_env(&mut builder, turn_env);
 
-    // Before the spawn, and before anything else touches this pty: on Windows
-    // the console host will not service the child at all until it is answered.
-    // A restart opens a fresh pseudoconsole, so it re-deadlocks without this.
+    // Windows console host blocks a fresh pty until its cursor probe is
+    // answered, including on every restart.
     let mut writer = pair.master.take_writer()?;
     answer_inherit_cursor_probe(&mut *writer);
 
@@ -592,13 +440,8 @@ pub(super) fn relaunch(
     Ok((pair, child, reader, writer))
 }
 
-/// T10, reworked for issue #358 (T9): applies the resolved `InteractiveGate`
-/// before the pty is ever opened. Usage headroom never blocks or delays a
-/// launch any more -- `Pause` and `Refuse` both just print `message` and
-/// return `Ok(())` to launch immediately, with no keypress wait and no
-/// confirmation prompt. `force_pace` is still accepted (every caller still
-/// passes it through) and still names itself in the line it prints, but it
-/// is now a no-op for the gate: there is nothing left for it to skip.
+/// Announce pacing guidance before opening the pty; no usage decision
+/// blocks or prompts this interactive launch. (#358)
 pub(in crate::commands::ctx) fn apply_interactive_gate(
     gate: pace::InteractiveGate,
     force_pace: bool,
@@ -616,32 +459,9 @@ pub(in crate::commands::ctx) fn apply_interactive_gate(
     Ok(())
 }
 
-/// `role` is a caller-supplied parameter rather than a `WrapArgs` field: it is
-/// not something a user ever types on the `wrap` command line, only something
-/// another verb (`zirv ctx chat`) decides on the caller's behalf. Both callers
-/// pass `PromptRole::Orchestrator` today -- `chat`, and the bare `wrap` verb
-/// itself, whose command an operator is sitting in front of and driving
-/// interactively. A relaunch inside `pump` never re-decides: it reuses this
-/// launch's own composed prompt, so it keeps this launch's role by
-/// construction.
-/// `session` lets a caller that already generated a session id for its own
-/// purposes (`chat.rs`'s launch banner, printed before this function is ever
-/// called) hand it in rather than have two different ids exist for the same
-/// launch. `None` (every caller but `chat`) keeps today's behavior: a fresh
-/// id minted here.
-///
-/// No writer parameter: this function never had anything of its own to print
-/// on a healthy path, and its one former write (a rare internal pump
-/// failure) went to `output::error` on stderr instead (item 6 audit) --
-/// printing it to a caller-supplied stdout writer, the same stream the
-/// wrapped session's own pty bytes already occupy, is exactly the kind of
-/// silently-lost diagnostic that motivated the fix.
-/// Pure mapping from "is this launch's stdio a real terminal" to the
-/// `LaunchMode` `compile`/`policy_launch_args` should use (2026-08-24
-/// hardening, finding 5): a non-tty launch fails closed to `Headless`
-/// rather than inheriting the permissive `Interactive` posture. Split out
-/// so the mapping itself -- as opposed to the `is_terminal()` calls that
-/// feed it -- is directly unit-testable.
+/// Launch an interactive Orchestrator with an optional caller-supplied
+/// session id; nonterminal stdio maps to Headless policy.
+/// Diagnostics use stderr because stdout carries child pty bytes.
 pub(super) fn launch_mode_from_interactive(interactive: bool) -> super::adapters::LaunchMode {
     if interactive {
         super::adapters::LaunchMode::Interactive
@@ -650,14 +470,7 @@ pub(super) fn launch_mode_from_interactive(interactive: bool) -> super::adapters
     }
 }
 
-/// The compiled context this launch actually uses: `compile::compile`'s own
-/// gathered memory/harness-roster/canonical-context layers, with the
-/// harness proxy's own bounded `[zirv proxy]` layer folded on top when
-/// `proxy_layer` is `Some` (issue #537, T2a) -- a no-op when it is `None`,
-/// which is every launch the proxy never took over. Split out of `run_with`
-/// so this wiring is testable without a pty: `run_with` itself is a hot,
-/// hard-to-unit-test path (a real supervised session), while this seam is a
-/// pure function of its inputs.
+/// Compose launch context and an optional bounded proxy layer. (#537)
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compiled_context_for_launch(
     repo: &Path,

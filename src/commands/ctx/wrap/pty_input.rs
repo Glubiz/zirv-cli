@@ -2,9 +2,8 @@
 
 use super::*;
 
-/// Gives the Unix stdin pump a bounded wake-up so ownership of the real
-/// terminal can move to a native successor. `read` remains the byte-preserving
-/// path; `poll` only says whether it would block.
+/// Polls stdin so ownership can move to a native successor without
+/// changing byte-preserving reads.
 #[cfg(unix)]
 pub(super) fn stdin_ready() -> std::io::Result<bool> {
     let mut descriptor = libc::pollfd {
@@ -23,35 +22,15 @@ pub(super) fn stdin_ready() -> std::io::Result<bool> {
             != 0)
 }
 
-/// A Cursor Position Report for row 1, column 1 -- the reply a terminal sends
-/// when something asks it where the cursor is with `ESC[6n`.
-///
-/// DO NOT DELETE THIS. portable-pty 0.9.0 creates every Windows pseudoconsole
-/// with `PSUEDOCONSOLE_INHERIT_CURSOR` hard-coded (portable-pty
-/// `src/win/psuedocon.rs`, not reachable through `openpty`). That flag makes
-/// conhost emit `ESC[6n` on the pty and then *block* until a Cursor Position
-/// Report comes back on the pty's input pipe -- before it services the child at
-/// all. Nothing in `wrap` ever answered, so every wrapped command hung forever
-/// on Windows; even `wrap --no-supervise -- cmd /c exit 0` never exited.
-/// Writing this one synthetic reply into the master unblocks the console host.
-///
-/// It is written once per pty generation, which includes the relaunch path: a
-/// restart opens a brand-new pseudoconsole that deadlocks exactly the same way.
-///
-/// It stays even now that raw mode works and a real terminal could answer for
-/// itself, because `wrap` also has to run with stdin redirected (CI, a pipe),
-/// where there is no terminal to answer at all. `CprFilter` below keeps the two
-/// replies from colliding.
+/// DO NOT DELETE THIS. Windows portable-pty 0.9.0 asks for `ESC[6n` and
+/// blocks child startup until the pty receives a cursor report; without this
+/// reply every wrapped command hangs forever on Windows. Answer once per
+/// pty, including relaunches and redirected stdin; filter the real
+/// terminal's duplicate.
 #[cfg(windows)]
 const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 
-/// Answers the `PSUEDOCONSOLE_INHERIT_CURSOR` probe described on
-/// `CURSOR_POSITION_REPORT`. A no-op everywhere else: no other platform's pty
-/// asks anything before it will run a child.
-///
-/// `pub(in crate::commands::ctx)` rather than private: `dash::pane`'s own PTY
-/// spawn (the same deadlock, same fix) reuses this exact function instead of
-/// duplicating it.
+/// Answers the Windows console-host probe; shared with dashboard ptys.
 pub(in crate::commands::ctx) fn answer_inherit_cursor_probe(writer: &mut (dyn Write + Send)) {
     #[cfg(windows)]
     {
@@ -62,31 +41,20 @@ pub(in crate::commands::ctx) fn answer_inherit_cursor_probe(writer: &mut (dyn Wr
     let _ = writer;
 }
 
-/// How long after a pty is opened a Cursor Position Report arriving on stdin is
-/// assumed to be the answer to that pty's own `ESC[6n`. Generous: it covers a
-/// terminal that is slow to answer, and still expires long before a TUI could
-/// plausibly ask for the cursor itself and want the reply.
+/// Short window in which a cursor report belongs to the console-host probe
+/// rather than the agent TUI.
 #[cfg(windows)]
 const CPR_FILTER_WINDOW: Duration = Duration::from_secs(3);
 
-/// Swallows the *real* terminal's answer to the console-host probe.
-///
-/// `wrap` forwards the inner pty's output verbatim, so the `ESC[6n` from
-/// `CURSOR_POSITION_REPORT`'s story also reaches the user's own terminal, which
-/// -- now that raw mode works -- dutifully answers it on our stdin. The inner
-/// console was already satisfied by the synthetic reply, so forwarding that
-/// answer would type `ESC[24;1R` into the agent's TUI as if the user had. One
-/// report per pty generation is dropped, and only inside a short window after
-/// that pty opened, so a report the agent itself asked for later still arrives.
+/// Drop only the real terminal's duplicate answer to the synthetic probe;
+/// later agent-requested reports must still reach the child.
 #[derive(Debug, Default)]
 pub struct CprFilter {
     armed_until: Option<Instant>,
 }
 
 impl CprFilter {
-    /// Armed on Windows only: no other platform's pty sends the probe, so on
-    /// unix this filter is permanently inert and stdin is passed through byte
-    /// for byte.
+    /// Windows-only; other platforms forward stdin byte for byte.
     pub fn arm(&mut self, now: Instant) {
         #[cfg(windows)]
         {
@@ -96,8 +64,7 @@ impl CprFilter {
         let _ = now;
     }
 
-    /// Returns the bytes to forward. Borrows unless something was actually
-    /// removed, so the common path copies nothing.
+    /// Borrow on the common unchanged path to avoid copying input.
     pub fn filter<'a>(&mut self, bytes: &'a [u8], now: Instant) -> std::borrow::Cow<'a, [u8]> {
         let Some(until) = self.armed_until else {
             return std::borrow::Cow::Borrowed(bytes);
@@ -145,82 +112,40 @@ fn find_cursor_position_report(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     None
 }
 
-/// The markers a bracketed-paste-aware terminal wraps pasted text in.
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// How much of an unterminated paste span is held before it is flushed as-is.
-/// Far above any plausible paste, so a real one is never split; low enough
-/// that a terminal that sends a start marker and no end marker cannot make
-/// `wrap` eat unbounded memory.
+/// Bound an unclosed paste span so input cannot consume unlimited memory.
 const PASTE_SPAN_CAP: usize = 1024 * 1024;
 
-/// The other half of that backstop. A paste arrives in one burst, so a span
-/// still open this long after it opened is a marker the terminal never
-/// closed -- and holding the operator's keystrokes any longer for it would be
-/// exactly the "wrap made the session worse" failure this guard exists to
-/// prevent.
+/// Release an unclosed span before it can hold later keystrokes hostage.
 const PASTE_SPAN_MAX: Duration = Duration::from_secs(5);
 
-/// The shortest trailing fragment of `PASTE_START` that is held back waiting
-/// for the rest of the marker. `ESC` and `ESC [` are deliberately below the
-/// floor: they are the start of Esc-to-interrupt and of every arrow key, and
-/// withholding those until the *next* keystroke would break the session in a
-/// far more visible way than an unrecognised paste ever could. Nothing is
-/// lost by forwarding them: [`PasteGuard::forwarded_start_prefix`] remembers
-/// that it did, so a marker split there still opens its span.
+/// Hold only marker fragments long enough to distinguish paste; forwarding
+/// short Esc prefixes keeps interrupt and arrow keys responsive.
 const MIN_HELD_MARKER_PREFIX: usize = 3;
 
-/// Keeps a bracketed paste whole on the operator-input path.
-///
-/// Issue #206. A terminal wraps pasted text in `ESC[200~ ... ESC[201~` so the
-/// agent's composer can tell a paste from typing and keep the pasted newlines
-/// as newlines rather than submitting a turn per line. `wrap` reads the
-/// operator's console 4096 bytes at a time and writes each read straight to
-/// the child's pty, which leaves two ways for that span to come apart:
-///
-/// - A read boundary can fall inside a marker, so the child is handed
-///   `ESC[20` and `0~...` and never sees a paste at all.
-/// - The stdin pump and the injector share one writer. Without this guard an
-///   injected advisory can be written *between* two chunks of a paste, i.e.
-///   inside the span, which is the same corruption from the other side.
-///
-/// So a span is accumulated here and written once, markers included and
-/// contents byte-for-byte untouched: no `\r`/`\n` translation, no synthetic
-/// Enter. Outside a span this is a passthrough that copies nothing.
-///
-/// Pure, like [`CprFilter`]: `now` is passed in rather than read, so every
-/// verdict is reproducible in a test.
+/// Gather bracketed paste into one byte-preserving write so read boundaries
+/// and concurrent injection cannot split or interleave its contents. (#206)
+/// `now` is passed in to keep the guard pure.
 #[derive(Debug, Default)]
 pub struct PasteGuard {
     /// Either a trailing fragment of a start marker (when no span is open) or
     /// the whole of the open span, start marker included.
     held: Vec<u8>,
-    /// When the currently open span's start marker arrived.
     span_started: Option<Instant>,
-    /// How many bytes of `PASTE_START` the *previous* read ended on and this
-    /// guard forwarded anyway because they were shorter than
-    /// [`MIN_HELD_MARKER_PREFIX`] -- so 1 (`ESC`) or 2 (`ESC [`), or `None`.
-    ///
-    /// Those bytes are not held back, but they are still remembered: if the
-    /// very next read opens with the rest of the marker, the span genuinely
-    /// started back there and has to be opened, or the body streams through
-    /// read by read and the one-write guarantee is lost exactly where the
-    /// terminal split hardest. Cleared by the next read whatever it turns out
-    /// to be, so the memory can never span more than one read.
+    /// Short marker prefix already forwarded, remembered for one read so a
+    /// split start marker still opens a paste span.
     forwarded_start_prefix: Option<usize>,
 }
 
 impl PasteGuard {
-    /// Returns the bytes to forward: the empty slice while a span is still
-    /// being accumulated, the whole span the moment it closes, and otherwise
-    /// exactly what came in.
+    /// Forward complete spans; hold only an open span or marker fragment.
     pub fn filter<'a>(&mut self, bytes: &'a [u8], now: Instant) -> std::borrow::Cow<'a, [u8]> {
         if bytes.is_empty() {
             return std::borrow::Cow::Borrowed(bytes);
         }
-        // Backstop first: a span the terminal never closed must not hold this
-        // read -- or any read after it -- hostage.
+        // An unclosed span must not hold this or later reads.
         if let Some(started) = self.span_started
             && now.duration_since(started) >= PASTE_SPAN_MAX
         {
@@ -230,15 +155,8 @@ impl PasteGuard {
             self.forwarded_start_prefix = forwarded_start_prefix(&flushed);
             return std::borrow::Cow::Owned(flushed);
         }
-        // The previous read ended on an `ESC` or `ESC [` that was forwarded
-        // rather than held (see `MIN_HELD_MARKER_PREFIX`). If this read opens
-        // with the rest of the start marker, that really was a paste
-        // beginning: open the span here, and gather from this read on. The
-        // marker's first bytes are already on the wire, so the child still
-        // receives the whole of it, just as two writes rather than one.
-        //
-        // `take` runs however the rest of the condition goes, which is what
-        // clears the memory for every read that is not the continuation.
+        // A forwarded Esc prefix may complete a paste marker on this read;
+        // clear the remembered prefix regardless of the outcome.
         if let Some(sent) = self.forwarded_start_prefix.take()
             && self.span_started.is_none()
             && self.held.is_empty()
@@ -246,16 +164,13 @@ impl PasteGuard {
         {
             self.span_started = Some(now);
         }
-        // The overwhelmingly common read: no span open, nothing held, and not
-        // a byte that could begin a marker. Copies nothing. Deliberately
-        // *after* the check above -- the tail of a start marker (`200~`)
-        // carries no `ESC` of its own and would slip straight through here.
+        // Check forwarded marker prefixes first: their continuation can
+        // contain no Esc byte.
         if self.span_started.is_none() && self.held.is_empty() && !bytes.contains(&ESC) {
             return std::borrow::Cow::Borrowed(bytes);
         }
 
-        // `held` is either a marker fragment or the open span so far, and in
-        // both cases it belongs immediately before this read.
+        // Held bytes immediately precede this read, whether marker or span.
         let mut work = std::mem::take(&mut self.held);
         work.extend_from_slice(bytes);
         let mut out: Vec<u8> = Vec::with_capacity(work.len());
@@ -270,9 +185,8 @@ impl PasteGuard {
                         at = end;
                     }
                     None if work.len() - at > PASTE_SPAN_CAP => {
-                        // Over the cap the span is abandoned, not truncated:
-                        // every byte still goes to the child, just no longer
-                        // as one write.
+                        // Over the cap, forward every byte even if the paste
+                        // can no longer stay in one write.
                         out.extend_from_slice(&work[at..]);
                         self.span_started = None;
                         break;
@@ -313,9 +227,7 @@ impl PasteGuard {
     }
 }
 
-/// The length of the 1- or 2-byte tail of `bytes` that is a prefix of
-/// [`PASTE_START`] -- the fragments [`trailing_marker_prefix`] deliberately
-/// forwards instead of holding. `None` when the read ends on anything else.
+/// Length of a short marker prefix already forwarded at the read tail.
 fn forwarded_start_prefix(bytes: &[u8]) -> Option<usize> {
     if bytes.ends_with(&PASTE_START[..2]) {
         Some(2)
@@ -329,9 +241,7 @@ fn forwarded_start_prefix(bytes: &[u8]) -> Option<usize> {
 /// `ESC`, the only byte either marker can start with.
 const ESC: u8 = 0x1b;
 
-/// The first offset in `bytes` where `marker` appears whole. Scans from the
-/// `ESC`s rather than every position, so an open span re-scanned across
-/// successive reads stays cheap.
+/// Search only escape starts to keep repeated span scans cheap.
 fn find_marker(bytes: &[u8], marker: &[u8]) -> Option<usize> {
     let mut at = 0;
     while at + marker.len() <= bytes.len() {
@@ -347,11 +257,8 @@ fn find_marker(bytes: &[u8], marker: &[u8]) -> Option<usize> {
     None
 }
 
-/// How many bytes at the end of `bytes` are a strict, long-enough prefix of
-/// `marker` -- i.e. how much has to be held back in case the rest of the
-/// marker is in the next read. Zero unless the tail is at least
-/// [`MIN_HELD_MARKER_PREFIX`] bytes long; see that constant for why the
-/// shorter fragments are forwarded instead.
+/// Tail length that could complete a marker on the next read; short Esc
+/// prefixes are forwarded to preserve key responsiveness.
 fn trailing_marker_prefix(bytes: &[u8], marker: &[u8]) -> usize {
     let longest = (marker.len() - 1).min(bytes.len());
     let mut len = longest;

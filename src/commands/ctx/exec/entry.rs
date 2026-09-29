@@ -110,10 +110,7 @@ pub struct ExecArgs {
     pub cancellation: Option<std::sync::Arc<super::provider::adapter::CancellationFlag>>,
 }
 
-/// The same defaults clap itself applies, so a caller that builds this struct
-/// in code (a delegation fold, an `agent:` script step, a test) gets the
-/// harness runtime and the worker role without restating them -- and a field
-/// added here later cannot silently become `""` at those call sites.
+/// Defaults for in-code callers match clap, including runtime and role.
 impl Default for ExecArgs {
     fn default() -> Self {
         Self {
@@ -141,24 +138,15 @@ impl Default for ExecArgs {
     }
 }
 
-/// T11: real-clock wrapper. `run_with_clock` (below) does the actual work;
-/// this hands it the two real-world functions -- `state::now_secs` and a
-/// genuine `std::thread::sleep` -- so every caller outside this module
-/// (`script_runner::AgentCommand`, `agent.rs`, `dash`'s headless spawn
-/// fallback) keeps calling `run_with` exactly as before, with no signature
-/// change to ripple through.
+/// Inject clock and sleep for deterministic supervision tests.
 pub fn run_with<W: Write>(
     args: &ExecArgs,
     w: &mut W,
     repo: &Path,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
-    // Issue #478: `--runtime native` conducts the conversation in-process
-    // instead of supervising a harness, and shares nothing with the spawn
-    // path below -- no adapter, no argv, no PTY, no transcript to score. It
-    // is matched here, before any of that work starts, and the branch is
-    // explicit: an unrecognised value is an error, never a silent fall back
-    // to the harness.
+    // Resolve native mode before harness setup; unknown runtimes fail
+    // instead of silently falling back. (#478)
     match args.runtime.parse::<super::runtime::RuntimeKind>() {
         Ok(super::runtime::RuntimeKind::Native) => return run_native(args, w, repo, env),
         Ok(super::runtime::RuntimeKind::Harness) => {}
@@ -180,11 +168,8 @@ pub fn run_with<W: Write>(
     )
 }
 
-/// `zirv ctx exec --runtime native` (issue #478, roadmap N09). The prompt is
-/// `--prompt`, or the trailing `-- <text>` words when no `--prompt` is given;
-/// `--agent`, `--transcript`, `--session-id` and the restart/rot flags have no
-/// meaning here and are refused rather than silently ignored, because a native
-/// session has no external process to restart or transcript to score.
+/// Native execution accepts a prompt or resume, but rejects harness-only
+/// flags because there is no external process or transcript to supervise. (#478)
 fn run_native<W: Write>(
     args: &ExecArgs,
     w: &mut W,
@@ -229,9 +214,7 @@ fn run_native<W: Write>(
     if let Some(timeout_secs) = args.timeout_secs {
         limits.max_wall_ms = timeout_secs.saturating_mul(1000);
     }
-    // Issue #637: was accepted by clap but never read on the native path, so
-    // `--budget-tokens` silently did nothing (`--max-tool-calls` on the same
-    // request correctly stopped the loop).
+    // Enforce the native budget instead of accepting an inert flag. (#637)
     if let Some(budget_tokens) = args.budget_tokens {
         limits.max_budget_tokens = Some(budget_tokens);
     }
@@ -246,10 +229,8 @@ fn run_native<W: Write>(
         resume: args.resume.as_deref(),
         provider: args.provider.as_deref(),
         fixture_tools: args.fixture_tools.as_deref(),
-        // Issue #479: a plain `zirv ctx exec --runtime native` is not a
-        // delegation. It holds no task card and no writer permit, so its
-        // repository writes are refused rather than silently unbacked --
-        // `zirv agent --runtime native` is the surface that grants both.
+        // Direct native exec has no task card or writer permit; refuse
+        // repository writes unless delegation grants both. (#479)
         task: None,
         writer: None,
         accounting: super::runtime::native::Accounting::Seat,
@@ -259,10 +240,7 @@ fn run_native<W: Write>(
         return super::runtime::native::run_headless(&mut request, w, env);
     }
 
-    // `--view plain`: the exact same JSON status `run_headless` always
-    // printed (the contract is unchanged), followed by the same view model
-    // `dash::native_pane`'s ratatui renderer draws, rendered as plain text
-    // -- no terminal, no ratatui, required to read it.
+    // Plain view follows the unchanged JSON status line.
     let mut notices: Vec<u8> = Vec::new();
     let status = super::runtime::native::run_session(&mut request, &mut notices, env)?;
     if !notices.is_empty() {
@@ -284,11 +262,7 @@ fn run_native<W: Write>(
     Ok(status.exit_code)
 }
 
-/// Replays `session`'s journal and renders it through `dash::native_pane`'s
-/// own plain-text renderer -- exactly the view model a dashboard native pane
-/// draws, over the SAME reducer (`build_transcript`) both surfaces share, so
-/// this headless view and the dashboard's live one never diverge in what a
-/// tool call, a diff or a test outcome looks like.
+/// Render the journal through the same transcript reducer as dashboard.
 fn render_native_session_plain(
     state: &super::state::StateDir,
     status: &super::runtime::native::NativeFinalStatus,
@@ -351,8 +325,7 @@ fn plain_status_projection(
     (state, blocked, unread)
 }
 
-/// Same supervised execution as [run_with], plus the per-harness accounting
-/// segments that make a cross-harness continuation observable to its caller.
+/// Supervised execution with per-harness accounting segments.
 pub fn run_with_report<W: Write>(
     args: &ExecArgs,
     w: &mut W,
@@ -375,9 +348,7 @@ pub fn run_with_report<W: Write>(
     Ok((code, report))
 }
 
-/// T11 (sleep injection): identical to the former run_with in every way
-/// except now_fn/sleep_fn are now parameters instead of a real-clock
-/// closure hardcoded two calls deep in the body.
+/// Inject clock and sleep without changing the supervisor contract.
 pub(crate) fn run_with_clock<W: Write>(
     args: &ExecArgs,
     w: &mut W,
@@ -397,15 +368,8 @@ pub(crate) fn run_with_clock<W: Write>(
     )
 }
 
-/// Issue #690 (remaining scope): [`run_with_clock`] with the launch
-/// pre-flight's one machine-dependent input injected -- whether the resolved
-/// adapter's program is actually installed -- in the same style
-/// `adapters::resolve_default_with_presence`/`select_with_presence` already
-/// expose. A test of the pre-flight at this entry point (the one `zirv ctx
-/// agent` delegates to) states the machine it assumes rather than inheriting
-/// the developer's own `PATH`, which is also the only way to assert the
-/// *absence* of the pacing and Keychain lines without a real 60-second sleep
-/// and a really uninstalled harness.
+/// Inject the presence oracle so preflight and pacing use the same stated
+/// machine, without depending on ambient PATH. (#690)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_clock_and_presence<W: Write>(
     args: &ExecArgs,
@@ -434,59 +398,22 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
 pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
-    // Issue #249/#250 review: this is a DIRECT CLI entry, not a supervisor
-    // spawn seam -- only `agent::run_with`'s fold (headless delegation) and
-    // dash's `verified_parent` (pane spawn) may ever establish parent
-    // lineage. A worker's own ambient process env may still carry a
-    // `PARENT_SESSION_ENV` it inherited from whatever launched IT (e.g. a
-    // worker with a real parent running this as a raw shell command rather
-    // than through `zirv agent`); left alone, that stale value would render
-    // its own parent's mail as steering for this brand new session, and
-    // export it onward to this session's own child. Scrubbed here with
-    // `agent::parent_session_env`'s own unconditional-substitute fold
-    // (`parent: None`), so a direct launch always resolves to no parent --
-    // fail-closed to peer trust.
+    // Direct CLI entry has no authority to assert parent lineage; scrub an
+    // inherited parent id before classifying mail as steering. (#249/#250)
     let env = agent::parent_session_env(&ambient, None);
-    // Issue #491: the CLI entry is where the operator's opt-in `[runtime]`
-    // default becomes an explicit backend, so everything below -- `run_with`,
-    // the native branch, `script_runner`'s own direct callers -- keeps seeing
-    // one of exactly two literal values and never has to resolve anything.
+    // Resolve the operator's runtime default at the CLI boundary. (#491)
     let choice = resolved_runtime(args, &repo, &env)?;
     if let Some(note) = &choice.note {
         eprintln!("zirv ctx exec: {note}");
     }
     let mut args = args.clone();
     args.runtime = choice.kind.as_str().to_string();
-    // Round 4B (stdout/stderr separation): a harness launch's child inherits
-    // nothing of its own -- `supervise::forward` echoes the CHILD's stdout
-    // line by line straight to this process's own real `std::io::stdout()`,
-    // on its own thread, entirely independent of `w`. Every "zirv ctx exec:
-    // ..." notice the harness path (`run_with_clock`/`run_with_clock_inner`)
-    // writes to `w` used to go to that SAME real stdout too -- on this, the
-    // one production call site (`mod.rs`'s `CtxVerb::Exec` dispatch), `w` IS
-    // `std::io::Stdout` -- racing the forwarding thread and landing a notice
-    // (`pace::wait_for_window`'s usage-limit line, a restart/nudge/backoff
-    // line, and so on) in front of a child's own `--output-format json`
-    // stream, which a machine consumer piping this process's stdout cannot
-    // recover from. `--runtime native`'s `w` argument IS the contract
-    // instead (`--view json/plain`'s structured result, `run_native`'s own
-    // `writeln!(w, ...)` calls), so only the harness branch is redirected --
-    // this mirrors `run_with`'s own branch exactly, just choosing the writer
-    // per arm rather than sharing one across both. `run_with` itself (and
-    // every other caller -- `script_runner::agent_command`, every test that
-    // still passes its own buffer) is untouched: this function alone owns
-    // the real-process CLI entry, so redirecting here cannot perturb a test
-    // that asserts on a harness notice via its own `Vec<u8>` writer through
-    // `run_with`/`run_with_clock` directly.
+    // Harness notices use stderr so child stdout remains parseable; native
+    // structured output keeps using the caller writer.
     match choice.kind {
         super::runtime::RuntimeKind::Native => run_native(&args, w, &repo, &env),
         super::runtime::RuntimeKind::Harness => {
-            // Issue #800: `run_with_clock` itself discards its own
-            // `ExecutionReport` (every OTHER caller of this arm's own
-            // underlying `run_with_clock_and_presence` never needed the
-            // segments it collects) -- this is the one call site that does,
-            // to learn the actual session/harness/model a `Direct` outcome
-            // row (below) would otherwise have to re-derive from env.
+            // Keep the execution report here for direct outcome attribution. (#800)
             let mut report = ExecutionReport::default();
             let code = run_with_clock_inner(
                 &args,
@@ -511,13 +438,8 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
     }
 }
 
-/// Issue #800: best-effort `Direct`-outcome recording for a headless launch
-/// that never ran a workflow -- gated by the SAME `[workflow]
-/// telemetry_enabled` switch `outcomes::record_terminal` itself checks, and
-/// never makes a provider call (`OutcomeRow::direct` only reads local config/
-/// env). `let _ =`/early-return throughout: this must never affect the
-/// launch's own exit code or block on a missing state directory/telemetry
-/// opt-out.
+/// Record direct outcomes best-effort when telemetry is enabled; this must
+/// never change the launch exit code. (#800)
 fn record_direct_outcome_if_needed(repo: &Path, env: EnvLookup<'_>, report: &ExecutionReport) {
     let Some(segment) = report.segments.last() else {
         return;
@@ -539,15 +461,7 @@ fn record_direct_outcome_if_needed(repo: &Path, env: EnvLookup<'_>, report: &Exe
     let _ = crate::commands::workflow::outcomes::append(&state, &row);
 }
 
-/// Issue #491: the `[runtime]` resolution `run` applies before anything
-/// downstream sees a runtime value at all.
-///
-/// Split out of `run` for one reason: the ROLE it keys on is a real decision,
-/// and hardcoding `"worker"` here would silently resolve `zirv ctx exec
-/// --role reviewer` against the `worker` row of `[runtime.roles]`. `args.role`
-/// is this run's own seat role -- the same key `agent::run` passes -- and a
-/// test pins that rather than the resolution ladder underneath it (which
-/// `runtime::tests` already owns).
+/// Resolve configured runtime using this run's actual seat role. (#491)
 fn resolved_runtime(
     args: &ExecArgs,
     repo: &Path,

@@ -1,33 +1,12 @@
 //! `zirv ctx wrap`: the interactive supervisor. It spawns the operator's own
-//! agent command behind a pty, passes bytes through byte for byte, and never
-//! makes the session worse than an unwrapped one -- any supervision failure
-//! degrades, once and for all, to pure passthrough.
+//! agent command behind a pty and passes bytes through byte for byte; wrap
+//! must never make the session worse than an unwrapped one, so any
+//! supervision failure degrades, once and for all, to pure passthrough.
 //!
-//! **What wrap may type into the child**, in full:
-//!
-//! * a `/compact` (with `COMPACT_FOCUS`) or a restart, from the rot
-//!   escalation ladder, only at a verified-idle turn boundary (`may_inject`);
-//! * (T13) **one labelled advisory line** when new mail arrives -- the same
-//!   `[zirv ▸ mail] ...` shape `dash::pane` uses for its own visible
-//!   injections, under exactly the same idle gate.
-//!
-//! The mail contract is therefore: *an advisory line at verified idle,
-//! message bodies never, consumption never.* An earlier version of this
-//! module promised that mail and nudges were stderr-only and that wrap
-//! "never writes to the pty" for them; that is no longer true of mail, and
-//! deliberately so -- an orchestrator inside the session could otherwise only
-//! learn about mail by blind polling. What has not changed:
-//!
-//! * **bodies never travel**. `mail_facts` drops them at the seam, so nothing
-//!   downstream of it holds a body to leak. Reading mail stays a deliberate
-//!   `zirv ctx inbox`.
-//! * **wrap never consumes mail.** Consumption moves a message into `read/`,
-//!   where no other session finds it; that is the session's own call.
-//! * **a nudge is still advisory only** -- its guidance body reaches an
-//!   interactive session through no channel at all.
-//! * **mail can never degrade a session.** An unreadable mailbox, a poisoned
-//!   writer or a missing identity all no-op or fall back to the `zirv ▸`
-//!   announcement channel; none of them calls `note_failure`.
+//! Wrap may submit compact/restart actions only at verified idle, and may
+//! submit one labelled mail advisory at verified idle. Mail bodies never enter
+//! the pty; only the session itself consumes mail with `zirv ctx inbox`.
+//! Nudges stay advisory. Mail errors must not degrade the session.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -91,25 +70,16 @@ use pty_input::stdin_ready;
 use pump::*;
 use relaunch::*;
 
-/// `Orchestrator`, not `Worker`: the operator is sitting in front of the
-/// command `wrap` supervises, driving it themselves, which is the same seat
-/// `chat` builds (CLAUDE.md classifies both as interactive Orchestrator
-/// sessions). The role now also picks the adapter's own layer and the
-/// user-layer file (`prompt::with_adapter_layer`, `prompt::
-/// WORKER_PROMPT_FILE`), so passing `Worker` here would inject
-/// worker-conventions text into an operator's own session and silently drop
-/// their `~/.zirv/system-prompt.md` -- a session made worse by being wrapped,
-/// which is the one thing `wrap` must never do.
+/// `Orchestrator`, not `Worker`: passing `Worker` would inject
+/// worker-conventions text and silently drop the operator's own
+/// `~/.zirv/system-prompt.md` -- a session made worse by being wrapped,
+/// which is the one thing wrap must never do. (#249)
 pub fn run<W: Write>(args: &WrapArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
-    // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
-    // `zirv ctx wrap` launch is not a supervisor spawn seam, so an inherited
-    // `PARENT_SESSION_ENV` off this process's own ambient env must be
-    // scrubbed rather than trusted (it would otherwise mark an unrelated
-    // sender's mail as steering in this session's own live advisory line);
-    // `agent::parent_session_env`'s fold with `parent: None` does that
-    // unconditionally.
+    // A direct wrap launch cannot trust inherited parent-session identity;
+    // scrub it, or an unrelated sender's mail could be marked as steering
+    // in this session's own advisory line. (#249/#250)
     let env = super::agent::parent_session_env(&ambient, None);
     run_with(
         args,

@@ -11,26 +11,16 @@ pub enum PumpEvent {
 
 #[derive(Debug, Clone)]
 pub struct InjectionState {
-    /// The turn number the agent last reported, for display only. It counts
-    /// turns within one transcript, so it restarts at 1 after a relaunch and
-    /// shrinks when a compaction rewrites the file -- which is why nothing
-    /// that has to move forwards is keyed on it.
+    /// Transcript turn numbers can reset on relaunch or compaction; never
+    /// use this display value for monotonic supervision state.
     pub last_turn: u64,
-    /// Turn signals this supervisor has received, ever. Monotonic across
-    /// relaunches and compactions by construction, because it counts what
-    /// arrived here rather than what the transcript says about itself.
+    /// Monotonic received-signal count across relaunches and compactions.
     pub signals_seen: u64,
     pub verdict: Verdict,
     pub score: u32,
     pub user_typed_since_turn: bool,
     pub last_output: Instant,
-    /// The last time the operator's own keystroke reached this pty --
-    /// `last_output`'s counterpart for input, tracked only so a signal-less
-    /// adapter's own idleness ([`signal_less_mail_ready`]) can be measured
-    /// from the *later* of the two, the same `dash::pane::latest_of` fold a
-    /// signal-less dashboard pane already applies. A turn-signal-capable
-    /// session never reads this field: its idleness is decided by the signal
-    /// alone (`may_inject`), exactly as before this field existed.
+    /// Last operator input, folded with last output for signal-less idleness.
     pub last_input: Instant,
     /// `signals_seen` at the moment an action fired. The next action waits for
     /// a strictly newer signal than that one.
@@ -80,26 +70,15 @@ impl InjectionState {
     }
 }
 
-/// Whether the last-armed cooldown has been cleared by a later turn. Shared
-/// by `may_inject` and `action_for`'s `Advise` arm: an advisory needs none of
-/// `may_inject`'s other preconditions (it only prints, never types into the
-/// agent), but it still must not re-fire on every ~100ms poll tick within the
-/// same turn once the pump has armed the cooldown for it.
-///
-/// Keyed on the supervisor's own signal count rather than the turn number the
-/// transcript reports. A relaunch starts a fresh session whose turns count from
-/// one again, and a compaction rewrites the transcript so its turn count
-/// shrinks; a cooldown armed at "turn 30" then never cleared, and supervision
-/// went silent for the rest of the run.
+/// Cooldown uses received-signal count, not transcript turn number, because
+/// relaunch and compaction can reset the latter.
 fn cooldown_cleared(state: &InjectionState) -> bool {
     state
         .cooldown_at_signal
         .is_none_or(|at| state.signals_seen > at)
 }
 
-/// Both spec preconditions, and nothing else: a turn boundary has been reported
-/// and the user is idle. Everything about which verdict deserves which action
-/// lives in the escalation ladder, not here.
+/// Injection requires a reported turn boundary and idle operator.
 pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> bool {
     !state.degraded
         && state.signals_seen > 0
@@ -108,13 +87,8 @@ pub fn may_inject(state: &InjectionState, now: Instant, debounce: Duration) -> b
         && cooldown_cleared(state)
 }
 
-/// Issue #84: whether a pending `zirv ctx handover` request may be acted on
-/// right now, versus refused with "mid-turn; retry once idle, or pass
-/// --force". `force` always wins outright (the operator asked to interrupt
-/// whatever the session is doing); otherwise this is exactly `may_inject`'s
-/// own "verified-idle turn boundary" precondition -- the same quiesce check
-/// every other injection in this module already gates on, reused rather than
-/// reinvented for this seam.
+/// Manual force may interrupt; otherwise handover needs the same verified
+/// idle boundary as other pty injections. (#84)
 pub fn handover_may_act(
     state: &InjectionState,
     now: Instant,
@@ -124,49 +98,15 @@ pub fn handover_may_act(
     force || may_inject(state, now, debounce)
 }
 
-/// Whether a session with no turn-signal mechanism at all (codex today) has
-/// been quiet long enough for T13's live mail advisory to be typed into it.
-///
-/// `may_inject`'s `state.signals_seen > 0` precondition can never pass for
-/// such a session: `register_turn_signal` is a no-op for it, so `on_turn` is
-/// never called and `signals_seen` stays `0` for the session's entire life.
-/// Before this, T13's poll arm therefore always fell back to `MailAction::
-/// Announce` for it -- a documented residual (see Known Issues, "wrap's own
-/// live mail advisory has no equivalent for a signal-less adapter"), and the
-/// mirror image of the bug `dash::pane::pane_is_idle` already fixed for a
-/// signal-less dashboard pane.
-///
-/// Mirrors `dash::pane::signal_less_quiescent` exactly: quiet is measured
-/// from the *later* of the child's last output and the operator's own last
-/// keystroke into it, not from output alone -- the same fold
-/// `dash::pane::latest_of` applies, for the same reason (see that function's
-/// own doc comment: an injection or a keystroke has to restart the quiet
-/// window, or the very next poll tick reads the pane as idle again before the
-/// child has had any real chance to respond). Finding 5 (review): the
-/// elapsed-time check itself is `dash::pane::quiescent_since`, shared rather
-/// than reimplemented here, so the two formulas cannot drift apart again.
-/// Deliberately **not** folded
-/// into `may_inject` itself: that function also gates `Compact`/`Restart`,
-/// and a debounce-only idle guess is not something this codebase wants
-/// deciding whether to type `/compact` into a session. `may_inject`'s own
-/// `state.signals_seen > 0` precondition is what actually protects that path
-/// for a signal-less adapter (codex today): `register_turn_signal` is a
-/// no-op for it regardless of `capabilities().events` (issue #86 gave codex
-/// real event *parsing*, which is a separate mechanism from turn-signal
-/// *posting*), so `signals_seen` never advances and `may_inject` stays
-/// permanently false -- this is scoped to the one caller that actually
-/// needs the quiet-time-only question.
+/// Signal-less mail injection uses quiet time after both child output and
+/// operator input; this weaker gate must never authorize compact or restart.
+/// Turn-signal actions retain their verified-boundary requirement. (#86)
 pub fn signal_less_mail_ready(state: &InjectionState, now: Instant, quiet: Duration) -> bool {
     !state.degraded
         && super::dash::pane::quiescent_since(state.last_output.max(state.last_input), now, quiet)
 }
 
-/// The T13 mail poll's own eligibility question, branching on
-/// `turn_signal_capable` (`AgentAdapter::capabilities().turn_signal`)
-/// exactly the way `dash::pane::pane_is_idle` already branches for a
-/// dashboard pane: `may_inject` for an adapter that reports turn boundaries,
-/// [`signal_less_mail_ready`] for one that cannot. Split out of the pump
-/// loop's own call site so the branch is testable without a real pty.
+/// Select the idle gate from adapter turn-signal capability.
 pub fn mail_inject_ready(
     turn_signal_capable: bool,
     state: &InjectionState,
@@ -183,26 +123,19 @@ pub fn mail_inject_ready(
 
 pub const TRANSCRIPT_ENV: &str = "ZIRV_CTX_TRANSCRIPT";
 
-/// The pre-F5 name: one global file under the state dir root. Still *read*
-/// (see `read_socket_path`) so a supervisor started by an older build stays
-/// discoverable, but never written any more: two concurrent supervisors
-/// clobbered each other's entry, and whoever read it afterwards got a socket
-/// belonging to somebody else's session.
+/// Read the legacy global socket path only as a compatibility fallback;
+/// concurrent sessions require distinct published paths.
 #[allow(dead_code)] // read only by `read_socket_path`, itself test-only today
 pub const SOCKET_PATH_FILE: &str = "socket-path";
 
-/// `<state>/socket-path-<short8>`, one per supervisor, named after the same
-/// short id the socket itself and the session registry record already use.
+/// Per-session socket path using the registry short id.
 pub const SOCKET_PATH_PREFIX: &str = "socket-path-";
 
 pub fn socket_path_file_for(session: &str) -> String {
     format!("{SOCKET_PATH_PREFIX}{}", super::sessions::short_id(session))
 }
 
-/// Publishes where this supervisor bound its turn-signal socket, so `zirv ctx
-/// status`, external tooling and the pty tests can find it. Best-effort, like
-/// every other piece of state-dir housekeeping: failing to publish must never
-/// fail a launch.
+/// Publish the bound socket best-effort; publication failure cannot fail launch.
 pub fn publish_socket_path(state: &StateDir, session: &str, socket: &Path) {
     let _ = super::state::create_private_dir_all(state.root());
     let _ = super::state::write_private(
@@ -211,37 +144,14 @@ pub fn publish_socket_path(state: &StateDir, session: &str, socket: &Path) {
     );
 }
 
-/// Removes this supervisor's published socket path. Paired with
-/// `publish_socket_path` at the one place `wrap` leaves the pump, so a dead
-/// session's file does not linger to be picked as "the newest" by a later
-/// reader with no session of its own.
+/// Remove the published path at exit so later readers cannot select a dead socket.
 pub fn unpublish_socket_path(state: &StateDir, session: &str) {
     let _ = std::fs::remove_file(state.root().join(socket_path_file_for(session)));
 }
 
-/// Resolves the socket path a reader should use.
-///
-/// `session` is the reader's own `ZIRV_CTX_SESSION` (or whichever session it
-/// is asking about). When it is given, only *that* session's file is
-/// considered: silently handing back a different live session's socket is
-/// precisely the cross-session confusion F5 exists to end, so a named session
-/// with no file of its own falls through to the legacy file and then to
-/// `None`, never to a neighbour's socket.
-///
-/// With no session -- an operator at a shell, or a test that never learned
-/// the id -- the newest published file wins, which is the closest honest
-/// approximation of "the session I am looking at" available without one.
-///
-/// The legacy global file is the last fallback either way, so a supervisor
-/// left over from a pre-F5 build is still reachable.
-///
-/// No production caller inside this binary reads it back today -- `wrap` is
-/// the only writer, and everything downstream of it already holds the socket
-/// path directly. It exists because publishing the file is a *contract with
-/// external tooling* (that is why it is written at all), and shipping a
-/// writer whose naming scheme has no canonical reader is how the pre-F5
-/// global file's semantics got lost in the first place. The pty tests are its
-/// in-tree consumer.
+/// Resolve a named session only to its own path, then the legacy fallback;
+/// never return a neighbour's socket. Without a session, use the newest
+/// published path, then legacy. This is the external-tooling contract.
 #[allow(dead_code)] // no production caller yet; the pty tests are its in-tree consumer
 pub fn read_socket_path(state: &StateDir, session: Option<&str>) -> Option<String> {
     let read = |path: PathBuf| -> Option<String> {
@@ -285,13 +195,8 @@ pub fn read_socket_path(state: &StateDir, session: Option<&str>) -> Option<Strin
     read(state.root().join(SOCKET_PATH_FILE))
 }
 
-/// Which file wrap watches for compactions and reads handoff context from.
-///
-/// wrap cannot derive it. It spawns the user's own command, and the agent
-/// mints its own session id inside that process, so the only party that knows
-/// the path is the hook running in the agent: it travels on the turn signal.
-/// A relaunch invalidates it, because the fresh session writes somewhere new.
-/// `ZIRV_CTX_TRANSCRIPT` pins it for an agent whose hook cannot report one.
+/// Use the hook-reported transcript path; wrap cannot derive an agent's
+/// native session id. A relaunch invalidates that path.
 #[derive(Debug, Default)]
 pub struct TranscriptSource {
     pinned: Option<PathBuf>,
@@ -318,8 +223,7 @@ impl TranscriptSource {
         }
     }
 
-    /// The relaunched agent is a new session writing a new file, so the old
-    /// path must not be watched for one more poll.
+    /// Forget the old transcript on relaunch.
     pub fn forget(&mut self) {
         self.reported = None;
     }

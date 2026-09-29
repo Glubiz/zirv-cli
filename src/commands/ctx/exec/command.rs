@@ -2,13 +2,8 @@
 
 use super::*;
 
-/// Review round 1 (issue #303): `session` must carry the launch's own `cwd`,
-/// not just its id -- `adapter.resume_target` needs both to recover an
-/// adapter-minted id (codex) that has nothing to do with zirv's own. Fails
-/// closed (`None`) whenever `resume_target` cannot recover a target at all,
-/// exactly like the pre-existing honest-refusal default on `headless_resume_
-/// cmd` itself: never resume a conversation this session did not verifiably
-/// start.
+/// Resume only a conversation verifiably started by this launch; recovering
+/// an adapter-owned id requires its launch cwd as well. (#303)
 pub(crate) fn headless_resume_launch(
     adapter: &dyn adapters::AgentAdapter,
     prompt: &str,
@@ -36,16 +31,8 @@ pub(super) fn build_command(command: &[String], repo: &Path) -> CtxResult<Comman
     Ok(cmd)
 }
 
-/// Whether this run's own headless launch reparses its downstream argv on a
-/// Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
-/// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
-/// go on stdin instead of argv (FIX B). `adapter.launches_through_cmd_shim()`
-/// only recognises the `cmd.exe` form; probing the real launcher prefix this
-/// run's headless spawn will use (`headless_cmd("", ...)`, no prompt token
-/// yet) and asking `adapters::launch_reparses_through_shim` covers both,
-/// matching the M1 fix `dash/mod.rs`'s `task_prompt_fallback_is_safe` made
-/// for the pty path. Split out for the same reason that one was: testable
-/// without spawning anything.
+/// Detect Windows cmd or PowerShell launchers that reparse argv, so the
+/// prompt is delivered on stdin.
 pub(crate) fn prompt_delivery_via_stdin(
     adapter: &dyn adapters::AgentAdapter,
     session: &SessionId,
@@ -54,60 +41,14 @@ pub(crate) fn prompt_delivery_via_stdin(
     adapters::launch_reparses_through_shim(&probe)
 }
 
-/// Issue #220: whether `build_headless` should route THIS launch's prompt to
-/// stdin rather than argv. `shim` is [`prompt_delivery_via_stdin`]'s own
-/// answer -- a Windows `cmd.exe`/`powershell -File` reparse, which forces
-/// stdin regardless of size, exactly as before this issue. `argv_total_len`
-/// is the second, independent reason: `adapter.headless_cmd` puts the
-/// prompt on argv verbatim on every platform, and the WHOLE resulting
-/// command line -- program, prompt, and every other argument riding beside
-/// it, not the prompt token in isolation -- overflows `CreateProcessW`'s
-/// ~32KB command-line limit outright (`os error 206`) on a perfectly
-/// ordinary, non-shim launch once it exceeds
-/// [`super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES`] (issue #213's own
-/// Windows-safe figure, reused rather than duplicated). Checked on every
-/// platform, not only Windows, so the same launch always takes the same
-/// delivery path regardless of where zirv runs.
-///
-/// Correctness follow-up (post-merge review): measuring the prompt alone
-/// missed a real overflow -- the #213 system-prompt layer (folded into
-/// `extra` as `--append-system-prompt <text>`/`-c developer_instructions=
-/// <json>`) rides on this SAME command line and can itself occupy close to
-/// the whole budget, so a prompt safely under budget by itself could still
-/// leave the total argv over it. The caller ([`headless_argv_len`]) now
-/// measures the fully assembled command `adapter.headless_cmd` would
-/// actually emit, so this function's own logic did not need to change --
-/// only what its second argument measures.
+/// Use stdin for reparsing launchers or when the fully assembled argv could
+/// exceed the OS command-line budget, including prompt and context flags. (#220, #213)
 pub(super) fn headless_prompt_via_stdin(shim: bool, argv_total_len: usize) -> bool {
     shim || argv_total_len > super::prompt::INLINE_ARGV_PROMPT_BUDGET_BYTES
 }
 
-/// The total bytes `command`'s argv would actually put on the OS command
-/// line: the program plus every argument, with one separator byte counted
-/// between each token, and each argument's own length inflated for the
-/// worst case of Windows' `CreateProcessW` quoting -- an under-count here
-/// would let a launch through that still overflows.
-/// [`headless_prompt_via_stdin`]'s own doc comment explains why this has to
-/// be the WHOLE command, not just the prompt argument.
-///
-/// Review follow-up (post-merge): the raw byte length alone is not a safe
-/// proxy for what actually lands on the command line. `std::process::
-/// Command` on Windows builds a UTF-16 command line using the same quoting
-/// `CommandLineToArgvW` expects: every `"` is escaped to `\"`, a run of
-/// backslashes immediately before a quote doubles, and any argument
-/// containing whitespace (a composed prompt almost always does) is wrapped
-/// in a surrounding pair of quotes. A quote-and-backslash-heavy prompt can
-/// therefore measure safely under `INLINE_ARGV_PROMPT_BUDGET_BYTES` in raw
-/// bytes and still expand past `CreateProcessW`'s 32,767-char limit,
-/// reproducing os error 206 despite this function's own budget check.
-/// Per argument this counts `len + count('"') + count('\\') + 2` --
-/// `len` for the literal bytes, one extra byte per `"`/`\\` for the
-/// worst case where every one of them needs escaping, and `+ 2` for a
-/// surrounding pair of quotes -- which over-counts an argument with no
-/// quotes/backslashes/whitespace at all (no quoting needed) but never
-/// under-counts one that does, which is the direction that matters: this
-/// is deliberately a conservative, platform-independent estimate rather
-/// than a byte-exact reproduction of `CreateProcessW`'s own algorithm.
+/// Conservatively count the whole command after Windows quoting expansion;
+/// undercounting can pass an argv that CreateProcessW rejects.
 pub(super) fn headless_argv_len(command: &Command) -> usize {
     let mut total = command.get_program().to_string_lossy().len();
     for arg in command.get_args() {

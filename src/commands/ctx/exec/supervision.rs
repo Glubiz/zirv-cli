@@ -2,22 +2,8 @@
 
 use super::*;
 
-/// The transcript path a supervision tick should switch to, or `None` to keep
-/// polling the current one.
-///
-/// Review round 1 (R4) added the self-heal: a path derived before the child
-/// was spawned can name a file the agent never writes (`codex exec` mints its
-/// own rollout id once it is running), so the adapter is asked again while the
-/// current path does not exist, accepting only an answer that names a
-/// DIFFERENT file which does.
-///
-/// Review round 2 (S1) narrows it to paths zirv itself derived, hence
-/// `resolve` being an `Option`. `--transcript` documents itself as the escape
-/// hatch for "the agent writes somewhere the adapter cannot derive": for such
-/// a run the adapter's guess is known-wrong by construction, so re-resolving
-/// onto it -- which an unconditional swap does the moment the operator's file
-/// has not been written yet and a stale derived one exists -- would silently
-/// supervise a file the operator never named.
+/// Self-heal only a zirv-derived missing transcript path; an explicit
+/// operator path must never be replaced by an adapter guess.
 fn self_heal_transcript(current: &Path, resolve: Option<&dyn Fn() -> PathBuf>) -> Option<PathBuf> {
     if current.exists() {
         return None;
@@ -35,37 +21,18 @@ pub(super) fn supervise_run(
     adapter: &dyn adapters::AgentAdapter,
     score_cfg: &super::config::ScoreConfig,
     pace_cfg: &super::config::PaceConfig,
-    // Issue #272 review round 1: the caller's own resolved `[screen]`
-    // config, the same narrow-purpose-parameter shape as `score_cfg`/
-    // `pace_cfg` right above -- so a repo-narrowed threshold reaches the
-    // live supervision poll below, not just the Stop hook's own fallback.
+    // Use this run's resolved screen thresholds in live polling. (#272)
     screen_thresholds: &super::screen::Thresholds,
-    // Issue #455 (review round 1, finding 4): the route-health policy, in
-    // the same narrow-purpose-parameter shape as `score_cfg`/`pace_cfg`/
-    // `screen_thresholds` above. This supervisor owns its own
-    // uncheckpointed scorer, so it must feed route health itself; a
-    // headless codex worker dying on connection refusals otherwise left
-    // its harness reading `Healthy` forever.
+    // Feed route health from this supervisor's own scorer. (#455)
     health_policy: &super::health::HealthPolicy,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
-    // C7: this run's stable registry short id, not `short_id(session)`.
-    // `zirv ctx nudge` writes its wake-up marker under the address it
-    // resolved from the registry, and that address does not rotate when a
-    // restart mints a fresh session -- deriving it from `session` here meant
-    // a nudge sent after the first restart was never claimed.
+    // Use the stable registry address for nudges across session remints.
     registry_short: &str,
-    // Issue #281: cleared the instant the tick loop below sees a turn signal
-    // reported by THIS session -- the turn `stamp_in_flight` marked at this
-    // cycle's own spawn (the call site right before `supervise_run`) has now
-    // reached a clean boundary.
+    // Clear in-flight state only on this session's turn boundary. (#281)
     session_guard: &mut super::sessions::SessionGuard,
-    // Issue #243 (review round, F3): the same `Announcer` this run's other
-    // events already use, plus this run's own de-duplication memory --
-    // owned above the per-restart loop (like `registry_short`/`nudged_by`),
-    // so a screening summary that has not changed is announced once for
-    // the whole supervised run, not once per poll or once per restart.
+    // Keep screening deduplication across restarts, not per poll. (#243)
     announcer: &super::announce::Announcer,
     screening_announced: &mut Option<String>,
     rotted: &mut bool,
@@ -83,44 +50,20 @@ pub(super) fn supervise_run(
     nudges_used: u32,
     max_nudges: u32,
     can_restart: bool,
-    // Issue #155, Phase 5(d): a budget checkpoint, independent of rot/nudge/
-    // limit above. `transcript` is read directly here rather than folded
-    // into `scorer`'s own bounded fold, because a budget needs this child's
-    // whole cumulative spend, which `RotState`'s windowed segments do not
-    // retain once the window has moved past them.
+    // Budget reads full cumulative spend, beyond the scorer's rolling
+    // window. (#155)
     transcript: &mut PathBuf,
-    // Review round 1 (R4): the path above is derived BEFORE the child is
-    // spawned, and `codex exec` mints its own session id and writes its
-    // rollout's `session_meta` only once it is running -- so the derivation
-    // answers a `rollout-<zirv id>.jsonl` that never appears, and every
-    // budget/rot/spend read for the whole run lands on a missing file. This
-    // asks the adapter again, but only while the current path does not exist
-    // and only accepting an answer that names a DIFFERENT file which does:
-    // one `exists()` per tick in the steady state, and never a redirect away
-    // from a transcript that is genuinely being written. Review round 2 (S1):
-    // `None` for an operator's own `--transcript`, which by definition names
-    // a file the adapter cannot derive -- see `self_heal_transcript`.
+    // Retry adapter discovery only for missing derived paths; explicit
+    // transcript overrides are authoritative.
     resolve_transcript: Option<&dyn Fn() -> PathBuf>,
     budget: agent::WorkerBudget,
-    // Issue #169.2: every prior child's own already-harvested spend this
-    // invocation has superseded, folded into every check below alongside
-    // `transcript`'s own current reading (`evaluate_worker_budget`).
+    // Include every prior child's harvested spend in this budget. (#169.2)
     prior_usage: &TranscriptUsage,
     prior_tool_calls: u32,
     soft_warned: &mut bool,
     budget_exhausted: &mut bool,
-    // Issue #310 (3a): progress-clock inputs and the once-only stall latch.
-    // `repo`/`cfg` feed the mail-activity progress signal (`mail::unread_
-    // counts`) and, since T4 (C-2), the steering nudge the latch actually
-    // delivers; the three durations are `cfg.supervise.{idle_no_tool,in_tool,
-    // stall_grace}_secs`, still read once by the caller and passed narrowly,
-    // like `score_cfg`/`pace_cfg` above. `cfg` is the ONE whole-config
-    // parameter here, and only because `mail::store_to` takes a `&CtxConfig`
-    // of its own -- no decision in this function reads anything off it but
-    // `mail.enabled`. `stalled` mirrors `rotted` above: set the instant the
-    // grace period elapses with no observed progress, so the caller's own
-    // `reason`/chain-recording logic can tell this restart apart from an
-    // ordinary rot/timeout one.
+    // Keep progress and stall state for this boot; only mailbox configuration
+    // is read from the whole config. (#310)
     repo: &Path,
     cfg: &CtxConfig,
     idle_no_tool: Duration,
@@ -129,28 +72,11 @@ pub(super) fn supervise_run(
     stalled: &mut bool,
     cancellation: Option<&super::provider::adapter::CancellationFlag>,
 ) -> CtxResult<Outcome> {
-    // Issue #203: `evaluate_worker_budget` reads the transcript fresh on
-    // every tick, so it can see a `HardStop` the instant the child's last
-    // chunk lands on disk -- often milliseconds before the child itself
-    // calls `exit()`. `supervise_child` checks `try_wait` *before* every
-    // tick, including the very next one, but a `Tick::Stop` on this same
-    // tick short-circuits straight to `terminate` and `Outcome::
-    // StoppedByTick`, which carries no exit code -- so a child that was
-    // already on its way out on its own has its real code discarded for
-    // `EXIT_BUDGET_EXHAUSTED`. One tick of grace (`Tick::Continue` instead
-    // of `Stop`, exactly once) gives that next `try_wait` a chance to
-    // observe a natural exit first -- the same spirit as the `limit_hit`
-    // path's own brief final drain/wait below, letting a child that is
-    // already on its way out finish naturally instead of being overridden.
-    // Only a child still alive on the SECOND consecutive `HardStop` tick is
-    // actually killed for budget.
+    // Give an over-budget child one tick to exit naturally so its own exit
+    // code is preserved; kill only on a second hard-stop tick. (#203)
     let mut budget_grace_given = false;
-    // Issue #310 (3a): the progress clock for this one boot -- fresh per
-    // `supervise_run` call, the same "a restart mints a fresh child, so its
-    // own clock starts over" reasoning `budget_grace_given`/`compact_budget`
-    // already follow. `last_mail_activity` is the previous tick's own mail
-    // reading, so a CHANGE (new mail arrived, or was consumed) is what
-    // counts as the mail signal advancing, not merely mail existing.
+    // Restart gets a fresh progress clock; only changes in unread mail count
+    // advance its mail channel. (#310)
     let mut stall_signals = super::stall::ProgressSignals::new(Instant::now());
     let mut stall_latch: Option<super::stall::StallLatch> = None;
     let mut last_mail_activity: Option<(usize, usize)> = None;
@@ -170,12 +96,8 @@ pub(super) fn supervise_run(
         }
         if pace::scan_for_limit(&lines, state, session, "exec", &mut std::io::stderr()) {
             let now = now_secs();
-            // Left on the static `provider()`: `supervise_run` has no pinned-
-            // model parameter of its own, and this deep, already-huge
-            // argument list (`#[allow(clippy::too_many_arguments)]`) is not
-            // the place to add one for this foundation track -- the caller
-            // (`run_with_clock_inner`) already resolves `execution_model` for
-            // every OTHER pacing call in this file.
+            // This scorer uses the adapter's static provider; pinned model
+            // bucketing is handled by the caller.
             match pace::confirm_limit_hit(state, pace_cfg, now, adapter.provider()) {
                 pace::LimitConfirmation::Confirmed { detail } => {
                     *limit_hit = true;
@@ -197,19 +119,13 @@ pub(super) fn supervise_run(
         if let Some(server) = server
             && let Some(received) = server.try_recv()
         {
-            // C3: a turn boundary reported by *this* session is evidence it
-            // got somewhere since the last nudge relaunch, which is what
-            // makes the nudge budget consecutive rather than cumulative.
-            // Recorded for any verdict, including the Restart one handled
-            // just below: the session still did a turn's work.
+            // Any completed turn restores the consecutive-nudge budget.
             if received.session_id == session {
                 *progressed = true;
                 compact_budget.observe_progress();
-                // Issue #310 (3a): a turn boundary is exactly the progress
-                // clock's own turn-signal channel.
+                // This session's turn boundary advances progress and clears
+                // its in-flight marker. (#281, #310)
                 stall_signals.last_turn = Some(Instant::now());
-                // Issue #281: this session's own turn just reached a clean
-                // boundary -- see this parameter's own doc comment.
                 session_guard.clear_in_flight();
             }
             match action_for_signal(adapter, &received, session) {
@@ -225,18 +141,10 @@ pub(super) fn supervise_run(
                 SignalAction::Compact | SignalAction::Ignore => {}
             }
         }
-        // N4: claiming the marker is atomic (`remove_file`), so exactly one
-        // observer ever sees `true` -- important even within one process,
-        // since a stale marker from a previous cycle must never re-fire.
-        // Gracefully stops the child (same `Tick::Stop` shape rot uses) only
-        // when a relaunch is actually possible and the consecutive-nudge cap
-        // has not been reached; otherwise the marker is still claimed (so it
-        // never re-triggers) but the child runs on untouched and the mail
-        // stays unread -- `nudge-ignored` in the decision log says why.
+        // Claim a nudge once, then stop only if relaunch is possible; otherwise
+        // leave the child and unread mail untouched.
         if let Some(from) = super::sessions::claim_nudge_marker(state, registry_short) {
             if can_restart && nudges_used < max_nudges {
-                // C4: the sender's own short id, read out of the marker, so
-                // the announcement can name who actually nudged us.
                 *nudged_by = Some(from);
                 return Tick::Stop("nudge");
             }
@@ -259,10 +167,7 @@ pub(super) fn supervise_run(
             );
             return Tick::Continue;
         }
-        // Issue #310 (3a): mail activity is the progress clock's third
-        // channel -- a CHANGE in the unread counts (new mail arrived, or was
-        // just consumed by the nudge check above) counts as progress, not
-        // merely mail existing.
+        // Mail counts advance progress only when they change. (#310)
         let mail_activity = super::mail::unread_counts(
             state,
             repo,
@@ -274,19 +179,9 @@ pub(super) fn supervise_run(
             stall_signals.last_mail = Some(Instant::now());
             last_mail_activity = mail_activity;
         }
-        // T4 (C-1): transcript growth is the progress clock's turn channel
-        // ("Stop hook / transcript-growth signal"), and this poll is already
-        // reading exactly the bytes that prove it -- `IncrementalScorer::
-        // poll` answers `Some(report)` only for a poll that genuinely
-        // consumed new bytes (or saw the transcript restart). Without this,
-        // the only channels were stdout, a turn signal and a mail-count
-        // change: a healthy `claude -p` worker prints nothing until the very
-        // end and posts its Stop hook only then, so 20 minutes of real tool
-        // work tripped `in_tool_secs` and was terminated after the grace.
-        // Polled HERE, ahead of `stall::decide`, so this tick's own growth
-        // counts toward this tick's verdict; the result is consumed by the
-        // screening/verdict arms below exactly as before, and a scoring
-        // failure still must never kill a healthy run.
+        // Count transcript growth before the stall verdict; a quiet stdout
+        // can still accompany active tool work. Scoring failure cannot kill
+        // a healthy run.
         let poll_result = scorer.poll(adapter, score_cfg, screen_thresholds);
         if let Ok((_, Some(_))) = &poll_result {
             stall_signals.last_turn = Some(Instant::now());
@@ -294,12 +189,8 @@ pub(super) fn supervise_run(
         match super::stall::decide(
             stall_latch,
             &stall_signals,
-            // exec.rs has no live tool-call boundary tracking yet
-            // (`IncrementalScorer` does not expose its parsed events), so
-            // this always applies the LONGER `in_tool` threshold -- the
-            // conservative direction: it only ever grows the fuse for a
-            // session that might genuinely be idle-thinking, never shortens
-            // it below what a legitimate long-running tool call could need.
+            // Without live tool boundaries, use the longer in-tool timeout
+            // so legitimate work is not stopped early.
             super::stall::ToolState::InTool,
             Instant::now(),
             idle_no_tool,
@@ -310,12 +201,8 @@ pub(super) fn supervise_run(
             super::stall::StallAction::ClearLatch => {
                 stall_latch = None;
                 super::sessions::clear_stall_marker(state, registry_short);
-                // Issue #349: progress resumed, so the stalled attention
-                // this same authority raised no longer applies. `Supervisor`
-                // authority, matching the observation that raised it -- a
-                // higher authority's own attention (an `AdapterHook`
-                // permission prompt, say) is untouched by this, since the
-                // two axes are resolved independently.
+                // Clear only Supervisor attention on resumed progress; higher
+                // authorities remain untouched. (#349)
                 let _ = super::attention::record(
                     state,
                     registry_short,
@@ -349,16 +236,8 @@ pub(super) fn supervise_run(
                     .with_attention(super::attention::Attention::Stalled),
                     now_secs(),
                 );
-                // Issue #310 / T4 (C-2): the latch used to write a marker,
-                // announce "sending a steering nudge" and log `stall-nudge`
-                // while delivering NOTHING to the child -- the announcement
-                // and the log line described a nudge that did not exist.
-                // Deliver it over the one channel a headless child actually
-                // consumes: a directed message in this run's own mailbox,
-                // addressed to the stable registry short so the next nudge
-                // relaunch (or `zirv ctx inbox`) picks it up. `nudged`
-                // carries the truth of that delivery into the banner rather
-                // than letting it claim something that did not happen.
+                // Deliver a stall nudge into this run's directed mailbox;
+                // do not announce delivery before it succeeds. (#310)
                 let slug = super::state::repo_slug(repo);
                 let nudge = super::mail::Message {
                     from_session: "supervisor".into(),
@@ -435,10 +314,7 @@ pub(super) fn supervise_run(
                 return Tick::Stop("stalled");
             }
         }
-        // Issue #155, Phase 5(d): `evaluate_worker_budget` itself skips the
-        // transcript read entirely when no ceiling is configured (every
-        // delegation before 2.35.0, and the common case even after), so a
-        // run that never asked to be bounded pays nothing extra here.
+        // No configured ceiling means no budget transcript read. (#155)
         match evaluate_worker_budget(
             adapter,
             budget,
@@ -447,9 +323,7 @@ pub(super) fn supervise_run(
             prior_tool_calls,
         ) {
             Some(agent::BudgetState::HardStop { used, limit }) => {
-                // Issue #203: give a child that is about to exit on its own
-                // one poll's worth of room to do so, so `try_wait` -- not
-                // this kill -- is what reports its real exit code.
+                // Preserve a natural exit code before forcing a budget stop. (#203)
                 if !budget_grace_given {
                     budget_grace_given = true;
                     return Tick::Continue;
@@ -470,19 +344,8 @@ pub(super) fn supervise_run(
             }
             Some(agent::BudgetState::SoftWarn { .. } | agent::BudgetState::Ok) | None => {}
         }
-        // Issue #243 (review round, F3/F5): consumes the screening half of
-        // every poll that actually read new bytes -- persisted and, when
-        // it changed, announced -- through the same shared helper the Stop
-        // hook uses (`sessions::record_screening`), so a codex/wrap-
-        // supervised session (no Claude Stop hook at all) still gets a
-        // live-detected injection marker or credential shape surfaced, not
-        // only silently dropped. `Some(report)` only when bytes were
-        // genuinely consumed this poll (`IncrementalScorer::poll`'s own
-        // doc comment): an IDLE poll (`None`) must never reach
-        // `record_screening` at all, or its fabricated-clean default would
-        // clobber an already-persisted flagged summary and reset the
-        // de-dup memory, making a real finding vanish across every idle
-        // gap and then re-announce.
+        // Record screening only after new transcript bytes; an idle poll
+        // must not erase or repeat a flagged summary. (#243)
         if let Ok((_, Some(report))) = &poll_result {
             super::sessions::record_screening(
                 state,
@@ -492,11 +355,8 @@ pub(super) fn supervise_run(
                 screening_announced,
             );
         }
-        // Finding 4: drained every poll, before the limit short-circuit
-        // below can return -- a poll whose transcript carried BOTH a rate
-        // limit and a transport failure must still record the transport
-        // one. Swallows its own I/O failures; nothing here can reach the
-        // supervised child.
+        // Drain route events before a limit short-circuit so simultaneous
+        // transport failure is recorded too.
         score::observe_route_health(state, adapter, scorer, health_policy, session, "exec");
         if scorer.provider_limit_hit() {
             *limit_hit = true;
@@ -524,27 +384,15 @@ pub(super) fn supervise_run(
     };
     let outcome = supervise::supervise_child(child, deadline, poll, &mut tick)?;
 
-    // A fast API-error exit can land its provider event after the final live
-    // tick, just like the tapped-output race closed by the caller's final
-    // drain. Give the transcript one last incremental read before deciding
-    // whether this was an ordinary exit.
+    // Read the final transcript before classifying a fast provider error.
     if !*limit_hit {
         let _ = scorer.poll(adapter, score_cfg, screen_thresholds);
         score::observe_route_health(state, adapter, scorer, health_policy, session, "exec");
         *limit_hit = scorer.provider_limit_hit();
     }
 
-    // C1 (issue #155 review finding): `supervise_child` checks `try_wait`
-    // for a completed child *before* ever calling the tick above, so a
-    // child that writes an over-budget final transcript and then exits
-    // between two polls can race past the very last tick that would have
-    // caught it -- and report its own clean exit code instead of the
-    // budget stop its transcript actually earned. Caught here as a final
-    // check on the transcript the child left behind, gated on
-    // `Exited(0)` specifically: a child that exited with its own failure
-    // code keeps that code untouched, since overriding it with a budget
-    // verdict here would erase a real failure that may have nothing to do
-    // with the budget at all.
+    // Check final spend after a clean exit, but preserve any nonzero child
+    // failure code instead of overwriting it. (#155)
     if !*budget_exhausted
         && matches!(outcome, Outcome::Exited(0))
         && let Some(agent::BudgetState::HardStop { used, limit }) = evaluate_worker_budget(
