@@ -45,7 +45,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -922,6 +922,13 @@ fn shared_agent() -> &'static ureq::Agent {
     })
 }
 
+#[cfg(test)]
+fn is_loopback_url(url: &str) -> bool {
+    let host = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = host.split(['/', ':']).next().unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost")
+}
+
 /// Posts one already-encoded Jev request body to `{base_url}/systemone`
 /// through the process-wide [`shared_agent`], honouring `timeout_secs` for
 /// THIS call only (see that function's own doc comment), and maps the
@@ -936,6 +943,13 @@ pub(crate) fn send_request(
     timeout_secs: u64,
     payload: String,
 ) -> Result<String, JevError> {
+    // A test run inherits the developer's real key and ~/.zirv config; it must never spend real requests.
+    #[cfg(test)]
+    if !is_loopback_url(base_url) {
+        return Err(JevError::Transport(
+            "tests may only reach a loopback Jev endpoint".to_string(),
+        ));
+    }
     let url = format!("{}/systemone", base_url.trim_end_matches('/'));
     let response = shared_agent()
         .post(&url)
@@ -975,7 +989,7 @@ pub(crate) fn send_request(
 /// `jev_relay::try_via_relay`'s own doc comment for the full list). The
 /// caller (`ask`, below) then falls straight through to [`send_request`]
 /// exactly as it always has -- a relay is an optimisation, never required.
-fn relay_send(state_dir: &Path, payload: &str) -> Option<Result<String, JevError>> {
+fn relay_send(state_dir: &Path, payload: &str, wait: Duration) -> Option<Result<String, JevError>> {
     let session = std::env::var(adapters::SESSION_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())?;
@@ -983,6 +997,7 @@ fn relay_send(state_dir: &Path, payload: &str) -> Option<Result<String, JevError
         &StateDir::from_path(state_dir.to_path_buf()),
         &session,
         payload,
+        wait,
     )
 }
 
@@ -1019,7 +1034,10 @@ pub(crate) fn ask(
         ));
     }
 
-    let body = match relay_send(state_dir, &payload) {
+    // Wait out the relay for as long as a direct call could take: giving up sooner re-sends the
+    // request directly while the relay's copy is still in flight, a second live request.
+    let relay_wait = Duration::from_secs(cfg.timeout_secs) + Duration::from_secs(3);
+    let body = match relay_send(state_dir, &payload, relay_wait) {
         Some(result) => result?,
         None => send_request(&cfg.base_url, &credential, cfg.timeout_secs, payload)?,
     };
@@ -1086,6 +1104,23 @@ const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
 /// site asked.
 const JEV_SPEND_AGENT: &str = "typesafe";
 
+/// The session a supervisor (wrap, exec) runs on behalf of: it exports `ZIRV_CTX_SESSION` to its
+/// child but not to itself, so its own Jev calls (handoff, harvest) would otherwise read "proxy".
+static PROCESS_SESSION: Mutex<Option<String>> = Mutex::new(None);
+
+/// Remember the session in a supervisor's child env, replacing any earlier one (handover swaps it).
+pub(crate) fn adopt_session(turn_env: &[(String, String)]) {
+    let Some((_, session)) = turn_env
+        .iter()
+        .find(|(key, _)| key == adapters::SESSION_ENV)
+    else {
+        return;
+    };
+    if let Ok(mut current) = PROCESS_SESSION.lock() {
+        *current = Some(session.clone());
+    }
+}
+
 /// This process's own `(session, principal)` -- `ZIRV_CTX_SESSION`/
 /// `ZIRV_PRINCIPAL`, falling back to `"proxy"`/`"root"` only when unset, the
 /// same "root session, no inherited envelope" convention `agent::
@@ -1096,6 +1131,7 @@ pub(crate) fn session_and_principal() -> (String, String) {
     let session = std::env::var(adapters::SESSION_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| PROCESS_SESSION.lock().ok().and_then(|s| s.clone()))
         .unwrap_or_else(|| "proxy".to_string());
     let principal = std::env::var(agent::PRINCIPAL_ENV)
         .ok()
@@ -1141,20 +1177,17 @@ struct DecisionRecord<'a> {
     attribution: Attribution,
 }
 
-/// Record decision and spend together so usage remains attributable to the verdict.
-// Appends via state::open_private_append (O_APPEND): a read-then-rewrite lost lines when two zirv
-// processes recorded at once. Best-effort: a write failure must never break the caller's decision.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record(
+/// Append one decision row to `jev-decisions.jsonl` and return the `(ts, session, principal)` it
+/// carries, for a caller that also writes the matching spend row. Best-effort like every recorder.
+pub(crate) fn record_decision_row(
     state: &StateDir,
-    cfg: &CtxConfig,
     site: &str,
     answers: &Answers,
     usage: &Usage,
     wall_ms: u64,
     fallbacks: &[String],
     cached: bool,
-) {
+) -> (u64, String, String) {
     let ts = state::now_secs();
     let (session, principal) = session_and_principal();
     let answer_records: BTreeMap<&str, AnswerRecord> = answers
@@ -1186,7 +1219,25 @@ pub(crate) fn record(
     {
         let _ = writeln!(file, "{line}");
     }
+    (ts, session, principal)
+}
 
+/// Record decision and spend together so usage remains attributable to the verdict.
+// Appends via state::open_private_append (O_APPEND): a read-then-rewrite lost lines when two zirv
+// processes recorded at once. Best-effort: a write failure must never break the caller's decision.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    site: &str,
+    answers: &Answers,
+    usage: &Usage,
+    wall_ms: u64,
+    fallbacks: &[String],
+    cached: bool,
+) {
+    let (ts, session, principal) =
+        record_decision_row(state, site, answers, usage, wall_ms, fallbacks, cached);
     let _ = log::append_delegation_cached(
         state,
         &log::Delegation {
@@ -2312,6 +2363,55 @@ pub(crate) mod tests {
         let value: serde_json::Value =
             serde_json::from_str(text.lines().next().expect("one line")).expect("parse json");
         assert_eq!(value["session"], "sess-under-test");
+    }
+
+    /// Tests inherit the developer's real credential and `~/.zirv` config, so the default
+    /// endpoint must be unreachable from a test build (it once spent real vendor requests).
+    #[test]
+    fn a_test_build_refuses_to_send_to_the_real_endpoint() {
+        let default = ProxyTypesafeConfig::default();
+        let result = send_request(&default.base_url, "dummy-not-a-key", 1, "{}".to_string());
+        assert!(
+            matches!(&result, Err(JevError::Transport(reason)) if reason.contains("loopback")),
+            "got {result:?}"
+        );
+    }
+
+    /// A supervisor process never has `ZIRV_CTX_SESSION` itself (only its child does), so its own
+    /// Jev calls were logged as "proxy" and dropped by every session-scoped rollup.
+    #[test]
+    fn supervisor_calls_are_attributed_to_the_session_it_adopted() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        unsafe {
+            std::env::remove_var(adapters::SESSION_ENV);
+        }
+        adopt_session(&[(
+            adapters::SESSION_ENV.to_string(),
+            "sess-adopted".to_string(),
+        )]);
+        record(
+            &state,
+            &cfg,
+            "memory",
+            &Answers::new(),
+            &usage,
+            1,
+            &[],
+            false,
+        );
+        if let Ok(mut current) = PROCESS_SESSION.lock() {
+            *current = None;
+        }
+
+        let scope: BTreeSet<String> = ["sess-adopted".to_string()].into();
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, Some(&scope));
+        assert_eq!(rollup.sites.get("memory").map(|u| u.calls), Some(1));
     }
 
     /// Review finding: `record` used to read the whole file, append in

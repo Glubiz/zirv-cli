@@ -52,15 +52,6 @@ use crate::commands::ctx::config::ProxyTypesafeConfig;
 use crate::commands::ctx::jev::{self, JevError};
 use crate::commands::ctx::state::StateDir;
 
-/// How long [`try_via_relay`] waits for the whole client-side round trip --
-/// connect, write, read -- before giving up and falling back to a direct
-/// call. Comfortably above the ~300ms a warm relay round trip should take
-/// (this module's own doc comment), comfortably below
-/// `ProxyTypesafeConfig::timeout_secs`'s own default (10s): a wedged relay
-/// costs at most a few seconds of extra latency, never turns an
-/// otherwise-successful direct call into a timeout of its own.
-const CLIENT_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(3);
-
 #[derive(Debug, Serialize, Deserialize)]
 struct RelayRequestFrame {
     body: String,
@@ -249,7 +240,7 @@ fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
 /// endpoint, if one is running for it. `None` whenever the relay cannot (or
 /// should not) be used for ANY reason -- this process IS the relay host, no
 /// endpoint is listening, a connect/write/read failure, a round trip that
-/// exceeds [`CLIENT_ROUND_TRIP_TIMEOUT`], a malformed frame, or the relay's
+/// exceeds `wait`, a malformed frame, or the relay's
 /// own `{"error": ...}` frame -- so the caller (`jev::ask`, via `jev::
 /// relay_send`) can fall straight through to its own direct call.
 /// `Some(Ok(body))`/`Some(Err(_))` is a genuine answer from Jev (a 200 or a
@@ -259,6 +250,7 @@ pub(crate) fn try_via_relay(
     state: &StateDir,
     session: &str,
     payload: &str,
+    wait: Duration,
 ) -> Option<Result<String, JevError>> {
     if is_relay_host() {
         return None;
@@ -289,7 +281,7 @@ pub(crate) fn try_via_relay(
         return None;
     };
 
-    match rx.recv_timeout(CLIENT_ROUND_TRIP_TIMEOUT) {
+    match rx.recv_timeout(wait) {
         Ok(Some(frame)) => {
             let _ = spawned.join();
             if frame.error.is_some() {
@@ -307,7 +299,7 @@ pub(crate) fn try_via_relay(
         }
         // Timed out: the spawned thread is left to finish (or stay blocked
         // on I/O) on its own rather than joined here -- this call must never
-        // block longer than `CLIENT_ROUND_TRIP_TIMEOUT` itself.
+        // block longer than `wait` itself.
         Err(_) => None,
     }
 }
@@ -316,6 +308,8 @@ pub(crate) fn try_via_relay(
 mod tests {
     use super::*;
     use crate::commands::ctx::jev::tests::one_shot_server;
+
+    const TEST_WAIT: Duration = Duration::from_secs(3);
 
     fn config(base_url: String, credential_env: &str) -> ProxyTypesafeConfig {
         ProxyTypesafeConfig {
@@ -437,7 +431,7 @@ mod tests {
     fn no_relay_endpoint_reports_nothing_to_relay_through() {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let result = try_via_relay(&state, "no-such-relay-session", "{}");
+        let result = try_via_relay(&state, "no-such-relay-session", "{}", TEST_WAIT);
         assert!(result.is_none());
     }
 
@@ -463,7 +457,7 @@ mod tests {
             drop(listener);
         });
 
-        let result = try_via_relay(&state, session, "{}");
+        let result = try_via_relay(&state, session, "{}", TEST_WAIT);
         assert!(
             result.is_none(),
             "an error frame must fall back, not answer"
@@ -494,9 +488,60 @@ mod tests {
             drop(listener);
         });
 
-        let result = try_via_relay(&state, session, "{}");
+        let result = try_via_relay(&state, session, "{}", TEST_WAIT);
         assert!(matches!(result, Some(Err(JevError::Auth))));
         server.join().expect("server thread must not panic");
+    }
+
+    /// A relay that answers after the old fixed 3s client wait made `ask` re-send the request
+    /// directly while the relay's own copy was still in flight: two live vendor requests, one row.
+    #[test]
+    fn a_slow_relay_answer_is_awaited_instead_of_re_sent_directly() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let session = "relay-slow-session";
+        let listener = Listener::bind(&Endpoint::for_jev_relay(&state, session)).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _frame) = accept_one_real_request(&listener);
+            std::thread::sleep(Duration::from_millis(3500));
+            let _ = connection.write_frame(&RelayResponseFrame {
+                status: Some(200),
+                body: Some(text),
+                ..Default::default()
+            });
+        });
+
+        // The direct fallback would fail (nothing listens on port 1), so an answer proves the relay's was awaited.
+        let cfg = ProxyTypesafeConfig {
+            timeout_secs: 10,
+            ..config("http://127.0.0.1:1".to_string(), "JEV_RELAY_TEST_SLOW")
+        };
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var("JEV_RELAY_TEST_SLOW", "secret");
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+        }
+        let result = jev::ask(
+            &cfg,
+            state_tmp.path(),
+            0,
+            &sample_state(),
+            &sample_questions(),
+        );
+        unsafe {
+            std::env::remove_var("JEV_RELAY_TEST_SLOW");
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+        }
+        server.join().expect("relay stand-in must not panic");
+        assert!(result.is_ok(), "got {result:?}");
     }
 
     /// A dead relay (accepted the connection, then dropped it without ever
@@ -515,7 +560,7 @@ mod tests {
             drop(listener);
         });
 
-        let result = try_via_relay(&state, session, "{}");
+        let result = try_via_relay(&state, session, "{}", TEST_WAIT);
         assert!(result.is_none());
         server.join().expect("server thread must not panic");
     }
