@@ -1,29 +1,12 @@
 //! Issue #381: one pure model catalogue replacing the four hand-written
-//! ladders that used to live separately in `adapters::claude`,
-//! `adapters::codex`, `handover::tier_default` and `price::built_in_table`.
-//! Pure -- no fs, clock, env or net -- so identical lookups give identical
-//! answers everywhere this module is consulted, the same purity discipline
-//! `rot.rs`/`permit::is_heavy`/`price.rs` itself already hold.
+//! ladders for adapters, handover and pricing. No filesystem, clock, environment or
+//! network reads: identical lookups yield identical results.
 //!
-//! A [`Vendor`] is a named model family (`anthropic`, `openai`, and the
-//! survey vendors added alongside this module) with a strength-ordered
-//! ladder of [`Rung`]s, strongest first. Every lookup here is the same
-//! substring-on-lowercased-string match the two adapters used to each
-//! implement by hand: a seat/model string can carry a full id
-//! (`claude-opus-4-5`) or a bare alias (`opus`), and both must land on the
-//! same rung.
+//! Vendor rungs are ordered strongest first. A full model id and a bare alias must match
+//! one rung by the same lowercased substring rule.
 //!
-//! `anthropic` and `openai` carry the exact prices, strengths, windows and
-//! ids the four call sites priced/ranked before this module existed
-//! (verified by the equivalence tests in `adapters::claude`,
-//! `adapters::codex`, `handover` and `price`); every other vendor is new
-//! data from the 2026-09-07 survey, dated by [`CATALOGUE_AS_OF`] rather than
-//! `price::BUILT_IN_AS_OF` because it was not priced on the same day. Every
-//! new vendor reuses one pricing shortcut, noted once here rather than on
-//! each rung: `cache_write_micros` equals `input_micros` (no separate
-//! cache-write rate is published for any of them) and `cache_read_micros` is
-//! `input_micros / 10` (the common ~90% cache-read discount every vendor
-//! zirv already prices -- claude and codex included -- happens to share).
+//! Survey vendors carry their own `as_of` date. Their cache-write price follows input
+//! price, and cache-read price uses one tenth of input where no separate rate is published.
 
 use std::borrow::Cow;
 
@@ -161,13 +144,8 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "sonnet",
         id: "claude-sonnet-5",
         strength: 2,
-        // Round 4 bug 4a (2026-09-25): verified directly against a real
-        // `claude -p --output-format json` result, which reports
-        // `"modelUsage":{"claude-sonnet-5":{"contextWindow":1000000,...}}`
-        // -- five times the 200_000 this rung previously stated. Changed
-        // only here, on real evidence: every other rung's window stays
-        // whatever was last verified for IT specifically (see `Rung`'s own
-        // doc comment on why an unverified guess is never an improvement).
+        // The Sonnet 5 context window is 1,000,000 according to Claude JSON model usage
+        // output; this rung must match that reported limit.
         context_window: Some(1_000_000),
         price: Some(SONNET),
         tier: Some(Tier::Standard),
@@ -182,9 +160,8 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
     },
 ];
 
-// codex's own tier ladder -- OpenAI's public pricing carries no separate
-// cache-WRITE class, so each rung reuses its own input rate (copied
-// verbatim from `price::built_in_table`).
+// Codex's own tier ladder -- OpenAI's public pricing carries no separate cache-WRITE class,
+// so each rung reuses its own input rate (copied verbatim from `price::built_in_table`).
 const SOL: ModelPrice = ModelPrice {
     input_micros: 15_000_000,
     cache_write_micros: 15_000_000,
@@ -731,15 +708,14 @@ const VENDORS: &[Vendor] = &[
         extra_prices: &[("jev-1.13.0", TYPESAFE_JEV_PRICE)],
         as_of: Some(CATALOGUE_AS_OF),
     },
-    // Issue #395: local-runtime "vendors" an operator's own endpoint override
-    // can name (`ollama`, `lmstudio`, `vllm`) -- there is no fixed model
-    // lineup or published price for a self-hosted runtime, so each carries
-    // EMPTY rungs, no prices, and no default context window. `EndpointTarget`
-    // validation therefore REQUIRES `model` for these three (see `config.rs`'s
-    // `validate_endpoint_target`: "model is required for a vendor with no
-    // catalogue rungs to default from"), and `EndpointTarget::pin_model`
-    // never overrides an operator's own choice for them, since there is no
-    // ladder to resolve a requested model against either.
+    // Local-runtime "vendors" an operator's own endpoint override can name (`ollama`,
+    // `lmstudio`, `vllm`) -- there is no fixed model lineup or published price for a
+    // self-hosted runtime, so each carries EMPTY rungs, no prices, and no default context
+    // window. `EndpointTarget` validation therefore REQUIRES `model` for these three (see
+    // `config.rs`'s `validate_endpoint_target`: "model is required for a vendor with no
+    // catalogue rungs to default from"), and `EndpointTarget::pin_model` never overrides an
+    // operator's own choice for them, since there is no ladder to resolve a requested model
+    // against either (#395).
     Vendor {
         slug: "ollama",
         rungs: &[],
@@ -773,10 +749,8 @@ pub fn vendors() -> &'static [Vendor] {
     VENDORS
 }
 
-/// The rung `model` matches on `vendor`'s ladder: substring match on the
-/// lowercased `model` against each rung's alias, then its id, scanning
-/// strongest to weakest and returning the first hit -- the same rule both
-/// adapters used to apply by hand.
+/// Match the lowercased model against each rung’s alias, then id, strongest first; return
+/// the first match.
 pub fn rung_of(vendor: &Vendor, model: &str) -> Option<&'static Rung> {
     let model = model.to_lowercase();
     vendor

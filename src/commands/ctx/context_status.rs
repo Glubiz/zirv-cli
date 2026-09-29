@@ -185,13 +185,12 @@ fn render_surface_line<W: Write>(
     } else {
         String::new()
     };
-    // Issue #105: a managed native file is still listed here -- its size
-    // still counts toward budgets -- but is excluded from the duplicate/
-    // precedence-level drift analysis below (`context_cli::
-    // surfaces_for_drift`), since it is a verbatim render of the canonical
-    // layer it would otherwise be reported as "duplicating". The note
-    // explains that exclusion right where a reader would otherwise wonder
-    // why this file never shows up in a drift finding.
+    // A managed native file is still listed here -- its size still counts toward budgets --
+    // but is excluded from the duplicate/ precedence-level drift analysis below
+    // (`context_cli::surfaces_for_drift`), since it is a verbatim render of the canonical
+    // layer it would otherwise be reported as "duplicating". The note explains that
+    // exclusion right where a reader would otherwise wonder why this file never shows up in
+    // a drift finding (#105).
     let managed_note = if context_cli::is_managed(&surface.text) {
         "  (zirv-managed, rendered from .zirv/context/)"
     } else {
@@ -212,10 +211,10 @@ fn render_surface_line<W: Write>(
         style::paint(managed_note, Tone::Muted, colour),
     )?;
 
-    // Issue #538: trust/scope/hash/decision, one line per surface -- "context
-    // status shows source path, trust, scope, bytes, hash and included/
-    // shadowed/truncated reason". `bytes` is already shown on the line
-    // above; this line adds the four columns that were missing.
+    // Trust/scope/hash/decision, one line per surface -- "context status shows source path,
+    // trust, scope, bytes, hash and included/ shadowed/truncated reason". `bytes` is
+    // already shown on the line above; this line adds the four columns that were missing
+    // (#538).
     let mut decision_text = decisions
         .get(surface.path.as_path())
         .map(|resolved| resolved.decision.render())
@@ -497,14 +496,12 @@ fn render_memory_section<W: Write>(
 /// status`/`zirv ctx inbox --peek` already use), so running this report
 /// never consumes a message a real session would otherwise have seen.
 ///
-/// Issue #100 (2026-08-23): the one exception is a message whose
-/// `To-session` names a session that no longer exists at all -- nothing
-/// will ever read it, so `mail::sweep_undeliverable` moves it into `read/`
-/// (the same move an ordinary read does) before the count below, and the
-/// swept count is reported separately rather than folded into "pending".
-/// This does not weaken the non-destructive promise above: it is cleanup of
-/// mail no live session could ever have seen, not a read on any session's
-/// behalf.
+/// The one exception is a message whose `To-session` names a session that no longer exists
+/// at all -- nothing will ever read it, so `mail::sweep_undeliverable` moves it into
+/// `read/` (the same move an ordinary read does) before the count below, and the swept
+/// count is reported separately rather than folded into "pending". This does not weaken the
+/// non-destructive promise above: it is cleanup of mail no live session could ever have
+/// seen, not a read on any session's behalf (#100).
 fn render_mail_section<W: Write>(
     w: &mut W,
     state: &StateDir,
@@ -601,10 +598,9 @@ fn render_handoff_section<W: Write>(
     )?;
     match handoff::latest_for_repo(state, repo) {
         Ok(Some((path, handoff))) => {
-            // Issue #281: the non-consuming preview, not `resume_prompt`
-            // itself -- this is a "what would resuming inject" estimate, not
-            // an actual resume, and must never burn the one-shot crash
-            // witness marker a real resume would consume.
+            // The non-consuming preview, not `resume_prompt` itself -- this is a "what
+            // would resuming inject" estimate, not an actual resume, and must never burn
+            // the one-shot crash witness marker a real resume would consume (#281).
             let resume_bytes =
                 resume::resume_prompt_preview(state, repo, "status", &handoff, screen_thresholds)
                     .len();
@@ -636,14 +632,8 @@ fn render_handoff_section<W: Write>(
     Ok(())
 }
 
-/// "Harness/orchestration contribution": the one layer that had no
-/// configured budget before this issue (`context.max_harness_roster_bytes`,
-/// added by this task -- see `config.rs`). Reads truncation straight off
-/// `CompiledContext::harness_roster`, the same raw/delivered/truncated
-/// provenance `prompt::compose` itself computes when it truncates this
-/// layer (via `prompt::harness_roster_injection`) -- this section can never
-/// disagree with what a real launch actually delivers, because it is
-/// reading the same computation, not a second one.
+/// Measure the harness roster against `context.max_harness_roster_bytes` and report
+/// truncation from compiled context.
 fn render_harness_roster_section<W: Write>(
     w: &mut W,
     cfg: &CtxConfig,
@@ -793,7 +783,7 @@ fn render_per_harness_section<W: Write>(
             )?;
         }
         for provenance in &compiled.provenance {
-            // Issue #155, Phase 3: a deduped surface (skipped because the
+            // A deduped surface (skipped because the
             // adapter's native file already provably carries it -- see
             // `compile::native_file_already_carries_canonical`) reports
             // `delivered_bytes: 0, truncated: false`. Checked AFTER
@@ -801,7 +791,7 @@ fn render_per_harness_section<W: Write>(
             // operator-configured `max_*_bytes = 0`) still reads as
             // `[TRUNCATED]`, never `[DEDUPED]` -- deduped is specifically
             // "zero delivered and NOT because the budget cut it", which an
-            // operator would otherwise have no way to tell apart from a bug.
+            // operator would otherwise have no way to tell apart from a bug (#155).
             let flag = if provenance.truncated {
                 format!(" {}", style::paint("[TRUNCATED]", Tone::Warn, colour))
             } else if provenance.delivered_bytes == 0 {
@@ -997,11 +987,10 @@ pub fn run_with<W: Write>(
         repo,
         cfg.optimize.max_surface_bytes,
     );
-    // Issue #538: every refused candidate (a symlinked ZIRV.md/AGENTS.md/
-    // CLAUDE.md/AGENT.md, or a symlinked nested directory) still gets a
-    // line in the surfaces report -- a synthetic zero-byte `Surface` so
-    // `render_surface_line` can render it the same way as a real one, its
-    // `decision` (below) spelling out why it carries no content.
+    // Every refused candidate (a symlinked ZIRV.md/AGENTS.md/ CLAUDE.md/AGENT.md, or a
+    // symlinked nested directory) still gets a line in the surfaces report -- a synthetic
+    // zero-byte `Surface` so `render_surface_line` can render it the same way as a real
+    // one, its `decision` (below) spelling out why it carries no content (#538).
     let excluded_only: Vec<Surface> = exclusions
         .iter()
         .map(|e| Surface {

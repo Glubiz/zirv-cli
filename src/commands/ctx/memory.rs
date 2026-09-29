@@ -44,14 +44,9 @@ pub struct Entry {
     /// tolerance `mail::parse_markdown` gives unknown header values.
     pub source: String,
     pub body: String,
-    /// Coarse, free-form priority signal for later retrieval ranking (issue
-    /// #35) and lifecycle/staleness decisions (issue #38) -- by convention
-    /// "high"/"normal"/"low", but not enforced: like `source`, a hand-edited
-    /// value that doesn't match the convention is still kept as-is rather
-    /// than rejected. `None` when unset. `skip_serializing_if` keeps
-    /// `zirv ctx recall --json` emitting the pre-issue-#32 shape for any
-    /// entry that doesn't use this field -- every entry before this change,
-    /// and every entry since that never sets it.
+    /// Priority is advisory and hand-edited values are preserved; an absent value remains
+    /// `None` (#35).
+    // skip_serializing_if keeps `recall --json` unchanged for entries that never set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub importance: Option<String>,
     /// Coarse, free-form confidence signal, same shape and parsing rules as
@@ -107,14 +102,14 @@ impl Entry {
 /// marker -- the per-entry cap every tier's writer applies just before
 /// storing, factored out so `rollback`'s multi-entry restore applies the
 /// identical rule rather than a fourth copy of it.
-/// Issue #537 (A3): the one-line stderr warning `zirv ctx remember`/`zirv
+/// The one-line stderr warning `zirv ctx remember`/`zirv
 /// memory remember` print when a body is about to be silently truncated by
 /// `cap_body` -- seven repo entries were cut at 512 bytes with no operator
 /// ever told. `None` when `body_len` is already within `cap`. Pure and
 /// directly testable, unlike the `eprintln!` at each of the two call sites;
 /// `pub(super)`, not private, the same cross-module-within-`ctx` reuse
 /// `is_temporary_or_generic` already gets, since `memory_cli.rs`'s own
-/// `--shared` handler needs the identical message.
+/// `--shared` handler needs the identical message (#537).
 pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> Option<String> {
     (body_len > cap).then(|| {
         format!(
@@ -124,7 +119,7 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
     })
 }
 
-/// Issue #773: the most `duplicate_write_warning` will ever compare a new
+/// The most `duplicate_write_warning` will ever compare a new
 /// entry's body against on a single `remember` -- an uncapped `list_scoped`
 /// read plus a Jaccard comparison against every OTHER entry in the bank made
 /// every write's cost grow linearly with a bank that only ever grows. Capped
@@ -133,10 +128,10 @@ pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> 
 /// rather than an arbitrary subset, since a near-duplicate of something
 /// remembered moments ago is the case this warning most needs to catch. A
 /// near-duplicate of an entry older than the window is simply never flagged
-/// -- an acceptable trade for a soft nudge, never a correctness guarantee.
+/// -- an acceptable trade for a soft nudge, never a correctness guarantee (#773).
 const DUPLICATE_CHECK_MAX_ENTRIES: usize = 200;
 
-/// Issue #773: the one-line stderr warning `zirv ctx remember`/`zirv memory
+/// The one-line stderr warning `zirv ctx remember`/`zirv memory
 /// remember` print when a new entry's body is an exact or near duplicate of
 /// one already in the same bank -- `zirv memory optimize`'s own duplicate/
 /// near-duplicate detectors otherwise only ever run when an operator
@@ -155,7 +150,7 @@ const DUPLICATE_CHECK_MAX_ENTRIES: usize = 200;
 /// reuse `truncation_warning` above gets, since `memory_cli.rs`'s own
 /// `--shared` handler needs it too. Never blocks or alters the write --
 /// `memory_optimize::duplicate_keys_for` does the actual comparison and this
-/// only formats its result.
+/// only formats its result (#773).
 pub(super) fn duplicate_write_warning(
     command: &str,
     scope: MemoryScope,
@@ -217,23 +212,8 @@ fn strip_bullet(line: &str) -> Option<String> {
     None
 }
 
-/// Parses a `## Memory` header block and body with the same tolerance as
-/// `mail::parse_markdown`: unknown headers and unknown sections are skipped
-/// rather than treated as an error.
-///
-/// Issue #326's class of fix, mirrored here: `## ` heading recognition is
-/// gated on `header_seen` being false -- it fires exactly once, to find the
-/// FIRST such heading and open the header block. Before this, every line
-/// starting with `## ` re-ran the heading check regardless of where the
-/// parser already was, so a body whose second paragraph happened to be a
-/// markdown heading (`## Notes`, `## Findings`) flipped `in_entry` back to
-/// `false` and the rest of the body was silently dropped -- and `verify`
-/// (which reads an entry then writes its own `to_markdown()` straight back)
-/// wrote that truncation to disk. Once `header_seen` is true, no line is
-/// ever inspected as a heading again -- not even a literal `## Memory`
-/// inside the body -- so a body cannot re-open header parsing and forge a
-/// new `Key`/`Source`/`Verified` (the same N2 threat `strip_bullet` guards
-/// against below, extended to headings).
+/// Parses one `## Memory` header; later headings remain body text and cannot
+/// reopen headers or forge fields. Unknown headers and sections are skipped (#326).
 pub fn parse_markdown(md: &str) -> Entry {
     let mut entry = Entry {
         key: String::new(),
@@ -266,17 +246,8 @@ pub fn parse_markdown(md: &str) -> Entry {
         }
         if in_header {
             let trimmed = line.trim();
-            // N2: the header block ends at the FIRST blank line after the
-            // `## Memory` heading -- the one `to_markdown` always writes
-            // after the last bullet. This used to `continue`, leaving the
-            // parser in header mode, so a body whose first line happened to
-            // be a `- key: value` bullet was absorbed as header. That let an
-            // entry's own body rewrite the Key it is filed under, or promote
-            // itself from `handoff` to `explicit`; it also silently ate any
-            // honest bulleted body (`- build: cargo build`). Bullets are
-            // header only until this line; everything after it is body,
-            // verbatim -- including a line that looks like a new `## `
-            // heading (see the function doc comment above).
+            // The first blank line ends the header; body bullets must never be parsed as
+            // header fields.
             if trimmed.is_empty() {
                 in_header = false;
                 continue;
@@ -371,7 +342,7 @@ pub enum MemoryScope {
     Shared,
     Private,
     Global,
-    /// Issue #295: one live session's own ephemeral tier, stored under
+    /// One live session's own ephemeral tier, stored under
     /// `<state>/memory/<repo_slug>/sessions/<session-id>/`. Unlike the other
     /// three scopes, resolving its storage directory needs a session id that
     /// this unit variant does not carry, so `dir` below always answers
@@ -382,7 +353,7 @@ pub enum MemoryScope {
     /// `verify_scoped` dispatch, which likewise never routes `Session`
     /// anywhere (see each of their own `Session` match arms). It still
     /// participates in `enabled`/`disabled_reason` and in journal `scope`
-    /// labeling like every other scope.
+    /// labeling like every other scope (#295).
     Session,
 }
 
@@ -402,23 +373,8 @@ impl MemoryScope {
         }
     }
 
-    /// `from_flags`, plus the session-tier default (issue #295): with
-    /// neither `--repo`/`--shared` nor `--global` given, `zirv ctx remember`/
-    /// `zirv memory remember` write to the session tier when a session id is
-    /// present in the environment (`AGENT_ENV`'s sibling, `adapters::
-    /// SESSION_ENV`) AND `session_enabled` says the tier itself is on, and
-    /// to the private tier otherwise -- exactly today's behavior for a
-    /// caller with no session id (a plain terminal, a script), and (review
-    /// round 1, finding 1) for an operator who set `memory.session_enabled
-    /// = false`: that switch used to be read only by `MemoryScope::enabled`
-    /// at write time deep inside `remember_session`, which never runs here
-    /// at all (the session-tier write path bypasses the gated scope-generic
-    /// dispatch by design -- see `MemoryScope::Session`'s own doc comment),
-    /// so a disabled session tier was silently written to anyway. Callers
-    /// pass `cfg.memory.session_enabled` (already resolved, so this stays a
-    /// plain function of already-gathered data, not a second config load).
-    /// An explicit flag always wins over the session default, same as it
-    /// already wins over the private default.
+    /// Without an explicit scope, use the session tier only when a session id exists and
+    /// the tier is enabled; otherwise use private (#295).
     pub fn default_remember_scope(
         shared: bool,
         global: bool,
@@ -471,11 +427,8 @@ impl MemoryScope {
         }
     }
 
-    /// This scope's canonical storage directory, or `None` when the location
-    /// cannot be trusted (`Shared`) or cannot be resolved at all from just a
-    /// repo/state/slug (`Session` -- see its own doc comment; use
-    /// `session_dir` instead). `Private`/`Global` always resolve; the
-    /// directory may simply not exist yet, same as before scopes existed.
+    /// The canonical directory may be absent; shared paths must pass trust checks before
+    /// use.
     pub fn dir(self, repo: &Path, state: &StateDir, slug: &str) -> Option<PathBuf> {
         match self {
             MemoryScope::Private => Some(state.memory().join(slug)),
@@ -498,17 +451,8 @@ impl MemoryScope {
     }
 }
 
-/// One entry plus the scope it was actually read from, for a scope-merging
-/// JSON surface (`zirv ctx recall --json`, `zirv memory list`/`recall
-/// --json`). `scope` must always be derived from which bank the caller read
-/// the entry from, never from the entry's own header fields -- a shared
-/// entry's `Source`/`Written-By` are themselves attacker-supplied repository
-/// content (see `MemoryScope::Shared`'s own doc comment above). Shared
-/// between both CLI surfaces (issue #172 cross-review finding 6) rather than
-/// each keeping its own identical copy; the two surfaces still use different
-/// label vocabularies at the call site (`"local"`/`"repo"` for `zirv ctx`,
-/// `"private"`/`"shared"` for `zirv memory`), so `scope` is filled in by the
-/// caller, not derived here.
+/// Derive scope from the bank read, never from an entry header supplied by the repository
+/// (#172).
 #[derive(Serialize)]
 pub(crate) struct ScopedEntry<'a> {
     #[serde(flatten)]
@@ -618,14 +562,8 @@ pub fn list_scoped(
     read_entries(&dir)
 }
 
-/// All scopes' entries, read from disk exactly once each. `render_for_prompt`
-/// and `retrieval::candidates_for_repo` each scan the identical three-scope
-/// bank on their own; a caller that needs both (`compile::gather_memory`, the
-/// launch-time context compiler) used to trigger the whole bank being read
-/// twice -- once per consumer -- for every single session launch. Loading it
-/// once here and handing the same in-memory entries to both consumers
-/// (`render_for_prompt_from_loaded`/`retrieval::candidates_from_loaded`)
-/// removes that duplication without changing what either one selects.
+/// Read each enabled bank once and share the snapshot across prompt rendering and
+/// retrieval.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoadedMemory {
     pub(crate) private: Vec<(PathBuf, Entry)>,
@@ -689,9 +627,8 @@ pub fn list_scoped_unchecked(
 /// rather than erroring -- consistent with `forget`/`verify`'s existing "an
 /// absent key is not a failure" contract for the private scope.
 ///
-/// Two more rules on the READ side specifically (`get_scoped`/`verify_scoped`,
-/// fix round 2): the canonical path is refused outright if it is a symlink
-/// rather than a regular file (`is_regular_file`) -- unlike a directory scan
+/// On reads, the canonical path is refused if it is a symlink rather than a
+/// regular file (`is_regular_file`) -- unlike a directory scan
 /// through `read_entries`, a single-path `read_to_string` does not filter
 /// symlinks out on its own, and following one here would read (`get_scoped`)
 /// or read-then-rewrite (`verify_scoped`) an arbitrary file elsewhere on the
@@ -702,19 +639,15 @@ pub fn list_scoped_unchecked(
 /// parses to `key == ""`) is refused and logged as `get-key-mismatch` rather
 /// than trusted or silently returned as a phantom entry.
 ///
-/// `Private` is unaffected by any of this: it has no canonical per-key file
-/// name at all (a key's file name always carries its `Written` timestamp
-/// too), so it keeps routing through its own pre-existing, unchanged
-/// `get`/`forget`/`verify`, which scan by embedded `Key:` -- the only way
-/// private lookup has ever worked.
+/// Private files include a timestamp in their names, so private operations
+/// must scan their embedded `Key:` rather than use a canonical per-key path.
 ///
 /// `get_scoped` itself: the `_scoped` sibling of the private-only `get`
 /// above. Reads respect `scope.enabled(cfg)`; Global follows the same
 /// `memory.enabled` master switch as Private and routes through
 /// `get(state, GLOBAL_SLUG, key)`.
 ///
-/// Two more `Shared`-only refusals, both fix round 2: the canonical path is
-/// refused if it is a symlink rather than a regular file (`is_regular_file`
+/// Shared reads refuse a symlinked canonical path (`is_regular_file`
 /// -- see its own doc comment for why `read_to_string` alone is not enough
 /// here, unlike a `read_entries`-based scan, which already filters symlinks
 /// out); and the parsed entry's OWN `key` must equal the `key` requested --
@@ -891,14 +824,8 @@ pub(crate) fn validate_shared_key(key: &str) -> CtxResult<()> {
 /// after the header, including a body that itself contains newlines, can
 /// never be read back as a header line.
 ///
-/// `key` used to be excluded here on the grounds that `validate_shared_key`'s
-/// charset already rules `\n`/`\r` out. That was true of the SHARED tier
-/// alone: `remember_inner`/`remember_session_inner` call neither validator,
-/// so a private- or session-tier `remember` accepted a forged key and
-/// `promote --shared` re-parsed the injected header lines back out and
-/// laundered them into the committed bank. Those two now run
-/// [`no_header_newline`] on the key themselves, and it is checked here too so
-/// the shared tier does not depend on a sibling validator for it.
+/// Check keys here as well as in private and session writes: those tiers do
+/// not run `validate_shared_key`, and promotion must not carry a forged header.
 fn validate_shared_entry_fields(entry: &Entry) -> CtxResult<()> {
     no_header_newline(&entry.key, "key")?;
     no_header_newline(&entry.written_by, "written_by")?;
@@ -956,23 +883,9 @@ fn shared_canonical_path(repo: &Path, key: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{key}.md")))
 }
 
-/// Whether `path` is an ordinary regular file, not a symlink -- the
-/// single-path analogue of `read_entries`'s own symlink skip (fix round 2).
-/// `get_scoped`/`verify_scoped`'s canonical-file reads bypass `read_entries`
-/// entirely (each reads exactly one known path, not a directory listing), so
-/// neither inherited that skip on its own. A symlinked canonical file (a
-/// repo-committed `some-key.md -> /etc/passwd`) must never be followed:
-/// `parse_markdown` only ever recognizes text between a `## Memory` heading
-/// and the next one, so an arbitrary target with no such heading (a literal
-/// `/etc/passwd`) parses to an empty phantom entry, not its actual bytes --
-/// but a target an attacker specifically crafts to look like a well-formed,
-/// key-matching entry is not so limited: `get_scoped` would read it back as
-/// if it were a genuine memory entry, and `verify_scoped` would go further
-/// and rewrite that crafted content into the repository as ordinary,
-/// committable text (`stamp_verified_in_place` still operates on whatever
-/// `read_to_string` handed it). `read_to_string` follows a symlink
-/// transparently, unlike `write_shared`'s `rename`, which replaces one
-/// without ever reading through it.
+/// Refuse symlinked canonical files even for one-key reads that bypass directory scanning.
+// A repo-committed key.md symlink must never be followed: a crafted target would read back as a genuine
+// entry, and verify would rewrite that content into the repository.
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
 }
@@ -1104,14 +1017,8 @@ fn upsert_shared(
     upsert_shared_inner(repo, state, slug, cfg, entry, allow_sensitive, true, &lock)
 }
 
-/// `upsert_shared`'s real body, with journaling made optional -- see
-/// `remember_inner`'s own doc comment for why `promote` needs this (the same
-/// "exactly one journal record" reasoning, for a promotion into the shared
-/// tier instead of the global one). `_lock` is the same lock-proof
-/// parameter `remember_inner` documents. `pub(crate)` (review round 2) so
-/// `memory_cli::run_remember_with`'s Shared arm can call it directly under
-/// its own already-held lock, the same reason every other `_inner`/
-/// `_locked` helper here is reachable from outside this module.
+/// Allow a promotion to write without an extra journal entry; the caller writes exactly
+/// one promotion record.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_shared_inner(
     repo: &Path,
@@ -1165,10 +1072,10 @@ pub(crate) fn upsert_shared_inner(
     // here for storage, so the credential guard always sees the full text.
     let entry = cap_body(entry, cfg.memory.max_entry_bytes);
 
-    // Issue #295/#322 (Hermes round): guard the overwrite, and capture
+    // Guard the overwrite, and capture
     // `before_body` for the journal, BEFORE touching the file. A file that
     // exists but cannot be read is an error that stops the write outright,
-    // never silently treated as an absent entry.
+    // never silently treated as an absent entry (#295).
     let before_body = if path.is_file() {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -1190,10 +1097,7 @@ pub(crate) fn upsert_shared_inner(
     let after_body = entry.to_markdown();
     super::state::write_shared(&path, &after_body)?;
     if journal {
-        // Review round 1, finding 4: the entry write above already
-        // succeeded and is not rolled back on a journal failure -- the
-        // error must say so rather than being silently discarded, since
-        // the caller is otherwise left thinking nothing happened at all.
+        // Report journal failure with the already-persisted mutation.
         append_journal(
             state,
             journal_slug_for(MemoryScope::Shared, slug),
@@ -1336,20 +1240,14 @@ pub fn forget_scoped(
         // a directory from here. Callers use `forget_session` directly.
         MemoryScope::Session => Ok(ForgetOutcome::removed(false)),
         MemoryScope::Shared => {
-            // Review round 2, finding 1: a shared-bank writer, so it takes
-            // the same bank lock every other shared writer does.
+            // Hold the shared-bank lock for every shared write.
             let lock = lock_bank(MemoryScope::Shared, state, slug)?;
             forget_shared_locked(repo, state, key, &lock)
         }
     }
 }
 
-/// `forget_scoped`'s Shared arm, factored out so `rollback` (review round
-/// 2, finding 2) can call it while already holding the SAME bank lock it
-/// acquired for its own check-then-inverse, rather than going through the
-/// public `forget_scoped` (which would try to acquire a second lock on the
-/// same file and deadlock -- lock_bank's own doc comment). `_lock` is the
-/// same lock-proof parameter every other `_inner`/`_locked` helper takes.
+/// Use the already-held bank lock during rollback; reacquiring it would deadlock.
 fn forget_shared_locked(
     repo: &Path,
     state: &StateDir,
@@ -1368,10 +1266,7 @@ fn forget_shared_locked(
 
     let mut still_claimed_by: Vec<PathBuf> = Vec::new();
     if let Some(dir) = safe_shared_dir(repo) {
-        // Best-effort (fix round 2): this is an ADVISORY scan after
-        // the canonical delete already succeeded -- a scan failure
-        // (e.g. the directory becomes unreadable mid-call) must not
-        // turn an already-completed forget into an `Err`.
+        // A failed advisory scan cannot turn a completed canonical delete into an error.
         still_claimed_by = read_entries(&dir)
             .unwrap_or_default()
             .into_iter()
@@ -1410,37 +1305,11 @@ fn forget_shared_locked(
 /// contract: refreshes only the `Verified` stamp, leaving `Written`/body
 /// untouched).
 ///
-/// `Shared` touches only the canonical file (same "canonical claimant only"
-/// policy as `get_scoped`/`forget_scoped` above; a pre-existing collision
-/// from some other file is left untouched, exactly as `duplicate_keys` would
-/// report it). Ungated on `shared_enabled` for the same "must not trap data"
-/// reason `forget_scoped` is. Refuses (reports `false`, touches nothing) if
-/// the canonical path is a symlink rather than a regular file (fix round 2,
-/// `is_regular_file`) -- see that function's doc comment for exactly what
-/// following one could and couldn't expose.
-///
-/// **Key agreement (fix round 3: extended from `get_scoped` -- the round-2
-/// ruling that scoped this check to `get_scoped` alone was an
-/// under-scoping, corrected here):** after parsing, if the entry's own `key`
-/// disagrees with the requested `key`, this logs a `verify-key-mismatch`
-/// decision (same shape as `get_scoped`'s `get-key-mismatch`) and returns
-/// `Ok(false)` WITHOUT writing anything. Before this fix, `verify_scoped`
-/// would stamp false freshness onto a mismatched file, answer `true` for a
-/// key `get_scoped` already refuses to return, and (see the next point)
-/// destroy a readable non-entry file by overwriting it with an empty
-/// phantom stub.
-///
-/// **In-place stamping (fix round 3, data-loss fix):** once the key is
-/// confirmed to agree, the `Verified` bullet is refreshed via
-/// `stamp_verified_in_place` -- NOT a parse-then-`to_markdown` re-render
-/// (what this used to do, and what `Private`'s `verify` still does for the
-/// machine-local bank). A re-render silently drops anything `parse_markdown`
-/// doesn't recognize into its own fixed field set: an unknown header bullet
-/// (`- Priority: urgent`) or a trailing `## Notes` section a human added
-/// would both vanish. Issue #32 requires shared entries to stay "readable
-/// and editable without Zirv" -- a hand-edited file must survive a `verify`
-/// call with everything it wasn't asked to change intact, so the write path
-/// edits the raw text directly instead.
+/// Shared verification touches only the canonical regular file and remains
+/// available when shared storage is disabled, so data is not trapped.
+/// A header key mismatch returns `false` without writing. Once keys agree,
+/// stamp `Verified` in place: re-rendering would erase unknown fields and
+/// hand-edited sections (#32).
 pub fn verify_scoped(
     scope: MemoryScope,
     repo: &Path,
@@ -1461,8 +1330,7 @@ pub fn verify_scoped(
             if !is_regular_file(&path) {
                 return Ok(false);
             }
-            // Review round 2, finding 1: held across the read-decide-write
-            // below, same as every other shared writer.
+            // Hold the bank lock across this shared read-decide-write.
             let _lock = lock_bank(MemoryScope::Shared, state, slug)?;
             // Hermes round (issue #295/#322): a file that EXISTS but cannot
             // be read (permissions, encoding, a partial write caught
@@ -1502,8 +1370,8 @@ pub fn verify_scoped(
             guard_round_trip(state, slug, key, &path, &text)?;
             let stamped = stamp_verified_in_place(&text, now_secs());
             super::state::write_shared(&path, &stamped)?;
-            // Review round 1, finding 4: propagate a journal-append
-            // failure -- the stamp above already landed on disk.
+            // Propagate journal failure while stating that the stamp already landed on
+            // disk.
             append_journal(
                 state,
                 journal_slug_for(MemoryScope::Shared, slug),
@@ -1661,13 +1529,8 @@ fn prune_to_cap(dir: &Path, keep: usize) {
 /// other zirv log (`log::LOG_FILE`'s `decisions.jsonl`).
 const JOURNAL_FILE: &str = "journal.jsonl";
 
-/// Fallback retention cap for the handful of journal writers that have no
-/// `CtxConfig` in hand (`forget`/`verify`, the private/global primitives many
-/// pre-existing call sites already depend on the exact signature of --
-/// see the module's own call-site survey before this was added). Every
-/// writer that DOES have `cfg` passes `cfg.memory.journal_max_entries`
-/// instead; this constant is deliberately the same value as that setting's
-/// own default so the two never disagree in practice.
+/// Use a fixed retention cap when a writer has no config; configured writers use
+/// `journal_max_entries`.
 const DEFAULT_JOURNAL_MAX_ENTRIES: usize = 500;
 
 /// One journaled write to a memory bank (issue #295): every `remember`/
@@ -1695,15 +1558,8 @@ pub struct JournalRecord {
     pub before_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_body: Option<String>,
-    /// EVERY body the write this record describes removed, in the order the
-    /// bank listed them; `before_body` is its first element. Normally at most
-    /// one -- a key addresses one entry -- but two concurrent `remember`s on
-    /// one key can each miss the other's not-yet-written file and leave two
-    /// (see `remember_inner`'s own collapse loop), and the removal loop then
-    /// deletes BOTH. Journaling only the first made every other one
-    /// unrecoverable: `rollback` restores each element of this list.
-    /// `#[serde(default)]` so a record written before this field existed
-    /// still reads back, falling back to `before_body` alone.
+    /// Record every removed body in bank order; concurrent writes can leave more than one
+    /// file for one key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before_bodies: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1937,20 +1793,10 @@ pub fn remember(
     remember_inner(state, slug, entry, cfg, true, &lock)
 }
 
-/// `remember`'s real body, with journaling made optional: `promote` (issue
-/// #295) writes the destination tier through this with `journal = false` so
-/// it can append its own single `"promote"` record afterward instead of
-/// getting an extra `"remember"` one for free -- "every remember/forget/
-/// verify/promote/rollback appends EXACTLY ONE journal record" would
-/// otherwise be double-counted for every promotion into the global tier.
-///
-/// `_lock` (review round 2, finding 1) is never read -- its only job is to
-/// PROVE, at the type level, that the caller already holds this bank's
-/// the bank lock before any read-decide-write happens here. Every caller
-/// reachable from outside this module goes through the public `remember`
-/// above, which acquires it; internal callers (`promote`, `rollback`)
-/// already hold the SAME lock for the same reason and pass it through
-/// rather than this function acquiring a second, deadlocking one.
+/// A promotion writes its destination without a nested journal entry, then appends one
+/// promotion record (#295).
+// `_lock` is never read: it proves at the type level that the caller already holds this bank's lock;
+// taking a second one here would deadlock.
 fn remember_inner(
     state: &StateDir,
     slug: &str,
@@ -1963,12 +1809,11 @@ fn remember_inner(
     let dir = state.memory().join(slug);
     super::state::create_private_dir_all(&dir)?;
 
-    // Issue #295: captured before the old file(s) are removed, so the
-    // journal record for this write carries the exact prior serialized
-    // entries -- `rollback`'s only source of truth for restoring them. EVERY
-    // one, not just the first: the loop below deletes every entry under the
-    // key, a state the collapse loop further down documents two concurrent
-    // `remember`s can reach.
+    // Captured before the old file(s) are removed, so the journal record for this write
+    // carries the exact prior serialized entries -- `rollback`'s only source of truth for
+    // restoring them. EVERY one, not just the first: the loop below deletes every entry
+    // under the key, a state the collapse loop further down documents two concurrent
+    // `remember`s can reach (#295).
     let mut before_bodies: Vec<String> = Vec::new();
     for (path, existing) in list(state, slug)? {
         if existing.key == entry.key {
@@ -2022,8 +1867,7 @@ fn remember_inner(
             &entry.written_by,
         );
         record.before_bodies = before_bodies;
-        // Review round 1, finding 4: propagate a journal-append failure --
-        // the write above already landed and is not undone.
+        // Propagate journal failure while stating that the write already landed on disk.
         append_journal(
             state,
             journal_slug_for(scope, slug),
@@ -2073,12 +1917,7 @@ pub fn forget(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
     forget_inner(state, slug, key, true, &lock)
 }
 
-/// `forget`'s real body, with journaling made optional -- see
-/// `remember_inner`'s own doc comment. `rollback` (review round 1, finding
-/// 5) uses this with `journal = false` for the inverse of a CREATE record,
-/// so undoing a create appends only the rollback's own single journal
-/// record rather than one from this delete plus one from the rollback.
-/// `_lock` is the same lock-proof parameter `remember_inner` documents.
+/// Rollback deletes without a nested forget record, then appends one rollback record.
 fn forget_inner(
     state: &StateDir,
     slug: &str,
@@ -2094,8 +1933,8 @@ fn forget_inner(
             removed = true;
             if journal {
                 let scope = private_or_global_scope(slug);
-                // Review round 1, finding 4: propagate a journal-append
-                // failure -- the delete above already happened.
+                // Propagate journal failure while stating that the delete already
+                // happened.
                 append_journal(
                     state,
                     journal_slug_for(scope, slug),
@@ -2144,8 +1983,7 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
             let after_body = entry.to_markdown();
             super::state::write_private(&path, &after_body)?;
             let scope = private_or_global_scope(slug);
-            // Review round 1, finding 4: propagate a journal-append
-            // failure -- the stamp above already landed on disk.
+            // Report journal failure with the already-persisted mutation.
             append_journal(
                 state,
                 journal_slug_for(scope, slug),
@@ -2169,17 +2007,8 @@ pub fn verify(state: &StateDir, slug: &str, key: &str) -> CtxResult<bool> {
     Ok(false)
 }
 
-/// Replaces any character outside `[A-Za-z0-9-]` with `-`, case preserved --
-/// a session id can never escape its own `sessions/` directory this way,
-/// regardless of what a harness happens to generate one as. The first 8 hex
-/// characters of `sha256(id)` are always appended (review round 1, finding
-/// 6): the charset substitution above is lossy -- `a/b` and `a?b` both
-/// sanitize to `a-b` on their own, which would let two distinct raw session
-/// ids collide onto the SAME directory, so retiring one session's tier
-/// (`forget_session_all`) could delete a still-live, unrelated session's
-/// entries. The hash suffix is computed from the raw, unsanitized `id`, so
-/// two ids differing only in a character this substitution collapses still
-/// get distinct directories.
+/// Replaces path-unsafe characters and appends a hash of the raw id; the
+/// suffix prevents distinct ids from sharing a directory after sanitization.
 fn sanitize_session_id(id: &str) -> String {
     let raw: String = id
         .chars()
@@ -2216,13 +2045,8 @@ pub fn session_dir(state: &StateDir, slug: &str, session_id: &str) -> PathBuf {
         .join(sanitize_session_id(session_id))
 }
 
-/// The pre-review-round-1 sanitize rule: charset substitution only, no
-/// `sha256` suffix. A binary built before round 1's finding-6 fix creates
-/// session directories under this name; review round 2's finding 4 exists
-/// because those directories are otherwise invisible to (and unreachable
-/// by) every post-fix lookup and cleanup. `session_dir`'s own doc comment
-/// covers why the NEW name has the suffix at all -- this function exists
-/// only so `list_session`/`forget_session_all` can also check the OLD one.
+/// Read legacy session directory names without hash suffix so older entries remain
+/// reachable.
 fn legacy_sanitize_session_id(id: &str) -> String {
     let raw: String = id
         .chars()
@@ -2252,16 +2076,8 @@ fn legacy_session_dir(state: &StateDir, slug: &str, session_id: &str) -> PathBuf
         .join(legacy_sanitize_session_id(session_id))
 }
 
-/// Lists every entry stored in one session's own tier, oldest-written-first
-/// -- the `list`/`list_scoped` analogue for `MemoryScope::Session`.
-///
-/// Review round 2, finding 4: also reads the LEGACY unsuffixed directory
-/// (`legacy_session_dir`) when it exists, so a session registered by a
-/// pre-round-1 binary -- whose entries live there, not under the new
-/// hash-suffixed name -- still recalls its own entries across the upgrade
-/// rather than finding an empty tier. New writes always go to the new
-/// directory (`remember_session_inner`); this is a read-side (and, via
-/// `forget_session_all`, cleanup-side) accommodation only.
+/// Read both current and legacy session directories; keep entries in deterministic write
+/// order.
 pub fn list_session(
     state: &StateDir,
     slug: &str,
@@ -2355,8 +2171,7 @@ fn remember_session_inner(
         );
         record.before_bodies = before_bodies;
         record.session_id = Some(session_id.to_string());
-        // Review round 1, finding 4: propagate a journal-append failure --
-        // the write above already landed on disk.
+        // Report journal failure with the already-persisted mutation.
         append_journal(
             state,
             journal_slug_for(MemoryScope::Session, slug),
@@ -2374,20 +2189,8 @@ fn remember_session_inner(
     Ok(path)
 }
 
-/// Removes the entry for `key` from one session's own tier. Returns whether
-/// anything was removed. Journals a `"forget"` record scoped `"session"`
-/// when something was actually removed and `journal` is true.
-///
-/// No CLI verb forgets from the session tier directly today (`zirv ctx
-/// forget`/`zirv memory forget` only ever target Private/Shared/Global --
-/// see their own scope-resolution doc comments), so this stays a private,
-/// explicit-`journal`-flag helper rather than the public journaling-wrapper-
-/// plus-inner-helper pair every other write primitive in this module has
-/// (`remember`/`remember_inner`, `forget`/`forget_inner`): a `pub` wrapper
-/// with no caller anywhere but its own inner function is dead code in a
-/// binary crate, not future-proofing. `rollback` (review round 1, finding
-/// 5) calls this with `journal = false` for the inverse of a session-tier
-/// CREATE record, so undoing it appends only the rollback's own record.
+/// Only internal session cleanup removes this tier; journal a per-key forget only when it
+/// actually deletes an entry.
 fn forget_session_inner(
     state: &StateDir,
     slug: &str,
@@ -2414,8 +2217,7 @@ fn forget_session_inner(
                     &entry.written_by,
                 );
                 record.session_id = Some(session_id.to_string());
-                // Review round 1, finding 4: propagate a journal-append
-                // failure -- the delete above already happened.
+                // Report journal failure with the already-persisted mutation.
                 append_journal(
                     state,
                     journal_slug_for(MemoryScope::Session, slug),
@@ -2447,17 +2249,7 @@ pub fn forget_session(
     forget_session_inner(state, slug, session_id, key, true, &lock)
 }
 
-/// Removes this session's ENTIRE tier outright -- called when the session's
-/// own registry entry retires (`sessions::SessionGuard::release`, issue
-/// #295): a session-scoped entry must never outlive the session it belongs
-/// to. Not journaled per-entry, the same "a bulk clear is not a per-key
-/// operation" reasoning `forget_all` already follows.
-///
-/// Review round 2, finding 4: also removes the LEGACY unsuffixed directory
-/// (`legacy_session_dir`) when present, so a mid-upgrade session's entries
-/// are actually cleaned up on retirement/rotation instead of becoming
-/// permanently invisible (per `list_session`'s own fix) AND permanently
-/// orphaned on disk.
+/// Remove both current and legacy session directories when the session retires (#295).
 pub fn forget_session_all(state: &StateDir, slug: &str, session_id: &str) -> CtxResult<()> {
     let dir = session_dir(state, slug, session_id);
     if dir.is_dir() {
@@ -2496,8 +2288,7 @@ pub fn verify_session(
                 &entry.written_by,
             );
             record.session_id = Some(session_id.to_string());
-            // Review round 1, finding 4: propagate a journal-append
-            // failure -- the stamp above already landed on disk.
+            // Report journal failure with the already-persisted mutation.
             append_journal(
                 state,
                 journal_slug_for(MemoryScope::Session, slug),
@@ -2582,7 +2373,7 @@ fn render_prompt_line(entry: Entry, scope: MemoryScope) -> super::prompt::Memory
     }
 }
 
-// Issue #37: harvesting durable, repository-wide facts at the end of a
+// Harvesting durable, repository-wide facts at the end of a
 // session's useful life -- not just a *distilled* mid-session restart (the
 // pre-existing N6 seam) but a genuinely completed session too. Two distinct
 // paths now feed the same one entry point (`harvest_durable`), so a session
@@ -2596,7 +2387,7 @@ fn render_prompt_line(entry: Entry, scope: MemoryScope) -> super::prompt::Memory
 //     under the exact same "distilled only" rule, then calls the same
 //     `harvest_durable`.
 // A nudge relaunch deliberately gets neither: it is not rot and not a real
-// session end, just an interruption.
+// session end, just an interruption (#37).
 //
 // Opt-in via `cfg.memory.harvest` (default false: an entry worth keeping
 // across sessions is a deliberate act, not an inferred one). Unlike the
@@ -2736,11 +2527,7 @@ not durable -- do not record it.\n\
 /// errs toward silence -- `filter_durable_candidates` is the deterministic
 /// backstop for whenever it doesn't.
 ///
-/// `tool_errors` is `None` for every pre-existing caller (a restart seam,
-/// which only ever has a distilled `Handoff` in hand, not the
-/// `StructuralContext` the raw errors live on) and `format_tool_errors_block`
-/// returns an empty string for `None`, so the prompt those callers see is
-/// byte-identical to before this parameter existed.
+/// When `tool_errors` is absent, the prompt omits that block.
 pub fn durable_harvest_prompt(
     handoff: &super::handoff::Handoff,
     tool_errors: Option<&[String]>,
@@ -2914,15 +2701,9 @@ fn harvest_candidate_credential_match(key: &str, body: &str) -> Option<String> {
 /// (`validate_shared_key` -- not lowercase kebab-case, too long, all-hyphen,
 /// or a reserved Windows device name) is dropped; a body matching
 /// `is_temporary_or_generic` is dropped; a body that looks credential-shaped
-/// (`harvest_candidate_credential_match`, checked against the RAW body here,
-/// BEFORE truncation) is dropped -- issue #172 cross-review: this filter
-/// used to truncate first and let `write_durable`'s own credential check run
-/// only on the ALREADY-truncated body, so a long credential straddling the
-/// truncation boundary could be sheared down to a tail too short for
-/// `review::detect_token_shape`'s length gates and land, partially, in the
-/// repo-committed bank -- the check now runs where `upsert_shared` itself
-/// already gets the order right: guard first, truncate second; the body is
-/// then truncated to `cfg.memory.max_entry_bytes` (the same per-entry cap
+/// (`harvest_candidate_credential_match`, checked against the raw body before
+/// truncation) is dropped; truncation could hide a sensitive value from the check.
+/// The body is then truncated to `cfg.memory.max_entry_bytes` (the same per-entry cap
 /// every other entry in this store gets) and dropped entirely if truncation
 /// leaves nothing but whitespace. Only survivors count against the two NEW
 /// per-session caps issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
@@ -2963,11 +2744,10 @@ pub fn filter_durable_candidates(
     out
 }
 
-/// Issue #537 (A3): the floor a Jev durability/relevance `noul` must clear
-/// to keep a candidate, shared by the harvest gate below and `compile::
-/// rerank_memory_candidates`. From a live 2026-09-18 probe: 0.3 cleanly
-/// separated all 24 recorded candidates (true/false positives never crossed
-/// it either way); 0.5 dropped a true positive.
+/// The floor a Jev durability/relevance `noul` must clear to keep a candidate, shared by
+/// the harvest gate below and `compile::rerank_memory_candidates`. From a live 2026-09-18
+/// probe: 0.3 cleanly separated all 24 recorded candidates (true/false positives never
+/// crossed it either way); 0.5 dropped a true positive (#537).
 pub(crate) const MEMORY_RELEVANCE_FLOOR: f64 = 0.3;
 
 /// Bounded numeric-only metadata state (issue #759's re-projection onto the
@@ -3033,34 +2813,8 @@ pub(crate) fn memory_harvest_action(
     }
 }
 
-/// Issue #537 (A3): re-examines candidates the keyword filter
-/// (`filter_durable_candidates`) already accepted, with one BATCHED Jev
-/// advisory call (site `"memory"`) when `[jev] memory` is on -- one Noul per
-/// candidate, asking whether it is a durable fact rather than transient
-/// narration. Jev never ACCEPTS a candidate the keyword filter itself
-/// rejected: this only ever narrows `accepted`, the same "propose, then
-/// dispose" relationship `filter_durable_candidates`'s own doc comment
-/// describes for the model/keyword-filter pair. Only an EXPLICIT rejection
-/// (a noul answer below [`MEMORY_RELEVANCE_FLOOR`]) drops a candidate,
-/// logged the same observable `harvest-skipped` way every other rejection in
-/// this pipeline already is. A missing or unparseable per-id answer is never
-/// grounds to drop a candidate the keyword filter already accepted -- it
-/// keeps the keyword filter's own verdict (accepted), same as the whole-call
-/// fallback below. Best-effort like every other `[jev]`-gated site: the gate
-/// being off, no credential, or any transport/parse error for the WHOLE call
-/// leaves `accepted` completely untouched (`jev::advise`'s own contract).
-///
-/// Issue #759: since issue #746's `jev::safe_metadata_request` egress
-/// boundary, the free-text state this used to send (each candidate's own
-/// key and a truncated body summary) was rejected before any cache read or
-/// network call -- this gate's own `[jev] memory` key was a dead deny-only
-/// fallback end to end, as its own now-replaced `..._rejects_text_state_
-/// without_egress` test documented. Re-projected onto the `_zirv_metadata_
-/// only`/`facts` contract every other `[jev]`-gated site uses; distinct
-/// from (and not superseded by) `jev_harvest_prescreen`'s own `harvest_
-/// screen` gate, which only ever decides whether to run the distiller AT
-/// ALL, before any candidate exists -- this gate re-examines the
-/// candidates the keyword filter already produced, one at a time.
+/// Send bounded structural state only; authority-side filtering must reject free-form
+/// candidate text (#537).
 fn apply_jev_harvest_gate(
     accepted: Vec<(String, String)>,
     cfg: &CtxConfig,
@@ -3576,9 +3330,9 @@ fn harvest_durable_with_tool_errors(
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
         return Ok(0);
     }
-    // Issue #742: a conservative, Jev-screened decision of whether this
-    // handoff is worth a real distiller call at all, checked before the
-    // model is touched -- see `jev_harvest_prescreen`'s own doc comment.
+    // A conservative, Jev-screened decision of whether this handoff is worth a real
+    // distiller call at all, checked before the model is touched -- see
+    // `jev_harvest_prescreen`'s own doc comment (#742).
     if jev_harvest_prescreen(
         handoff
             .gotchas
@@ -3604,7 +3358,7 @@ fn harvest_durable_with_tool_errors(
         return Ok(0);
     }
     let timeout = std::time::Duration::from_secs(cfg.handoff.timeout_secs);
-    // Issue #89.
+    //  (#89).
     super::adapters::announce_sandbox_residual_once(adapter, cfg.chrome.events);
     let answer = super::handoff::helper_answer(
         super::helper::ROLE_DISTILLER,
@@ -3642,32 +3396,23 @@ fn harvest_durable_with_tool_errors(
         }
     }
     let accepted = filter_durable_candidates(&candidates, cfg);
-    // Issue #537 (A3): narrows (never widens) the keyword filter's own
-    // output with one batched Jev advisory call when `[jev] memory` is on;
-    // a byte-identical pass-through otherwise (`apply_jev_harvest_gate`'s
-    // own doc comment).
+    // Narrows (never widens) the keyword filter's own output with one batched Jev advisory
+    // call when `[jev] memory` is on; a byte-identical pass-through otherwise
+    // (`apply_jev_harvest_gate`'s own doc comment) (#537).
     let accepted = apply_jev_harvest_gate(accepted, cfg, state, repo, slug, now_secs());
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
-    // Issue #87: a one-line summary on the `zirv ▸` channel every time a
-    // harvest actually ran (this function is the single choke point every
-    // call site funnels through), so harvesting is visible rather than a
-    // silent diff under `.zirv/memory/` days later. Fired even at
-    // `written == 0` -- that is still a real outcome, distinct from a
-    // harvest that never ran at all.
+    // A one-line summary on the `zirv ▸` channel every time a harvest actually ran (this
+    // function is the single choke point every call site funnels through), so harvesting is
+    // visible rather than a silent diff under `.zirv/memory/` days later. Fired even at
+    // `written == 0` -- that is still a real outcome, distinct from a harvest that never
+    // ran at all (#87).
     super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr())
         .emit(&super::announce::Event::MemoryHarvested { count: written });
     Ok(written)
 }
 
-/// The clean-session-end companion to `harvest_durable` (issue #37): a
-/// session that simply ends -- no rot, no timeout, no restart -- previously
-/// never harvested at all. This is the seam `exec.rs`'s and `wrap.rs`'s
-/// clean-exit arms call: it distills the just-ended transcript itself (there
-/// is no already-distilled handoff lying around at a clean exit the way
-/// there is at a restart) and, only when that distillation genuinely
-/// succeeded (`source == "distilled"` -- never the mechanical structural
-/// fallback, which has nothing durable to offer, the exact same rule the
-/// restart seams already apply), hands the result to `harvest_durable`.
+/// On clean exit, distills the just-ended transcript and harvests only a
+/// genuinely distilled result; structural fallback has no durable facts (#37).
 ///
 /// Gated on `cfg.memory.enabled && cfg.memory.harvest && cfg.memory.
 /// shared_enabled` first, before the distiller is even touched -- the same
@@ -3691,11 +3436,10 @@ pub fn harvest_at_session_end(
     if !cfg.memory.enabled || !cfg.memory.harvest || !cfg.memory.shared_enabled {
         return Ok(0);
     }
-    // Issue #742: screens the clean-exit distillation itself, not just the
-    // helper call it feeds -- safe because this call exists solely to build
-    // `note` below (see `distill_or_structural`'s own doc comment naming
-    // "the memory-harvest note" among its non-restart callers, unlike the
-    // genuinely restart-bound `wrap::pump` call site).
+    // Screens the clean-exit distillation itself, not just the helper call it feeds -- safe
+    // because this call exists solely to build `note` below (see `distill_or_structural`'s
+    // own doc comment naming "the memory-harvest note" among its non-restart callers,
+    // unlike the genuinely restart-bound `wrap::pump` call site) (#742).
     if jev_harvest_prescreen(
         ctx.user_messages
             .iter()
@@ -3778,39 +3522,13 @@ pub fn check_if_unchanged(existing: Option<&Entry>, expected: &str) -> CtxResult
     }
 }
 
-// A held, per-memory-bank advisory OS lock (review round 2, findings 1 and
-// 3). Acquired ONCE at each PUBLIC write entry point (`remember`, `forget`,
-// `verify`, `upsert_shared`, `remember_session`, `verify_session`,
-// `promote`, `rollback`, and the Shared-scope arms of `forget_scoped`/
-// `verify_scoped`) and threaded down into every `_inner` helper as
-// `&FileLock`, so a function that already holds the lock never tries to
-// acquire it a second time: `std::fs::File::lock` is not re-entrant within
-// one process -- a second lock on a second handle for the same path BLOCKS
-// (deadlocking the caller against itself on Windows in particular), it
-// does not silently succeed the way a re-entrant mutex would. This closes
-// review round 1's residual gap: that round only ever locked the
-// `--if-unchanged` path, so an ordinary unconditional `remember`/`forget`/
-// `verify`/`promote` racing an `--if-unchanged` writer still clobbered it --
-// the conflict check was a check, not a compare-and-swap, without every
-// writer serializing on the same lock.
-//
-// Lives entirely in the trusted state dir, never in the repo checkout
-// (review round 2, finding 3): see `bank_lock_path` for the exact three
-// paths. Shares `state::FileLock`/`state::acquire_lock` (issue #728) --
-// the same shared advisory-lock guard `group.rs`/`task.rs` use -- rather
-// than a hand-rolled `BankLock` newtype.
+// Hold one bank lock across every public write's read-decide-write and pass it
+// to inner helpers; reacquiring the same file lock can deadlock on Windows.
+// Lock files live in trusted state, never at repository-controlled paths (#728).
 
-/// The lock file path for `scope`'s bank -- ALWAYS inside the trusted state
-/// dir, never the repo checkout (review round 2, finding 3: the shared
-/// bank's lock used to live at `<repo>/.zirv/memory/.lock`, a
-/// repo-controlled path a hostile checkout could commit as a symlink
-/// pointing anywhere on the machine, since `open_lock_file` follows one).
-/// `Private`/`Session` share one lock (`<state>/memory/<slug>/.lock`) --
-/// the slug already identifies which repository, and both tiers live under
-/// the same bank root; `Shared` gets its own file in the same directory
-/// (`shared.lock`) rather than a `.lock` inside the repo-owned
-/// `<repo>/.zirv/memory/` directory itself; `Global` gets
-/// `<state>/memory/_global/.lock`.
+/// Lock paths stay under trusted state: repository paths could redirect file
+/// opening through a symlink. Private and Session share one bank lock;
+/// Shared and Global each use a separate lock.
 fn bank_lock_path(scope: MemoryScope, state: &StateDir, slug: &str) -> PathBuf {
     match scope {
         MemoryScope::Global => state.memory().join(GLOBAL_SLUG).join(".lock"),
@@ -3860,13 +3578,7 @@ pub fn promote(
         return Err("zirv memory promote: pass --shared or --global".into());
     }
 
-    // Review round 2, finding 1: lock BOTH banks this operation touches for
-    // its whole read-decide-write -- the origin (`Private`/`Session` share
-    // one lock per slug, so `MemoryScope::Private` here locks the same file
-    // a session-tier origin would) and the destination (`Shared`/`Global`)
-    // -- acquired in a FIXED order (origin, then destination) every single
-    // call, so two concurrent `promote`s can never deadlock by acquiring
-    // the same pair of locks in opposite order.
+    // Lock origin and destination banks in a fixed order for the whole read-decide-write.
     let origin_lock = lock_bank(MemoryScope::Private, state, slug)?;
     let dest_lock = lock_bank(target, state, slug)?;
 
@@ -3943,9 +3655,8 @@ pub fn promote(
         )
     })?;
 
-    // Review round 1, finding 4: propagate a journal-append failure -- the
-    // destination write above already succeeded and the origin has already
-    // been cleared.
+    // Propagate journal failure while stating that the destination write succeeded and the
+    // origin was cleared.
     append_journal(
         state,
         journal_slug_for(target, slug),
@@ -3969,13 +3680,8 @@ pub fn promote(
     Ok(path)
 }
 
-/// The CURRENT raw on-disk markdown for `key` in `scope`, or `None` if no
-/// entry exists there right now (review round 1, finding 3). Reads the
-/// actual bytes at the actual path -- never through the gated `get_scoped`,
-/// whose `scope.enabled(cfg)` check would otherwise read a disabled-but-
-/// still-populated scope as "absent" and let `rollback` silently clobber
-/// real content. Used only to answer "has this key changed since the
-/// record being rolled back last wrote it", never rendered or stored.
+/// Reads raw on-disk content even from disabled scopes, so rollback cannot
+/// mistake existing data for an absent key and overwrite it.
 fn current_raw_body(
     scope: MemoryScope,
     repo: &Path,
@@ -4037,15 +3743,8 @@ fn current_raw_body(
 /// rather than replaying the inverse a second time. Otherwise appends its
 /// own `"rollback"` record and returns `Ok(true)`.
 ///
-/// **Refuses a stale rollback (review round 1, finding 3).** Before
-/// replaying the inverse, the entry's CURRENT raw body is compared against
-/// this record's own `after_body` (what THIS record actually produced --
-/// `None` means the record's own write left the key absent). A mismatch
-/// means a LATER write already changed this key since this record ran --
-/// rolling back an old create/overwrite over a newer value would silently
-/// clobber that newer value, so the rollback is refused outright (nothing
-/// written, the id's own `"rollback"` record is not appended either) rather
-/// than restoring stale content.
+/// Refuse rollback when the current raw body differs from this record's
+/// `after_body`; an intervening write must never be clobbered.
 pub fn rollback(
     repo: &Path,
     state: &StateDir,
@@ -4070,12 +3769,7 @@ pub fn rollback(
         let key = record.key.clone();
         let session_id = record.session_id.as_deref();
 
-        // Review round 2, finding 1 + 2: acquired ONCE, before the
-        // conflict-check read, and held through the inverse write and the
-        // rollback's own journal append below -- the whole
-        // read-decide-write is now a single critical section, so a
-        // concurrent write between the check and the inverse is impossible
-        // by construction, not merely unlikely.
+        // Hold one lock from conflict check through inverse write and journal append.
         let lock = lock_bank(scope, state, journal_slug)?;
 
         let current = current_raw_body(scope, repo, state, journal_slug, session_id, &key)?;
@@ -4101,11 +3795,8 @@ pub fn rollback(
 
         match before_bodies.split_first() {
             None => {
-                // The record introduced this key; its inverse deletes it.
-                // Non-journaling (review round 1, finding 5): the
-                // `"rollback"` record appended below already documents
-                // this whole operation, so the delete must not ALSO emit
-                // its own `"forget"` record -- one rollback, one record.
+                // Delete a newly introduced key without a nested forget record; the
+                // rollback record describes the inverse.
                 match scope {
                     MemoryScope::Shared => {
                         // `forget_shared_locked`, not the public
@@ -4185,8 +3876,7 @@ pub fn rollback(
             written_by,
         );
         rollback_record.target_id = Some(record.id.clone());
-        // Review round 1, finding 4: propagate a journal-append failure --
-        // the inverse write above already happened.
+        // Propagate journal failure while stating that the inverse write already happened.
         append_journal(
             state,
             journal_slug,
@@ -4363,13 +4053,11 @@ pub fn run_remember_with<W: Write>(
 
     let state = StateDir::resolve(env)?;
     let slug = repo_slug(repo);
-    // Issue #295: with neither `--repo` nor `--global` given, a session id
-    // present in the environment routes a bare `remember` to the session
-    // tier instead of the private one -- `default_remember_scope`'s own doc
-    // comment. `--verify`-only still targets whatever `from_flags` would
-    // have picked before session routing existed, since verifying an
-    // EXISTING entry should not move it to a tier it was never written
-    // into.
+    // With neither `--repo` nor `--global` given, a session id present in the environment
+    // routes a bare `remember` to the session tier instead of the private one --
+    // `default_remember_scope`'s own doc comment. `--verify`-only still targets whatever
+    // `from_flags` would have picked before session routing existed, since verifying an
+    // EXISTING entry should not move it to a tier it was never written into (#295).
     let session_id = env(super::adapters::SESSION_ENV).filter(|v| !v.trim().is_empty());
     let scope = MemoryScope::default_remember_scope(
         args.repo,
@@ -4377,11 +4065,8 @@ pub fn run_remember_with<W: Write>(
         session_id.as_deref(),
         cfg.memory.session_enabled,
     );
-    // Review round 1, finding 1: a session id was present and no explicit
-    // scope flag was given, but `session_enabled = false` sent this to the
-    // private tier instead -- named in the output so a `memory.
-    // session_enabled = false` operator is not left wondering why a bare
-    // `remember` did not land in the session tier they expected.
+    // Name private scope in output when session storage is disabled, so the destination is
+    // explicit.
     let session_fallback_note = if scope == MemoryScope::Private
         && !args.repo
         && !args.global
@@ -4503,11 +4188,10 @@ pub fn run_remember_with<W: Write>(
                 // exists to set it yet.
                 paths: Vec::new(),
             };
-            // Issue #773: computed before the write (see `duplicate_write_
-            // warning`'s own doc comment for why the key about to be
-            // written is excluded from the comparison), printed right
-            // after so it lands ahead of the success line below rather
-            // than being lost above it.
+            // Computed before the write (see `duplicate_write_warning`'s own doc comment
+            // for why the key about to be written is excluded from the comparison), printed
+            // right after so it lands ahead of the success line below rather than being
+            // lost above it (#773).
             let duplicate_warning = duplicate_write_warning(
                 "zirv ctx remember",
                 scope,
@@ -4517,15 +4201,7 @@ pub fn run_remember_with<W: Write>(
                 &cfg,
                 &entry,
             );
-            // Review round 2, finding 1: every write acquires this bank's
-            // lock now. `--if-unchanged` needs the check and the write
-            // under the SAME held lock (else a second writer could land in
-            // between), so that path takes the lock itself here and calls
-            // the `_inner` functions directly -- the public wrappers below
-            // would try to acquire a second lock on the same file and
-            // deadlock (lock_bank's own doc comment). Without
-            // `--if-unchanged`, the public wrappers' own internal locking
-            // is enough.
+            // Hold one lock across the unchanged check and write; nested wrappers would deadlock.
             let path = if let Some(expected) = &args.if_unchanged {
                 let lock = lock_bank(scope, &state, &slug)?;
                 let existing = match scope {
@@ -4662,11 +4338,10 @@ pub fn run_recall_with<W: Write>(
             .into_iter()
             .map(|(_, e)| (e, MemoryScope::Shared)),
     );
-    // Issue #295: the session tier is never repo-forbidden-gated through
-    // `list_scoped` (it has no session id to resolve a directory from, see
-    // `MemoryScope::Session`'s own doc comment) -- gated here directly on
-    // `MemoryScope::Session.enabled(cfg)` instead, and only ever contributes
-    // THIS process's own session id's entries, never another session's.
+    // The session tier is never repo-forbidden-gated through `list_scoped` (it has no
+    // session id to resolve a directory from, see `MemoryScope::Session`'s own doc comment)
+    // -- gated here directly on `MemoryScope::Session.enabled(cfg)` instead, and only ever
+    // contributes THIS process's own session id's entries, never another session's (#295).
     if MemoryScope::Session.enabled(&cfg)
         && let Some(id) = env(super::adapters::SESSION_ENV).filter(|v| !v.trim().is_empty())
     {

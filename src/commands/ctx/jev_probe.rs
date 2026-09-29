@@ -490,10 +490,10 @@ impl Site {
             }
             Self::Inject => inject_gate::inject_action(answer, min_confidence, min_margin),
             Self::Crash => {
-                // facts[0] layout (see task.rs's own `jev_crash_cause`):
-                // [exit_kind, attempt, max_attempts, access, configuration,
-                // missing_file, transient] -- indices 3, 4, 5 are the three
-                // signal bools the classification rule also reads.
+                // Facts[0] layout (see task.rs's own `jev_crash_cause`): [exit_kind,
+                // attempt, max_attempts, access, configuration, missing_file, transient] --
+                // indices 3, 4, 5 are the three signal bools the classification rule also
+                // reads.
                 let facts = facts_row0(case);
                 let access = facts.get(3).copied().unwrap_or(0) != 0;
                 let configuration = facts.get(4).copied().unwrap_or(0) != 0;

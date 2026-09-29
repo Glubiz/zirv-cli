@@ -1,46 +1,11 @@
 //! Deterministic drift detection across instruction surfaces (issue #42):
-//! duplicate, contradiction, and precedence/shadowing findings between
-//! zirv's canonical `.zirv/context/` layer (issue #41, `context.rs`) and
-//! every native CLAUDE.md/AGENTS.md surface `surface_collect::collect_surfaces`
-//! already collects.
+//! compares canonical context with native instruction surfaces using deterministic
+//! lexical and structural analysis. It only returns findings and never writes files.
 //!
-//! Built entirely on `surface_collect.rs`'s existing normalization
-//! (`surface_collect::normalize`/`surface_collect::statements`, via the shared
-//! `surface_collect::all_instructions`/`group_by_normalized` helpers `lint_redundancy`
-//! also uses) -- lexical/structural only, no model call, in keeping with
-//! issue #42's "prefer deterministic lexical/structural analysis first".
-//! Report-only, the same guarantee `surface_collect.rs` itself carries: `analyze`
-//! takes already-collected `Surface` text and returns `Finding`s only, with
-//! no filesystem write path anywhere in this module for a caller to
-//! accidentally reach.
-//!
-//! **Informational vs. behavior-changing**, per issue #42's acceptance
-//! criteria: every finding kind here is `Severity::Info` -- worth tidying,
-//! changes nothing about what a session actually does -- except
-//! `"contradiction"` (`Severity::Warning`), the one kind where two surfaces
-//! disagree about the same rule and which one a session follows depends on
-//! precedence that may not have been intended. Opposite-polarity wording
-//! across *different* harnesses (fix round 1, review finding 12-1) is a
-//! separate, deliberately `Info`-severity kind, `"differs-per-harness"`: a
-//! Claude-specific and a Codex-specific file disagreeing is the intended
-//! per-harness customization issue #41 exists to allow, not a bug -- only a
-//! same-provider pair, or a pair where either side is the harness-neutral
-//! canonical layer (`Provider::Zirv`), can actually contradict itself.
-//!
-//! **Scope note.** The near-duplicate/contradiction pass compares every pair
-//! of cross-surface instructions using fixed Jaccard/negation-token
-//! heuristics -- lexical overlap, not semantic understanding, and not
-//! profiled against a deliberately adversarial input. Nominally `O(n^2)` in
-//! the total bullet count, but each pair is pruned by a cheap token-count
-//! ratio check (a necessary condition for the Jaccard threshold: Jaccard
-//! similarity is always `<= min(|A|,|B|) / max(|A|,|B|)`, so the ratio check
-//! can only reject pairs the full Jaccard computation would have rejected
-//! too) before either side's token set is built or intersected, and total
-//! emitted pair-findings are capped (`MAX_PAIR_FINDINGS`) with an explicit
-//! truncation note rather than growing unbounded or truncating silently.
-//! `surface_collect.rs` already bounds the input (`MAX_SURFACES`,
-//! `cfg.optimize.max_surface_bytes`), which is the scope this module
-//! inherits rather than adding its own surface-count cap.
+//! Contradictions within one provider or against neutral canonical context are warnings;
+//! expected differences across harness-specific files are informational. Pairwise
+//! comparison uses a necessary token-ratio filter and caps emitted findings, reporting
+//! truncation explicitly.
 
 use std::collections::BTreeSet;
 
@@ -230,10 +195,8 @@ fn duplicate_findings(surfaces: &[Surface]) -> Vec<Finding> {
     findings
 }
 
-/// A single instruction's precomputed comparison data, built once per
-/// instruction rather than once per pair (fix round 1, review finding 12-3
-/// -- the original pairwise loop rebuilt both `BTreeSet`s on every
-/// comparison).
+/// Precompute each instruction’s comparison data once to avoid rebuilding it for every
+/// pair.
 struct Profile<'a> {
     instruction: &'a Instruction,
     tokens: BTreeSet<&'a str>,

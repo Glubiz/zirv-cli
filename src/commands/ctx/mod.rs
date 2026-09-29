@@ -22,8 +22,8 @@ pub mod context;
 pub mod context_cli;
 pub mod context_lint;
 pub mod context_status;
-/// Issue #485 (roadmap N16): the native coordinator's durable task graph and
-/// the one place a delegation's identity-decidable bounds are judged.
+/// The native coordinator's durable task graph and the one place a delegation's
+/// identity-decidable bounds are judged (#485).
 pub mod coordinator;
 pub mod dash;
 pub mod delegation;
@@ -103,8 +103,8 @@ pub mod screen;
 pub mod search;
 pub mod search_index;
 pub mod seat;
-/// Issue #352: the persistent runtime service -- the process that owns
-/// pty/ConPTY sessions so they outlive the client looking at them.
+/// The persistent runtime service -- the process that owns pty/ConPTY sessions so they
+/// outlive the client looking at them (#352).
 pub mod session;
 pub mod session_spend;
 pub mod sessions;
@@ -118,8 +118,8 @@ pub mod supervise;
 pub mod surface;
 pub mod surface_collect;
 pub mod task;
-/// Issue #485 (roadmap N16): the native team's roles, the operator-configured
-/// route each one spends, and the authority a role carries on its own.
+/// The native team's roles, the operator-configured route each one spends, and the
+/// authority a role carries on its own (#485).
 pub mod team;
 pub mod term;
 pub(crate) mod testrun;
@@ -327,7 +327,7 @@ pub(crate) mod testenv {
         (dir, guard)
     }
 
-    /// Issue #609 (roadmap N22, review of #493): the install-proof
+    /// The install-proof
     /// counterpart of [`stub_live_adapters_on_path`] above. That helper
     /// drops an empty placeholder file per adapter, which is enough to prove
     /// PRESENCE but nothing about INVOCATION. This drops one CANARY
@@ -338,7 +338,7 @@ pub(crate) mod testenv {
     /// never came to exist: direct evidence that no registered harness
     /// executable was spawned, not merely that `PATH` came up empty (which a
     /// regression that resolved a harness by full path, or via `PATHEXT`,
-    /// could still slip past).
+    /// could still slip past) (#609).
     ///
     /// Returns both guards for the same reason `stub_live_adapters_on_path`
     /// does: the `TempDir` must outlive the `VarGuard`.
@@ -514,30 +514,10 @@ pub(crate) mod testenv {
 /// rest of the crate (`Box<dyn std::error::Error>`).
 pub type CtxResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-// Item 7: named here, in the text `zirv ctx --help` actually prints, so
-// nothing implies an unready adapter works today. `readiness_note` generates
-// the not-ready clause from the registry's own `ready()` calls rather than a
-// literal, so it never drifts from adapters::codex::CodexAdapter::ready --
-// the same wording a user hits directly via `--agent codex`.
-//
-// Perf: `clap`'s derive bakes `about` into `CtxCli::command()`, which runs on
-// *every* `try_parse_from` -- i.e. every `dispatch()` call, whether or not
-// help text is ever displayed. `readiness_note()` calls `ready()` on every
-// registered adapter, and on Windows that walks `PATH`/`PATHEXT` per
-// adapter, so an ordinary `ctx hook pretool` (fired by Claude Code on every
-// tool call) or `ctx usage tee` (once per statusline render) used to pay
-// ~275ms for text nobody was about to read. `dispatch` now decides from raw
-// argv, before `try_parse_from` ever builds `CtxCli::command()`, whether this
-// invocation will actually render `zirv ctx`'s own help (see
-// `ctx_will_render_help`, which mirrors `main.rs`'s pre-clap
-// `is_top_level_help`) and only then flips `SHOW_READINESS_NOTE`.
-// `ctx_about()` skips the probe entirely otherwise, and once the note *has*
-// been computed for a help render it stays cached for the rest of the
-// process -- free within one process (tests, in particular, call `dispatch`
-// hundreds of times) even though a fresh `zirv ctx ...` invocation is still
-// its own process either way. The flag only ever moves false -> true: a
-// process that renders help after already having dispatched a plain verb
-// must still show the note, so nothing resets it back to false.
+// Skip CLI construction for hot-path commands that do not need generated help text.
+// clap bakes the readiness note into CtxCli::command() on every parse and the probe walks PATH per
+// adapter (~275ms on Windows); dispatch decides from raw argv whether help will render. The flag only
+// moves false -> true: a process that renders help after a plain verb must still show the note.
 static SHOW_READINESS_NOTE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -799,12 +779,11 @@ pub fn dispatch(args: &[String]) -> i32 {
         Ok(cli) => cli,
         Err(err) => {
             let _ = err.print();
-            // clap represents `--help`/`--version` as an `Err` too, since
-            // printing and exiting is the caller's job here; both are
-            // informational, not a rejected invocation, and must exit 0 like
-            // top-level `zirv --help` already does via `Parser::parse()`'s
-            // own exit path. A genuine parse error keeps falling through to
-            // `classify_parse_failure` below.
+            // Clap represents `--help`/`--version` as an `Err` too, since printing and
+            // exiting is the caller's job here; both are informational, not a rejected
+            // invocation, and must exit 0 like top-level `zirv --help` already does via
+            // `Parser::parse()`'s own exit path. A genuine parse error keeps falling
+            // through to `classify_parse_failure` below.
             if matches!(
                 err.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
@@ -822,7 +801,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         }
     };
 
-    // Issue #330: the one place a `zirv ctx` PROCESS learns which kind of
+    // The one place a `zirv ctx` PROCESS learns which kind of
     // session it is about to become, and the last one before any of it runs.
     // `exec`, `loop` and `agent` are the three verbs that supervise delegated
     // work (`PromptRole::Worker` throughout those modules -- none of them
@@ -834,7 +813,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     // modules' own `run()` functions -- unit tests call those directly, and a
     // test binary must never lower a process it does not own. `wrap`/`chat`
     // are not listed: the interactive posture belongs to the launch itself
-    // (see `wrap::run_with`) and only ever raises a thread.
+    // (see `wrap::run_with`) and only ever raises a thread (#330).
     if matches!(
         &cli.verb,
         CtxVerb::Exec(_) | CtxVerb::Loop(_) | CtxVerb::Agent(_)

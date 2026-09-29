@@ -88,13 +88,11 @@ impl Phase {
     }
 }
 
-/// Issue #723: the fine-grained WHY behind a delegation's coarse [`Phase`],
-/// for a consumer that wants to branch on a specific decision rather than
-/// only on where the delegation currently sits (google/ax's own
-/// `Condition.reason` is a free-form string nothing typechecks -- see
-/// this crate's tracking issue for why zirv uses a closed enum instead).
-/// Exhaustively matched on purpose: a new reason is a variant added here,
-/// never a new free-form string.
+/// The fine-grained WHY behind a delegation's coarse [`Phase`], for a consumer that wants
+/// to branch on a specific decision rather than only on where the delegation currently sits
+/// (google/ax's own `Condition.reason` is a free-form string nothing typechecks -- see this
+/// crate's tracking issue for why zirv uses a closed enum instead). Exhaustively matched on
+/// purpose: a new reason is a variant added here, never a new free-form string (#723).
 ///
 /// Refusals (a blocked task card, an exhausted group) have no variant: both
 /// are decided before a delegation `Record` exists, so there is nothing to
@@ -173,11 +171,11 @@ pub struct WorkerHandle {
     #[serde(default)]
     pub objective: Option<String>,
     pub workdir: PathBuf,
-    /// Issue #541 chunk C, decision 2: the manifest identity this delegation
+    /// The manifest identity this delegation
     /// was checked against (the caller's explicit choice, or the role's own
     /// default) -- `None` for a role outside the closed team, which skips
     /// the manifest/team-plan checks entirely. Older durable records default
-    /// safely to `None`.
+    /// safely to `None` (#541).
     #[serde(default)]
     pub manifest: Option<String>,
     /// Whether this delegation used the coordinator's `plan_override`
@@ -272,9 +270,7 @@ pub struct Record {
     pub unknown_tool_outcomes: Vec<String>,
     #[serde(default)]
     pub attempts: Vec<Attempt>,
-    /// Issue #723: typed reasons recorded alongside `phase`, never replacing
-    /// it. `#[serde(default)]` so a record written before this field existed
-    /// deserializes with an empty list rather than failing.
+    /// Missing typed reasons deserialize as an empty list while preserving `phase` (#723).
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }
@@ -455,10 +451,10 @@ pub fn record_ownership(
     save(state, repo, &record)
 }
 
-/// Issue #723: appends one [`Condition`] to a delegation's durable record --
-/// recording a fact some caller already decided elsewhere (a task claim, a
-/// budget admission, a contract evaluation), never deciding anything new
-/// itself. Mirrors [`record_ownership`]'s own lock-load-mutate-save shape.
+/// Appends one [`Condition`] to a delegation's durable record -- recording a fact some
+/// caller already decided elsewhere (a task claim, a budget admission, a contract
+/// evaluation), never deciding anything new itself. Mirrors [`record_ownership`]'s own
+/// lock-load-mutate-save shape (#723).
 pub fn record_condition(
     state: &StateDir,
     repo: &Path,
@@ -538,9 +534,9 @@ pub fn publish_terminal(
             attempt.summary.clone_from(&summary);
             attempt.result_path.clone_from(&result_path);
         }
-        // Issue #723: this write already decided whether the attempt has
-        // anything to show for itself -- recorded once, on the genuine
-        // write, never on a replay of the same terminal facts.
+        // This write already decided whether the attempt has anything to show for itself --
+        // recorded once, on the genuine write, never on a replay of the same terminal facts
+        // (#723).
         if summary.is_some() {
             record.conditions.push(Condition {
                 reason: ConditionReason::Reporting,
@@ -1051,23 +1047,10 @@ pub fn delivery_of(body: &str) -> Option<String> {
         .filter(|identity| !identity.is_empty())
 }
 
-/// A read-only PEEK at whether `identity` names a delegation outcome this
-/// repository has ALREADY consumed -- never mutates anything, unlike
-/// [`consume_delivery`]/[`mark_delivery_consumed`].
-///
-/// `mail.rs`'s inbox rendering uses this to drop a message whose delivery was
-/// consumed in an EARLIER call, while deliberately NOT consuming anything
-/// itself: consuming every candidate up front, before the byte-cap decides
-/// which of them are actually rendered, used to mark a message the cap only
-/// DEFERRED to `more_unread` as consumed anyway -- so the next call dropped
-/// it as a false duplicate, having never actually shown it (review finding
-/// on issue #479's inbox rendering).
-///
-/// Fails open on purpose: an identity that names no delegation record here
-/// (an outcome from another repository, a hand-written line, a record swept
-/// away) is reported as not-yet-consumed. Hiding a message nobody can
-/// account for would turn a bookkeeping gap into lost mail, which is the
-/// failure this whole mechanism exists to prevent.
+/// Peek without consuming: only messages actually rendered within the byte cap may be
+/// marked delivered (#479).
+// Fails open on purpose: an identity naming no delegation record here reads as not-yet-consumed;
+// hiding a message nobody can account for would turn a bookkeeping gap into lost mail.
 pub fn is_delivery_consumed(state: &StateDir, repo: &Path, identity: &str) -> bool {
     let Some(delegation) = identity.split(':').next() else {
         return false;
@@ -1091,20 +1074,8 @@ pub fn mark_delivery_consumed(state: &StateDir, repo: &Path, identity: &str) {
     let _ = consume_delivery(state, repo, delegation, identity);
 }
 
-/// Retries every delegation's deferred messages at THIS boundary, and reports
-/// how many were actually delivered. Called from the orchestrator-side
-/// checkpoint (`zirv ctx inbox`), which is by construction a moment no
-/// approval dialog is open on the caller -- the #468 rule, applied per
-/// worker rather than per pane.
-///
-/// Also the retry path [`publish_terminal`]'s own doc comment promises: a
-/// terminal record whose current delivery identity is still absent from
-/// `published` had its mail fail (or never ran at all), and `publish_
-/// terminal` is idempotent by construction -- calling it again with the
-/// record's own already-durable terminal facts changes nothing but the
-/// delivery outcome, so a transport failure is retried here and, once it
-/// succeeds, delivered exactly once (review finding on issue #479's
-/// `publish_terminal`).
+/// Retry deferred messages at an orchestrator checkpoint; mark each delivery only after it
+/// succeeds (#468).
 pub fn drain_all(state: &StateDir, repo: &Path, cfg: &CtxConfig, now: u64) -> usize {
     let mut delivered = 0;
     for record in list(state, repo) {
@@ -1152,26 +1123,20 @@ pub struct LaunchRequest {
     pub task: Option<String>,
     pub group: Option<String>,
     pub workdir: Option<PathBuf>,
-    /// Issue #541 chunk C, decision 2: the workflow agent manifest id this
+    /// The workflow agent manifest id this
     /// delegation names. `None` defers to the role's own default manifest
     /// (`team::default_manifest_for_role`); a role outside the closed team
     /// (`worker`, `seat`, an operator's own label) skips the manifest/
-    /// team-plan checks entirely regardless of this field.
+    /// team-plan checks entirely regardless of this field (#541).
     pub manifest: Option<String>,
-    /// Issue #541 chunk C, decision 2: bypass the "must match an unfilled
+    /// Bypass the "must match an unfilled
     /// team-plan seat" rule. Only the COORDINATOR seat's request for this is
     /// ever honoured (`coordinator::check`); anyone else's is silently
-    /// ignored rather than erroring, since asking is not itself a violation.
+    /// ignored rather than erroring, since asking is not itself a violation (#541).
     pub plan_override_requested: bool,
-    /// Issue #541 chunk C follow-up: the CALLER's own agent registry (built-
-    /// ins plus, where the caller resolved them, operator-global/repository
-    /// manifests), used ONLY to answer "is `manifest` (or the role's own
-    /// default) a known manifest, and what does it grant". `delegate` itself
-    /// must stay pure -- no filesystem read, no home-directory lookup -- so
-    /// it never builds this registry on its own. `None` falls back to
-    /// `delegate`'s own built-in-only lookup, exactly as before this field
-    /// existed: every caller that does not yet plumb a registry through (and
-    /// every non-`HomeGuard` test) keeps working unchanged.
+    /// An absent registry uses the built-in lookup; a supplied registry resolves the
+    /// caller’s manifests (#541).
+    // `delegate` stays pure (no filesystem or home-directory read), so it never builds this registry.
     pub manifest_registry: Option<std::sync::Arc<crate::commands::workflow::agents::AgentRegistry>>,
     pub read_only: bool,
     pub budget_tokens: Option<u64>,
@@ -1342,24 +1307,21 @@ impl WorkerLauncher for RecordingLauncher {
 
 /// The DELEGATING seat, as the launch path needs to know it.
 ///
-/// Issue #485 (roadmap N16): `role` and `depth` are what make a delegation's
-/// bounds decidable before anything starts. Both come from trusted runtime
-/// state -- the role off the persisted seat record (reachable at effect time
-/// as `ExecutionIdentity::role`), the depth off this session's own
-/// `envelope::WorkerEnvelope` -- and neither is ever supplied by model
-/// output.
+/// `role` and `depth` are what make a delegation's bounds decidable before anything starts.
+/// Both come from trusted runtime state -- the role off the persisted seat record
+/// (reachable at effect time as `ExecutionIdentity::role`), the depth off this session's
+/// own `envelope::WorkerEnvelope` -- and neither is ever supplied by model output (#485).
 #[derive(Clone, Copy, Debug)]
 pub struct Parent<'a> {
     pub session: Option<&'a str>,
     pub short: &'a str,
     pub role: &'a str,
     pub depth: u8,
-    /// Issue #488: the seat generation this delegator believes it holds,
-    /// from the same trusted runtime state `role` comes from
-    /// (`ExecutionIdentity::generation`). `None` for a caller with no seat
-    /// generation to present at all -- a manual CLI delegation, a worker
-    /// running outside any seat -- which is not fenced, exactly as
-    /// `seat::fence` leaves an unseated process alone.
+    /// The seat generation this delegator believes it holds, from the same trusted runtime
+    /// state `role` comes from (`ExecutionIdentity::generation`). `None` for a caller with
+    /// no seat generation to present at all -- a manual CLI delegation, a worker running
+    /// outside any seat -- which is not fenced, exactly as `seat::fence` leaves an unseated
+    /// process alone (#488).
     pub generation: Option<u64>,
     /// The caller already holds this generation's seat lock across the whole effect.
     pub generation_locked: bool,
@@ -1373,13 +1335,12 @@ pub struct Parent<'a> {
 /// published through [`publish_terminal`], which is where the delivery
 /// identity a consumer deduplicates on comes from.
 ///
-/// Issue #485: the bounds decision (`coordinator::check`) happens FIRST, so
-/// a refused delegation leaves no launch receipt naming work nobody started,
-/// and the child's write posture is the one its own ROLE grants rather than
-/// the one the caller asked for. Everything the check deliberately does not
-/// cover -- the task claim, the writer permit, the group's child limit and
-/// token budget, the per-provider reservation -- is enforced centrally
-/// further down `agent::run_with`, which both runtimes go through.
+/// The bounds decision (`coordinator::check`) happens FIRST, so a refused delegation leaves
+/// no launch receipt naming work nobody started, and the child's write posture is the one
+/// its own ROLE grants rather than the one the caller asked for. Everything the check
+/// deliberately does not cover -- the task claim, the writer permit, the group's child
+/// limit and token budget, the per-provider reservation -- is enforced centrally further
+/// down `agent::run_with`, which both runtimes go through (#485).
 pub fn delegate(
     state: &StateDir,
     repo: &Path,
@@ -1389,20 +1350,19 @@ pub fn delegate(
     parent: &Parent<'_>,
     now: u64,
 ) -> CtxResult<(Record, Option<Publication>)> {
-    // Issue #488 (item 4): a superseded generation may not start work, and a
-    // successor whose rollover is prepared but not yet committed may not
-    // either. This is FIRST -- ahead of the bounds check and far ahead of the
-    // durable launch receipt -- because a stale delegator that gets as far as
-    // a receipt has already named work the live generation knows nothing
-    // about. The refusal is `seat::StaleGeneration`, so a caller can tell
-    // "you were replaced" from "your transaction has not committed yet"
-    // without matching on prose.
+    // A superseded generation may not start work, and a successor whose rollover is
+    // prepared but not yet committed may not either. This is FIRST -- ahead of the bounds
+    // check and far ahead of the durable launch receipt -- because a stale delegator that
+    // gets as far as a receipt has already named work the live generation knows nothing
+    // about. The refusal is `seat::StaleGeneration`, so a caller can tell "you were
+    // replaced" from "your transaction has not committed yet" without matching on prose
+    // (#488).
     if let Some(generation) = parent.generation {
         super::seat::guard(state, parent.short, generation)?;
     }
     let mut graph = super::coordinator::load(state, repo);
 
-    // Issue #541 chunk C, decision 2: resolve the manifest identity and
+    // Resolve the manifest identity and
     // team-plan facts the pure `coordinator::check` needs, from trusted
     // runtime state -- a registry lookup and a plan read are both I/O, so
     // they happen HERE, never inside `check` itself. Chunk C follow-up: the
@@ -1412,7 +1372,7 @@ pub fn delegate(
     // repository manifest is honoured exactly as `team_plan`/the slash
     // commands already honour it; a caller that has not plumbed one through
     // falls back to the built-in-only lookup this had before, so `delegate`
-    // still never reads a filesystem or a home directory on its own.
+    // still never reads a filesystem or a home directory on its own (#541).
     let team_role_requested = super::team::TeamRole::parse(&request.role);
     let requested_manifest_id: Option<String> = team_role_requested.and_then(|role| {
         request
@@ -1461,14 +1421,8 @@ pub fn delegate(
         .map(|seat| seat.id.as_str());
     let matched_claim_paths: &[String] =
         matched_seat.map_or(&empty_paths, |seat| &seat.claim.paths);
-    // Issue #541 chunk C review finding: `ancestors` are the seats
-    // `matched_seat` transitively `depends_on` -- a planned HAND-OFF, never
-    // a conflict, however wide their own claim is (a bug-fix plan's
-    // `debugger-1` and `implementer-1` share a claim on purpose). And a
-    // seat only holds its claim while IN FLIGHT (`seat_claim_active`, not
-    // `seat_filled`): a settled seat -- `Completed`, `Failed`, `Cancelled`
-    // -- has released it, which is what lets a sequential hand-off admit
-    // its successor instead of refusing it as a permanent conflict.
+    // Dependencies are planned handoffs, so ancestor seats do not conflict with this
+    // seat’s claim (#541).
     let ancestor_ids: std::collections::BTreeSet<&str> = match (&resolved_plan, matched_seat) {
         (Some(plan), Some(seat)) => plan.ancestors_of(&seat.id),
         _ => std::collections::BTreeSet::new(),
@@ -1547,11 +1501,10 @@ pub fn delegate(
         .task
         .clone()
         .unwrap_or_else(|| delegation_id.clone());
-    // Issue #488: the graph write goes through the FENCED door, and re-reads
-    // rather than writing back the copy loaded above -- so the window in
-    // which a concurrently committed rollover could be overwritten is the
-    // fenced write itself rather than the whole launch. A caller with no
-    // generation to present writes exactly as before.
+    // The graph write goes through the FENCED door, and re-reads rather than writing back
+    // the copy loaded above -- so the window in which a concurrently committed rollover
+    // could be overwritten is the fenced write itself rather than the whole launch. A
+    // caller with no generation to present writes exactly as before (#488).
     let dispatch = |graph: &mut super::coordinator::Coordinator| {
         graph.dispatched(
             &node,
@@ -1585,11 +1538,8 @@ pub fn delegate(
             let launched =
                 record_launch(state, repo, handle, parent.session.map(str::to_string), now)?;
             dispatch(&mut graph);
-            // Review finding on issue #485: the launch receipt above is what
-            // is authoritative, so a coordinator-graph store failure must
-            // never block it -- but it must not vanish silently either. One
-            // decision-log line, the same best-effort idiom `log_boundary`
-            // uses just above.
+            // The durable launch receipt is authoritative; graph-store failure is logged
+            // but cannot block launch (#485).
             if let Err(error) = super::coordinator::store(state, repo, &graph) {
                 let detail = format!("delegation {delegation_id}: {error}");
                 let _ = super::log::append(

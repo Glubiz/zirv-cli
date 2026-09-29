@@ -91,12 +91,11 @@ pub enum Attention {
     WorkflowGate,
     WriterConflict,
     VerificationFailure,
-    /// Issue #379: a compaction has started and nothing has been heard from
-    /// the session since. Transient by construction, not a latch -- see
-    /// [`compose`]'s own clearing rule -- and rendered two different ways by
-    /// [`project_at`]/[`reason_at`] depending on how long ago it started:
-    /// "compacting since HH:MM" while a compaction plausibly is still
-    /// running, "stalled after compaction" once it has gone on too long.
+    /// A compaction has started and nothing has been heard from the session since.
+    /// Transient by construction, not a latch -- see [`compose`]'s own clearing rule -- and
+    /// rendered two different ways by [`project_at`]/[`reason_at`] depending on how long
+    /// ago it started: "compacting since HH:MM" while a compaction plausibly is still
+    /// running, "stalled after compaction" once it has gone on too long (#379).
     Compacting,
     Stalled,
     #[serde(other)]
@@ -129,8 +128,8 @@ pub enum Authority {
     /// PreToolUse/Permission hooks). The most direct, lowest-latency signal
     /// available, so it out-ranks everything else.
     AdapterHook,
-    /// zirv's own supervisor loop (`exec.rs`/`wrap.rs`): stall latch,
-    /// process exit, turn-signal socket.
+    /// Zirv's own supervisor loop (`exec.rs`/`wrap.rs`): stall latch, process exit,
+    /// turn-signal socket.
     Supervisor,
     /// `workflow::engine`'s gate/approval/verification state.
     Workflow,
@@ -392,15 +391,14 @@ pub fn compose(
             }
             winner.attention.expect("has_field guaranteed Some")
         }
-        // Issue #379: `Compacting` is a marker for "a compaction started and
-        // we have heard nothing since", so ANY later observation from an
-        // authority that speaks for the session itself clears it -- not just
-        // one that happens to assert the attention axis. Without this it
-        // would outlive the compaction, because the hooks that fire on the
-        // other side of one (`Prompt`, `SessionStart`) assert a lifecycle
-        // only and would leave `base.attention` untouched. No other variant
-        // gets this treatment: every one of them is a real latch that must
-        // survive until something positively says otherwise.
+        // `Compacting` is a marker for "a compaction started and we have heard nothing
+        // since", so ANY later observation from an authority that speaks for the session
+        // itself clears it -- not just one that happens to assert the attention axis.
+        // Without this it would outlive the compaction, because the hooks that fire on the
+        // other side of one (`Prompt`, `SessionStart`) assert a lifecycle only and would
+        // leave `base.attention` untouched. No other variant gets this treatment: every one
+        // of them is a real latch that must survive until something positively says
+        // otherwise (#379).
         None if base.attention == Attention::Compacting
             && observations
                 .iter()
@@ -437,25 +435,10 @@ pub fn compose(
     candidate
 }
 
-/// Issue #468, generalised for issue #479 (roadmap N10): the one predicate
-/// that decides whether an unsolicited notification may be delivered to a
-/// session right now. `Some(attention)` means a latch is open -- a harness
-/// permission dialog, a question, a quota park -- and typing into that
-/// session would land as raw keystrokes on whatever is open, which is
-/// exactly the "must never be typed into a legacy approval dialog" failure
-/// #468 reported. The caller queues and retries at the next boundary where
-/// this returns `None`.
-///
-/// `Projection::Blocked(Attention::None)` (a bare `Lifecycle::Waiting` with
-/// no named reason) is deliberately NOT blocking: nothing in this codebase
-/// latches that combination from a live hook, and treating it as one would
-/// silently withhold ordinary advisories from a session merely waiting for
-/// its next prompt.
-///
-/// Lives here rather than in `dash` because BOTH delivery surfaces need the
-/// identical answer: the dashboard's own pane mail sweep
-/// (`dash::advise_one_pane`) and the runtime-neutral delegation mail service
-/// (`delegation::send`), which must reach native and legacy workers alike.
+/// Suppress unsolicited typing while a permission, question, or quota latch
+/// is open; callers queue and retry when this returns `None` (#468, #479).
+/// Bare `Waiting` with no named reason does not block ordinary advisories.
+/// Dashboard and delegation delivery share this predicate.
 pub fn blocking(status: &SessionStatus) -> Option<Attention> {
     match project(status) {
         Projection::Blocked(Attention::None) => None,
@@ -510,11 +493,10 @@ pub fn project(status: &SessionStatus) -> Projection {
     }
 }
 
-/// Issue #379: when a compaction started (`status.last_transition` is the
-/// timestamp of the transition INTO [`Attention::Compacting`], which is the
-/// only way that variant is ever reached), and whether it has been running
-/// long enough to count as stalled. Pure: `now` and the threshold are the
-/// caller's, never read from a clock or a config file here.
+/// When a compaction started (`status.last_transition` is the timestamp of the transition
+/// INTO [`Attention::Compacting`], which is the only way that variant is ever reached), and
+/// whether it has been running long enough to count as stalled. Pure: `now` and the
+/// threshold are the caller's, never read from a clock or a config file here (#379).
 fn compaction_stalled(status: &SessionStatus, now: u64, compact_stall_secs: u64) -> bool {
     status.attention == Attention::Compacting
         && now.saturating_sub(status.last_transition) >= compact_stall_secs
@@ -528,12 +510,11 @@ fn utc_hhmm(ts: u64) -> String {
     format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day / 60) % 60)
 }
 
-/// Issue #379: [`project`] with the compaction clock applied. A session whose
-/// last word was "a compaction started" and that has said nothing for
-/// `compact_stall_secs` since is `Blocked(Stalled)`, not merely
-/// `Blocked(Compacting)` -- the codex pane in issue #379 sat in a compaction
-/// that never returned, and "working" is exactly the wrong thing to show for
-/// it. Every non-`Compacting` status projects identically to [`project`].
+/// [`project`] with the compaction clock applied. A session whose last word was "a
+/// compaction started" and that has said nothing for `compact_stall_secs` since is
+/// `Blocked(Stalled)`, not merely `Blocked(Compacting)` -- the codex pane in issue #379 sat
+/// in a compaction that never returned, and "working" is exactly the wrong thing to show
+/// for it. Every non-`Compacting` status projects identically to [`project`].
 pub fn project_at(status: &SessionStatus, now: u64, compact_stall_secs: u64) -> Projection {
     if compaction_stalled(status, now, compact_stall_secs) {
         return Projection::Blocked(Attention::Stalled);
@@ -742,10 +723,8 @@ fn next_poll_interval(current: Duration) -> Duration {
     (current * 2).min(WAIT_POLL_MAX)
 }
 
-/// Pure: whether `current` is still the SAME process `wait` originally
-/// pinned -- both the pid and the process's own start time (when known) must
-/// match, so an OS pid reuse can never read as "the same session". Mirrors
-/// `sessions::record_is_alive`'s own pid+start_time disambiguation.
+/// Match both PID and process start time when available, so PID reuse cannot impersonate
+/// the pinned session.
 fn same_generation(
     pinned_pid: u32,
     pinned_started_at: Option<u64>,

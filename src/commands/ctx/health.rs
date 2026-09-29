@@ -1,27 +1,13 @@
 //! Issue #455: pure per-harness route health, the transport/server half of
-//! routing.
 //!
-//! Usage headroom answers "may this account spend more". It says nothing
-//! about whether the endpoint can be reached at all: a session that dies on
-//! `API Error: Connection refused` has full headroom and zero capacity. This
-//! module is the state machine that turns observed [`ProviderErrorClass`]
-//! values into an admission verdict for one route.
+//! Usage headroom cannot show whether an endpoint is reachable; this state machine
+//! turns transport and server failures into a route admission verdict.
 //!
-//! A route is a HARNESS, not a harness/model pair (review round 1, finding
-//! 1). The failures that trip this breaker are transport and server
-//! failures, whose failing hop is the connection or the endpoint, not the
-//! model -- so routing always judged them per harness anyway. Keying the
-//! record per model additionally made a terminal `Unavailable` unhealable:
-//! an auth failure observed before any model line was parsed landed on the
-//! bare harness key, while every later success landed on `harness/<model>`,
-//! so the deny never cleared. The last model seen is still recorded, as
-//! information for `zirv ctx status` only.
+//! The breaker is keyed by harness, because the failing hop is the connection or endpoint.
+//! The last model is status information only; a model-specific key could strand a denial.
 //!
-//! Pure in exactly the sense `rot.rs` documents for itself -- no fs, clock,
-//! env or net. Every function takes the current record and an explicit
-//! `now`, so identical inputs always give the identical verdict and a
-//! transition can be replayed or diffed. All I/O lives in
-//! [`super::health_store`].
+//! No filesystem, clock, environment or network reads occur here. Callers supply `now`;
+//! all persistence belongs to `super::health_store`.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,14 +45,7 @@ pub struct Trial {
     pub at: u64,
 }
 
-/// What a breaker record is ABOUT (issue #487, item 4).
-///
-/// Slice 1 of #455 had one scope because a harness has one: the failing hop
-/// is the connection or the endpoint, and a harness names both at once. A
-/// native route names four separately, and folding them together means one
-/// rejected key disables an account's other models and one model an account
-/// may not use looks like an outage. `Harness` is the `Default`, so every
-/// record written before this reads back unchanged.
+/// Missing route scope defaults to the harness scope for stored records (#487).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteScope {
@@ -156,15 +135,8 @@ fn sanitize(raw: &str) -> String {
     }
 }
 
-/// One provider error as an adapter parsed it, before any clock is
-/// consulted. `at` is the transcript row's OWN timestamp and `id` its own
-/// row identity -- both `None` for a transcript shape that states neither.
-///
-/// Review round 1, finding 2: stamping an observation with wall-clock `now`
-/// meant a poll that re-read a transcript from offset 0 (a missing or
-/// version-bumped checkpoint) folded months-old error rows into the current
-/// window and opened the breaker on a perfectly healthy harness. The row's
-/// own time is what `prune` must judge.
+/// Use the transcript row’s timestamp and identity so replayed rows cannot create fresh
+/// observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
     pub class: ProviderErrorClass,
@@ -220,12 +192,7 @@ pub enum Phase {
         opened_at: u64,
         until: u64,
         reason: String,
-        /// Which class tripped this breaker. Only `Transport`/`Server`
-        /// describe a failing HOP rather than a failing account, so only
-        /// those propagate to another harness sharing the same configured
-        /// endpoint host (`health_store::admissions`). `#[serde(default)]`
-        /// leaves a record written before this field existed reading
-        /// `Other`, which propagates nothing.
+        /// Missing failure class defaults to the existing route-level interpretation.
         #[serde(default)]
         class: ProviderErrorClass,
     },
@@ -260,16 +227,8 @@ impl Phase {
     }
 }
 
-/// One route's whole health record: its phase, the bounded observation ring
-/// the phase was derived from, and the bounded ring of row ids already
-/// folded in.
-///
-/// `seen_ids` is what makes [`observe`] idempotent (review round 1, finding
-/// 4). Two supervisors can legitimately read the same transcript rows -- a
-/// headless `exec` scorer and the Stop hook's checkpointed one, for
-/// instance -- and without this the same three retries would count as six,
-/// opening the breaker after two real failures instead of the configured
-/// three. Same `MAX_OBSERVATIONS` bound, for the same reason.
+/// Bound remembered row ids alongside observations so transcript replay remains
+/// idempotent.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouteHealth {
@@ -294,31 +253,11 @@ pub struct RouteHealth {
     /// Time-to-first-text samples, only ever read when the operator set
     /// `degrade_ttft_ms`.
     pub latency: Vec<LatencySample>,
-    /// R2: row ids for classes that can never open the circuit
-    /// (rate limits, overflows, `Other`), kept in their own small ring.
-    ///
-    /// They used to share `seen_ids` with the counting classes, where a
-    /// burst of rate limits -- the single most common thing a busy account
-    /// produces -- evicted the ids of Transport/Server failures the
-    /// `failures` ring was still holding. A replay from offset 0 then no
-    /// longer recognised those rows, counted them a second time, and
-    /// reopened a route on history it had already healed from.
+    /// Keep non-counting row ids separate so their bursts cannot evict ids of failures
+    /// that still count.
     pub seen_other_ids: Vec<String>,
-    /// #496 finding 2: row ids of Auth observations, with the row's own time,
-    /// kept for as long as that row could still ACT.
-    ///
-    /// Auth does not count towards opening, so these ids used to land in
-    /// `seen_other_ids` alongside rate limits and overflows -- and an Auth row
-    /// is the one non-counting class that still changes a phase. One healed
-    /// auth failure followed by twenty rate limits (the single most common
-    /// thing a busy account produces) evicted its id, and the next replay
-    /// from offset 0 marked the route `Unavailable` all over again.
-    ///
-    /// Pruned by the policy WINDOW rather than by a bare count, because that
-    /// is exactly the span over which [`observe`]'s `inside_window` guard
-    /// still lets an auth row act: once the row has aged out it cannot change
-    /// anything, so its id no longer has to be remembered. [`MAX_SAMPLES`] is
-    /// a hard bound on top, so a pathological window cannot grow the record.
+    /// Keep authentication row ids for the full policy window; a replay must not retrigger
+    /// an active refusal (#496).
     pub seen_auth_ids: Vec<SeenId>,
     /// R3: the `at` of the newest success this record has EVICTED by cap,
     /// `None` while the ring has never overflowed.
@@ -579,13 +518,12 @@ fn median(values: &[u64]) -> Option<u64> {
 /// The rolling rate's numerator and denominator, over the span BOTH rings
 /// still cover.
 ///
-/// Finding 10: the rings are capped independently, so a busy window can
-/// retain 20 failures while the success ring has already dropped everything
-/// older than its newest [`MAX_SAMPLES`]. Counting those failures against
-/// that truncated denominator reported 20/60 for a window that really ran
-/// 20/120 -- a degradation invented by the cap rather than by the route.
-/// Once the success ring has overflowed, its oldest retained entry is the
-/// floor for both sides.
+/// The rings are capped independently, so a busy window can retain 20 failures while the
+/// success ring has already dropped everything older than its newest [`MAX_SAMPLES`].
+/// Counting those failures against that truncated denominator reported 20/60 for a window
+/// that really ran 20/120 -- a degradation invented by the cap rather than by the route.
+/// Once the success ring has overflowed, its oldest retained entry is the floor for both
+/// sides.
 fn rate_samples(health: &RouteHealth) -> (u64, u64) {
     let floor = health.success_floor.unwrap_or(0);
     let failures = health.failures.iter().filter(|at| **at > floor).count() as u64;
@@ -760,23 +698,14 @@ pub fn dependency_from_base_url(raw: &str) -> Option<String> {
 pub fn trial_at(phase: &Phase, policy: &HealthPolicy) -> Option<u64> {
     match phase {
         Phase::Open { until, .. } => Some(*until),
-        // Finding 1: an `Unavailable` route re-probes on the same cooldown
-        // an `Open` one does, measured from when it was marked.
+        // An `Unavailable` route re-probes on the same cooldown an `Open` one does,
+        // measured from when it was marked.
         Phase::Unavailable { since, .. } => Some(since.saturating_add(policy.cooldown_secs)),
         _ => None,
     }
 }
 
-/// Normalizes a breaker whose cooldown has elapsed into `HalfOpen`, so both
-/// [`observe`] and [`record_success`] reason about one shape. Every other
-/// phase passes through untouched.
-///
-/// `pub` (review round 1, finding 6) because this is the ONLY producer of
-/// `Transition::HalfOpened`, and both internal callers go on to supersede it
-/// with an `Opened` or a `Recovered`. `health_store::observe_poll` therefore
-/// applies it first, on its own, so the half-open edge is actually persisted
-/// and logged instead of being a phase no `zirv ctx status` ever showed and
-/// no `health-half-open` line ever recorded.
+/// This is the sole producer of the cooldown-to-half-open transition used by the store.
 pub fn promote(
     health: &RouteHealth,
     now: u64,
@@ -847,17 +776,8 @@ pub fn observe(
         next.failures = prune_times(next.failures, now, policy);
     }
     if let Some(id) = &observed.id {
-        // R2: a counting class's id shares the `failures` ring's own cap and
-        // its own FIFO order, so an id is only ever evicted alongside (or
-        // after) the failure it belongs to. Everything else goes in its own
-        // ring, where no burst of rate limits can push a still-retained
-        // failure's id out -- finding 8's single shared cap fixed the size
-        // but left the eviction competition in place.
-        //
-        // #496 finding 2: Auth is neither -- it does not count towards
-        // opening, yet it is the one class besides those two that moves a
-        // phase, so it gets its own window-aged ring rather than competing
-        // for slots with a burst of rate limits.
+        // Evict counting row ids only alongside or after their failure samples; keep other
+        // classes separate (#496).
         if class == ProviderErrorClass::Auth {
             next.seen_auth_ids.push(SeenId { id: id.clone(), at });
             next.seen_auth_ids = prune_seen_auth(next.seen_auth_ids, now, policy);
@@ -886,16 +806,8 @@ pub fn observe(
     let prior_phase = next.phase.clone();
 
     if class == ProviderErrorClass::Auth {
-        // Review round 2, finding 1: Auth is the one class that does NOT go
-        // through `prune`'s window filter on its way to a phase change, so
-        // it needed the same guard explicitly. Without it a dated week-old
-        // `authentication_error` row -- exactly what a fresh scorer
-        // re-parsing a transcript from offset 0 hands over -- denied the
-        // harness at the CURRENT clock, healed after the cooldown, and was
-        // marked again on the next iteration: a route flapping every cycle
-        // on one long-fixed credential error. An undated row relies on the
-        // caller's incremental vetting (`health_store::observe_poll`),
-        // exactly as Transport/Server do.
+        // Reject stale authentication rows before phase changes; they bypass the normal
+        // failure-window filter.
         let inside_window = observed
             .at
             .is_none_or(|at| at >= now.saturating_sub(policy.window_secs));
@@ -953,14 +865,12 @@ pub fn observe(
                     .unwrap_or(at),
             }
         };
-        // Finding 9: the degrade rule is evaluated ONCE per poll, by
-        // [`record_samples`], after every piece of that poll's evidence is
-        // folded. Deriving it here too meant a poll carrying one failure and
-        // one success evaluated the failure against a denominator the
-        // success had not yet reached (2/8 rather than the poll's true 2/9),
-        // degraded on it, and then hysteresis held the route there. So this
-        // only ever CARRIES an existing degradation forward -- it never
-        // derives a new one.
+        // The degrade rule is evaluated ONCE per poll, by [`record_samples`], after every
+        // piece of that poll's evidence is folded. Deriving it here too meant a poll
+        // carrying one failure and one success evaluated the failure against a denominator
+        // the success had not yet reached (2/8 rather than the poll's true 2/9), degraded
+        // on it, and then hysteresis held the route there. So this only ever CARRIES an
+        // existing degradation forward -- it never derives a new one.
         next.phase = if matches!(prior_phase, Phase::Degraded { .. }) {
             prior_phase
         } else {
@@ -1010,12 +920,8 @@ pub fn record_samples(
     let prior_phase = promoted.phase.clone();
     let mut next = pruned(&promoted, now, policy);
     let floor = now.saturating_sub(policy.window_secs);
-    // #496 finding 3: a sample at or below `success_floor` is one the cap has
-    // ALREADY evicted. A poll re-reading the transcript from offset 0 hands
-    // the whole run's successes over again, and re-admitting the evicted ones
-    // both inflated the denominator and pushed genuinely newer samples back
-    // out of the ring on the very next prune -- a ring that churned instead
-    // of sliding, and a rate that read lower than the window really ran.
+    // Reject success samples at or below the cap-eviction floor, so transcript replay
+    // cannot resurrect them (#496).
     let evicted_floor = next.success_floor.unwrap_or(0);
     for at in successes {
         if *at >= floor && *at > evicted_floor && !next.successes.contains(at) {
@@ -1142,7 +1048,7 @@ pub fn record_success(
     policy: &HealthPolicy,
 ) -> (RouteHealth, Option<Transition>) {
     let (promoted, _) = promote(health, now, policy);
-    // Finding 1(b): a heal clears the PHASE and the observation ring, never
+    // A heal clears the PHASE and the observation ring, never
     // the seen-id ring. Returning `RouteHealth::default()` wiped the ids, so
     // the very rows that had just been folded in became eligible again and
     // the next poll re-observed them -- the other half of the flap.
@@ -1226,8 +1132,8 @@ pub fn admission(health: &RouteHealth, now: u64, policy: &HealthPolicy) -> Admis
             }
             Admission::deny(format!("route health open: {reason}"))
         }
-        // Finding 1: re-probes on the same cooldown, so a credential the
-        // operator has since fixed heals on its own.
+        // Re-probes on the same cooldown, so a credential the operator has since fixed
+        // heals on its own.
         Phase::Unavailable { reason, .. } => {
             if trial_at(&health.phase, policy).is_some_and(|at| now >= at) {
                 return Admission::Trial;

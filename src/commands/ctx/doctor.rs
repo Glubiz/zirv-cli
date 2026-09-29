@@ -212,13 +212,12 @@ pub fn diagnose(input: &DoctorInput<'_>) -> DoctorReport {
     };
 
     if let Some(inventory) = input.inventory {
-        // Issue #597 (roadmap N22): the role table this reports on is the
-        // union of `native.toml`'s own `[roles]` (`inventory.access`, built
-        // by `provider::inventory::access_matrix`) and `ctx.toml`'s
-        // `[runtime.roles]` -- a role bound ONLY in the latter (an operator's
-        // custom role with no native route configured at all yet) must still
-        // get a row and a resolution, exactly as the no-inventory-at-all
-        // branch below already gives it.
+        // The role table this reports on is the union of `native.toml`'s own `[roles]`
+        // (`inventory.access`, built by `provider::inventory::access_matrix`) and
+        // `ctx.toml`'s `[runtime.roles]` -- a role bound ONLY in the latter (an operator's
+        // custom role with no native route configured at all yet) must still get a row and
+        // a resolution, exactly as the no-inventory-at-all branch below already gives it
+        // (#597).
         let role_names: std::collections::BTreeSet<&str> = inventory
             .access
             .iter()
@@ -586,12 +585,11 @@ fn run_with(
 ) -> CtxResult<i32> {
     let cfg = CtxConfig::load(repo, env)?;
     let isolation = PlatformIsolation::detect();
-    // Issue #567 (roadmap N22): an invalid `native.toml` can quote the very
-    // value that broke it back verbatim -- a route id or role value the
-    // operator wrote in it -- so this is routed through the SAME text/json
-    // rendering (and its per-field `redacted()` calls) every other doctor
-    // finding already gets, rather than propagated as a bare `Err` that
-    // bypasses that redaction layer entirely.
+    // An invalid `native.toml` can quote the very value that broke it back verbatim -- a
+    // route id or role value the operator wrote in it -- so this is routed through the SAME
+    // text/json rendering (and its per-field `redacted()` calls) every other doctor finding
+    // already gets, rather than propagated as a bare `Err` that bypasses that redaction
+    // layer entirely (#567).
     let native = match NativeConfig::load(home, repo) {
         Ok(native) => native,
         Err(error) => {
@@ -622,7 +620,7 @@ fn run_with(
         inventory.inspect_executions(native, home, repo, env);
     }
     let integrations = super::runtime::capabilities::discover(&cfg, repo);
-    // Issue #597 (roadmap N22): `ready()` is fail-open by design (see
+    // `ready()` is fail-open by design (see
     // `adapters::resolve_program`'s own doc comment) -- a program that
     // resolves to nothing at all is not an error there, since ordinary
     // launch code needs "not found" raised by the OS at spawn time, not
@@ -631,7 +629,7 @@ fn run_with(
     // stronger check that ACTUALLY looks for the binary -- on top of, never
     // in place of, `ready()`: an adapter still has to be otherwise ready
     // (e.g. an attached endpoint override's credential env var still has to
-    // be named) as well as have its program findable on disk.
+    // be named) as well as have its program findable on disk (#597).
     let harnesses_present = super::adapters::all(cfg.agent_bin.as_deref())
         .into_iter()
         .filter(|adapter| {

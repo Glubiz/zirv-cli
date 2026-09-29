@@ -1,26 +1,11 @@
 //! The `zirv ▸` announcement channel: short, timestamped lines on stderr that
-//! narrate what a supervised session is doing -- prompt composition, a rot
-//! verdict crossing a band, a compaction or restart, a pacing wait, mail
-//! delivered or waiting, supervision degrading, a delegated run starting or
-//! finishing. It replaces the ad-hoc `writeln!(stderr, "\r\n{}\r", ...)`
-//! lines `wrap.rs`, `pace.rs` and friends used to build by hand (the rot
-//! advisory, the T8 mail advisory) with one shared format and one shared
-//! opt-out.
+//! narrate supervision events with one shared format and one opt-out.
 //!
-//! `Event::line` is pure: it never touches a clock injected from outside
-//! (there is nowhere in any of these call sites to thread one through) but
-//! it also never reads any terminal state, never applies colour, and never
-//! emits a cursor-addressing escape sequence -- the reserved bottom row
-//! (T12b) is never at risk from anything printed here. Colour, when it
-//! applies at all, is added by `Announcer::render`, kept separate so the
-//! event's own text can be asserted on exactly regardless of it.
+//! `Event::line` is pure and emits no terminal control sequences, so it cannot disturb the
+//! reserved bottom row. `Announcer::render` applies colour separately.
 //!
-//! Opt-outs -- `--quiet` on `chat`/`agent` (folded into `ZIRV_CTX_QUIET` by
-//! those verbs), `ZIRV_CTX_QUIET` itself, and `[chrome] events = false` --
-//! all collapse to one boolean, `cfg.chrome.events`, which is what
-//! `Announcer::enabled` is built from. `output::error` and `output::warn`
-//! are a different channel entirely: neither takes an `Announcer` nor
-//! consults `cfg.chrome`, so nothing here can suppress them.
+//! `--quiet`, `ZIRV_CTX_QUIET`, and `[chrome] events = false` resolve to
+//! `cfg.chrome.events`; errors and warnings use a separate channel and remain visible.
 
 use std::io::Write;
 
@@ -51,22 +36,12 @@ pub enum Event {
     /// verified event parsing at all, `handoff::distill_or_structural`'s own
     /// vocabulary) and where the handoff was stored.
     Restart { style: String, stored: String },
-    /// Issue #310: the progress clock latched -- no PTY output, transcript
-    /// growth, or mail activity for `idle_secs`, and this is the ONE time the
-    /// once-only banner fires for this stall episode (`sessions::write_stall_
-    /// marker`'s own claim-once idiom is what keeps this from repeating every
-    /// poll). If no progress is observed within the configured grace period
-    /// the session is terminated, which is its own, separate log/report, not
-    /// a second `Stalled` event.
-    ///
-    /// T4 (C-2): `nudged` is whether a steering nudge was actually delivered
-    /// (queued in the session's mailbox) at this same moment. It used to be
-    /// announced unconditionally, and nothing was ever delivered at all --
-    /// the banner has to be able to say so when mail is disabled or the
-    /// write failed, rather than promising a nudge that never arrived.
+    /// Emit one stall notice per idle episode, including unread mail when present; a new
+    /// observation clears the latch (#310).
+    // `nudged` is whether a steering nudge was actually queued; never promise one when mail is
+    // disabled or the write failed.
     Stalled { idle_secs: u64, nudged: bool },
-    /// Unread mail is waiting in the mailbox (the T8 advisory `wrap`'s pump
-    /// used to build by hand).
+    /// Unread mail is waiting in the mailbox.
     MailWaiting { count: usize },
     /// Mail was folded into a composed prompt at session start.
     MailDelivered { count: usize },
@@ -86,7 +61,7 @@ pub enum Event {
         window: String,
         reset_at: Option<u64>,
     },
-    /// T8 (fail-SAFE, not open): the pacing gate has no usable data at all
+    /// The pacing gate has no usable data at all
     /// for this provider -- no binding collector reading (ever recorded, or
     /// gone stale below the ceiling with nothing fresher), and no configured
     /// estimator to fall back on -- so instead of the old behavior (skip the
@@ -97,7 +72,7 @@ pub enum Event {
     /// remedy (file absent, macOS Keychain access needed, or the statusline
     /// tee never wired).
     PacingBlind { provider: String, delay_secs: u64 },
-    /// Item 4: the pacing gate is inside the soft-throttle band, delaying
+    /// The pacing gate is inside the soft-throttle band, delaying
     /// cycles rather than hard-pausing (`PaceDecision::Slow`). Unlike
     /// `PacingWait`, this is a recurring per-cycle delay rather than a wait
     /// to an absolute deadline, so `delay_secs` is a snapshot of the delay
@@ -119,23 +94,18 @@ pub enum Event {
     /// operator has to be told, because zirv is now running with less of the
     /// repository's own input than the repository asked for.
     WorkflowGatesClosed { reason: String },
-    /// The active workflow step's skill context could not be rendered, so the
-    /// composed prompt is missing its workflow layer. A repository skill
-    /// manifest that will not load is the usual cause, and the whole layer
-    /// used to disappear in silence (`.ok().flatten()`) -- leaving a session
-    /// running with no methodology and no way to notice.
+    /// Report a missing workflow skill layer, because the composed prompt omits that
+    /// context.
     WorkflowLayerSkipped { reason: String },
-    /// Issue #242: a gate transition auto-spawned a detached lifecycle
-    /// worker for `phase` (review/test/verify), naming the argv it ran.
+    /// A gate transition auto-spawned a detached lifecycle worker for `phase`
+    /// (review/test/verify), naming the argv it ran (#242).
     AutoSpawned { phase: String, command: String },
-    /// Issue #242: a gate transition was eligible for auto-spawn (the
-    /// operator turned the key on, the phase and workflow status matched)
-    /// but was skipped, naming why -- no free heavy-operation permit, or no
-    /// adapter to run a reviewer as. Never emitted for the ordinary case
-    /// (the feature disabled, or a phase it was never meant to touch).
+    /// A gate transition was eligible for auto-spawn (the operator turned the key on, the
+    /// phase and workflow status matched) but was skipped, naming why -- no free
+    /// heavy-operation permit, or no adapter to run a reviewer as. Never emitted for the
+    /// ordinary case (the feature disabled, or a phase it was never meant to touch) (#242).
     AutoSpawnSkipped { phase: String, reason: String },
-    /// Context health is slipping (the rot advisory `wrap`'s pump used to
-    /// build by hand as `advisory_line`).
+    /// The rot score crossed an advisory threshold.
     RotAdvisory { score: u32, tokens: u64 },
     /// A delegated supervised run (`zirv ctx agent`, or an `agent:` script
     /// step) started on another harness -- inline in this terminal, or as a
@@ -145,12 +115,8 @@ pub enum Event {
     /// exit (`exec::describe_exit`'s own text for the two supervisor exit
     /// codes, or a plain "exited with code N" otherwise).
     DelegatedFinish { agent: String, meaning: String },
-    /// Item 6 audit: `wrap`'s pump loop ends the wrapped session, propagating
-    /// the wrapped agent's own exit code, the moment the child exits --
-    /// whether that is the agent quitting cleanly or crashing. Previously
-    /// silent: nothing printed when this happened, so a maintainer watching
-    /// the session saw it end with no explanation at all, indistinguishable
-    /// from a bug in `wrap` itself.
+    /// Report the child exit before ending supervision, preserving its exit status even on
+    /// a crash.
     SessionEnded { agent: String, code: i32 },
     /// An interactive session is launching with a model chosen by
     /// configuration rather than by the operator's own command line
@@ -167,7 +133,7 @@ pub enum Event {
     /// operator can, with `--quiet`/`ZIRV_CTX_QUIET`, which is exactly the
     /// trust asymmetry the rest of this codebase already holds.
     ChatModel { model: String },
-    /// Issue #690: the default-harness fallback landed on `chosen` because
+    /// The default-harness fallback landed on `chosen` because
     /// `not_found`, ahead of it in registry order, is not installed on this
     /// machine. Presence is an operator-owned fact, so consulting it is
     /// right -- but a provider chosen for an operator must never be chosen
@@ -177,12 +143,10 @@ pub enum Event {
     /// `REPO_FORBIDDEN`), and the banner's compact tiers have no room for
     /// the missing harness anyway, so the disclosure that one vendor was
     /// picked over another rides `chrome.events`, which a repo cannot
-    /// silence.
+    /// silence (#690).
     HarnessAutoSelected { chosen: String, not_found: String },
-    /// A `zirv ctx nudge` wake-up marker was claimed. `from` names the
-    /// *sending* session's short id, read out of the marker file itself
-    /// (C4): every emitter used to pass its own short id here, so the line
-    /// always read "nudged by <myself>".
+    /// Read the sender from the claimed nudge marker so the notice names the sending
+    /// session.
     Nudge {
         from: String,
         disposition: NudgeDisposition,
@@ -231,7 +195,7 @@ pub enum Event {
     /// process regardless, the same one-time-latch discipline `poll.rs`'s
     /// `announce_keychain_prompt_once` uses.
     ConfigUnparsable { detail: String },
-    /// Issue #89: this session's resolved distiller or workflow reviewer is
+    /// This session's resolved distiller or workflow reviewer is
     /// an adapter whose own report-only sandbox pin
     /// (`AgentAdapter::read_only_args`) has a known, recorded gap on the
     /// operator's currently-installed binary
@@ -241,9 +205,9 @@ pub enum Event {
     /// reads the repo's `.rules` execpolicy files and the operator's own
     /// `~/.codex/config.toml`. Fired at most once per process
     /// (`adapters::announce_sandbox_residual_once`); `note` is the
-    /// adapter's own one-line explanation, pre-rendered by the caller.
+    /// adapter's own one-line explanation, pre-rendered by the caller (#89).
     SandboxResidual { note: String },
-    /// Issue #87: a durable memory harvest ran at a session boundary
+    /// A durable memory harvest ran at a session boundary
     /// (restart or clean exit, `memory::harvest_durable` -- the single
     /// choke point every one of the four call sites in `exec.rs`/`wrap.rs`
     /// funnels through) and finished. `count` is the number of entries
@@ -252,12 +216,12 @@ pub enum Event {
     /// the model proposed nothing durable or every candidate was filtered
     /// out -- still worth a one-line signal, so an operator watching the
     /// `zirv ▸` channel can see that memory harvesting ran at all, not just
-    /// silently infer it from a diff in `.zirv/memory/` days later.
+    /// silently infer it from a diff in `.zirv/memory/` days later (#87).
     MemoryHarvested { count: usize },
-    /// Issue #84: the orchestrator seat's model or harness was swapped in
-    /// place via `zirv ctx handover`, carrying a handoff packet across the
-    /// swap while the session kept its registry short id. Both models are
-    /// named, matching the decision-log entry's own contract.
+    /// The orchestrator seat's model or harness was swapped in place via `zirv ctx
+    /// handover`, carrying a handoff packet across the swap while the session kept its
+    /// registry short id. Both models are named, matching the decision-log entry's own
+    /// contract (#84).
     Handover {
         from_agent: String,
         from_model: String,
@@ -265,34 +229,29 @@ pub enum Event {
         to_model: String,
         stored: String,
     },
-    /// Issue #222: an interactive codex launch under an approval posture
-    /// that prompts on ordinary commands (`codex::codex_approval_advisory`).
-    /// `advisory` is pre-rendered by the caller.
+    /// An interactive codex launch under an approval posture that prompts on ordinary
+    /// commands (`codex::codex_approval_advisory`). `advisory` is pre-rendered by the
+    /// caller (#222).
     CodexApprovalAdvisory { advisory: String },
-    /// Issue #537: the harness proxy's own line -- the activation refusal
-    /// reason, the `--simple`/`--resume` skip reason, or `proxy::
-    /// announce_line`'s summary of a decision that took over the launch.
-    /// `text` is pre-rendered by the caller, the same plain-passthrough
-    /// shape `CodexApprovalAdvisory` uses.
+    /// The harness proxy's own line -- the activation refusal reason, the
+    /// `--simple`/`--resume` skip reason, or `proxy::announce_line`'s summary of a
+    /// decision that took over the launch. `text` is pre-rendered by the caller, the same
+    /// plain-passthrough shape `CodexApprovalAdvisory` uses (#537).
     ProxyAdvisory { text: String },
-    /// Issue #243 (review round, F3/F4): a live supervision loop's own
-    /// scoring cycle flagged something in the transcript bytes it just
-    /// ingested (`sessions::record_screening`, de-duplicated there so an
-    /// unchanged summary is announced once, not every poll). `summary` is
-    /// `screen::ScreenReport::summary`'s own text.
+    /// Announce only new screening findings from bytes just ingested; deduplication
+    /// happens in `sessions::record_screening` (#243).
     Screening { summary: String },
     /// A `zirv ctx handover` request was refused rather than acted on --
     /// most commonly "mid-turn, and no `--force` was given" (see
     /// `wrap::may_inject`, the same quiesce check every other injection
     /// already gates on).
     HandoverRefused { reason: String },
-    /// Issue #420: a hook-integrity drift warning fired at supervisor start
-    /// (`hook_integrity::drift_warning_if_due`) -- at least one of the hook
-    /// entries zirv installed no longer matches what the current binary
-    /// would write, and this is the one time in the last 24h this is worth
-    /// saying. `summary` is pre-rendered by the caller, naming which
-    /// entries and their verdicts; `zirv ctx hook status` has the full
-    /// detail.
+    /// A hook-integrity drift warning fired at supervisor start
+    /// (`hook_integrity::drift_warning_if_due`) -- at least one of the hook entries zirv
+    /// installed no longer matches what the current binary would write, and this is the one
+    /// time in the last 24h this is worth saying. `summary` is pre-rendered by the caller,
+    /// naming which entries and their verdicts; `zirv ctx hook status` has the full detail
+    /// (#420).
     HookIntegrity { summary: String },
 }
 

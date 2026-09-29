@@ -608,15 +608,13 @@ impl Scope {
                     .collect()
             })
             .unwrap_or_default();
-        // Issue #539 chunk E1: this bridge caps every result at
-        // `MAX_RESULT_BYTES` (`response`, below); a "with no query, every
-        // skill's digest" listing can exceed it once the registry grows
-        // past a few dozen entries, which the native tool -- with no such
-        // transport ceiling -- never has to worry about. Degrade gracefully
-        // here rather than hard-refusing the whole call the way `response`
-        // does for every other tool: keep as many digests as fit and name
-        // the rest in `warnings`, so the listing stays usable and the
-        // caller knows to narrow with `query` or `limit`.
+        // This bridge caps every result at `MAX_RESULT_BYTES` (`response`, below); a "with
+        // no query, every skill's digest" listing can exceed it once the registry grows
+        // past a few dozen entries, which the native tool -- with no such transport ceiling
+        // -- never has to worry about. Degrade gracefully here rather than hard-refusing
+        // the whole call the way `response` does for every other tool: keep as many digests
+        // as fit and name the rest in `warnings`, so the listing stays usable and the
+        // caller knows to narrow with `query` or `limit` (#539).
         let skills = if no_query {
             bound_skill_digests(skills, &mut warnings)
         } else {

@@ -1,33 +1,10 @@
 //! Round 4 bug 4a: an operator-invisible, runtime-learned override for a
-//! model's real context window, layered strictly BETWEEN the two facts that
-//! already outrank each other -- `cfg.score.model_context_tokens` (the
-//! operator's own pin, which always wins; see `rot::capacity`'s `cfg.
-//! model_context_tokens.or(caps.context_window_tokens)`) above it, and
-//! `catalogue`'s own conservative built-in default below it.
+//! model's real context window. The operator's configured pin wins; a learned value
+//! comes next; the catalogue remains the fallback.
 //!
-//! Claude's own `-p --output-format json` result reports the TRUE window for
-//! the model it actually ran, e.g. `"modelUsage":{"claude-sonnet-5":
-//! {"contextWindow":1000000,...}}` -- verified 2026-09-25 against a real
-//! result, the same evidence that corrected the catalogue's own `sonnet`
-//! rung (`catalogue::ANTHROPIC_RUNGS`) from an understated 200_000. This
-//! module exists for every OTHER case the catalogue has not been corrected
-//! for yet: a future model, a different vendor/endpoint, or a rung this
-//! round simply did not touch.
-//!
-//! `exec.rs`'s main supervision loop already captures a headless child's
-//! final stdout (`OutputTap::drain_to_eof`, the same capture `pace::scan_
-//! for_limit` reads) -- `parse_observed_window` (pure) reads those same
-//! lines for this fact, and `record` persists it under BOTH the resolved
-//! model id and the requested model/alias from argv, so a later launch
-//! naming either one finds it.
-//!
-//! Deliberately kept OFF the `AgentAdapter` construction path (`select`/
-//! `resolve_default`, whose signature dozens of unrelated callers share) and
-//! out of `rot.rs` (which must stay pure): `ClaudeAdapter::context_window_
-//! tokens` reads this file directly off `home_dir()` -- the same zirv-owned-
-//! under-operator-home convention `hook_integrity` and the memory bank
-//! already use -- rather than needing a `StateDir`/`env` threaded through
-//! adapter selection and every one of its callers.
+//! Claude JSON output can report the window of the model actually run. `exec.rs` parses
+//! captured final output and records both resolved id and requested alias for later launches.
+//! The store is best effort and remains outside the pure `rot.rs` decision path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,18 +30,8 @@ fn normalize(key: &str) -> String {
     key.trim().to_lowercase()
 }
 
-/// Issue #779 (round 4 review): the plausible range for a real model's
-/// context window. `record` used to reject only `0`, so a single garbled or
-/// adversarial `--output-format json` result (a stray digit, a unit
-/// mismatch, a hostile transcript) could persist an absurd value that then
-/// poisons every later compaction decision made against that model, in
-/// either direction -- too small triggers needless compaction, too large
-/// never compacts at all. `MIN_PLAUSIBLE_WINDOW` is comfortably below every
-/// known model's window (smaller than any shipped rung in `catalogue`, so a
-/// real vendor figure is never rejected); `MAX_PLAUSIBLE_WINDOW` is
-/// comfortably above the largest verified window this codebase has observed
-/// (1,000,000, see this module's own doc comment) with headroom for a
-/// legitimate future model.
+/// Accept learned context windows only within a plausible range; malformed runtime output
+/// must not override the catalogue (#779).
 const MIN_PLAUSIBLE_WINDOW: u64 = 8_192;
 const MAX_PLAUSIBLE_WINDOW: u64 = 10_000_000;
 
@@ -142,15 +109,9 @@ pub(crate) fn record(home: &Path, keys: &[&str], window: u64) {
     let Ok(text) = serde_json::to_string_pretty(&store) else {
         return;
     };
-    // Issue #779 (round 4 review): a plain read-modify-write races any other
-    // process doing the same (two sessions launched against different models
-    // at once, each reading the store before the other's write lands) into a
-    // lost update. Written via a temp sibling file plus rename, like
-    // `window.rs::save_transcript_cache`/`score.rs::save_checkpoint`, so a
-    // process killed mid-write leaves the previous store intact rather than
-    // a truncated one, and the rename itself is atomic. No lock file: this
-    // cache is best-effort, so the rarer race of two processes each renaming
-    // over the other just costs the loser's observation, never corruption.
+    // Temp sibling file plus rename: a process killed mid-write leaves the previous store intact.
+    // No lock file: this cache is best-effort, so two racing renames cost the loser's observation,
+    // never corruption (#779).
     let staged = parent.join(format!("model-windows.{}.tmp", std::process::id()));
     if std::fs::write(&staged, text).is_ok() {
         let _ = std::fs::rename(&staged, &file);

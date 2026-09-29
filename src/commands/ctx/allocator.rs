@@ -22,11 +22,7 @@ pub enum HarnessState {
 }
 
 impl HarnessState {
-    /// Not yet called from production code: the `zirv ctx status` surface
-    /// this feeds (issue #358, a later task) lands after this one. Kept
-    /// `pub` and exercised by this module's own tests now, the same
-    /// task-ordering shape `FallbackConfig::rollover_headroom_pct` already
-    /// documents for itself.
+    ///  (#358).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -79,21 +75,17 @@ pub struct HarnessCapacity {
     pub reserve_headroom_pct: f64,
     pub state: HarnessState,
     pub state_reason: String,
-    /// Issue #455: what the route-health breaker says about this harness
-    /// (`health_store::harness_admission`, resolved once by the snapshot).
-    /// `Allow` whenever the policy is off, so this module's behaviour is
-    /// unchanged by default.
+    /// What the route-health breaker says about this harness
+    /// (`health_store::harness_admission`, resolved once by the snapshot). `Allow` whenever
+    /// the policy is off, so this module's behaviour is unchanged by default (#455).
     pub health: super::health::Admission,
-    /// Issue #487 (N18): what this route IS -- runtime, provider, endpoint,
-    /// credential, model and billing pool. A harness row states the identity
-    /// this module always implied (`RouteIdentity::harness`), so nothing
-    /// about harness placement changes; a native row states a real one, and
-    /// its `pool` is what `CapacitySnapshot::pool` looks capacity up by.
+    /// What this route IS -- runtime, provider, endpoint, credential, model and billing
+    /// pool. A harness row states the identity this module always implied
+    /// (`RouteIdentity::harness`), so nothing about harness placement changes; a native row
+    /// states a real one, and its `pool` is what `CapacitySnapshot::pool` looks capacity up
+    /// by (#487).
     pub identity: super::route::RouteIdentity,
-    /// What this route can do and how it is paid for, for the eligibility
-    /// gate that runs BEFORE ranking. `None` for a route that declares
-    /// nothing, which is every harness row today: an undeclared offer is not
-    /// gated, exactly as before.
+    /// An undeclared offer is not gated; eligibility runs before ranking.
     pub offer: Option<super::route::RouteOffer>,
 }
 
@@ -167,12 +159,10 @@ pub struct WorkUnit {
     pub source_model: Option<String>,
     pub source_model_explicit: bool,
     pub delegation: bool,
-    /// Issue #487 (item 5): what this unit needs from whatever route takes
-    /// it -- capabilities, context room and authorized billing. Checked
-    /// BEFORE ranking, so a route that could never have run the work is
-    /// excluded by its own reason rather than reported as outranked.
-    /// `Demand::default()` constrains nothing, which is every existing
-    /// caller.
+    /// What this unit needs from whatever route takes it -- capabilities, context room and
+    /// authorized billing. Checked BEFORE ranking, so a route that could never have run the
+    /// work is excluded by its own reason rather than reported as outranked.
+    /// `Demand::default()` constrains nothing, which is every existing caller (#487).
     pub demand: super::route::Demand,
 }
 
@@ -196,18 +186,16 @@ pub enum Exclusion {
     NoEquivalentModel,
     Visited,
     Excluded,
-    /// Issue #455: the route-health breaker is open (or the route is
-    /// `Unavailable`) for this harness. Carries the breaker's own reason so
-    /// `PoolView.exclusions` and a park message name the failures, the
-    /// window and the estimated retry, rather than reporting a bare
-    /// `HardBlocked` that reads as a usage refusal.
+    /// The route-health breaker is open (or the route is `Unavailable`) for this harness.
+    /// Carries the breaker's own reason so `PoolView.exclusions` and a park message name
+    /// the failures, the window and the estimated retry, rather than reporting a bare
+    /// `HardBlocked` that reads as a usage refusal (#455).
     Unhealthy(String),
-    /// Issue #487 (item 5): the route cannot run this work at all -- policy
-    /// refuses it, it lacks a required capability, its context window cannot
-    /// hold the prompt, or its billing posture is not one this work is
-    /// authorized for. Judged before capacity and before ranking, because
-    /// ranking a route that could never take the task is how "outranked"
-    /// ends up naming a route the work was never eligible for.
+    /// The route cannot run this work at all -- policy refuses it, it lacks a required
+    /// capability, its context window cannot hold the prompt, or its billing posture is not
+    /// one this work is authorized for. Judged before capacity and before ranking, because
+    /// ranking a route that could never take the task is how "outranked" ends up naming a
+    /// route the work was never eligible for (#487).
     Ineligible(super::route::Ineligible),
     /// This candidate cleared every eligibility check but lost to `by`,
     /// whose own projected headroom (`projected_headroom_pct`) was greater
@@ -222,8 +210,7 @@ pub enum Exclusion {
 }
 
 impl Exclusion {
-    /// Same task-ordering note as `HarnessState::as_str`: the human-facing
-    /// surface this labels for lands in a later issue #358 task.
+    /// The human-facing state label for capacity reports (#358).
     pub fn label(&self) -> String {
         match self {
             Self::Disabled => "disabled".to_string(),
@@ -295,11 +282,10 @@ pub fn classify(
             .unwrap_or_else(|| "not ready".to_string());
         return (HarnessState::Disabled, reason);
     }
-    // Issue #455: read before the usage ladder below. A route that cannot be
-    // connected to is unusable at any headroom, so a denied breaker is a
-    // hard block regardless of what the usage windows say -- and the reason
-    // travels with it, which is what `zirv ctx status` and a park message
-    // then show instead of a bare "hard blocked".
+    // Read before the usage ladder below. A route that cannot be connected to is unusable
+    // at any headroom, so a denied breaker is a hard block regardless of what the usage
+    // windows say -- and the reason travels with it, which is what `zirv ctx status` and a
+    // park message then show instead of a bare "hard blocked" (#455).
     if let Some(reason) = harness.health.denied() {
         return (HarnessState::HardBlocked, reason.to_string());
     }
@@ -344,9 +330,8 @@ pub fn classify(
             "ready (route health trial: one attempt admitted after a cooldown)".to_string(),
         );
     }
-    // Slice A: a degraded route is `Ready` -- it answers, just worse than it
-    // should. The reason rides on the state so `zirv ctx status` explains why
-    // this harness keeps losing ties it used to win.
+    // A degraded route can answer but loses ties to a healthy route; carry its reason into
+    // status.
     if let Some(reason) = harness.health.degraded() {
         return (HarnessState::Ready, format!("ready (degraded: {reason})"));
     }
@@ -396,8 +381,8 @@ pub fn projected_headroom(
     ))
 }
 
-/// Issue #487 (items 2 and 7): every capacity dimension this route can run
-/// out of, as one list, each number labelled with where it came from.
+/// Every capacity dimension this route can run out of, as one list, each number labelled
+/// with where it came from (#487).
 ///
 /// The usage windows a provider reports are all `SubscriptionWindow`
 /// readings -- that is the one dimension a harness has ever had. A native
@@ -589,9 +574,8 @@ fn requested_unfit_reason(
     cfg: &CtxConfig,
     unit: &WorkUnit,
 ) -> Exclusion {
-    // Issue #455: named before the state ladder, so a health denial reports
-    // its own reason rather than the generic `HardBlocked` label `classify`
-    // folded it into.
+    // Named before the state ladder, so a health denial reports its own reason rather than
+    // the generic `HardBlocked` label `classify` folded it into (#455).
     if let Some(reason) = harness.health.denied() {
         return Exclusion::Unhealthy(reason.to_string());
     }
@@ -620,10 +604,9 @@ fn requested_unfit_reason(
     }
 }
 
-/// Issue #487 (item 5): whether this route is disqualified from the task
-/// itself, as opposed to from its current capacity or health. `None` for a
-/// route that declares no offer, which leaves every existing harness row
-/// exactly as it was.
+/// Whether this route is disqualified from the task itself, as opposed to from its current
+/// capacity or health. `None` for a route that declares no offer, which leaves every
+/// existing harness row exactly as it was (#487).
 fn ineligible(harness: &HarnessCapacity, unit: &WorkUnit) -> Option<super::route::Ineligible> {
     let offer = harness.offer.as_ref()?;
     super::route::eligible(offer, &unit.demand).err()
@@ -652,7 +635,7 @@ pub fn place(
     models: &dyn Fn(&str) -> Option<String>,
 ) -> Placement {
     let mut exclusions: Vec<(String, Exclusion)> = Vec::new();
-    // Slice A: the requested harness's own fit, held back rather than
+    // The requested harness's own fit, held back rather than
     // returned when it is DEGRADED. Rule (a) may keep a degraded route only
     // once the order walk below has proved there is no healthy one to take
     // the work instead -- a degraded route is reduced, never excluded.
@@ -670,7 +653,7 @@ pub fn place(
             if requested_excluded {
                 exclusions.push((requested.name.clone(), Exclusion::Excluded));
             } else if let Some(why) = ineligible(requested, unit) {
-                // Item 5: before every capacity and health question. A route
+                // Before every capacity and health question. A route
                 // the work may not run on does not keep it merely because it
                 // is the one that asked.
                 exclusions.push((requested.name.clone(), Exclusion::Ineligible(why)));
@@ -774,15 +757,14 @@ pub fn place(
             exclusions.push((name.clone(), Exclusion::NoToolCallCounting));
             continue;
         }
-        // Item 5: capability, policy, context room and authorized billing,
+        // Capability, policy, context room and authorized billing,
         // all before any capacity is read or any ranking happens.
         if let Some(why) = ineligible(harness, unit) {
             exclusions.push((name.clone(), Exclusion::Ineligible(why)));
             continue;
         }
-        // Issue #455: before the state match below, which would otherwise
-        // report a health denial as a bare `HardBlocked` and lose the
-        // breaker's reason.
+        // Before the state match below, which would otherwise report a health denial as a
+        // bare `HardBlocked` and lose the breaker's reason (#455).
         if let Some(reason) = harness.health.denied() {
             exclusions.push((name.clone(), Exclusion::Unhealthy(reason.to_string())));
             continue;
@@ -908,12 +890,8 @@ pub fn place(
         ));
     }
 
-    // The same "greatest projected headroom, ties by order position" rule
-    // as before, just applied over the whole `eligible` set at once instead
-    // of tracked incrementally, so the loser(s) can still be identified.
-    // Slice A: a healthy eligible candidate beats a degraded one outright;
-    // among equals the rule is unchanged (greatest projected headroom, ties
-    // by `cfg.fallback.order` position).
+    // Healthy routes outrank degraded ones; ties use projected headroom, then fallback
+    // order.
     let winner_index = eligible.iter().enumerate().min_by(
         |(_, (a_order, a_degraded, a)), (_, (b_order, b_degraded, b))| {
             a_degraded
@@ -985,17 +963,7 @@ pub fn place(
     }
 }
 
-/// Plans every unit in order against one scratch copy of `snapshot`: each
-/// admitted unit's `expected_tokens` is added to its provider's `reserved_
-/// tokens` and its harness's `active` count is incremented before the next
-/// unit is placed, so later units see the capacity the earlier ones already
-/// claimed. `O(units * harnesses)`: each unit does one `place` call plus a
-/// bounded scratch update, no unit ever re-scans earlier units.
-///
-/// Not yet called from production code: the multi-unit scheduling call site
-/// (issue #358, a later task) lands after this one. Kept `pub` and exercised
-/// by this module's own tests now, the same task-ordering shape
-/// `FallbackConfig::rollover_headroom_pct` already documents for itself.
+/// Each admitted unit updates shared capacity before the next placement (#358).
 #[allow(dead_code)]
 pub fn plan(
     snapshot: &CapacitySnapshot,
@@ -1010,7 +978,7 @@ pub fn plan(
         let placement = place(&scratch, cfg, unit, &[], &|name: &str| models(unit, name));
 
         if let Some(candidate) = &placement.selected {
-            // Item 1: the reservation lands on the POOL the route actually
+            // The reservation lands on the POOL the route actually
             // spends from, so a second unit placed on a sibling route of the
             // same account sees the tokens the first one already claimed.
             let provider_name = scratch.harness(&candidate.name).map(|h| {
@@ -1036,15 +1004,8 @@ pub fn plan(
                 {
                     harness.active = harness.active.saturating_add(1);
                 }
-                // Finding #8 (issue #358 review): `reserved_tokens` just
-                // moved on the WHOLE provider, not just the harness that was
-                // placed -- every sibling harness sharing this provider has
-                // stale `state`/`state_reason` the moment that happens (a
-                // second harness on the same provider can flip Ready ->
-                // Draining purely from a sibling's admission, with no
-                // capacity change of its own). Reclassify every harness on
-                // this provider, not only `candidate.name`, so the NEXT
-                // unit's own `place` call sees an accurate snapshot.
+                // Reclassify every harness sharing this provider after a reservation, or
+                // the next unit sees stale capacity (#358).
                 if let Some(provider) = scratch.provider(&provider_name).cloned() {
                     let siblings: Vec<String> = scratch
                         .harnesses

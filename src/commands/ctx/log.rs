@@ -140,33 +140,26 @@ pub struct Delegation<'a> {
     pub wall_ms: u64,
     pub exit_code: i32,
     pub outcome: &'a str,
-    /// Issue #267: whether this worker ran `read-only` or `writing`. A row
-    /// written before this field existed deserializes (via [`DelegationRow`]
-    /// `#[serde(default)]`) as `None` -- readers must treat that as
-    /// "unknown", never as either mode outright.
+    /// Whether this worker ran `read-only` or `writing`. A row written before this field
+    /// existed deserializes (via [`DelegationRow`] `#[serde(default)]`) as `None` --
+    /// readers must treat that as "unknown", never as either mode outright (#267).
     pub mode: Option<WorkerMode>,
-    /// Issue #264: what kind of work this delegation was, when known -- see
-    /// [`TaskClass`]'s own doc comment. Same "row predates the field, or its
-    /// caller never named one" contract as `mode` above.
+    /// What kind of work this delegation was, when known -- see [`TaskClass`]'s own doc
+    /// comment. Same "row predates the field, or its caller never named one" contract as
+    /// `mode` above (#264).
     pub task_class: Option<TaskClass>,
-    /// Issue #262: the `"<parent short>/<child short>"` delegation chain
-    /// this worker ran under (`envelope::WorkerEnvelope::principal`), or
-    /// `"root"` for a top-level, non-delegated session.
+    /// The `"<parent short>/<child short>"` delegation chain this worker ran under
+    /// (`envelope::WorkerEnvelope::principal`), or `"root"` for a top-level, non-delegated
+    /// session (#262).
     pub principal: &'a str,
-    /// Issue #262: `sha256(canonical_json(envelope))` for the envelope this
-    /// worker actually ran under (`envelope::digest`) -- lets a later reader
-    /// prove under which delegation envelope a worker ran, without the raw
-    /// envelope itself needing to be logged. `None` only for a row logged
-    /// before this field existed.
+    /// `sha256(canonical_json(envelope))` for the envelope this worker actually ran under
+    /// (`envelope::digest`) -- lets a later reader prove under which delegation envelope a
+    /// worker ran, without the raw envelope itself needing to be logged. `None` only for a
+    /// row logged before this field existed (#262).
     pub envelope_sha256: Option<&'a str>,
 }
 
-/// The JSON [`append_delegation`]/[`append_delegation_cached`] actually
-/// write: [`Delegation`]'s own fields, flattened, plus this process's own
-/// attribution (issue #800) and whether this row is a CACHED Jev hit (issue
-/// #803 follow-up) -- both computed in this ONE place rather than threaded
-/// through every one of `Delegation`'s many call sites, and both skipped when
-/// at their default so an existing row's JSON stays byte-identical.
+/// A missing cache indicator means the row was a priced Jev call (#800).
 #[derive(Serialize)]
 struct DelegationWire<'a> {
     #[serde(flatten)]
@@ -216,42 +209,32 @@ pub struct DelegationRow {
     #[allow(dead_code)]
     pub exit_code: i32,
     pub outcome: String,
-    /// Issue #267: mirrors `Delegation::mode`. `#[serde(default)]` so a row
-    /// written before this field existed deserializes as `None` rather than
-    /// failing to parse -- the only reading an old row can honestly carry.
+    /// A missing mode deserializes as `None`, preserving unknown status (#267).
     #[serde(default)]
     #[allow(dead_code)]
     pub mode: Option<WorkerMode>,
-    /// Issue #264: mirrors `Delegation::task_class`. `#[serde(default)]` so a
-    /// row written before this field existed deserialises as `None` rather
-    /// than failing to parse. Read by `spend::aggregate`'s `--by task-class`
-    /// grouping.
+    /// A missing task class deserializes as `None` for spend grouping (#264).
     #[serde(default)]
     pub task_class: Option<TaskClass>,
-    /// Issue #262: mirrors `Delegation::principal`. `#[serde(default)]` so a
-    /// row written before this field existed deserializes as `""` (empty,
-    /// distinguished from a real `"root"`) rather than failing to parse.
-    /// Kept for parity with every field `Delegation` writes -- not read by
-    /// any reader yet, the same kept-for-parity-not-yet-read pattern
-    /// `SafetyDecisionRecord::mode` already uses.
+    /// A missing principal deserializes as empty, distinct from the real `root` principal
+    /// (#262).
     #[serde(default)]
     #[allow(dead_code)]
     pub principal: String,
-    /// Issue #262: mirrors `Delegation::envelope_sha256`.
+    /// Mirrors `Delegation::envelope_sha256` (#262).
     #[serde(default)]
     #[allow(dead_code)]
     pub envelope_sha256: Option<String>,
-    /// Issue #800: this row's own campaign/candidate/trial/task ids, from
-    /// `DelegationWire`. `#[serde(default)]` so a row written before this
-    /// field existed deserializes as the empty (unattributed) default.
+    /// This row's own campaign/candidate/trial/task ids, from `DelegationWire`; a row written before
+    /// this field existed deserializes as the empty (unattributed) default (#800).
     #[serde(default)]
     pub attribution: Attribution,
-    /// Issue #803 follow-up: whether this row is a CACHED Jev hit (a real
+    /// Whether this row is a CACHED Jev hit (a real
     /// call was skipped) rather than a priced one -- see `attribution::
     /// Receipt::cached`'s own doc comment for how the reconciler uses this.
     /// `#[serde(default)]` so a row written before this field existed
     /// deserializes as `false`, the only honest reading for a row that
-    /// predates it (every such row WAS a real, priced call).
+    /// predates it (every such row WAS a real, priced call) (#803).
     #[serde(default)]
     pub cached: bool,
 }
@@ -364,8 +347,7 @@ pub fn read_permission_prompts(state: &StateDir) -> Vec<PermissionPromptRecord> 
 #[derive(Debug, Serialize)]
 pub struct OrchestratorBlock<'a> {
     pub ts: u64,
-    /// zirv session short id (`mail::session_identity`), else the harness's
-    /// own session id.
+    /// Zirv session short id (`mail::session_identity`), else the harness's own session id.
     pub session: &'a str,
     /// Tool name: Edit, Write, MultiEdit, NotebookEdit, Bash, PowerShell.
     pub tool: &'a str,
@@ -373,12 +355,7 @@ pub struct OrchestratorBlock<'a> {
     /// program family (e.g. "sed -i"), NEVER the full command text.
     pub target: &'a str,
     pub reason: &'a str,
-    /// This decision's own posture outcome: "denied", "advised", or
-    /// "allowed" (`hook::OrchestratorWriteOutcome::log_label`). Issue #358
-    /// T8: every row before this field existed was necessarily a denial
-    /// (the guard only ever refused), which is exactly what [`
-    /// OrchestratorBlockRecord`]'s own `#[serde(default)]` value preserves
-    /// for an old log line that never wrote this field at all.
+    /// Missing posture outcomes are denials because the earlier guard only refused (#358).
     pub outcome: &'a str,
 }
 
@@ -392,9 +369,8 @@ pub fn append_orchestrator_block(state: &StateDir, block: &OrchestratorBlock<'_>
     Ok(())
 }
 
-/// The default `outcome` for a pre-#358 log row that never wrote the field
-/// at all -- every such row was, by construction, a denial (the guard only
-/// ever refused before this task).
+/// Default missing posture outcomes to denial; earlier rows could only record refusals
+/// (#358).
 fn default_orchestrator_block_outcome() -> String {
     "denied".to_string()
 }
@@ -598,19 +574,16 @@ pub struct SafetyDecisionRecord {
     #[allow(dead_code)]
     pub mode: String,
     pub verdict: String,
-    /// Change 5a. `#[serde(default)]` so a row written before this field
-    /// existed still parses -- an empty string reads as "unknown", the
-    /// only honest reading for a record that predates it.
+    /// An absent value deserializes as unknown for older rows.
     #[serde(default)]
     pub family: String,
     pub command_sha256: String,
     #[serde(default)]
     pub matched_pattern: Option<String>,
-    /// Issue #320: `zirv ctx snapshot`'s own hook-attestation-state field --
-    /// mirrors [`SafetyDecision::attestation`] exactly. `#[serde(default)]`
-    /// so a row written before any reader deserialized this field still
-    /// parses; an empty string reads as "unknown", the only honest reading
-    /// for a record that predates it.
+    /// `zirv ctx snapshot`'s own hook-attestation-state field -- mirrors
+    /// [`SafetyDecision::attestation`] exactly. `#[serde(default)]` so a row written before
+    /// any reader deserialized this field still parses; an empty string reads as "unknown",
+    /// the only honest reading for a record that predates it (#320).
     #[serde(default)]
     pub attestation: String,
 }
@@ -648,19 +621,9 @@ pub fn read_safety_decisions(state: &StateDir) -> Vec<SafetyDecisionRecord> {
     out
 }
 
-/// Issue #313 (consecutive-denial breaker): a BOUNDED counterpart to
-/// [`read_safety_decisions`] for a hook process that runs on every single
-/// PreToolUse invocation and cannot afford that function's unbounded,
-/// every-file-ever-written scan. Opens only the day-bucketed files for
-/// `now_day` (today, as `ts / 86_400`) and the day before it, in case the
-/// session's own history spans a UTC midnight -- never merely "the two
-/// newest files that exist" (codex review round 1): after days with no
-/// safety decisions at all, those would be stale records that must not
-/// count toward a CURRENT run of denials. Filters to `session` and returns
-/// at most the last `limit` matching records, oldest-first -- exactly the
-/// tail the breaker needs to count a trailing run of consecutive denials.
-/// Same best-effort tolerance as `read_safety_decisions`: an absent file or
-/// a line that fails to parse is skipped, never fatal.
+/// Reads only the day buckets for `now_day` and the day before it, never the two newest files that
+/// exist: after idle days those would be stale records that must not count toward a current run of
+/// denials (#313).
 pub fn read_recent_safety_decisions(
     state: &StateDir,
     session: &str,

@@ -218,20 +218,10 @@ pub fn counts_by_class(record: &ChainRecord) -> BTreeMap<FailureClass, u32> {
     counts
 }
 
-/// I/O wrapper: load the chain (a missing one reads as empty), append this
-/// boot, store it back, then evaluate the freshly updated record against
-/// `class`. The one seam a caller (`exec.rs`) actually needs. Best-effort
-/// like every other piece of state-dir housekeeping in this codebase: a
-/// store failure never blocks the restart decision itself, it only means
-/// this boot silently did not count toward the breaker.
-///
-/// A record this build cannot PARSE is neither read as empty nor written
-/// over: it used to be, which silently reset an operator's restart-loop
-/// breaker on the first schema drift between an installed binary and a
-/// branch one. The honest answer for a breaker that cannot read its own
-/// history is that it cannot evaluate -- so the boot is allowed
-/// ([`ChainVerdict::Ok`]) and the file is left exactly as it was found,
-/// rather than a `Tripped` this has no evidence for or a clobbered chain.
+/// Load, append, persist, then evaluate the updated chain; persistence failure must not
+/// reset the restart breaker.
+// A record this build cannot parse is neither read as empty nor overwritten: allow the boot
+// (ChainVerdict::Ok) and leave the file as found, so schema drift never resets the breaker.
 pub fn record_boot_and_evaluate(
     state: &StateDir,
     key: &str,

@@ -1,31 +1,10 @@
 //! Runtime-neutral session lifecycle decisions (issue #478, roadmap N09).
 //!
-//! Before this module every lifecycle decision zirv makes about a running
-//! session -- may this tool run, should this tool result be replaced, what
-//! rides along with a prompt, may this session stop, what does a notification
-//! mean, is fresh verification owed -- was reachable only by feeding a
-//! harness-shaped JSON payload to `hook.rs`. A native session has no harness
-//! and therefore no hook process to shell out to, so those decisions have to
-//! exist somewhere both paths can call.
+//! Both harness hooks and native sessions call these decisions. Hooks translate their
+//! payloads; native sessions pass intents from their own journal and tool records.
 //!
-//! This module is that place. It owns the DECISIONS and nothing else:
-//!
-//! - `hook.rs` stays the payload translator it always was. It parses claude's
-//!   (or a projected agent's) JSON, builds the neutral intents below, calls
-//!   in here, and renders the answer back into the harness's own envelope.
-//!   Every existing hook behaviour and every existing hook test is unchanged
-//!   by construction -- the harness-shaped types, the envelopes, the state
-//!   writes and the decision logging all stay in `hook.rs`.
-//! - `runtime::native` calls the same functions directly, with intents built
-//!   from its own journal/tool records. No hook process, no harness binary,
-//!   no PATH probe -- which is what makes acceptance criterion (f) of issue
-//!   #478 provable.
-//!
-//! Everything here is pure: no filesystem, clock, environment or network
-//! access of its own. Where a decision genuinely needs the environment (the
-//! harness-home exemption in [`orchestrator_write_target`]) the lookup is
-//! passed in as `EnvLookup`, exactly as the hook path already did it, so both
-//! callers and every test stay deterministic.
+//! This module is pure: no filesystem, clock, environment or network reads. Required
+//! environment values are supplied through `EnvLookup` so decisions are replayable.
 
 use std::path::{Path, PathBuf};
 

@@ -127,13 +127,8 @@ fn native_structural_context(
             }
         }
     }
-    // Review round 1 on #598: this used to forward the whole replayed
-    // conversation unbounded, unlike the harness branch right beside it,
-    // which caps with `cfg.handoff.tail_items` via each adapter's own
-    // `structural_context(jsonl, last_n)`. Same cap, same truncation shape
-    // (`keep_last`, mirrored from `adapters::claude::keep_last`, which is
-    // not exported): newest `last_n` entries kept, oldest dropped from the
-    // front.
+    // Cap native replay to `cfg.handoff.tail_items`, as for harness sessions, before
+    // building the ask prompt (#598).
     fn keep_last<T>(items: &mut Vec<T>, last_n: usize) {
         if items.len() > last_n {
             items.drain(..items.len() - last_n);
@@ -230,13 +225,12 @@ fn run_with_provider<W: Write>(
 
     let timeout = Duration::from_secs(cfg.handoff.timeout_secs);
 
-    // Issue #598 (roadmap N15): a native session records its agent as
-    // `"native"`, which is not a coding harness -- `adapters::select` was
-    // correctly refusing it, leaving `ctx ask` unable to inspect a native
-    // session at all. Read it through its own durable journal instead, and
-    // answer it natively too when the operator has a route for `ROLE_ASK`,
-    // so asking about (and answering from) a native session never needs a
-    // harness adapter, or one on PATH, at all.
+    // A native session records its agent as `"native"`, which is not a coding harness --
+    // `adapters::select` was correctly refusing it, leaving `ctx ask` unable to inspect a
+    // native session at all. Read it through its own durable journal instead, and answer it
+    // natively too when the operator has a route for `ROLE_ASK`, so asking about (and
+    // answering from) a native session never needs a harness adapter, or one on PATH, at
+    // all (#598).
     let answer = if record.agent == super::runtime::RuntimeKind::Native.as_str() {
         let ctx = native_structural_context(&state, &record.session, cfg.handoff.tail_items)?;
         let prompt = ask_prompt(&ctx, &args.question);

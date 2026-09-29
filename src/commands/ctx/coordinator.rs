@@ -269,7 +269,7 @@ impl Coordinator {
         self.updated_at = now;
     }
 
-    /// Item 7: the user narrows or redirects the objective. Constraints are
+    /// The user narrows or redirects the objective. Constraints are
     /// additive and newest-last; a repeated constraint is not duplicated.
     pub fn steer(&mut self, constraint: &str, now: u64) {
         let constraint = clip(constraint);
@@ -283,7 +283,7 @@ impl Coordinator {
         self.updated_at = now;
     }
 
-    /// Item 7: the user cancels. Planned work is cancelled outright;
+    /// The user cancels. Planned work is cancelled outright;
     /// delegated work keeps its node (the worker may still be running and its
     /// receipt still has to be consumed) and is stopped through
     /// `delegation::interrupt`, which owns cancellation of a live worker.
@@ -311,9 +311,9 @@ impl Coordinator {
         nodes
     }
 
-    /// Issue #541 chunk C, decision 1: the `team_plan` tool's storage rule --
+    /// The `team_plan` tool's storage rule --
     /// a workflow that is active for this objective OWNS the plan, and this
-    /// record keeps only its id.
+    /// record keeps only its id (#541).
     pub fn store_team_plan_workflow(&mut self, workflow_id: &str, now: u64) {
         self.team_plan = Some(TeamPlanLocation::Workflow {
             workflow_id: workflow_id.to_string(),
@@ -329,28 +329,21 @@ impl Coordinator {
         self.updated_at = now;
     }
 
-    /// Issue #541 chunk C, decision 2: whether `seat_id` in this coordinator's
+    /// Whether `seat_id` in this coordinator's
     /// team plan already has an active answerer. `Filled` covers `Delegated`
     /// (a live delegation is answering for it) and `Completed` (the seat's
     /// work is done, so the plan is satisfied and must not be re-dispatched);
     /// anything else -- no node at all, `Planned`, `Failed`, `Cancelled` -- is
     /// `Empty` and free to (re)fill, which is what lets a retry after a
-    /// failure re-fill the SAME seat rather than being permanently refused.
+    /// failure re-fill the SAME seat rather than being permanently refused (#541).
     pub fn seat_filled(&self, seat_id: &str) -> bool {
         self.nodes
             .get(seat_id)
             .is_some_and(|node| matches!(node.state, NodeState::Delegated | NodeState::Completed))
     }
 
-    /// Issue #541 chunk C review finding: whether `seat_id`'s CLAIM is
-    /// currently active -- true only while a delegation is IN FLIGHT for it
-    /// (`Delegated`). Deliberately narrower than [`Self::seat_filled`],
-    /// which answers a different question (may this seat be matched again)
-    /// and treats `Completed` as filled forever: a settled seat --
-    /// `Completed`, `Failed`, `Cancelled` -- has released its claim, so a
-    /// bug-fix plan's `debugger-1` and `implementer-1` sharing a claim can
-    /// hand off sequentially (the debugger settles, THEN the implementer is
-    /// admitted) without either treating the other as a permanent conflict.
+    /// A seat claim is active only while its delegation is in flight; filled seats have a
+    /// different meaning (#541).
     pub fn seat_claim_active(&self, seat_id: &str) -> bool {
         self.nodes
             .get(seat_id)
@@ -358,13 +351,13 @@ impl Coordinator {
     }
 }
 
-/// Issue #541 chunk C, decision 1: resolves the [`TeamPlan`] a coordinator
+/// Resolves the [`TeamPlan`] a coordinator
 /// record points at, following [`TeamPlanLocation::Workflow`] through the
 /// workflow engine's own store when the plan lives there. `None` when no
 /// plan has been compiled yet, or when a `Workflow` reference names a
 /// workflow that no longer exists (deleted, or a state directory an
 /// operator pruned) -- read failure here is "no plan", never an error a
-/// bounds check has no way to surface.
+/// bounds check has no way to surface (#541).
 pub fn resolve_team_plan(state: &StateDir, repo: &Path, record: &Coordinator) -> Option<TeamPlan> {
     match record.team_plan.as_ref()? {
         TeamPlanLocation::Inline { plan } => Some(plan.as_ref().clone()),
@@ -564,23 +557,23 @@ pub struct Bounds<'a> {
     pub cancelled: bool,
     /// What the caller asked the child's mode to be. Only ever narrowed.
     pub requested_write: bool,
-    /// Issue #541 chunk C, decision 2: identity facts about the manifest this
+    /// Identity facts about the manifest this
     /// delegation named (or the role's own default). `None` when the child
     /// role is outside the closed team (`worker`, `seat`, an operator's own
     /// label) -- the manifest/team-plan system applies only to a recognised
-    /// [`team::TeamRole`], exactly like `team::authority` itself.
+    /// [`team::TeamRole`], exactly like `team::authority` itself (#541).
     pub manifest: Option<ManifestBounds<'a>>,
-    /// Issue #541 chunk C, decision 2/3: what the caller has already resolved
+    /// What the caller has already resolved
     /// about the team plan for this objective, gathered from the
     /// coordinator's own graph and the plan before `check` is called (a
     /// registry/plan lookup is I/O, so it cannot happen inside this pure
     /// function). `None` when there is no plan concept to check against --
-    /// same rule as `manifest`.
+    /// same rule as `manifest` (#541).
     pub plan: Option<PlanBounds<'a>>,
 }
 
-/// Issue #541 chunk C, decision 2: what the caller resolved about the
-/// manifest a delegation named.
+/// What the caller resolved about the
+/// manifest a delegation named (#541).
 #[derive(Clone, Copy, Debug)]
 pub struct ManifestBounds<'a> {
     pub requested_id: &'a str,
@@ -594,8 +587,8 @@ pub struct ManifestFacts {
     pub may_write: bool,
 }
 
-/// Issue #541 chunk C, decision 2/3: what the caller resolved about the team
-/// plan for this objective and this delegation's place in it.
+/// What the caller resolved about the team
+/// plan for this objective and this delegation's place in it (#541).
 #[derive(Clone, Copy, Debug)]
 pub struct PlanBounds<'a> {
     /// A plan exists for this objective -- even a zero-seat one (a Direct
@@ -633,10 +626,10 @@ pub struct Grant {
     pub write: bool,
     /// The depth the child's envelope starts from.
     pub depth: u8,
-    /// Issue #541 chunk C, decision 2: whether this grant used the
+    /// Whether this grant used the
     /// coordinator's `override: true` escape from the team-plan match rule --
     /// recorded so the launch receipt can carry it rather than leaving an
-    /// override invisible after the fact.
+    /// override invisible after the fact (#541).
     pub plan_override: bool,
 }
 
@@ -648,8 +641,8 @@ pub enum Refusal {
     ParentMayNotDelegate { role: String },
     /// The delegating session's envelope is out of delegation hops.
     DepthExhausted,
-    /// Issue #541 chunk C, decision 2: the named manifest is not one the
-    /// registry knows.
+    /// The named manifest is not one the
+    /// registry knows (#541).
     UnknownManifest { manifest_id: String },
     /// The manifest's own team role does not match the role this delegation
     /// requested for it.
@@ -717,11 +710,10 @@ impl std::error::Error for Refusal {}
 /// The pure bounds decision. No clock, no filesystem, no config: identical
 /// inputs give an identical verdict, the same discipline `rot.rs` keeps.
 ///
-/// Issue #541 chunk C: the manifest identity check and the team-plan match
-/// happen AFTER role/depth/cancellation but still entirely before any
-/// durable launch receipt exists -- a refused delegation here leaves no
-/// receipt naming work nobody started, exactly like the pre-existing three
-/// checks above them.
+/// The manifest identity check and the team-plan match happen AFTER role/depth/cancellation
+/// but still entirely before any durable launch receipt exists -- a refused delegation here
+/// leaves no receipt naming work nobody started, exactly like the pre-existing three checks
+/// above them (#541).
 pub fn check(bounds: &Bounds<'_>) -> Result<Grant, Refusal> {
     if bounds.cancelled {
         return Err(Refusal::Cancelled);

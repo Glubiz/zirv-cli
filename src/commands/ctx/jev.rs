@@ -88,11 +88,10 @@ const _: () = assert!(
     "must clear every general-field flip margin (<= 0.14)"
 );
 
-/// Issue #803: the nine sites [`JevFloorsConfig`](crate::commands::ctx::
-/// config::JevFloorsConfig) makes tunable -- every other `decisive()` call
-/// site in this crate (safety/verification gates, the harness proxy's own
-/// intake thresholds) keeps its compiled constant and has no [`floor`] call
-/// at all.
+/// The nine sites [`JevFloorsConfig`](crate::commands::ctx:: config::JevFloorsConfig) makes
+/// tunable -- every other `decisive()` call site in this crate (safety/verification gates,
+/// the harness proxy's own intake thresholds) keeps its compiled constant and has no
+/// [`floor`] call at all (#803).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloorSite {
     Memory,
@@ -106,12 +105,8 @@ pub(crate) enum FloorSite {
     Inject,
 }
 
-/// Resolves `site`'s effective `(min_confidence, min_margin)`: the operator's
-/// own `[jev.floors.<site>]` override when set, falling back field-by-field to
-/// `default_confidence`/`default_margin` -- the exact constant that call site
-/// already used before this task -- when unset. With every `[jev.floors]` key
-/// unset (the shipped default), every caller gets back exactly the pair it
-/// passed in, so behaviour is byte-identical to before this task existed.
+/// Use the site override field by field, falling back to the configured default for unset
+/// floors.
 pub(crate) fn floor(
     cfg: &CtxConfig,
     site: FloorSite,
@@ -1139,30 +1134,16 @@ struct DecisionRecord<'a> {
     /// which is exactly why a session-scoped view could not be built from
     /// them until now.
     session: &'a str,
-    /// Issue #800: this process's own campaign/candidate/trial/task ids, so
-    /// `zirv workflow spend --campaign <id>` can count this decision. Never
-    /// serialized when unset -- an existing row's JSON is byte-identical.
+    /// This process's own campaign/candidate/trial/task ids, so `zirv workflow spend
+    /// --campaign <id>` can count this decision. Never serialized when unset -- an existing
+    /// row's JSON is byte-identical (#800).
     #[serde(default, skip_serializing_if = "Attribution::is_empty")]
     attribution: Attribution,
 }
 
-/// Appends one JSON line -- `site`, a timestamp, every answer's value/
-/// confidence/probabilities/margin, `usage`, `wall_ms`, `fallbacks` and
-/// `cached` -- to `<state_dir>/jev-decisions.jsonl`, and records a
-/// `log::Delegation` spend row (agent `"typesafe"`, model from `cfg.proxy.
-/// typesafe.model`, `usage`'s input/output tokens, `wall_ms`) so `zirv ctx
-/// spend` prices the call through the same catalogue vendor the harness
-/// proxy already does -- a cache hit's own `0`/`0` `usage` naturally prices
-/// as free. The harness proxy keeps recording its own `proxy-decisions.jsonl`
-/// and spend row via `proxy::persist` -- this is for every OTHER
-/// `[jev]`-gated site, never a second record for the proxy's own call.
-/// Appends via `state::open_private_append`, the same `O_APPEND`-backed
-/// write `proxy::persist` itself uses for its own decisions file -- a prior
-/// version read the whole file, appended in memory, and rewrote it with
-/// `state::write_private`, which lost a line whenever two zirv processes
-/// recorded at the same time (review finding). Best-effort like every other
-/// append in this crate's flat logs: a write failure here must never break
-/// the caller's own (already-computed) decision.
+/// Record decision and spend together so usage remains attributable to the verdict.
+// Appends via state::open_private_append (O_APPEND): a read-then-rewrite lost lines when two zirv
+// processes recorded at once. Best-effort: a write failure must never break the caller's decision.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     state: &StateDir,
@@ -1345,13 +1326,7 @@ struct DecisionRollupRow {
     cached: bool,
     #[serde(default)]
     fallbacks: Vec<String>,
-    /// Session-scoped dash follow-up: which session recorded this row.
-    /// `#[serde(default)]` so a row written before this field existed
-    /// deserializes as `""` (empty) rather than failing to parse -- `""` is
-    /// never a real session id (`session_and_principal`'s own fallback is
-    /// `"proxy"`, never empty), so an old row simply never matches any
-    /// session-scoped filter set and is silently excluded from a session
-    /// view, exactly as if it had never happened -- never a parse error.
+    /// A missing session id deserializes as empty and never matches a real session.
     #[serde(default)]
     session: String,
 }
@@ -1485,35 +1460,9 @@ fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
     Some(sorted[idx.min(sorted.len() - 1)])
 }
 
-/// Folds `<state>/jev-decisions.jsonl` and `<state>/jev-effects.jsonl` into
-/// a per-site [`JevSiteUsage`] map, plus the window's single most recent call
-/// and latest error reason (see [`JevRollup`]), over `window_secs` looking
-/// back from now. `window_secs` is a parameter (dash refresh PR2's JEV
-/// sidebar section narrows to 24h; `zirv ctx jev status` keeps
-/// [`ROLLUP_WINDOW_SECS`], 7 days) rather than the constant itself, so one
-/// fold serves both windows. Read-only and best-effort: a missing file
-/// contributes nothing -- never an error -- and a line that isn't valid JSON
-/// or doesn't match the expected shape is skipped rather than aborting the
-/// fold, since both logs are appended to by several call sites with no
-/// cross-process locking (see [`record`]/[`record_effect`]'s own doc
-/// comments), so a torn last line is expected, not exceptional. Must stay
-/// fast: `zirv ctx jev status` is a read-only diagnostic and the dashboard
-/// reads this on its own throttled cadence, never per frame -- either way,
-/// this is the only I/O beyond loading config.
-///
-/// Session-scoped dash follow-up: both logs are a SINGLE machine-wide file
-/// (there is one `<platform state dir>/jev-decisions.jsonl`, written by
-/// every zirv process on the machine, across every repo and every day --
-/// confirmed by inspecting a real one on this box, which carried a dozen
-/// distinct session ids), so without a filter this folds every session's
-/// rows together. `sessions` is that filter: `None` keeps today's
-/// all-sessions behavior (`zirv ctx jev status`'s own 7-day, every-session
-/// view), `Some(set)` keeps only rows whose own `session` field is in it
-/// (the dashboard's session-scoped sidebar section). A row with no session
-/// at all (`DecisionRollupRow::session`/`EffectRollupRow::session`'s own
-/// `""` default, from before this field existed) never matches a `Some`
-/// filter, so it silently drops out of a session view rather than needing a
-/// special case.
+/// An empty stored session id must never match a requested session filter.
+// Read-only and best-effort: a missing file contributes nothing, and an invalid or torn line is skipped,
+// since several writers append with no cross-process lock.
 pub(crate) fn usage_rollup(
     state: &StateDir,
     window_secs: u64,

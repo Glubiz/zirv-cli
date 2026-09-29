@@ -179,11 +179,8 @@ pub fn canonical_sha256(common: Option<&str>, harness_specific: Option<&str>) ->
         .collect()
 }
 
-/// The hash a generated file states it was rendered from, if it states one.
-/// `None` for a file generated before this change, for a native file, or for
-/// a malformed line -- every one of which correctly means "cannot prove
-/// equality", which `compile.rs`'s `native_file_already_carries_canonical`
-/// (issue #155, Task 3.2) reads as "inject as before".
+/// An absent or malformed canonical hash cannot prove equivalence, so the file must be
+/// checked as stale (#155).
 pub fn embedded_canonical_sha256(text: &str) -> Option<String> {
     let line = text
         .lines()
@@ -359,22 +356,8 @@ fn import_one(
 /// caps it, not silently truncated to something smaller.
 const REPORT_MAX_SURFACE_BYTES: usize = 200_000;
 
-/// Issue #754: whether `native_path` is a zirv-managed file for which
-/// compile.rs's own dedupe would NOT fire -- i.e. `--check` must call this
-/// stale in every case where `compile::native_file_already_carries_
-/// canonical` returns `false` and re-injects the canonical layer on top of
-/// what the native file already (almost) carries. Delegates the actual
-/// "would dedupe fire" proof to that same predicate (rather than
-/// re-deriving it here) so the two can never independently drift again --
-/// this was exactly issue #754: this function used to compare bytes
-/// directly and omit `native_file_already_carries_canonical`'s
-/// `would_truncate` gate (`common`/`harness` over
-/// `cfg.context.max_common_bytes`/`max_harness_bytes`), so an oversized
-/// common.md made `--check` pass while compile's real dedupe still missed
-/// and injected the layer twice. `false` for anything that is not itself
-/// already a managed file: missing or hand-maintained is a different
-/// state, not "stale", and is `--report`'s drift/compatibility section's
-/// job to surface, not `--check`'s.
+/// Check managed native files for stale canonical content whenever compile-time
+/// deduplication would not cover them (#754).
 fn managed_native_is_stale(
     native_path: &Path,
     adapter_name: &str,
@@ -434,10 +417,10 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
         }
     )?;
 
-    // Issue #538 (chunk C), decision 4: a repo with only AGENTS.md (no
+    // A repo with only AGENTS.md (no
     // ZIRV.md, no CLAUDE.md) gets a one-line compatibility-link plan --
     // AGENTS.md is already a first-class portable source (chunk A), so the
-    // suggestion is a lone import stanza, never a full duplicate copy.
+    // suggestion is a lone import stanza, never a full duplicate copy (#538).
     if agents_present && !zirv_md_present && !claude_md_present {
         writeln!(
             w,
@@ -475,13 +458,12 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
          native files."
     )?;
 
-    // Issue #754: `--check` is a CI gate on canonical drift -- a managed
-    // native file for which compile.rs's own dedupe would not fire today
-    // (byte mismatch, or the same `would_truncate` budget gate compile.rs
-    // applies). Computed unconditionally (cheap: a config load plus a
-    // handful of file reads) but only acted on (printed, folded into the
-    // exit code) when asked, so a plain `zirv context sync`/`--report`
-    // keeps its existing output and exit code exactly.
+    // `--check` is a CI gate on canonical drift -- a managed native file for which
+    // compile.rs's own dedupe would not fire today (byte mismatch, or the same
+    // `would_truncate` budget gate compile.rs applies). Computed unconditionally (cheap: a
+    // config load plus a handful of file reads) but only acted on (printed, folded into the
+    // exit code) when asked, so a plain `zirv context sync`/`--report` keeps its existing
+    // output and exit code exactly (#754).
     let env = env_from_process();
     let cfg = CtxConfig::load(repo, &env)?;
     let common = fs::read_to_string(context::common_path(repo)).ok();
@@ -530,12 +512,11 @@ fn run_report<W: Write>(w: &mut W, repo: &Path, check: bool) -> CtxResult<i32> {
         }
     }
 
-    // Issue #275: CTX001 (budget headroom) and CTX005 (dedupe leak) are the
-    // two `zirv context lint` findings wired into this gate as errors --
-    // every other finding (CTX002/CTX003/CTX004) stays advisory-only and is
-    // never printed here; `zirv context lint` is the full report. Always at
-    // the `Standard` budget profile: this report's pass/fail must match the
-    // configured `ctx.toml` budgets exactly, never a `--budget`-scaled one.
+    // CTX001 (budget headroom) and CTX005 (dedupe leak) are the two `zirv context lint`
+    // findings wired into this gate as errors -- every other finding (CTX002/CTX003/CTX004)
+    // stays advisory-only and is never printed here; `zirv context lint` is the full
+    // report. Always at the `Standard` budget profile: this report's pass/fail must match
+    // the configured `ctx.toml` budgets exactly, never a `--budget`-scaled one (#275).
     let (layers, dedupe_leak) = gather_layers(repo, &cfg, BudgetProfile::Standard, &env);
     let lint_report = context_lint::analyze(&layers, cfg.context.lint_max_pairs, dedupe_leak);
     let blocking: Vec<&context_lint::Finding> = lint_report
@@ -679,7 +660,7 @@ struct ZirvMdPlan {
     skipped: Vec<String>,
 }
 
-/// Issue #538 (chunk C), decision 4: selects existing sources for a fresh
+/// Selects existing sources for a fresh
 /// `ZIRV.md` -- the canonical `.zirv/context/common.md` layer, plus any root
 /// `AGENTS.md`/`CLAUDE.md` content that is not already zirv-managed
 /// (`is_managed`, so `--generate`'s own output is never round-tripped back
@@ -689,7 +670,7 @@ struct ZirvMdPlan {
 /// runtime filter. Each candidate is screened with `safety::text_names_
 /// credential_material` (the one existing content screen this codebase has
 /// for credential-shaped material; no new scanner is invented here) and
-/// skipped, not silently dropped, when it trips it.
+/// skipped, not silently dropped, when it trips it (#538).
 fn build_zirv_md_plan(repo: &Path) -> ZirvMdPlan {
     let mut skipped = Vec::new();
     let mut sections = Vec::new();
@@ -755,13 +736,13 @@ fn build_zirv_md_plan(repo: &Path) -> ZirvMdPlan {
     ZirvMdPlan { content, skipped }
 }
 
-/// Issue #538 (chunk C), decision 4: `zirv context sync --init-zirv-md`.
+/// `zirv context sync --init-zirv-md`.
 /// Idempotent and non-destructive by reusing `generate_one` exactly as
 /// `--generate` does: a fresh write, an already-matching file (a repeat run
 /// with nothing changed) is `Unchanged`, and an existing file that differs
 /// is `Refused` unless `--force` is given -- `ZIRV.md` deliberately carries
 /// no `MANAGED_MARKER`, so once an operator hand-edits it, this command can
-/// never silently regenerate over that edit.
+/// never silently regenerate over that edit (#538).
 fn run_init_zirv_md<W: Write>(w: &mut W, repo: &Path, force: bool) -> CtxResult<i32> {
     writeln!(w, "zirv context sync --init-zirv-md")?;
 

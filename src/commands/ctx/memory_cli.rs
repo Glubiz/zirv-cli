@@ -1,33 +1,10 @@
 //! Top-level `zirv memory` command family (issue #33): a management surface
-//! for the memory bank (`super::memory`) that works without starting an AI
-//! session -- `status`, `list`, `recall <query>`, `remember <key> <text>`,
-//! `forget <key>`, `verify <key>`, each selecting the private (default) or
-//! shared (`--shared`) scope. Intercepted directly against raw argv in
-//! `main.rs`, the same way `ctx`/`chat`/`agent` are, rather than nested under
-//! `zirv ctx` -- see `dispatch` below.
+//! for the memory bank without starting an agent session. `status`, `list`,
+//! `recall`, `remember`, `forget`, and `verify` reuse `super::memory` operations;
+//! private remembers use the same path as `zirv ctx remember`.
 //!
-//! This wraps the scope-generic store `super::memory` already exposes
-//! (`list_scoped`/`upsert_scoped`/`forget_scoped`/`verify_scoped`,
-//! `MemoryScope`, `duplicate_keys`) rather than duplicating any of its
-//! logic. The private-scope arm of `remember` reuses `super::memory::
-//! run_remember_with` directly -- the exact code path `zirv ctx remember`
-//! itself calls -- so the two surfaces can never silently drift apart for
-//! that scope; `zirv ctx remember`/`recall`/`forget` are otherwise untouched
-//! by this module and keep working exactly as before. `recall` (issue #35)
-//! routes through `super::retrieval`'s deterministic ranking engine instead
-//! of the store's own `get_scoped` lookup -- see `run_recall_with`'s own
-//! doc comment for the resulting behavior change.
-//!
-//! Gating: `list`/`recall` are reads and respect each scope's own gate
-//! (`memory.enabled`/`memory.shared_enabled`) -- a disabled scope lists or
-//! recalls nothing, via `MemoryScope::enabled`/`list_scoped`/`get_scoped`,
-//! which already encode this. `status` is the one exception: it reports a
-//! disabled scope's counts and bytes too (marked `disabled`), the same
-//! "must never trap data" rule as `forget`/`verify`, since a byte count is
-//! not the entry content the gate exists to withhold -- see
-//! `write_scope_status`. `forget`/`verify` are maintenance verbs and stay
-//! ungated, per the "disabling a scope must never trap data" rule `forget_scoped`/
-//! `verify_scoped` already follow.
+//! Reads respect each scope's enable gate. Status may show disabled scope counts and bytes;
+//! forget and verify remain available so disabling a scope never traps its data.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -411,13 +388,7 @@ pub fn run_init<W: Write>(args: &InitArgs, w: &mut W) -> CtxResult<i32> {
     run_init_with(args, w, &std::env::current_dir()?)
 }
 
-/// Renders entries already selected from one scope. Never trusts an entry's
-/// own header for its scope label (see `memory::ScopedEntry`, shared with
-/// `zirv ctx recall`'s own JSON output rather than each surface keeping its
-/// own identical copy -- issue #172 cross-review finding 6); a shared
-/// entry's human-readable line additionally carries an explicit
-/// untrusted-content note so a repo-committed `Source: explicit` can never
-/// read as if it were operator-verified.
+/// Use the selected scope for labels; entry headers cannot override it (#172).
 fn render_entries<W: Write>(
     w: &mut W,
     entries: &[Entry],
@@ -507,12 +478,8 @@ fn render_ranked<W: Write>(
     Ok(0)
 }
 
-/// A disabled scope prints nothing on stdout (its own contract, unchanged
-/// -- `list` is a read that respects the gate). Nit (fix round, memory
-/// review): that used to be indistinguishable from a merely-empty scope,
-/// and now reads inconsistently with `status`'s "(disabled)" transparency.
-/// A one-line stderr note closes the gap without touching stdout, which a
-/// caller may be parsing (`--json` or otherwise).
+/// When a scope is disabled, print no entries and label it disabled rather than empty.
+// The note goes to stderr, never stdout, which a caller may be parsing (--json or otherwise).
 pub fn run_list_with<W: Write>(
     args: &ListArgs,
     w: &mut W,
@@ -543,15 +510,13 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W) -> CtxResult<i32> {
     run_list_with(args, w, &repo, &env)
 }
 
-/// Issue #35: routes through the deterministic ranking engine
-/// (`retrieval::rank`/`select`) instead of the old "exact key match, else
-/// substring over key/body" pair. Deliberate behavior change: an exact key
-/// match now ranks first rather than suppressing every other hit -- a
-/// query that also matches other entries by keyword/tag/path can still
-/// surface them, budgeted by `cfg.memory.retrieval_max_bytes`/
-/// `retrieval_max_entries` and never exceeding either. An empty or weak
-/// query (no signal clears the relevance floor) returns nothing, per
-/// issue #35's "never inject the whole bank" requirement.
+/// Routes through the deterministic ranking engine (`retrieval::rank`/`select`) instead of
+/// the old "exact key match, else substring over key/body" pair. Deliberate behavior
+/// change: an exact key match now ranks first rather than suppressing every other hit -- a
+/// query that also matches other entries by keyword/tag/path can still surface them,
+/// budgeted by `cfg.memory.retrieval_max_bytes`/ `retrieval_max_entries` and never
+/// exceeding either. An empty or weak query (no signal clears the relevance floor) returns
+/// nothing, per issue #35's "never inject the whole bank" requirement.
 pub fn run_recall_with<W: Write>(
     args: &RecallArgs,
     w: &mut W,
@@ -653,9 +618,9 @@ pub fn run_remember_with<W: Write>(
         // yet.
         paths: Vec::new(),
     };
-    // Issue #773: same pre-write duplicate/near-duplicate check `zirv ctx
-    // remember` runs, reused here (`memory::duplicate_write_warning`) so
-    // the two remember surfaces never drift on when they warn.
+    // Same pre-write duplicate/near-duplicate check `zirv ctx remember` runs, reused here
+    // (`memory::duplicate_write_warning`) so the two remember surfaces never drift on when
+    // they warn (#773).
     let duplicate_warning = memory::duplicate_write_warning(
         "zirv memory remember",
         scope,
@@ -665,15 +630,8 @@ pub fn run_remember_with<W: Write>(
         &cfg,
         &entry,
     );
-    // Review round 2, finding 1: `--if-unchanged` needs the check and the
-    // write under the SAME held bank lock (else a second writer could land
-    // in between), so that path takes the lock itself and calls
-    // `upsert_shared_inner` directly -- the public `upsert_shared_allow_
-    // sensitive`/`upsert_scoped` wrappers below would try to acquire a
-    // second lock on the same file and deadlock (`lock_bank`'s own doc
-    // comment). Without `--if-unchanged`, their own internal locking is
-    // enough. This call site is Shared only, guaranteed by the `scope !=
-    // Shared` return above.
+    // Hold the bank lock across the unchanged check and write, or another writer can land
+    // between them.
     let path = if let Some(expected) = &args.if_unchanged {
         let lock = memory::lock_bank(scope, &state, &slug)?;
         let existing = memory::get_scoped(scope, repo, &state, &slug, &cfg, &args.key)?;
@@ -778,15 +736,14 @@ pub fn run_verify<W: Write>(args: &VerifyArgs, w: &mut W) -> CtxResult<i32> {
     run_verify_with(args, w, &repo, &env)
 }
 
-/// Issue #38. REPORT-FIRST: `analyze`/`gather_candidates` (both read-only)
-/// run and print unconditionally; the model-driven consolidation pass only
-/// runs when `args.apply && !args.dry_run` -- `--dry-run` always overrides
-/// `--apply`, the same "safety wins" rule `zirv memory init --dry-run`
-/// follows. Resolving an adapter is deferred
-/// until a consolidation pass is actually about to run, so a plain report
-/// (the common case) never fails just because no agent is configured or
-/// available -- mirrors `surface_collect::run_with`'s own graceful degradation
-/// when an adapter cannot be resolved.
+/// REPORT-FIRST: `analyze`/`gather_candidates` (both read-only) run and print
+/// unconditionally; the model-driven consolidation pass only runs when `args.apply &&
+/// !args.dry_run` -- `--dry-run` always overrides `--apply`, the same "safety wins" rule
+/// `zirv memory init --dry-run` follows. Resolving an adapter is deferred until a
+/// consolidation pass is actually about to run, so a plain report (the common case) never
+/// fails just because no agent is configured or available -- mirrors
+/// `surface_collect::run_with`'s own graceful degradation when an adapter cannot be
+/// resolved (#38).
 pub fn run_optimize_with<W: Write>(
     args: &OptimizeArgs,
     w: &mut W,
