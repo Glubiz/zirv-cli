@@ -34,9 +34,7 @@ use crate::commands::ctx::CtxResult;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 const MAX_WORKFLOW_DIRECTORY_ENTRIES: usize = 512;
 
-/// Capabilities the widening refusal polices (issue #542 architecture §2):
-/// a repository pack may only declare one of these on a step when some
-/// built-in pack already declares it on one of its own steps, anywhere.
+/// Repository steps may declare a capability only if some built-in pack already declares it. (#542)
 const WATCHED_CAPABILITIES: [CapabilityId; 5] = [
     CapabilityId::RepoWrite,
     CapabilityId::ShellExec,
@@ -83,7 +81,6 @@ fn builtin_sources() -> [(&'static str, &'static str); 32] {
         ("spike", include_str!("packs/spike.toml")),
         ("review", include_str!("packs/review.toml")),
         ("adaptive-work", include_str!("packs/adaptive-work.toml")),
-        // Issue #542 chunk 4: first-wave professional packs, one per group.
         (
             "pm-requirements",
             include_str!("packs/pm-requirements.toml"),
@@ -124,7 +121,6 @@ fn builtin_sources() -> [(&'static str, &'static str); 32] {
             "security-remediation",
             include_str!("packs/security-remediation.toml"),
         ),
-        // Issue #542 chunk 5: the remaining catalogue.
         (
             "pm-backlog-triage",
             include_str!("packs/pm-backlog-triage.toml"),
@@ -186,13 +182,7 @@ fn builtin_sources() -> [(&'static str, &'static str); 32] {
     ]
 }
 
-/// Parses ONE embedded built-in pack by id, without constructing a whole
-/// registry (no skill-registry cross-check, no disk I/O) -- issue #542
-/// chunk 3a: `engine::WorkflowState::start`'s fallback when a live registry
-/// lookup is unavailable or does not (yet) know this id. Built-in pack text
-/// is compiled into the binary and proven to parse by `every_builtin_pack_
-/// parses_and_validates`, so a parse failure here is a build-time invariant
-/// violation, not a runtime condition callers need to handle.
+/// Parse one embedded built-in pack without disk or registry lookup; parse failure violates the tested built-in invariant. (#542)
 pub(crate) fn builtin_definition(id: &str) -> Option<WorkflowDefinitionV2> {
     let (_, text) = builtin_sources()
         .into_iter()
@@ -548,12 +538,7 @@ fn widening_violation(
         }
     }
 
-    // Issue #542 review finding 8: the gate-floor check below only compares
-    // `candidate` against built-in packs whose `domains` INTERSECT its own --
-    // an empty `domains` list intersects nothing, so a repository pack could
-    // silently skip the gate-floor comparison entirely (and every built-in
-    // domain's gate floor with it) simply by omitting `domains`. A
-    // repository pack must now declare at least one domain outright.
+    // Require a repository pack to declare a domain so it cannot skip built-in gate-floor comparisons. (#542)
     if candidate.domains.is_empty() {
         return Some(
             "must declare at least one `domains` tag -- an empty list would let the gate-floor \
@@ -573,12 +558,7 @@ fn widening_violation(
     for builtin in registered
         .values()
         .filter(|workflow| workflow.source == WorkflowSource::BuiltIn)
-        // Defense in depth alongside the empty-`domains` rejection just
-        // above (issue #542 review finding 8): even if that check were ever
-        // reordered or bypassed, a candidate with no domains still compares
-        // against the FULL built-in set here rather than an empty
-        // intersection -- it can never silently clear every built-in
-        // domain's gate floor for free.
+        // An empty-domain candidate compares against every built-in gate floor as defense in depth. (#542)
         .filter(|workflow| {
             candidate.domains.is_empty()
                 || workflow

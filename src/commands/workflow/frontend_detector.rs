@@ -184,13 +184,7 @@ pub struct DetectorFinding {
     pub disposition: FindingDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiver: Option<WaiverProvenance>,
-    /// True when this finding's path was NOT in the workflow's since-base
-    /// change set at scan time -- a full-surface (Review/Verify) scan tags
-    /// every finding this way so the gate can fail closed on anything the
-    /// current change introduced while still surfacing (rather than
-    /// silently hiding) what was already there (#251). Always `false` for a
-    /// scan that never had a baseline to compare against, such as a bare
-    /// `zirv frontend check`.
+    /// Mark findings outside the since-base change set as pre-existing; without a baseline, never infer that status. (#251)
     #[serde(default)]
     pub preexisting: bool,
 }
@@ -364,14 +358,7 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<DetectorRe
     Ok(Some(report))
 }
 
-/// H-3: `require_full_surface` mirrors `detect_for_workflow`'s own parameter
-/// -- a Review/Verify gate needs a full-repository (`DetectorScope::All`)
-/// scan, and a cached `Changed`/`Explicit`-scope report (e.g. from the Test
-/// step, or a bare `zirv frontend check --path one.tsx`) must not be accepted
-/// as satisfying it, even when it is otherwise fresh and passing: it never
-/// looked at most of the repository. A `Changed`-scope requirement (the Test
-/// gate) still accepts any scope, since a broader scan is strictly more
-/// evidence than a narrower requirement needs.
+/// A full-surface Review/Verify gate requires an `All` scan; narrower cached reports cannot prove the rest of the repository was checked.
 pub fn latest_is_fresh_and_passing(
     state: &StateDir,
     repo: &Path,
@@ -418,21 +405,7 @@ pub fn detect(
     detect_with_scope(state, &repo, scope, paths, truncated, None)
 }
 
-/// The workflow-facing entry point (#251/#255). Unlike the standalone
-/// `detect` above, this always measures the since-base change set
-/// (`verification::changed_paths_since_base`, which -- unlike
-/// `changed_paths` -- still sees a change once an earlier step has
-/// committed it) and uses it two ways:
-///
-/// - When `require_full_surface` is false (the Test-phase gate), scope is
-///   ALWAYS `Changed` over that since-base set -- never a whole-repository
-///   fallback, which used to fire the moment the change set went quiet
-///   after a commit and fail the gate on unrelated pre-existing findings.
-/// - When `require_full_surface` is true (Review/Verify), the scan still
-///   covers the whole repository, but every finding is tagged
-///   `preexisting` against the since-base set so the gate (and an operator
-///   reading the report) can tell a finding this change introduced from one
-///   that was already there.
+/// Use since-base paths for Test’s changed-only scan and for pre-existing tags on Review/Verify’s full scan. (#251, #255)
 pub fn detect_for_workflow(
     state: &StateDir,
     repo: &Path,
@@ -612,18 +585,7 @@ fn has_denied_component(path: &Path) -> bool {
     })
 }
 
-/// #251: the hand-rolled walk below does not honor `.gitignore`, so a
-/// generated build artifact directory a repository never bothered to add to
-/// the deny list above (`.gitlab-ci-local/builds/.docker` in the wild) still
-/// got scanned. When `repo` is a git work tree, ask git for the candidate
-/// list instead -- tracked plus untracked-not-ignored -- which is both
-/// `.gitignore`-aware and cheaper than a manual recursive walk.
-///
-/// `Ok(None)` when git could not be spawned OR exited non-zero -- never a
-/// silent empty candidate list, which `collect_all` below would otherwise
-/// be unable to tell apart from a repository that genuinely has zero
-/// frontend files, failing the whole scan open into a "not applicable" pass
-/// on what was actually a git failure.
+/// Use Git’s tracked and untracked-not-ignored paths for full scans; a Git failure returns `None`, never an empty passing candidate list. (#251)
 fn collect_all_via_git(repo: &Path) -> CtxResult<Option<(Vec<PathBuf>, bool)>> {
     let Ok(output) = Command::new("git")
         .arg("-C")

@@ -43,11 +43,7 @@ pub enum RiskBand {
     Critical,
 }
 
-/// Whether the Git-based safety net that re-measures a declared or
-/// previously-classified risk band actually ran. `Unavailable` is a distinct
-/// state from "measured, no escalation needed" -- collapsing the two used to
-/// let a mis-declared low-risk scope stand unchallenged in exactly the case
-/// zirv can see least (outside a repository, or one with no commits).
+/// Distinguish unavailable Git measurement from a measured low-risk change; unavailable measurement cannot validate a declared risk band.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RiskMeasurement {
@@ -135,14 +131,7 @@ pub struct Classification {
     pub risk_score: u16,
     pub changed_files: usize,
     pub changed_lines: usize,
-    /// The changed paths themselves, bounded (issue #541 chunk C, decision
-    /// 3): the team compiler needs REAL path boundaries to split implementer
-    /// seats by claim, not just a count. Capped at
-    /// [`MAX_CHANGED_PATHS`] so a huge diff never inflates a durable
-    /// classification or a persisted `TeamPlan`; `changed_files` above stays
-    /// the true total even when this list was truncated. Older durable state
-    /// defaults safely to empty, which the team compiler treats exactly like
-    /// "no path detail available" (falls back to bucketing by count).
+    /// Keep real path boundaries for team seat claims, capped to bound durable state; `changed_files` remains the true total. Missing older data falls back to count bucketing. (#541)
     #[serde(default)]
     pub changed_paths: Vec<String>,
     /// The change surface was declared on the command line (`--path`/
@@ -156,10 +145,7 @@ pub struct Classification {
     /// permissions; older durable state defaults safely to `general`.
     #[serde(default)]
     pub work_domain: DomainClassification,
-    /// Whether the Git-based re-measurement that backs `risk` actually ran.
-    /// Older durable state defaults safely to `Measured` (its pre-existing,
-    /// unlabeled behavior): this field is additive, not a reinterpretation of
-    /// history.
+    /// Git re-measurement status; older state defaults to `Measured` to preserve its existing interpretation.
     #[serde(default)]
     pub risk_measurement: RiskMeasurement,
     pub reasons: Vec<String>,
@@ -199,10 +185,7 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         })
         .collect();
     let mut sensitive_floor: Option<RiskBand> = None;
-    // `max`, and derived from the signal's own return value rather than from
-    // string-matching the reasons vector: a later signal must never be able to
-    // lower a floor an earlier one set, and a reason worded differently must
-    // never be able to drop the floor entirely.
+    // Take the maximum signal floor directly from each signal; later signals and wording changes must never lower it.
     let raise_floor = |band: RiskBand, floor: &mut Option<RiskBand>| {
         *floor = Some(floor.map_or(band, |current: RiskBand| current.max(band)));
     };
@@ -337,15 +320,10 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
     })
 }
 
-/// Bounded so a huge diff never inflates a durable classification or a
-/// persisted `TeamPlan` (issue #541 chunk C, decision 3).
+/// Cap paths so a huge diff cannot inflate a durable classification or `TeamPlan`. (#541)
 pub const MAX_CHANGED_PATHS: usize = 200;
 
-/// The task-text keywords [`infer_work_domain`] scans for a frontend
-/// surface, promoted out of it so the workflow module's own metadata-only
-/// Jev classify refinement (issue #782, `profile::refine_via_jev`) can count
-/// the same keyword hits as one of its per-domain facts instead of carrying
-/// a second copy of this list.
+/// Shared frontend keywords keep domain classification and Jev refinement consistent. (#782)
 pub(crate) const FRONTEND_TASK_TERMS: [&str; 10] = [
     "frontend",
     "front-end",
@@ -362,10 +340,7 @@ pub(crate) const FRONTEND_TASK_TERMS: [&str; 10] = [
 fn infer_work_domain(task: &str, paths: &[PathBuf]) -> DomainClassification {
     let mut score = 0u8;
     let mut reasons = Vec::new();
-    // #255: capped below the 45 selection threshold -- task text alone can
-    // no longer select the Frontend domain. The bare word "frontend" shows
-    // up in plenty of non-UI work (permission families, CLI flags, docs);
-    // Frontend must also see at least one real frontend path signal below.
+    // Task text alone stays below the Frontend threshold; require a real frontend path because the word also appears in non-UI work. (#255)
     if FRONTEND_TASK_TERMS.iter().any(|term| task.contains(term))
         || task.starts_with("ui ")
         || task.ends_with(" ui")
@@ -612,15 +587,7 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
         return Some(Intent::Review);
     }
     if FEATURE_LEAD.contains(&lead) {
-        // Adjustment (a), narrowed: a feature lead followed within the next
-        // 3 tokens by fix/bugfix/hotfix is Bugfix ("Implement a fix for the
-        // login crash") ONLY when that word is either the task's very last
-        // token, or is directly followed by one of for/to/in/on -- a bare
-        // mention of the word as an ordinary noun phrase ("Add a bugfix
-        // changelog section") must stay Feature. Review finding: EVERY
-        // fix/bugfix/hotfix token in the window is checked, not just the
-        // first -- "Implement a fix/hotfix for startup" must still trigger
-        // on "hotfix" even though the earlier "fix" alone doesn't qualify.
+        // A nearby fix term changes a feature to Bugfix only at task end or before for/to/in/on; inspect every term in the window so an earlier nonqualifying one cannot hide a later match.
         let window_end = (start + 4).min(tokens.len());
         let triggers_bugfix = (start + 1..window_end).any(|index| {
             matches!(tokens[index], "fix" | "bugfix" | "hotfix") && {
@@ -671,15 +638,7 @@ fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
     None
 }
 
-/// Deterministic intent classification from `task` (already lowercased by
-/// [`classify`]). Whole-word tokens only, never a substring match ("prefix"
-/// no longer contains "fix", "explorer" no longer contains "explore").
-/// Tier 1 reads the task's own leading verb, once leading filler is
-/// skipped -- the strongest, most literal signal of
-/// what is being asked. Tier 2, reached only when tier 1 found no leading
-/// verb, falls back to a whole-word scan anywhere in the task, in a fixed
-/// priority order. An empty or entirely-filler task matches neither tier and
-/// is [`Intent::Other`].
+/// Classify whole-word intent tokens by leading verb, then fixed-priority fallback; substrings and filler-only tasks do not match.
 fn infer_intent(task: &str) -> Intent {
     let tokens = word_tokens_ordered(task);
 
@@ -719,34 +678,12 @@ fn band_for_score(score: u16) -> RiskBand {
     }
 }
 
-/// True for a repo-relative path whose first component is `.zirv`.
-///
-/// `.zirv/work/` (workflow work products) and other `.zirv/` state are
-/// deliberately not gitignored, so they show up as untracked paths. That
-/// state is zirv's own bookkeeping, not the operator's change surface, and
-/// must never drive a workflow's classification (a stale
-/// `.zirv/work/<id>/*.html` from an earlier workflow has previously flipped
-/// unrelated workflows to the Frontend domain).
+/// Exclude `.zirv` bookkeeping from classification; untracked work products must never determine the operator’s work domain.
 fn is_zirv_owned_path(path: &Path) -> bool {
     matches!(path.components().next(), Some(std::path::Component::Normal(name)) if name == ".zirv")
 }
 
-/// True for a repo-relative path whose first two components are
-/// `.zirv/work` -- the workflow's own work-product directory (plans,
-/// execute-plan artifacts, raw reviewer salvage). Narrower than
-/// `is_zirv_owned_path` above (which also covers `.zirv/ctx.toml` and other
-/// repository config a reviewer legitimately needs to see): a review
-/// package and its staleness fingerprint must ignore workflow bookkeeping
-/// specifically, not every `.zirv/` path, or a real change to
-/// `.zirv/commands/*` would silently vanish from what gets reviewed.
-///
-/// #229/#232: an operator ticking a checkbox in the untracked
-/// `.zirv/work/<id>/plan.md` while an independent review ran changed the
-/// repository's change-set fingerprint out from under the review, so the
-/// completed round was refused with "the change set changed during
-/// review" even though nothing the reviewer was asked to look at had
-/// changed. `review::package` and `verification::change_fingerprint` both
-/// exclude paths this returns true for.
+/// Ignore only `.zirv/work` bookkeeping in review and fingerprints; excluding all `.zirv` would hide real config or script changes. (#229, #232)
 pub(crate) fn is_workflow_work_path(path: &Path) -> bool {
     let mut components = path.components();
     matches!(components.next(), Some(std::path::Component::Normal(name)) if name == ".zirv")
@@ -790,10 +727,7 @@ fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf
 }
 
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
-    // The same base `review::package` uses (merge-base against origin/main,
-    // then main, then HEAD^, then HEAD). Measuring against bare HEAD made
-    // classification and review disagree about what "the change" even is:
-    // everything already committed on the branch was invisible here.
+    // Measure against the same merge base as review so committed branch changes remain visible to classification.
     let base = super::review::default_base(repo)?;
     let (mut paths, mut lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base])?;
     let untracked = Command::new("git")
@@ -849,17 +783,7 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
     })
 }
 
-/// Like [`git_change_input`], but diffs `branch` against its own base as
-/// pure refs (`git diff --numstat <base> <branch>`) rather than `repo`'s
-/// working tree -- for `--branch <name>` (issue #467): the checkout given as
-/// `repo` need not have `branch` checked out at all (an orchestrator's main
-/// checkout classifying a worker's feature branch). No untracked-file scan:
-/// there is no working tree standing in for `branch`'s own content to
-/// sample. A currently-checked-out branch with uncommitted edits given via
-/// `--branch` will therefore not see those edits reflected here -- accepted,
-/// since `--branch`'s purpose is inspecting a branch this checkout is NOT
-/// sitting on; plain `git_change_input` already covers the checkout's own
-/// current branch, uncommitted edits included.
+/// Diff the named branch against its base as refs because `repo` need not have it checked out. There is no worktree to scan for untracked or uncommitted content. (#467)
 pub fn git_change_input_for_branch(
     repo: &Path,
     branch: &str,
@@ -953,17 +877,7 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
         return Ok(classification);
     }
     classification.declared_scope = true;
-    // Declared inputs used to switch Git measurement off entirely, which
-    // turned `--path README.md` into a way to talk a real auth-file change
-    // down from High to Low and drop the review step with it. Declared and
-    // measured are both computed; the risk band is the higher of the two.
-    //
-    // When Git itself cannot be measured (no repository, or one with no
-    // commits) the old behavior silently kept the declared band -- treating
-    // "I could not check" as "I checked and it was fine". That fails open at
-    // exactly the moment a mis-declared low-risk scope is hardest to catch.
-    // `mark_unavailable` fails safe instead: it records the unmeasured state
-    // and escalates the risk band one step.
+    // Combine declared and Git-measured risk at the higher band; if Git cannot be measured, record that state and raise risk one step so declarations cannot bypass review.
     let Ok(mut measured) = measured_input(&repo, args.branch.as_deref(), args.task.clone()) else {
         mark_unavailable(
             &mut classification,

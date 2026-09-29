@@ -113,11 +113,7 @@ impl WorkflowKind {
         }
     }
 
-    /// The inverse of [`Self::intent`] -- `None` for [`Intent::Other`],
-    /// which has no legacy kind counterpart. Issue #542 chunk 3b: `select_
-    /// definition` uses this so a classified software-development intent
-    /// still selects its own kind pack outright, unchanged from before
-    /// selection existed.
+    /// Map classified intent to a legacy kind when one exists; `Other` has none. (#542)
     pub(crate) fn from_intent(intent: Intent) -> Option<Self> {
         match intent {
             Intent::Feature => Some(Self::Feature),
@@ -129,11 +125,7 @@ impl WorkflowKind {
         }
     }
 
-    /// The `WorkflowKind` a [`crate::commands::workflow::registry::WorkflowRegistry`] pack id
-    /// names, for the five kinds converted to `packs/*.toml` (issue #542).
-    /// `None` for any other registry id -- a v2-only definition with no
-    /// legacy kind counterpart, which `workflow start` cannot yet execute
-    /// (selection/execution of an arbitrary v2 definition is chunk 3).
+    /// Map only the five legacy pack ids to `WorkflowKind`; other registry ids have no legacy counterpart. (#542)
     pub fn from_pack_id(id: &str) -> Option<Self> {
         match id {
             "feature" => Some(Self::Feature),
@@ -186,13 +178,7 @@ impl std::fmt::Display for ArtifactStage {
     }
 }
 
-/// A pinned reference to the [`crate::commands::workflow::definition::WorkflowDefinitionV2`]
-/// pack a workflow run started from (issue #542, chunks 1+2). Persisted on
-/// [`WorkflowState`] so update, resume and rollover cannot change the run's
-/// meaning silently: `status` re-resolves `id` against the CURRENT registry
-/// and reports drift when `hash` no longer matches, but the run itself keeps
-/// executing against whatever this reference (and, for a non-built-in
-/// definition, `inline` below) already pinned.
+/// Pin the pack id, version and hash so updates cannot silently change a running workflow; status reports drift. (#542)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefinitionRef {
     pub id: String,
@@ -229,10 +215,7 @@ pub enum StepCondition {
     },
 }
 
-/// Whether `condition` admits `classification` -- shared by [`WorkflowStep::
-/// applies`] (state already materialized, kept for callers reading a
-/// persisted step) and [`crate::commands::workflow::definition::StepV2`]'s own pruning at
-/// materialize time (issue #542 chunk 3a), so the two can never drift.
+/// Share condition evaluation between materialization and persisted-step readers so they cannot diverge. (#542)
 pub(super) fn condition_applies(condition: StepCondition, classification: &Classification) -> bool {
     match condition {
         StepCondition::Always => true,
@@ -259,14 +242,9 @@ pub struct WorkflowStep {
     pub condition: StepCondition,
     pub approval: bool,
     pub max_attempts: u8,
-    /// Issue #542 chunk 3a: carried straight from `StepV2::parallel_group`.
-    /// Informational for now -- the state machine is still the single
-    /// `current_step` index it always was; a future scheduler can use this
-    /// tag to run same-group steps concurrently without a state-shape
-    /// change, since it already round-trips through persisted state.
+    /// Persist the parallel group as metadata; the state machine still advances through one current step. (#542)
     #[serde(default)]
     pub parallel_group: Option<String>,
-    /// Issue #542 chunk 3a: carried straight from `StepV2::effect`.
     #[serde(default)]
     pub effect: crate::commands::workflow::definition::EffectClass,
 }
@@ -694,32 +672,8 @@ pub struct AcceptedPreexistingFindings {
     pub total: usize,
 }
 
-/// Resolves which `StepV2` supplies a step's non-structural data (`skills`,
-/// `agent_role`, `capabilities`-derived `effect`, `approval`, `artifact`,
-/// `max_attempts`) for `profile` -- issue #542 chunk 3a, replacing the old
-/// hardcoded `WorkflowProfile`-keyed Rust match table with pack data. A
-/// step's canonical `id`/`phase`/`depends_on`/`parallel_group`/`condition`
-/// always come from `primary`, never from a variant: see
-/// [`crate::commands::workflow::definition::StepV2::overrides_step`]'s own doc comment for why.
-///
-/// `WorkflowProfile::Standard` always resolves to `primary` itself (there is
-/// no "standard" domain tag to match); `WorkflowProfile::Frontend` prefers a
-/// step with `overrides_step == Some(primary.id)` and `domains` containing
-/// `"frontend"`, falling back to `primary` when no such variant exists (a
-/// pack with no frontend variant for this step -- for example `WorkflowPhase
-/// ::Intent`/`Deploy` -- behaves identically under either profile, matching
-/// the old table's explicit `continue` for those phases).
-/// Issue #542 review finding 12: the phases a domain variant can never
-/// override -- shared by `materialize_from_definition` (the initial build)
-/// and `apply_profile` (a later `workflow reclassify`/mid-run Frontend
-/// detection re-selection), so the two can never drift apart on which
-/// phases are profile-invariant. Before this fix, `materialize_from_
-/// definition` skipped no phase at all (relying entirely on no built-in pack
-/// happening to author a variant for these phases, an implicit invariant),
-/// while `apply_profile` hardcoded the identical-looking list separately;
-/// a future pack authoring e.g. a Deploy-phase frontend variant would then
-/// have made the initial materialize and a later reclassify silently
-/// disagree.
+/// Select profile-specific step data while keeping canonical id, phase, dependencies and order; profile-invariant phases use the primary step. (#542)
+// Shared by materialize_from_definition and apply_profile so initial build and later reclassify can never disagree on which phases are profile-invariant. (#542)
 pub(super) const PROFILE_INVARIANT_PHASES: [WorkflowPhase; 4] = [
     WorkflowPhase::Intent,
     WorkflowPhase::Deploy,
@@ -746,14 +700,7 @@ pub(super) fn select_step_data<'a>(
         .unwrap_or(primary)
 }
 
-/// Re-selects every already-materialized step's profile-specific data
-/// in place, without disturbing `id`/`phase`/order/completed-step tracking
-/// -- issue #542 chunk 3a. Used by `WorkflowState::set_profile`/`workflow
-/// reclassify` and by automatic mid-run Frontend detection
-/// (`reclassify_at_gate`) to relabel an IN-PROGRESS step list. A step whose
-/// id no longer names a primary step in `definition` (should not happen for
-/// a definition resolved by `resolve_definition_for_state`, but a defensive
-/// no-op rather than a panic if it ever does) is left untouched.
+/// Re-select profile data in place without changing step identity or completion; unknown primary ids are left untouched. (#542)
 pub(super) fn apply_profile(
     definition: &crate::commands::workflow::definition::WorkflowDefinitionV2,
     profile: WorkflowProfile,
@@ -784,32 +731,12 @@ pub(super) fn apply_profile(
     }
 }
 
-/// Default intent-step skill per kind, absent a `--brainstorm`/
-/// `--no-brainstorm` override: on for exploratory Feature/Spike, off for
-/// Bugfix/Refactor's autonomous default. `Review` has no intent step.
-/// `WorkflowKind` remains the legacy id set (issue #542 chunk 3a decision
-/// 3): a registry id with no legacy kind counterpart has no per-kind
-/// default here, so its caller (`workflow start`'s CLI handler) falls back
-/// to the autonomous default instead of calling this.
+/// Legacy intent defaults use brainstorming for Feature/Spike and autonomous writing for Bugfix/Refactor; other packs use their authored skill. (#542)
 pub(super) fn default_brainstorm_for_kind(kind: WorkflowKind) -> bool {
     matches!(kind, WorkflowKind::Feature | WorkflowKind::Spike)
 }
 
-/// Selects the intent step's skill, same shape as `apply_profile`. Keyed on
-/// `WorkflowPhase`, but -- issue #542 review finding 11 -- gated on
-/// `legacy_eligible` (whether this run's pack is one of the five legacy kind
-/// ids: `WorkflowKind::from_pack_id` resolves it): the "brainstorm" vs.
-/// "write-intent" toggle is a legacy Feature/Bugfix/Refactor/Spike/Review
-/// concept, not a general one. Before this fix, `start_from_pack`'s harmless
-/// `WorkflowKind::Feature` placeholder for a pack with no legacy counterpart
-/// fed straight into `default_brainstorm_for_kind`, which returns `true` for
-/// `Feature` -- so EVERY non-legacy pack (all thirty-plus chunk-4/5
-/// professional packs, none of which ever declares a `brainstorm` skill)
-/// silently had its authored `write-intent` intent step swapped to
-/// `brainstorm` at start, a skill the pack author never chose and the pack's
-/// own `validate()` never even required to exist for it. `legacy_eligible ==
-/// false` now leaves every non-legacy pack's intent step exactly as its
-/// definition authored it, regardless of the resolved `brainstorm` bool.
+/// Apply brainstorm/write-intent substitution only to legacy packs; non-legacy packs retain their authored intent skill. (#542)
 pub(super) fn apply_brainstorm_selection(
     brainstorm: bool,
     legacy_eligible: bool,
@@ -830,10 +757,7 @@ pub(super) fn apply_brainstorm_selection(
     }
 }
 
-/// Already keyed on `WorkflowPhase`, never on `WorkflowKind` or any pack id
-/// (issue #542 chunk 3a decision 2): any pack's Deploy/Verify-phase steps
-/// work with this unchanged. The synthetic Review step it may insert is a
-/// fixed production-readiness safety net, not pack-authored data.
+/// Apply deploy readiness by phase for any pack; an inserted Review step is a fixed safety gate. (#542)
 pub(super) fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>) {
     if tier == DeployTier::Production
         && !steps.iter().any(|step| step.phase == WorkflowPhase::Review)
@@ -843,16 +767,7 @@ pub(super) fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>)
     {
         steps.insert(
             verify_index,
-            // Issue #542 review nit: `__review` rather than `review` -- a
-            // reserved id `valid_id` itself can never accept for an authored
-            // step (it must start with a lowercase letter or digit, never
-            // `_`), so this synthetic production-safety step can never
-            // collide with a pack-authored step that happens to name itself
-            // "review" for some OTHER phase (an authored Review-phase step
-            // named "review", like several built-in packs have, is never a
-            // collision risk in the first place: the `!steps.iter().any(...
-            // WorkflowPhase::Review)` guard above already skips this
-            // insertion whenever any Review-phase step already exists).
+            // Use reserved `__review` so a synthetic safety step cannot collide with authored step ids. (#542)
             step(
                 "__review",
                 WorkflowPhase::Review,
@@ -864,24 +779,13 @@ pub(super) fn apply_deploy_tier(tier: DeployTier, steps: &mut Vec<WorkflowStep>)
     }
     for step in steps {
         if step.phase == WorkflowPhase::Deploy {
-            // Issue #542 review finding 7: this must only ever WIDEN the
-            // gate, never clear one the pack itself authored -- a lower
-            // deploy tier is not license to silently drop an approval a
-            // pack's own Deploy-phase step declared unconditionally.
+            // A deploy-tier overlay may widen approval but must never clear a gate authored by the pack. (#542)
             step.approval = step.approval || tier >= DeployTier::Staging;
         }
     }
 }
 
-/// Builds this run's step list directly from a `WorkflowDefinitionV2` --
-/// issue #542 chunk 3a, decision 1: the ONLY step-list construction path a
-/// real `zirv workflow start` runs. Prunes by `StepCondition` (unchanged
-/// semantics), resolves each surviving step's profile-specific data via
-/// [`select_step_data`], orders the result by dependency (`depends_on`, a
-/// stable topological sort -- Kahn's algorithm, ties broken by declaration
-/// order in the source pack), then applies the brainstorm and deploy-tier
-/// overlays exactly as before. A new pack -- including one with a
-/// `domains = ["frontend"]` variant step -- needs no Rust code here.
+/// Materialize one validated definition by pruning, profile selection and stable dependency order, then apply intent and deploy overlays. (#542)
 pub(super) fn materialize_from_definition(
     definition: &crate::commands::workflow::definition::WorkflowDefinitionV2,
     classification: &Classification,
@@ -953,10 +857,7 @@ pub(super) fn materialize_from_definition(
         .into_iter()
         .map(|id| {
             let primary = primaries_by_id[id];
-            // Issue #542 review finding 12: explicit now, not merely
-            // implicit in no built-in pack ever authoring a variant for
-            // these phases -- see `PROFILE_INVARIANT_PHASES`'s own doc
-            // comment.
+            // Enforce profile-invariant phases in initial materialization as well as later reclassification. (#542)
             let effective = if PROFILE_INVARIANT_PHASES.contains(&primary.phase) {
                 primary
             } else {
@@ -990,13 +891,7 @@ pub(super) fn materialize_from_definition(
     steps
 }
 
-/// The `WorkflowDefinitionV2` a live/persisted `WorkflowState` is actually
-/// running against (issue #542 chunk 3a): the pinned inline copy (a
-/// non-built-in pack), else the CURRENT built-in pack matching the pinned
-/// id, else -- for a v1/schema-4 state with no pin at all -- the built-in
-/// pack for `state.kind`. Always resolves to SOME definition: a built-in
-/// pack id always parses (`every_builtin_pack_parses_and_validates`), so
-/// this never needs to be fallible.
+/// Resolve the pinned inline definition, matching built-in, or legacy kind fallback; built-in parsing is a tested invariant. (#542)
 pub(super) fn resolve_definition_for_state(
     state: &WorkflowState,
 ) -> crate::commands::workflow::definition::WorkflowDefinitionV2 {
@@ -1014,15 +909,7 @@ pub(super) fn resolve_definition_for_state(
         .expect("every WorkflowKind maps to a built-in pack")
 }
 
-/// Resolves the pack `kind` should start from: a live, registry-aware
-/// lookup (so an operator's `override = true` global pack, or an enabled
-/// repository pack, wins the same way `workflow start <id>` already
-/// respects the registry) when one succeeds, else the pure embedded
-/// built-in text -- issue #542 chunk 3a. Best-effort by design: an
-/// unreadable registry must not block `WorkflowState::start`, which stays
-/// infallible for its ~90 non-CLI callers across the codebase (test
-/// fixtures in unrelated modules, none of which care about registry
-/// overrides).
+/// Prefer a live registry override; unreadable registry falls back to embedded built-in data so state start remains infallible. (#542)
 pub(super) fn resolve_builtin_or_registry(
     repo: &Path,
     kind: WorkflowKind,
@@ -1047,17 +934,7 @@ pub(super) fn resolve_builtin_or_registry(
     )
 }
 
-/// Skill ids that compose one materialized step. The primary step skill stays
-/// stable for state/back-compat; substantial implementation additionally
-/// receives the resume-safe accepted-plan executor, whose own dependency stack
-/// includes worktree isolation and the general implementation discipline.
-///
-/// Private: `render_current_context` (this module) is its only caller. Issue
-/// #539 chunk E2.2 briefly made this `pub(crate)` for a task-matched
-/// suggestions layer in `ctx::prompt`; that layer was removed in chunk F
-/// (the operator's own design decision: zirv only surfaces which skills
-/// exist, via a stable session-wide index, and never pre-selects one for a
-/// task), so the cross-module visibility is no longer needed.
+/// Compose step skills from the primary skill and accepted-plan executor when needed; this helper is private to context rendering. (#539)
 pub(super) fn step_skill_ids(step: &WorkflowStep, classification: &Classification) -> Vec<String> {
     let mut ids = Vec::new();
     // `simplify` shares the Implement phase but is a reuse pass over a

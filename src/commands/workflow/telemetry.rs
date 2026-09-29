@@ -15,28 +15,14 @@ use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, prune_to_newest, repo_slug, write_private,
 };
 
-/// Issue #699 Phase 0: the "build" (implement) side of the prompt-to-PR
-/// split -- everything up to and including `implement`, classified by
-/// `WorkflowPhase` rather than by step id so a domain variant step (for
-/// example `implement-frontend`, whose `phase` is still `Implement`) lands
-/// in the right bucket automatically. `Debug`/`Delegate`/`Present` are
-/// intentionally in neither array: they are informational phases outside
-/// the `feature`/`bugfix` pack spine this issue measures, so a workflow
-/// using them contributes nothing to either side rather than being guessed
-/// into one.
+/// Build timing includes phases through Implement, keyed by phase so domain variants stay in the same bucket; informational phases are excluded. (#699)
 const BUILD_PHASES: [WorkflowPhase; 4] = [
     WorkflowPhase::Intent,
     WorkflowPhase::Design,
     WorkflowPhase::Plan,
     WorkflowPhase::Implement,
 ];
-/// The "validate" side. `Deploy` (the pack's "Finish branch" step) is
-/// deliberately bucketed here, not with `BUILD_PHASES`: issue #699's own
-/// problem statement explicitly lists "finish-branch" alongside
-/// test/review/verify as part of the ~75% validation-and-fixing side, not
-/// the ~25% build side -- CLAUDE.md's own required `cargo build && cargo
-/// nextest run --no-fail-fast && cargo fmt -- --check && cargo clippy
-/// --all-targets -- -D warnings` gate runs at exactly this step.
+/// Validate timing includes Test, Review, Verify and Deploy, where finish-branch gates run. (#699)
 const VALIDATE_PHASES: [WorkflowPhase; 4] = [
     WorkflowPhase::Test,
     WorkflowPhase::Review,
@@ -62,10 +48,7 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    /// The operator's `[workflow]` config, with this module's hard caps still
-    /// applied on top. Retention/enablement used to come straight from the
-    /// process environment, which any repository script could set for itself;
-    /// the keys now live in `ctx.toml` and are `REPO_FORBIDDEN`.
+    /// Use operator-owned workflow config with hard caps; repository scripts cannot change telemetry authority.
     pub fn from_config(cfg: &crate::commands::ctx::config::WorkflowConfig) -> Self {
         Self {
             enabled: cfg.telemetry_enabled,
@@ -113,38 +96,21 @@ pub enum TelemetryKind {
     FrontendDetectorRun,
     FrontendRenderRun,
     FrontendVisualReview,
-    /// Issue #223: a session's own signals first crossed the "substantial
-    /// edit work" threshold (`adoption::is_substantial`). Recorded at most
-    /// once per session -- `workflow_id` stays `None` (this is a session-
-    /// level fact, not a workflow one), `session_id` names the session.
+    /// Record substantial edit work once per session, without a workflow id. (#223)
     AdoptionDetected,
-    /// Issue #223: a session recorded as `AdoptionDetected` with no active
-    /// workflow later has one active. Recorded at most once per session.
+    /// Record once when a substantial session gains an active workflow. (#223)
     AdoptionRecovered,
     /// `zirv workflow close`: a workflow that will not reach `Completed`
     /// (for example one whose review/fix loop hit `MAX_FIX_REVIEW_ROUNDS`)
     /// was explicitly closed instead of staying `Running` forever.
     Closed,
-    /// Issue #293: one speed-axis sample -- `turn_p50_ms`/`turn_max_ms`/
-    /// `ttft_p50_ms`/`tool_error_rate` -- recorded where `score.rs` computes
-    /// a `Score` for a live session (`ctx::hook::run_stop`), once per
-    /// scoring pass rather than once per poll. `workflow_id` stays `None`
-    /// (a session-level fact, like `AdoptionDetected`); `session_id` names
-    /// the session.
+    /// Record one live-session speed sample per scoring pass, keyed to session rather than workflow. (#293)
     TurnLatencySampled,
-    /// Issue #539 chunk E1: one successful `skill_load` -- native tool or
-    /// MCP bridge, see `skill_surface` -- recorded so a skill an agent chose
-    /// for itself leaves the same durable trail an operator's own `/skill`
-    /// invocation would. A refused load (an unsupported capability or
-    /// integration) records nothing: only a load that actually returned
-    /// instructions is an activation.
+    /// Record only successful skill loads; refused loads never count as activation. (#539)
     SkillActivated,
 }
 
-// Issue #293: `Eq` dropped -- `tool_error_rate: Option<f64>` cannot
-// implement it (`f64` has no total order). Every existing/new consumer only
-// ever needed `PartialEq` (`assert_eq!`, `==`); nothing in this crate keys a
-// `HashSet`/`BTreeSet`/map on a whole `TelemetryEvent`.
+// `tool_error_rate` contains `f64`, so telemetry supports `PartialEq` but not `Eq`. (#293)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub schema_version: u32,
@@ -173,15 +139,7 @@ pub struct TelemetryEvent {
     pub fix_round: u8,
     pub artifact_count: u32,
     pub worker_count: u32,
-    /// Issue #155: the raw cache classes alongside `input_tokens`.
-    /// `input_tokens` keeps its pre-2.34.0 meaning for events produced by the
-    /// workflow engine: the COMBINED context total (raw input plus both cache
-    /// classes -- see `engine.rs`'s `usage.context_total()`), not the raw
-    /// uncached class alone. `cache_read_input_tokens` is therefore a SUBSET
-    /// of `input_tokens`, not a third figure to add to it: a cache-hit ratio
-    /// is `cache_read_input_tokens / input_tokens` directly (see
-    /// `cache_hit_ratio()` below) -- summing `input_tokens` with the cache
-    /// classes double-counts them.
+    /// `input_tokens` is combined context total; cache-read input is a subset, so adding it again double-counts. (#155)
     #[serde(default)]
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
@@ -219,25 +177,13 @@ pub struct TelemetryEvent {
     /// Provider-neutral agent manifest id, populated by agent dispatch in phase 3.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// Issue #223: for `AdoptionDetected`/`AdoptionRecovered` only, whether a
-    /// `zirv workflow` was active at that moment. `#[serde(default)]` so
-    /// every event file written before this field existed still deserializes.
+    /// Whether a workflow was active for adoption events; older events default to absent. (#223)
     #[serde(default)]
     pub workflow_active: Option<bool>,
-    /// Issue #287: set on a `PhaseFailed` event raised by the no-progress
-    /// guard -- the worktree was byte-identical to the step's previous
-    /// failed attempt, so no check was actually executed. Distinguishes a
-    /// genuinely re-evaluated failure from a no-op turn that only burned an
-    /// attempt. `#[serde(default)]` so every event file written before this
-    /// field existed still deserializes, correctly, as `false`.
+    /// Mark no-progress failure events that skipped checks; older events default to false. (#287)
     #[serde(default)]
     pub verification_unchanged: bool,
-    /// Issue #264: this event's own cost, in micro-USD, priced from `model`
-    /// plus the four raw token classes above (`price::price`) -- `None` when
-    /// `model` is unset, or is unpriced (an unrecognised model prices as
-    /// `None`, never `0`; see `price::price`'s own doc comment), or when this
-    /// event carries no token counts at all. `#[serde(default)]` so an event
-    /// written before this field existed still deserializes.
+    /// Price this event from model and raw usage; absent or unpriced data stays `None`, never zero. (#264)
     #[serde(default)]
     pub cost_micros: Option<u64>,
     /// The price table's own `as_of` stamp, alongside `cost_micros` -- so a
@@ -246,9 +192,7 @@ pub struct TelemetryEvent {
     /// second lookup. `None` exactly when `cost_micros` is `None`.
     #[serde(default)]
     pub price_as_of: Option<String>,
-    /// Issue #293, `TurnLatencySampled` only. Additive schema (no
-    /// `TELEMETRY_SCHEMA_VERSION` bump): a legacy event file simply
-    /// deserializes every one of these as `None`.
+    /// Optional latency fields apply only to `TurnLatencySampled`; older events deserialize them as absent. (#293)
     #[serde(default)]
     pub turn_p50_ms: Option<u64>,
     #[serde(default)]
@@ -257,32 +201,13 @@ pub struct TelemetryEvent {
     pub ttft_p50_ms: Option<u64>,
     #[serde(default)]
     pub tool_error_rate: Option<f64>,
-    /// Issue #699 Phase 0: on an `ArtifactAccepted` event for an
-    /// approval-gated step (intent/spec/plan-style artifact gates, or a
-    /// gate-only `approval = true` step with no artifact), the wall-clock
-    /// this step spent in `WorkflowStatus::AwaitingApproval` before
-    /// `zirv workflow approve` cleared it -- `engine.rs`'s own
-    /// `phase_started_at`/`record_step_duration_ms` machinery, read at the
-    /// same place, not a second measurement. The engine does not
-    /// distinguish an agent still drafting the artifact from an operator
-    /// reviewing a finished one within that span, so this is the WHOLE
-    /// span, never subdivided further -- the closest honest approximation,
-    /// not an invented number. `None` for every other event kind, and for
-    /// an `ArtifactAccepted` event recorded before this field existed.
+    /// Measure the full AwaitingApproval span; state cannot distinguish agent drafting from operator review, so it must never claim human-only time. (#699)
     #[serde(default)]
     pub approval_wait_ms: Option<u64>,
-    /// Issue #699 Phase 0, `PhaseFailed` only: why this fix round happened,
-    /// per `classify_fix_round_cause`'s documented precedence. `None` for
-    /// every other event kind, for a `PhaseFailed` outside
-    /// Test/Review/Verify, and for an event recorded before this field
-    /// existed.
+    /// Classified cause for Test/Review/Verify failure events; other and older events have none. (#699)
     #[serde(default)]
     pub fix_round_cause: Option<FixRoundCause>,
-    /// Issue #539 chunk E1, `SkillActivated` only: the loaded skill's id,
-    /// version, content hash and source (`built-in`/`operator-global`/
-    /// `repository-untrusted`, `SkillSource`'s own `Display` spelling).
-    /// `#[serde(default)]` so an event recorded before this field existed
-    /// still deserializes.
+    /// Skill identity, version, hash and source for activation events; older events default to absent. (#539)
     #[serde(default)]
     pub skill_id: Option<String>,
     #[serde(default)]
@@ -297,11 +222,7 @@ pub struct TelemetryEvent {
     pub skill_surface: Option<String>,
 }
 
-/// Issue #699 Phase 0: why one review/fix round happened -- the datum the
-/// issue's two competing hypotheses (defective early code vs. over-thorough
-/// validation) turn on. See [`classify_fix_round_cause`] for how one is
-/// derived and its documented precedence when a round trips more than one
-/// signal.
+/// Classify fix-round cause by documented precedence when several signals apply. (#699)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FixRoundCause {
@@ -317,12 +238,7 @@ pub enum FixRoundCause {
     /// `review_evidence` (open findings, or not enough fresh independent
     /// review runs), so a review-phase failure is always this.
     ReviewFinding,
-    /// The no-progress guard's own verdict (issue #287,
-    /// `TransitionEvidence::verification_unchanged`): the worktree was
-    /// byte-identical to this step's previous failed attempt, so nothing
-    /// was even re-executed -- the round exists purely because the
-    /// evidence-freshness gate required a re-run, not because anything
-    /// actually needed fixing.
+    /// An unchanged worktree skipped re-execution, so this is stale evidence rather than a newly observed defect. (#287)
     StaleEvidence,
 }
 
@@ -341,24 +257,7 @@ impl FixRoundCause {
     }
 }
 
-/// Issue #699 Phase 0. Precedence (documented, not inferred, because a
-/// single round can trip more than one signal at once):
-///
-/// 1. [`FixRoundCause::StaleEvidence`] -- `verification_unchanged` is the
-///    no-progress guard's own verdict; nothing else about the round is
-///    meaningful once this is true, since no check was even re-executed.
-/// 2. [`FixRoundCause::ReviewFinding`] -- the failing step IS the review
-///    phase; engine.rs's review gate never depends on `VerificationReport`
-///    checks at all, so a review-phase failure is always this.
-/// 3. [`FixRoundCause::FailingTest`] -- the latest persisted
-///    `VerificationReport` has at least one `Unit`/`Integration` check that
-///    did not pass. A genuine functional failure outranks a style/lint one.
-/// 4. [`FixRoundCause::FmtClippy`] -- otherwise, at least one `Format`/
-///    `Lint` check did not pass.
-///
-/// `None` when `phase` is not Test/Review/Verify, or (Test/Verify only)
-/// when no `VerificationReport` is available to inspect -- this must never
-/// guess a cause it has no evidence for.
+/// Precedence: stale evidence, review finding, failing test, then format/lint. Return none without a relevant phase or report; never infer a cause without evidence. (#699)
 pub(crate) fn classify_fix_round_cause(
     phase: super::skill::WorkflowPhase,
     verification_unchanged: bool,
@@ -458,35 +357,14 @@ impl TelemetryEvent {
         }
     }
 
-    /// The fraction of `input_tokens` (the combined context total) served
-    /// from cache. `cache_read_input_tokens` is a SUBSET of `input_tokens`,
-    /// not a separate figure to add to it -- see the doc comment on that
-    /// field. `None` when either value is missing, or `input_tokens` is `0`
-    /// (no ratio to report, never a manufactured 0%).
-    ///
-    /// No CLI surface reads a `TelemetryEvent`'s ratio back yet (`usage.rs`'s
-    /// own `--sessions` cache-hit line works off `window::SessionSpend`, a
-    /// different type) -- this is the one correct formula for whichever
-    /// future reporting surface needs it, landed now so it is not
-    /// re-derived incorrectly a second time, the same "accessor lands ahead
-    /// of its production caller" pattern `log::tail_delegations` used.
-    ///
-    /// Issue #225: now consumed by `StatsReport::overall_cache_hit_ratio`
-    /// and `PhaseStats`/`AdapterStats::cache_hit_ratio` (via `aggregate`'s
-    /// own per-event accumulation, not by calling this method directly on
-    /// each event) -- `zirv workflow stats` is its first CLI surface.
+    /// Cache-hit ratio divides cache-read input by combined input; missing or zero input yields no ratio, never fabricated zero. (#225)
     pub fn cache_hit_ratio(&self) -> Option<f64> {
         let read = self.cache_read_input_tokens?;
         let total = self.input_tokens?;
         (total > 0).then(|| read as f64 / total as f64)
     }
 
-    /// This event's own four RAW token classes, reconstructed from its
-    /// "combined context total" `input_tokens` (see that field's own doc
-    /// comment) and the already-separate cache classes -- what `price::
-    /// price` actually needs, as opposed to the pre-summed figure this type
-    /// stores for historical reasons. `None` when `input_tokens` is unset
-    /// (nothing recorded to price at all).
+    /// Reconstruct raw usage classes from combined context and separate cache fields for pricing; missing input yields none.
     pub fn raw_usage(&self) -> Option<crate::commands::ctx::event::TranscriptUsage> {
         let combined = self.input_tokens?;
         let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
@@ -569,18 +447,7 @@ pub fn record(
     Ok(())
 }
 
-/// Removes every entry in `dir` whose filename starts with a
-/// `{timestamp}-...` prefix older than `now - days`, except any name listed
-/// in `keep` (used by `verification.rs` to protect its `latest` report even
-/// when that report's own age would otherwise make it eligible). `days == 0`
-/// means "keep forever" and is a no-op, matching `telemetry_retention_days`'s
-/// own zero-means-unbounded convention.
-///
-/// Reused as-is by verification report retention (`verification.rs`'s
-/// `save_report`) rather than adding a second pruner: both this module's
-/// events and verification's reports are one file per record under a
-/// per-repository directory, named with a leading zero-padded timestamp, so
-/// the same age rule and cutoff math apply unchanged.
+/// Prune timestamped records older than `now - days`, except protected names; zero days means retain forever.
 pub(crate) fn prune_expired_except(dir: &Path, now: u64, days: u64, keep: &[&str]) {
     if days == 0 {
         return;
@@ -618,8 +485,7 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        // One unreadable event file used to fail the whole `workflow stats`
-        // command. Statistics over almost every event beat no statistics.
+        // Skip unreadable event files so one corrupt record does not erase statistics from the rest.
         let body = match std::fs::read_to_string(entry.path()) {
             Ok(body) => body,
             Err(error) => {
@@ -640,13 +506,7 @@ pub fn list(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
     Ok(events)
 }
 
-/// Issue #539 chunk E1: every `SkillActivated` event recorded for `repo`,
-/// oldest first (the same order `list` already returns) -- so a CLI surface
-/// or a test can read back what an agent loaded for itself without
-/// re-deriving the filter each time.
-// no CLI surface reads this back yet; only the native
-// tool/MCP bridge tests call it today, to assert what `record_skill_
-// activation` wrote.
+/// List successful skill activations oldest first for this repository. (#539)
 #[allow(dead_code)]
 pub fn skill_activations(state: &StateDir, repo: &Path) -> CtxResult<Vec<TelemetryEvent>> {
     Ok(list(state, repo)?
@@ -682,10 +542,7 @@ pub struct PhaseStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub failures: usize,
-    /// Issue #225: the subset of `input_tokens` served from cache, summed
-    /// only over events that actually carried the field -- see
-    /// `TelemetryEvent::cache_read_input_tokens`'s own doc comment for why
-    /// this is a subset of `input_tokens`, never an addition to it.
+    /// Sum cache-read input only from events that reported it; it is a subset of combined input. (#225)
     #[serde(default)]
     pub cache_read_input_tokens: u64,
     /// How many of `events` actually reported `cache_read_input_tokens`.
@@ -693,14 +550,7 @@ pub struct PhaseStats {
     /// carry as `None`, never a manufactured 0%.
     #[serde(default)]
     pub cache_events: usize,
-    /// H-6: `input_tokens` summed only over the same `cache_events` that
-    /// contribute to `cache_read_input_tokens` -- `cache_hit_ratio`'s own
-    /// denominator. An event whose adapter/schema version never reports
-    /// cache data at all still adds to `input_tokens` (the phase's real
-    /// token total), but must not dilute the ratio as if it were a 100%
-    /// cache miss; mixing that event's tokens into the denominator while its
-    /// (nonexistent) cache reads never reach the numerator deflates the
-    /// ratio below what the events that actually reported cache data show.
+    /// Use only cache-reporting events in the ratio denominator; missing cache data is not a measured miss.
     #[serde(default)]
     pub cache_eligible_input_tokens: u64,
     /// Same formula and same "no data, no ratio" contract as
@@ -709,10 +559,7 @@ pub struct PhaseStats {
     /// `--json` carries it without a consumer re-deriving the formula.
     #[serde(default)]
     pub cache_hit_ratio: Option<f64>,
-    /// Issue #264: this phase's summed cost, in micro-USD, over every event
-    /// that priced (`TelemetryEvent::cost_micros`) -- `None` when no event
-    /// in this phase ever priced (no model, or an unpriced one), never a
-    /// manufactured `0`.
+    /// Sum priced event cost for the phase; no priced event yields `None`, never zero. (#264)
     #[serde(default)]
     pub cost_micros: Option<u64>,
 }
@@ -753,15 +600,7 @@ fn cache_hit_ratio_from(
         .then(|| cache_read_input_tokens as f64 / input_tokens as f64)
 }
 
-/// Per-`workflow_id` breakdown (issue #155's "each shipped item showing its
-/// measured reduction" acceptance hook): how many independent `ReviewRun`
-/// rounds a workflow went through, its findings totals -- `findings_total`
-/// is every finding *reported* by a reviewer, `findings_meaningful` is the
-/// subset that is Major/Critical and not dismissed, i.e. *confirmed* -- and
-/// the token totals attributed to it. Findings come from the same
-/// latest-snapshot-per-workflow logic `aggregate`'s overall counters already
-/// used, so this never double-counts across phases the way summing every
-/// event's findings fields would.
+/// Aggregate per workflow from the latest findings snapshot so phase events cannot double-count confirmed findings. (#155)
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WorkflowStats {
     pub review_runs: usize,
@@ -775,27 +614,12 @@ pub struct WorkflowStats {
     /// this workflow's own defect-rate accounting hook. `None` when this
     /// workflow has recorded no `ReviewRun` event, never a manufactured 0.
     pub confirmed_findings_per_review: Option<f64>,
-    /// Issue #264: this workflow's own summed cost, in micro-USD, over every
-    /// event that priced. `None` when nothing this workflow recorded ever
-    /// priced, never a manufactured `0`.
+    /// Sum priced event cost for this workflow; no priced event yields `None`, never zero. (#264)
     #[serde(default)]
     pub cost_micros: Option<u64>,
 }
 
-/// Issue #223: how often substantial edit work actually ran inside a `zirv
-/// workflow`, and how much of that came from a nudge rather than already
-/// being underway. Derived from `AdoptionDetected`/`AdoptionRecovered`
-/// events, each recorded at most once per session (`ctx::hook`'s own
-/// `detected_recorded`/`recovered_recorded` guards).
-/// Issue #293: the speed axis's aggregate, built from every
-/// `TurnLatencySampled` event -- one sample per live-session scoring pass
-/// (`ctx::hook::run_stop`, via `score::derive_speed_metrics`). `samples ==
-/// 0` is "no data" (`zirv workflow stats`' own "no data" speed block), never
-/// a manufactured zero-latency reading. The per-sample p50s are themselves
-/// averaged across samples here (a lightweight aggregate, not a true
-/// percentile of the underlying per-turn population); `turn_max_ms` is the
-/// true max across every sample instead, since a worst-case-latency
-/// question wants the single slowest turn observed, not an averaged one.
+/// Aggregate adoption once per session and speed once per scoring pass; average sample p50s but take the true maximum turn latency. (#223, #293)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct SpeedStats {
     pub samples: usize,
@@ -852,21 +676,11 @@ pub struct StatsReport {
     pub deploy_gate_failures: usize,
     pub maintenance_scans: usize,
     pub maintenance_breaches: usize,
-    /// Every workflow id seen in this repository's telemetry, keyed to its
-    /// own `WorkflowStats` -- the per-workflow / per-`ReviewRun` breakdown
-    /// `docs/benchmarks/token-cost.md` §1.3 previously had no CLI for.
     pub workflows: BTreeMap<String, WorkflowStats>,
     pub review_runs: usize,
-    /// Confirmed findings per review round, across every workflow combined
-    /// (`findings_meaningful` / `review_runs`). `None` when no `ReviewRun`
-    /// event has been recorded at all -- the "no regression in
-    /// review-confirmed defect rates" accounting hook issue #155 asks for.
+    /// Confirmed findings per review round; no review run yields no rate, never zero. (#155)
     pub review_defect_rate: Option<f64>,
-    /// Issue #225: combined input tokens across every event that reported
-    /// one, regardless of whether it also carried a `phase`/`adapter` -- a
-    /// wider set than either `phases` or `adapters` covers alone. No longer
-    /// `overall_cache_hit_ratio`'s own denominator -- see
-    /// `overall_cache_eligible_input_tokens` (H-6).
+    /// Sum combined input across all events; cache ratio uses only cache-eligible events. (#225)
     #[serde(default)]
     pub overall_input_tokens: u64,
     /// See `PhaseStats::cache_read_input_tokens`, summed over every event.
@@ -889,10 +703,7 @@ pub struct StatsReport {
     /// comment for why this is never a manufactured 0%.
     #[serde(default)]
     pub overall_cache_hit_ratio: Option<f64>,
-    /// Issue #264: summed cost, in micro-USD, over every event in this
-    /// report that priced -- `None` when nothing ever priced (no model on
-    /// any event, or every named model was unpriced), never a manufactured
-    /// `0`.
+    /// Sum priced event cost; no priced event yields `None`, never zero. (#264)
     #[serde(default)]
     pub overall_cost_micros: Option<u64>,
     /// The price table's own `as_of` stamp behind `overall_cost_micros` --
@@ -903,35 +714,21 @@ pub struct StatsReport {
     /// `overall_cost_micros` is `None`.
     #[serde(default)]
     pub overall_price_as_of: Option<String>,
-    /// Issue #699 Phase 0: summed MACHINE `duration_ms` (never
-    /// `approval_wait_ms`) over every `PhaseCompleted`/`PhaseFailed` event
-    /// whose `phase` is Intent/Design/Plan/Implement -- the "build" side of
-    /// the implement-vs-validate split. See `BUILD_PHASES`/`VALIDATE_PHASES`
-    /// for the exact bucketing and why `Deploy` lands in `validate_ms`
-    /// instead.
+    /// Build duration sums machine time through Implement, excluding approval wait and Deploy. (#699)
     #[serde(default)]
     pub build_ms: u64,
     /// Same as `build_ms`, for the Test/Review/Verify/Deploy "validate"
     /// side.
     #[serde(default)]
     pub validate_ms: u64,
-    /// Issue #699 Phase 0: summed `approval_wait_ms` over every
-    /// `ArtifactAccepted` event that carried one -- see that field's own
-    /// doc comment for why this is the whole approval-gated step span, not
-    /// a sub-divided "human-only" figure. Deliberately excluded from
-    /// `build_ms`/`validate_ms` so an operator idling on an approval gate
-    /// can never skew that ratio.
+    /// Sum approval wait separately so idle gates cannot skew build/validate timing. (#699)
     #[serde(default)]
     pub approval_wait_ms: u64,
     /// How many `ArtifactAccepted` events contributed to `approval_wait_ms`
     /// -- zero means "no data", never a manufactured `0ms`.
     #[serde(default)]
     pub approval_wait_steps: usize,
-    /// Issue #699 Phase 0: how many recorded fix rounds (`PhaseFailed` on
-    /// Test/Review/Verify) each [`FixRoundCause`] accounts for, keyed by
-    /// `FixRoundCause::as_str()`. Only ever has the four keys that cause can
-    /// produce; a fix round whose cause could not be determined is counted
-    /// in `fix_rounds_unclassified` instead, never folded into one of these.
+    /// Count fix rounds by classified cause; unknown causes stay in the unclassified count. (#699)
     #[serde(default)]
     pub fix_round_causes: BTreeMap<String, usize>,
     /// Fix rounds recorded whose cause `classify_fix_round_cause` could not
@@ -939,10 +736,9 @@ pub struct StatsReport {
     /// yet for a Test/Verify failure).
     #[serde(default)]
     pub fix_rounds_unclassified: usize,
-    /// Issue #293.
     #[serde(default)]
     pub speed: SpeedStats,
-    /// Issue #223. Always last -- see `run_stats`'s own ordering comment.
+    /// Adoption statistics render last. (#223)
     pub adoption: AdoptionStats,
 }
 
@@ -1000,10 +796,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
             overall_cache_read_input_tokens = overall_cache_read_input_tokens
                 .saturating_add(event.cache_read_input_tokens.unwrap_or(0));
             overall_cache_events += 1;
-            // H-6: only an event that itself reported cache data contributes
-            // to the ratio's denominator -- an event whose adapter/schema
-            // version never reports cache data at all must not dilute the
-            // ratio as if its tokens were a 100% cache miss.
+            // Only cache-reporting events contribute to the ratio denominator; absent cache data is not a miss.
             overall_cache_eligible_input_tokens =
                 overall_cache_eligible_input_tokens.saturating_add(event.input_tokens.unwrap_or(0));
         }
@@ -1380,11 +1173,7 @@ fn overall_cache_hit_line(report: &StatsReport) -> String {
     }
 }
 
-/// Issue #264: the `cost <...>` fragment `run_stats` appends after a phase's
-/// or a workflow's own token totals -- `"no data"` when nothing in that
-/// group ever priced (no event named a model, or every named model was
-/// unpriced), never a manufactured `$0.00`. Pure, mirroring
-/// `adapter_cache_hit_suffix`.
+/// Format priced cost or `no data`; missing prices must never appear as zero. (#264)
 fn format_cost(cost_micros: Option<u64>) -> String {
     match cost_micros {
         Some(cost) => crate::commands::ctx::price::format_usd(cost, false),
@@ -1451,17 +1240,9 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 adapter_cache_hit_suffix(stats)
             )?;
         }
-        // Issue #225: right after the token totals above (per-phase, then
-        // per-adapter) -- the one place an operator already looks to answer
-        // "how expensive was this workflow", so the cache line answers "how
-        // much of that was actually free" in the same glance. Schema v2's
-        // own formula (`TelemetryEvent::cache_hit_ratio`'s doc comment):
-        // `cache_read_input_tokens` is a SUBSET of the combined
-        // `input_tokens`, not a third figure to add to it.
+        // Render cache ratio beside usage totals; cache-read input is already included in combined input. (#225)
         writeln!(writer, "{}", overall_cache_hit_line(&report))?;
-        // Issue #264: right after the cache-hit line -- the "cost" block the
-        // design asks for, at three altitudes: overall here, per-phase above
-        // (`format_cost` appended to each phase line), per-workflow below.
+        // Render overall, phase and workflow costs together with usage. (#264)
         writeln!(writer, "{}", overall_cost_line(&report))?;
         if !report.token_sources.is_empty() {
             writeln!(
@@ -1488,11 +1269,7 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 .as_deref()
                 .unwrap_or("unknown")
         )?;
-        // Issue #699 Phase 0: the implement-vs-validate split and its
-        // separately-reported approval wait, right after the per-phase
-        // summaries above -- see `render_build_validate_line`/
-        // `render_approval_wait_line`'s own doc comments for the exact
-        // bucketing and why wait is never folded into the split.
+        // Keep approval wait separate from the build/validate duration split. (#699)
         writeln!(writer, "{}", render_build_validate_line(&report))?;
         writeln!(writer, "{}", render_approval_wait_line(&report))?;
         writeln!(
@@ -1516,9 +1293,7 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 ))
                 .unwrap_or_else(|| "no ReviewRun events recorded yet".to_string())
         )?;
-        // Issue #699 Phase 0: which of the two competing hypotheses
-        // (defective early code vs. over-thorough validation) the review/fix
-        // loop's rounds actually support.
+        // Show classified fix-round causes so repeated validation can be assessed from evidence. (#699)
         writeln!(writer, "{}", render_fix_round_causes_line(&report))?;
         if !report.workflows.is_empty() {
             writeln!(writer, "workflows:")?;
@@ -1562,30 +1337,13 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
             report.maintenance_breaches
         )?;
         writeln!(writer, "{}", render_speed_line(&report.speed))?;
-        // Issue #223: deliberately the LAST line of the report.
+        // Render adoption last. (#223)
         writeln!(writer, "{}", render_adoption_line(&report.adoption))?;
     }
     Ok(0)
 }
 
-/// Issue #699 Phase 0: this line used to read `speed: no data`, which a
-/// reader chasing `zirv workflow stats`'s "slowest phase: unknown" problem
-/// could easily (and, per the issue, actually did) mistake for *workflow
-/// phase timing* being unmeasured. It is not that: `SpeedStats` comes
-/// entirely from `TurnLatencySampled` events, a chat/harness per-turn
-/// latency sampler (`score::derive_speed_metrics`) with no relationship to
-/// a workflow step's own wall-clock -- see `render_build_validate_line`/
-/// `render_approval_wait_line` for the actual workflow-timing lines. The
-/// label now says so explicitly so this line is never read as a workflow
-/// measurement again; the metric itself is unchanged.
-///
-/// `chat turn latency (...): no data` when no `TurnLatencySampled` event has
-/// ever been recorded; otherwise `chat turn latency (...): N samples, turn
-/// p50 ~Xms (max Yms), ttft p50 ~Zms, tool error rate ~W%` -- any of the
-/// three rate/latency clauses itself reads `n/a` when that particular field
-/// never had a sample (a session with no timestamps at all still
-/// contributes a sample with every field `None`, see
-/// `score::derive_speed_metrics`'s own "empty" contract).
+/// Label these as chat turn latency, not workflow phase timing; absent samples or fields render `no data` or `n/a`. (#699)
 fn render_speed_line(stats: &SpeedStats) -> String {
     const LABEL: &str = "chat turn latency (harness per-turn sampler, not workflow phase timing)";
     if stats.samples == 0 {
@@ -1604,14 +1362,7 @@ fn render_speed_line(stats: &SpeedStats) -> String {
     )
 }
 
-/// Issue #699 Phase 0: the wall-clock split the issue tracks (~25/75 today,
-/// targeting ~60/40), in MACHINE milliseconds only -- `report.build_ms`/
-/// `report.validate_ms`, which sum `duration_ms` (never `approval_wait_ms`)
-/// per `WorkflowPhase` via `BUILD_PHASES`/`VALIDATE_PHASES`. Operator
-/// approval wait is reported separately by `render_approval_wait_line`,
-/// deliberately never mixed into this ratio -- see that function's own doc
-/// comment for why. "no data" when neither side has ever recorded a
-/// duration, never a fabricated `0ms (0%) / 0ms (0%)` split.
+/// Use machine duration for build/validate timing, excluding approval wait; no durations render `no data`. (#699)
 fn render_build_validate_line(report: &StatsReport) -> String {
     let total = report.build_ms.saturating_add(report.validate_ms);
     if total == 0 {
@@ -1627,15 +1378,7 @@ fn render_build_validate_line(report: &StatsReport) -> String {
     )
 }
 
-/// Issue #699 Phase 0: total operator/approval wait across every
-/// approval-gated step completed (intent/spec/plan-style artifact gates, or
-/// a gate-only `approval = true` step) -- see `TelemetryEvent::
-/// approval_wait_ms`'s own doc comment for why this is the WHOLE
-/// `AwaitingApproval` span, never sub-divided into "agent drafting" vs.
-/// "human reviewing": the engine's own state has no signal to draw that
-/// line, so this is the closest honest approximation, reported on its own
-/// rather than folded into `render_build_validate_line`'s ratio. "no data"
-/// when no approval-gated step has completed yet.
+/// Report whole awaiting-approval spans separately; engine state cannot isolate human review time. (#699)
 fn render_approval_wait_line(report: &StatsReport) -> String {
     if report.approval_wait_steps == 0 {
         return "approval wait: no data (no approval-gated step completed yet)".to_string();
@@ -1647,12 +1390,7 @@ fn render_approval_wait_line(report: &StatsReport) -> String {
     )
 }
 
-/// Issue #699 Phase 0: which of the issue's two competing hypotheses
-/// (defective early code, so `failing-test`/`review-finding` dominate, vs.
-/// over-thorough/redundant validation, so `stale-evidence` dominates) the
-/// recorded fix rounds actually support -- see `classify_fix_round_cause`'s
-/// documented precedence. "no fix rounds recorded yet" when nothing has
-/// been classified (or left unclassified) at all.
+/// Render fix-round cause counts or an explicit no-data message using the documented cause precedence. (#699)
 fn render_fix_round_causes_line(report: &StatsReport) -> String {
     let classified: usize = report.fix_round_causes.values().sum();
     let total = classified + report.fix_rounds_unclassified;

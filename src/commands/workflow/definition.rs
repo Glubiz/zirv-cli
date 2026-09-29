@@ -82,12 +82,7 @@ pub struct TypedOutput {
     pub schema: Option<String>,
 }
 
-/// Approval/validation/independent-review gates, each a set of step ids that
-/// carry that gate. Redundant with (but explicit about) a step's own
-/// `approval: bool` -- `gates` is the definition-level summary a status
-/// reader or `an_unmatched_task`-style selector can inspect without walking
-/// every step, while a step's own fields remain the execution-time source of
-/// truth. `validate` requires every id here to resolve to a real step.
+/// Definition-level gate summary for status and selection; step fields remain the execution source of truth and every id must resolve.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GateSpec {
@@ -129,15 +124,7 @@ pub struct FailurePolicy {
     pub retry: bool,
 }
 
-/// External-effect classification (issue #542 architecture §1): whether
-/// completing this definition (or one of its steps) can leave a durable
-/// mark outside the repository/workflow state itself. `None` -- no effect at
-/// all, e.g. a read-only investigation or report -- `Repository`, or
-/// `External` (Linear/Kibana/cloud/a repository host action). Steps default
-/// to `None`; a definition's own top-level `effects` is the ceiling none of
-/// its steps may exceed unless the definition itself says otherwise (not
-/// enforced here -- see `registry.rs`'s widening refusal for the repository
-/// trust layer).
+/// A definition’s effect is the ceiling for its steps; the repository trust layer enforces widening rules. (#542)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectClass {
@@ -196,30 +183,10 @@ pub struct StepV2 {
     pub effect: EffectClass,
     #[serde(default)]
     pub reason: Option<String>,
-    /// Free-form domain tags this step's data applies to (matched against
-    /// the classified [`super::classify::WorkDomain`]/[`super::engine::
-    /// WorkflowProfile`], e.g. `"frontend"`) -- issue #542 chunk 3a. Empty
-    /// (the default) means "the general/default data for this step's slot".
-    /// Only meaningful together with `overrides_step`: a step with a
-    /// non-empty `domains` and no `overrides_step` is still a normal
-    /// standalone DAG node, just one `materialize` never prunes for domain
-    /// reasons (domain-based selection only ever happens between an
-    /// `overrides_step` variant and the step it names).
+    /// Domain tags select among `overrides_step` variants; a tagged standalone step remains a normal DAG node. (#542)
     #[serde(default)]
     pub domains: Vec<String>,
-    /// When set, this step is not its own DAG node: it is a domain-scoped
-    /// DATA VARIANT of the step named here (which must exist in the same
-    /// definition and must not itself be a variant). At materialize time,
-    /// exactly one variant (or the overridden step's own data, if none
-    /// matches) supplies `skills`/`agent_role`/`capabilities`/`effect`/
-    /// `approval`/`artifact`/`max_attempts` for the overridden step's id --
-    /// `id`/`phase`/`depends_on`/`parallel_group`/`condition` always come
-    /// from the overridden (canonical) step, so the canonical id is stable
-    /// across a profile change (`zirv workflow reclassify`) the same way it
-    /// was before this schema existed. Replaces the old hardcoded
-    /// `WorkflowProfile`-keyed Rust match table: a new pack adds a
-    /// `domains = ["frontend"]`, `overrides_step = "<id>"` entry instead of
-    /// a new engine.rs match arm.
+    /// A domain variant supplies data for one canonical DAG step while preserving its id, phase, dependencies and ordering across profile changes.
     #[serde(default)]
     pub overrides_step: Option<String>,
 }
@@ -362,10 +329,7 @@ impl WorkflowDefinitionV2 {
             }
         }
 
-        // Issue #542 chunk 3a: a step with `overrides_step` is a domain-
-        // scoped data variant, not its own DAG node -- it must name a real,
-        // non-variant sibling and carry no dependency edges of its own
-        // (those live on the canonical step it overrides).
+        // An override is a domain variant, not its own DAG node; it names a non-variant sibling and carries no dependency edges. (#542)
         let variant_targets: std::collections::BTreeMap<&str, &str> = self
             .steps
             .iter()
@@ -429,25 +393,7 @@ impl WorkflowDefinitionV2 {
             }
         }
 
-        // Issue #542 review finding 2: before this fix, a step's own
-        // `effect` field was purely descriptive -- nothing anywhere actually
-        // gated on it, so an `External`-effect step (a genuine durable mark
-        // outside the repository/workflow state itself: a ticket, a cloud
-        // action, a deployment) could be authored to run completely
-        // unattended simply by leaving its own `approval` unset. A step
-        // whose OWN effect is `External` must now be recorded as an
-        // approval gate -- either the step's own `approval = true`, or its
-        // id listed in `gates.approval`. `Repository`-effect steps are
-        // deliberately NOT included here: every built-in pack already gates
-        // its actual repository mutation points (intent/plan/deploy) via
-        // the existing convention while leaving implement/test/verify
-        // ungated by design, so widening this to `Repository` would gate
-        // steps the issue never asked to gate and break the entire built-in
-        // catalogue. (The engine's own `WorkflowState::step_requires_
-        // approval` separately refuses to ENTER an unapproved `External`
-        // step even if this authoring-time check were somehow bypassed --
-        // e.g. an operator-global override, which also runs through this
-        // same `validate()`.)
+        // Every `External`-effect step requires an approval gate, and the engine checks again before entry. Repository effects retain their existing step gates. (#542)
         for step in &self.steps {
             if step.effect == EffectClass::External
                 && !step.approval

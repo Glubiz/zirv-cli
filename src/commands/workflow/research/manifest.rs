@@ -184,8 +184,7 @@ pub const KNOWN_TASK_CLASSES: &[&str] = &[
 pub struct StageSpec {
     pub split: Split,
     pub reps: u32,
-    /// Issue #804: narrows this stage to only these corpus `class` values
-    /// (empty/absent, the default -- every task of the split).
+    /// Restrict this stage to named corpus classes; absent means every class. (#804)
     #[serde(default)]
     pub classes: Vec<String>,
 }
@@ -323,12 +322,7 @@ pub struct Manifest {
     pub candidates: Vec<Candidate>,
     #[serde(default)]
     pub proposer: Option<Proposer>,
-    /// Issue #804: `"none"` (default) keeps today's single cohort key per
-    /// campaign; `"class"` appends each observation's own corpus task
-    /// `class` to it, so the promotion gate evaluates every class
-    /// separately -- cohorts are never pooled, and a routing candidate that
-    /// helps `bounded` work while hurting `architecture` work must not be
-    /// averaged into one misleading verdict.
+    /// Class stratification evaluates each class separately so gains cannot mask regressions in another class. (#804)
     #[serde(default)]
     pub stratify: Stratify,
 }
@@ -443,9 +437,7 @@ impl Manifest {
             .map_err(|reason| format!("[cohort].env: {reason}"))?;
 
         if matches!(self.runtime, Runtime::Native) {
-            // Coverage note only -- `plan`/`run` still validate the rest of
-            // the campaign; the campaign-level verdict is forced to
-            // Unmeasured downstream (issue #802's `runtime = native` clause).
+            // Native runtime coverage remains unmeasured until the campaign is validated downstream. (#802)
         }
 
         for (label, classes) in [
@@ -463,11 +455,7 @@ impl Manifest {
             }
         }
 
-        // Issue #801 split discipline: screen and validate measuring the
-        // same split would let validate re-confirm exactly what screen
-        // already saw rather than generalizing past it, and holdout is
-        // reserved for the single final confirmation -- neither earlier
-        // stage may spend it.
+        // Screen and validate must use different splits; holdout is reserved for final confirmation. (#801)
         if self.stages.screen.split == self.stages.validate.split {
             return Err(format!(
                 "stages.screen and stages.validate must use different splits (both use {:?}): validate would re-measure exactly what screen already saw",

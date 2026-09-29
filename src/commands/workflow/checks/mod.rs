@@ -22,22 +22,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-/// One built-in check's three-valued verdict. Mirrors `GateOutcome`'s
-/// Pass/Fail/Inconclusive shape (issue #268's degraded-gate ban: an
-/// `Inconclusive` check must block a gate exactly as hard as a `Failed` one)
-/// rather than reusing that type directly -- `GateOutcome`'s own
-/// `InconclusiveReason` enum is scoped to test-runner-output classification
-/// (`ToolMissing`/`RunnerCrashed`/`NoTestsSelected`/...), and none of its
-/// variants describe what makes a builtin check here inconclusive ("no git
-/// available", "no base branch", "the doc's anchor comments are missing").
-///
-/// `NotApplicable` is the fourth verdict and the only non-blocking one
-/// besides `Pass`: most checks here guard zirv's OWN source and README
-/// invariants, which are a statement about this repository and no other. See
-/// [`is_zirv_repo`], which decides that once, for every such check.
-/// `Inconclusive` stays reserved for an input this repository is supposed to
-/// have but that could not be found, read or parsed -- that really is a
-/// degraded gate, and issue #268's ban still applies to it.
+/// An inconclusive built-in check blocks like failure; `NotApplicable` is nonblocking only outside the zirv repo. (#268)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuiltinOutcome {
@@ -64,10 +49,7 @@ impl BuiltinOutcome {
     }
 }
 
-/// One check's report line: a stable `id`, its verdict, the `proves:`/
-/// `fix:`/`origin:` labels issue #276 asks for (always present, not only on
-/// failure, so `--json` carries the full story either way), and a free-text
-/// `details` naming what was actually found.
+/// A check report carries stable id, verdict, evidence labels and observed details. (#276)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuiltinCheckResult {
     pub id: &'static str,
@@ -157,16 +139,7 @@ pub fn absent_input(path: &Path) -> String {
     )
 }
 
-/// Whether `repo` IS the zirv checkout, read from its own `[package] name`.
-///
-/// Review round 1 (R9): every zirv-specific check keyed `NotApplicable` on
-/// its input FILE being absent, which answers the wrong question in both
-/// directions -- an ordinary repository that happens to own a
-/// `.gitattributes` was judged against zirv's invariants and FAILED, while
-/// deleting one of those files inside the zirv checkout made the check that
-/// guards it silently pass. Applicability is a fact about the repository, so
-/// it is decided here, once, before any input is read; an absent input
-/// inside the zirv repo stays `Inconclusive`.
+/// Decide applicability from the repository package identity before reading check inputs; missing required input in zirv remains inconclusive.
 pub fn is_zirv_repo(repo: &Path) -> bool {
     std::fs::read_to_string(repo.join("Cargo.toml"))
         .ok()

@@ -67,10 +67,7 @@ impl Corpus {
             .collect()
     }
 
-    /// Issue #804: `classes` narrows `tasks_for_split` to only the named
-    /// `class` values; an empty list (the default, no `[stages.*] classes`
-    /// declared) keeps every task of the split, unchanged from
-    /// `tasks_for_split`.
+    /// Filter a split by named classes; an empty list keeps every task. (#804)
     pub fn tasks_for_split_and_classes(&self, split: Split, classes: &[String]) -> Vec<&Task> {
         self.tasks
             .iter()
@@ -79,10 +76,7 @@ impl Corpus {
             .collect()
     }
 
-    /// The task count per `class`, after the same split+classes filter
-    /// `tasks_for_split_and_classes` applies -- used to find the smallest
-    /// cohort a `stratify = "class"` campaign would produce for a stage, so
-    /// a `min_pairs` check can be against the worst case, not the total.
+    /// Count each class after split and class filtering so `min_pairs` uses the smallest cohort.
     pub fn class_counts_for_split(
         &self,
         split: Split,

@@ -280,15 +280,7 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
                 "src/commands/ctx/run_loop.rs",
                 "prompt_delivery_via_stdin" | "zirv_invocation"
             )
-            // Valid only while `runtime::select` has no production caller
-            // (it is referenced solely from `runtime/mod.rs`'s own
-            // `#[cfg(test)] mod tests`, per
-            // `runtime_select_is_referenced_only_from_its_own_tests` below).
-            // The harness backend this call sits in is unreachable dead
-            // code until something wires `runtime::select` up to a real
-            // command path; the moment it does, `start`/`submit` become a
-            // live model-calling entry point and this exclusion must be
-            // dropped so the inventory documents them.
+            // Exclude this backend only while `runtime::select` has no production caller; once wired, its model-calling verbs must enter the inventory.
             | ("src/commands/ctx/runtime/harness.rs", "start" | "submit")
             | ("src/commands/ctx/session/host.rs", "resume_argv")
             | ("src/commands/ctx/session/mod.rs", "spawn_service")

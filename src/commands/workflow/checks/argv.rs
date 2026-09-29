@@ -38,11 +38,7 @@ pub fn run_codex_exec(_repo: &Path) -> BuiltinCheckResult {
     codex_exec_result(&CodexAdapter::new(None))
 }
 
-/// The pure evaluation `run_codex_exec` runs against the real, default-
-/// installed adapter -- split out so a test can pass a `CodexAdapter` whose
-/// `program` is forced to resolve to a Windows `.cmd` shim (I-2) without
-/// depending on what `codex` actually resolves to via `PATH` on the machine
-/// running the suite.
+/// Evaluate against an injected adapter so Windows shim behavior is checked without depending on the machine’s PATH.
 fn codex_exec_result(adapter: &CodexAdapter) -> BuiltinCheckResult {
     let policy = EffectivePolicy {
         shell_exec: Stance::Deny,
@@ -52,13 +48,7 @@ fn codex_exec_result(adapter: &CodexAdapter) -> BuiltinCheckResult {
     let session = SessionId::new_v4();
     let prompt = "zchk-argv-codex-exec probe prompt";
     let cmd = adapter.headless_cmd(prompt, &session, &extra);
-    // I-2: on a Windows machine where `codex` resolves to an npm-installed
-    // `.cmd` shim, `resolve_program` routes the launch through `cmd.exe /c
-    // <shim>`, so the raw argv starts with that zirv-controlled launcher
-    // prefix rather than `exec` -- `built_args` strips it the same way the
-    // adapters' own tests do, so this check keeps asserting the invariant
-    // (`exec` first) rather than an argv shape that depends on how `codex`
-    // happens to be installed on the machine running `zirv verify`.
+    // On Windows npm installs, `cmd.exe /c <shim>` precedes `exec`; strip that launcher before asserting adapter argv.
     let args: Vec<String> = crate::commands::ctx::adapters::built_args(adapter.program(), &cmd);
 
     let mut problems = Vec::new();
@@ -144,11 +134,7 @@ const CLAUDE_FIX: &str = "adapters::claude::ClaudeAdapter::headless_cmd must kee
 const CLAUDE_ORIGIN: &str = "adapter argv regressions -- Ruflo round-2 audit-codex-integration.mjs \
      precedent (issue #278), applied to claude's own headless builder";
 
-/// `claude -p [PROMPT] --session-id <id>` under the default, all-`Allow`
-/// policy -- `policy_args_agree_on_no_restriction_under_the_default_policy`
-/// (adapters::mod tests) already proves this projects to no extra argv at
-/// all, so a bare `headless_cmd` call is the real shape a default-posture
-/// headless launch sends.
+/// Default all-Allow Claude headless launch adds no policy argv, so this checks the real bare command shape.
 pub fn run_claude_headless(_repo: &Path) -> BuiltinCheckResult {
     let adapter = ClaudeAdapter::new(None);
     let policy = EffectivePolicy::default();

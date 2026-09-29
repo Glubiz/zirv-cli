@@ -15,11 +15,7 @@ use crate::commands::workflow::classify::Classification;
 use crate::commands::workflow::deploy::DeployTier;
 
 use super::definitions::*;
-/// Bumped 4 -> 5 for issue #542: adds `WorkflowState.definition`, a pinned
-/// reference to the `WorkflowDefinitionV2` pack this run started from (or
-/// `None` for a v1, kind-only run). `load` upgrades a v4 file in place --
-/// see its own doc comment -- so this is not a breaking change for in-flight
-/// state.
+/// Schema 5 pins the workflow definition; load upgrades older state without changing in-flight semantics. (#542)
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
 
 /// The previous state schema `load` still accepts and upgrades in place.
@@ -45,24 +41,13 @@ fn default_true() -> bool {
     true
 }
 
-// `Eq` dropped (issue #542 review nit -- persisting `selection`): `Selection`
-// carries an `f64` confidence score, which cannot implement `Eq`; nothing in
-// this crate needs `WorkflowState: Eq` (`PartialEq`, used by every existing
-// `assert_eq!`/`==` on a `WorkflowState`, is unaffected).
+// `Selection` contains `f64` confidence, so workflow state supports `PartialEq` but not `Eq`. (#542)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub schema_version: u32,
     pub id: String,
     pub repo: PathBuf,
-    /// The branch this workflow gates -- `--branch` at `start`, or the
-    /// checkout's own current branch when not given (empty when neither is
-    /// resolvable: a detached HEAD, no commits, or `git` unavailable).
-    /// Issue #467: the relatedness key `verification::
-    /// latest_is_fresh_and_passing`'s widened sibling-worktree read matches
-    /// against a candidate's own recorded `VerificationReport::branch` --
-    /// an empty value never matches anything, so an unresolvable branch
-    /// safely disables widening rather than matching too broadly.
-    /// `#[serde(default)]` for state persisted before this field existed.
+    /// An unresolved branch is empty and cannot match sibling-worktree evidence; older state defaults to empty. (#467)
     #[serde(default)]
     pub branch: String,
     pub task: String,
@@ -93,10 +78,7 @@ pub struct WorkflowState {
     /// in this private state: repository markdown is never trusted as config.
     #[serde(default)]
     pub artifacts: BTreeMap<String, WorkflowArtifactRecord>,
-    /// Issue #542: the pinned `WorkflowDefinitionV2` pack this run started
-    /// from, when the registry had a matching id at `start` time.
-    /// `#[serde(default)]` so a v4 state file (pre-dating this field)
-    /// deserializes as `None` -- v1, kind-only semantics, unchanged.
+    /// Pin the definition used at start; older state without one retains legacy kind semantics. (#542)
     #[serde(default)]
     pub definition: Option<DefinitionRef>,
     #[serde(default)]
@@ -105,16 +87,10 @@ pub struct WorkflowState {
     pub review_evidence: Vec<crate::commands::workflow::review::ReviewRunEvidence>,
     #[serde(default)]
     pub usage_checkpoint: Option<UsageCheckpoint>,
-    /// Repository whose frontend the detector/render evidence should scan
-    /// instead of `repo`, for workflows tracked in one repository while the
-    /// actual frontend under test lives in a sibling checkout. `None` keeps
-    /// the historical single-repo behavior of scanning `repo` itself.
+    /// Optional sibling repository for frontend evidence; absent means this repository.
     #[serde(default)]
     pub frontend_target_root: Option<PathBuf>,
-    /// Whether `profile` came from automatic classification or was later
-    /// forced by an operator (`--profile` at start, or `workflow
-    /// reclassify`). A state saved before this key existed defaults to
-    /// `Classified`, its historical-only behavior.
+    /// Track whether profile was classified or operator-forced; older state defaults to classified.
     #[serde(default)]
     pub profile_source: ProfileSource,
     /// Set once an operator has accepted a workflow's pre-existing (not
@@ -126,47 +102,24 @@ pub struct WorkflowState {
     pub accepted_preexisting_findings: Option<AcceptedPreexistingFindings>,
     #[serde(default)]
     pub phase_started_at: u64,
-    /// Issue #542 chunk 5: the id of the step whose GATE-ONLY (no
-    /// `artifact`) approval has already been satisfied, so a subsequent
-    /// status recompute over the SAME still-current step does not re-derive
-    /// `AwaitingApproval` from that step's declarative `approval = true` a
-    /// second time. `approve`'s artifact branch never sets this -- it
-    /// advances `current_step` atomically with acceptance instead, so the
-    /// next recompute already sees a fresh step. Read only alongside
-    /// `step.approval`, via `Self::step_requires_approval`; compared by id
-    /// rather than cleared on every `current_step` change, since a step id
-    /// is unique within one materialization (validated at registration) so
-    /// a stale value can never falsely match a later, different step.
+    /// Remember gate-only approval by step id so recomputation cannot reopen the current gate; unique ids prevent stale approval matching another step. (#542)
     #[serde(default)]
     pub current_step_approved: Option<String>,
-    /// Whether the intent step (when present) uses `brainstorm` (interactive
-    /// Q&A) or `write-intent` (autonomous). A state saved before this key
-    /// existed defaults to interactive on load.
+    /// Intent steps use interactive brainstorming or autonomous write-intent; older state defaults to interactive.
     #[serde(default = "default_true")]
     pub brainstorm: bool,
     pub status: WorkflowStatus,
-    /// Operator-supplied reason recorded by `zirv workflow close --reason`.
-    /// A state saved before `close` existed defaults to `None`.
+    /// Operator-supplied close reason; older state defaults to absent.
     #[serde(default)]
     pub closed_reason: Option<String>,
     /// When this workflow was closed (`WorkflowStatus::Closed`), `now_secs()`
     /// at that moment. `None` for a workflow never closed.
     #[serde(default)]
     pub closed_at: Option<u64>,
-    /// The most recently compiled `zirv workflow team plan` for this
-    /// workflow (issue #541). `None` until `team plan` is run against it;
-    /// state persisted before this field existed defaults safely to `None`,
-    /// same as every other additive field on this struct.
+    /// Most recently compiled team plan, absent until one is saved or in older state. (#541)
     #[serde(default)]
     pub team_plan: Option<crate::commands::workflow::team::TeamPlan>,
-    /// Issue #542 review nit: the [`crate::commands::workflow::selection::Selection`] that
-    /// chose this run's pack, when `zirv workflow start` (or the native
-    /// `workflow_start` tool) picked one deterministically rather than
-    /// being given an explicit id -- persisted so `zirv workflow status`
-    /// can explain why a pack was chosen without the caller having to
-    /// separately re-run `workflow classify` against the same task text.
-    /// `None` for an explicit-id start (no selection ever ran) and for
-    /// state persisted before this field existed.
+    /// Persist deterministic pack selection so status can explain it; explicit-id starts have no selection. (#542)
     #[serde(default)]
     pub selection: Option<crate::commands::workflow::selection::Selection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -180,30 +133,14 @@ impl WorkflowState {
         self.steps.get(self.current_step)
     }
 
-    /// Whether `step` (assumed to be the current step) still needs an
-    /// operator's approval -- `step.approval` is true, OR the step's own
-    /// `effect` is `External` (issue #542 review finding 2: an external
-    /// effect is never metadata-only -- the engine itself refuses to enter
-    /// an unapproved external-effect step regardless of whether the pack
-    /// author also remembered to set `approval = true`, so a definition-
-    /// level authoring gap can never let one through) -- AND this exact step
-    /// id has not already been approved via the gate-only path recorded in
-    /// `current_step_approved` (issue #542 chunk 5). An artifact-gated step
-    /// never sets that field, so this is equivalent to plain `step.approval`
-    /// for it, unchanged from before this fix.
+    /// External effects require approval even if the pack omits its flag; gate-only approval applies only to this exact step id. (#542)
     pub(super) fn step_requires_approval(&self, step: &WorkflowStep) -> bool {
         (step.approval
             || step.effect == crate::commands::workflow::definition::EffectClass::External)
             && self.current_step_approved.as_deref() != Some(step.id.as_str())
     }
 
-    /// Starts a workflow for one of the five legacy kind ids. Signature
-    /// unchanged since before issue #542 (deliberately -- ~90 call sites
-    /// across the codebase, mostly unrelated-module test fixtures,
-    /// construct a workflow this way); internally now resolves and
-    /// materializes from a `WorkflowDefinitionV2` pack (registry-aware,
-    /// falling back to the embedded built-in) instead of the deleted
-    /// per-kind literal.
+    /// Start one of the five legacy kinds through its materialized definition, preserving the caller contract. (#542)
     pub(crate) fn start(
         repo: PathBuf,
         task: String,
@@ -227,16 +164,7 @@ impl WorkflowState {
         )
     }
 
-    /// Starts a workflow from an already-resolved registry pack (issue #542
-    /// chunk 3a decision 4): any registry id, not just the five legacy
-    /// kinds. `pack.definition.id` is mapped back to a legacy `WorkflowKind`
-    /// when one exists (`WorkflowKind::from_pack_id`) purely for the
-    /// vestigial `kind`/`brainstorm`-default fields old readers still
-    /// expect; a pack with no legacy counterpart gets `WorkflowKind::
-    /// Feature` as a harmless placeholder -- `state.definition` is the
-    /// authoritative record of what is actually running (issue #542 chunk
-    /// 3a decision 3: "WorkflowKind remains the legacy id set ... nothing
-    /// else keys on it").
+    /// Start any resolved registry pack; `definition` is authoritative while legacy `kind` remains for older readers. (#542)
     pub(crate) fn start_from_pack(
         repo: PathBuf,
         task: String,
@@ -281,11 +209,7 @@ impl WorkflowState {
             deploy_tier,
             brainstorm,
         );
-        // Issue #542 review finding 2: mirrors `step_requires_approval` --
-        // an `External`-effect first step must gate even when the pack
-        // author only listed it in `gates.approval` rather than setting its
-        // own `approval = true` (no `current_step_approved` can exist yet
-        // for a workflow that has not started).
+        // An External-effect first step must gate even when its pack omitted the step approval flag. (#542)
         let status = if steps.first().is_some_and(|step| {
             step.approval
                 || step.effect == crate::commands::workflow::definition::EffectClass::External
@@ -596,11 +520,7 @@ pub(super) fn pin_current_artifact_with_config(
         .and_then(|step| step.artifact)
         .ok_or("current workflow step has no artifact to approve")?;
     let path = workflow_artifact_path(state, stage)?;
-    // F6 (blind-review finding, 2026-09-24): the artifact is never
-    // pre-created any more (see `start_workflow`'s own doc comment on the
-    // point) -- a file that has not been written at all reads exactly like
-    // the untouched template it would otherwise contain, so the refusal
-    // below fires identically either way, never a missing-file I/O error.
+    // A missing unfilled artifact is equivalent to an untouched template and must trigger the same refusal, not an I/O error.
     let body = std::fs::read_to_string(&path).unwrap_or_else(|_| stage.template().to_string());
     if body.trim() == stage.template().trim() {
         return Err(format!(
@@ -701,10 +621,7 @@ pub(super) fn reopen_artifact_gate(
     state
         .completed_steps
         .retain(|completed| !invalid.contains(completed));
-    // Issue #542 review finding 14: a gate-only approval recorded further
-    // along the (now rewound) step list must not silently count as still
-    // granted if/when this run walks forward past it again -- `invalid`
-    // covers exactly the steps this rewind un-completes.
+    // Clear gate-only approvals for rewound steps so they cannot remain granted when execution reaches them again. (#542)
     if state
         .current_step_approved
         .as_deref()
@@ -783,9 +700,7 @@ pub(crate) fn read_accepted_artifact(
         return Ok(None);
     };
     let path = workflow_artifact_path(state, stage)?;
-    // Same drift rule as `append_accepted_artifacts`: a file whose bytes no
-    // longer hash to the accepted value is not the accepted artifact, so it
-    // is never handed on as accepted content (review finding).
+    // Never hand changed bytes on as an accepted artifact; re-check the pinned hash before appending.
     if !path.exists() || artifact_hash(&path)? != accepted {
         return Ok(None);
     }
@@ -806,17 +721,7 @@ pub struct UsageCheckpoint {
 }
 
 pub(super) fn repo_dir(state: &StateDir, repo: &Path) -> PathBuf {
-    // Issue #467 round 3 (Finding 1): plain, literal `repo_slug` -- NOT a
-    // shared cross-worktree identity. Round 2's `workflow_identity_slug`
-    // keyed workflow state (and the active-workflow pointer) by the main
-    // checkout's identity for every linked worktree; review caught that this
-    // made every sibling worktree of one repository share ONE active
-    // pointer, so two unrelated `zirv workflow start` runs in two different
-    // worker worktrees clobbered each other. `load`/`load_active` below
-    // instead search sibling checkouts explicitly, with fallback rules
-    // narrow enough to stay safe (see their own doc comments), while
-    // storage itself -- what this function decides -- stays exactly where
-    // pre-#467 code put it.
+    // Keep workflow state keyed to the literal checkout so sibling worktrees retain separate active pointers; cross-checkout lookup is explicit. (#467)
     state.workflows().join(repo_slug(repo))
 }
 
@@ -853,12 +758,7 @@ pub(crate) fn save(state_dir: &StateDir, state: &WorkflowState, active: bool) ->
     Ok(())
 }
 
-/// Persists `state` without touching the active-workflow pointer either way
-/// -- unlike [`save`], whose `active` flag can clear a DIFFERENT workflow's
-/// pointer when `false`. Issue #541: `zirv workflow team plan` annotates a
-/// (possibly non-active, explicitly `--workflow <id>`-named) workflow with a
-/// compiled `TeamPlan` and must never change which workflow is active as a
-/// side effect of doing so.
+/// Persist state without changing any active pointer; annotating a non-active workflow must not deactivate another. (#541)
 pub(crate) fn save_preserving_active(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
     write_state_file(state_dir, state)
 }
@@ -883,15 +783,7 @@ pub(super) fn save_inactive_if_active(
     Ok(())
 }
 
-/// Issue #467 round 3 (Finding 1): workflow state itself stays keyed by the
-/// LITERAL checkout (see `repo_dir`'s doc comment), but `--repo <path>` on
-/// `status|advance|review package <id>` must still find a workflow tracked
-/// by a DIFFERENT checkout of the same repository. This checks the literal
-/// `repo` first, then every sibling checkout (`pathutil::sibling_checkouts`,
-/// in whatever order git reports them) for one holding `id` -- unlike the
-/// active-pointer fallback in `load_active`, this is safe to widen to every
-/// sibling: an explicit id is never ambiguous the way "whichever pointer
-/// happens to be there" is.
+/// Search the literal checkout first, then sibling checkouts for an explicit workflow id; the id makes this widening unambiguous. (#467)
 pub(super) fn resolve_state_path_for_id(
     state: &StateDir,
     repo: &Path,
@@ -925,12 +817,7 @@ pub fn load(state: &StateDir, repo: &Path, id: &str) -> CtxResult<WorkflowState>
     Ok(value)
 }
 
-/// Dash refresh PR1: `id`'s own state file's last-modified time, in epoch
-/// seconds -- a pragmatic stand-in for "when did this run finish" (there is
-/// no dedicated `completed_at` field on `WorkflowState`), used to fade the
-/// sidebar/pane-header "done" fact 10 minutes after a `Completed` run's last
-/// write. `None` when the file cannot be resolved or its metadata cannot be
-/// read (never fabricated as "now" or "never").
+/// Use state-file mtime as the completed-run timestamp; unreadable metadata yields none, never fabricated recency.
 pub fn state_mtime_secs(state: &StateDir, repo: &Path, id: &str) -> Option<u64> {
     let path = resolve_state_path_for_id(state, repo, id).ok()?;
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
@@ -953,10 +840,7 @@ pub(super) fn load_from_path(path: &Path, id: &str) -> CtxResult<WorkflowState> 
     match value.schema_version {
         version if version == WORKFLOW_SCHEMA_VERSION => {}
         WORKFLOW_SCHEMA_VERSION_V4 => {
-            // Issue #542: v4 has no `definition` pin at all -- `#[serde(
-            // default)]` already deserialized it as `None` above, kind-only
-            // v1 semantics unchanged. Only the version marker itself needs
-            // upgrading so a subsequent `save` writes it back as current.
+            // Upgrade only the version marker for unpinned legacy state; kind-only semantics remain unchanged. (#542)
             value.schema_version = WORKFLOW_SCHEMA_VERSION;
         }
         other => {
@@ -978,15 +862,7 @@ pub(super) fn read_active_pointer(state: &StateDir, repo: &Path) -> CtxResult<Op
     Ok(Some(std::fs::read_to_string(path)?.trim().to_string()))
 }
 
-/// Issue #467 round 3 (Finding 1): the literal checkout's own active-
-/// workflow pointer first; if it has none, falls back to the MAIN
-/// checkout's own pointer ONLY (`pathutil::worktree_identity`) -- never an
-/// arbitrary other sibling. A worker worktree with no workflow of its own
-/// (bare `zirv workflow status` run there) inherits the orchestrator's, but
-/// two workers each running their own `zirv workflow start` in their own
-/// worktrees never collide: neither's pointer is ever mistaken for the
-/// other's, since neither is the main checkout. The main checkout itself
-/// has no further fallback (its own pointer, or nothing).
+/// Use the literal checkout’s active pointer, falling back only to the main checkout; never inherit an arbitrary sibling’s workflow. (#467)
 pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowState>> {
     if let Some(id) = read_active_pointer(state, repo)? {
         return load(state, repo, &id).map(Some);

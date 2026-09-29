@@ -27,10 +27,7 @@ use crate::commands::ctx::attribution::{self, Attribution};
 use crate::commands::ctx::proxy::decision::SeatTier;
 use crate::commands::ctx::state::{StateDir, create_private_dir_all, now_secs};
 
-/// Issue #800: bumped 1 -> 2 to add `kind`/`session`/`attribution`/
-/// `harness`/`model`/`effort`/`policy` -- every one `#[serde(default)]` so a
-/// v1 row (which never wrote them) still deserializes, as the empty/`None`
-/// values that are the only honest reading for a row that predates them.
+/// Schema 2 adds optional attribution fields; defaults keep schema 1 rows readable. (#800)
 pub const OUTCOME_SCHEMA_VERSION: u32 = 2;
 /// `<state>/logs/workflow-outcomes/{day:010}.jsonl`, the same daily-bucket
 /// layout (and pruner) the safety-decision log uses.
@@ -51,10 +48,7 @@ pub const LIGHTER_FIRST_PASS_AT_LEAST: f64 = 0.95;
 /// ...AND the mean review rounds is AT MOST this.
 pub const LIGHTER_MEAN_REVIEW_ROUNDS_AT_MOST: f64 = 0.2;
 
-/// Issue #800: whether this row is a completed/failed/closed WORKFLOW, or a
-/// headless `zirv ctx exec` session that ran no workflow at all (a "direct"
-/// task). `#[default]` is `Workflow` -- the only kind a v1 row (which never
-/// wrote this field) could have been.
+/// A row represents a workflow or a direct headless session; older rows default to workflow. (#800)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutcomeKind {
@@ -63,8 +57,6 @@ pub enum OutcomeKind {
     Direct,
 }
 
-/// One terminal workflow, or (issue #800) one direct headless session,
-/// metadata only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeRow {
     pub schema_version: u32,
@@ -93,29 +85,21 @@ pub struct OutcomeRow {
     /// that the session ran, never a workflow verdict.
     pub terminal: WorkflowStatus,
     pub duration_secs: u64,
-    /// Issue #800.
+    /// Session attribution fields are optional for older rows. (#800)
     #[serde(default)]
     pub kind: OutcomeKind,
-    /// Issue #800: `ZIRV_CTX_SESSION`, when this row's own process had one --
-    /// lets `zirv ctx exec`'s own direct-row append at exit check "did THIS
-    /// session already write a workflow row" before adding a redundant one.
+    /// Use this process’s session id to avoid appending a direct row after its workflow row. (#800)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// Issue #800: this process's own campaign/candidate/trial/task ids.
     #[serde(default, skip_serializing_if = "Attribution::is_empty")]
     pub attribution: Attribution,
-    /// Issue #800: the actual harness this session ran (`ZIRV_CTX_AGENT`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
-    /// Issue #800: the actual configured model (`ZIRV_ROUTE_MODEL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Issue #800: the actual headless effort level (`ZIRV_ROUTE_EFFORT`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Issue #800: `attribution::policy_fingerprint`'s own output, so two
-    /// outcomes can be compared knowing whether the SAME policy produced
-    /// them.
+    /// A policy fingerprint makes outcomes comparable under the same policy. (#800)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 }
@@ -131,11 +115,7 @@ fn parse_seat_tier(label: &str) -> Option<SeatTier> {
     }
 }
 
-/// Issue #800: this session's ACTUAL seat tier -- `ZIRV_ROUTE_TIER` when the
-/// launch seam already resolved one, else derived from `harness`/`model`
-/// through the handover ladder (`handover::tier_for_model`), else `None`.
-/// Best-effort throughout: a config load failure or an unplaceable model is
-/// `None`, never a guess.
+/// Record the resolved seat tier when known; config errors or unknown models stay `None`, never guessed. (#800)
 fn resolve_seat_tier(cfg: Option<&crate::commands::ctx::config::CtxConfig>) -> Option<SeatTier> {
     if let Ok(raw) = std::env::var(attribution::ROUTE_TIER_ENV)
         && let Some(tier) = parse_seat_tier(raw.trim())
@@ -203,12 +183,7 @@ impl OutcomeRow {
         }
     }
 
-    /// Issue #800: a `Direct` row for a headless session that ran no
-    /// workflow at all -- `zirv ctx exec`'s own best-effort append at exit.
-    /// `harness`/`model` are the actual values the launch resolved (from its
-    /// own [`super::super::ctx::exec::ExecutionReport`] segment), not
-    /// re-derived from env, since a supervised run's own env may already have
-    /// moved on to a later turn by the time this is called.
+    /// Record a direct headless session only when it ran no workflow; use launch-resolved harness and model values. (#800)
     pub fn direct(session: &str, harness: Option<&str>, model: Option<&str>) -> Self {
         let cfg = load_cfg_best_effort();
         let seat_tier = std::env::var(attribution::ROUTE_TIER_ENV)
@@ -302,10 +277,7 @@ pub fn record_terminal(state_dir: &StateDir, state: &WorkflowState) -> CtxResult
     append(state_dir, &OutcomeRow::from_state(state))
 }
 
-/// Every parseable row at schema 1 or 2, oldest bucket first -- issue #800
-/// bumped the schema to 2, but every new field is `#[serde(default)]`, so a
-/// v1 row still deserializes cleanly and is kept, not dropped. A corrupt line
-/// or an unreadable bucket is skipped, never fatal.
+/// Read schema 1 and 2 rows; skip corrupt lines or unreadable buckets without losing other outcomes. (#800)
 pub fn read_all(state: &StateDir) -> Vec<OutcomeRow> {
     let Ok(entries) = std::fs::read_dir(outcomes_dir(state)) else {
         return Vec::new();
@@ -328,13 +300,7 @@ pub fn read_all(state: &StateDir) -> Vec<OutcomeRow> {
         .collect()
 }
 
-/// Whether `read_all` already holds ANY row (`Workflow` or `Direct`) for
-/// `session` -- `zirv ctx exec`'s own best-effort exit check for whether to
-/// append a `Direct` row (issue #800). A session that already ran a workflow
-/// to completion must never also get a redundant direct row, and (issue-
-/// review finding R5) a resumed headless session that already recorded its
-/// own `Direct` row on a prior attempt must not get a second one appended
-/// when it resumes and exits again.
+/// A session gets at most one outcome row, including across resumed headless attempts. (#800)
 pub fn has_any_row_for_session(state: &StateDir, session: &str) -> bool {
     read_all(state)
         .iter()
@@ -516,11 +482,7 @@ pub fn propose(
 pub fn calibrate(rows: &[OutcomeRow], min_samples: usize) -> CalibrationReport {
     type Key = (Complexity, String, String);
     let mut groups: BTreeMap<Key, Vec<&OutcomeRow>> = BTreeMap::new();
-    // Issue #800: a `Direct` row carries no workflow complexity/profile/tier
-    // routing decision to calibrate against -- only ever a placeholder
-    // (`Complexity::Trivial`/`WorkflowProfile::default()`), so folding it in
-    // here would silently contaminate the `trivial`/`standard` bucket with
-    // rows this proposal table was never meant to see.
+    // Exclude direct rows from complexity calibration; their placeholder profile would contaminate the workflow buckets. (#800)
     let rows: Vec<&OutcomeRow> = rows
         .iter()
         .filter(|row| row.kind == OutcomeKind::Workflow)

@@ -66,12 +66,7 @@ pub struct TransitionEvidence {
     pub output_tokens: Option<u64>,
     pub token_usage_source: Option<String>,
     pub worker_count: u32,
-    /// Issue #155, Phase 2: the raw cache classes behind `input_tokens`
-    /// (which keeps its existing "combined context size" meaning), and the
-    /// same four classes read separately over `isSidechain` rows -- subagent
-    /// spend that used to be dropped entirely. `parent_session_id` and
-    /// `work_group_id` are NOT here: they stay on `TelemetryEvent` only,
-    /// populated by Phase 5, never invented here.
+    /// Keep `input_tokens` as combined context size and record raw cache and sidechain classes separately. (#155)
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
     pub sidechain_input_tokens: Option<u64>,
@@ -79,10 +74,7 @@ pub struct TransitionEvidence {
     pub sidechain_cache_read_input_tokens: Option<u64>,
     pub sidechain_output_tokens: Option<u64>,
     pub session_id: Option<String>,
-    /// Issue #287: set when this `StepOutcome::Failure` is the no-progress
-    /// guard's `GateOutcome::Unchanged` -- carried onto the resulting
-    /// `TelemetryEvent` so the pathology is distinguishable from a genuinely
-    /// re-evaluated failure. Never set for any other transition.
+    /// Mark only no-progress failures as unchanged so telemetry separates them from re-evaluated failures. (#287)
     pub verification_unchanged: bool,
 }
 
@@ -102,14 +94,7 @@ pub(super) fn session_identity() -> Option<(String, String)> {
     (valid_session && valid_adapter).then_some((session_id, adapter))
 }
 
-/// Issue #349: files one attention observation, under `Authority::Workflow`,
-/// against whatever `ZIRV_CTX_SESSION` currently names -- skipped silently
-/// when unset (a headless caller with no live session context, or a test),
-/// matching every other best-effort write in this codebase. Deliberately
-/// reads only `SESSION_ENV`, not the stricter [`session_identity`] (which
-/// also requires a valid `AGENT_ENV`): a workflow transition's own attention
-/// row must not go unrecorded just because the adapter-name env happens to
-/// be unset or malformed.
+/// Record workflow attention against the available session id; a missing adapter name must not suppress it. (#349)
 pub(super) fn record_workflow_attention(
     attention: crate::commands::ctx::attention::Attention,
     evidence: impl Into<String>,
@@ -140,11 +125,7 @@ pub(super) fn record_workflow_attention(
     );
 }
 
-/// Dash refresh PR1: best-effort companion to [`record_workflow_attention`]
-/// -- same env-only lookup (deliberately just `SESSION_ENV`, not the
-/// stricter [`session_identity`], for the identical reason: a workflow start
-/// with a malformed or missing adapter-name env must not lose its binding),
-/// same "quietly do nothing" fallback for a headless caller or a test.
+/// Bind attention by session id alone; missing adapter identity must not lose the workflow binding, and headless callers skip quietly.
 pub(super) fn bind_started_workflow_to_calling_session(state_dir: &StateDir, workflow_id: &str) {
     let Ok(session_id) = std::env::var(crate::commands::ctx::adapters::SESSION_ENV) else {
         return;
@@ -274,11 +255,7 @@ pub(super) fn sidechain_usage_since(
         return None;
     }
     let body = read_transcript_range(&path, checkpoint.transcript_bytes, end)?;
-    // The in-file branch is legacy: current Claude Code writes no
-    // `isSidechain` rows into the main transcript at all, keeping subagent
-    // turns in a sibling `subagents/` directory instead. Preferred when it
-    // answers, so a transcript recorded by an older harness still reads
-    // exactly as before.
+    // Prefer main-transcript sidechain rows when present; current Claude Code stores subagent turns under sibling `subagents/` files.
     crate::commands::ctx::adapters::claude::sidechain_transcript_usage(&body)
         .or_else(|| crate::commands::ctx::adapters::claude::subagent_transcript_usage(&path, &body))
 }
@@ -339,11 +316,7 @@ pub(super) fn enrich_transition_evidence(
     }
     if let Some(usage) = observed {
         if evidence.input_tokens.is_none() {
-            // `context_total()`, not the raw `input_tokens` field: this is
-            // the same combined "real context size" number this call site
-            // always reported, back when `TranscriptUsage::input_tokens` was
-            // the adapter's pre-summed figure. Existing telemetry consumers
-            // must keep seeing that value unchanged (issue #155 Phase 2).
+            // Use combined context size so existing telemetry consumers retain its meaning. (#155)
             evidence.input_tokens = Some(usage.context_total());
         }
         if evidence.output_tokens.is_none() {
@@ -550,18 +523,7 @@ pub(super) fn apply_jev_gate_advice(
     if state.classification.work_domain.domain == WorkDomain::Frontend {
         measured.work_domain = state.classification.work_domain.clone();
     }
-    // Jev determinism fix: each `is_some_and` below now also requires the
-    // answer to be `decisive` (margin at or above `jev::DEFAULT_MIN_MARGIN`);
-    // for a noul, that is a margin-only check (no separate confidence on the
-    // wire), so `decisive(0.0, ..)` -- the additional condition only ever
-    // narrows which answers apply, never widens. No "thin margin at the
-    // floor" test exists for `sensitive_surface`/the five tags below: their
-    // own floors (`JEV_SENSITIVE_PROBABILITY`/`JEV_TAG_PROBABILITY`, both
-    // 0.7) sit far enough from 0.5 that every value clearing them already has
-    // margin `>= |0.7 - 0.5| * 2 = 0.4`, well clear of the default -- the
-    // gate is real (see `jev::Answer::decisive`'s own tests) but structurally
-    // a no-op at this floor, the same reasoning `memory.rs`'s harvest gate
-    // documents for its own floor.
+    // Apply Jev advice only when decisive; at the current probability floors this margin gate is structurally satisfied for sensitive-surface and tag answers.
 
     let (sensitive_min_confidence, sensitive_min_margin) = GATE_RECLASS_NOUL_DEFAULT_FLOOR;
     if gate_sensitive_surface_action(
@@ -601,20 +563,7 @@ pub(super) fn apply_jev_gate_advice(
     state.jev_tags.sort();
 }
 
-/// Re-measure risk when a workflow reaches a gated step, and never lower it.
-///
-/// Classification used to be frozen at `workflow start`, which for the common
-/// case (start the workflow, then do the work) measured an empty tree: the
-/// review step was decided before a single line existed. Re-measuring here
-/// means the tree that actually got written is what decides whether review is
-/// required. Only Review/Verify steps are added by this path -- a design gate
-/// appearing after the implementation is finished would be ceremony, not
-/// safety -- and completed steps are never re-run.
-///
-/// Fails safe, not silently, when Git cannot be measured (not a repository,
-/// no commits): the band is escalated one step (`classify::mark_unavailable`)
-/// rather than left standing unchallenged -- see the Decision Log entry
-/// "Unmeasurable risk fails safe, not open".
+/// Re-measure risk at gated steps after work exists, never lower it, and add only Review/Verify without re-running completed steps. Unmeasurable Git risk raises the band.
 pub(super) fn reclassify_at_gate(
     state_dir: &StateDir,
     state: &mut WorkflowState,
@@ -677,10 +626,7 @@ pub(super) fn reclassify_at_gate(
     rematerialize_after_risk_increase(state);
 }
 
-/// Adds any Review/Verify step the just-raised risk band newly requires,
-/// without re-running or reordering completed steps. Shared by the measured
-/// re-classification above and by the fail-safe escalation applied when Git
-/// measurement is unavailable at a gate.
+/// Add newly required Review/Verify steps without moving or re-running completed steps.
 pub(super) fn rematerialize_after_risk_increase(state: &mut WorkflowState) {
     let definition = resolve_definition_for_state(state);
     let desired = materialize_from_definition(
@@ -744,11 +690,7 @@ pub(super) fn apply_effective_deploy_tier(state: &mut WorkflowState, effective: 
         state
             .completed_steps
             .retain(|completed| safe_ids.contains(completed));
-        // Issue #542 review finding 15: a deploy-tier escalation can
-        // invalidate steps the same way `reopen_artifact_gate`'s rewind
-        // does -- a gate-only approval recorded for a step this escalation
-        // just un-completed must not be treated as still granted if this
-        // run walks forward past it again.
+        // Clear gate-only approval when a deploy-tier escalation invalidates its step. (#542)
         if state
             .current_step_approved
             .as_deref()
@@ -820,12 +762,7 @@ pub fn advance_with_evidence(
         .current()
         .cloned()
         .ok_or("workflow has no current step")?;
-    // Issue #699 Phase 0: this attempt's own machine elapsed time, captured
-    // by the match arms below (`Some` on both outcomes -- each assigns
-    // exactly once, on every path that does not return early) so the
-    // `PhaseCompleted`/`PhaseFailed` telemetry event built after the match
-    // can carry it automatically -- see `phase_elapsed_ms`'s own doc
-    // comment for why the same value is valid for either outcome.
+    // Capture this attempt’s elapsed machine time for either completion or failure telemetry. (#699)
     let auto_duration_ms: Option<u64>;
     match outcome {
         StepOutcome::Success => {
@@ -1048,12 +985,7 @@ pub fn advance_with_evidence(
                 }
                 Some(_) => WorkflowStatus::Running,
             };
-            // Issue #349: `state.status` just above is ALWAYS a fresh
-            // transition off `Running` here -- `advance_with_evidence`
-            // already refused (line ~1623) to reach this match at all while
-            // the previous status was `AwaitingApproval`. `AwaitingApproval`
-            // needs an operator; `Completed`/`Running` mean this advance
-            // cleared whatever gate attention a prior failed attempt left.
+            // This transition always leaves Running; clear gate attention only for Running or Completed, never for awaiting approval. (#349)
             match state.status {
                 WorkflowStatus::AwaitingApproval => record_workflow_attention(
                     crate::commands::ctx::attention::Attention::WorkflowGate,
@@ -1070,10 +1002,7 @@ pub fn advance_with_evidence(
             }
         }
         StepOutcome::Failure => {
-            // Issue #699 Phase 0: captured before `phase_started_at` resets
-            // below -- this failed attempt's own elapsed time, for the
-            // `PhaseFailed` event's `duration_ms` (an explicit
-            // `--duration-ms` still overrides it, same as `Success`).
+            // Capture failed-attempt duration before resetting the phase clock; an explicit duration still overrides it. (#699)
             auto_duration_ms = Some(phase_elapsed_ms(&state));
             let attempts = state.attempts.entry(current.id.clone()).or_default();
             *attempts = attempts.saturating_add(1);
@@ -1102,12 +1031,7 @@ pub fn advance_with_evidence(
     event.complexity = Some(state.classification.complexity);
     event.risk = Some(state.classification.risk);
     event.work_domain = Some(state.classification.work_domain.domain);
-    // Issue #699 Phase 0: `--duration-ms` remains an explicit override when
-    // a caller passes one; otherwise this is the same elapsed span
-    // `record_step_duration_ms`/`phase_elapsed_ms` already derived from
-    // `phase_started_at` above, so `slowest phase`/the implement-vs-
-    // validate split work for any ordinary run with no special caller
-    // cooperation.
+    // Use elapsed phase time unless the caller supplied a duration, so ordinary runs carry timing data. (#699)
     event.duration_ms = evidence.duration_ms.or(auto_duration_ms);
     event.adapter = evidence.adapter;
     event.model = evidence.model;
@@ -1122,14 +1046,7 @@ pub fn advance_with_evidence(
     event.sidechain_cache_read_input_tokens = evidence.sidechain_cache_read_input_tokens;
     event.sidechain_output_tokens = evidence.sidechain_output_tokens;
     event.session_id = evidence.session_id;
-    // Issue #264: this process's own supervising session, if the delegated
-    // worker running this workflow step was told one (`agent::PARENT_
-    // SESSION_ENV`, set by `agent::run_with`/`dash::mod::fulfill_spawn_
-    // request` at spawn time) -- what makes a delegation tree's cost
-    // attributable up the chain, not just down to the leaf that ran it.
-    // `None` for an orchestrator running this step directly (no parent to
-    // report), the same "read fresh from this process's own env, never
-    // cached" discipline `agent::parent_identity`'s own doc comment holds.
+    // Read the supervising session from this process for delegation cost attribution; direct orchestration has no parent. (#264)
     event.parent_session_id =
         crate::commands::ctx::agent::parent_identity(&|key| std::env::var(key).ok());
     event.verification_unchanged = evidence.verification_unchanged;
@@ -1138,14 +1055,7 @@ pub fn advance_with_evidence(
     event.findings_meaningful = findings_meaningful;
     event.findings_dismissed = findings_dismissed;
     event.fix_round = state.attempts.get(&current.id).copied().unwrap_or(0);
-    // Issue #699 Phase 0: only a genuine failure is a fix round happening;
-    // a `Success` never gets a cause, even if `attempts` above is nonzero
-    // (a step that failed N times before finally passing). Best-effort --
-    // `load_latest` reads the SAME persisted report the engine's own
-    // Test/Verify gate above already required to be fresh, so this never
-    // does speculative work the gate did not already justify; a load
-    // failure degrades to `None` (unclassified) rather than failing
-    // `advance` itself.
+    // Only a failure creates a fix-round cause; an unavailable report leaves it unclassified without failing advance. (#699)
     event.fix_round_cause = (outcome == StepOutcome::Failure)
         .then(|| {
             let report =
@@ -1160,9 +1070,7 @@ pub fn advance_with_evidence(
         })
         .flatten();
     event.worker_count = evidence.worker_count;
-    // Issue #264: best-effort -- a config load failure here must never fail
-    // `advance` itself, so it degrades to the built-in price table (no
-    // operator override) rather than propagating the error.
+    // An unreadable config uses built-in prices and must not fail advance. (#264)
     let price_cfg =
         crate::commands::ctx::config::CtxConfig::load(&state.repo, &|key| std::env::var(key).ok())
             .unwrap_or_default();
@@ -1194,8 +1102,7 @@ pub fn advance_with_evidence(
             &crate::commands::workflow::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
     }
-    // Issue #757: `advance` only runs from `Running`, so a terminal status
-    // here is always a fresh transition -- exactly one outcome row.
+    // Advance starts from Running, so a terminal transition writes exactly one outcome row. (#757)
     let _ = crate::commands::workflow::outcomes::record_terminal(state_dir, &state);
     if outcome == StepOutcome::Success {
         try_auto_spawn(state_dir, &state);

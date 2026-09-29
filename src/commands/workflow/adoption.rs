@@ -160,18 +160,7 @@ pub fn nudge_due(
     }
 }
 
-/// The nudge message itself. There is no task text at the point a nudge
-/// fires, so it never guesses a workflow kind: the printed command omits
-/// the id entirely -- `zirv workflow start` with no id selects
-/// deterministically from the task once the operator supplies one. Under
-/// [`AdoptionPolicy::Enforce`] an extra sentence names the delegation gate
-/// this policy also applies (`ctx::agent::run_with`).
-///
-/// Wrapper behaviour redesign (2026-09-01): the wording is now proportional
-/// -- it names a workflow as something to start "if it spans several areas
-/// or carries real risk" and says outright that a bounded change may finish
-/// without one, rather than unconditionally telling the session to start one
-/// now. See `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
+/// The nudge cannot infer a workflow kind without task text; enforce mode also names its delegation gate. Proportional wording permits bounded work to finish without a workflow.
 pub fn nudge_text(signals: &AdoptionSignals, policy: AdoptionPolicy) -> String {
     let mut text = format!(
         "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns) \
@@ -195,22 +184,7 @@ pub fn nudge_text(signals: &AdoptionSignals, policy: AdoptionPolicy) -> String {
     text
 }
 
-/// Whether the skill nudge should fire right now -- substantial work, zero
-/// skill loads this session, and due by the same [`NUDGE_EVERY_TURNS`]
-/// cadence [`nudge_due`] uses, but its OWN `last_skill_nudged_turn` -- so
-/// this nudge and the workflow-adoption nudge above never suppress or get
-/// suppressed by each other.
-///
-/// Deliberately takes no `AdoptionPolicy`/`workflow_active`, unlike
-/// `nudge_due`: an operator's workflow-adoption strictness governs the
-/// WORKFLOW nudge, not whether the skill library gets pointed at, and a
-/// workflow being active says nothing about whether a skill was ever loaded
-/// -- skills matter inside a workflow too. The caller (`ctx::hook`) still
-/// gates the whole feature on `prompt.skill_index`, and inherits whatever
-/// gate stops the transcript scan that produces `skill_loads`/`substantial`
-/// in the first place (see `ctx::hook::adoption_stop_nudge`'s own doc
-/// comment on the `workflow.adoption == Off` case) -- neither of which
-/// belongs in this pure function's own signature.
+/// Uses its own cadence so skill and workflow nudges cannot suppress each other. Workflow adoption policy and active state do not determine whether a skill was loaded.
 pub fn skill_nudge_due(
     substantial: bool,
     skill_loads: usize,

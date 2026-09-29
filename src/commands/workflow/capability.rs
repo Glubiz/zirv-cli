@@ -12,10 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::policy::{Capability as PolicyCapability, EffectivePolicy, Stance};
 
-/// The adapter name a NATIVE seat host reports under (issue #484, roadmap
-/// N15). Not a vendor CLI: it names zirv's own runtime, so a report built for
-/// it describes what the execution broker and the native tool registry
-/// provide.
+/// Identifies zirv’s native seat host, whose capabilities come from its broker and tool registry. (#484)
 pub const NATIVE_ADAPTER: &str = "native";
 
 /// Shared id shape for workflow definitions, agent roles and skills: an
@@ -78,8 +75,6 @@ impl CapabilityId {
         }
     }
 
-    /// Issue #539: the inverse of [`Self::as_str`], for reading a capability
-    /// name out of a portable bundle's flat metadata map.
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -156,11 +151,8 @@ pub enum IntegrationId {
     ArtifactRender,
     #[serde(rename = "frontend.render")]
     FrontendRender,
-    /// Issue #539: a Linear MCP server, for skills that read or file issues.
     #[serde(rename = "linear")]
     Linear,
-    /// Issue #539: a Kibana/Elasticsearch MCP server, for skills that query
-    /// logs or dashboards.
     #[serde(rename = "kibana")]
     Kibana,
 }
@@ -289,10 +281,7 @@ impl IntegrationStatus {
 pub struct CapabilityReport {
     pub adapter: String,
     pub statuses: Vec<CapabilityStatus>,
-    /// Issue #483: the concrete integrations discovered for this repository.
-    /// Empty on a report built without discovery (`for_adapter`), which is
-    /// why [`CapabilityReport::admit`] treats an absent row as unavailable
-    /// rather than as permission.
+    /// Discovered integrations; an absent row means unavailable, never permission. (#483)
     #[serde(default)]
     pub integrations: Vec<IntegrationStatus>,
 }
@@ -303,13 +292,7 @@ impl CapabilityReport {
     /// them. Zirv-owned operations can be reported as supported independently
     /// of a vendor's native tool vocabulary.
     pub fn for_adapter(adapter: &str) -> Self {
-        // Issue #484 (roadmap N15): the native runtime is a first-class
-        // seat host, not an unknown adapter. Its logical capabilities are the
-        // same ones a harness seat has -- zirv owns agent spawn, test running
-        // and artifact rendering either way, and shell/filesystem/network stay
-        // operator-controlled because the execution broker, not markdown,
-        // decides them. Without this row a native reviewer or agent seat is
-        // refused by `ensure_supported` before it ever runs.
+        // The native runtime supports harness-level capabilities; shell, filesystem and network authority still comes from the broker, never markdown. (#484)
         let known = matches!(adapter, "claude" | "codex" | NATIVE_ADAPTER);
         let status = |capability, support, reason: &'static str| CapabilityStatus {
             capability,
@@ -441,15 +424,7 @@ impl CapabilityReport {
             .unwrap_or(PolicyDecision::Deny)
     }
 
-    /// Resolve logical workflow capabilities against the effective canonical
-    /// policy for `repo`. Policy loading uses the same asymmetric operator /
-    /// repository fold as every AI launch, so repository content can narrow
-    /// permissions but cannot grant itself a capability.
-    /// Resolved report for `repo`: logical capabilities folded through the
-    /// canonical policy, plus the concrete integrations auto-discovered
-    /// within the authorization that already exists (issue #483). Discovery
-    /// contacts nothing -- it reads config, PATH and the tree -- so this stays
-    /// cheap enough for every workflow admission check.
+    /// Resolve logical capabilities through canonical policy: repository content may narrow but never grant. Discovery reads only config, PATH and the tree. (#483)
     pub fn for_repo(adapter: &str, repo: &Path) -> CtxResult<Self> {
         let config =
             crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())?;
@@ -490,11 +465,7 @@ impl CapabilityReport {
     }
 }
 
-/// The integrations one workflow step genuinely cannot proceed without
-/// (issue #483). Deliberately short: a step is refused only where the missing
-/// backend makes the step impossible rather than merely harder. A frontend
-/// step that has to render and inspect a page needs a browser; nothing else
-/// in the ladder does.
+/// Require an integration only when its absence makes a step impossible; frontend rendering and inspection require a browser. (#483)
 pub fn required_integrations(
     phase: super::skill::WorkflowPhase,
     frontend_domain: bool,

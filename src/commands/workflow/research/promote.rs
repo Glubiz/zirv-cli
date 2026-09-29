@@ -50,11 +50,7 @@ pub enum TrialStatus {
     Crash,
 }
 
-/// The campaign-level axis a candidate must win on to be promoted
-/// (`[criteria] objective`): `Efficiency` (the default) requires a
-/// material cost-or-wall win, exactly as before this key existed;
-/// `Quality` requires a material answer-stability (`quality`) win instead,
-/// for campaigns tuning a floor where cost and wall time never change.
+/// Promotion objective: Efficiency requires a material cost or wall-time win; Quality requires an answer-stability win.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
@@ -85,9 +81,7 @@ pub struct Criteria {
     pub min_effect: f64,
     pub confidence: f64,
     pub bootstrap_resamples: usize,
-    /// Which axis a material win must be measured on to promote a
-    /// candidate. Defaults to `Efficiency`, matching every manifest written
-    /// before this key existed.
+    /// Axis on which a candidate must materially improve; defaults to Efficiency for older manifests.
     pub objective: Objective,
 }
 
@@ -965,10 +959,7 @@ pub fn screen_points(obs: &[Observation]) -> ScreenPoints {
     }
 }
 
-/// Every observation's own exclusion reason (`untriggered`, `env_mismatch`,
-/// ...), counted -- report generation (issue #802) needs this breakdown per
-/// candidate/stage, and `CohortDecision.excluded` is only ever a total
-/// count, not broken down by reason.
+/// Count exclusion reasons per candidate and stage; the cohort decision holds only a total. (#802)
 pub fn excluded_by_reason(obs: &[Observation]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for o in obs {

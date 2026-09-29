@@ -19,38 +19,21 @@ const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 pub const MAX_INSTRUCTION_BUDGET: usize = 8 * 1024;
 const MAX_SKILL_DIRECTORY_ENTRIES: usize = 512;
 const MAX_RESOLVED_CONTEXT_BYTES: usize = 32 * 1024;
-/// Issue #539: a single resource file inside a portable bundle's
-/// `scripts/`/`references/`/`assets/` directory.
+/// Maximum size of one portable bundle resource. (#539)
 const MAX_RESOURCE_BYTES: usize = 64 * 1024;
-/// Issue #539: total resource bytes across one bundle -- generous enough for
-/// a handful of reference documents, small enough that a skill still reads
-/// as a compact unit rather than a smuggled dataset.
+/// Cap total bundle resources so a skill cannot carry an unbounded dataset. (#539)
 const MAX_BUNDLE_RESOURCE_BYTES: usize = 256 * 1024;
-/// Issue #539: resource file count cap, independent of size -- stops a
-/// bundle from spending the read budget on many tiny files.
+/// Cap resource count independently of size to bound many small files. (#539)
 const MAX_BUNDLE_RESOURCES: usize = 64;
-/// Issue #539: the Agent Skills spec caps `description` at this many
-/// characters; enforced on both parse (an untrusted bundle cannot exceed it)
-/// and export (a zirv skill exported for another host must not either).
+/// Agent Skills description length limit, enforced on parse and export. (#539)
 const MAX_BUNDLE_DESCRIPTION_CHARS: usize = 1024;
-/// Issue #539: the spec caps the generated `compatibility` line at this many
-/// characters.
-// #[allow(dead_code)]: only `bundle_compatibility` reads this today; its
-// caller (the CLI/tool-registry export surface) is a later #539 chunk.
+/// Agent Skills compatibility line length limit. (#539)
 const MAX_COMPATIBILITY_CHARS: usize = 500;
 /// A resource body read on demand through [`SkillRegistry::read_resource`]
 /// is truncated to this many bytes -- progressive disclosure only helps if
 /// the on-demand read stays bounded too, not just the upfront digest.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
-/// Issue #539: the whole discovery listing -- one compact line per
-/// registered skill -- must fit this budget. This guards the human-facing
-/// discovery surfaces (`zirv skill list`) and the activation scorer's own
-/// rendering; it is not a model context budget, because zirv resolves
-/// activation deterministically in Rust rather than asking a model to pick a
-/// skill from a rendered catalogue the way a host that delegates that choice
-/// would need to.
-// `ensure_discovery_budget` has no caller yet; the CLI
-// and activation surfaces that enforce it are a later #539 chunk.
+/// Cap the full discovery listing; instructions and resources are disclosed separately. (#539)
 #[allow(dead_code)]
 pub const MAX_DISCOVERY_BUDGET_BYTES: usize = 32 * 1024;
 
@@ -104,16 +87,13 @@ pub struct SkillManifest {
     pub required_capabilities: Vec<CapabilityId>,
     #[serde(default)]
     pub optional_capabilities: Vec<CapabilityId>,
-    /// Issue #539: concrete backends this skill cannot work without.
+    /// Concrete backends required for this skill to function. (#539)
     #[serde(default)]
     pub required_integrations: Vec<IntegrationId>,
-    /// Issue #539: false (the default) means investigation-only; a skill that
-    /// mutates an external service must say so and name the integration.
+    /// A mutating external-service skill must declare its effect and integration. (#539)
     #[serde(default)]
     pub external_writes: bool,
-    /// Issue #539: false keeps a skill out of automatic activation while
-    /// leaving it explicitly invocable, mirroring the invocation policy
-    /// portable bundles from other hosts carry.
+    /// Explicit-only skills remain invocable but are excluded from automatic activation. (#539)
     #[serde(default = "default_true")]
     pub implicit_activation: bool,
     pub context_budget_bytes: usize,
@@ -142,12 +122,7 @@ impl SkillManifest {
         if self.name.trim().is_empty() || self.description.trim().is_empty() {
             return Err(format!("skill '{}': name and description are required", self.id).into());
         }
-        // Issue #539 fix round: a control character (newline, carriage
-        // return, tab, ...) in `description` would let a repository skill
-        // inject extra untagged lines into the skill index prompt layer --
-        // including a forged `---` layer separator -- since that layer
-        // renders `description` (or its first sentence) directly into the
-        // composed prompt. Rejected for `name` too, on the same principle.
+        // Reject control characters in names and descriptions so repository metadata cannot forge lines or layer boundaries in the prompt. (#539)
         if self.name.chars().any(char::is_control) || self.description.chars().any(char::is_control)
         {
             return Err(format!(
@@ -218,10 +193,7 @@ impl SkillManifest {
     }
 }
 
-/// Issue #539: what kind of bundle-relative file a [`SkillResource`] points
-/// at. Purely descriptive -- it changes nothing about how the file is
-/// stored or trusted, only how a caller might choose to use it (a script is
-/// runnable, a reference is read, an asset is opaque).
+/// Describes the resource type without changing its storage or trust. (#539)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkillResourceKind {
@@ -240,10 +212,7 @@ impl std::fmt::Display for SkillResourceKind {
     }
 }
 
-/// Issue #539: metadata for one file inside a portable bundle. Bodies are
-/// read on demand through [`SkillRegistry::read_resource`] -- this struct is
-/// deliberately body-less, which is what keeps a resource's discovery cost
-/// at a hash and a byte count rather than its full content.
+/// Keep only resource metadata resident; load bodies on demand. (#539)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillResource {
     pub kind: SkillResourceKind,
@@ -287,10 +256,7 @@ pub struct RegisteredSkill {
 }
 
 impl RegisteredSkill {
-    /// The compact, budget-safe summary used for discovery (issue #539's
-    /// progressive disclosure): everything needed to decide whether to
-    /// activate a skill, and nothing that would spend the discovery budget
-    /// on instruction text or a resource body before that decision is made.
+    /// Discovery summary excludes instructions and resource bodies to stay within its budget. (#539)
     pub fn digest(&self) -> SkillDigest<'_> {
         SkillDigest {
             id: &self.manifest.id,
@@ -311,9 +277,7 @@ impl RegisteredSkill {
     }
 }
 
-/// Issue #539's progressive disclosure: a compact, serializable summary a
-/// caller can use to decide whether to activate a skill without paying for
-/// its instruction text or any resource body. Deliberately excludes both.
+/// Serializable discovery summary without instruction or resource bodies. (#539)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillDigest<'a> {
     pub id: &'a str,
@@ -499,10 +463,7 @@ impl SkillRegistry {
                     .into());
                 }
             }
-            // Issue #539: a capability is a logical permission a harness may
-            // or may not grant; an integration is a concrete backend that
-            // either exists on this machine or does not. Both must clear
-            // before a skill using either is admitted.
+            // A skill needs both its logical capability and its concrete integration to be admitted. (#539)
             report
                 .admit(&skill.manifest.required_integrations)
                 .map_err(|err| format!("skill '{}': {err}", skill.manifest.id))?;
@@ -510,8 +471,7 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// Issue #539's progressive disclosure: every registered skill reduced to
-    /// its compact intake summary, with no instruction text or resource body.
+    /// List compact intake summaries without loading instruction or resource bodies. (#539)
     pub fn digests(&self) -> Vec<SkillDigest<'_>> {
         self.skills.values().map(RegisteredSkill::digest).collect()
     }
@@ -543,12 +503,7 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// Reads one bundle resource body on demand (issue #539's progressive
-    /// disclosure): the registry keeps only resource metadata resident, so a
-    /// caller that actually needs a reference or script body calls this,
-    /// which re-checks the same trust rules the loader applied at discovery
-    /// time rather than trusting a path that could have changed on disk
-    /// since.
+    /// Re-check loader trust rules when reading a resource because its path may have changed since discovery. (#539)
     pub fn read_resource(&self, id: &str, relative: &str) -> CtxResult<String> {
         let skill = self.get(id)?;
         let bundle_root = skill
@@ -664,11 +619,7 @@ impl SkillRegistry {
     }
 }
 
-/// Operator-global manifests may replace a built-in: the operator is trusted.
-/// A repository manifest may only ADD an id. Replacing `review`'s or
-/// `verify`'s methodology text with a checkout's own version is the one thing
-/// an untrusted layer must not be able to do, so a colliding id is ignored and
-/// named in `warnings` rather than silently overwriting the trusted entry.
+/// Operator bundles may replace built-ins; repository bundles may only add ids and collisions produce warnings.
 fn load_dir(
     root: &Path,
     allowed_root: &Path,
@@ -723,10 +674,7 @@ fn load_dir(
             return Err(format!("refusing symlinked skill entry '{}'", path.display()).into());
         }
         if metadata.is_dir() {
-            // Issue #539: a portable Agent Skills bundle. A directory that
-            // does not contain SKILL.md is not a skill of ours, so it is
-            // skipped rather than treated as an error -- an operator's
-            // skills directory may hold other content alongside zirv's.
+            // Skip directories without SKILL.md; skill directories may contain unrelated content. (#539)
             if !path.join("SKILL.md").is_file() {
                 continue;
             }
@@ -807,9 +755,7 @@ fn insert_skill(
     skills.insert(id, registered);
 }
 
-/// Loads one portable Agent Skills bundle directory (issue #539). `dir` is
-/// the bundle root; `canonical_skills_root` is the already-canonicalized,
-/// already-trust-checked skills directory it must not escape.
+/// Load a bundle beneath its canonical trusted root; it must not escape that root. (#539)
 fn load_bundle(
     dir: &Path,
     canonical_skills_root: &Path,
@@ -879,11 +825,7 @@ fn load_bundle(
     })
 }
 
-/// Scans a bundle's three known resource subdirectories (issue #539:
-/// `scripts/`, `references/`, `assets/`), one level deep plus nested
-/// directories within each. Applies the same trust rules `load_dir` applies
-/// to a flat manifest: no symlinks, everything must resolve inside the
-/// bundle root, and both a per-file and a whole-bundle size cap apply.
+/// Scan known resource directories recursively under the bundle root with symlink and size checks. (#539)
 fn scan_bundle_resources(bundle_root: &Path) -> CtxResult<Vec<SkillResource>> {
     let mut resources = Vec::new();
     let mut total_bytes = 0usize;
@@ -1319,17 +1261,7 @@ fn bundle_compatibility(manifest: &SkillManifest) -> Option<String> {
     Some(line)
 }
 
-/// Writes a portable Agent Skills bundle for `skill` under `out_dir`,
-/// re-loadable through [`parse_skill_md`] to an identical [`SkillManifest`].
-/// Only the six top-level keys the spec (and Claude Code's own packaging
-/// path) allow are emitted -- `name`, `description`, `license`,
-/// `compatibility`, `allowed-tools`, `metadata` -- so an exported zirv skill
-/// never trips another host's strict frontmatter check. Every zirv-specific
-/// field goes into `metadata`'s `x-zirv-*` keys, the only place this format
-/// is asked to carry them; a key equal to its default is omitted rather than
-/// written out, matching what an absent key already means on parse.
-// #[allow(dead_code)]: this chunk (issue #539) only defines the library
-// function; the CLI subcommand that calls it is a later chunk's job.
+/// Export only Agent Skills frontmatter keys; keep zirv fields under `metadata.x-zirv-*` and omit defaults. (#539)
 pub fn export_bundle(skill: &RegisteredSkill, out_dir: &Path) -> CtxResult<PathBuf> {
     ensure_bundle_description_len(&skill.manifest.description, &skill.manifest.id)?;
     let bundle_dir = out_dir.join(&skill.manifest.id);
@@ -1606,10 +1538,7 @@ fn manifest(
     }
 }
 
-/// Issue #539: the professional catalogue ships as real portable Agent
-/// Skills bundles rather than inline literals, so the built-ins and an
-/// operator's own bundles go through one parser and one validation path,
-/// and a reviewer reads the skill as the markdown a person actually wrote.
+/// Parse built-in and operator bundles through the same portable format and validation path. (#539)
 const CATALOGUE: &[(&str, &str)] = &[
     (
         "src/commands/workflow/skills/adr-authoring/SKILL.md",
@@ -2410,12 +2339,7 @@ fn run_load(args: &SkillLoadArgs, writer: &mut impl Write) -> CtxResult<i32> {
     if let Ok(state) = StateDir::resolve(&|key| std::env::var(key).ok()) {
         let _ = skill_tools::record_skill_activation(&state, &repo, &loaded, SkillLoadSurface::Cli);
     }
-    // This shell invocation is the PRIMARY skill-load path (the standing
-    // skill index and the pretool dispatch pointer both tell an agent to run
-    // exactly this command), and the transcript-based skill nudge can never
-    // see it on its own -- see `hook::record_shell_skill_load`'s own doc
-    // comment. Best-effort, same rule as the activation-journal write just
-    // above.
+    // Journal shell loads because transcript-based nudges cannot identify them; recording remains best-effort.
     crate::commands::ctx::hook::record_shell_skill_load(&|key| std::env::var(key).ok());
     Ok(0)
 }

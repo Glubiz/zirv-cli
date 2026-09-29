@@ -138,14 +138,7 @@ pub struct RunState {
     pub(crate) campaign_dir: PathBuf,
     pub(crate) ledger: Ledger,
     pub(crate) tracker: Tracker,
-    /// Carried alongside `ledger` so `dispatch_batch` can re-hash protected
-    /// files against it right before every trial spawn (issue-review
-    /// finding R1): evaluator drift used to be checked only at campaign
-    /// start and at each candidate's screen/validate stage decision, so
-    /// tampering that happened mid-stage -- while a concurrent batch of
-    /// trials was still running -- was not caught until the next stage
-    /// boundary, by which point a verdict had already been computed from
-    /// (potentially) tainted results.
+    /// Carry the protected-file baseline into each dispatch so mid-stage evaluator drift is caught before another trial runs.
     pub(crate) lock: Lock,
 }
 
@@ -888,13 +881,7 @@ pub fn execute(
                         manifest.criteria.confidence,
                         seed,
                     );
-                    // One last re-hash immediately before a verdict is
-                    // recorded and, if it accepts, a candidate is promoted:
-                    // closes the gap between holdout's last trial finishing
-                    // and this decision being finalized. On drift this
-                    // propagates `Err`, so neither the holdout
-                    // `StageDecision` nor `promoted` is ever written from
-                    // results that may now be tainted.
+                    // Re-hash protected files immediately before recording a verdict or promotion; drift aborts without persisting either.
                     ensure_no_drift(&repo, &lock, &mut state.ledger)?;
                     let seq = state.ledger.next_seq();
                     state.ledger.append(&LedgerEvent::StageDecision {
