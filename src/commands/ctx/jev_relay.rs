@@ -26,10 +26,12 @@
 //! {"error": "<what went wrong>"}
 //! ```
 //!
-//! A client that gets an `{"error": ...}` frame back -- or fails to connect,
-//! times out, or reads a malformed frame -- falls back to a direct call
-//! (`jev::ask`'s own relay step, `jev::relay_send`): a broken or absent relay
-//! can only ever cost a little latency, never a wrong or missing answer. A
+//! A client that cannot reach the relay (no endpoint, or connect/write of the
+//! request frame fails) falls back to a direct call (`jev::ask`'s own relay
+//! step, `jev::relay_send`). Once the request frame is written it never does:
+//! an `{"error": ...}` frame, a lost frame or a timeout become a `JevError`
+//! (recorded as a fallback row), because the vendor may already have the
+//! request and a direct re-send would bill a second one. A
 //! `{"status", "body"}` frame, by contrast, is treated exactly like a direct
 //! call's own response for that same status: [`try_via_relay`] returns
 //! `Some(Ok(body))` for `200`, `Some(Err(jev::status_error(status)))`
@@ -174,8 +176,8 @@ fn serve_one(mut connection: Connection, cfg: &ProxyTypesafeConfig) {
 /// trace back to a real HTTP status -- the inverse of `jev::status_error`.
 /// `None` for every error kind that never HAD one (`Timeout`, `Transport`,
 /// `Malformed`, `NoCredential`, `UnsafeState`): those become an `{"error":
-/// ...}` frame instead, which the client treats as "fall back to a direct
-/// call" rather than a genuine answer -- see this module's own doc comment.
+/// ...}` frame instead, which the client turns into a `JevError` without a
+/// direct re-send -- see this module's own doc comment.
 fn error_status(error: &JevError) -> Option<u16> {
     match error {
         JevError::Auth => Some(401),
@@ -237,15 +239,13 @@ fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
 }
 
 /// Tries to answer one already-encoded request via `session`'s relay
-/// endpoint, if one is running for it. `None` whenever the relay cannot (or
-/// should not) be used for ANY reason -- this process IS the relay host, no
-/// endpoint is listening, a connect/write/read failure, a round trip that
-/// exceeds `wait`, a malformed frame, or the relay's
-/// own `{"error": ...}` frame -- so the caller (`jev::ask`, via `jev::
-/// relay_send`) can fall straight through to its own direct call.
-/// `Some(Ok(body))`/`Some(Err(_))` is a genuine answer from Jev (a 200 or a
-/// mapped HTTP status), identical either way to what a direct call would
-/// have produced for that same status.
+/// endpoint, if one is running for it. `None` only when nothing was sent --
+/// this process IS the relay host, no endpoint is listening, or connect/write
+/// of the request frame failed -- so the caller (`jev::ask`, via `jev::
+/// relay_send`) can fall through to its own direct call. Once the frame is
+/// written the result is `Some`: a 200 or mapped HTTP status as a direct call
+/// would give, or a `Transport`/`Timeout` error for an error frame, a lost
+/// frame or a round trip exceeding `wait`.
 pub(crate) fn try_via_relay(
     state: &StateDir,
     session: &str,
@@ -268,12 +268,20 @@ pub(crate) fn try_via_relay(
     let spawned = std::thread::Builder::new()
         .name("jev-relay-client".to_string())
         .spawn(move || {
-            let outcome = (|| -> Option<RelayResponseFrame> {
-                let mut connection = transport::connect(&endpoint).ok()?;
-                connection
+            let outcome = (|| {
+                let Ok(mut connection) = transport::connect(&endpoint) else {
+                    return RelayOutcome::Unreachable;
+                };
+                if connection
                     .write_frame(&RelayRequestFrame { body: payload })
-                    .ok()?;
-                connection.read_frame::<RelayResponseFrame>().ok()?
+                    .is_err()
+                {
+                    return RelayOutcome::Unreachable;
+                }
+                match connection.read_frame::<RelayResponseFrame>() {
+                    Ok(Some(frame)) => RelayOutcome::Answered(frame),
+                    _ => RelayOutcome::Lost,
+                }
             })();
             let _ = tx.send(outcome);
         });
@@ -281,32 +289,47 @@ pub(crate) fn try_via_relay(
         return None;
     };
 
+    // Past this point the request may have reached the vendor: never fall back to a direct send.
     match rx.recv_timeout(wait) {
-        Ok(Some(frame)) => {
+        Ok(RelayOutcome::Unreachable) => {
             let _ = spawned.join();
-            if frame.error.is_some() {
-                return None;
+            None
+        }
+        Ok(RelayOutcome::Answered(frame)) => {
+            let _ = spawned.join();
+            if let Some(error) = frame.error {
+                return Some(Err(JevError::Transport(format!("relay: {error}"))));
             }
             match frame.status {
                 Some(200) => frame.body.map(Ok),
                 Some(status) => Some(Err(jev::status_error(status))),
-                None => None,
+                None => Some(Err(JevError::Transport("relay: empty answer".to_string()))),
             }
         }
-        Ok(None) => {
+        Ok(RelayOutcome::Lost) => {
             let _ = spawned.join();
-            None
+            Some(Err(JevError::Transport(
+                "relay: connection lost before an answer".to_string(),
+            )))
         }
-        // Timed out: the spawned thread is left to finish (or stay blocked
-        // on I/O) on its own rather than joined here -- this call must never
-        // block longer than `wait` itself.
-        Err(_) => None,
+        // The client thread is left to finish on its own; this call must never block longer than `wait`.
+        Err(_) => Some(Err(JevError::Timeout)),
     }
+}
+
+/// How one client-side relay round trip ended.
+enum RelayOutcome {
+    /// Connect or write of the request frame failed: nothing was sent, so a direct call is safe.
+    Unreachable,
+    Answered(RelayResponseFrame),
+    /// The request frame was written but no answer frame came back.
+    Lost,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::config::CtxConfig;
     use crate::commands::ctx::jev::tests::one_shot_server;
 
     const TEST_WAIT: Duration = Duration::from_secs(3);
@@ -435,34 +458,83 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// A relay that returns an `{"error": ...}` frame is treated the same as
-    /// no relay at all by the client-side helper: `None`, so the caller
-    /// falls back to a direct call.
+    /// Config, key and session for an `advise_detailed` call whose relay is a stand-in and whose
+    /// direct endpoint is a listener that must never be contacted.
+    fn relay_case(
+        tag: &str,
+    ) -> (
+        CtxConfig,
+        StateDir,
+        tempfile::TempDir,
+        std::net::TcpListener,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vendor = std::net::TcpListener::bind("127.0.0.1:0").expect("vendor stub");
+        vendor.set_nonblocking(true).expect("nonblocking");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.cache_ttl_secs = 0;
+        cfg.proxy.typesafe = config(
+            format!("http://{}", vendor.local_addr().expect("addr")),
+            &format!("JEV_RELAY_TEST_{tag}"),
+        );
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        (cfg, state, dir, vendor)
+    }
+
+    fn assert_one_fallback_row_and_no_direct_send(
+        state: &StateDir,
+        vendor: &std::net::TcpListener,
+        status: jev::AdvisoryStatus,
+    ) {
+        assert!(matches!(status, jev::AdvisoryStatus::Failed));
+        assert!(
+            vendor.accept().is_err(),
+            "no direct request may follow a written frame"
+        );
+        let text = std::fs::read_to_string(state.root().join("jev-decisions.jsonl"))
+            .expect("decision row");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            !text.contains("\"fallbacks\":[]"),
+            "the row must carry the fallback: {text}"
+        );
+    }
+
+    /// The relay reported a vendor failure (an error frame) after the request was written: the
+    /// client must not re-send it directly.
     #[test]
-    fn a_relay_error_frame_reports_nothing_to_relay_through() {
-        let state_tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+    fn a_relay_error_frame_is_not_retried_directly() {
+        let (cfg, state, _dir, vendor) = relay_case("ERRFRAME");
         let session = "relay-error-frame-session";
-        let endpoint = Endpoint::for_jev_relay(&state, session);
-        let listener = Listener::bind(&endpoint).expect("bind");
+        let listener = Listener::bind(&Endpoint::for_jev_relay(&state, session)).expect("bind");
         let server = std::thread::spawn(move || {
             let (mut connection, _frame) = accept_one_real_request(&listener);
             connection
                 .write_frame(&RelayResponseFrame {
-                    error: Some("upstream unreachable".to_string()),
+                    error: Some("upstream timed out".to_string()),
                     ..Default::default()
                 })
                 .expect("write");
-            drop(connection);
-            drop(listener);
         });
-
-        let result = try_via_relay(&state, session, "{}", TEST_WAIT);
-        assert!(
-            result.is_none(),
-            "an error frame must fall back, not answer"
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var("JEV_RELAY_TEST_ERRFRAME", "secret");
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+        }
+        let status = jev::advise_detailed(
+            &cfg,
+            &state,
+            "memory",
+            true,
+            &sample_state(),
+            &sample_questions(),
         );
+        unsafe {
+            std::env::remove_var("JEV_RELAY_TEST_ERRFRAME");
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+        }
         server.join().expect("server thread must not panic");
+        assert_one_fallback_row_and_no_direct_send(&state, &vendor, status);
     }
 
     /// A relay that forwards a non-200 status is a genuine answer, not a
@@ -544,25 +616,82 @@ mod tests {
         assert!(result.is_ok(), "got {result:?}");
     }
 
-    /// A dead relay (accepted the connection, then dropped it without ever
-    /// writing a frame) is indistinguishable from any other relay failure:
-    /// the client falls back.
+    /// A test build must refuse a non-loopback endpoint before it even looks for a relay: a live
+    /// relay from the developer's own session would send the request from a non-test process.
     #[test]
-    fn a_relay_that_dies_mid_request_falls_back() {
+    fn a_test_build_never_contacts_the_relay_for_a_real_endpoint() {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
-        let session = "relay-dies-session";
+        let session = "relay-guard-session";
         let endpoint = Endpoint::for_jev_relay(&state, session);
         let listener = Listener::bind(&endpoint).expect("bind");
+        let server = std::thread::spawn(move || accept_one_real_request(&listener).1.body);
+
+        let cfg = config(
+            ProxyTypesafeConfig::default().base_url,
+            "JEV_RELAY_TEST_GUARD",
+        );
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var("JEV_RELAY_TEST_GUARD", "secret");
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+        }
+        let result = jev::ask(
+            &cfg,
+            state_tmp.path(),
+            0,
+            &sample_state(),
+            &sample_questions(),
+        );
+        unsafe {
+            std::env::remove_var("JEV_RELAY_TEST_GUARD");
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+        }
+        assert!(
+            matches!(result, Err(JevError::Transport(_))),
+            "got {result:?}"
+        );
+
+        // The first request the stand-in sees must be this marker, not `ask`'s payload.
+        let mut connection = transport::connect(&endpoint).expect("connect");
+        connection
+            .write_frame(&RelayRequestFrame {
+                body: "marker".to_string(),
+            })
+            .expect("write");
+        assert_eq!(server.join().expect("stand-in must not panic"), "marker");
+    }
+
+    /// The relay took the request frame and then vanished (supervisor exit mid-flight): the vendor
+    /// may already have it, so the client records a fallback and never re-sends directly.
+    #[test]
+    fn a_lost_relay_answer_is_not_retried_directly() {
+        let (cfg, state, _dir, vendor) = relay_case("LOSTFRAME");
+        let session = "relay-dies-session";
+        let listener = Listener::bind(&Endpoint::for_jev_relay(&state, session)).expect("bind");
         let server = std::thread::spawn(move || {
             let (connection, _frame) = accept_one_real_request(&listener);
             drop(connection);
-            drop(listener);
         });
-
-        let result = try_via_relay(&state, session, "{}", TEST_WAIT);
-        assert!(result.is_none());
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var("JEV_RELAY_TEST_LOSTFRAME", "secret");
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+        }
+        let status = jev::advise_detailed(
+            &cfg,
+            &state,
+            "memory",
+            true,
+            &sample_state(),
+            &sample_questions(),
+        );
+        unsafe {
+            std::env::remove_var("JEV_RELAY_TEST_LOSTFRAME");
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+        }
         server.join().expect("server thread must not panic");
+        assert_one_fallback_row_and_no_direct_send(&state, &vendor, status);
     }
 
     /// `start` refuses outright when no `[jev]` gate is on or no credential
