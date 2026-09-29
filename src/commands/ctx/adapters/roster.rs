@@ -2,59 +2,9 @@
 //! gaps, and the readiness note.
 use super::*;
 
-/// One line per registered adapter, describing whether an Orchestrator
-/// session may delegate to it right now via `zirv agent <name> "<prompt>"`.
-/// Rendered by a caller that already has `cfg` in hand (`wrap`, `chat`'s
-/// dashboard orchestrator pane path), never by a Worker call site: the result
-/// is folded into the composed prompt as the harness roster
-/// (`prompt::PromptSource::Harnesses`), and a worker must not learn what it
+/// Build the orchestrator's delegation roster from enabled, ready harnesses; uncertain presence stays visible, confirmed absence is omitted. The current harness cannot delegate to itself. (#298)
+/// Rendered only for an Orchestrator prompt, never a Worker's: a worker must not learn what it
 /// could delegate to.
-///
-/// `current_adapter` is the resolved adapter running *this* session -- its
-/// line is marked "(this session's harness)" instead of the `zirv agent`
-/// invitation, since `HARNESS_PROMPT` frames delegation as going to *other*
-/// harnesses; a session cannot review-round itself.
-///
-/// Walks `ADAPTERS` in registry order, same as `readiness_note`, but reports
-/// per-adapter gate state too (`readiness_note` only ever speaks about
-/// installed-but-not-ready or degraded adapters, never a disabled one).
-///
-/// Issue #298 ("capability-gated injection"): a disabled adapter, or one
-/// whose [`liveness_probe`] comes back confirmed [`Liveness::Absent`], gets
-/// no line at all -- omission, never an annotated "disabled"/"not
-/// installed" claim spending prompt bytes on a capability that cannot run
-/// (and, for "not installed" specifically, a claim [`program_is_present`]'s
-/// own doc comment already admits can be wrong). `Liveness::Unknown` still
-/// renders the normal "ready" line (fail-open: a probe that cannot decide
-/// must never cost the session a capability it might actually have). The
-/// trailing "- code review: ..." line is unaffected -- see `review_roster_
-/// line`'s own doc comment for why it deliberately does not check presence.
-///
-/// `ready()` alone is fail-open for a binary that simply is not there (see
-/// [`program_is_present`]'s own doc comment), so a `ready()`-Ok adapter's
-/// [`Liveness`] is checked again against the real filesystem (widened with
-/// [`known_install_roots`]) before its line may claim "ready" and hand out
-/// the `zirv agent` invitation.
-///
-/// `cfg.agent_bin` is one global override (see `agent_bin_names_a_different_
-/// adapter`'s own doc comment), so it is never handed to an adapter whose own
-/// basename it does not name: every `ctor(bin)` call below used to reuse the
-/// same `bin` for every adapter in the registry, which put a real `claude`
-/// binary's presence verdict onto codex's line (and vice versa) whenever an
-/// operator's `agent_bin` named one specific agent -- either wrongly
-/// advertising `zirv agent codex` on the strength of claude's binary, or, for
-/// a not-yet-real wrapper path, wrongly omitting every *other* adapter's
-/// line too. `agent_bin_names_a_different_adapter` returning `Some` means
-/// `bin`'s basename names a *different* registered adapter than the one
-/// about to be built, so that adapter is built with `None` instead and its
-/// presence is judged from its own default program name, exactly as if no
-/// override were configured at all.
-///
-/// Test-only: every production caller has a `StateDir` in hand and goes
-/// through [`harness_prompt_lines_cached`] instead (`compile::compile_with_
-/// harness_roster`'s only real call site), so this uncached, `Vec<String>`-
-/// returning shape now exists purely as the simpler entry point the bulk of
-/// this module's own tests were written against before the cache existed.
 #[cfg(test)]
 pub fn harness_prompt_lines(cfg: &CtxConfig, current_adapter: &str) -> Vec<String> {
     harness_roster_lines(cfg, current_adapter, None).lines
@@ -84,25 +34,7 @@ pub struct HarnessRosterReport {
     pub omitted_bytes: usize,
 }
 
-/// Steps 2-4 of `harness_roster_lines`' own per-adapter loop, isolated so
-/// `chat::harness_list` reaches the identical verdict without
-/// re-implementing the `agent_bin` override handling
-/// (`agent_bin_names_a_different_adapter`) or the issue #298 liveness
-/// probe's own `PATH` walk. Neither caller's enabled-gate check lives here
-/// -- each still gates on `cfg.agents` itself before calling this for a name
-/// it already knows is enabled.
-///
-/// `Ok((adapter, verdict))` when `ready()` succeeds, handing back the built
-/// adapter itself so a caller that also needs `program()`/`capabilities()`
-/// reuses this same instance rather than constructing another. `Err(reason)`
-/// when `ready()` itself fails, carrying its error text -- fail-open,
-/// exactly like `Liveness::Unknown`: the caller still counts the adapter as
-/// present.
-///
-/// `cache: None` runs the probe fresh every call, right for
-/// `chat::harness_list` (a banner rendered once at startup); `harness_
-/// roster_lines` threads its own per-repository `ProbeCache` through
-/// instead, unchanged from before this function existed.
+/// Share adapter construction and presence verdicts across prompt and chat rosters; callers apply their own enabled gate.
 pub(crate) fn adapter_liveness(
     cfg: &CtxConfig,
     name: &str,
@@ -290,13 +222,7 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
             } else {
                 ctor(bin)
             };
-            // Review finding (#395 follow-up): attach the same endpoint
-            // override `apply_endpoint_override` gives every adapter that is
-            // actually spawned -- without it, this line advised a native-
-            // ladder model for a harness the operator retargeted at a
-            // vendor endpoint, even though the real review launch
-            // (`reviewer_args`, via this adapter's own `model_args`) pins to
-            // that endpoint's ladder.
+            // Apply endpoint override before choosing roster model, matching the actual review launch. (#395)
             apply_endpoint_override(&mut adapter, cfg);
             let choice = resolve_review_model(cfg, name, adapter.as_ref());
             let model = adapter.pin_model_for_endpoint(&choice.model);
@@ -369,36 +295,7 @@ fn join_with_or(items: &[&str]) -> String {
     }
 }
 
-/// A short clause naming every adapter that is not ready yet, a second
-/// naming every adapter whose `ready()` failure is permanent for this
-/// platform (`AgentAdapter::platform_unsupported`) rather than a fixable
-/// "not installed yet" state, plus a third naming every *ready* adapter
-/// whose own `capabilities()` still leaves its launches degraded (no rot
-/// score, usage, turn signal, or injected system prompt) -- for `zirv ctx
-/// --help`'s `about` text. All three are generated from each adapter's own
-/// `ready()`/`platform_unsupported()`/`capabilities()` rather than
-/// hardcoded, so a newly wired-up adapter (or one that later closes a
-/// capability gap) falls in or out of the sentence on its own. Empty only
-/// once every adapter is both ready and fully capable.
-///
-/// Codex is the adapter this currently discloses: `ready()` no longer
-/// hard-errors (its shim gap and `resolve_program` routing are closed, see
-/// [[Known Issues]] via CLAUDE.md), but its `capabilities()` is still
-/// honestly all-`false` -- `--agent codex` works, silently missing the four
-/// things claude gets for free, which a user reading `--help` deserves to
-/// see stated plainly rather than only discovering by surprise.
-///
-/// Muse (issue #394) is the adapter the second clause currently discloses on
-/// Windows: its `ready()` refuses outright there since no binary can ever
-/// exist for it on that platform, which is categorically different from
-/// "not ready yet" -- the latter implies installing the binary would fix
-/// it.
-/// How many times this process has actually walked every adapter's
-/// `ready()` (i.e. called [`readiness_note`]) -- observable from tests so a
-/// perf regression that makes some ordinary `zirv ctx <verb>` invocation pay
-/// this probe again shows up as a counter mismatch rather than only a wall-
-/// clock number nobody is watching (see `ctx::mod::ctx_about`, which is the
-/// only call site and gates it behind "help is actually about to render").
+/// Report absent, permanently unsupported, and capability-degraded adapters separately without asserting uncertain absence.
 pub(crate) static READINESS_NOTE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -406,12 +303,7 @@ pub fn readiness_note() -> String {
     READINESS_NOTE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut clauses: Vec<String> = Vec::new();
 
-    // Item 11: each adapter is constructed and `ready()`-checked exactly
-    // once here, in one pass -- the two-pass version used to build a fresh
-    // adapter and re-call `ready()` a second time for every adapter, once
-    // per clause. `ctx_about()`'s `OnceLock` already caps this to once per
-    // process, but the hook/statusline path still goes through it on every
-    // invocation before that cache is warm.
+    // Construct and check each adapter once per roster build; readiness probes may be expensive.
     let mut not_ready: Vec<&str> = Vec::new();
     let mut unsupported: Vec<&str> = Vec::new();
     let mut degraded: Vec<String> = Vec::new();

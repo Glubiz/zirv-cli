@@ -495,8 +495,7 @@ impl ParsedTool {
                 workflow_id(args.id.as_deref())?;
                 non_empty(&args.task, "task")
             }
-            // Issue #485: ids that name a durable record are validated here,
-            // at the boundary, rather than left for the store to reject.
+            // Validate durable IDs at the tool boundary before touching the store. (#485)
             Self::TaskCreate(args) => args.validate(),
             Self::TaskClaim(args) => super::team::validate_id(&args.task, "task"),
             Self::TaskList(_) | Self::ObjectiveStatus(_) | Self::TeamStatus(_) => Ok(()),
@@ -625,13 +624,7 @@ impl ParsedTool {
                 key: Some(args.query.clone()),
                 write: false,
             },
-            // Issue #479: every delegation tool crosses the broker's own
-            // `Delegate` action, so a native session cannot delegate around
-            // the seat fence and policy its other tools run behind. `role`
-            // names the operation for the six that address an existing
-            // delegation, and the requested worker role for `delegate`
-            // itself; `task` is the shared card (or the handle being acted
-            // on) the broker requires to be non-empty.
+            // Every delegation crosses the broker's `Delegate` action, preserving seat fences and policy. (#479)
             Self::Delegate(args) => ExecutionAction::Delegate {
                 role: args.role_or_default(),
                 task: args.action_task(),
@@ -744,11 +737,8 @@ impl ParsedTool {
                 arguments: args.arguments.clone(),
                 effects: ProcessEffects::default(),
             },
-            // Issue #484: the workflow store is SHARED state. Reading it is
-            // inert; advancing or approving is a write the broker prices as
-            // one, so a session with no writer permit for this worktree -- a
-            // read-only helper, a reviewer seat -- is refused at effect time
-            // rather than by a prompt it could be talked out of.
+            // Workflow mutations require a writer permit at effect time because the
+            // shared store is outside the session's prompt authority. (#484)
             Self::WorkflowStatus(args) => ExecutionAction::Knowledge {
                 service: "workflow".into(),
                 operation: "status".into(),
@@ -777,10 +767,7 @@ impl ParsedTool {
                 key: args.id.clone(),
                 write: true,
             },
-            // Issue #542 chunk 3b: listing the registry is inert, exactly
-            // like reading a workflow's own status; starting one WRITES the
-            // shared workflow store (a new durable id, the active pointer)
-            // the same way advance/approve do.
+            // Registry reads are inert; starting a workflow writes the shared store. (#542)
             Self::WorkflowList(_) => ExecutionAction::Knowledge {
                 service: "workflow".into(),
                 operation: "list".into(),
@@ -795,10 +782,7 @@ impl ParsedTool {
                 key: args.id.clone(),
                 write: true,
             },
-            // Issue #485: the task, group, objective and coordinator stores
-            // are shared state on exactly the same footing as the workflow
-            // store above. Minting a card, taking a claim and opening a work
-            // group are writes; reading any of them is inert.
+            // Task, group, objective, and coordinator mutations write shared state; reads remain inert. (#485)
             Self::TaskCreate(args) => ExecutionAction::Knowledge {
                 service: "task".into(),
                 operation: "create".into(),
@@ -848,10 +832,7 @@ impl ParsedTool {
                 key: None,
                 write: false,
             },
-            // Issue #541 chunk C, decision 1: compiling and persisting a
-            // team plan writes the active workflow's state (or the
-            // coordinator record when there is none) -- shared state, same
-            // footing as `task_create`/`group_create` above.
+            // Compiling and persisting a team plan writes shared workflow or coordinator state. (#541)
             Self::TeamPlan(_) => ExecutionAction::Knowledge {
                 service: "coordinator".into(),
                 operation: "team_plan".into(),
@@ -859,14 +840,7 @@ impl ParsedTool {
                 key: None,
                 write: true,
             },
-            // Issue #539 chunk E1: discovering, loading and reading a
-            // skill's own bundle resources are all inert -- none of them
-            // changes repository or external state. `skill_load`'s
-            // best-effort activation-journal write is zirv's own private
-            // accounting (the workflow telemetry store under the STATE
-            // dir), not repository or external state, so it stays a read
-            // here exactly like `workflow_status`'s own best-effort writes
-            // elsewhere in this crate.
+            // Skill discovery and resource reads are inert; private activation journaling cannot grant repository write authority. (#539)
             Self::SkillList(_) => ExecutionAction::Knowledge {
                 service: "skill".into(),
                 operation: "list".into(),
@@ -1621,10 +1595,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
                 RetryPolicy::NeverAfterStart,
             ),
         ),
-        // Issue #484 (roadmap N15): the workflow store is shared state, so
-        // every one of these carries the worktree-write claim and the two
-        // that MUTATE it declare the write capability -- a read-only session
-        // can read a workflow and cannot move it.
+        // Workflow reads are inert; mutations require the shared worktree writer claim. (#484)
         definition(
             WORKFLOW_STATUS,
             "Report the workflow's status, current step, branch and -- most usefully -- whether anything currently blocks this session from finishing.",
@@ -1668,10 +1639,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::WorktreeWrite],
             (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
-        // Issue #542 chunk 3b: the layered workflow-definition registry is
-        // read-only to list; starting a workflow writes the shared store
-        // (a new durable id, the active pointer) exactly like advance/
-        // approve above.
+        // Registry listing is read-only; workflow start writes the active pointer and durable ID. (#542)
         definition(
             WORKFLOW_LIST,
             "List every registered workflow definition pack (built-in, operator-global, and enabled repository packs), with layer, version, hash and domains.",
@@ -1696,10 +1664,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::WorktreeWrite],
             (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
-        // Issue #539 chunk E1: an agent's own skill discovery/load/resource
-        // tools, mirrored on the read-only MCP bridge with the same names
-        // and shapes. All three are reads: loading a skill's instructions
-        // changes no repository or external state.
+        // Skill tools and the read-only MCP bridge share shapes; loading instructions changes no external state. (#539)
         definition(
             SKILL_LIST,
             "Returns this session's own standing skill index (metadata-only digests -- never \
@@ -1753,11 +1718,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &[ResourceClaimKind::ReadRoot],
             (CancellationContract::NotApplicable, RetryPolicy::Safe),
         ),
-        // Issue #485 (roadmap N16): the coordinator's own services. Each is a
-        // thin adaptor over the same `ctx::task`/`ctx::group`/`ctx::objective`
-        // function the CLI verb calls; the three that mutate shared state
-        // declare the write capability, so a read-only seat can read the
-        // board and cannot move a piece on it.
+        // Coordinator tools use the CLI's durable services; mutations declare shared write authority. (#485)
         definition(
             TASK_CREATE,
             "Mint a shared task card: a title, the brief a worker claiming it is told to do, and \

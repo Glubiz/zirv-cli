@@ -267,19 +267,7 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// inherit "no restriction" by omission.
     fn read_only_args(&self) -> Vec<String>;
 
-    /// The interactive-launch counterpart of [`read_only_args`](Self::
-    /// read_only_args): the same restriction, but never carrying a flag that
-    /// only an `exec`-style (non-interactive) launch surface accepts. Bug
-    /// fix (2026-09-06): codex's `--ignore-rules`/`--ignore-user-config`
-    /// exist only on `codex exec --help`; the top-level interactive `codex
-    /// [OPTIONS] [PROMPT]` launch a dashboard pane uses rejects both with a
-    /// clap usage error (exit 2), which killed a `--mode read-only` pane
-    /// instantly, before it ever registered a session -- see
-    /// `CodexAdapter`'s own override.
-    ///
-    /// Defaults to `read_only_args()` unchanged, which is correct for any
-    /// adapter whose read-only pin does not vary by launch surface (claude's
-    /// `--disallowedTools=...` works identically either way).
+    /// Use only restrictions accepted by the interactive CLI surface; exec-only flags can terminate a pane at launch.
     fn interactive_read_only_args(&self) -> Vec<String> {
         self.read_only_args()
     }
@@ -428,23 +416,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
-    /// This adapter's own hard-coded model for a delegated headless worker
-    /// (`zirv ctx agent`, and the dashboard's own spawn-request pane
-    /// variant) when the operator has not set `worker.<name>` explicitly.
-    /// Used only by `resolve_worker_model` in this module, the one place
-    /// this and the operator override are combined into the argv a
-    /// delegation spawn actually launches with.
-    ///
-    /// `None` -- the default, and codex's own answer -- means this adapter
-    /// has no verified cheap-enough default of its own to guess, the same
-    /// "nothing verified to guess" answer `default_distiller_model` gives:
-    /// the launch omits `--model` entirely and the agent's own
-    /// configuration (codex's `~/.codex/config.toml`) picks instead.
-    /// Claude's own default is `"sonnet"`, a real hard-coded value specific
-    /// to claude's lineup: a delegated worker used to silently inherit
-    /// whatever the operator's own interactive default happened to be
-    /// (often a far pricier model than the work actually needs), which is
-    /// exactly the spend this default exists to stop.
+    /// Optional worker model used when the operator has no override; `None` leaves selection to the launched harness.
     fn default_worker_model(&self) -> Option<&'static str> {
         None
     }
@@ -660,26 +632,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
-    /// Whether [`parse_events`](Self::parse_events) can ever emit
-    /// [`NormalizedEvent::ToolCall`] for this agent -- i.e., whether
-    /// `--max-tool-calls` (issue #155, Phase 5(d)) has any real signal to
-    /// count against. `true` by default, since most adapters' `parse_events`
-    /// are built directly off verified tool-call records in their own
-    /// transcript.
-    ///
-    /// Issue #155 review finding C2: `CodexAdapter` overrides this to
-    /// `false` -- its own `parse_events` doc comment explains there is no
-    /// verified rollout shape for a tool call at all, so it deliberately
-    /// never emits one. Left silently `true` here, `--max-tool-calls` would
-    /// accept the flag for a codex worker and then never advance toward it,
-    /// which reads as "budget respected" forever rather than "budget not
-    /// enforceable". `exec::run_with_clock` checks this once, at
-    /// argument-validation time, and refuses the flag outright rather than
-    /// let it fail silently on every poll after that.
-    ///
-    /// Deliberately outside [`Capabilities`]: nothing in `rot.rs` or
-    /// anything scored reads this, so it does not belong in the struct that
-    /// exists to feed those signals.
+    /// Advertise tool-call events only when verified, so max-tool-calls cannot be accepted without an enforceable counter. (#155)
     fn counts_tool_calls(&self) -> bool {
         true
     }
@@ -804,47 +757,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         super::policy::CapabilityDescriptor::advisory_only()
     }
 
-    /// Argv that applies zirv's canonical `[policy]` (`policy::
-    /// EffectivePolicy`) to a REAL session launch -- not the honest report
-    /// `policy_support`/`policy::evaluate` produce for `zirv context status`,
-    /// but the actual flags a launch command carries, so one operator setting
-    /// produces equivalent behaviour on every registered adapter.
-    ///
-    /// Default is empty: the same "nothing verified to guess" shape every
-    /// other optional method on this trait uses, and also the *correct*
-    /// answer for the shipped default -- `EffectivePolicy::default()` is
-    /// `Allow` on every capability except `network` (`Stance::Allow`'s own
-    /// doc comment: "zirv declares no restriction of its own";
-    /// `EffectivePolicy`'s own doc comment covers `network`'s exception,
-    /// `Option<Stance>` defaulting to `None` -- "no operator layer has ever
-    /// named it" -- rather than a `Stance` this method would need to act
-    /// on), so an operator who has set no `[policy]` table at all gets
-    /// byte-for-byte the same argv as before this method existed, on every
-    /// adapter. Anything more restrictive requires an explicit `[policy]`
-    /// stance, and anything more *permissive* than the default cannot come
-    /// from this method at all: there is no `Stance` value that widens past
-    /// `Allow`, and a repo checkout cannot set one stricter than the
-    /// operator's own layer either (`policy::resolve`'s narrow-only fold --
-    /// see that module's doc comment).
-    ///
-    /// Only a capability this adapter also names `Enforced`/`Degraded` for in
-    /// `policy_support` may ever change this launch's argv: `Ask`/`Allow`
-    /// stay `OperatorControlled` (the harness's own native config decides,
-    /// exactly as before this method existed) -- this trait has no verified
-    /// per-run mechanism to make a headless worker request approval that
-    /// isn't already asking, only to suppress or deny it. Both registered
-    /// adapters override this for `Deny` on `RepoFsWrite`/`ShellExec` only,
-    /// the same pair `read_only_args`/`distiller_cmd` already pin.
-    ///
-    /// `mode` (issue #134, 2026-08-25) exists for the same reason
-    /// `default_sandbox_args` already takes it: codex's projection of a Deny
-    /// stance is command-surface-dependent (`codex exec` rejects
-    /// `--ask-for-approval` on current codex-cli even though the top-level
-    /// interactive `codex` accepts it), so the adapter needs to know which
-    /// surface this argv is headed for to project a working flag rather
-    /// than one the installed binary rejects outright. Claude has no such
-    /// surface split and ignores it, exactly as it already ignores `mode`
-    /// nowhere else on this trait.
+    /// Apply resolved policy to the real launch; unsupported adapters return no flags and must report that gap honestly.
     fn policy_args(
         &self,
         policy: &super::policy::EffectivePolicy,
@@ -854,55 +767,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
-    /// argv for zirv's own shipped-default launch posture (2026-08-22
-    /// decision, harness/model parity round): **sandboxed, no prompts**.
-    /// Commands run freely inside the repository workspace; anything
-    /// reaching outside it fails rather than prompting a human -- both
-    /// halves are load-bearing (a posture that stops prompting by removing
-    /// the sandbox is not this). Applied by `policy_launch_args` whenever
-    /// `cfg.sandbox.enabled` is true (the default; an operator opts out with
-    /// `[sandbox] enabled = false` or `ZIRV_CTX_SANDBOX=false`), independent
-    /// of whether `[policy]` itself is configured -- `EffectivePolicy`'s own
-    /// default stays all-`Allow` ("zirv's per-capability policy declares
-    /// nothing"; unchanged by this), so this is a **separate** baseline
-    /// layered underneath it, not a change to what `Allow` means.
-    ///
-    /// Default empty (no verified mechanism); both registered adapters
-    /// override it -- unlike `policy_args`, this takes no `EffectivePolicy`
-    /// input, since the shipped baseline is the same argv regardless of
-    /// what (if anything) `[policy]` says.
-    ///
-    /// `sandbox` (fix round 3, 2026-08-22) carries the operator's own
-    /// `extra_allow`/`extra_deny` (`SandboxConfig`, `config.rs`) -- claude's
-    /// own implementation appends both after the command-family rules
-    /// projected from `safety` (issue #83, below) before rendering the
-    /// generated `--allowedTools=`/`--disallowedTools=` argv, so an operator
-    /// whose project needs one more build command is not forced to discard
-    /// the whole generated deny list by pinning their own flags instead
-    /// (`flags_pin_policy` still covers that path).
-    ///
-    /// `safety` (issue #83) is zirv's harness-neutral command safety policy
-    /// (`safety::SafetyPolicy`, resolved from `[safety]` plus the built-in
-    /// set derived from `SHIPPED_POSTURE_ALLOW`/`_DENY`) -- the single
-    /// source this method's generated command rules are a projection of.
-    /// Under the shipped default (no `[safety]`/`sandbox.extra_*`
-    /// configured), `safety` is exactly `SHIPPED_POSTURE_ALLOW`/`_DENY`
-    /// again (`SafetyPolicy::default()` derives from the same constants),
-    /// so claude's projection stays byte-identical to before this method
-    /// took the parameter -- see `default_sandbox_args_stays_byte_
-    /// identical_to_the_pre_safety_shipped_default` in `claude.rs`. Codex
-    /// has no per-command mechanism to receive either parameter and ignores
-    /// both.
-    ///
-    /// `network_allowlist` (issue #727 round 2): the resolved `[policy]
-    /// network_allowlist` (`EffectivePolicy::network_allowlist`), passed so
-    /// an adapter that can honestly scope network access by destination may
-    /// do so in the REAL launch argv, not only in `network_allowlist_
-    /// support`'s report. Empty (today's shipped default, and every caller
-    /// that has no policy in scope) must leave this method's argv byte-
-    /// identical to before this parameter existed -- claude's own
-    /// implementation only branches on it when non-empty. Codex has no
-    /// per-destination mechanism and ignores it, same as `sandbox`/`safety`.
+    /// Default launches allow workspace work without prompts while retaining a sandbox or structural deny; unattended approval requests fail closed.
     fn default_sandbox_args(
         &self,
         sandbox: &super::config::SandboxConfig,
@@ -914,60 +779,17 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
-    /// Extra writable-root argv for a launch whose working directory is
-    /// `cwd`, beyond `default_sandbox_args`'s own baseline sandbox flags.
-    ///
-    /// **Caller contract:** call only where both `cwd` and `mail_dir` are
-    /// already in hand for a launch that is actually happening -- that is
-    /// `dash::worker_pane_extra_args` (see below), called unconditionally for
-    /// every dashboard-spawned worker pane, and (issue #252, 2026-09-01)
-    /// `agent::run_with`'s own headless `zirv agent` launch, called
-    /// unconditionally there too so a headless codex worker gets the same
-    /// git-dir/mail-dir roots a dashboard pane always got. Never speculative
-    /// for a launch that may not occur. Added as a distinct method
-    /// (2026-08-26, codex approval-posture round)
-    /// rather than folded into `default_sandbox_args` itself, since neither
-    /// `cwd` nor `mail_dir` is available at that method's existing call site
-    /// (`policy_launch_args`) without threading them through all seven
-    /// launch seams that call it; this is called separately, only where a
-    /// caller already has both in hand (currently `dash::worker_pane_extra_
-    /// args`, the one seam issue #119's own evidence names).
-    ///
-    /// Two concrete gaps this closes for codex, neither addressed by
-    /// `default_sandbox_args`'s `--sandbox workspace-write`:
-    /// - a dashboard pane whose `cwd` is a linked `git worktree add` sibling
-    ///   (issue #119) shares its `.git` common dir with the main checkout,
-    ///   which sits OUTSIDE `cwd` and so outside the workspace-write
-    ///   sandbox -- every git object/ref write a worker makes there fails
-    ///   (headless) or escalates (interactive) with no mechanism to grant it.
-    /// - `zirv ctx send`'s report-back write lands under the state dir's
-    ///   `mail/` subtree, also outside `cwd`, so it is denied the same way.
-    ///
-    /// Default empty -- no verified per-run mechanism, matching every other
-    /// "no verified mechanism" trait default on this trait (`policy_args`,
-    /// `default_sandbox_args`); only `CodexAdapter` overrides it. `mail_dir`
-    /// is deliberately the mail subtree alone (`StateDir::mail()`), never the
-    /// whole state root: policy snapshots and the decision log must stay
-    /// unwritable by the workload even when this widens the mail path.
+    /// Add only launch-specific worktree and mail roots, using the adapter's verified CLI mechanism at the actual spawn seam.
+    /// Caller contract: only call for a launch that is actually happening, never
+    /// speculatively. `mail_dir` is deliberately the mail subtree alone, never the
+    /// whole state root -- policy snapshots and the decision log must stay
+    /// unwritable by the workload.
     fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
         let _ = (cwd, mail_dir);
         Vec::new()
     }
 
-    /// Extra argv registering zirv's own skills as native host skills, for a
-    /// launch whose own trailing `flags` are given (so an adapter can back
-    /// off when those flags already disable its plugin surface). Default
-    /// empty; only `ClaudeAdapter` overrides it.
-    ///
-    /// Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
-    /// `role` is the compiled prompt role this launch actually gets --
-    /// `PromptRole::Worker`/`PromptRole::Single` already carry the one-line
-    /// `SKILL_POINTER_LAYER` telling them to load a skill on demand via `zirv
-    /// skill load <id>`, so registering ~46 zirv skills as a native plugin on
-    /// top of that only inflates every worker/single launch's init `Skill`
-    /// tool listing (measured 79 skills vs vanilla's 33) for no benefit.
-    /// `PromptRole::Orchestrator`/`PromptRole::SubOrchestrator` still decide
-    /// which harnesses run and so still need the plugin.
+    /// Register native host skills when the launch permits them; worker and single-seat prompts already carry the compact skill index.
     fn plugin_dir_args(&self, flags: &[String], role: super::prompt::PromptRole) -> Vec<String> {
         let _ = (flags, role);
         Vec::new()
@@ -991,17 +813,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
-    /// Review finding (#395 follow-up): pins `model` through this adapter
-    /// INSTANCE's own attached `[endpoint.*]` override, exactly like
-    /// `ClaudeAdapter::model_args`/`CodexAdapter::model_args` already pin the
-    /// `--model` launch flag via `EndpointTarget::pin_model`. Default no-op
-    /// (`model` unchanged) for every adapter that cannot carry an endpoint;
-    /// only claude/codex override it. The one seam `review_roster_line`
-    /// routes the roster's advisory review-model text through, so that text
-    /// never names a native-ladder model for a harness the operator has
-    /// retargeted at a vendor endpoint -- the actual review launch already
-    /// gets this via `model_args`, so this keeps the advisory text honest
-    /// about what that launch will actually resolve to.
+    /// Pin roster and launch model through the same operator endpoint override. (#395)
     fn pin_model_for_endpoint(&self, model: &str) -> String {
         model.to_string()
     }
@@ -1358,11 +1170,7 @@ fn describe_known_adapters(gate: &crate::settings::AgentGate) -> String {
         .join(", ")
 }
 
-/// The adapters that are both gate-enabled and `ready()` right now, in
-/// registry order. Used to spell out actual options in an error instead of a
-/// single hardcoded name -- `wrap`'s undetected-command refusal in
-/// particular, which used to say "pass --agent claude" no matter how many
-/// adapters the registry actually held.
+/// List enabled, ready adapters for launch errors, in registry order.
 pub fn available_adapter_names(cfg: &CtxConfig) -> Vec<&'static str> {
     let bin = cfg.agent_bin.as_deref();
     ADAPTERS
@@ -1583,18 +1391,7 @@ pub(crate) fn resolve_default_with_presence(
                     )
                     .into());
                 }
-                // Medium 2: recorded and skipped, not `?`-aborted. `bin`
-                // is one value tried against *every* candidate in this
-                // loop in registry order -- if it names a different
-                // adapter than this one (`name`), the right answer is to
-                // keep walking to the adapter it actually does name, not
-                // to abort the whole fallback here. An operator with no
-                // `agent =` configured, only `agent_bin` pointing at a
-                // real codex install, used to get a hard error at claude
-                // (first in registry order) instead of landing on codex.
-                // The explicit-`--agent` arm above still hard-refuses:
-                // there the operator named the mismatch directly, so
-                // there is nothing left to fall back to.
+                // Keep scanning when a global binary override names another adapter; this candidate alone is not the fallback decision.
                 if let Some(other) = agent_bin_names_a_different_adapter(bin, name) {
                     reasons.push(format!("{name}: agent_bin names '{other}', not '{name}'"));
                     continue;
@@ -1629,14 +1426,7 @@ pub(crate) fn resolve_default_with_presence(
         reasons.join("\n")
     );
     if !not_installed.is_empty() {
-        // G3: the one case the aggregate error used to describe only through
-        // each adapter's own `ready()` text, which fails open on a missing
-        // binary and so never says the plain thing -- nothing is installed.
-        // The plain sentence is only true when absence is the *whole*
-        // story: with a disabled-but-installed adapter in the list too,
-        // "no harness is installed" would be exactly the kind of asserted
-        // absence `Liveness`'s own doc comment forbids, so that case names
-        // what is missing and claims nothing further.
+        // Claim no harness is installed only when every candidate is confidently absent; disabled or uncertain candidates prevent that claim.
         let every_candidate = not_installed.len() == reasons.len();
         let missing = not_installed.join(", ");
         message.push_str(&format!(
@@ -1803,23 +1593,7 @@ pub(crate) fn select_with_presence(
         return Ok(adapter);
     }
 
-    // G3 and passthrough: the caller says whether it is choosing a harness
-    // to launch, and presence belongs to the choosing case alone. A caller
-    // that says no reached here having handed zirv a program no adapter
-    // claims, so zirv is not choosing anything -- it is labelling someone
-    // else's (`wrap --no-supervise -- echo hi`, `exec -- ./script.sh`).
-    // Refusing to run an operator's own command because zirv's own default
-    // harness is not installed would worsen a session outright, which `wrap`
-    // may never do (CLAUDE.md's own rule: supervision failure is pure
-    // passthrough).
-    //
-    // Stated by the caller rather than re-derived from `command` here
-    // because the two callers read the same argv differently: `wrap` would
-    // spawn `-- --foo` itself, while `exec` appends `-- --model x` to
-    // `adapter.program()` and so IS choosing a harness. Deriving it from a
-    // non-empty `command` alone used to make `exec -- --model x` keep an
-    // absent default harness that the very next pre-flight then refused,
-    // where the operator had an installed one to be given.
+    // Only harness selection probes presence; passthrough must not refuse an operator command due to a missing default harness.
     let present: &dyn Fn(&str, &str) -> Liveness = if adapter_builds_launch {
         present
     } else {

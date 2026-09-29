@@ -114,20 +114,9 @@ impl Default for RouteConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct NativePolicy {
     pub allowed_routes: Option<BTreeSet<RouteId>>,
-    /// Issue #486: whether zirv may compact a native session on its own
-    /// (`automatic`, the default) or may only report that it should be
-    /// compacted (`advisory`). The second key a repository layer may set,
-    /// and -- like `allowed_routes` -- it may only NARROW: a checkout can
-    /// turn automatic compaction off for work done in it, never turn an
-    /// operator's `advisory` back on.
+    /// Repository policy may narrow automatic compaction to advisory, never enable it against operator policy. (#486)
     pub compaction: Option<CompactionPolicy>,
-    /// Issue #756: whether the Anthropic Messages adapter requests
-    /// server-side context editing (`clear_tool_uses_20250919`) on native
-    /// sessions. `None` (the default) means enabled -- long tool-heavy
-    /// sessions should shed stale tool results before they exhaust context.
-    /// The third key a repository layer may set, and like `compaction` it
-    /// may only NARROW: a checkout can turn context editing off, never turn
-    /// an operator's `false` back on.
+    /// Repository policy may disable default-on context editing, never enable it against operator policy. (#756)
     pub context_editing: Option<bool>,
 }
 
@@ -228,10 +217,7 @@ impl NativeConfig {
         self.policy.compaction.unwrap_or_default()
     }
 
-    /// Issue #756: resolved context-editing policy, after any repository
-    /// narrowing. Absent configuration is enabled -- the safe default is
-    /// that a long native session sheds stale tool results before it runs
-    /// out of context.
+    /// Absent configuration enables context editing so long sessions can shed stale tool results. (#756)
     pub fn context_editing_enabled(&self) -> bool {
         self.policy.context_editing.unwrap_or(true)
     }
@@ -589,18 +575,7 @@ impl NativeConfig {
                 )
                 .into());
             }
-            // Issue #595 (roadmap N02): a route excluded by repository
-            // `policy.allowed_routes` narrowing is deliberately NOT checked
-            // here anymore. This ran at whole-config LOAD time, so one role
-            // naming an excluded route failed `NativeConfig::load` entirely
-            // -- taking down every other, still-allowed role with it, in a
-            // checkout that is by definition not allowed to touch the role
-            // table at all (`roles` is `REPO_FORBIDDEN`; only the operator
-            // writes it). The exclusion is real, but it must surface only
-            // when that specific role is actually selected -- exactly what
-            // `team::route_for_role` now checks -- the same posture
-            // `resolve_target` and `route::eligible`/`offers_from_config`
-            // already give every OTHER route lookup.
+            // Validate a repository-excluded route when its role is selected, not at whole-config load; the repository cannot edit operator roles. (#595)
         }
         Ok(())
     }

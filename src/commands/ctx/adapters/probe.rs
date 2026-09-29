@@ -97,18 +97,8 @@ pub fn resolve_program(program: &str) -> Result<ResolvedProgram, String> {
     Ok(ResolvedProgram::direct(program))
 }
 
-/// I: the flags an adapter-built command carries, with any launcher prefix
-/// dropped. On a Windows machine where the adapter's own program resolves to
-/// a real npm `.cmd` shim, every command an adapter builds starts `cmd.exe /c
-/// <shim>`, and those tokens are not what a caller asserting on agent flags
-/// means to inspect. `program` is a plain `&str` (rather than `&dyn
-/// AgentAdapter`) since nothing else about the adapter is needed -- callers
-/// get it from the adapter's own public `AgentAdapter::program()`. Was
-/// duplicated byte-for-byte in `claude.rs` and `codex.rs`'s own test modules
-/// before this; both now call this one copy. No longer test-only (issue
-/// I-2): `checks::argv::run_codex_exec` (`zirv verify`'s own
-/// `ZCHK-ARGV-CODEX-EXEC`) needs the identical launcher-stripping to avoid
-/// failing on the operator's own Windows `.cmd`-shim install.
+/// Strip a Windows `cmd.exe /c <shim>` launcher so argv checks inspect the
+/// adapter flags; the verification check uses the same stripping. (I-2)
 pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<String> {
     let launcher = resolve_program(program)
         .map(|resolved| resolved.prefix.len())
@@ -119,22 +109,7 @@ pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<Stri
         .collect()
 }
 
-/// The cmd.exe metacharacters that, appearing RAW in an argument, cmd.exe
-/// re-parses out of its own `/c` command line rather than passing through to
-/// the shim it invokes. portable-pty and `std::process` both append a
-/// no-whitespace metachar-bearing argument to a Windows command line unquoted,
-/// and an embedded `"` toggles cmd.exe out of any quoting that *was* added
-/// (BatBadBut / CVE-2024-24576's quote-toggle). Newline and carriage return
-/// terminate the command line outright. Any of these in a shim-form argument
-/// is therefore a command-injection primitive, not a literal argument value.
-///
-/// Review finding (#395): `pub(crate)` and not `#[cfg(windows)]`-gated (the
-/// guard's own use of it below still is) -- `config::validate_endpoint_target`
-/// also scans an `[endpoint.*]` `base_url` against this exact list at load
-/// time, on every platform a config can be validated on, so a base_url that
-/// would be refused by [`guard_cmd_shim_reparse`] on a Windows launch is
-/// rejected up front rather than reaching codex's `-c` argv as a token this
-/// guard then has to fail closed on.
+/// `cmd.exe /c` reparses raw metacharacters and embedded quotes in shim arguments; reject them at launch and in endpoint configuration. (#395)
 pub(crate) const CMD_REPARSE_METACHARS: &[char] =
     &['&', '|', '<', '>', '^', '(', ')', '%', '!', '"', '\n', '\r'];
 
@@ -191,29 +166,10 @@ fn reparse_launcher_prefix(program: &str, args: &[String]) -> Option<usize> {
     }
 }
 
-/// FIX (command-injection defense): fail-closed guard for the one launch shape
-/// where a downstream argv element becomes cmd.exe *source text* rather than a
-/// literal argument. When [`resolve_program`] rewrites an npm-installed
-/// `claude.cmd` to `cmd.exe /c <shim>`, cmd.exe parses the whole appended
-/// command line before invoking the shim, so any argument after the shim path
-/// that carries a cmd.exe metacharacter is re-interpreted as a command. Repo-
-/// controlled strings (an injected system prompt, a passed-through flag) reach
-/// this argv, so an unguarded metacharacter there is arbitrary code execution
-/// on a victim who merely runs a supervised session in a hostile checkout.
-///
-/// This rejects such a launch outright rather than trying to quote around
-/// cmd.exe (which the embedded-quote toggle defeats). It is deliberately a
-/// pure decision function over the already-resolved `program`/`args`, called
-/// at every spawn seam (`supervise::spawn_tapped` for the headless
-/// `exec`/`loop` path; the `CommandBuilder` assembly in `wrap` and
-/// `dash::pane` for the pty path), so there is one metacharacter policy.
-///
-/// A no-op off Windows, and on Windows for any launch that is not the shim
-/// form: a direct `.exe`, an `sh <script>` fake agent, or a program with no
-/// launcher prefix is spawned exactly as before. zirv's own flags never carry
-/// these characters, so only injected content is ever rejected. The two shim-
-/// prefix tokens themselves (`/c` and the shim path) are zirv-controlled and
-/// skipped.
+/// Fail closed before every Windows shim launch: downstream argv becomes `cmd.exe` source text, so quoting cannot safely carry untrusted metacharacters.
+/// Repo-controlled text (an injected system prompt, a passed-through flag) reaches this argv,
+/// so an unguarded metacharacter here is RCE on a victim in a hostile checkout. Reject outright
+/// rather than quoting: the embedded-quote toggle (CVE-2024-24576) defeats quoting.
 pub fn guard_cmd_shim_reparse(program: &str, args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -395,28 +351,10 @@ pub fn program_is_present(program: &str) -> bool {
     }
 }
 
-/// Issue #298 ("capability-gated injection"): a cheap, filesystem/config-only
-/// verdict on whether a capability can actually be exercised right now -- no
-/// process spawn, no network call, no more than a few `stat`s. Only `Live`
-/// earns a line in the injected harness roster: `Absent` costs the session
-/// zero prompt bytes rather than annotating a capability it cannot use, and
-/// `Unknown` still renders the line, because a probe that could not decide
-/// must never cost a session a capability it might actually have -- the same
-/// fail-open discipline [`program_is_present`]'s own doc comment already
-/// holds `resolve_program`/`ready()` to.
-///
-/// Never assert absence in injected text: an omitted line is honest, but a
-/// rendered "not installed" claim can be wrong (see [`program_is_present`]'s
-/// own doc comment -- codex's real install root on this repo's own dev
-/// machine is one a plain `PATH` walk never reaches). `Absent`'s `String` is
-/// a diagnostic reason for an operator-facing surface (`compile --measure`'s
-/// own note column) only; nothing in this module ever prints it into a
-/// session's own prompt.
-///
-/// `pub(crate)`: also the verdict [`adapter_liveness`] hands back to
-/// `chat::harness_list`, so the chat banner's roster and this module's own
-/// injected roster (`harness_roster_lines`) read the same fail-open rule off
-/// one type instead of each defining its own notion of "live".
+/// Probe only local files/config without spawning; include `Live` and uncertain `Unknown` in the roster, omit confirmed `Absent`. (#298)
+/// Never assert absence in injected prompt text: an omitted line is honest, but a rendered
+/// "not installed" claim can be wrong. `Absent`'s reason string is for an operator-facing
+/// surface only, never printed into a session's own prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Liveness {
     Live,
@@ -584,27 +522,7 @@ pub(crate) fn liveness_probe(adapter_name: &str, program: &str) -> Liveness {
     }
 }
 
-/// The one sentence zirv uses for "this adapter's program is not on this
-/// machine", wherever that answer is reached from.
-///
-/// Issue #690 (remaining scope) added a second way to reach it -- the launch
-/// pre-flight ([`refuse_if_program_absent_with_presence`]) that decides it
-/// *before* the spawn rather than from the spawn's own `NotFound` -- and a
-/// second `format!` would have been a second wording to keep in step. Factored
-/// here instead, so the fast answer and the slow one are byte-identical: the
-/// pre-flight only ever turns a slow failure into a fast one, and an operator
-/// comparing the two never has to wonder whether they mean different things.
-///
-/// All three ways out, in the same words [`resolve_default_with_presence`]'s
-/// aggregate "no harness is installed" error already uses. The `agent_bin`
-/// remedy is the one that matters most here and used to be missing: this
-/// message is reached precisely when no `agent_bin` is set (the pre-flight
-/// does not probe an override at all), so its reader may well be someone
-/// whose harness *is* installed, just not anywhere a `PATH` walk reaches --
-/// see [`known_install_roots`] and CLAUDE.md's own note that codex on this
-/// repo's dev machine lives at a real install outside `PATH`. Telling that
-/// operator to install software they already have is the wrong answer, and
-/// it was the only one this sentence gave.
+/// Share the absent-program error across preflight and spawn failure paths so both report the same adapter identity. (#690)
 fn program_not_found_message(adapter_name: &str, program: &str) -> String {
     format!(
         "adapter '{adapter_name}': program '{program}' not found. Install it so its program is \
@@ -634,52 +552,10 @@ pub(crate) fn format_launch_error(
     )
 }
 
-/// Issue #690 (remaining scope): the launch pre-flight. Once a launch path
-/// has resolved the adapter it is about to *start*, and before it engages
-/// pacing, usage polling or the macOS Keychain-reading path any of that
-/// drags in, refuse outright if that adapter's program is confidently not on
-/// this machine.
-///
-/// The defect this exists for: on a machine with no harness installed,
-/// `zirv ctx agent claude "say hi"` used to warn about Keychain access for a
-/// harness the operator does not have, sit out `[pace] blind_delay_secs` of
-/// safety delay because that harness has no usage source, and only then
-/// report that `claude` is not a program. None of that machinery has anything
-/// to pace or poll when there is no process to launch.
-///
-/// Three rules, none of them new -- each is the rule an existing seam in this
-/// module already holds to:
-///
-/// 1. Fail-open. Only [`Liveness::Absent`] refuses; `Live` and `Unknown` both
-///    proceed exactly as before the pre-flight existed. A probe that could
-///    not decide must never cost a launch that would have worked -- see
-///    [`Liveness`]'s and [`program_is_present`]'s own doc comments for how
-///    wrong this probe is allowed to be.
-/// 2. Never substitute. This only ever turns a slow failure into a fast one;
-///    it chooses nothing. An explicitly named `--agent`, or a configured
-///    `agent`, fails here under *its own* name -- the invariant
-///    [`resolve_default_with_presence`]'s G/G3 notes pin, that a harness the
-///    operator named is never silently swapped for another, is not weakened
-///    by making its failure arrive sooner.
-/// 3. No probe at all while `agent_bin` is set. An operator-set override
-///    need not be a path a `stat` can answer (the `sh <wrapper>.sh` shape
-///    this codebase's own fixtures use throughout resolves to nothing on
-///    disk), so probing it would hard-fail working setups. This is
-///    [`resolve_default_with_presence`]'s own `consult_presence = bin.
-///    is_none()` rule, reused rather than a second rule invented beside it.
-///
-/// It is the caller's job to apply this only where the program about to be
-/// spawned actually *is* `adapter.program()`. `exec`'s explicit
-/// `-- <command>` passthrough and `wrap`'s wrapped argv are the operator's
-/// own program, not this adapter's, and refusing those would worsen a
-/// session rather than fail one faster.
-///
-/// `_with_presence` and no un-injected twin, unlike [`resolve_default`]/
-/// [`resolve_default_with_presence`]: every production caller is a *launch
-/// entry point* (`exec::run_with_clock`, `run_loop::run_with_clock`) that
-/// already names [`liveness_probe`] once for its whole call, so a second
-/// wrapper naming it again here would only be a second place for a caller
-/// to reach the probe from -- and dead code besides.
+/// Refuse a confidently absent program before pacing or usage work; uncertain presence stays launchable, and explicit choice never falls back to another vendor. (#690)
+/// Caller contract: apply only where the program about to spawn IS this adapter's own -- never
+/// to `exec`'s passthrough or `wrap`'s wrapped command, which are the operator's own program;
+/// refusing those would worsen a session rather than fail one faster.
 pub(crate) fn refuse_if_program_absent_with_presence(
     adapter: &dyn AgentAdapter,
     cfg: &CtxConfig,

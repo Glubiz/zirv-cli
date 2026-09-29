@@ -1,9 +1,7 @@
 //! The harness proxy's first-choice decider (issue #537 seam): a thin
-//! wrapper over the shared Jev client at `jev.rs` (issue #537 seam
-//! extraction, task A1), kept as its own module purely so `proxy::mod`'s
-//! existing `typesafe::decide` call site needs no change. The wire
-//! contract, request/response shapes, and every real code path now live in
-//! `jev::ask`; see that module's own doc comment for the documented shape.
+//! wrapper over the shared Jev client.
+//!
+//! Delegates the wire contract to the shared Jev client. (#537)
 
 pub use crate::commands::ctx::jev::JevError as TypesafeError;
 

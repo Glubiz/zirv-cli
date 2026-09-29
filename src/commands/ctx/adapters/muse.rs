@@ -1,30 +1,9 @@
 //! Issue #394 (wave 3): the Meta Muse Code CLI adapter (`muse`),
 //! macOS/Linux only.
 //!
-//! Not installed on this machine; every fact below is exactly what issue
-//! #394's own "Verified facts" section states, sourced from
-//! `dev.meta.ai/docs/muse-code/{configuration,permissions,extending,
-//! rewind}.md` (2026-09-07, proprietary beta). The CLI form of `/resume`,
-//! compaction, and the exact hook payload schema are explicitly called out
-//! in the issue as unverified and are left on the trait's own "no verified
-//! mechanism" default rather than guessed.
-//!
-//! Issue #394 itself flags muse's transcript LOCATION as unverified --
-//! "path ... only from third parties, verify on a Linux box first" -- unlike
-//! every other wave-3 issue, where at least the file location came from
-//! official docs. [`transcript_path`](MuseAdapter::transcript_path)
-//! therefore returns an empty path rather than hard-coding a third-party,
-//! unconfirmed claim as if it were fact, and
-//! [`capabilities`](MuseAdapter::capabilities) reports `events: false`.
-//!
-//! Muse is proprietary beta, macOS/Linux only (issue #394): [`ready`]
-//! (MuseAdapter::ready) refuses outright on Windows, since no binary can
-//! ever exist there for this harness. That refusal is a permanent platform
-//! fact rather than a fixable "not installed yet" state, so
-//! [`platform_unsupported`](MuseAdapter::platform_unsupported) overrides the
-//! trait's default `false` to say so -- it keeps `readiness_note()` (`zirv
-//! ctx --help`) from filing muse under its "Not ready yet" (go-install)
-//! clause on Windows.
+//! Muse is unavailable on Windows. Its transcript location and hook
+//! shape are unverified, so readiness refuses that platform and event
+//! parsing remains disabled. (#394)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,9 +58,7 @@ impl AgentAdapter for MuseAdapter {
         CATALOGUE_VENDOR
     }
 
-    /// Issue #394: "macOS/Linux only" -- refuses outright on Windows rather
-    /// than attempting (and failing) to resolve a binary that can never
-    /// exist there.
+    /// Refuse Muse on Windows, where no supported binary exists. (#394)
     fn ready(&self) -> CtxResult<()> {
         if cfg!(windows) {
             return Err(
@@ -93,12 +70,7 @@ impl AgentAdapter for MuseAdapter {
         Ok(())
     }
 
-    /// Issue #394: the Windows `ready()` refusal above is a permanent fact
-    /// of the platform, never a "not installed yet" state -- no binary can
-    /// ever exist for muse there. Distinguishing the two keeps
-    /// `readiness_note()`'s "Not ready yet: ... (see issue #11)" clause
-    /// (which reads as "go install this") from wrongly claiming that about
-    /// muse on Windows.
+    /// Distinguish permanent Windows incompatibility from a missing install. (#394)
     fn platform_unsupported(&self) -> bool {
         cfg!(windows)
     }

@@ -23,70 +23,18 @@ pub const SESSION_ENV: &str = "ZIRV_CTX_SESSION";
 /// calling session without requiring an explicit `--to`/`--agent` flag.
 pub const AGENT_ENV: &str = "ZIRV_CTX_AGENT";
 
-/// Tells a spawned **orchestrator** session which model its own seat runs on,
-/// so the `zirv ctx hook pretool` guard inside it can refuse a subagent
-/// dispatch that would silently inherit that seat (see `hook::pretool_
-/// decision`). Prompt-level guidance was tried first and failed: a fork
-/// fan-out inherited the seat model and spent roughly half a five-hour usage
-/// window in one run, so the gate is deterministic rather than advisory.
-///
-/// Set only by the two orchestrator launch paths (`wrap::run_with` for an
-/// `Orchestrator` role, and the dashboard's first pane), never by
-/// `exec`/`loop`/worker panes -- and listed in `sessions::SUPERVISION_ENV` so
-/// a worker spawned from inside an orchestrator session has it scrubbed
-/// rather than inherited. A seat is a property of the session that owns it,
-/// exactly like `SESSION_ENV`/`SOCKET_ENV`.
+/// Pin the orchestrator seat model so the hook can refuse subagent dispatch that would inherit it; scrub this pin from workers.
 pub const SEAT_MODEL_ENV: &str = "ZIRV_CTX_SEAT_MODEL";
 
-/// Tells a spawned session which **role** launched it -- orchestrator,
-/// sub-orchestrator, worker, or (issue #537 T3) the harness proxy's own
-/// single seat -- so a hook process (`zirv ctx hook pretool`, `zirv ctx
-/// safety check`) and `zirv ctx agent` can learn which seat role is running
-/// without re-deriving it. Only the value `"orchestrator"` ever gates any
-/// behaviour: an orchestrator seat must be technically unable to edit
-/// repository files, and delegation inside the same harness must use the
-/// harness's own native subagent tool rather than a nested `zirv ctx` launch
-/// (issues #328/#334). `"single"` is therefore treated exactly like
-/// `"worker"`/`"sub-orchestrator"` by every guard keyed on this value: none
-/// of them ever compare against anything but the literal `"orchestrator"`.
-///
-/// Set for every role, unlike `SEAT_MODEL_ENV` (orchestrator-only) -- a
-/// worker or sub-orchestrator seat needs to be told apart from an
-/// orchestrator seat just as reliably as an orchestrator needs to be
-/// detected. Inherited exactly like `SEAT_MODEL_ENV`: listed in `sessions::
-/// SUPERVISION_ENV` so a worker spawned from inside an orchestrator session
-/// has it scrubbed rather than inherited -- a seat's role is a property of
-/// the session that owns it, exactly like `SESSION_ENV`/`SOCKET_ENV`/
-/// `SEAT_MODEL_ENV`.
+/// Pin the launch role for hook authority checks; only `orchestrator` restricts writes, and nested launches must scrub it. (#328, #334, #537)
+/// Every guard compares only against the literal `"orchestrator"`; single/worker/
+/// sub-orchestrator are equivalent for authority purposes.
 pub const SEAT_ROLE_ENV: &str = "ZIRV_CTX_SEAT_ROLE";
 
-/// Issue #753: set to `"1"` on a session whose launch already applied a
-/// harness-proxy decision (`WrapArgs::proxy_layer` is `Some`), so the
-/// `UserPromptSubmit` hook's own intake discipline never repeats what the
-/// proxy decided. Listed in `sessions::SUPERVISION_ENV` so a worker spawned
-/// from inside that session decides fresh rather than inheriting it.
+/// Marks a proxy-decided launch so intake does not run twice; scrub on nested launches. (#753)
 pub const PROXY_DECIDED_ENV: &str = "ZIRV_CTX_PROXY_DECIDED";
 
-/// Set on every child zirv itself launches interactively -- `zirv chat`,
-/// `zirv ctx wrap`, or a dashboard pane spawned from a request that vouches
-/// a human is present (`SpawnRequest.interactive`) -- so `zirv ctx safety
-/// check` (a `PreToolUse` hook that runs as a child of that same claude
-/// process, inheriting its environment the same way any other zirv-owned
-/// launch env var reaches it) can prove `LaunchMode::Interactive` from
-/// zirv's OWN launch record rather than trusting only Claude's
-/// self-reported `permission_mode` (issue #147 amendment, 2026-08-26): an
-/// operator whose native `defaultMode` is anything other than
-/// `"default"`/`"plan"`/`"acceptEdits"` (`"auto"`, in the field evidence
-/// that filed this) had every genuinely interactive session silently fall
-/// to the fail-closed Headless posture, asking on everything a human was
-/// right there to approve. See `safety::launch_mode_pinned_interactive` for
-/// the read side.
-///
-/// Listed in `sessions::SUPERVISION_ENV` so it is scrubbed, not inherited,
-/// by a nested launch: a headless worker spawned from inside an interactive
-/// session (`exec`/`loop`, or a dashboard pane fulfilling a non-interactive
-/// request) must decide its OWN interactivity fresh, never borrow its
-/// parent's proof.
+/// Pin interactivity from zirv's launch record, not the harness's reported permission mode; nested launches must decide afresh. (#147)
 pub const LAUNCH_MODE_ENV: &str = "ZIRV_CTX_LAUNCH_MODE";
 
 /// The one value [`LAUNCH_MODE_ENV`] is ever set to. Any other value, or its
@@ -94,20 +42,9 @@ pub const LAUNCH_MODE_ENV: &str = "ZIRV_CTX_LAUNCH_MODE";
 /// the fail-closed default, not a second, spoofable "false" value.
 pub const LAUNCH_MODE_INTERACTIVE_VALUE: &str = "interactive";
 
-/// Set to `"1"` on every child launched with [`LaunchMode::Headless`], read
-/// by `workflow::engine::refusal_for` to refuse the interactive `brainstorm`
-/// skill. Listed in `sessions::SUPERVISION_ENV` so an INTERACTIVE launch
-/// (`wrap`, `chat`, a human-vouched dashboard pane) scrubs it rather than
-/// inheriting it from whatever spawned that session -- only the exact value
-/// `"1"` counts as headless (`engine::is_headless_env`), never mere presence.
-///
-/// 2026-09-06: it means "nobody is present to answer a prompt", NOT "this run
-/// has no visible terminal". Spawn topology stopped being a thing zirv has an
-/// opinion about when `--headless` was removed; permission-prompt
-/// answerability did not. The marker is therefore derived from the launch
-/// mode itself ([`headless_marker_env`]), which is exactly what
-/// `dash::mod::trusted_launch_mode` already decides for a pane and what
-/// `exec.rs` has always been.
+/// Marks unattended launches so interactive skills are refused; only the exact value `"1"` counts, and nested launches scrub it.
+/// Means "nobody is present to answer a prompt", not "this run has no visible terminal" --
+/// spawn topology and prompt-answerability are different questions.
 pub const HEADLESS_ENV: &str = "ZIRV_CTX_HEADLESS";
 
 /// The `(key, value)` pair a real interactive-launch seam pushes into its
@@ -136,18 +73,7 @@ pub fn headless_marker_env(mode: LaunchMode) -> Option<(String, String)> {
     }
 }
 
-/// How one argv token spells a model-selecting flag -- `--model`/`-m`, in
-/// separated (bare, value is the next token), joined-by-`=`
-/// (`--model=x`/`-m=x`), or (short form only) attached (`-mx`) form. Shared
-/// by `last_model_flag` below (which needs the value) and `agent::
-/// flags_pin_model` (which only needs to know a token pins something at
-/// all, never the value), so the two can never drift on what counts as a
-/// model flag between them.
-///
-/// `Separated` deliberately carries no value itself: `last_model_flag` reads
-/// the following token from `flags` when it wants one, and `flags_pin_model`
-/// never needs to at all -- the flag's own presence is enough to say
-/// "already pinned", matching the pre-existing bare `--model`/`-m` rule.
+/// Recognize separated, `=`-joined, and attached short model flags consistently for launch and policy checks.
 pub(crate) enum ModelFlagForm<'a> {
     Separated,
     Joined(&'a str),
@@ -176,19 +102,7 @@ pub(crate) fn classify_model_flag(arg: &str) -> Option<ModelFlagForm<'_>> {
     None
 }
 
-/// Whether the launch this argv is being built for has a human sitting in
-/// front of it who can answer an approval prompt.
-///
-/// This is the one distinction zirv's shipped posture could not previously
-/// express, and it is why `--permission-mode dontAsk` had to be applied to
-/// interactive sessions too: with no way to say "someone is watching", the
-/// only safe answer was the fail-closed one. Every real-launch seam
-/// (`chat.rs`, `wrap.rs`, `dash/mod.rs`, `handover.rs`, `exec.rs`,
-/// `run_loop.rs`, `agent.rs`) now states its own answer, and the compiler
-/// -- not a comment -- is what keeps a new seam from forgetting to.
-///
-/// `ValueEnum` so `zirv ctx safety explain --mode <...>` can take it
-/// directly; the derived value names are already `interactive`/`headless`.
+/// Whether a human can answer an approval prompt; headless is the safe default when that cannot be proved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum LaunchMode {
     /// `zirv chat`, `zirv ctx wrap`, a dashboard pane, a live handover swap:
@@ -200,9 +114,7 @@ pub enum LaunchMode {
     Headless,
 }
 
-// `policy::evaluate`'s report rendering and the adapters' own `policy_support`
-// arms now consume both accessors in production (`zirv agent`'s headless
-// warning path, issue #230 item 3, among others).
+// Both accessors serve policy reports and adapter launch policy. (#230)
 impl LaunchMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -256,21 +168,7 @@ pub(crate) fn last_model_flag(flags: &[String]) -> Option<&str> {
     found
 }
 
-/// The model `flags` pins when it pins **nothing else** -- every token in it
-/// is part of one model flag, in any form `classify_model_flag` recognises.
-/// `None` when `flags` is empty, names any other flag, leaves a bare
-/// `--model`/`-m` dangling with no value, or names a value that is itself
-/// flag-shaped (a leading `-` is never a model name, and this value becomes an
-/// argv token).
-///
-/// The one caller is `agent::try_join_dashboard`: a dashboard pane cannot
-/// honour arbitrary trailing flags (they belong to `exec::run_with`), so a
-/// request carrying any declines the pane and runs headless. A model pin is
-/// the exception the harness layer now teaches orchestrators to write on every
-/// delegation, and it is the one flag a pane *can* honour, since the pane
-/// builds its own argv from a resolved worker model anyway -- so recognising
-/// exactly that shape is what keeps "pick the cheapest model" from silently
-/// costing every dashboard delegation its pane.
+/// Return a model only when every flag token belongs to valid model selection; reject dangling or flag-shaped values.
 pub(crate) fn model_only_flags(flags: &[String]) -> Option<&str> {
     let mut found = None;
     let mut i = 0;

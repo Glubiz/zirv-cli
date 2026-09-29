@@ -56,22 +56,11 @@ pub struct HeadlessRequest<'a> {
     /// none, every tool call reports a fixture failure rather than touching
     /// the machine.
     pub fixture_tools: Option<&'a std::path::Path>,
-    /// Issue #479 (roadmap N10): the SHARED task-card id this session is
-    /// working (`zirv ctx task`), carried onto the journal's own session
-    /// identity, onto the loop's config and onto every tool call's execution
-    /// identity, so a native worker's durable record names the same task a
-    /// legacy worker's does. `None` for a plain `zirv ctx exec --runtime
-    /// native` with no card behind it.
+    /// Shared task card follows the session, loop, and tool execution identity. (#479)
     pub task: Option<String>,
-    /// Issue #479: the live writer permit this session's repository writes are
-    /// backed by (`permit::acquire_writer`). Moved into the execution broker
-    /// ([`brokered_tools`]), which refuses every repository write that is not
-    /// covered by a permit for this exact worktree -- so a native worker and a
-    /// legacy worker can never both hold one checkout. `None` is a session
-    /// nobody granted a tree to: its file writes are refused, which is the
-    /// honest answer rather than an unbacked write.
+    /// Repository writes require this live permit at the broker effect boundary. (#479)
     pub writer: Option<Box<dyn super::super::enforcement::WriterLease>>,
-    /// Who accounts this run (issue #554, review round 2). See [`Accounting`].
+    /// Account owner for this run. (#554)
     pub accounting: Accounting,
 }
 
@@ -302,17 +291,10 @@ pub fn run_session<W: std::io::Write>(
     let home = crate::utils::home_dir()?;
     let cfg = super::super::super::config::CtxConfig::load(request.repo, env)?;
     let now = now_secs();
-    // Issue #479: the shared task card, validated once here so a malformed id
-    // fails before any seat, journal session or effect exists.
+    // Validate the shared card before creating a seat, journal entry, or effect. (#479)
     let task = request.task.clone().map(TaskId::new).transpose()?;
 
-    // Issue #485 (roadmap N16) item 7: a COORDINATING session picks its own
-    // graph back up before it does anything else -- every terminal worker
-    // outcome published while it was away is consumed exactly once
-    // (`delegation::consume_delivery` is the mechanism, not a second one) and
-    // folded into the durable graph. A settled node is never re-settled, so a
-    // restarted coordinator neither loses a receipt nor restarts finished
-    // work. A worker session has no graph to resume and is left alone.
+    // Resume the coordinator graph before other work; consume terminal worker outcomes once. (#485)
     if matches!(
         super::super::super::team::prompt_role(request.role),
         super::super::super::prompt::PromptRole::Orchestrator
@@ -347,12 +329,8 @@ pub fn run_session<W: std::io::Write>(
         }
     }
 
-    // Issue #554 (review round 1): admission through the SHARED allocator,
-    // before a transport is built. A headless native run is a request on a
-    // real account exactly as a delegated worker's is, so it is placed the
-    // same way and refused by the same persistent breaker -- previously only
-    // `native_worker` did this, and `zirv ctx exec --runtime native` walked
-    // straight past an open breaker onto an endpoint that had just failed.
+    // Admit through the shared allocator before building a transport, so a
+    // headless run obeys the account breaker. (#554)
     if request.accounting == Accounting::Seat
         && let Ok(route_id) = resolve_role_route_for(request.repo, request.route, request.role)
         && let Some(refusal) = super::super::super::native_account::native_placement(
@@ -373,12 +351,7 @@ pub fn run_session<W: std::io::Write>(
     let mut journal = Journal::open(&state)?;
     let mut backend = NativeBackend::new();
 
-    // Issue #639: the same canonical form recorded on the journal session
-    // at start (below) and compared against on every `--resume` of it --
-    // canonicalized so a symlinked or relative checkout of the SAME
-    // worktree still affinity-matches, and falls back to the raw path
-    // (never fails the run over it) when canonicalization itself cannot
-    // resolve it, exactly like `spawn_interactive`'s own `tree` above it.
+    // Record the canonical root so relative or symlinked paths to this worktree match on resume. (#639)
     let canonical_repo =
         std::fs::canonicalize(request.repo).unwrap_or_else(|_| request.repo.to_path_buf());
 
@@ -387,15 +360,7 @@ pub fn run_session<W: std::io::Write>(
     let (handle, session) = match request.resume {
         Some(resume) => {
             let session = JournalSessionId::new(resume)?;
-            // Issue #639: checked BEFORE `resume_journal` (below), which
-            // mutates -- it reconciles outcome-unknown executions and
-            // advances the generation. A refused resume must be a pure
-            // refusal, not a resume attempt that partly happened and then
-            // got refused. `repo` is empty only for a session whose journal
-            // predates this field (never shipped, but tolerated the same
-            // tolerant-read way every other optional seat/journal field is)
-            // -- an empty recorded origin refuses nothing, since there is no
-            // origin to contradict.
+            // Check root affinity before `resume_journal` mutates generation or execution state; a refusal must be pure. (#639)
             let identity = journal.session(&session)?;
             if !identity.repo.as_os_str().is_empty() && identity.repo != canonical_repo {
                 return Err(format!(
@@ -461,12 +426,10 @@ pub fn run_session<W: std::io::Write>(
                 session: session.clone(),
                 seat: SeatId::new(handle.short.clone())?,
                 generation: handle.generation,
-                // Issue #479: the SHARED card, so a native worker's journal
-                // session and a legacy worker's task card name one task.
+                // Native journal and delegated task card identify the same shared task. (#479)
                 task: task.clone(),
                 route: route.clone(),
-                // Issue #639: recorded once, at true session start, so a
-                // later `--resume` has an origin to check itself against.
+                // Record the canonical origin once for later resume affinity checks. (#639)
                 repo: canonical_repo.clone(),
                 created_at: now,
                 completed_at: None,
@@ -499,29 +462,10 @@ pub fn run_session<W: std::io::Write>(
         },
     )?;
 
-    // Issue #488 (review finding 4): this seat's conversation reference,
-    // recorded under the runtime it belongs to.
+    // Record the conversation reference under its owning runtime. (#488)
     record_seat_conversation(&state, &handle, &session);
 
-    // Issue #645: a live headless native run (`zirv ctx exec --runtime
-    // native`) must appear in the session registry exactly like a live
-    // headless harness run does (`exec.rs`'s own `SessionGuard::register`,
-    // ~line 1721) -- `explain-status`/`ask`/`nudge`/`kill`/`session.list`
-    // all read that registry (`sessions::list`), never the seat/journal
-    // this session already writes regardless. Same record shape a
-    // dashboard-hosted native conversation registers under
-    // (`session::native::NativeSessions::register`): native binds no
-    // turn-signal socket at all, so `.unreachable()` is the honest answer
-    // here too. Scoped to `Accounting::Seat` -- the doc comment on that
-    // variant already calls it "every operator-facing entry point",
-    // covering this plain exec AND a bounded helper call the same way a
-    // human-launched session is covered; `CallerOwned` (a delegated
-    // `native_worker` run) is deliberately excluded, since the caller that
-    // placed it already owns its own visibility and settlement. The guard
-    // lives for the rest of this function and deregisters on every exit
-    // path via `Drop`, the same as every other `SessionGuard` in this
-    // crate -- no explicit `release()` needed here, since nothing in this
-    // function runs after the guard should already be gone.
+    // Register seat-owned native runs for status and control; delegated runs are caller-owned. Keep the guard through every exit path and leave in-flight stamps after aborts. (#645)
     let mut registry_guard = (request.accounting == Accounting::Seat).then(|| {
         let mut record = super::super::super::sessions::Record::new(
             &handle.logical_id,
@@ -542,14 +486,7 @@ pub fn run_session<W: std::io::Write>(
         tools = executor;
     }
 
-    // Issue #484 (roadmap N15): the standing context, compiled ONCE by the
-    // native context compiler. This is what makes methodology and workflow
-    // adoption automatic -- a native session gets the engineering standard,
-    // its role's methodology, the model profile, the operator's and
-    // repository's instruction files and the active workflow's current step
-    // without anyone hand-seeding a prompt. A compilation that fails degrades
-    // to no standing context rather than failing the session: a session that
-    // runs with less context is recoverable, one that will not start is not.
+    // Compile standing context once; failure degrades to an empty layer so the session can still run. (#484)
     let (system, preamble) = match compile_standing_context(
         &state,
         &home,
@@ -584,12 +521,7 @@ pub fn run_session<W: std::io::Write>(
         .or_else(|| backend.cancellation(&handle))
         .unwrap_or_else(|| std::sync::Arc::new(CancellationFlag::default()));
 
-    // Issue #486: the compaction envelope for this run. The capacity is the
-    // route model's DECLARED context window less the output reservation this
-    // run actually asked for -- an unknown window stays `None`, which the rot
-    // token gate reads as "use the absolute fallbacks", never as a guess. The
-    // policy comes from `~/.zirv/native.toml`, already narrowed by any
-    // repository layer.
+    // Use the declared model window minus reserved output; unknown capacity remains unknown to the rot gate. (#486)
     let compaction = CompactionSettings {
         enabled: true,
         policy: super::super::super::provider::config::NativeConfig::load(&home, request.repo)?
@@ -611,13 +543,8 @@ pub fn run_session<W: std::io::Write>(
         state: Some(state.clone()),
     };
 
-    // Issue #554 (review round 1): the pool's ledger holds this run's own
-    // estimate while it runs, and the settlement below replaces it with what
-    // the provider actually metered.
-    // Review round 2: held in a guard, so the `?`s below (the loop's own
-    // error, a journal that cannot be completed) release it instead of
-    // leaving it outstanding against the pool forever. `settle` takes it out
-    // of the guard on the success path.
+    // Guard the estimate until settlement so an early error releases the pool
+    // reservation. (#554)
     let mut reservation = SeatReservation {
         state: &state,
         held: (request.accounting == Accounting::Seat)
@@ -646,15 +573,11 @@ pub fn run_session<W: std::io::Write>(
                 seat_model: env(super::super::super::adapters::SEAT_MODEL_ENV),
                 write_posture: lifecycle::orchestrator_write_posture(&cfg),
                 limits: request.limits,
-                // Issue #479: the shared card the loop's own tool-call scopes
-                // and task receipts are filed under.
+                // Scope tool calls and task receipts to the shared card. (#479)
                 task: task.clone(),
                 workflow_gate: None,
                 compaction,
-                // Issue #484: the active workflow of the repository this
-                // session is actually working, consulted live at every
-                // completion attempt. A fixture run brokers nothing and
-                // performs no effects, so gating it would only be theatre.
+                // Read the active workflow at every real completion attempt; fixtures perform no effects. (#484)
                 workflow_repo: brokered.then(|| request.repo.to_path_buf()),
                 system,
                 preamble,
@@ -666,28 +589,19 @@ pub fn run_session<W: std::io::Write>(
             &now_ms,
             env,
         );
-        // Issue #538 (chunk C), decision 1: opts this loop into automatic
-        // per-turn recompile checking -- see `set_recompile_context`'s own
-        // doc.
+        // Recheck standing instructions at each turn boundary. (#538)
         driver.set_recompile_context(RecompileContext {
             state: state.clone(),
             home: home.clone(),
             cfg: cfg.clone(),
             repo: request.repo.to_path_buf(),
         });
-        // Issue #645: stamped immediately before the turn actually runs, the
-        // same edge `exec.rs`'s own per-cycle spawn stamps at. Left standing
-        // on the abort/error arm below on purpose -- a record still carrying
-        // it after ITS OWN process is gone is exactly the crash witness
-        // `list_with_retention`'s retention window exists for; cleared only
-        // once this run is known to have reached a clean boundary.
+        // Stamp in-flight immediately before running; retain it after abort as a crash witness, clearing only at a clean boundary. (#645)
         if let Some(guard) = registry_guard.as_mut() {
             guard.stamp_in_flight(super::super::super::sessions::Verb::Exec.as_str(), 0);
         }
-        // Issue #554 (integration review): a hard abort still carries what
-        // this loop already billed. Settle it before the error propagates --
-        // for a SEAT here, and for a caller-owned run by handing the abort
-        // on so `native_worker` settles it with its own delegation identity.
+        // Settle billed work before propagating an abort; caller-owned runs pass
+        // the billed status to their caller for settlement. (#554)
         match driver.run_to_completion() {
             Ok(status) => {
                 if let Some(guard) = registry_guard.as_mut() {
@@ -718,14 +632,8 @@ pub fn run_session<W: std::io::Write>(
             now_secs(),
         )?;
     }
-    // Issue #554: the breaker, the pool and the spend ledger, through the one
-    // seam every native path shares. A headless run's tokens are spent on the
-    // same account a delegated worker's are.
-    //
-    // Review round 2: skipped entirely when the CALLER owns the accounting --
-    // `native_worker` settles this run itself, with a delegation identity
-    // this function does not have, and doing it here as well wrote the same
-    // spend twice.
+    // Settle the seat here; caller-owned runs settle under their delegation
+    // identity and must not be charged twice. (#554)
     if request.accounting == Accounting::Seat {
         super::super::super::native_account::settle_seat_turn(
             &state,
@@ -738,13 +646,7 @@ pub fn run_session<W: std::io::Write>(
     Ok(status)
 }
 
-/// One seat run's reservation, released on drop unless it was settled
-/// (issue #554, review round 2).
-///
-/// `run_session` has two `?`s between taking the estimate and settling it --
-/// the loop's own failure and a journal that cannot be completed -- and
-/// before this guard existed either of them left the estimate outstanding
-/// against the pool for the rest of the state directory's life.
+/// Releases an unsettled estimate on drop, including early error paths. (#554)
 struct SeatReservation<'a> {
     state: &'a super::super::super::state::StateDir,
     held: Option<(String, String)>,

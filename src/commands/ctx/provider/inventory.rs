@@ -178,18 +178,7 @@ pub(crate) fn resolve_model(
     vendor_slug: &str,
     requested: &str,
 ) -> Result<(ModelId, Option<String>), ModelResolutionError> {
-    // Issue #596 (roadmap N13): a vendor with no catalogue rungs at all --
-    // every local-compatible profile (`ollama`, `lmstudio`, `vllm`), and any
-    // other vendor slug this catalogue does not carry -- has no fixed model
-    // lineup for a `vendor/model` PREFIX to mean anything against. The
-    // configured id is opaque and stays exactly as written, slashes and all
-    // (Hugging-Face-style ids such as `Qwen/model` are the common case), so
-    // the vendor-prefix mismatch check below -- which exists only to catch a
-    // model accidentally written for a DIFFERENT, catalogued vendor's own
-    // `vendor/model` convention -- never runs for one. `nonempty_model_name`
-    // still strips a genuine `<this vendor>/` prefix and still catches an
-    // empty model name, so `vllm/` alone is still refused and
-    // `vllm/Qwen/model` still strips down to the opaque `Qwen/model`.
+    // Vendors without catalogue rungs have opaque model IDs; retain slashes and only strip their own prefix. (#596)
     let catalogued_vendor = crate::commands::ctx::catalogue::vendor(vendor_slug)
         .filter(|vendor| !vendor.rungs.is_empty());
     let Some(vendor) = catalogued_vendor else {
@@ -431,15 +420,7 @@ impl Inventory {
                         .push("no credential declared (unauthenticated endpoint)".into());
                     None
                 }
-                // Issue #643: a route whose profile marks the credential
-                // optional (`CredentialClass::is_optional`, e.g. vllm) used
-                // to block the probe the same way a genuinely required,
-                // missing credential does -- staying at `Configured` with no
-                // network attempt at all. An optional credential that fails
-                // to resolve is an advisory (kept in `problems` so the gap is
-                // still visible), never a reason to skip probing: it must
-                // reach `reachable` exactly like a credential-less
-                // (`LocalNone`) profile such as ollama already does.
+                // An optional authentication lookup failure is advisory; still probe the endpoint and report the problem. (#643)
                 Err(problem) if profile.is_some_and(|profile| profile.credential.is_optional()) => {
                     report.problems.push(problem);
                     None

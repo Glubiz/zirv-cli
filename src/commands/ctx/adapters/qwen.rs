@@ -1,29 +1,7 @@
 //! Issue #389 (wave 2): the Qwen Code adapter (`@qwen-code/qwen-code`).
 //!
-//! Qwen Code is a fork of gemini-cli (see `gemini.rs`'s own doc comment for
-//! that lineage) that has since diverged substantially -- its own transcript
-//! shape, tool-permission model and session-id story are all different from
-//! upstream gemini-cli's, and every fact below was re-verified against
-//! Qwen Code itself rather than assumed from the fork parent. Not installed
-//! on this machine and node here is v19 (too old to run it), so nothing below
-//! was exercised against a live process. Two sources were used:
-//!
-//! - GitHub source at `QwenLM/qwen-code@main` (fetched 2026-09-07), for the
-//!   yargs flag definitions and the CLI-level session-id/resume wiring
-//!   (`packages/cli/src/config/{config,top-level-options}.ts`).
-//! - The published npm tarball `@qwen-code/qwen-code@0.23.0` (`npm pack
-//!   @qwen-code/qwen-code@latest`, 2026-09-07), whose bundled (but
-//!   `--keep-names`, not minified past readability) JS was grepped directly
-//!   for the runtime facts no doc file states: the transcript record shape
-//!   (`packages/core/src/services/chatRecordingService.ts`, bundled into
-//!   `chunks/chunk-4F7GQGXB.js`), the project-directory slug algorithm
-//!   (`packages/core/src/utils/paths.ts` / `packages/core/src/config/
-//!   storage.ts`, bundled into `chunks/chunk-EAHOJF6V.js`), the canonical
-//!   tool-name constants (`packages/core/src/tools/tool-names.ts`, bundled
-//!   into `chunks/chunk-7JMGTOH7.js`), and the `--exclude-tools` enforcement
-//!   path (`chunks/chunk-4F7GQGXB.js`, `isToolEnabled`/`getPermissionsDeny`).
-//!   Anything not cited to one of these two sources below is UNSUPPORTED and
-//!   left at the trait default rather than guessed.
+//! Qwen has its own transcript, permission, and session contracts despite
+//! its Gemini CLI origin; the contracts below use Qwen source. (#389)
 //!
 //! # Verified facts and their source
 //!

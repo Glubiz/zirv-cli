@@ -23,11 +23,7 @@ use crate::commands::ctx::adapters;
 use crate::commands::ctx::catalogue::{self, Tier};
 use crate::commands::ctx::config::CtxConfig;
 use crate::commands::ctx::handover;
-// Issue #537 seam extraction (A1): `Question`/`Criteria`/`QuestionKind`/
-// `AnswerValue`/`Answer`/`Answers`/`Usage`/`MAX_CHOICE_OPTIONS` now live in
-// the shared `jev` module (any future Jev-consuming site needs the same
-// neutral shapes); re-exported here so every existing `decision::<Name>`
-// path in this crate keeps compiling unchanged.
+// Re-export shared Jev shapes to preserve this module's public paths. (#537)
 pub use crate::commands::ctx::jev::{
     Answer, AnswerValue, Answers, Criteria, MAX_CHOICE_OPTIONS, Question, QuestionKind, Usage,
 };
@@ -43,10 +39,7 @@ use crate::commands::workflow::selection;
 /// construction outright.
 const CLASSIFY_TASK_MAX_BYTES: usize = 4000;
 
-/// Issue #537 (A2): the additive domain tags a confident `Noul` answer may
-/// add to [`ProxyDecision::domains`] -- also the exact question ids
-/// [`questions`] asks and [`merge`] reads back, so the two can never drift
-/// out of sync with each other.
+/// Domain question IDs are shared by question generation and merge, so tags cannot drift. (#537)
 pub(crate) const DOMAIN_QUESTION_IDS: [&str; 6] = [
     "security",
     "data",
@@ -139,26 +132,7 @@ impl SeatRole {
     }
 }
 
-/// The generic tier the orchestrator SEAT ITSELF runs at -- issue #537 field
-/// evidence problem (a): asking a `seat` question over every enabled
-/// `harness/alias` pair spread probability across too many similar-looking
-/// options for any answer to ever clear the confidence floor, so the launch
-/// always fell back to the configured orchestrator model regardless of how
-/// small the request was. A live 24-case Jev battery then showed that even a
-/// four-option `seat_tier` question fared no better (any many-option seat/
-/// tier question never cleared the floor, while its `execution` answers were
-/// themselves unreliable, 17-74 confidence, calling architectural work
-/// "direct") -- so `seat_tier` (like `execution`) is now derived, never
-/// asked, from [`SeatTier::from_execution_complexity_risk`]. `Frontier` is
-/// the top-of-fleet tier `worker_tier`/[`super::catalogue::Tier`]
-/// deliberately has no equivalent of: a delegated worker is never the
-/// orchestrator seat compiling the team, so it never needs the top rung.
-///
-/// Frontier seat gate (wrapper-overhead benchmark, 2026-09-22): a 36-run
-/// replay of the proxy intake found `Substantial` complexity alone routing
-/// two six-step feature tasks to a frontier orchestrator seat at 1.7-2.2x
-/// cost with no correctness gain. `Orchestrated` execution no longer implies
-/// `Frontier` by itself -- see [`SeatTier::from_execution_complexity_risk`].
+/// Seat tier is derived from execution, complexity, and risk; only the orchestrator may use `Frontier`. (#537)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeatTier {
@@ -169,25 +143,7 @@ pub enum SeatTier {
 }
 
 impl SeatTier {
-    /// Issue #537, revised by the wrapper-overhead benchmark: `Direct` needs
-    /// no more than a cheap seat and `Bounded` a standard one, exactly as
-    /// before. `Orchestrated` (a real compiled team) no longer earns the
-    /// frontier rung on complexity alone -- it earns `Frontier` only when the
-    /// complexity is `Architectural` (an architectural-scope task always
-    /// gets the top seat) OR the risk is `High`/`Critical` (a sensitive
-    /// surface always gets the top seat regardless of scope); a `Substantial`
-    /// task at `Low`/`Medium` risk gets a `Standard` seat instead. `execution`,
-    /// `seat_role` (still `SeatRole::from_execution`), and `worker_tier`
-    /// (still `worker_tier_from_execution`) are untouched by this rule.
-    ///
-    /// Cheap-seat overhead fix (benchmark, 2026-09-24, 85 sonnet runs): the
-    /// intake sent 16/28 runs to the cheap (haiku) seat purely because
-    /// `execution` came back `Direct`, and haiku then took 2-5x the turns of
-    /// sonnet on the SAME code task (20 vs 6, 27 vs 5 turns) for +133% wall
-    /// time and no cost saving. `execution` alone must never downgrade the
-    /// seat below `Standard` -- `Direct` now maps to `Standard`, exactly
-    /// like `Bounded`; only an explicit `worker_tier`/operator override still
-    /// reaches `Cheap` for delegated workers.
+    /// Direct and bounded seats use `Standard`; orchestrated work reaches `Frontier` only for architectural scope or high risk. (#537)
     fn from_execution_complexity_risk(
         execution: ExecutionMode,
         complexity: Complexity,
@@ -236,15 +192,8 @@ pub struct ProxyDecision {
     pub seat_tier: SeatTier,
     pub worker_tier: Tier,
     pub needs_clarification: f32,
-    /// Whether the `needs_clarification` answer above was itself
-    /// [`Answer::decisive`] (margin-gated -- see that method's own doc
-    /// comment) at merge time. `needs_clarification` always keeps the raw
-    /// value regardless; a consumer that would act on it (`chat.rs::
-    /// maybe_clarify`'s interactive round, `prompt_layer`'s `clarify:` line)
-    /// checks THIS flag too, so a confident-looking but unstable "ambiguous"
-    /// reading never interrupts a launch on its own. `#[serde(default)]` so
-    /// a decision persisted before this field existed still deserializes, as
-    /// `false` (never fires a clarify round retroactively).
+    /// Only a decisive clarification answer may interrupt launch; persisted
+    /// decisions without this field default to no interruption. (#537)
     #[serde(default)]
     pub needs_clarification_decisive: bool,
     /// A fixed clarification question selected by the optional intake
@@ -265,26 +214,12 @@ pub struct ProxyDecision {
     pub elapsed_ms: u64,
     pub usage: Option<Usage>,
     pub created_at: u64,
-    /// Issue #537 headless single seat: whether THIS decision was computed
-    /// for a headless (unattended) launch -- set once, at the tail of
-    /// [`super::decide`], the same place [`super::force_single_seat`] runs.
-    /// [`super::prompt_layer`]'s `clarify:` line reads this to pick between
-    /// the interactive "ask the user" text and the headless "nobody can
-    /// answer, name the assumption instead" text, and `zirv ctx proxy
-    /// --json` exposes it so an external harness (e.g. the benchmark's own
-    /// `build_proxy_layer`) can mirror the same choice without re-deriving
-    /// it from `--headless`/`HEADLESS_ENV` itself. `#[serde(default)]` so a
-    /// decision persisted before this field existed still deserializes, as
-    /// `false` (the historical, interactive-only behaviour).
+    /// Records unattended launch mode for clarification text and serialized decisions; absent values default to interactive. (#537)
     #[serde(default)]
     pub headless: bool,
 }
 
-// `QuestionKind`/`Criteria`/`Question`/`AnswerValue`/`Answer`/`Answers` --
-// the neutral question/answer shapes both `typesafe.rs` (via `jev::ask`) and
-// `llm.rs` consume/produce, so [`merge`] never needs to know which decider
-// answered -- now live in the shared `jev` module; re-exported at the top
-// of this file.
+// Shared Jev question and answer shapes are re-exported above. (#537)
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeWorkflow {
@@ -292,14 +227,7 @@ pub struct IntakeWorkflow {
     pub description: String,
 }
 
-/// Issue #537 determinism fix (2026-09-18 replay): this used to also carry
-/// `uncommitted_or_branch_changes`, `active_workflow` and `primary_
-/// extensions` -- live-measured repository facts that differ between runs
-/// and worktrees. Stripping every one of them changed no answer's accuracy
-/// in that replay, so the request body (state + `questions()`) now depends
-/// only on the request text, the workflow registry ([`IntakeState::
-/// workflows`]) and the policy -- nothing that can silently drift the
-/// intake between two calls for the same request.
+/// Intake repository data excludes live worktree measurements so identical requests and policy produce identical decider input. (#537)
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeRepository {
     pub name: String,
@@ -310,19 +238,7 @@ pub struct IntakePolicy {
     pub native_available: bool,
 }
 
-/// The Jev `state` payload (also what `questions` itself is built from).
-/// Bounded and repository-neutral by construction: `request` is truncated to
-/// `request_max_bytes`, `repository` carries counts and extensions rather
-/// than paths or diffs, and neither this type nor anything that builds it
-/// ever touches file contents or environment values.
-///
-/// Issue #537 (A2): the harness/model catalogue (names, readiness, headroom,
-/// prices) used to ride along here too, even though no question ever reads
-/// it -- TypeSafe's own guidance is that irrelevant state degrades answer
-/// accuracy, so it was dropped. The harness roster stays exactly where it
-/// already lived for its one real job: [`validate`] polices the winning
-/// decision's `orchestrator.harness` against the live [`Roster`] directly,
-/// never against anything carried in this state.
+/// Bounded decider input contains request text, workflow choices, and policy; live roster validation runs separately. (#537)
 #[derive(Debug, Clone, Serialize)]
 pub struct IntakeState {
     pub request: String,
@@ -432,20 +348,7 @@ fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
-/// The deterministic classification behind a decision's baseline --
-/// TEXT ONLY (issue #537 fix): classifies via `classify::classify` directly
-/// with zero declared changed files/lines, never `classify::from_args`.
-/// `from_args` always measures the repository's own diff against its base,
-/// even on its "declared" branch (there only as a floor a declared scope
-/// cannot talk down) -- so on a feature branch carrying thousands of lines
-/// unrelated to the request being decided on right now, every request's
-/// complexity/risk got inflated by that unrelated diff, and the merge
-/// chain's own monotonic floor then forbade a model decider from ever
-/// lowering it back down, defeating the point of asking one at all. `intent`
-/// still comes from the request text (`classify::classify`'s own
-/// `infer_intent`); `work_domain` and the path-based risk floor need real
-/// paths and so stay at their text-only/no-signal defaults here -- `zirv ctx
-/// proxy` decides BEFORE any code exists to measure, not after.
+/// Classify request text alone; a branch diff would impose an unrelated monotonic complexity floor before code exists. (#537)
 pub fn classify_request(request: &str) -> Classification {
     try_classify_request(request)
         .expect("task truncated below classify's own byte limit; classify() cannot fail here")
@@ -469,11 +372,7 @@ pub fn try_classify_request(request: &str) -> Option<Classification> {
     classification.reasons.push(
         "classification: request text only; repository diff not measured at intake".to_string(),
     );
-    // With no paths or lines, `classify` can only ever answer `Trivial`, and
-    // a metadata-only Jev intake sees nothing better -- so every multi-part
-    // spec was routed to the cheap seat (wrapped-vs-vanilla benchmark,
-    // 2026-09-23: large tasks lost points on haiku). The request's own size
-    // is the one scope signal intake has.
+    // Request size supplies the scope signal available before paths or changed lines exist.
     let size_floor = request_size_floor(request);
     if size_floor > classification.complexity {
         classification.complexity = size_floor;
@@ -512,19 +411,7 @@ fn request_size_floor(request: &str) -> Complexity {
     }
 }
 
-/// Issue #537 field evidence problem (a): the orchestrator seat's model is
-/// resolved from `seat_tier` alone, never asked or chosen as its own
-/// harness/model question -- `harness` is always the baseline default
-/// (unchanged by any decider); only the tier varies. `cheap`/`standard`/
-/// `deep` go through `handover::resolve_model` (the same tier ladder,
-/// operator overrides included, `zirv ctx handover` itself uses); `frontier`
-/// is the operator's own configured `chat.model` when set, else the vendor's
-/// own top rung -- there is no "frontier" tier in `handover`'s own
-/// cheap/standard/deep ladder because that ladder is for delegated workers,
-/// which never need the orchestrator's own top-of-fleet rung.
-/// `handover::resolve_model` failing (an adapter with no tier ladder at all)
-/// degrades to the same top-rung alias `frontier` itself falls back to,
-/// rather than propagating -- `proxy::decide` must never fail.
+/// Resolve the orchestrator model from seat tier and operator policy; the decider cannot choose a harness or model directly. (#537)
 fn model_for_tier(cfg: &CtxConfig, harness: &str, tier: SeatTier) -> String {
     match tier {
         SeatTier::Frontier => cfg
@@ -554,21 +441,7 @@ fn baseline_seat(cfg: &CtxConfig, seat_tier: SeatTier) -> Seat {
     }
 }
 
-/// Operator follow-up (2026-09-26, round 2): "available" for plan-card
-/// choice 2 must mean enabled AND actually on this machine -- every harness
-/// defaults to enabled (`AgentGate::is_enabled`'s own permissive default), so
-/// gating on that alone offered harnesses like `copilot`/`gemini`/`muse` that
-/// simply are not installed here. This is the SAME readiness [`Roster::
-/// gather`] already computes for `decide`/`validate` (`RosterHarness.ready =
-/// is_enabled && adapter.ready().is_ok()`) -- "the harness roster" in this
-/// crate's own vocabulary -- reused rather than re-derived, so choice 2 can
-/// never disagree with what the proxy itself would actually accept as this
-/// decision's own harness.
-///
-/// `adapter.ready()` touches disk/PATH, so this is deliberately NOT called
-/// from the render path: `intake.rs` computes it once per intake, off the
-/// UI thread, alongside `decide()` itself, and passes the resulting name
-/// list in here as `ready_harnesses`.
+/// Plan choices include only enabled harnesses whose binaries are ready on this machine.
 pub(crate) fn ready_harness_names(cfg: &CtxConfig, repo: &Path) -> Vec<String> {
     Roster::gather(cfg, repo)
         .harnesses
@@ -648,16 +521,7 @@ pub fn baseline(
     roster: &Roster,
 ) -> ProxyDecision {
     let profile = ExecutionProfile::derive(request, classification);
-    // Workflow-start overhead fix (wrapper-overhead benchmark, 2026-09-24):
-    // the baseline used to propose a workflow (via `select_definition`) for
-    // ANY non-`Trivial` complexity, including `Bounded` -- a live 85-run
-    // replay found intake starting a workflow for every Bounded-complexity
-    // headless run even though headless agents never read it, adding
-    // ~11s/run for nothing. The baseline now only proposes one at
-    // `Substantial`/`Architectural` complexity; an operator who explicitly
-    // asks for a workflow still gets one at any complexity, via
-    // `apply_explicit_workflow_request_floor` below, which runs
-    // unconditionally regardless of what this match picks.
+    // Propose a workflow automatically only for substantial or architectural work; bounded headless work should not pay for an unused workflow.
     let workflow = match classification.complexity {
         Complexity::Trivial | Complexity::Bounded => None,
         Complexity::Substantial | Complexity::Architectural => {
@@ -713,18 +577,7 @@ pub fn baseline(
     decision
 }
 
-/// Issue #537: with the baseline now text-only (see `classify_request`'s
-/// own doc comment), the path-based sensitive-surface risk floor
-/// `classify::classify` used to apply can no longer see any paths at
-/// intake time -- so a request like "rotate the shared credential
-/// constant" would otherwise obtain the fast path from wording alone,
-/// exactly the property #537 must not lose. `validation.security_review`
-/// is already text-driven (`ExecutionProfile::derive`'s own domain-signal
-/// detection, independent of `risk`); when it is `true` and `risk` has not
-/// already reached `High` some other way, this raises it -- which then
-/// feeds [`apply_risk_execution_floor`] right after it in both call sites,
-/// lifting `execution` to `Bounded` too. The one place this rule lives,
-/// called from the tail of both [`baseline`] and [`merge`].
+/// Apply the text-derived sensitive-surface floor because intake has no paths from which to infer risk. (#537)
 fn apply_security_risk_floor(decision: &mut ProxyDecision) {
     if decision.validation.security_review && decision.risk < RiskBand::High {
         decision.risk = RiskBand::High;
@@ -741,15 +594,7 @@ fn apply_security_risk_floor(decision: &mut ProxyDecision) {
 /// request two clauses later.
 const NEGATION_LOOKBEHIND_WORDS: usize = 4;
 
-/// Pure: whether `phrase` occurs in `text` as something the request ASKS
-/// for, rather than something it rules out.
-///
-/// Review finding: matching a bare substring escalated "do not parallelize
-/// this" and "no need to spawn workers" exactly as if they had asked for a
-/// team. Only the few words immediately before an occurrence are examined,
-/// and only for the ordinary negating words -- this is a floor over
-/// operator-authored text, so the cost of missing an exotic negation is one
-/// seat too many, never one too few.
+/// Match asserted requests, ignoring nearby negations so a prohibition does not request a team.
 fn phrase_is_asserted(text: &str, phrase: &str) -> bool {
     text.match_indices(phrase).any(|(at, _)| {
         let preceding = &text[..at];
@@ -766,16 +611,7 @@ fn phrase_is_asserted(text: &str, phrase: &str) -> bool {
     })
 }
 
-/// Pure: whether `text` names harness `name` in its own prose, rather than
-/// inside a path or URL.
-///
-/// Review finding: tokenizing the whole request on every non-alphanumeric
-/// character turned `src/codex/client.rs` into a bare `codex` token, so
-/// "fix the delegate method in src/codex/client.rs" -- one file, one method,
-/// no team -- floored to `Substantial`. Any whitespace-delimited word
-/// carrying a `/` is a path or a URL, never prose naming a harness to
-/// delegate to, so it is dropped before the finer tokenization that finds
-/// the name itself.
+/// Count harness names in prose, excluding path and URL words so file paths cannot request delegation.
 fn names_harness_in_prose(text: &str, name: &str) -> bool {
     prose_words(text).any(|token| token == name)
 }
@@ -816,17 +652,7 @@ const DELEGATION_CUES: &[&str] = &[
 /// pair up with an unrelated mention.
 const DELEGATION_CUE_DISTANCE_WORDS: usize = 6;
 
-/// Pure: whether `text` hands part of the work to harness `name`.
-///
-/// Review finding: matching only "delegate"-shaped wording missed the
-/// ordinary ways of asking ("have codex handle the frontend part", "split
-/// this across claude and codex"), so a request for a team got one seat.
-/// Pairing a cue anywhere in the request with a name anywhere else is the
-/// opposite mistake, hence the proximity window. It is still deliberately
-/// generous -- a cue that happens to stand near an incidental mention floors
-/// the request -- because the failure this floor exists to prevent is one
-/// seat too few, and the deciders that can actually read intent are exactly
-/// what is unavailable when it runs.
+/// Match a delegation cue near the harness name; proximity limits incidental mentions.
 fn delegates_work_to_harness(text: &str, name: &str) -> bool {
     let words: Vec<&str> = prose_words(text).collect();
     words
@@ -920,22 +746,13 @@ const WORKFLOW_VERB_ARTICLE_ID: &[(&str, &str)] = &[
 /// of listing them.
 const NEGATION_WORDS: &[&str] = &["not", "no", "never", "avoid", "without", "skip"];
 
-/// Review finding: auxiliary/modal stems whose "n't" contraction is a
-/// negator, checked against a word with a trailing "nt" stripped --
-/// generalises "dont"/"cant"/"wont"/"isnt"/"doesnt"/"shouldnt"/... (typed
-/// with no apostrophe at all) from this one small list of STEMS, rather
-/// than needing an entry for every contracted FORM.
+/// Stems recognize negating contractions with or without an apostrophe.
 const NEGATION_AUX_STEMS: &[&str] = &[
     "do", "does", "did", "is", "are", "was", "were", "has", "have", "had", "ca", "wo", "could",
     "would", "should", "must", "need",
 ];
 
-/// Whether `word` (already lowercased, a whole raw word -- see
-/// [`clause_words`]) negates what follows. Review finding: rather than
-/// listing every negating stem, this generalises "any `<word>n't` is a
-/// negator" -- covers the straight apostrophe, the curly one (`\u{2019}`,
-/// U+2019), and the same contraction typed with no apostrophe at all
-/// ("dont", "cant", "wont", "isnt", "doesnt", ...) via [`NEGATION_AUX_STEMS`].
+/// Recognize negating contractions with straight, curly, or omitted apostrophes.
 fn is_negation_word(word: &str) -> bool {
     if NEGATION_WORDS.contains(&word) {
         return true;
@@ -950,22 +767,14 @@ fn is_negation_word(word: &str) -> bool {
         .is_some_and(|stem| NEGATION_AUX_STEMS.contains(&stem))
 }
 
-/// The same [`NEGATION_LOOKBEHIND_WORDS`] distance [`phrase_is_asserted`]
-/// uses, applied to [`clause_words`] rather than a raw-text byte offset --
-/// [`explicit_workflow_requests`]'s id-bearing templates have a
-/// variable-width slot a literal substring search can't express. Review
-/// finding: scoped to ONE CLAUSE's own words -- the caller never passes a
-/// window that could reach across a clause boundary into another one.
+/// Use the same negation window over words within one clause; workflow IDs can occupy variable-width slots.
 fn words_negate_before(words: &[String], before: usize) -> bool {
     words[before.saturating_sub(NEGATION_LOOKBEHIND_WORDS)..before]
         .iter()
         .any(|word| is_negation_word(word))
 }
 
-/// Review finding: a period ending one of these (compared case-
-/// insensitively) closes an abbreviation, not a sentence -- "e.g."/"i.e."/
-/// "etc." and the rest never end a clause, even immediately before a
-/// workflow request.
+/// These abbreviations do not end a clause, even before a workflow request.
 const KNOWN_ABBREVIATIONS: &[&str] = &["e.g", "i.e", "etc", "vs", "cf", "approx"];
 
 fn ends_with_known_abbreviation(word: &str) -> bool {
@@ -990,21 +799,7 @@ fn word_ending_at(text: &str, end_byte: usize) -> &str {
     &text[word_start..end_byte]
 }
 
-/// Splits `text` into clauses at `,`/`;`/`:`, a newline, a RUN of one or
-/// more `.`/`!`/`?` immediately followed by whitespace or the end of the
-/// text, or a run of two or more `-` or an em/en dash (`\u{2013}`/
-/// `\u{2014}`) anywhere, whitespace or not. Review finding: consuming the
-/// WHOLE punctuation run keeps "workflow..." from leaving any of the dots
-/// glued to the word before it, and the dash rule keeps "workflow--let me
-/// know" separated even with no surrounding whitespace at all.
-/// [`explicit_workflow_requests`] matches and negates within one clause's
-/// own words at a time, so negation lookback never crosses a clause
-/// boundary ("fix the bug, do not refactor; start a bugfix workflow" must
-/// still fire on the third clause). A single `.` NOT followed by
-/// whitespace/end -- as in a registered id like "sre.postmortem" -- is never
-/// a boundary candidate at all, and one that IS followed by whitespace but
-/// ends a known abbreviation (see [`ends_with_known_abbreviation`]) is
-/// still not a boundary, so a negation before it stays in scope.
+/// Split at clause punctuation, consuming whole punctuation runs so adjacent workflow words remain separate.
 fn split_into_clauses(text: &str) -> Vec<&str> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut clauses = Vec::new();
@@ -1060,15 +855,7 @@ fn split_into_clauses(text: &str) -> Vec<&str> {
     clauses
 }
 
-/// Raw whitespace-delimited words for one clause, lowercased and trimmed of
-/// leading/trailing non-alphanumeric characters -- backticks, quotes,
-/// ordinary punctuation, and any stray `.`/`-`/`_` a clause boundary left
-/// glued to a word's edge. Review finding: unlike `prose_words` (used
-/// elsewhere in this module), this keeps each whitespace-delimited word
-/// WHOLE apart from that edge trim, so the exact raw word adjacent to
-/// "workflow" -- a registered id like `sre.postmortem`/`team_review`
-/// included, since `.`/`-`/`_` INTERIOR to a word are never trimmed -- can
-/// be looked up in the registry unmodified.
+/// Normalize one clause's words while preserving embedded punctuation in workflow IDs.
 fn clause_words(clause: &str) -> Vec<String> {
     clause
         .split_whitespace()
@@ -1080,14 +867,7 @@ fn clause_words(clause: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every explicit, asserted workflow-request match within one clause's own
-/// words. Review finding: scans the WHOLE clause rather than returning
-/// at the first match. `None` per match with no id slot ("start a
-/// workflow"), `Some(word)` with the raw word found in an id-bearing slot
-/// (`<id> workflow`, or `workflow start <id>`) -- that word need not itself
-/// be a registered pack id; [`apply_explicit_workflow_request_floor`] is
-/// what falls through to `selection::select_definition` when none of the
-/// matches name one.
+/// Scan every asserted workflow request in a clause, retaining optional raw IDs for later registry lookup.
 fn clause_matches(clause: &str) -> Vec<Option<String>> {
     let words = clause_words(clause);
     let mut matches = Vec::new();
@@ -1142,12 +922,7 @@ fn clause_matches(clause: &str) -> Vec<Option<String>> {
 /// it doesn't assert.
 const EXPLANATORY_LEAD_WORDS: &[&str] = &["explain", "describe"];
 
-/// Interrogative lead words that mark a request as explanatory only when
-/// the request is actually a question (see [`is_explanatory_request`]).
-/// Review finding: a leading "what"/"is"/... does not by itself mean the
-/// request only describes or asks -- "What I need: start a bugfix workflow
-/// for the login crash" and "Is broken -- start a bugfix workflow" both
-/// assert one, and must still fire.
+/// A leading question word marks an explanation only when the whole request is a question.
 const INTERROGATIVE_LEAD_WORDS: &[&str] =
     &["what", "how", "why", "when", "where", "which", "does", "is"];
 
@@ -1257,15 +1032,7 @@ fn apply_explicit_workflow_request_floor(
     }
 }
 
-/// Issue #537 (battery finding): a sensitive-surface risk floor must also
-/// floor execution, so a "small" request touching a sensitive path (a
-/// one-line auth change, say) can never route as `Direct` on wording or
-/// diff size alone -- `risk >= High` alone already forces independent/
-/// security review in `validation`, but until this rule existed nothing
-/// stopped `execution` from staying `Direct` regardless. The one place this
-/// rule lives: called from [`finalize_derived_fields`] right after
-/// `execution` is (re)derived from `complexity`, so it holds no matter which
-/// decider produced `risk`/`complexity`.
+/// Sensitive surfaces floor execution as well as review risk, so even a one-line request cannot route directly. (#537)
 fn apply_risk_execution_floor(decision: &mut ProxyDecision) {
     if decision.risk >= RiskBand::High
         && execution_rank(decision.execution) < execution_rank(ExecutionMode::Bounded)
@@ -1277,24 +1044,7 @@ fn apply_risk_execution_floor(decision: &mut ProxyDecision) {
     }
 }
 
-/// Issue #537 field evidence problem (b): a `direct` execution answer must
-/// never coexist with a gated `workflow` -- both of the operator's own live
-/// complaints were exactly this pairing (a one-place color change and a
-/// bounded bugfix investigation, each landing a `workflow` a `Direct`
-/// execution has no business gating). One function, applied at the tail of
-/// both [`baseline`] and [`merge`] (after every floor above it, so it reads
-/// the FINAL `execution`): `Direct` clears `workflow` to `None` with a
-/// recorded reason; `Bounded`/`Orchestrated` keep whatever the model or
-/// baseline already chose.
-///
-/// Workflow-start overhead fix (2026-09-24): `baseline`'s own deterministic
-/// pick no longer reaches `Bounded` complexity at all (see `baseline`'s
-/// `workflow` match), so in practice this rule now only ever fires for a
-/// MODEL-decided `workflow` answer landing on a still-`Trivial`/`Direct`
-/// decision -- an explicit "start a workflow" request is unaffected either
-/// way, since [`apply_explicit_workflow_request_floor`] always raises
-/// `complexity` to at least `Bounded` (hence `execution` to at least
-/// `Bounded`) in the same call that sets `workflow`.
+/// Clear workflow gating for direct execution after all floors resolve; a direct seat cannot own a gated workflow. (#537)
 fn apply_direct_execution_workflow_rule(decision: &mut ProxyDecision) {
     if decision.execution == ExecutionMode::Direct && decision.workflow.is_some() {
         decision.workflow = None;
@@ -1304,15 +1054,7 @@ fn apply_direct_execution_workflow_rule(decision: &mut ProxyDecision) {
     }
 }
 
-/// Issue #537 design revision, from a live 24-case Jev battery run against
-/// this decider: Jev's own `complexity`/`workflow` answers were reliable,
-/// but its `execution` answers were not (17-74 confidence, calling
-/// architectural work "direct"), and neither `execution` nor any many-option
-/// seat/tier question ever cleared the confidence floor. `execution` is
-/// therefore never asked at all -- it is this one deterministic mapping from
-/// the (already merged/floored) `complexity`, the same mapping
-/// `ExecutionProfile::derive` itself already used to compute its own
-/// `execution` field.
+/// Derive execution and seat tiers from merged complexity and risk; decider answers do not choose those fields directly. (#537)
 fn execution_from_complexity(complexity: Complexity) -> ExecutionMode {
     match complexity {
         Complexity::Trivial => ExecutionMode::Direct,
@@ -1321,11 +1063,7 @@ fn execution_from_complexity(complexity: Complexity) -> ExecutionMode {
     }
 }
 
-/// Issue #537 design revision: delegated workers only ever need a step up
-/// from cheap when there is a real compiled team coordinating them
-/// (`Orchestrated`) -- `Direct`/`Bounded` both stay on the cheap tier, since
-/// a single seat handling its own bounded work has no delegated workers to
-/// tier up in the first place.
+/// Raise worker tier only for an orchestrated team; direct and bounded seats do not delegate. (#537)
 fn worker_tier_from_execution(execution: ExecutionMode) -> Tier {
     match execution {
         ExecutionMode::Orchestrated => Tier::Standard,
@@ -1363,30 +1101,10 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
 }
 
-/// Issue #537 (headless single seat): a headless launch works unattended --
-/// there is nobody to run a spawned team past, and zirv's own rule for a
-/// worker is "runs unattended and must not delegate further" -- so it must
-/// never be told `seat_role: Orchestrator`, no matter what the deterministic
-/// baseline or a Jev/helper merge decided. Called by [`super::decide`] AFTER
-/// [`finalize_derived_fields`] has already run (both inside [`baseline`] and,
-/// when a model decider won, inside [`merge`]), so it always sees the FINAL
-/// execution/seat_role pair, from either path.
-///
-/// Downgrades `Orchestrated` to `Bounded` -- NOT `Direct`: `Direct` carries
-/// its own invariant ([`apply_direct_execution_workflow_rule`], "a `Direct`
-/// execution never coexists with a `workflow`"), and this function runs after
-/// that rule already had its say, so forcing `Direct` here would silently
-/// violate it on any decision that named a workflow. `Bounded` is the
-/// highest execution rank that still maps to `SeatRole::Single`
-/// ([`SeatRole::from_execution`]), so it downgrades the seat without
-/// disturbing that invariant.
-///
-/// Deliberately narrow: only `execution`/`seat_role` change. `complexity`,
-/// `risk`, `seat_tier`, `worker_tier`, and `workflow` are left exactly as the
-/// rest of the pipeline decided -- this changes which seat executes the
-/// request, not how hard the request is judged to be or what it should
-/// still be told to do. A no-op when `execution` is already
-/// `Direct`/`Bounded` (already single-seat).
+/// Force unattended launches to one seat with no delegation; preserve the decision's other constraints. (#537)
+/// Downgrades to `Bounded`, never `Direct`: a `Direct` execution never coexists with a
+/// workflow (`apply_direct_execution_workflow_rule` already ran), so forcing `Direct` here
+/// could silently violate that on a decision that named one.
 pub fn force_single_seat(decision: &mut ProxyDecision) {
     if decision.execution == ExecutionMode::Orchestrated {
         decision.execution = ExecutionMode::Bounded;
@@ -1399,15 +1117,7 @@ pub fn force_single_seat(decision: &mut ProxyDecision) {
     }
 }
 
-/// Builds the Jev `state`/`questions()` input: the request (truncated to
-/// `cfg.proxy.request_max_bytes`), the repository's own name, the registered
-/// workflow ids/descriptions, and whether the native runtime is available.
-/// Issue #537 determinism fix (2026-09-18 replay): no longer measures the
-/// repository at all -- see [`IntakeRepository`]'s own doc comment for why;
-/// `state_dir` is accepted only for call-site parity with every other
-/// `build_*`-shaped seam in this crate and is not read. Issue #537 (A2):
-/// also no longer carries the harness/model catalogue -- see [`IntakeState`]'s
-/// own doc comment for why.
+/// Build bounded, repository-neutral decider input from request text, workflow definitions, and native availability. (#537)
 pub fn build_intake(
     cfg: &CtxConfig,
     repo: &Path,
@@ -1607,21 +1317,10 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
         ]),
     });
 
-    // Issue #537 design revision: `execution`/`seat_tier`/`worker_tier` are
-    // no longer asked at all -- a live 24-case Jev battery showed
-    // `execution` answers were unreliable (17-74 confidence, calling
-    // architectural work "direct") and any many-option seat/tier question
-    // never cleared the confidence floor. All three are now derived from
-    // `complexity` alone (see `execution_from_complexity`,
-    // `finalize_derived_fields`); the model's influence on them flows
-    // entirely through its `complexity` answer.
+    // Derive execution and tiers from merged complexity, not separate decider answers. (#537)
     const NONE_WORKFLOW_DESCRIPTION: &str = "Direct work that needs no gated workflow: \
                                               one-place changes, tiny fixes, questions.";
-    // Issue #537 (this design revision): the registry's own `refactor` pack
-    // description does not spell out that it covers a pure deletion/removal
-    // (no new behavior) -- sharpened here, at the one place this question is
-    // built, rather than in the pack's own definition this module does not
-    // own.
+    // Explain that the refactor choice includes pure deletion, without changing the registry owned elsewhere. (#537)
     const REFACTOR_COVERS_DELETIONS: &str = " Explicitly covers deletions or removals of code \
                                               and docs with no new behavior.";
     let mut workflow_options: Vec<(String, Option<String>)> = intake
@@ -1661,15 +1360,7 @@ pub fn questions(intake: &IntakeState) -> Vec<Question> {
         },
     });
 
-    // Issue #537 (A2): additive domain tags, one Noul question per tag
-    // (`DOMAIN_QUESTION_IDS`, the single source of truth `merge` reads back
-    // by the same ids). A substring keyword match (`ExecutionProfile::
-    // derive`'s own domain detection) misses phrasing that never uses one of
-    // its fixed keywords -- "rotate the shared token" names no keyword in
-    // its `security` list at all -- so these ask the model directly instead.
-    // `security`'s own confident `true` answer floors risk/execution the
-    // same way the keyword trigger already does (see `merge`); the other
-    // five are informational only.
+    // Domain tags only add constraints; a thin-margin answer adds none, and security feeds the text-derived risk floor. (#537)
     for (id, (what, when_true, when_false)) in
         DOMAIN_QUESTION_IDS.into_iter().zip(DOMAIN_NOUL_QUESTIONS)
     {
@@ -1721,39 +1412,10 @@ fn risk_from_index(index: f64) -> RiskBand {
     LEVELS[idx]
 }
 
-/// Merges `answers` onto `baseline`'s own fields, applying the per-field
-/// rules the spec's "Decision fields" table sets: an answer that is not
-/// [`Answer::decisive`] (either its confidence is below `min_confidence`, or
-/// its margin is below `cfg.proxy.min_margin` -- see that method's own doc
-/// comment for why margin, not confidence alone, is what catches the
-/// 2026-09-18 replay's instability) resolves complexity/risk to the higher
-/// of its two most probable levels -- but only when it is the MARGIN that
-/// fell short, see [`Answer::near_tie_score`] for why a below-floor
-/// confidence keeps the baseline instead. Complexity/risk only ever rise, so
-/// that resolved level is taken only when it is above the baseline. The
-/// recorded reason names the outcome that actually happened (`resolved
-/// upward to <label>` or `kept baseline`), never a level the comparison
-/// discarded. Every other
-/// ASKED field (`intent`, `workflow`, a domain tag) is replaced/added outright
-/// when decisive. Existence checks against the live roster (a workflow id, a
-/// harness/model pair) are deferred to [`validate`], which runs right after
-/// this and has the `Roster` this function does not need.
-///
-/// Issue #537 design revision, from a live 24-case Jev battery: `execution`,
-/// `seat_tier` and `worker_tier` are no longer questions at all (see
-/// [`finalize_derived_fields`]'s own doc comment for why) -- a model's only
-/// influence on them is indirect, through however it moved `complexity`.
-///
-/// `request` is the same text `baseline` was itself derived from -- passed
-/// through (never re-truncated or substituted with `""`) so the validation
-/// recompute below can still see request-text-driven flags
-/// (`ExecutionProfile::derive`'s own security-domain detection from words
-/// like "credential"/"auth"/"secret") instead of silently losing them the
-/// moment a model answers.
-///
-/// `cfg` is needed for [`finalize_derived_fields`]'s own resolution of the
-/// orchestrator's model via `handover::resolve_model`, and for
-/// `cfg.proxy.min_margin`.
+/// Merge decisive answers; near-tie complexity/risk may raise the baseline,
+/// while low-confidence answers keep it. Complexity and risk only ever rise
+/// from the baseline, never fall. Pass the original request to
+/// security-domain derivation; validate choices against the live roster. (#537)
 pub fn merge(
     cfg: &CtxConfig,
     baseline: &ProxyDecision,
@@ -1872,14 +1534,7 @@ pub fn merge(
         decision.needs_clarification_decisive = answer.decisive(min_confidence, min_margin);
     }
 
-    // Issue #537 (A2): additive domain tags -- a decisive `true` noul answer
-    // adds that domain; nothing ever removes one. A confident-but-thin-margin
-    // `true` answer now falls back to "not added" (the deterministic
-    // baseline never has a domain tag of its own), recorded the same way a
-    // discarded intent/workflow answer is. `security`'s own
-    // tag sets the same validation flags the keyword-based `ExecutionProfile
-    // ::derive` detection sets below, so `apply_security_risk_floor` floors
-    // risk/execution the same way regardless of which detector caught it.
+    // Domain tags only add constraints; thin-margin answers add none, and security feeds the text-derived risk floor. (#537)
     for id in DOMAIN_QUESTION_IDS {
         if let Some(answer) = answers.get(id)
             && let AnswerValue::Noul(value) = answer.value
@@ -1954,25 +1609,11 @@ impl ProxyDecision {
     }
 }
 
-/// Reverts `decision`'s `orchestrator`/`workflow` fields to `baseline`'s own
-/// when the roster proves them invalid.
-///
-/// Review finding (round 3): the orchestrator's `model` is NEVER policed
-/// against the catalogue here -- only `harness` readiness is. `model` is
-/// always the tier-derived result of `model_for_tier` (`handover::
-/// resolve_model`, see that function's own doc comment), the same trusted
-/// resolver `zirv ctx handover` itself uses, and it already honors an
-/// operator's own free-form override (`[handover.claude] standard =
-/// "my-team/internal-model"`, a documented value with no catalogue rung of
-/// its own at all). Policing it here used to silently revert exactly that
-/// kind of decision to the BASELINE's own model -- which, whenever a merge
-/// had raised `seat_tier` above the baseline's own (a confident `complexity`
-/// answer, say), was a DIFFERENT tier's model: the decision then announced
-/// one seat tier while quietly launching another. When the harness itself is
-/// not enabled+ready, `orchestrator` still reverts -- but to the baseline's
-/// harness with the model RE-DERIVED for it at `decision`'s own (unreverted)
-/// `seat_tier`, so the decision stays internally consistent rather than
-/// falling back to whatever tier the baseline itself happened to be at.
+/// Validate harness readiness and workflow availability against the live roster; the operator-resolved model is trusted.
+/// Never polices `model` against the catalogue: it is already the trusted, tier-derived result
+/// (including operator overrides with no catalogue rung of their own). Reverting an unready
+/// harness re-derives the model at the decision's own seat_tier, so the tier it announces and
+/// the model it launches never disagree.
 pub fn validate(
     decision: &mut ProxyDecision,
     baseline: &ProxyDecision,

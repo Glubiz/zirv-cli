@@ -1,8 +1,6 @@
 //! The native memory/context tools (issues #474-#475, roadmap N05-N06):
 //! `memory_recall`, `memory_remember`, `memory_forget` and `context_search`.
-//! Each is a thin typed shape in front of `ctx::memory`/`ctx::context`, the
-//! same services `zirv ctx memory|context` uses, so a native session and the
-//! CLI can never see two different answers to "what does this repo know".
+//! They use the CLI's memory/context services so both surfaces agree.
 
 use serde::Deserialize;
 use serde_json::{Value, json};

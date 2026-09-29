@@ -1,16 +1,8 @@
 //! Typed arguments for the native workflow tools (issue #484, roadmap N15).
 //!
-//! A native session drives the SAME workflow engine a `zirv workflow ...`
-//! command does, over the same durable state, through the same gates. These
-//! are thin argument shapes in front of `workflow::engine`; none of them
-//! contains workflow logic of its own, exactly the way N10's delegation tools
-//! are thin over `ctx::delegation`. A second implementation of "what advances
-//! a step" is a second definition of "done", and the two would drift.
-//!
-//! `workflow_advance` and `workflow_approve` are shared-scope knowledge WRITES,
-//! so the execution broker requires a live writer permit for the session's own
-//! worktree. A read-only helper or reviewer therefore cannot advance the
-//! workflow it is reviewing -- enforced at effect time, not by the prompt.
+//! The CLI and native tools use the same workflow engine and gates.
+//! Advance and approval require a live writer permit at the broker effect
+//! boundary, where a request cannot grant itself authority.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,10 +47,7 @@ pub(super) struct WorkflowAdvanceArgs {
     pub note: Option<String>,
 }
 
-/// Issue #542 chunk 3b: `workflow_start` mirrors `zirv workflow start`'s own
-/// id/task shape exactly -- omitting `id` runs the same deterministic
-/// `selection::select_definition` the CLI does, against `task` and the
-/// resolved classification; an explicit `id` always wins outright.
+/// Omitted workflow ID uses the CLI's deterministic selection from task and classification. (#542)
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WorkflowStartArgs {
@@ -149,10 +138,7 @@ impl super::NativeToolClient {
         }))
     }
 
-    /// Issue #542 chunk 3b: the layered, trust-checked registry for this
-    /// session's own repository -- shared by `workflow_list` and
-    /// `workflow_start`, the same construction `zirv workflow list|show|
-    /// start` uses (`workflow::engine::load_workflow_registry`).
+    /// Workflow tools share the CLI's trust-checked registry for this repository. (#542)
     fn workflow_registry(
         &self,
     ) -> Result<crate::commands::workflow::registry::WorkflowRegistry, ToolError> {

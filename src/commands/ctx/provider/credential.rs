@@ -640,22 +640,8 @@ pub fn linux_set_command(item: &str, secret: &str) -> CommandSpec {
     }
 }
 
-// Issue #642: PowerShell's `-Command <script>` treats every remaining argv
-// entry as MORE script text, not as `$args` -- unlike `-Command { <scriptblock>
-// } arg1 arg2`, a bare string command never populates `$args` from the
-// command line at all. The item id used to be appended as a positional argv
-// entry, so the script failed to parse: `Unexpected token 'test-item' in
-// expression or statement`, and every `store:` ref was non-functional on
-// Windows. Both scripts now read the item from `$env:ZIRV_CRED_ITEM`
-// instead, set via `CommandSpec::envs` -- the secret itself keeps going over
-// stdin, unchanged.
-//
-// `Add-Type -AssemblyName System.Security` is likewise required, not
-// decorative: a bare `-NoProfile -NonInteractive` PowerShell host does not
-// have `System.Security.dll` loaded by default, so
-// `[Security.Cryptography.ProtectedData]` resolves to "Unable to find type"
-// without it -- verified on this machine (Windows 11 Pro, PowerShell 5.1)
-// once the argv fix above let the script actually reach this line.
+// PowerShell treats argv after `-Command` as script text; pass the item via
+// `ZIRV_CRED_ITEM`. `Add-Type` loads System.Security in a bare host. (#642)
 #[cfg(any(test, target_os = "windows"))]
 const WINDOWS_READ_SCRIPT: &str = r#"Add-Type -AssemblyName System.Security; $p=Join-Path $env:LOCALAPPDATA ('zirv\native-credentials\'+$env:ZIRV_CRED_ITEM+'.dpapi'); if(!(Test-Path $p)){exit 3}; $b=[IO.File]::ReadAllBytes($p); $d=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'); [Text.Encoding]::UTF8.GetString($d)"#;
 #[cfg(any(test, target_os = "windows"))]

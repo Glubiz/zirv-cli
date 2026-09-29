@@ -1,16 +1,7 @@
 //! Issue #388 (wave 2): the Factory Droid CLI adapter.
 //!
-//! Droid ships as the npm package `@factory/cli` (binary name `droid`,
-//! platform binaries under `@factory/cli-<platform>-<arch>`), a proprietary,
-//! closed-source, curl/npm-installed agent. Not installed on this machine, and
-//! there is no public source to read the way `pi.rs`/`gemini.rs` could read
-//! bundled JS -- every fact below is instead verified by directly running the
-//! REAL compiled binary (`@factory/cli-win32-x64@0.213.0`, downloaded via
-//! `npm pack` into this worktree's `target/` on 2026-09-07 and never
-//! installed globally) rather than trusting `docs.factory.ai`, whose own
-//! pages disagree with the shipped binary on multiple flags (see "Doc vs.
-//! binary disagreements" below). Anything not cited to a specific probe or
-//! doc page here is UNSUPPORTED and left at the trait default.
+//! The CLI contract below comes from the compiled Droid binary; its
+//! shipped flags can differ from the published reference. (#388)
 //!
 //! # Verified against the real binary (`droid.exe --help`, `droid.exe exec
 //! --help`, 0.213.0, 2026-09-07)

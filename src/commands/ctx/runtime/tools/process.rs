@@ -150,12 +150,8 @@ pub struct ProcessSnapshot {
     pub exit_code: Option<i32>,
     pub output: Vec<ProcessOutputChunk>,
     pub pending_output_bytes: usize,
-    /// Set once any stream (stdout/stderr/PTY) crossed
-    /// `MAX_STREAM_BYTES`/`MAX_STREAM_LINES` and stopped being read further
-    /// (issue #583 review round 1). Distinct from `pending_output_bytes`:
-    /// that tracks output the caller's own inline-display budget excluded
-    /// but which still reached the persisted capture; this means output was
-    /// never read from the process at all and is gone permanently.
+    /// True when a stream exceeds its read ceiling; those bytes are lost, unlike
+    /// output omitted only from the caller's inline display. (#583)
     pub stream_truncated: bool,
     pub output_id: Option<String>,
     pub summary: Option<String>,
@@ -179,10 +175,7 @@ pub(super) struct ProcessLimits {
 struct StreamChunk {
     stream: ProcessStream,
     bytes: Vec<u8>,
-    /// Set on the one chunk a reader sends immediately before giving up on
-    /// this stream because it crossed `MAX_STREAM_BYTES`/`MAX_STREAM_LINES`
-    /// (issue #583 review round 1). `false` on every ordinary chunk,
-    /// including the last one before a natural EOF.
+    /// Marks the last captured chunk when the reader stops at a stream limit. (#583)
     truncated: bool,
 }
 
@@ -327,12 +320,8 @@ struct ManagedProcess {
     /// harmless -- `terminate_pid` on an exited pid is a no-op) kill later.
     /// `None` when no `timeout_ms` was given, so no watchdog was spawned.
     watchdog_stop: Option<Sender<()>>,
-    /// Set once any reader thread stopped pulling its stream early because
-    /// it crossed [`MAX_STREAM_BYTES`]/[`MAX_STREAM_LINES`] -- review round
-    /// 1 on #583: hitting either cap used to be silent, with no way for a
-    /// caller to tell "the process produced no more output" apart from "the
-    /// process produced more output than zirv would ever retain". Surfaced
-    /// on [`ProcessSnapshot::stream_truncated`].
+    /// Reports when a reader stopped at a hard stream limit, distinguishing
+    /// truncated capture from natural EOF. (#583)
     stream_truncated: bool,
 }
 
@@ -426,12 +415,7 @@ impl ProcessManager {
             &self.limits.extra_verbatim,
             self.limits.compact_search,
         );
-        // Issue #583 (roadmap N05): the deadline must fire even if nobody
-        // ever calls `poll`/`wait` again, so it cannot live inside
-        // `update_process` alone. This watchdog owns only the bare pid, not
-        // the `Child`/`ManagedProcess`, so it needs no lock over state this
-        // struct's normal methods mutate; `cancel_watchdog` stops it as soon
-        // as the process reaches a terminal state by any other path.
+        // A watchdog enforces the deadline even without polling; it owns only the PID, so it must not depend on the child handle. (#583)
         let watchdog_stop = args.timeout_ms.zip(child.pid()).map(|(timeout_ms, pid)| {
             let (stop_tx, stop_rx) = mpsc::channel::<()>();
             std::thread::spawn(move || {
@@ -675,21 +659,8 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(read) => {
                     total_bytes += read;
                     total_lines += buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
-                    // Issue #583 (roadmap N05): stop pulling more of this
-                    // stream once either hard ceiling is crossed,
-                    // independent of whether -- or how often -- a caller
-                    // drains the channel. A byte-only cap does not bound a
-                    // stream of many small lines the same way a child could
-                    // still flood: each `read()` can return a full buffer of
-                    // short lines as one chunk under the byte cap.
-                    //
-                    // Checked here, after folding this read into the
-                    // running totals, rather than at the top of the loop:
-                    // that lets the chunk that actually crosses the ceiling
-                    // carry `truncated: true` itself (review round 1), so a
-                    // caller can tell "no more output" apart from "more
-                    // output existed and was permanently dropped" without a
-                    // separate empty marker chunk.
+                    // Enforce both byte and line ceilings in the reader, independent of caller
+                    // draining; include the crossing read and mark it truncated. (#583)
                     let truncated =
                         total_bytes >= MAX_STREAM_BYTES || total_lines >= MAX_STREAM_LINES;
                     if sender

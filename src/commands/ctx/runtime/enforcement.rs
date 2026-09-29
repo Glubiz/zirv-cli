@@ -27,10 +27,7 @@ use super::super::adapters::LaunchMode;
 use super::super::config::{CtxConfig, env_from_process};
 use super::super::permit::HeavyPermit;
 use super::super::policy::{Capability, EffectivePolicy, Stance};
-// Issue #727: `NetworkTarget` moved to `policy.rs` (shared with `[policy]
-// network_allowlist`) but re-exported here so every existing
-// `enforcement::NetworkTarget` reference (native.rs, runtime/tools/*) keeps
-// working unchanged.
+// Preserve the enforcement path for the shared policy network target type. (#727)
 pub use super::super::policy::NetworkTarget;
 use super::super::safety::{self, SafetyPolicy, Verdict};
 use super::super::seat;
@@ -77,11 +74,7 @@ pub enum NetworkScope {
     Any,
 }
 
-/// Issue #727: moved to [`super::super::policy`] so the harness runtime's
-/// `[policy] network_allowlist` and the native broker's own [`NetworkScope`]
-/// share one type instead of two structurally-identical ones drifting apart.
-/// The validating constructor stays here: it returns a [`BrokerError`], which
-/// belongs to this module, not to `policy.rs`.
+/// Shared network target type keeps harness policy and native broker scopes consistent. (#727)
 impl NetworkTarget {
     pub fn new(scheme: &str, host: &str, port: Option<u16>) -> Result<Self, BrokerError> {
         let scheme = scheme.to_ascii_lowercase();
@@ -1107,11 +1100,7 @@ pub struct ExecutionBroker {
     policy: Arc<dyn PolicySource>,
     fence: Arc<dyn GenerationFence>,
     approval_authority: Arc<ApprovalAuthority>,
-    /// Issue #490 (N21 item B): the operator's own dialog, for an in-process
-    /// interactive session. `None` -- every headless session, and every
-    /// interactive one whose caller did not install a gate -- keeps the
-    /// pre-#490 behaviour exactly: a request that needs approval and carries
-    /// no grant is refused with [`BrokerError::ApprovalRequired`].
+    /// Optional in-process approval dialog; without one, ungranted requests are refused. (#490)
     approvals: Option<Arc<InteractiveApprovals>>,
     writer: Option<Box<dyn WriterLease>>,
     isolation: PlatformIsolation,
@@ -1170,15 +1159,7 @@ impl ExecutionBroker {
         })
     }
 
-    /// Issue #490 (N21 item B): installs the in-process operator dialog this
-    /// broker asks when an action needs approval and carries no grant. The
-    /// gate must share this broker's own [`ApprovalAuthority`], or every grant
-    /// it mints fails verification -- `runtime::native::session_broker` is the
-    /// one place that pairs them.
-    ///
-    /// Only meaningful in [`ApprovalMode::Interactive`]: a headless session
-    /// refuses before the gate is ever consulted, which is what keeps
-    /// "headless cannot be approved away" true no matter who calls this.
+    /// The interactive gate must share this broker's approval authority; headless requests refuse before consulting it. (#490)
     pub fn with_interactive_approvals(mut self, approvals: Arc<InteractiveApprovals>) -> Self {
         self.approvals = Some(approvals);
         self
@@ -1251,15 +1232,7 @@ impl ExecutionBroker {
                     approval_expires_at = grant.expires_at;
                 }
                 Some(_) => return Err(BrokerError::InvalidApproval(Box::new(request))),
-                // Issue #490 (N21 item B): an in-process interactive session
-                // asks its own operator here and BLOCKS this call until the
-                // dialog answers. The decision is applied exactly once (the
-                // prompt is consumed by answering it) and a grant is verified
-                // against this broker's authority before it admits anything,
-                // so the dialog can never describe less authority than what
-                // actually runs. Every other session -- headless, and any
-                // interactive one with nobody listening -- refuses exactly as
-                // before.
+                // Block for one operator decision, then verify the grant against this broker's authority; unattended sessions refuse. (#490)
                 None => match self.approvals.as_ref() {
                     Some(approvals) => {
                         waited_for_approval = true;
@@ -1452,12 +1425,7 @@ impl ExecutionBroker {
                     required.push(Capability::RepoFsWrite);
                     needs_writer = true;
                 }
-                // Issue #483: not every knowledge service is inert. The
-                // frontend one starts a development server and a headless
-                // browser through zirv's own vetted `frontend_render` path,
-                // so it carries exactly the capabilities that implies --
-                // named here rather than inside the tool, so the broker stays
-                // the only place an effect is priced.
+                // Frontend rendering starts a server and browser, so its knowledge action needs network and process capabilities. (#483)
                 if service == "web" {
                     required.push(Capability::Network);
                 }

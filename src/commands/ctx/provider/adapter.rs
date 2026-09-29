@@ -437,9 +437,7 @@ pub enum ProviderStreamEvent {
         index: usize,
     },
     Ping,
-    /// Issue #756: the provider applied server-side context editing to this
-    /// turn (Anthropic's `context_management.applied_edits`), clearing stale
-    /// tool results before the model saw them.
+    /// Reports whether server-side context editing cleared tool results this turn. (#756)
     ContextEditApplied {
         cleared_tool_uses: u64,
         cleared_input_tokens: u64,

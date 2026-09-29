@@ -1,16 +1,7 @@
 //! Issue #384: the Gemini CLI adapter (`@google/gemini-cli`).
 //!
-//! Every fact this module relies on was verified against the published npm
-//! tarball `@google/gemini-cli@0.58.0` (`npm pack @google/gemini-cli@latest`,
-//! 2026-09-07) -- both its bundled documentation (`bundle/docs/**/*.md`,
-//! shipped verbatim inside the package) and, where the docs were stale or
-//! silent, the bundled JS itself (`bundle/chunk-FQCNOBUR.js` and its
-//! `chunk-MFLFXOVQ.js`/`chunk-RTL6OG34.js` near-duplicates, `bundle/gemini-
-//! CKAAKWBN.js` and siblings). gemini-cli is not installed on this machine
-//! and node here is v19 (too old to run it), so nothing below was exercised
-//! against a live process -- only read from source. Anything not cited to a
-//! specific symbol below is UNSUPPORTED and left at the trait default rather
-//! than guessed.
+//! The contracts below come from the published CLI package and bundled
+//! source; unsupported behavior stays on the adapter default. (#384)
 //!
 //! # Verified facts and their source
 //!
@@ -201,12 +192,7 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 /// `"google"`.
 const CATALOGUE_VENDOR: &str = "google";
 
-/// `ChatRecordingService`'s own filename prefix, verified in
-/// `chunk-FQCNOBUR.js` (`var SESSION_FILE_PREFIX = "session-";`). Subagent
-/// chat files are named `<uuid>.jsonl` with no prefix at all and live in a
-/// nested `chats/<parentSessionId>/` directory, so filtering on this prefix
-/// (matching `getAllSessionFiles`'s own filter) naturally excludes them
-/// without needing to know `kind` up front.
+/// Filter by the `session-` prefix to exclude nested subagent files with bare UUID names.
 const SESSION_FILE_PREFIX: &str = "session-";
 
 /// The read-only admin policy this adapter pins via `--admin-policy` -- see

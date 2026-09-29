@@ -1,14 +1,8 @@
 //! Issue #385: adapter for [OpenCode](https://opencode.ai) (npm package
-//! `opencode-ai`, GitHub `anomalyco/opencode`). OpenCode is not installed on
-//! this machine, so every fact this module relies on is verified against the
-//! actual published release **v1.18.29** (2026-09-07) rather than probed or
-//! guessed -- source files were fetched at the exact git tag `v1.18.29` (not
-//! `dev`, which can be ahead of what is actually shipped), via `gh api
-//! repos/anomalyco/opencode/contents/<path>?ref=v1.18.29`. File/symbol
-//! citations are attached at each fact below. Anything this pass could not
-//! verify is left on the trait's own "no verified mechanism" default rather
-//! than guessed at -- see the per-method doc comments for exactly what that
-//! covers.
+//! `opencode-ai`).
+//!
+//! The contracts below come from the published OpenCode release source;
+//! unsupported behavior stays on the adapter default. (#385)
 //!
 //! ## CLI surface (verified: `packages/opencode/src/cli/cmd/run.ts`,
 //! `packages/opencode/src/cli/cmd/tui.ts`, both at `v1.18.29`)
@@ -215,10 +209,7 @@ use super::super::state::{self, StateDir};
 use super::super::transcript_source::ShadowTranscript;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
-/// The fixed agent name naming zirv's structurally-deny reviewer/distiller
-/// pin (see [`OpenCodeAdapter::read_only_args`]). A fixed, public (this crate
-/// is open source) name rather than a random one -- obscurity is not this
-/// pin's protection, the materialized `permission` map is.
+/// Fixed reviewer/distiller agent name; the materialized permission map, not obscurity, enforces the deny.
 const READ_ONLY_AGENT: &str = "zirv-read-only";
 
 /// Prefix identifying a zirv-materialized system-prompt agent
@@ -228,13 +219,7 @@ const READ_ONLY_AGENT: &str = "zirv-read-only";
 /// directly in the agent name.
 const SYSTEM_PROMPT_AGENT_PREFIX: &str = "zirv-sp-";
 
-/// Verified facts backing this adapter are cited per-fact in the module doc
-/// comment above (opencode-ai v1.18.29, `anomalyco/opencode` at git tag
-/// `v1.18.29`). Unlike `CodexAdapter`, OpenCode is never installed anywhere
-/// this pass could probe, so `ready()` only ever refuses the one thing it
-/// can know without a live binary: a bare name that resolves (via `PATH`) to
-/// a file this OS cannot execute at all -- identical to `CodexAdapter::
-/// ready`'s own reasoning.
+/// Readiness refuses a resolved program that cannot execute; unsupported CLI behavior stays disabled.
 #[derive(Debug, Clone)]
 pub struct OpenCodeAdapter {
     program: String,

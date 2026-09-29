@@ -1,19 +1,8 @@
 //! Issue #386 (wave 1): the Pi coding-agent adapter.
 //!
-//! Pi is `pi-coding-agent` (npm `pi-coding-agent`, published as
-//! `@earendil-works/pi-coding-agent`), source at `github.com/badlogic/
-//! pi-mono`. Not installed on this machine -- every fact below is verified
-//! against the upstream source at the commit on `main` fetched 2026-09-07,
-//! never guessed. Unlike claude/codex, Pi is a genuinely multi-provider CLI
-//! (`--provider`/`--model provider/id`, Anthropic/OpenAI/Google/Azure/
-//! DeepSeek/Mistral/Groq/xAI/OpenRouter and more -- `packages/coding-agent/
-//! src/cli/args.ts`'s own `--api-key`/env-var help text), so this adapter
-//! overrides every ladder method (`provider_for_model`, `review_model_below`,
-//! `model_strength`, `context_window_tokens`) to resolve through `catalogue::
-//! vendor_of(model)` instead of one hardcoded vendor constant the way
-//! `codex::CATALOGUE_VENDOR`/`claude::CATALOGUE_VENDOR` do -- `catalogue::
-//! normalize_id`/`vendor_of`'s own doc comments (issue #381) name this
-//! adapter and `#385` (OpenCode) as their first callers.
+//! Pi is multi-provider: model routing resolves through the catalogue
+//! instead of a fixed vendor. Unsupported behavior stays on the adapter
+//! default. (#381, #386)
 //!
 //! Verified facts and their source files (`packages/coding-agent/src/`
 //! unless noted, badlogic/pi-mono @ 2026-09-07):

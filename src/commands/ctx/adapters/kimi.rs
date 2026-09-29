@@ -1,23 +1,7 @@
 //! Issue #391 (wave 3): the Moonshot Kimi Code CLI adapter (`kimi`).
 //!
-//! Not installed on this machine; every fact below is exactly what issue
-//! #391's own "Verified facts" section states, sourced from
-//! `MoonshotAI/kimi-cli` docs (`docs/en/reference/kimi-command.md`,
-//! `docs/en/configuration/data-locations.md`, 2026-09-07). The model flag,
-//! compaction, and the exact hook schema are explicitly called out in the
-//! issue as unverified and are left on the trait's own "no verified
-//! mechanism" default rather than guessed.
-//!
-//! **No row-level transcript schema is documented anywhere in issue #391**
-//! (only file names/locations: `context.jsonl`, `wire.jsonl`, `state.json`).
-//! [`capabilities`](KimiAdapter::capabilities) therefore reports
-//! `events: false` -- see `grok.rs`'s own doc comment for why that is the
-//! honest answer rather than an invented schema.
-//! [`transcript_path`](KimiAdapter::transcript_path) still resolves a real,
-//! best-effort location via [`super::pin_newest_transcript`], since the
-//! exact md5-of-cwd digest input (raw string? trailing slash? case folding?)
-//! is not given, so this scans for the newest `context.jsonl` under the
-//! sessions root rather than computing that digest.
+//! Transcript row fields and the session-directory digest are unverified;
+//! events stay disabled and path lookup scans for the newest transcript. (#391)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
