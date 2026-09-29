@@ -144,11 +144,7 @@ fn infer_kind(path: &Path) -> ArtifactKind {
     }
 }
 
-/// `register` canonicalized its repo path while `load`/`list` used the
-/// caller's verbatim, so where the two spellings differ (macOS `/var` ->
-/// `/private/var`) a just-registered artifact could not be read back. The
-/// canonicalization now lives inside `repo_slug` itself, so every caller on
-/// either side of that split agrees.
+/// Canonicalize the repository path inside `repo_slug` so register, load and list agree on aliases such as macOS `/var` and `/private/var`.
 fn artifact_dir(state: &StateDir, repo: &Path) -> PathBuf {
     state.artifacts().join(repo_slug(repo))
 }
@@ -376,12 +372,7 @@ fn open_url(url: &str) -> CtxResult<()> {
     Ok(())
 }
 
-/// `host:port` for a readiness probe. `--url` is both dialed by this process
-/// and handed to the platform opener, so it is restricted twice over: to
-/// `http`/`https` (a `file://` or `vscode://` value turns "open the local
-/// preview" into "launch whatever this string names"), and to a loopback host
-/// (any other host makes `artifact present` a way to make the operator's
-/// machine reach out to, and open a browser on, an address the caller chose).
+/// The URL is dialed and opened locally, so allow only HTTP(S) on loopback; other schemes or hosts could open an arbitrary target.
 fn probe_target(url: &str) -> CtxResult<String> {
     let (scheme, rest) = url
         .split_once("://")
@@ -489,15 +480,7 @@ fn stderr_note(tail: &std::sync::Mutex<Vec<u8>>) -> String {
     format!(": {text}")
 }
 
-/// How long a failure path waits for [`spawn_stderr_drain`]'s reader thread
-/// to catch up before [`stderr_note`] reads its tail. Every call site sits
-/// downstream of the child already being dead (an immediate exit) or just
-/// killed (a readiness timeout), so `try_wait`/termination observing the
-/// OS-level exit races the reader thread actually being scheduled to drain
-/// the pipe -- the exact mechanism `supervise::FINAL_DRAIN_BUDGET` bounds
-/// for the analogous `OutputTap` race. A child that wrote its last line and
-/// exited in the same instant used to lose that line here: `try_wait`
-/// noticed the exit before the reader thread had drained it.
+/// After child exit, allow the stderr reader to drain before reading its tail; exit observation can race the reader thread.
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 
 /// Waits (bounded by `budget`) for `handle` to finish. Never blocks past the
@@ -534,14 +517,10 @@ fn run_interactive_with(args: &PresentArgs, repo: &Path, ready_timeout: Duration
         .spawn()?;
     let mut job = crate::commands::ctx::supervise::JobGuard::adopt(child.id());
     let (stderr, stderr_thread) = spawn_stderr_drain(child.stderr.take());
-    // The clock starts at spawn, not after the blocking browser open: an
-    // opener that sits waiting for a user used to extend the "hard" lifetime
-    // by however long that took.
+    // Start the lifetime clock at spawn because a blocking browser opener must not extend the server lifetime.
     let deadline = Instant::now() + Duration::from_secs(args.lifetime_secs);
 
-    // Success means a live server, not a spawn that returned. A command that
-    // exits immediately (typo, port in use) used to report success with its
-    // own error message thrown away.
+    // Success requires a live server; an immediate child exit must report its error.
     let ready_by = Instant::now() + ready_timeout;
     loop {
         if let Some(status) = child.try_wait()? {

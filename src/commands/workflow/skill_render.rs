@@ -57,11 +57,7 @@ pub fn write_digest_list(writer: &mut impl Write, digests: &[SkillDigest<'_>]) -
     Ok(())
 }
 
-/// The plain-text detail `/skill <id>` and any future `zirv skill show`
-/// rewrite print for one resolved skill: everything a caller needs to
-/// decide whether to trust and activate it, but never the instruction
-/// body -- that is a separate disclosure stage the caller opts into
-/// explicitly (issue #539's progressive disclosure), never bundled in here.
+/// Show provenance and metadata without instruction text; loading instructions requires a separate explicit action. (#539)
 pub fn write_digest_detail(writer: &mut impl Write, skill: &RegisteredSkill) -> CtxResult<()> {
     let digest = skill.digest();
     writeln!(writer, "{}@{}", digest.id, digest.version)?;

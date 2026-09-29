@@ -96,12 +96,7 @@ fn matches_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
-/// The five keyword-domain signals [`ExecutionProfile::derive`] scans
-/// `request_text` for, beyond the base `general`/`frontend` split
-/// [`classify::WorkDomain`] already carries -- promoted out of `derive`
-/// itself so the workflow module's own metadata-only Jev classify
-/// refinement (issue #782, [`refine_via_jev`]) can count the same keyword
-/// hits instead of carrying a second copy of these lists.
+/// Share keyword-domain signals with Jev refinement so the two classifiers count the same facts. (#782)
 pub(crate) const DOMAIN_SIGNALS: [(&[&str], WorkDomainTag, &str); 5] = [
     (
         &["security", "auth", "permission", "credential", "secret"],
@@ -234,8 +229,7 @@ impl ExecutionProfile {
     }
 }
 
-/// Issue #782 site string every `jev-decisions.jsonl`/`jev-effects.jsonl`
-/// row and `cfg.jev.classify` gate share.
+/// Shared site id for the classify gate and Jev decision/effect journals. (#782)
 pub(crate) const JEV_CLASSIFY_SITE: &str = "classify";
 
 /// Minimum additive-domain-tag probability for the classify site, the same
@@ -474,19 +468,7 @@ fn apply_classify_answers(cfg: &CtxConfig, answers: &Answers, profile: &mut Exec
     profile.reasons.dedup();
 }
 
-/// Issue #782: an off-by-default Jev refinement of an already-computed
-/// `profile`, for `zirv workflow classify` -- gated on `cfg.jev.classify`
-/// (`[jev] classify`/`ZIRV_CTX_JEV_CLASSIFY`). Key off, or no
-/// `[proxy.typesafe]` credential, is a silent no-op: `profile` is left
-/// exactly as [`ExecutionProfile::derive`] computed it, so the caller's own
-/// output stays byte-identical to today (issue #782 acceptance). Sends only
-/// the same bounded numeric metadata envelope every other `[jev]`-gated site
-/// sends ([`classify_jev_facts`]), never the request text itself, and never
-/// fails or blocks the caller: any Jev error, timeout, or low-margin answer
-/// simply leaves `profile` untouched, recorded as a fallback by the shared
-/// [`jev::advise`] client. For `zirv workflow start`, which has no
-/// `ExecutionProfile` surface to add a domain tag to, see
-/// [`refine_intent_via_jev`] instead.
+/// Refine the derived profile only when enabled; send bounded numeric facts, never request text, and preserve the original on unavailable or indecisive advice. (#782)
 pub(crate) fn refine_via_jev(repo: &Path, task: &str, profile: &mut ExecutionProfile) {
     let env = |key: &str| std::env::var(key).ok();
     let Ok(cfg) = CtxConfig::load(repo, &env) else {
@@ -528,16 +510,7 @@ fn refine_profile_with_jev(
     apply_classify_answers(cfg, &answers, profile);
 }
 
-/// Issue #782: the same off-by-default Jev intent refinement as
-/// [`refine_via_jev`], for `zirv workflow start` (`workflow::engine::
-/// start_workflow`), which classifies before any `ExecutionProfile` exists
-/// and has no domain-tag surface to add to -- so, deliberately, this asks
-/// and applies only the intent Choice, never the domain Nouls. Same gate
-/// (`cfg.jev.classify`), same facts ([`classify_jev_facts`]), same
-/// byte-identical-when-off/no-credential/failed-call guarantee as
-/// `refine_via_jev`; a decisive answer replaces `classification.intent`
-/// in place, before the caller's own `selection::select_definition` runs,
-/// so a replaced intent steers pack selection at start too.
+/// At workflow start, refine only intent before pack selection because no profile domain-tag surface exists yet; preserve the original on unavailable or indecisive advice. (#782)
 pub(crate) fn refine_intent_via_jev(repo: &Path, task: &str, classification: &mut Classification) {
     let env = |key: &str| std::env::var(key).ok();
     let Ok(cfg) = CtxConfig::load(repo, &env) else {

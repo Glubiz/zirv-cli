@@ -332,10 +332,7 @@ pub(crate) fn reconcile_unfinished(
                 retryable: true,
                 ..
             } => {
-                // Bump the still-queued schedule entry to the attempt it is
-                // now owed, and mark it as already known (from the ledger)
-                // to need a real redispatch -- not a `trial.json` check, one
-                // was never written for an attempt that never ran.
+                // Requeue an owed attempt from the ledger; no trial file exists for an attempt that never ran.
                 if let Some(entry) = queues.get_mut(trial_id).and_then(VecDeque::back_mut) {
                     entry.attempt += 1;
                     needs_redispatch.insert(trial_id.clone());

@@ -33,12 +33,7 @@ const MAX_REVIEW_FINDINGS: usize = 256;
 const MAX_FINDINGS_PER_RUN: usize = 64;
 const MAX_FINDING_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_FINDING_PATH_BYTES: usize = 4 * 1024;
-/// Issue #326 B2: aggregate cap across every summary in a package's
-/// `existing_findings` -- `MAX_FINDING_SUMMARY_BYTES` bounds one finding's
-/// own summary and `MAX_REVIEW_FINDINGS` bounds how many findings a workflow
-/// may carry, but neither bounds their SUM: up to 256 findings at 4 KB each
-/// is a megabyte of prose resent to a reviewer every single round. See
-/// `cap_findings_payload`.
+/// Cap the aggregate finding summaries, not only each summary, so repeated review packages stay bounded. (#326)
 const MAX_REVIEW_FINDINGS_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
@@ -529,15 +524,7 @@ fn advise_duplicates(
                 Some((*candidate, probability, answer))
             })
             .max_by(|left, right| left.1.total_cmp(&right.1));
-        // Jev determinism fix: the winning answer must also be `decisive`
-        // (margin at or above `jev::DEFAULT_MIN_MARGIN`; a noul has no
-        // separate confidence to check, so this is a margin-only gate) --
-        // a thin-margin verdict falls through, same as no answer at all. No
-        // dedicated thin-margin test exists for this site: `JEV_DEDUP_
-        // PROBABILITY` (0.9) sits far enough from 0.5 that every accepted
-        // value already has margin `>= 0.8`, well clear of the default --
-        // structurally a no-op at this floor, same reasoning `memory.rs`'s
-        // harvest gate documents for its own floor.
+        // Require decisive dedup advice; thin margins fall through like no answer, even if the current probability floor already implies enough margin.
         let (min_confidence, min_margin) = REVIEW_DEDUP_DEFAULT_FLOOR;
         if let Some((candidate, probability, answer)) = best
             && review_dedup_action(Some(answer), min_confidence, min_margin) == "duplicate"
@@ -548,13 +535,7 @@ fn advise_duplicates(
     }
 }
 
-/// H-7: "recurred" means the same finding identity survived across a fix
-/// pass into a *later* review round, not merely that two findings from the
-/// same round happen to share a location. `build_review_findings` stamps
-/// every finding from one reviewer run with the identical `created_at` it is
-/// called with, so a distinct `created_at` is this module's own round
-/// marker -- two findings sharing a key only count as recurrence once they
-/// carry at least two distinct `created_at` values.
+/// A finding recurs only across distinct review runs, identified by different `created_at` values; duplicates within one run do not count.
 fn has_repeated_meaningful_finding(findings: &[ReviewFinding]) -> bool {
     let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
         std::collections::BTreeMap::new();
@@ -614,34 +595,13 @@ pub struct ReviewRunEvidence {
     pub adapter: String,
     pub review_round: u8,
     pub completed_at: u64,
-    /// The HEAD sha this reviewer actually reviewed. `None` for evidence
-    /// written before this field existed -- an older zirv. T4: no longer read
-    /// by `delta_base` -- a commit sha alone cannot reconstruct the staged,
-    /// unstaged and untracked content layered on top of it that the reviewer
-    /// actually saw, which is exactly the staleness bug T4 fixes (see
-    /// `reviewed_tree_sha` below). Kept purely for display/debugging and as
-    /// the PR-review "did the PR head move" comparison's sibling concept.
+    /// Reviewed HEAD for display and PR head comparison; commit sha alone cannot represent the reviewed worktree, so deltas use `reviewed_tree_sha`.
     #[serde(default)]
     pub head_sha: Option<String>,
-    /// T4: a git tree object representing the EXACT worktree this reviewer
-    /// reviewed -- `head_sha`'s commit plus every staged/unstaged change to a
-    /// tracked file plus every untracked file the package included, built by
-    /// `compute_reviewed_tree_sha`. `None` for evidence written before this
-    /// field existed (an older zirv, same degrade-gracefully shape `head_sha`
-    /// already has) -- `delta_base` then reads the chain as broken and falls
-    /// back to a full package rather than delta against a commit sha that
-    /// cannot represent the reviewed worktree.
+    /// Exact reviewed worktree tree, including staged, unstaged and included untracked files; missing old evidence forces a full package.
     #[serde(default)]
     pub reviewed_tree_sha: Option<String>,
-    /// Every finding's `id` -> `disposition` as of this round's completion
-    /// (after the reviewer's own findings were merged in). T2: the snapshot
-    /// a later round's `package()` diffs the CURRENT `state.review_findings`
-    /// against to decide which findings actually changed since the previous
-    /// round -- see `delta_existing_findings`. Empty for evidence written
-    /// before this field existed (an older zirv, same `#[serde(default)]`
-    /// degrade-gracefully shape `head_sha` already has): every current
-    /// finding then reads as "not in the snapshot", so it is treated as
-    /// changed and resent in full rather than silently dropped.
+    /// Snapshot of finding dispositions after this round; missing old snapshots resend all current findings rather than dropping them.
     #[serde(default)]
     pub finding_dispositions: BTreeMap<String, FindingDisposition>,
     /// Reviewer identity for a completed round where Jev's semantic dedup
@@ -667,15 +627,7 @@ pub struct VerificationEvidence {
     pub fresh: bool,
     pub fingerprint: u64,
     pub checks: Vec<(String, super::verification::CheckStatus, u64)>,
-    /// #238: whether this (raw-failing) report nonetheless satisfies the
-    /// operator's recorded per-repository baseline (issue #215) -- i.e.
-    /// `verification::evaluate_against_operator_baseline(&report,
-    /// repo).gate_passed`. Only ever `true` when `passed` is `false`; a raw
-    /// pass, or a still-failing report (a genuine failure alongside any
-    /// baselined one, or nothing baselined at all), leaves this `false` and
-    /// `waived_failing_tests` empty, and skips serializing both so a genuine
-    /// (non-waived, or only-partially-waived) failure round-trips exactly as
-    /// it did before this field existed.
+    /// True only when a raw-failing report fully satisfies the operator baseline; partial waivers never mark a genuine failure as passed. (#238)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub passed_with_baseline_waiver: bool,
     /// The sorted, deduplicated failing test names waived by the operator's
@@ -698,12 +650,7 @@ impl VerificationEvidence {
             if evaluation.gate_passed {
                 (true, evaluation.waived)
             } else {
-                // A partially baselined genuine failure (or nothing
-                // baselined at all): `evaluation.waived` can still be
-                // non-empty here, but the report as a whole did NOT pass, so
-                // neither field may be populated -- otherwise a real
-                // regression would serialize alongside waiver fields that
-                // read as "this passed via baseline."
+                // Do not serialize waiver fields unless the whole report passes the baseline; partial waivers must not disguise a real failure.
                 (false, Vec::new())
             }
         };
@@ -732,17 +679,11 @@ pub struct PullRequestReference {
     pub url: Option<String>,
 }
 
-/// What kind of git object `ReviewPackage::diff_base_sha` names. T4: added
-/// alongside `reviewed_tree_sha` so a reader can tell the two apart --
-/// notably, `git diff A...B` (triple-dot, merge-base) syntax requires a
-/// commit-ish and will not accept a bare tree object, unlike the plain
-/// `git diff A` this module itself always uses to build the package.
+/// Identify whether `diff_base_sha` names a commit or tree; triple-dot git diff requires a commit, while plain diff accepts a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiffBaseKind {
-    /// `diff_base_sha` is a commit: round 1, a PR review (always round 1),
-    /// or any round whose evidence chain is broken and fell back to the full
-    /// diff against the workflow's `base_sha`.
+    /// A commit base means round 1 or a broken evidence chain, which sends the full workflow diff.
     Commit,
     /// `diff_base_sha` is a git tree object -- the previous round's
     /// `ReviewRunEvidence::reviewed_tree_sha`, the exact worktree that
@@ -752,33 +693,13 @@ pub enum DiffBaseKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewPackage {
-    /// This type never round-trips back through zirv itself (`Serialize`
-    /// only, no `Deserialize`) -- a reviewer process is the only reader, so
-    /// this exists purely so it can tell an old package from a new one. 1:
-    /// original shape. 2: added `diff_is_delta`/`diff_base_sha`. 3 (T2):
-    /// `changed_paths`/`existing_findings` became deltas on an intact-chain
-    /// round instead of always resending everything since `base_sha`, and
-    /// `unchanged_existing_findings` was added. 4 (T3): added
-    /// `accepted_spec_excerpt`. 5 (T4): added `diff_base_kind`; a delta
-    /// round's `diff_base_sha` is now the previous round's reviewed git TREE
-    /// (`reviewed_tree_sha`), not its `head_sha` commit -- a commit sha alone
-    /// could not represent the staged/unstaged/untracked content layered on
-    /// top of it, so a fix landing without an intervening commit used to
-    /// silently resend content the previous round already reviewed while
-    /// still labelling the package a delta.
+    /// Version the reviewer-only package so readers can interpret delta fields and tree-based bases; zirv does not deserialize it.
     pub schema_version: u32,
     #[serde(skip)]
     pub repo_root: PathBuf,
     #[serde(skip)]
     pub include_custom_agents: bool,
-    /// T4: the exact worktree THIS package describes, so a later round's
-    /// `delta_base` can diff from it instead of from `head_sha`'s commit.
-    /// Carried on the package (rather than computed again at evidence-write
-    /// time) because the reviewer seat is always read-only -- the worktree
-    /// cannot change between packaging and evidence recording. Never sent to
-    /// the reviewer: `#[serde(skip)]`, exactly like `repo_root` above.
-    /// `None` only for a PR package, which is always round 1 and never
-    /// becomes local review evidence.
+    /// Carry the exact packaged worktree for later deltas; read-only review cannot change it before evidence is recorded, and it is never sent to the reviewer.
     #[serde(skip)]
     pub reviewed_tree_sha: Option<String>,
     pub workflow_id: String,
@@ -791,9 +712,7 @@ pub struct ReviewPackage {
     pub escalation_reason: Option<String>,
     pub base_sha: String,
     pub head_sha: String,
-    /// The sha the packaged `diff` is actually computed against: `base_sha`
-    /// on round 1 or whenever the evidence chain is broken, otherwise the
-    /// previous round's reviewed tree (see `diff_base_kind`).
+    /// Diff base is the workflow base for full packages or the previous reviewed tree for deltas.
     pub diff_base_sha: String,
     /// What kind of object `diff_base_sha` is -- see `DiffBaseKind`.
     pub diff_base_kind: DiffBaseKind,
@@ -802,23 +721,12 @@ pub struct ReviewPackage {
     /// other.
     pub diff_is_delta: bool,
     pub change_fingerprint: u64,
-    /// T2: on round 1, or any round whose diff fell back to the full change
-    /// (`!diff_is_delta`), every path changed since `base_sha` -- unchanged
-    /// from before this field's delta behavior existed. On an intact-chain
-    /// delta round, only paths changed since `diff_base_sha`: paths a
-    /// previous round already sent and that have not changed further since
-    /// are left out, the same "not already sent" contract `diff` itself
-    /// already applies.
+    /// Send all changed paths for full packages and only paths changed since the reviewed tree for deltas.
     pub changed_paths: Vec<PathBuf>,
     pub diff: String,
     pub diff_truncated: bool,
     pub verification: Option<VerificationEvidence>,
-    /// T2: on round 1, or any round whose diff fell back to the full change
-    /// (`!diff_is_delta`), every recorded finding -- unchanged from before
-    /// this field's delta behavior existed. On an intact-chain delta round,
-    /// only findings that are new or whose disposition changed since the
-    /// previous round (`delta_existing_findings`); how many were left out
-    /// because nothing about them changed is `unchanged_existing_findings`.
+    /// Send all findings for full packages; deltas send only new or disposition-changed findings.
     pub existing_findings: Vec<ReviewFinding>,
     /// How many of this workflow's recorded findings were left out of
     /// `existing_findings` because neither they nor their disposition
@@ -833,12 +741,7 @@ pub struct ReviewPackage {
     /// status` reports rather than discovering it only via a passing gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_preexisting_findings: Option<engine::AcceptedPreexistingFindings>,
-    /// T3: a bounded excerpt (`accepted_artifact_excerpt`, capped at
-    /// `MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES`) of whichever accepted spec,
-    /// intent, or plan artifact exists for this workflow, spec preferred --
-    /// so a reviewer judges the diff against what the operator actually
-    /// accepted, not only the one-line `task` description above. `None`
-    /// when nothing has been accepted yet.
+    /// Bound the accepted spec/intent/plan excerpt so review uses the accepted requirements without unbounded context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_spec_excerpt: Option<String>,
 }
@@ -866,29 +769,7 @@ fn review_round(state: &WorkflowState, current_fingerprint: u64) -> u8 {
     evidence_round.max(attempt_round)
 }
 
-/// The most recently completed evidence from a round STRICTLY BEFORE
-/// `before_round`, if any: "latest round below `before_round`, then latest
-/// completion within it". Factored out (T2) so `delta_existing_findings` can
-/// read the SAME round's `finding_dispositions` snapshot that `delta_base`
-/// reads `head_sha` from, rather than risking the two ever disagreeing about
-/// which round is "the previous one".
-///
-/// Issue #326 B5: this used to pick the single most recent evidence overall
-/// (`max_by_key((review_round, completed_at))`, no `before_round` filter),
-/// which is wrong once a round requires more than one independent reviewer.
-/// Each reviewer invocation is its own `package()`/evidence-append call, so
-/// on round >= 2 the SECOND required reviewer's own `package()` ran after the
-/// FIRST reviewer of the SAME round had already appended its evidence --
-/// "most recent overall" then picked that sibling's own just-recorded
-/// evidence instead of the previous round's, collapsing the second
-/// reviewer's delta (diff and existing-findings both) to near-empty, since
-/// nothing changed between the two reviewers. Filtering to `review_round <
-/// before_round` -- the round `package()`'s own caller is CURRENTLY
-/// computing a delta for -- makes the lookup reviewer-slot aware: a sibling's
-/// evidence from the same round in progress can never be mistaken for the
-/// previous round's, however many reviewers that round has already recorded.
-/// Round 1's own behavior (`delta_base` returns `None` before this is ever
-/// called) is unchanged.
+/// Use only evidence from a strictly earlier round; sibling reviewers in the current round must not collapse one another’s deltas. (#326)
 fn previous_round_evidence(state: &WorkflowState, before_round: u8) -> Option<&ReviewRunEvidence> {
     state
         .review_evidence
@@ -897,20 +778,7 @@ fn previous_round_evidence(state: &WorkflowState, before_round: u8) -> Option<&R
         .max_by_key(|evidence| (evidence.review_round, evidence.completed_at))
 }
 
-/// The git tree object a later review round should diff FROM: the EXACT
-/// worktree the most recent completed reviewer actually reviewed, not merely
-/// the commit it was built on top of.
-///
-/// `None` -- meaning "send the full diff against the workflow's base_sha,
-/// exactly as before" -- whenever the chain cannot be proven intact: round 1,
-/// no evidence at all, evidence written before `reviewed_tree_sha` existed
-/// (T4: an old `head_sha`-only record no longer drives a delta at all -- a
-/// commit sha cannot reconstruct the staged/unstaged/untracked content the
-/// previous package layered on top of it, which is exactly the staleness bug
-/// T4 fixes), or a recorded tree that no longer resolves in this repository
-/// (a rebase, a reset, a fresh clone). A reviewer that silently receives LESS
-/// than the change it is judging is a worse outcome than an expensive
-/// review, so every ambiguous case falls back to a full package.
+/// Use the last reviewed tree for deltas; if the evidence chain or tree cannot be verified, send the full diff so review never misses changes.
 fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<String> {
     if review_round <= 1 {
         return None;
@@ -924,27 +792,7 @@ fn delta_base(state: &WorkflowState, repo: &Path, review_round: u8) -> Option<St
     Some(tree_sha)
 }
 
-/// T2: which of `state.review_findings` a reviewer needs to see again on a
-/// delta round, plus how many were left out because nothing about them
-/// changed. Compares each current finding's disposition against the snapshot
-/// `previous_round_evidence` recorded when the previous round completed --
-/// new (no entry in that snapshot) or disposition-changed (a different
-/// entry) findings are returned; everything else is only counted.
-///
-/// Caller's responsibility, not this function's: only call this on a round
-/// that is actually a delta (`diff_is_delta`); round 1 and any round with a
-/// broken evidence chain must send every finding in full, the same
-/// unconditional way they always have, and this function has no way to
-/// distinguish "genuinely no previous round" from "previous round's snapshot
-/// was empty" -- both look identical here (every finding treated as
-/// changed), which is the correct, safe answer for the first but a needless
-/// full resend for the second when the caller already knows better.
-///
-/// `review_round` (issue #326 B5) is the round THIS package is being built
-/// for, passed straight through to `previous_round_evidence` so it reads the
-/// same "strictly before this round" snapshot `delta_base` computed its own
-/// tree sha from -- never a sibling reviewer's own evidence from this same
-/// round.
+/// On delta rounds, resend only new or disposition-changed findings against the strictly previous round; full rounds must send every finding. (#326)
 fn delta_existing_findings(state: &WorkflowState, review_round: u8) -> (Vec<ReviewFinding>, usize) {
     let previous = previous_round_evidence(state, review_round)
         .map(|evidence| &evidence.finding_dispositions)
@@ -962,10 +810,7 @@ fn delta_existing_findings(state: &WorkflowState, review_round: u8) -> (Vec<Revi
     (changed, unchanged)
 }
 
-/// T3: which accepted artifact `accepted_artifact_excerpt` prefers when more
-/// than one is accepted -- spec is the most concrete statement of what must
-/// actually be true of the change, intent the next most concrete, plan the
-/// least (it says how, not what "done" means).
+/// Prefer accepted spec, then intent, then plan because each is less direct evidence of required behavior.
 const ACCEPTED_ARTIFACT_PRIORITY: [ArtifactStage; 3] = [
     ArtifactStage::Spec,
     ArtifactStage::Intent,
@@ -980,10 +825,7 @@ const ACCEPTED_ARTIFACT_PRIORITY: [ArtifactStage; 3] = [
 /// on first.
 const PRIORITY_EXCERPT_HEADINGS: &[&str] = &["acceptance criteria", "goals"];
 
-/// T3: the excerpt cap. Bounded so a reviewer's judging context grows by a
-/// fixed, small amount regardless of how long the accepted artifact is --
-/// the same "cap it, don't just trust the source not to be huge" discipline
-/// every other injected section in a review package already follows.
+/// Cap accepted-artifact excerpts independently of artifact size.
 const MAX_ACCEPTED_ARTIFACT_EXCERPT_BYTES: usize = 2 * 1024;
 
 /// Splits markdown `text` at each ATX heading line (one or more leading `#`)
@@ -1012,24 +854,7 @@ fn markdown_sections(text: &str) -> Vec<(String, String)> {
     sections
 }
 
-/// Reorders `body`'s markdown sections so any heading in
-/// `PRIORITY_EXCERPT_HEADINGS` comes first (`markdown_sections`), then caps
-/// the result at `cap_bytes` on a char boundary (`crate::utils::
-/// truncate_bytes`). An excerpt that already fits `cap_bytes` is returned
-/// byte-for-byte with no marker, matching every other bounded-excerpt layer
-/// this module composes.
-///
-/// `truncation_marker`, when given, is appended whenever the cap actually
-/// cut something -- with the marker itself counted against `cap_bytes`, so
-/// the total never exceeds the budget -- for a caller (`ctx::agent`'s
-/// `--attach-artifact`) that wants a reader to see the excerpt was cut
-/// rather than believe it ended there. `None` reproduces this module's own
-/// `accepted_spec_excerpt` behaviour, which has never added one.
-///
-/// Shared (S1) by `accepted_artifact_excerpt` below and `ctx::agent`'s
-/// `--attach-artifact` excerpt: both reorder-then-cap an accepted workflow
-/// artifact the same way, and used to carry two copies of this logic before
-/// this helper existed.
+/// Prioritize markdown sections before a character-safe cap; count any truncation marker within that cap.
 pub(crate) fn prioritized_excerpt(
     body: &str,
     cap_bytes: usize,
@@ -1058,22 +883,9 @@ pub(crate) fn prioritized_excerpt(
     }
 }
 
-/// T3: a bounded excerpt of whichever accepted spec/intent/plan artifact
-/// exists for `state`, for a reviewer to judge the change against instead of
-/// only the operator's one-line `task` description. `None` when nothing is
-/// accepted yet, matching every other optional layer in this package.
-///
-/// Reads through `engine::read_accepted_artifact`, the same validated,
-/// symlink-checked path every other artifact reader in the workflow engine
-/// funnels through (`workflow_artifact_path` / `refuse_symlinked_artifact_
-/// path`) -- a repo-owned artifact record's `rel_path` is untrusted (see
-/// `CLAUDE.md`'s "repo-owned surfaces" rule), and a writer who replaces an
-/// already-accepted artifact with a symlink after acceptance must not be
-/// able to smuggle an arbitrary local file into a review package excerpt.
-/// A validation failure (or any other read failure) is never a hard error
-/// here: it degrades to `None`, exactly like "nothing accepted yet", after
-/// logging a warning so the skip is visible without blocking packaging.
+/// Read a bounded accepted artifact through the validated, symlink-checked path; an invalid path degrades to no excerpt after a warning.
 fn accepted_artifact_excerpt(state: &WorkflowState) -> Option<String> {
+    // A repo-owned artifact record's rel_path is untrusted: a symlink swapped in after acceptance must not smuggle an arbitrary local file into the excerpt.
     let stage = ACCEPTED_ARTIFACT_PRIORITY.iter().copied().find(|stage| {
         state
             .artifacts
@@ -1153,18 +965,7 @@ impl Drop for TempIndex {
     }
 }
 
-/// T4: builds a git tree object representing the EXACT worktree a review
-/// package's `diff` and untracked-file section describe -- `HEAD` plus every
-/// staged/unstaged change to a tracked file (the same content a plain
-/// `git diff <commit>` already exposes), plus every untracked file the
-/// package itself would include, respecting `.gitignore` and excluding
-/// `.zirv/work/**` workflow bookkeeping the same way `package()`'s own
-/// untracked scan already does (`super::classify::is_workflow_work_path`).
-///
-/// Built entirely through a throwaway index file (`GIT_INDEX_FILE`) so the
-/// repository's REAL index is never staged, touched, or left dirty by this
-/// read-only operation -- verified by
-/// `computing_the_reviewed_tree_sha_leaves_the_real_index_untouched`.
+/// Build the exact reviewed tree with a throwaway Git index so this read-only operation never stages or changes the real index.
 fn compute_reviewed_tree_sha(repo: &Path) -> CtxResult<String> {
     let index = TempIndex::new();
     git_with_index(repo, &index.0, &["read-tree", "HEAD"])?;
@@ -1199,11 +1000,7 @@ pub fn default_base(repo: &Path) -> CtxResult<String> {
     git(repo, &["rev-parse", "HEAD"])
 }
 
-/// Like [`default_base`], but resolves relative to `branch` (a ref name)
-/// rather than `HEAD` -- issue #467's `--branch`: the checkout given as
-/// `repo` need not have `branch` checked out at all, so the base must be
-/// found by asking git about the ref directly, never by inspecting whatever
-/// happens to be checked out.
+/// Resolve the base from the named branch ref; the checkout need not have that branch checked out. (#467)
 pub fn default_base_for(repo: &Path, branch: &str) -> CtxResult<String> {
     let parent = format!("{branch}^");
     for candidate in ["origin/main", "main", parent.as_str()] {
@@ -1636,9 +1433,7 @@ fn package_pull_request(
         diff,
         diff_truncated,
         verification: None,
-        // A PR review is always packaged as round 1 (see `review_round: 1`
-        // just below), so this stays the full list -- never a delta -- the
-        // same "round 1 is never a delta" rule `package()` follows.
+        // PR review is always round 1, so its changed-path list is full, never a delta.
         existing_findings,
         unchanged_existing_findings: 0,
         review_round: 1,
@@ -2033,9 +1828,7 @@ fn has_digit_and_letter(run: &[u8]) -> bool {
     run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic)
 }
 
-/// `pub(crate)`: reused by `ctx::screen` (issue #243) for mail-body
-/// screening, the same entropy check this module already applies to a
-/// review package's untracked-file bodies.
+/// Share the entropy screen with mail-body checks so both surfaces apply the same filter. (#243)
 pub(crate) fn detect_high_entropy_run(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut index = 0usize;
@@ -2160,18 +1953,7 @@ fn untracked_exclusion(path: &Path, metadata: &std::fs::Metadata) -> Option<Stri
     None
 }
 
-/// Issue #326 B2: trims `findings`' own summary text so the aggregate never
-/// exceeds `budget` bytes, without ever dropping a finding outright --
-/// `id`/`severity`/`disposition`/`path`/`line` survive regardless of
-/// trimming, so a reviewer can always see WHICH findings exist even once
-/// their prose is gone. Trimming order mirrors triage priority: a finding
-/// whose disposition already means it is no longer an open concern (anything
-/// but `Open`) is trimmed before any `Open` one, oldest (`created_at`) first
-/// within each group -- an `Open` finding a reviewer still has to act on
-/// keeps its full text as long as the budget allows. Trims only as many
-/// findings as it takes to fit, and only when trimming would actually shrink
-/// a summary (a already-short summary is left alone). A no-op, returned
-/// unchanged, when the aggregate already fits.
+/// Trim closed findings before open ones to fit the aggregate summary budget; always preserve finding identity and disposition. (#326)
 fn cap_findings_payload(mut findings: Vec<ReviewFinding>, budget: usize) -> Vec<ReviewFinding> {
     const TRIMMED_NOTE: &str = "[summary trimmed to fit the aggregate review-findings budget]";
     let total_bytes =
@@ -2233,13 +2015,7 @@ pub fn package(
         )
         .into());
     }
-    // Round 1, or any break in the evidence chain, packages the full diff
-    // against `base_sha` exactly as before. A later round with an intact
-    // chain packages only what changed since the last reviewed TREE -- T2:
-    // `changed_paths` (below) and `existing_findings` now follow the same
-    // delta shape, rather than resending everything a previous round already
-    // sent. T4: the base is a tree object (the exact worktree the previous
-    // round reviewed), never a commit -- see `delta_base`.
+    // A broken evidence chain sends the full base diff; an intact chain sends only changes since the exact previously reviewed tree.
     let (diff_base_sha, diff_base_kind) = match delta_base(state, &state.repo, review_round) {
         Some(tree_sha) => (tree_sha, DiffBaseKind::Tree),
         None => (base_sha.clone(), DiffBaseKind::Commit),
@@ -2266,18 +2042,7 @@ pub fn package(
             .filter(|path| !super::classify::is_workflow_work_path(path))
             .collect();
     append_untracked(&mut diff, &mut diff_truncated, &state.repo, &untracked)?;
-    // T2: computed against `diff_base_sha`, not always `base_sha` -- on
-    // round 1, or any round whose diff fell back to the full change,
-    // `diff_base_sha == base_sha` (see above), so this is still every file
-    // touched since the workflow's base, unchanged from before this existed.
-    // On an intact-chain delta round it is only what changed since the last
-    // reviewed sha, the same base the packaged `diff` itself is already
-    // scoped to -- a path a previous round already sent, and that has not
-    // changed further since, is left out. Untracked files have no sha to
-    // diff against either way, so they are always included in full: there is
-    // no cheap way to know whether a previous round already reported a given
-    // untracked path without persisting that set, and an untracked file is
-    // rare enough that resending it is not the cost this field exists to cut.
+    // Scope changed paths to the diff base; include untracked files in full because they have no prior tree identity to compare.
     let mut changed_paths: BTreeSet<PathBuf> =
         git(&state.repo, &["diff", "--name-only", &diff_base_sha])?
             .lines()
@@ -2292,8 +2057,7 @@ pub fn package(
     } else {
         (state.review_findings.clone(), 0)
     };
-    // Issue #326 B2: bounds the aggregate size of what just got selected
-    // above, regardless of which branch selected it.
+    // Cap the aggregate findings payload regardless of how findings were selected. (#326)
     let mut existing_findings =
         cap_findings_payload(existing_findings, MAX_REVIEW_FINDINGS_PAYLOAD_BYTES);
     sort_findings_by_advisory(&mut existing_findings);
@@ -2301,10 +2065,7 @@ pub fn package(
         .map(|report| VerificationEvidence::from_report(report, current_fingerprint, &state.repo));
     let required_reviews = required_independent_reviews_for(state);
     let escalated = required_reviews > required_independent_reviews(state.classification.risk);
-    // T4: snapshotted for THIS package so a later round's `delta_base` can
-    // diff against exactly what this reviewer is about to see -- the
-    // reviewer seat is always read-only, so nothing can change this worktree
-    // between now and when the evidence for this round gets recorded.
+    // Snapshot this read-only package’s exact worktree so the next round can diff against what this reviewer saw.
     let reviewed_tree_sha = compute_reviewed_tree_sha(&state.repo)?;
     Ok(ReviewPackage {
         schema_version: 5,
@@ -2523,33 +2284,7 @@ fn record_finding_update(state_dir: &StateDir, state: &WorkflowState) {
     );
 }
 
-/// Leaves ONE durable, machine-local memory note behind when a review
-/// finding's disposition settles on `Fixed` or `Residual` -- both are a real
-/// defect the review process actually found and closed out one way or
-/// another, worth surfacing to a later session; `Dismissed` (not a real
-/// issue) and `Accepted`/`Open` (nothing settled yet) are not. Never stores
-/// the diff, only a short summary excerpt -- see `Entry::body` below.
-///
-/// Uses a per-finding bank (`review-finding-<8-char id>`), not the
-/// repository's own memory bank: this is a durable audit trail addressable
-/// by finding id, not a fact meant to be surfaced automatically in a future
-/// session's prompt (which only ever reads the repo's own bank). The repo is
-/// still named inside the entry body itself, via `state::repo_slug`.
-///
-/// Best-effort like `record_finding_update` above: a disabled
-/// `cfg.memory.enabled` means "nothing was recorded", never a failure of the
-/// disposition itself, the same posture `run_remember_with` documents for the
-/// `zirv ctx remember` CLI wrapper's own gate. A config load *failure*,
-/// however, is NOT treated the same way: repo-owned surfaces
-/// (`<repo>/.zirv/ctx.toml`) may only ever narrow what this session does,
-/// never disable an operator-facing feature outright, so a hostile repo
-/// cannot suppress this audit trail merely by adding a `REPO_FORBIDDEN` key
-/// that makes `CtxConfig::load` hard-error. On a load failure this falls
-/// back to `CtxConfig::default()` (memory is enabled by default) and warns
-/// once, the same graceful-degrade shape `reviewer_args`'s own
-/// `.unwrap_or_default()` uses for the review model -- only an
-/// operator-level `memory.enabled = false` (a repo layer cannot set that key
-/// at all) skips the write.
+/// Record settled real findings in a per-finding local bank with a short summary, never the diff. On config errors use defaults so untrusted repository text cannot suppress the audit; an operator disable skips it.
 fn remember_finding_disposition(
     state_dir: &StateDir,
     state: &WorkflowState,
@@ -2746,6 +2481,7 @@ struct ReviewerFinding {
 /// trimmed, is either the bare marker or exactly one whitespace-free
 /// bracketed tag followed by a single space and the marker; `None` otherwise.
 fn review_result_json(line: &str) -> Option<&str> {
+    // Strict prefix rule: attacker-influenced output echoing the marker (multi-word tag, missing space) must never be mistaken for the structured result. (#232)
     let trimmed = line.trim();
     if let Some(json) = trimmed.strip_prefix(REVIEW_RESULT_PREFIX) {
         return Some(json);
@@ -2761,12 +2497,7 @@ fn review_result_json(line: &str) -> Option<&str> {
         .strip_prefix(REVIEW_RESULT_PREFIX)
 }
 
-/// Issue #232 (review round): after trimming, at most one leading bracketed
-/// tag with no internal whitespace (e.g. `[zirv] `, from this repo's
-/// `UserPromptSubmit` hook) may precede `REVIEW_RESULT_PREFIX`; anything
-/// else ahead of the marker -- echoed text, a multi-word tag, a missing
-/// space -- rejects the line, so attacker-influenced output containing the
-/// marker is never mistaken for the structured result.
+/// Allow only one compact leading bracketed tag before the result marker; reject other prefixes as unstructured output. (#232)
 fn parse_reviewer_output(output: &str) -> CtxResult<Vec<ReviewerFinding>> {
     if output.len() > MAX_REVIEW_OUTPUT_BYTES {
         return Err(format!("reviewer output exceeds {MAX_REVIEW_OUTPUT_BYTES} bytes").into());
@@ -2882,18 +2613,7 @@ fn append_reviewer_findings(
     Ok(())
 }
 
-/// The private supervised request for one workflow reviewer. On the harness
-/// runtime, adapter model and read-only controls travel in `AgentArgs::flags`;
-/// native requests carry no vendor flags. `inline` has no CLI spelling and is
-/// set only here because this caller consumes the completed review evidence.
-///
-/// Issue #484 (roadmap N15): under `RuntimeKind::Native` the same seat runs
-/// with no vendor CLI at all. `agent` is then read as the provider ROUTE, the
-/// same repurposing `zirv agent --runtime native` already applies to its own
-/// positional; there are no trailing flags, because there is no external
-/// process to pass them to; and `--mode read-only` is not advice but the
-/// mechanism -- `native_worker` takes no writer permit for a read-only worker,
-/// so the execution broker refuses every mutating effect at effect time.
+/// Native review uses a provider route and broker-enforced read-only mode; harness review carries adapter flags. (#484)
 pub(crate) fn reviewer_args(
     runtime: RuntimeKind,
     agent: &str,
@@ -2962,25 +2682,9 @@ pub(crate) fn reviewer_args(
     }
     let adapter = adapter.expect("the harness path always resolves an adapter");
 
-    // R1-4 (2026-09-06 review): the seat instructions travel as `zirv ctx
-    // agent`'s own `--system-prompt`, not as a trailing `--append-system-
-    // prompt` in `seat_args` below. Trailing flags become argv on the real
-    // harness child, so `dash::mod::sanitize_file_dropped_request` clears
-    // them -- which silently ran every pane-fulfilled review with NO seat
-    // instructions at all. As a zirv flag the text reaches BOTH forks: an
-    // inline run renders it through this same `system_prompt_args` seam
-    // (`agent::flags_with_system_prompt`), and a pane carries it as
-    // `SpawnRequest::system_prompt`.
+    // Pass seat instructions as a zirv system-prompt field so both inline and dashboard forks carry them; trailing child flags are dropped by dashboard sanitization.
     let mut seat_args: Vec<String> = Vec::new();
-    // Enforce the same review-model resolution `review_roster_line` only
-    // ADVISES the orchestrator with (operator's own `review.<agent>` first,
-    // else the adapter's own ladder default one tier below `chat.model`) --
-    // otherwise the reviewer silently ran on the adapter's bare CLI default.
-    // A config that fails to load degrades to the adapter's own top-tier
-    // default via `CtxConfig::default()`, the same graceful-degrade shape
-    // `reviewer_worker_budget` below uses, rather than refusing the review.
-    // Must land before the read-only floor below so no model argument can
-    // ever weaken it.
+    // Resolve the reviewer model from operator config or adapter default before applying the read-only floor; config errors use defaults.
     let review_cfg =
         crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
             .unwrap_or_default();
@@ -2990,37 +2694,14 @@ pub(crate) fn reviewer_args(
     if !review_model.is_empty() {
         seat_args.extend(adapter.model_args(&review_model));
     }
-    // Keep the existing static read-only resolver as the enforcement seam:
-    // it also reports adapter-specific sandbox residuals. Append it last so
-    // no system/model argument can weaken the floor.
-    // This forks through `codex exec` (see this fn's own doc comment: "no
-    // `--headless`... resolves prompt in-process, before it ever chooses
-    // between a pane and an inline run"), never the interactive TUI, so the
-    // `exec`-only floor is always correct here -- a pane fork drops these
-    // trailing flags entirely and re-derives its own via
-    // `dash::worker_pane_extra_args`, which is mode-aware.
+    // Append the static read-only floor last so model and system arguments cannot weaken it; dashboard forks re-derive the floor server-side.
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(
         agent,
         crate::commands::ctx::adapters::LaunchMode::Headless,
     )
     .ok_or_else(|| format!("unknown adapter '{agent}'; cannot pin the reviewer read-only"))?;
     seat_args.extend(read_only);
-    // 2026-09-06: no `--headless`. The package still travels on this child's
-    // own stdin (`-`) -- `zirv ctx agent` resolves the prompt in-process,
-    // before it ever chooses between a pane and an inline run, so the pane
-    // fork carries the identical package as `SpawnRequest::prompt`. What a
-    // pane cannot carry is the trailing `-- <seat_args>` below, whose
-    // load-bearing half is the read-only floor; `--mode read-only` states
-    // that as a request field instead, which `dash::worker_pane_extra_args`
-    // re-applies server-side from this adapter's own read-only pin. A
-    // Issue #733: the private `inline` field below keeps this caller
-    // synchronous so it can
-    // validate and persist completed review evidence even when a dashboard
-    // is live.
-    //
-    // R1-4: the seat instructions state that the same way -- `--system-
-    // prompt`, a zirv flag, which travels on the request as data instead of
-    // being dropped with the trailing flags.
+    // Keep the review package on stdin and force inline completion; server-side read-only pin and seat instructions survive dashboard dispatch. (#733)
     Ok(crate::commands::ctx::agent::AgentArgs {
         name: agent.to_string(),
         prompt,
@@ -3126,10 +2807,7 @@ fn salvage_suffix(path: Option<&Path>) -> String {
 /// other signal telling it to wrap up.
 const DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE: u32 = 40;
 
-/// The prompt text sent to an independent reviewer for `package`, split out
-/// from `launch_reviewer` so its exact wording (in particular the #238
-/// baseline-waiver guidance and issue #406's `reuse-and-simplicity`
-/// dimension) is unit-testable without spawning a real reviewer process.
+/// Build the reviewer prompt separately so baseline and review-dimension wording can be verified without a launch. (#238, #406)
 fn build_reviewer_prompt(
     package: &ReviewPackage,
     budget_tokens: Option<u64>,
@@ -3173,11 +2851,7 @@ fn build_reviewer_prompt(
     } else {
         String::new()
     };
-    // T3: `task` is only ever the operator's one-line description; when a
-    // more concrete accepted artifact exists, a reviewer that judges the
-    // diff against `task` alone can pass a change that satisfies the
-    // one-liner but misses acceptance criteria or goals the operator
-    // actually signed off on.
+    // Include accepted artifact criteria because the one-line task cannot fully define what review must judge.
     let accepted_spec_notice = if package.accepted_spec_excerpt.is_some() {
         "The package's `accepted_spec_excerpt` field holds a bounded excerpt of this workflow's \
          accepted spec, intent, or plan artifact. Judge the diff against what it actually \
@@ -3186,13 +2860,7 @@ fn build_reviewer_prompt(
     } else {
         ""
     };
-    // Issue #406 layer 2: the `reuse-and-simplicity` dimension. The pre-write
-    // probe (`ctx::reuse`) only sees one write at a time and only sees
-    // NAMES; a reviewer sees the whole diff and can judge whether an
-    // addition duplicates something spelled differently, or is simply
-    // larger than the requirement needs. Stated as a per-added-item
-    // obligation with a citation or the literal words `none found`, so an
-    // unchecked item is visible as a missing citation rather than silent.
+    // Ask reviewers for a reuse citation or `none found` per addition; a whole diff reveals duplication beyond a single write. (#406)
     let reuse_notice = "One review dimension is `reuse-and-simplicity`. For EVERY item this diff \
          ADDS -- function, struct, module, file, script, config key, flag -- state two things: \
          whether an existing item already covers it, and whether a smaller design would meet the \
@@ -3200,14 +2868,7 @@ fn build_reviewer_prompt(
          found` when you looked and there was nothing. Raise a finding ONLY for a duplication or \
          an oversized design you actually confirmed, never for a suspicion, and prefix its \
          `summary` with `reuse:` so it is recognisable when dispositions are applied.\n\n";
-    // #229/#232: earlier prompt text showed one example value per field and
-    // left the reviewer to guess the rest of the enum, which produced
-    // variants like `blocker` and `needs-confirmation` that a strict parser
-    // rejected outright. The contract now states the exact JSON shape, the
-    // field list, and every allowed value, so a model has no reason to
-    // invent one -- lenient parsing (`normalize_severity`/
-    // `normalize_disposition`) is a safety net for this prompt, not a
-    // substitute for it.
+    // State the exact JSON schema and allowed enum values so reviewer output remains parseable; lenient normalization is only a fallback. (#229, #232)
     Ok(format!(
         "{bound_notice}{delta_notice}{accepted_spec_notice}{reuse_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
@@ -3521,11 +3182,7 @@ fn run_independent_review(
         let current = load_pull_request(&repository, pr)?;
         let unchanged = current.head_ref_oid == package.head_sha;
         let recorded = records_evidence(&run, unchanged);
-        // #229/#232: attempt to parse whenever there is output at all, not
-        // only when this round will end up `recorded` -- a parse failure or
-        // a stale PR head must not silently discard whatever the reviewer
-        // actually reported, and either way the raw bytes get salvaged
-        // below.
+        // Parse any available reviewer output and salvage raw bytes on parse or freshness failure. (#229, #232)
         let parse_attempt = if run.dashboard_spawn {
             Ok(Vec::new())
         } else {
@@ -3593,20 +3250,13 @@ fn run_independent_review(
         return Ok(code);
     }
 
-    // #229/#232: the staleness fingerprint recomputed here is compared
-    // against `package.change_fingerprint`, which `package()` captured at
-    // the START of THIS run (immediately before dispatching the reviewer,
-    // above) -- never a fingerprint left over from an earlier attempt.
+    // Compare against the fingerprint captured at the start of this same review run, before dispatch. (#229, #232)
     let fingerprint_unchanged =
         verification::change_fingerprint(&state.repo)? == package.change_fingerprint;
     // `records_evidence` -- not dashboard-spawned, exit 0, fingerprint intact
     // -- is exactly "did this round actually complete a review".
     let recorded = records_evidence(&run, fingerprint_unchanged);
-    // Parse whenever there is reviewer output to look at, regardless of
-    // whether this round will end up `recorded`: a parse failure, a stale
-    // fingerprint, or a non-zero reviewer exit must never silently discard a
-    // reviewer's structured findings -- the raw output is salvaged below so
-    // the operator can recover them with `zirv workflow review add`.
+    // Parse reviewer output even when the run fails or is stale; salvage raw findings for manual recovery.
     let parse_attempt = if run.dashboard_spawn {
         Ok(Vec::new())
     } else {
@@ -3676,10 +3326,7 @@ fn run_independent_review(
         // happen on a converged round: convergence is a stopping rule, not a
         // skip. What changes is only whether another round is demanded.
         append_reviewer_findings(&mut state, incoming_findings)?;
-        // T2: snapshotted AFTER the merge above, so a later round's
-        // `delta_existing_findings` compares against every finding this
-        // round actually ended with -- including the ones this very
-        // reviewer just added -- not a stale pre-merge view.
+        // Snapshot findings after merging this reviewer’s results so the next delta sees every finding from this round.
         let finding_dispositions = state
             .review_findings
             .iter()
@@ -3732,8 +3379,7 @@ fn run_independent_review(
             review_round: package.review_round,
             completed_at: now_secs(),
             head_sha: Some(package.head_sha.clone()),
-            // T4: the worktree this local package computed at packaging
-            // time, always `Some` for a local (non-PR) package.
+            // Use the tree captured when this local package was built, not a later worktree state.
             reviewed_tree_sha: package.reviewed_tree_sha.clone(),
             finding_dispositions,
             jev_dedup_converged_for,
@@ -3782,11 +3428,7 @@ fn run_independent_review(
         &event,
         &super::telemetry::TelemetryConfig::for_repo(&state.repo),
     );
-    // #229/#232: any round that did not end up `recorded` (a stale
-    // fingerprint or a non-zero reviewer exit -- dashboard spawns already
-    // returned their own message above) is explained to the operator with
-    // the salvage path, rather than a bare reviewer exit code and no trace
-    // of what the reviewer actually reported.
+    // Explain every unrecorded round with its salvage path so findings remain recoverable. (#229, #232)
     if !run.dashboard_spawn && !recorded {
         let reason = if !fingerprint_unchanged {
             "the change set changed during review; review evidence was not recorded".to_string()
@@ -3798,19 +3440,7 @@ fn run_independent_review(
     Ok(round_exit_code(&outcome, code))
 }
 
-/// `zirv workflow review record` (issue #685): registers a completed
-/// independent review that happened on the native subagent tool rather than
-/// one this process itself launched via `review run` -- the path a
-/// same-harness orchestrator seat needs, since it is refused from `review
-/// run --agent <its own harness>` (`same_harness_refusal` in `ctx::agent`)
-/// and must instead delegate through the harness's own native subagent tool.
-///
-/// Reuses exactly the freshness rule the gate itself checks
-/// (`engine::advance`'s `review_evidence.iter().filter(|e|
-/// e.change_fingerprint == fingerprint)`): the pushed `ReviewRunEvidence`
-/// carries the SAME `verification::change_fingerprint` computation a `review
-/// run` package captures, so it counts toward the required run count under
-/// precisely the same staleness rule.
+/// Record native subagent review with the same change fingerprint the independent review gate checks. (#685)
 fn record_independent_review(args: &RecordReviewArgs, writer: &mut impl Write) -> CtxResult<i32> {
     let (state_dir, mut state) = state_and_repo(args.repo.as_deref(), &args.workflow_id)?;
     if required_independent_reviews_for(&state) == 0 {

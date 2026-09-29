@@ -30,23 +30,7 @@ const FIX: &str = "classify the new key: add its dotted path to config.rs's REPO
 const ORIGIN: &str = "untrusted-config posture (CLAUDE.md: repo-owned surfaces may only narrow) \
      was a checklist item, not a check -- issue #276";
 
-/// Dotted `ctx.toml` key paths a repository checkout MAY set. Two different
-/// reasons land a key here, and both are safe for the identical reason a
-/// `REPO_FORBIDDEN` key is refused -- the repo cannot widen zirv's OWN
-/// authority over the machine/process it did not already have:
-///
-/// - an explicit narrow-only fold (`config.rs`'s own doc comment on the
-///   field documents the fold: a repo may disable a feature, lower a
-///   ceiling, or tighten a stance, never the reverse); or
-/// - a plain preference/timing/budget knob with no capability behind it at
-///   all (how long to wait, how many entries to keep, how sensitive a
-///   scoring threshold is) -- repo-settable by original design, not merely
-///   overlooked.
-///
-/// Every entry below is reviewed alongside the PR that adds it; a new key
-/// landing in `config.rs`'s `ENV_MAP` with neither an explicit narrow-only
-/// fold nor a plain-preference justification belongs in `REPO_FORBIDDEN`
-/// instead, not here.
+/// Repository-settable keys either narrow authority or control preferences without capabilities. A new key without one of those properties belongs in `REPO_FORBIDDEN`.
 pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // Narrow-only folds (config.rs's own doc comment on each field states
     // the fold in full):
@@ -54,18 +38,12 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "supervise.orchestrator_writes", // repo may only tighten allow -> advise -> deny.
     "fallback.adaptive_delegation", // repo may only disable, per its own doc comment.
     "fallback.auto_orchestrator_rollover", // same AND-fold as adaptive_delegation.
-    // Issue #455: the same AND-fold again -- a repo may switch the
-    // route-health breaker off, never on for an operator who disabled it.
-    // Its three timing knobs (`open_after_failures`, `window_secs`,
-    // `cooldown_secs`) are `REPO_FORBIDDEN` outright.
+    // A repository may disable route health, never enable it against operator policy; its timing controls are operator-only. (#455)
     "fallback.health.enabled",
     // The scope-creep guard: a repo may switch it off, never on for an
     // operator who disabled it (`narrow_scope_guard_enabled`).
     "scope_guard.enabled",
-    // Issue #466: a repo may request `mask` (narrower: strips the retained
-    // domain hint), never force the operator's `mask` back to `keep`. See
-    // config.rs's fold right beside `obfuscate.literals_file`'s own
-    // `REPO_FORBIDDEN` row.
+    // A repository may request the narrower `mask`, never restore `keep` against operator policy. (#466)
     "obfuscate.email_domain",
     // `chat.model` is deliberately not `REPO_FORBIDDEN` (see [[Untrusted
     // Configuration]] / README.md's own trust-boundary intro): the one model
@@ -116,15 +94,12 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "supervise.poll_ms",
     "worker.deny_network", // narrow-only fold: repo may only turn network OFF.
     "worker.max_depth",    // narrow-only fold: repo may only lower the depth cap.
-    // Issue #718: min-fold like `worker.max_depth` -- a repo may only shrink
-    // the warm worktree pool or expire it sooner.
+    // Repository values may only shrink the warm worktree pool or expire it sooner. (#718)
     "worktree.idle_pool_max",
     "worktree.idle_ttl_secs",
     "wrap.debounce_ms",
     "wrap.inject_timeout_ms",
-    // Issue #539 fix round: narrow-only fold (`narrow_skill_index_bool`) --
-    // repo may only turn the standing skill index off, never force it back
-    // on for an operator who disabled it.
+    // Repository values may disable the standing skill index, never enable it against operator policy. (#539)
     "prompt.skill_index",
     // #753: narrow-only fold (`narrow_intake_discipline_bool`) -- repo may
     // only turn the first-prompt discipline note off.
@@ -292,14 +267,7 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     }
 }
 
-/// Whether `path` (an `ENV_MAP` entry's dotted key, e.g. `"review.claude"`)
-/// is covered by `forbidden` (the dotted `REPO_FORBIDDEN` paths) -- either
-/// exactly, or because `REPO_FORBIDDEN` names an ancestor TABLE rather than
-/// the leaf (`config.rs`'s own comment on `(&["review"], ...)`: "`value_at`
-/// matches a table node the same way it matches a leaf ... this one entry
-/// blocks both `review.claude` and `review.codex` together"). Component-wise
-/// (splits on `.`), not a raw string prefix, so `"reviewer"` is never
-/// wrongly covered by a `"review"` entry.
+/// Match forbidden dotted paths by components, including ancestor tables, so `review` covers `review.claude` but not `reviewer`.
 fn is_repo_forbidden(path: &str, forbidden: &BTreeSet<&str>) -> bool {
     if forbidden.contains(path) {
         return true;

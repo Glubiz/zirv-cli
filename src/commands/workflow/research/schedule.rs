@@ -127,14 +127,7 @@ pub(crate) fn warmup_trial(candidate: &str, arm: Arm, task: &str, split: Split) 
     }
 }
 
-/// The base cohort key, plus (issue #804) the observation's own corpus task
-/// `class` appended when `manifest.stratify = "class"` -- cohorts are never
-/// pooled, so a routing/gate change that helps `bounded` work while hurting
-/// `architecture` work is reported as two separate verdicts, not averaged
-/// into one misleading one. `task_class` is `None` only when `stratify =
-/// "class"` and the task is missing from the loaded corpus (should not
-/// happen in practice; falls back to an explicit `unknown` bucket rather
-/// than silently reusing another class's cohort).
+/// Append task class to cohort keys when stratifying; missing tasks use an explicit unknown class, never another cohort. (#804)
 pub(crate) fn cohort_key(manifest: &Manifest, task_class: Option<&str>) -> String {
     let base = format!(
         "{}:{}:{}:{}",
@@ -453,16 +446,7 @@ pub(crate) fn dispatch_batch(
                 let Some(pending_trial) = queue.pop_front() else {
                     break;
                 };
-                // Re-hash protected files before every single trial dispatch
-                // (issue-review finding R1), not just at stage boundaries:
-                // a concurrent batch's trials can run for a long time, and
-                // tampering mid-stage must be caught before the *next*
-                // trial goes out, not only after the whole stage finishes
-                // and a verdict has already been computed. On drift this
-                // appends `campaign_stopped { evaluator_tampered }` and
-                // returns `Err`, which aborts this batch (and, via `?` at
-                // every call site, the whole campaign) before this trial --
-                // or any trial after it -- is ever spawned.
+                // Re-hash protected files before every dispatch, including within concurrent batches; drift stops the campaign before another trial starts.
                 if let Err(err) = ensure_no_drift(&repo, &state.lock, &mut state.ledger) {
                     dispatch_err = Some(err);
                     break 'outer;

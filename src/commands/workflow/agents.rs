@@ -41,12 +41,7 @@ impl std::fmt::Display for ModelTier {
     }
 }
 
-/// A skill this seat should be handed for its task, by id (and optionally a
-/// pinned version) -- never inline instruction text. Issue #541 decision 4:
-/// a manifest composes skills rather than cloning their bodies, so a skill
-/// update reaches every manifest that references it instead of drifting
-/// copy by copy. [`AgentRegistry::validate_against`] is the one place an
-/// unknown or version-mismatched reference is refused.
+/// Reference skills by id and optional version so manifests receive skill updates; reject unknown or mismatched references at registry validation. (#541)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRef {
@@ -73,17 +68,10 @@ pub struct AgentManifest {
     pub optional_capabilities: Vec<CapabilityId>,
     pub context_budget_bytes: usize,
     pub instructions: String,
-    /// The closed native team role this seat maps to (issue #541 decision
-    /// 3). Explicit for every built-in; `None` for an operator/repository
-    /// manifest predating this field or one that simply trusts the derived
-    /// mapping -- see [`team_role_for`]. A manifest is never itself an
-    /// authority grant: `team_role`'s [`Authority`](crate::commands::ctx::
-    /// team::Authority) still has to agree with `read_only`
-    /// ([`AgentManifest::validate`]).
+    /// A manifest never grants authority: the native team role must agree with `read_only`; absent roles derive from that flag. (#541)
     #[serde(default)]
     pub team_role: Option<TeamRole>,
-    /// Skills this seat should be handed for its task, composed rather than
-    /// duplicated into `instructions` (issue #541 decision 4).
+    /// Compose skill references instead of copying their instructions into the manifest. (#541)
     #[serde(default)]
     pub skills: Vec<SkillRef>,
 }
@@ -168,12 +156,7 @@ impl AgentManifest {
                 .into());
             }
         }
-        // Issue #541 decision 3: a manifest's `team_role` is never allowed to
-        // disagree with its own `read_only` flag -- the two authority
-        // stories (the harness dispatch layer, and the closed native team's
-        // `Authority`) must agree, or a plan could claim a role's write
-        // authority for a seat the harness dispatcher would run read-only,
-        // or vice versa.
+        // The harness write posture and native team authority must agree, or a seat could claim access the dispatcher denies. (#541)
         if let Some(team_role) = self.team_role {
             let authority = team_role.authority();
             if authority.may_write == self.read_only {
@@ -212,12 +195,7 @@ impl AgentManifest {
     }
 }
 
-/// The closed native team role a manifest maps to (issue #541 decision 3).
-/// An explicit `team_role` always wins; otherwise the role is derived from
-/// `read_only` alone -- `Researcher` (no write authority) for a read-only
-/// seat, `Implementer` (write authority) for a writable one. This is what
-/// lets an existing operator/repository manifest, written before this field
-/// existed, keep loading and dispatching exactly as before.
+/// An explicit role wins; absent roles derive from `read_only` so older manifests remain valid. (#541)
 pub fn team_role_for(manifest: &AgentManifest) -> TeamRole {
     manifest.team_role.unwrap_or(if manifest.read_only {
         TeamRole::Researcher
@@ -355,11 +333,7 @@ impl AgentRegistry {
         Ok(agent)
     }
 
-    /// Refuses any registered manifest that references an unknown skill id,
-    /// or a known id resolved to a version the manifest did not ask for
-    /// (issue #541 decision 4). Every built-in already satisfies this; the
-    /// check exists for operator/repository manifests, which can name a
-    /// skill that does not exist in a given registry composition.
+    /// Reject unknown or version-mismatched skill references from operator and repository manifests. (#541)
     pub fn validate_against(&self, skills: &SkillRegistry) -> CtxResult<()> {
         for agent in self.agents.values() {
             for skill_ref in &agent.manifest.skills {
@@ -793,10 +767,7 @@ fn registry(repo: Option<&Path>, built_in_only: bool) -> CtxResult<(PathBuf, Age
     Ok((repo, registry))
 }
 
-/// The `zirv workflow agent list --json`-equivalent text table: id, version,
-/// team role, model tier, write posture, provenance. Issue #541 chunk C:
-/// the native `/agents` slash command calls this SAME function so the two
-/// surfaces render from one table, never two.
+/// The native `/agents` command and CLI share this table so their seat descriptions agree. (#541)
 pub(crate) fn write_agent_table(
     registry: &AgentRegistry,
     writer: &mut impl Write,
@@ -899,10 +870,7 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
             for warning in registry.warnings() {
                 crate::output::warn(warning);
             }
-            // Issue #466: the one prompt this dispatch composes, protected
-            // before it reaches either launch path below -- the native
-            // seat's helper call and the legacy adapter's `dispatch_agent`
-            // both go straight to a model.
+            // Protect the composed prompt before either native or legacy launch path sends it to a model. (#466)
             let dispatch_env = crate::commands::ctx::config::env_from_process();
             let prompt = crate::commands::ctx::obfuscate_store::protect_text_with_env(
                 &repo,
@@ -941,15 +909,7 @@ pub fn run(args: &AgentArgs, writer: &mut impl Write) -> CtxResult<i32> {
     }
 }
 
-/// Runs one built-in seat on zirv's own runtime (issue #484, roadmap N15).
-///
-/// The seat manifest reaches the model as the helper call's instructions, and
-/// the seat's own `read_only` flag is honoured by the mechanism rather than by
-/// the prompt: the helper service holds no writer permit at all, so the
-/// execution broker refuses every mutating effect. A WRITABLE seat is
-/// therefore refused here outright rather than quietly dispatched read-only --
-/// promising a seat write access it does not have would be worse than saying
-/// so.
+/// Runs a built-in seat on zirv’s runtime. The broker has no writer permit, so writable seats must be refused rather than silently reduced to read-only. (#484)
 fn dispatch_native_seat(
     repo: &Path,
     route: &str,

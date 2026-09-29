@@ -252,10 +252,7 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
         }
     }
 
-    // Issue #804: a stage's own `classes` filter (if any) narrows which
-    // tasks of its split actually run -- the same
-    // `tasks_for_split_and_classes` the runner itself dispatches from, so
-    // this preview and the real schedule can never disagree.
+    // Preview uses the same class-filtered tasks as dispatch so schedules agree. (#804)
     let class_filtered_count = |split: manifest::Split, classes: &[String]| -> usize {
         loaded_corpus
             .as_ref()
@@ -302,13 +299,7 @@ pub fn plan(manifest_path: &Path, repo: &Path) -> CtxResult<PlanReport> {
         && worst_case_calls <= manifest.budgets.max_calls
         && worst_case_trials as u64 <= manifest.budgets.max_trials;
 
-    // Issue #802/#804: a stage that can never produce `criteria.min_pairs`
-    // pairs can never promote a candidate at all -- `evaluate_cohort`
-    // returns Inconclusive below that floor, forever, on every run. Catch
-    // it at plan time rather than after real trials have already spent
-    // money. With `stratify = "class"`, the gate never pools cohorts, so
-    // the binding constraint is the SMALLEST class's own pair count, not
-    // the stage's total.
+    // Reject a stage that cannot reach `min_pairs` before trials run; class stratification uses the smallest cohort. (#802, #804)
     let min_pairs = manifest.criteria.min_pairs;
     for (label, split, classes, reps) in [
         (

@@ -810,11 +810,7 @@ const BROWSER_PATH_CANDIDATES: [&str; 6] = [
     "msedge",
 ];
 
-/// Issue #678: on macOS a Chrome/Chromium/Edge install is an app bundle, not
-/// a `PATH` entry, so PATH-name discovery alone never finds it. This probes
-/// the standard bundle executable paths under `/Applications` and
-/// `$HOME/Applications`, the two locations a normal (non-Homebrew) install
-/// uses.
+/// macOS browser installations are app bundles outside PATH; probe standard system and user application paths. (#678)
 #[cfg(target_os = "macos")]
 fn macos_bundle_candidates() -> Vec<String> {
     const BUNDLES: [(&str, &str); 3] = [
@@ -845,11 +841,7 @@ fn macos_bundle_candidates() -> Vec<String> {
     Vec::new()
 }
 
-/// Issue #678: on Windows a Chrome/Edge install is an ordinary file under
-/// `Program Files`, `Program Files (x86)`, or a per-user `%LocalAppData%` --
-/// not a `PATH` entry unless the installer happened to add one, which most
-/// don't. This probes the standard per-browser install path under each of
-/// those three roots.
+/// Windows browsers often live under Program Files or LocalAppData outside PATH; probe those install roots. (#678)
 #[cfg(target_os = "windows")]
 fn windows_bundle_candidates() -> Vec<String> {
     const RELATIVE: [&str; 2] = [
@@ -878,26 +870,9 @@ pub(crate) fn discover_browser() -> Option<String> {
     discover_browser_verbose().0
 }
 
-/// A launch-free counterpart to [`discover_browser`]: the first candidate
-/// that EXISTS on disk (a `PATH` entry or a known bundle path), with no
-/// attempt to launch it. `capabilities::discover`'s Browser/`FrontendRender`
-/// gate check used `discover_browser` directly, which spends up to
-/// `probe_browser_launch`'s own timeout PER installed candidate; on a
-/// machine where `--headless ... --version` does not exit promptly (a real
-/// Chrome/Edge install can spend most of a minute tearing its own process
-/// tree back down rather than the few hundred ms the flag combination
-/// promises), `zirv workflow start`'s capability check measured ~15s of
-/// idle wall time for this alone -- and `discover()` called it twice.
-/// `capabilities::discover` now uses this instead, reporting
-/// [`super::capability::IntegrationStatus::unverified`] rather than
-/// `available` -- the exact same "configured/present but not contacted this
-/// run" honesty that row already gives a configured MCP server, never
-/// claiming a launch that was never attempted actually works. The real
-/// capture path (anything that would actually open a page) still resolves
-/// through `discover_browser`/a direct launch of its own binary, so a
-/// browser that is present but broken is still caught the moment something
-/// tries to render, just not at every workflow-start gate check.
+/// Capability discovery checks browser presence without launching it; real capture still probes launchability, and presence alone is reported unverified.
 pub(crate) fn browser_present() -> Option<String> {
+    // Launching a real Chrome/Edge with `--headless --version` can take tens of seconds to exit, per candidate, on every workflow-start capability check.
     machine_browser_candidates().into_iter().find(|candidate| {
         if candidate.contains('/') || candidate.contains('\\') {
             Path::new(candidate).is_file()
@@ -919,13 +894,7 @@ fn machine_browser_candidates() -> Vec<String> {
     candidates
 }
 
-/// Probes `candidates` in order and returns the first that launches
-/// headless, plus every candidate that was actually present but failed the
-/// headless launch probe (issue #676: an Ubuntu snap `chromium` stub exits
-/// non-zero for every headless run while `google-chrome` on the same `PATH`
-/// works). A candidate that is simply absent is not reported here -- only
-/// one that exists and could not launch, so a render report names the stub
-/// that was skipped rather than every browser this machine does not have.
+/// Probe candidates in order and report only present binaries that failed launch, so a broken stub does not hide a working browser. (#676)
 fn discover_browser_among(
     candidates: impl IntoIterator<Item = String>,
 ) -> (Option<String>, Vec<String>) {
@@ -940,15 +909,7 @@ fn discover_browser_among(
     (None, skipped)
 }
 
-/// The browser `discover_browser` would choose, plus every candidate that
-/// was actually present but failed the headless launch probe. Gated to never
-/// probe in a unit-test executable (mirrors `ctx::runtime::native_available`'s
-/// `cfg!(test)` gate): every capability report a test builds with the
-/// default config reaches `browser_binary` (`ctx/runtime/capabilities.rs`),
-/// which used to fall through to this probe and launch the operator's real
-/// Chrome from `/Applications` on every test run, bouncing the Dock icon.
-/// Tests that need the real probe call `discover_browser_among` directly
-/// with explicit candidates.
+/// Skip real browser probes in unit-test executables; tests needing one pass explicit candidates.
 fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
     if cfg!(test) {
         return (None, Vec::new());
@@ -956,13 +917,7 @@ fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
     discover_browser_among(machine_browser_candidates())
 }
 
-/// A disposable Chrome/Chromium `--user-data-dir`, hand-rolled under
-/// `std::env::temp_dir()` -- the same one-off-unique-path pattern
-/// `review.rs`'s `IndexTempPath` already uses -- rather than the dev-only
-/// `tempfile` crate, since this runs in production. Removed on drop, so
-/// every caller (the discovery probe, the real capture launch, and
-/// `ChromiumRunner`) is cleaned up on every exit path, including a
-/// timeout-kill, without repeating the cleanup at each call site.
+/// Remove each disposable browser profile on drop, including timeout paths; production cannot depend on dev-only `tempfile`.
 pub(crate) struct BrowserProfileDir(PathBuf);
 
 impl BrowserProfileDir {
@@ -1448,13 +1403,10 @@ pub fn review(state: &StateDir, repo: &Path, args: &VisualReviewArgs) -> CtxResu
     let workflow = super::engine::load_active(state, &repo)?;
     let workflow_id = workflow.as_ref().map(|state| state.id.clone());
     let round = review_round(state, &repo, workflow_id.as_deref(), fingerprint)?;
-    // Issue #484: an unrecognised `--runtime` is an error, never a silent fall
-    // back to the harness.
+    // Reject an unknown runtime instead of silently selecting the harness. (#484)
     let runtime = crate::commands::ctx::runtime::selected(&args.runtime)?;
     let agent = if runtime == crate::commands::ctx::runtime::RuntimeKind::Native {
-        // A native reviewer names a provider ROUTE, not an installed adapter,
-        // so there is nothing on PATH to select from. The reserved value
-        // `native` defers to the operator's `[roles]` entry.
+        // Native review selects an operator-configured provider route, not a PATH adapter.
         args.agent.clone().unwrap_or_else(|| {
             crate::commands::ctx::runtime::RuntimeKind::Native
                 .as_str()

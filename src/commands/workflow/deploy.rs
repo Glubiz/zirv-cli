@@ -35,20 +35,9 @@ impl std::fmt::Display for DeployTier {
     }
 }
 
-/// H-8: a repository `.zirv/ctx.toml` that trips a `REPO_FORBIDDEN` key hard-
-/// errors `CtxConfig::load` -- mirrors `mod.rs`'s own `repo_gates`, which
-/// deliberately fails closed on exactly this shape (an unreadable config
-/// disables repo-provided skills/checks) rather than propagating the error
-/// and hard-failing every `workflow advance/approve/resume/start`.
-/// `Development` (the type's own `#[default]`) is the least-strict tier --
-/// degrading to it, rather than escalating, is the fail-closed direction
-/// here: an unreadable config can never be a repository's own way to widen
-/// what an operator's own declared tier requires, but this module's whole
-/// point is that a repository cannot ratchet the deploy tier down either, so
-/// the safe move on "I cannot tell what the operator's tier is" is the
-/// default the operator never configured, not an error that blocks the
-/// workflow command outright.
+/// Unreadable config provides no trusted tier; announce the error and use the unconfigured Development default so workflow commands remain available.
 pub fn effective_tier(repo: &Path) -> CtxResult<DeployTier> {
+    // A REPO_FORBIDDEN key hard-errors CtxConfig::load; degrade like mod.rs's repo_gates instead of failing every workflow advance/approve/resume/start. (H-8)
     match crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok()) {
         Ok(cfg) => Ok(cfg.workflow.deploy.tier),
         Err(error) => {

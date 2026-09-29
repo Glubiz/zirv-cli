@@ -32,7 +32,6 @@ const FIXED_SAFETY_JEV_GATES: &[&str] = &[
 const FIXED_SAFETY_SUBSTRINGS: &[&str] =
     &["PERMISSION", "SANDBOX", "SAFETY", "CREDENTIAL", "BASE_URL"];
 
-/// Jev boolean gates a candidate may tune (issue #803's tunable sites).
 const JEV_BOOL_GATES: &[&str] = &[
     "MEMORY",
     "SUPERVISOR",
@@ -48,9 +47,7 @@ const JEV_BOOL_GATES: &[&str] = &[
     "LAUNCH_EFFORT",
 ];
 
-/// Sites with a tunable `min_confidence`/`min_margin` floor -- a subset of
-/// `JEV_BOOL_GATES` (no floor for `supervisor`, `intake_savings`, or
-/// `review_reuse`).
+/// Only these sites accept a tunable confidence or margin floor.
 const JEV_FLOOR_SITES: &[&str] = &[
     "MEMORY",
     "CONTEXT",
@@ -282,15 +279,7 @@ pub const HARD_DENY_PATCH_PATTERNS: &[&str] = &[
     "src/commands/ctx/price.rs",
 ];
 
-/// `pattern` matches `path` exactly, or (for a `dir/**` pattern) `path` is
-/// `dir` itself or lives under it. Both sides are normalized to forward
-/// slashes first so a Windows-style numstat path still matches a Unix-style
-/// glob, and case-folded so a case-insensitive filesystem (Windows, default
-/// macOS) can never be used to slip a path past `HARD_DENY_PATCH_PATTERNS`
-/// or the protected-evaluator set by spelling it with different case (e.g.
-/// `src/commands/ctx/Safety.rs`) -- `allowed_paths` membership is folded the
-/// same way for consistency, so a differently-cased but genuinely in-scope
-/// path is never spuriously rejected either.
+/// Normalize separators and case for path checks so platform spelling cannot bypass protected or allowed paths.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.replace('\\', "/").to_lowercase();
     let path = path.replace('\\', "/").to_lowercase();
@@ -461,9 +450,7 @@ pub fn detect_drift(repo: &Path, expected: &BTreeMap<String, String>) -> Vec<Str
     drifted
 }
 
-/// Compiled-in protected defaults, resolved relative to `benchmark_dir`
-/// (the corpus file's parent directory) -- issue #801's evaluator set,
-/// beyond whatever the manifest itself declares in `evaluator.protected`.
+/// Compiled-in evaluator files protected relative to the corpus directory. (#801)
 pub fn compiled_protected_defaults(benchmark_dir: &Path) -> Vec<PathBuf> {
     ["run.py", "grade.py", "quality_rubric.md"]
         .iter()

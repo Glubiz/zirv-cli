@@ -113,13 +113,7 @@ pub struct TeamPlan {
 }
 
 impl TeamPlan {
-    /// Every seat id `seat_id` transitively depends on, issue #541 chunk C
-    /// review finding: an ancestor in the dependency graph is a HAND-OFF
-    /// the plan already accounts for, never a claim conflict, however wide
-    /// its own claim is -- `delegation::delegate`'s claim-overlap check
-    /// excludes exactly this set. `seat_id` naming no seat in this plan (or
-    /// a seat with no `depends_on`) returns an empty set -- never an error,
-    /// since the caller already knows whether a seat matched before asking.
+    /// Transitive dependency ancestors are handoffs, never claim conflicts; an unknown seat yields an empty set. (#541)
     pub fn ancestors_of(&self, seat_id: &str) -> std::collections::BTreeSet<&str> {
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         let mut stack: Vec<&str> = self
@@ -185,13 +179,7 @@ fn specialist_for(tag: WorkDomainTag) -> Option<(&'static str, &'static str, &'s
             "changed operational paths + verification evidence",
             true,
         )),
-        // Security is covered by `ValidationProfile::security_review`
-        // (`profile::ExecutionProfile::derive` already sets it whenever the
-        // Security domain tag is present), so it never needs a second,
-        // duplicate specialist-selection path here. Frontend and
-        // Architecture have no distinct manifest of their own: Frontend
-        // work is implemented by the ordinary `implementer` seat(s), and
-        // Architecture is handled by the `architect` seat added below.
+        // Security uses the profile review flag; frontend uses implementers and architecture uses the architect seat.
         WorkDomainTag::Security
         | WorkDomainTag::Frontend
         | WorkDomainTag::Architecture
@@ -318,11 +306,7 @@ fn claim_groups_from_paths(paths: &[String], max_fan_out: usize) -> Vec<Vec<Stri
     groups
 }
 
-/// The claim groups this Orchestrated implementer split actually uses: real
-/// path-boundary groups from [`Classification::changed_paths`] when the
-/// classification carries them, else the count-based bucket
-/// [`implementer_seat_count`] always could (issue #541 chunk C, decision 3
-/// -- resolves chunk B's "deferred: real per-path claim splitting").
+/// Use real changed-path groups when available, otherwise count-based implementer buckets. (#541)
 fn claim_groups_for(classification: &Classification, max_fan_out: usize) -> Vec<Vec<String>> {
     let real = claim_groups_from_paths(&classification.changed_paths, max_fan_out);
     if !real.is_empty() {
@@ -971,11 +955,7 @@ fn default_route_eligibility(repo: &Path) -> Box<dyn Fn(TeamRole) -> Result<(), 
     })
 }
 
-/// Compiles the team plan for `objective` -- proportionally, or (with
-/// `seat`) a single explicit manifest -- without persisting it. Issue #541
-/// chunk C: shared by the native `team_plan` tool and the native pane's
-/// `/team plan`/`/agent` slash commands, so the two never grow independent
-/// copies of "classify, derive the profile, load the registry, compile".
+/// Share classification, profile and team compilation across the native tool and pane commands. (#541)
 pub fn compile_for_objective(
     repo: &Path,
     home: Option<&Path>,
@@ -1023,9 +1003,7 @@ pub fn compile_for_objective(
     })
 }
 
-/// Persists `plan`: the active workflow owns it when one exists for this
-/// repository, else the coordinator record does (issue #541 chunk C,
-/// decision 1). Shared for the same reason [`compile_for_objective`] is.
+/// Persist under the active workflow when present, otherwise under the coordinator record. (#541)
 pub fn store_plan(
     state: &crate::commands::ctx::state::StateDir,
     repo: &Path,
@@ -1240,10 +1218,7 @@ fn run_show(args: &TeamShowArgs, writer: &mut impl Write) -> CtxResult<i32> {
     Ok(0)
 }
 
-/// Issue #541 chunk C: the native `/team` slash command calls this SAME
-/// function (`dash::native_ux::render_team_plan`) so the headless
-/// `zirv workflow team show|plan` text and the native pane's view are one
-/// rendering, never two.
+/// Share one renderer between headless team commands and the native pane. (#541)
 pub(crate) fn print_plan_text(plan: &TeamPlan, writer: &mut impl Write) -> CtxResult<()> {
     writeln!(
         writer,

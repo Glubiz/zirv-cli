@@ -330,8 +330,7 @@ pub(super) fn report_registry_warnings(
     }
 }
 
-/// The layered [`crate::commands::workflow::registry::WorkflowRegistry`] for `repo`: built-ins,
-/// plus operator-global/repository packs unless `built_in_only`. Issue #542.
+/// Load the layered registry for this repository, with optional built-in-only mode. (#542)
 pub(crate) fn load_workflow_registry(
     repo: &Path,
     built_in_only: bool,
@@ -345,9 +344,7 @@ pub(crate) fn load_workflow_registry(
     )
 }
 
-/// The plain-text rendering `workflow list` prints without `--json` --
-/// shared verbatim with the native `/workflows` slash command (issue #542
-/// chunk 3b, decision 5) so the two surfaces can never drift apart.
+/// Share one plain-text workflow list between the CLI and native slash command. (#542)
 pub(crate) fn write_registry_list(
     writer: &mut impl Write,
     entries: &[&crate::commands::workflow::registry::RegisteredWorkflow],
@@ -405,10 +402,7 @@ pub(crate) fn write_registry_entry(
     Ok(())
 }
 
-/// The rendering `workflow start` prints (JSON or text) for a [`StartOutcome`]
-/// -- shared verbatim with the native `/workflow <id>` slash command's start
-/// path (issue #542 chunk 3b, decision 5) so the two surfaces can never
-/// drift apart.
+/// Share one start-result renderer between the CLI and native slash command. (#542)
 pub(crate) fn write_start_outcome(
     writer: &mut impl Write,
     outcome: &StartOutcome,
@@ -429,23 +423,14 @@ pub(crate) fn write_start_outcome(
             serde_json::to_writer_pretty(&mut *writer, &value)?;
             writeln!(writer)?;
         }
-        // Issue #542 review nit: `write_state` itself now prints "selected:
-        // ..." from `state.selection` (persisted alongside it, above), so
-        // this no longer needs its own separate print -- `outcome.state.
-        // selection` is set from this same `outcome.selection` value.
+        // `write_state` already prints persisted selection, so avoid a duplicate line. (#542)
         (Some(_), false) => write_state(writer, &outcome.state, false)?,
         (None, json) => write_state(writer, &outcome.state, json)?,
     }
     Ok(())
 }
 
-/// A pinned [`DefinitionRef`] resolved from `state`, one line for the
-/// terminal reader plus, when the registry's current copy of that id no
-/// longer hashes the same (or the id has vanished entirely), an explicit
-/// drift note -- decision #6 of issue #542's chunks 1+2. Best-effort: a
-/// registry that fails to load (an unusual environment problem, not the
-/// workflow's own concern) is silently treated as "cannot check drift"
-/// rather than failing `zirv workflow status` outright.
+/// Show the pinned definition and any registry drift; registry read failures do not break status. (#542)
 pub(crate) fn write_definition_status(
     writer: &mut impl Write,
     state: &WorkflowState,
@@ -500,50 +485,7 @@ pub(crate) fn resolve_state() -> CtxResult<StateDir> {
     StateDir::resolve(&|key| std::env::var(key).ok())
 }
 
-/// Runs the evidence command a `Test`/`Verify` step itself requires --
-/// `zirv test changed` for `Test`, `zirv verify` for `Verify` -- through the
-/// same in-process function the CLI verb itself calls (never a subprocess),
-/// printing its evidence summary to `writer`. Returns the resolved
-/// [`crate::commands::workflow::verification::GateOutcome`]. Backs `zirv workflow advance
-/// --run-checks`, which collapses "run the gate, then advance" into a single
-/// call. Any other phase is not something `--run-checks` knows how to
-/// satisfy, so it errors rather than silently treating the step as passed.
-///
-/// Issue #287: before running anything, checks whether the worktree is
-/// byte-identical to the fingerprint recorded by this step's own previous
-/// *failing* report ([`crate::commands::workflow::verification::last_failure_fingerprint`]) --
-/// a no-op turn since that attempt can only reach the same verdict, so no
-/// check is executed at all and `GateOutcome::Unchanged` is returned
-/// directly.
-///
-/// Otherwise, pass/fail is decided by
-/// [`crate::commands::workflow::verification::latest_is_fresh_and_passing`] against the report
-/// the run just persisted -- the exact same baseline-aware gate the plain
-/// `zirv workflow advance --outcome success` path applies to a report from
-/// an out-of-process `zirv test changed`/`zirv verify` run (see the
-/// `Test`/`Verify` arm of `advance_with_evidence`). `run_test`/`run_verify`'s
-/// own raw exit code is deliberately not used here: it reflects the run's
-/// unwaived pass/fail, so a report whose only failures are covered by the
-/// operator's recorded baseline (`zirv test baseline`) exits non-zero even
-/// though the same report satisfies the gate -- see the dogfooding bug where
-/// `--run-checks` printed "checks failed" immediately before a follow-up
-/// `--outcome success` against the identical report advanced with the
-/// baseline warning. Collapsed to `GateOutcome::Fail` here regardless of
-/// which of `Fail`/`Inconclusive` the report's own outcome would name -- the
-/// caller only ever distinguished pass from fail before this issue, and
-/// still only needs to distinguish `Unchanged` from everything else.
-///
-/// Before running, and again after, this snapshots
-/// [`crate::commands::workflow::verification::latest_report_id`] -- the persisted report's own
-/// identity (a fresh UUID every run). `run_and_persist` swallows a `persist`
-/// failure into a warning so the run's printed results survive a transient
-/// IO error, which means the report `latest_is_fresh_and_passing` would read
-/// afterwards can still be whatever older report preceded this run. If the
-/// identity did not change, no fresh report exists to gate on at all -- so
-/// this fails the step outright rather than falling back to evaluating that
-/// stale report (which could easily still be fresh-and-passing against the
-/// unchanged fingerprint, silently advancing a step whose check just
-/// genuinely failed).
+/// Run Test/Verify checks in process, skip unchanged failed worktrees, and gate only on a newly persisted report evaluated with the operator baseline. (#287)
 pub(super) fn run_required_checks(
     state_dir: &StateDir,
     repo: &Path,
@@ -604,6 +546,7 @@ pub(super) fn run_required_checks(
         _ => unreachable!("non-Test/Verify phases returned above"),
     };
     let after = crate::commands::workflow::verification::latest_report_id(state_dir, repo)?;
+    // run_and_persist turns a persist failure into a warning, so an unchanged report id means no fresh report exists; never gate on the stale one. (#287)
     if after == before {
         writeln!(
             writer,
@@ -611,6 +554,7 @@ pub(super) fn run_required_checks(
         )?;
         return Ok(crate::commands::workflow::verification::GateOutcome::Fail);
     }
+    // Gate on the baseline-aware freshness rule, not run_test/run_verify's raw exit code: baselined failures exit non-zero yet satisfy the gate. (#215)
     if crate::commands::workflow::verification::latest_is_fresh_and_passing(
         state_dir,
         repo,
@@ -623,25 +567,14 @@ pub(super) fn run_required_checks(
     }
 }
 
-/// This attempt's elapsed wall-clock, in milliseconds, since
-/// `state.phase_started_at` -- shared by `record_step_duration_ms` (a
-/// completed step) and, issue #699 Phase 0, by `advance_with_evidence`'s
-/// `Failure` arm (a failed attempt that will retry): `phase_started_at` is
-/// reset unconditionally after EVERY `advance_with_evidence` call,
-/// success or failure, so this is well-defined either way -- it names
-/// "since the step became current, or since the previous attempt was
-/// recorded", never a stale span.
+/// Measure each attempt since the step became current or the previous attempt reset its phase clock. (#699)
 pub(super) fn phase_elapsed_ms(state: &WorkflowState) -> u64 {
     now_secs()
         .saturating_sub(state.phase_started_at)
         .saturating_mul(1000)
 }
 
-/// Call before pushing `step_id` onto `completed_steps`, while
-/// `phase_started_at` still names its own start. Returns the elapsed
-/// milliseconds recorded, so a caller can also feed it (issue #699 Phase 0)
-/// to a telemetry event's `duration_ms` without a second, potentially
-/// inconsistent `now_secs()` read.
+/// Record duration before completing the step so telemetry reuses the same elapsed measurement. (#699)
 pub(super) fn record_step_duration_ms(state: &mut WorkflowState, step_id: &str) -> u64 {
     let elapsed_ms = phase_elapsed_ms(state);
     state
@@ -661,28 +594,13 @@ pub(super) fn format_wall_clock(ms: u64) -> String {
 pub(crate) struct AutoSpawn {
     pub phase: WorkflowPhase,
     pub argv: Vec<String>,
-    /// Review is read-only; Test and Verify need writing mode for build
-    /// artifacts and caches. Not yet consumed by `spawn_auto_worker`, which
-    /// launches zirv subprocesses directly rather than delegating workers.
+    /// Review is read-only; Test/Verify need writes for build artifacts and caches.
     pub mode: crate::commands::ctx::permit::WorkerMode,
-    /// Issue #264: the task class this auto-spawn's own work is, alongside
-    /// `mode` above -- for a future caller that threads it onto the
-    /// delegation this ultimately becomes (`zirv ctx agent --task-class`).
-    /// Not yet consumed by `spawn_auto_worker` itself (this call spawns a
-    /// `zirv workflow review run`/`test changed`/`verify` subprocess
-    /// directly, not `zirv ctx agent`), the same not-yet-wired parity `mode`
-    /// already holds for this exact call.
+    /// Task class for a future delegated auto-spawn; this subprocess path does not consume it. (#264)
     pub task_class: crate::commands::ctx::log::TaskClass,
 }
 
-/// Why a gate transition that WOULD otherwise be eligible (right phase,
-/// `Running`, enabled) did not produce an [`AutoSpawn`]. `Quiet` covers
-/// every case that is not worth an operator's attention: the config key is
-/// off, the phase is not Review/Test/Verify, or the workflow is
-/// `AwaitingApproval` -- an operator who never opted in, or a transition
-/// this feature was never meant to touch, must see nothing new. `NoPermit`/
-/// `NoAgent` are the opposite: the operator explicitly enabled this, so a
-/// skip is reported, not silent.
+/// Stay quiet when auto-spawn is disabled or ineligible; report missing permits or agents when the operator enabled it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoSpawnSkip {
     Quiet,
@@ -750,8 +668,7 @@ pub(crate) fn auto_spawn_decision(
         } else {
             crate::commands::ctx::permit::WorkerMode::Writing
         },
-        // Issue #264: Review is its own class; Test and Verify are both
-        // "did the checkout pass" work, so both map to `TaskClass::Test`.
+        // Review has its own task class; Test and Verify share `TaskClass::Test`. (#264)
         task_class: match phase {
             WorkflowPhase::Review => crate::commands::ctx::log::TaskClass::Review,
             WorkflowPhase::Test | WorkflowPhase::Verify => {
@@ -792,13 +709,7 @@ pub(super) fn announce_auto_spawn_skip(
     );
 }
 
-/// Issue #242: spawns `spawn.argv` detached and never fails `advance` --
-/// `test changed`/`verify`/`review run` govern no heavy-operation permit of
-/// their own, so this acquires one on their behalf and leaks it (the child
-/// outlives this call): `HeavyPermit::set_child_pid` plus `permit::live_
-/// records`' own dead-owner sweep is exactly the mechanism that frees the
-/// slot once the detached child exits, the same as a parent that dies while
-/// its child keeps running.
+/// Detach the child without failing advance; retain its heavy permit until the live-record sweep observes child exit. (#242)
 pub(super) fn spawn_auto_worker(
     state_dir: &StateDir,
     state: &WorkflowState,
@@ -932,11 +843,7 @@ pub(crate) fn write_state(
     } else {
         writeln!(writer, "workflow: {}", state.id)?;
         writeln!(writer, "kind: {}", state.kind.as_str())?;
-        // Issue #542 review nit: `state.selection` persists the deterministic
-        // selection that chose this run's pack (when one ran at all -- an
-        // explicit id at start never populates it), so `status` can explain
-        // why a pack was chosen without a separate `workflow classify` call
-        // against the same task text.
+        // Persisted selection explains the chosen pack in status. (#542)
         if let Some(selection) = &state.selection {
             writeln!(
                 writer,
@@ -985,19 +892,11 @@ pub(crate) fn write_state(
         {
             writeln!(writer, "risk measurement: unavailable ({reason})")?;
         }
-        // Issue #685: a gate-time reclassification (`reclassify_at_gate`)
-        // appends its own reason here, but this is the only text render that
-        // reads `classification.reasons` at all -- otherwise an operator's
-        // `--complexity`/`--risk` override at `workflow start` can be
-        // escalated by a later gate with no visible explanation short of
-        // `--json`.
+        // Show gate-time classification reasons so escalated risk is visible in text status. (#685)
         for reason in &state.classification.reasons {
             writeln!(writer, "- {reason}")?;
         }
-        // Issue #236: only meaningful when this workflow actually has an
-        // intent step -- `Review` never does, and a Feature/Bugfix/Refactor
-        // whose classification did not gate one in has nothing for the flag
-        // to select between.
+        // The intent-step flag matters only when this workflow has an intent step. (#236)
         if state
             .steps
             .iter()
@@ -1065,13 +964,7 @@ pub(super) fn active_workflow_displaced_note(
     )
 }
 
-/// Review finding: writes `note` to `writer` best-effort. By the time
-/// [`start_workflow`] reaches this, the new workflow is already saved --
-/// `eprintln!`/`crate::output::note` panic on a write error (a closed
-/// stderr, say), which would surface as a spurious failure of an already-
-/// successful start. Ignoring the `Result` here instead keeps this call
-/// site pure passthrough, the same posture `wrap.rs` holds its own
-/// supervision failures to.
+/// A status-note write failure must not turn an already-saved workflow start into a failure.
 pub(super) fn best_effort_write_displacement_note(mut writer: impl std::io::Write, note: &str) {
     let _ = writeln!(writer, "{note}");
 }
@@ -1089,10 +982,7 @@ pub(super) fn best_effort_write_displacement_note(mut writer: impl std::io::Writ
 /// either way.
 pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<StartOutcome> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    // Issue #542 chunk 3a decision 4: any registry id executes through this
-    // same path now, not just the five legacy kinds. `registry.get`'s own
-    // "unknown workflow '<id>'" phrasing matches `load`'s convention for an
-    // unknown STATE id.
+    // Resolve any registry id through the same start path; use the standard unknown-workflow wording. (#542)
     let registry = load_workflow_registry(&repo, args.built_in_only)?;
     report_registry_warnings(&registry);
     let inherited_agent = session_identity().map(|(_, adapter)| adapter);
@@ -1105,11 +995,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     // like `zirv workflow start bugfix`.
     let requested_id = args.id.as_deref().map(str::to_ascii_lowercase);
 
-    // Issue #542 chunk 3b: an explicit id always wins outright, no
-    // selection performed at all. Omitting it classifies first (intent
-    // inferred naturally, never forced to an explicit id's kind) and runs
-    // `select_definition` against that classification and the raw `--task`
-    // objective text.
+    // An explicit id wins; otherwise classify then select from the task objective. (#542)
     let explicit_kind_hint = requested_id.as_deref().and_then(WorkflowKind::from_pack_id);
     let classify_args = classify::ClassifyArgs {
         task: args.task.clone(),
@@ -1124,13 +1010,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         json: false,
     };
     let mut classification = classify::from_args(&classify_args)?;
-    // Issue #782: the same off-by-default Jev intent refinement `zirv
-    // workflow classify` runs, applied before `selection::select_definition`
-    // so a decisively replaced intent steers pack selection here too. No
-    // domain tags: `start_workflow` has no `ExecutionProfile` surface to add
-    // one to (see `profile::refine_intent_via_jev`'s own doc comment) -- a
-    // silent no-op unless `[jev] classify` is on and a credential is set, so
-    // this stays byte-identical to today either way.
+    // Refine intent before pack selection when enabled; start has no profile domain-tag surface. (#782)
     crate::commands::workflow::profile::refine_intent_via_jev(
         &repo,
         &args.task,
@@ -1181,10 +1061,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
             for skill in step_skill_ids(step, &classification) {
                 skills.ensure_supported(&skill, &report)?;
             }
-            // Issue #483: a workflow must not enter a step whose required
-            // integration is unavailable. The refusal names the missing
-            // binary or credential, here at start, rather than halfway
-            // through the step.
+            // Refuse unavailable required integrations before entering a step, naming what is missing. (#483)
             let frontend = classification.work_domain.domain == WorkDomain::Frontend;
             report
                 .admit(
@@ -1195,11 +1072,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
                 .map_err(|why| format!("step '{}': {why}", step.id))?;
         }
     }
-    // Issue #542 chunk 3a decision 1: every referenced agent role must
-    // resolve before any state is written -- independent of whether an
-    // execution adapter was even given (the capability-support loop above
-    // only runs `if let Some(agent) = ...`, so a plain existence check runs
-    // unconditionally here instead).
+    // Resolve every agent role before writing state, even when no execution adapter is configured. (#542)
     let agent_registry =
         AgentRegistry::load_for_repo(&repo, dirs::home_dir().as_deref(), !args.built_in_only)?;
     for step in &materialized {
@@ -1244,27 +1117,10 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     if let Some(frontend_root) = &args.frontend_root {
         state.frontend_target_root = Some(resolve_frontend_root(frontend_root)?);
     }
-    // F6 (blind-review finding, 2026-09-24): `zirv workflow start` used to
-    // pre-create the first artifact-bearing step's own unfilled template
-    // file here -- an untouched, empty-looking file a `git add .`/`git
-    // commit -a` downstream then swept in as a stray addition (16/20 runs
-    // in a blind review). Start now leaves the worktree and the git index
-    // exactly as they were: the path and the template text are still
-    // discoverable (`render_current_context`, used by `zirv workflow
-    // status`/`context`, prints both for a step whose artifact does not
-    // exist yet), and the agent creates the real file itself when it fills
-    // it in. `pin_current_artifact_with_config` (the approval path) already
-    // treats a still-missing file exactly like an untouched template.
+    // Starting a workflow must never pre-create an unfilled artifact or mutate the worktree/index; context still exposes its path and template.
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
     save(state_dir, &state, true)?;
-    // Dash refresh PR1: bind this workflow onto the calling session's own
-    // record, so the dashboard can resolve THIS pane's workflow from its own
-    // session rather than the one repo-wide "active" pointer every pane used
-    // to share (see `sessions::bind_workflow_id`'s own doc comment).
-    // Best-effort and silent when `ZIRV_CTX_SESSION` is unset (a headless or
-    // scripted `workflow start`, or a test) -- exactly like every other
-    // env-keyed, best-effort write in this module (`record_workflow_
-    // attention`).
+    // Bind the workflow to this session for pane-specific status; absent session context is a quiet best-effort skip.
     bind_started_workflow_to_calling_session(state_dir, &state.id);
     if let Some(old) = previously_active
         && old.id != state.id
@@ -1338,18 +1194,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
         }
         WorkflowSubcommand::Classify(args) => {
             let classification = classify::from_args(args)?;
-            // Issue #542 chunk 3b: best-effort, so an unreadable registry
-            // (an unusual environment problem, not classify's own concern)
-            // never breaks `workflow classify` -- it just omits `selection`.
+            // Registry selection is best-effort; an unreadable registry must not break classify. (#542)
             let repo = resolve_repo(args.repo.as_deref())?;
-            // Issue #541 decision 1: the minimal execution profile derived
-            // from this same classification, embedded alongside it rather
-            // than requiring a second call. Issue #782: an off-by-default
-            // Jev refinement runs here too, before `selection` so a
-            // decisively replaced intent still drives it -- a silent no-op
-            // unless `[jev] classify` is on and a credential is set, so
-            // `profile`/`classification` (and this command's output) stay
-            // byte-identical to today either way.
+            // Derive profile from the same classification; optional Jev refinement precedes pack selection and leaves defaults intact when unavailable. (#541, #782)
             let mut profile = crate::commands::workflow::profile::ExecutionProfile::derive(
                 &args.task,
                 &classification,
@@ -1367,12 +1214,9 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 struct ClassifyOutput<'a> {
                     #[serde(flatten)]
                     classification: &'a Classification,
-                    /// Issue #541 decision 1: the minimal execution profile
-                    /// derived from this same classification, embedded
-                    /// alongside it rather than requiring a second call.
+                    /// Embed the minimal execution profile from the same classification. (#541)
                     profile: &'a crate::commands::workflow::profile::ExecutionProfile,
-                    /// Issue #542 chunk 3b: best-effort registry selection,
-                    /// omitted when the registry could not be loaded.
+                    /// Omit best-effort selection if the registry cannot load. (#542)
                     #[serde(skip_serializing_if = "Option::is_none")]
                     selection: Option<&'a crate::commands::workflow::selection::Selection>,
                 }

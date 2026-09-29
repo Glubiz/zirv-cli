@@ -68,9 +68,7 @@ fn word_tokens(text: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// One skill's deterministic score against `task`/`phase`, and why it
-/// scored that way -- issue #539's requirement that an activation is
-/// reviewable, not just a number.
+/// One deterministic skill score and its reasons, so activation is reviewable. (#539)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillMatch<'a> {
     pub skill: &'a RegisteredSkill,
@@ -82,17 +80,7 @@ pub struct SkillMatch<'a> {
     pub matched_triggers: usize,
 }
 
-/// Deterministic, model-independent skill activation. Scores every skill
-/// the registry resolved against the task text and the active phase and
-/// returns the best matches above [`ACTIVATION_FLOOR`], highest score
-/// first, ties broken by matched-trigger share then id -- never by map
-/// iteration order, and never by
-/// anything a model decided.
-///
-/// Issue #539 chunk F: the agent's own search, not a standing prompt layer
-/// -- wired into `skill_tools::skill_list`'s `query` (and `zirv skill list
-/// --match`), both initiated by the agent or operator, never by zirv
-/// pre-selecting a skill for a task on its own.
+/// Score explicit search requests deterministically; exclude implicit activation choices and break ties by trigger share then id. (#539)
 pub fn score_skills<'a>(
     registry: &'a SkillRegistry,
     task: &str,
@@ -104,10 +92,7 @@ pub fn score_skills<'a>(
 
     let mut scored: Vec<SkillMatch<'a>> = registry
         .list()
-        // Issue #539: `implicit_activation == false` means explicit
-        // invocation only -- this scorer exists for automatic activation,
-        // so such a skill must never appear here no matter how well its
-        // triggers match.
+        // Explicit-only skills must never appear in automatic activation results, regardless of trigger score. (#539)
         .filter(|skill| skill.manifest.implicit_activation)
         .filter_map(|skill| {
             let mut score = 0u32;

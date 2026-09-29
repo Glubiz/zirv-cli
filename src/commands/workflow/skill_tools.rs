@@ -117,14 +117,7 @@ pub struct SkillLoadResult {
     /// [`SkillSource`] `Display` spelling, so this reads the same as
     /// `zirv skill show`'s own `source:` line.
     pub source: String,
-    /// Issue #539: for [`SkillSource::Repository`], names this text as
-    /// untrusted data a checkout produced -- the exact distinction
-    /// `runtime::context::append_workflow_sources` already applies to the
-    /// same source tag (`MessageRole::Data`/`SourceTrust::RepositoryUntrusted`
-    /// there, "untrusted" in `skill_render::write_digest_detail`'s own
-    /// `trust:` line) -- reused here, not reinvented, so a repository skill
-    /// can never look like an operator instruction just because this tool
-    /// returns it differently than the CLI does.
+    /// Label repository skill text as untrusted data so tool output cannot present it as operator instruction. (#539)
     pub trust: String,
     pub content_hash: String,
     pub external_writes: bool,
@@ -226,12 +219,7 @@ pub fn skill_read_resource(registry: &SkillRegistry, id: &str, path: &str) -> Ct
     registry.read_resource(strip_host_prefix(id), path)
 }
 
-/// Which tool surface a `skill_load` activation came through, carried into
-/// the activation journal so an operator can tell a native session's own
-/// choice from one an MCP-bridged harness made -- or, since issue #539 chunk
-/// G, one an agent made by running `zirv skill load <id>` from a shell
-/// instead of reaching for either tool. All three call this exact function,
-/// so a `cli` activation is measured on the same footing as the other two.
+/// Record whether a skill load came from the native tool, MCP bridge or CLI in the same activation journal. (#539)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillLoadSurface {
     NativeTool,
@@ -249,11 +237,7 @@ impl SkillLoadSurface {
     }
 }
 
-/// Records one `skill_load` activation in the workflow telemetry journal
-/// (issue #539 chunk E1). Best-effort, like every other `telemetry::record`
-/// call site in this crate: a journal write failure must never fail the
-/// tool call that already succeeded, so both callers ignore this function's
-/// `Err` the same way `artifact::register`/`engine::advance` etc. do.
+/// Journal writes are best-effort and must never fail a skill load that already succeeded. (#539)
 pub fn record_skill_activation(
     state: &StateDir,
     repo: &std::path::Path,

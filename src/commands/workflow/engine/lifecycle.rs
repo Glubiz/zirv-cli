@@ -13,22 +13,10 @@ use super::cli::*;
 use super::definitions::*;
 use super::state::*;
 use super::transition::*;
-/// Marks a `[skill ...]` provenance header this compiler itself emitted,
-/// placed right after the newline and before `[skill `. Repository skill
-/// bodies are untrusted text rendered into the same buffer; without a
-/// boundary marker only the compiler can produce, a body containing a
-/// newline followed by a hand-typed `[skill fake@1; source=built-in]` line
-/// would be indistinguishable from a real header once `ctx::runtime::context`
-/// scans the rendered text for fragment boundaries. `render_current_context`
-/// strips this exact byte from every skill body before insertion (see
-/// [`sanitize_skill_body`]), so it can never appear anywhere except where
-/// this function put it (issue #557 / roadmap N06).
+/// Mark compiler-emitted skill headers with a sentinel stripped from untrusted bodies, so repository text cannot forge provenance. (#557)
 pub const SKILL_HEADER_SENTINEL: char = '\u{1}';
 
-/// Neutralises the compiler's own header-boundary sentinel inside untrusted
-/// skill body text so a repository skill can never forge a
-/// `[skill ...; source=...]` provenance header by embedding one in its own
-/// instructions (issue #557 / roadmap N06).
+/// Strip the header sentinel from untrusted skill bodies to prevent forged provenance headers. (#557)
 fn sanitize_skill_body(body: &str) -> std::borrow::Cow<'_, str> {
     if body.contains(SKILL_HEADER_SENTINEL) {
         std::borrow::Cow::Owned(
@@ -70,10 +58,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         if let Some(warning) = warning {
             crate::output::warn(warning);
         }
-        // Issue #699 Phase 0: `None` when this artifact was already
-        // completed (the `!contains` guard above is false) -- re-approving
-        // an artifact that drifted back into acceptance without a genuine
-        // new `AwaitingApproval` span has no honest wait to report.
+        // A re-approval without a new awaiting-approval span has no honest wait duration to report. (#699)
         let mut approval_wait_ms = None;
         if !state.completed_steps.contains(&completed.id) {
             approval_wait_ms = Some(record_step_duration_ms(&mut state, &completed.id));
@@ -107,10 +92,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         event.work_domain = Some(state.classification.work_domain.domain);
         event.succeeded = Some(true);
         event.artifact_stage = Some(accepted.to_string());
-        // Issue #699 Phase 0: the whole `AwaitingApproval` span this
-        // artifact-gated step spent, agent-drafting time and operator
-        // review time both -- see `TelemetryEvent::approval_wait_ms`'s own
-        // doc comment for why this is never sub-divided further.
+        // Record the whole awaiting-approval span because state cannot separate drafting from operator review. (#699)
         event.approval_wait_ms = approval_wait_ms;
         let _ = crate::commands::workflow::telemetry::record(
             state_dir,
@@ -118,9 +100,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
             &event,
             &crate::commands::workflow::telemetry::TelemetryConfig::for_repo(&state.repo),
         );
-        // Issue #349: a chained approval-required step (`state.status` is
-        // `AwaitingApproval` again) still needs an operator, so only a
-        // genuine `Running`/`Completed` outcome clears the gate attention.
+        // A chained approval step still needs an operator; clear attention only after Running or Completed. (#349)
         match state.status {
             WorkflowStatus::AwaitingApproval => record_workflow_attention(
                 crate::commands::ctx::attention::Attention::WorkflowGate,
@@ -138,25 +118,9 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         return Ok(state);
     }
 
-    // Issue #542 chunk 5: a gate-only (no `artifact`) approval step does not
-    // advance `current_step` here -- it stays current -- so record THIS
-    // step's id as approved. Without it, the next `refresh_deploy_tier`
-    // (called at the top of both `approve` and `advance_with_evidence`)
-    // would recompute `status` from this same still-current step's
-    // declarative `approval = true` and immediately re-derive
-    // `AwaitingApproval`, making the approval just granted unobservable.
+    // Record gate-only approval against the still-current step id so status recomputation cannot immediately re-open the gate. (#542)
     let approved_phase = state.current().map(|step| step.phase);
-    // Issue #699 Phase 0: this gate-only step's own `AwaitingApproval` span
-    // -- captured before `phase_started_at` resets below. Unlike the
-    // artifact branch above, a gate-only step does NOT complete here (it
-    // stays current and still has to run), so this must never be written to
-    // `step_durations_ms`/`record_step_duration_ms` (that would falsely
-    // mark the step as finished). Resetting `phase_started_at` to now, here,
-    // is what makes the two spans separable at all: without it, the step's
-    // EVENTUAL completion would measure from before this approval, folding
-    // wait and execution back together exactly like the state itself does
-    // not otherwise distinguish them (see `TelemetryEvent::
-    // approval_wait_ms`'s own doc comment).
+    // Gate-only approval does not finish the step; record wait separately and reset its clock before execution time starts. (#699)
     let gate_wait_ms = phase_elapsed_ms(&state);
     if let Some(step) = state.current() {
         state.current_step_approved = Some(step.id.clone());
@@ -166,11 +130,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     state.phase_started_at = state.updated_at;
     save(state_dir, &state, true)?;
 
-    // Issue #542 review nit: a gate-only approval is still an approval --
-    // emit the same `ArtifactAccepted` telemetry event the artifact branch
-    // above does (with no `artifact_stage`, since there is none), so an
-    // operator/dashboard reading this event stream sees every approval
-    // grant, not only the artifact-gated ones.
+    // Gate-only approval also emits acceptance telemetry, without an artifact stage. (#542)
     let mut event = crate::commands::workflow::telemetry::TelemetryEvent::new(
         crate::commands::workflow::telemetry::TelemetryKind::ArtifactAccepted,
     );
@@ -181,7 +141,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     event.risk = Some(state.classification.risk);
     event.work_domain = Some(state.classification.work_domain.domain);
     event.succeeded = Some(true);
-    // Issue #699 Phase 0: see the artifact branch's identical assignment.
+    // Record the same whole approval span as the artifact gate. (#699)
     event.approval_wait_ms = Some(gate_wait_ms);
     let _ = crate::commands::workflow::telemetry::record(
         state_dir,
@@ -197,20 +157,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
     Ok(state)
 }
 
-/// Closes a workflow that will not reach `Completed` -- typically one whose
-/// review/fix loop hit `MAX_FIX_REVIEW_ROUNDS` (review.rs) and would
-/// otherwise stay `Running` forever, still reported as this repository's
-/// active workflow by `load_active`. Refuses (fail closed) when the
-/// workflow's status is already terminal (`Completed`/`Failed`/`Closed`) --
-/// `close` only applies to a workflow still in flight -- while any review
-/// finding is still `Open` -- residual dispositions must be recorded first,
-/// via `workflow review dispose` -- or while the workflow is
-/// `AwaitingApproval`, since approval is itself a pending decision on the
-/// current step. Otherwise sets `status: Closed`, records `closed_reason`/
-/// `closed_at`, and persists via `save_inactive_if_active`, which clears
-/// this repository's active pointer only when it currently names THIS
-/// workflow -- closing an older, non-active workflow must never deactivate a
-/// different, currently-running one for the same repo.
+/// Close only an in-flight workflow with no open finding or pending approval; clear the active pointer only if it names this workflow.
 pub fn close(
     state_dir: &StateDir,
     state: WorkflowState,
@@ -251,18 +198,7 @@ pub fn close(
     finish_close(state_dir, state, reason)
 }
 
-/// Issue #537 review: a workflow the proxy started immediately before a
-/// spawn that then failed is `AwaitingApproval` the instant `packs/feature.
-/// toml`/`packs/bugfix.toml` gate the first step behind `approval = true`
-/// (any bounded-or-riskier classification does) -- `close`'s own approval
-/// refusal above exists because approval is a pending human decision on the
-/// CURRENT step, but nobody has made or seen that decision yet here. This
-/// path is deliberately narrower than `close`: it only ever closes a
-/// workflow sitting at its very first gate, before a human has advanced OR
-/// approved anything at all -- zero `completed_steps` and zero accepted
-/// artifacts. The moment either is non-empty, this refuses and the caller
-/// must go through `close` instead, the same fail-closed shape `close`
-/// itself already uses for every other state it will not touch.
+/// Close after spawn failure only at the first gate, before any step or artifact was completed; later state requires ordinary close. (#537)
 pub fn close_unstarted(
     state_dir: &StateDir,
     state: WorkflowState,
@@ -301,11 +237,7 @@ pub fn close_unstarted(
     finish_close(state_dir, state, reason)
 }
 
-/// The actual close: sets `status: Closed`, records `closed_reason`/
-/// `closed_at`, persists via `save_inactive_if_active` (clears this
-/// repository's active pointer only when it currently names THIS
-/// workflow), and records the same `TelemetryKind::Closed` event either of
-/// [`close`]/[`close_unstarted`] always did inline before this split.
+/// Close this workflow and clear the active pointer only when it names this workflow; record the Closed event once.
 pub(super) fn finish_close(
     state_dir: &StateDir,
     mut state: WorkflowState,
@@ -349,28 +281,7 @@ pub struct AppliedDisposition {
     pub requires_explicit_disposition: bool,
 }
 
-/// Applies every *open* review finding's own `recommended_disposition` in one
-/// call, collapsing the per-finding turn cost of `zirv workflow review
-/// dispose` for the common case where a reviewer already recommended a
-/// disposition (review.rs stores it as `ReviewFinding::recommended_
-/// disposition`, read here through that existing field rather than any new
-/// accessor). A finding that is not `Open` (already `Accepted`/`Dismissed`/
-/// `Fixed`/`Residual`) is left untouched and not reported at all -- this is
-/// additive over the single-finding dispose, never a way to revisit a
-/// decision already made. An open finding with no recommendation is left
-/// `Open` and still reported, so the caller can see it was considered and
-/// skipped rather than silently missed. Critical and Major findings whose
-/// recommendation is `Dismissed` also remain `Open` for explicit disposition.
-///
-/// Called directly by `zirv workflow review dispose --apply-recommended`
-/// (`review::ReviewCommand::Dispose`'s handler): the flag lives on the same
-/// `dispose` verb the single-finding form uses -- a standalone
-/// `DisposeRecommended` subcommand was the stopgap spelling before that flag
-/// was wired up. Mirrors `review.rs`'s own single-finding arm otherwise: the
-/// same load/mutate/save/telemetry shape (its `record_finding_update` is
-/// private to that module, so the telemetry recording is reimplemented here
-/// rather than exposed solely for this one caller), just applied to every
-/// eligible finding instead of one named by id.
+/// Apply recommendations only to open findings; Critical/Major dismissals still require explicit disposition, and missing recommendations stay open.
 pub fn apply_recommended_dispositions(
     state_dir: &StateDir,
     mut state: WorkflowState,
@@ -430,15 +341,7 @@ pub fn apply_recommended_dispositions(
     Ok((state, results))
 }
 
-/// Forces a persisted workflow's methodology overlay (#255 recovery path: a
-/// misclassified profile previously could only be fixed by abandoning the
-/// workflow). A profile change never adds, removes, or reorders steps --
-/// `WorkflowState::set_profile` relabels skills on the existing step list in
-/// place -- so completed steps and accepted artifacts are structurally
-/// untouched; the state machine is never reset. (Unlike a risk increase,
-/// which can genuinely require a new gate, `rematerialize_after_risk_
-/// increase`'s known-step-id trimming would be a no-op here anyway, since
-/// the same classification always produces the same step ids.)
+/// Change the methodology overlay in place, preserving completed steps and accepted artifacts; profile changes do not reorder steps. (#255)
 pub fn reclassify(
     state_dir: &StateDir,
     mut state: WorkflowState,
@@ -483,13 +386,7 @@ pub(super) fn is_headless_env(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
-/// Issue #326: caps `rendered`'s total bytes at `max_bytes`, appending a
-/// visible marker naming how many bytes were cut rather than a silent
-/// truncation -- the same "keep what came first, mark what is missing"
-/// shape `memory::cap_body` already uses for a memory entry's own per-entry
-/// cap. The head is kept, never the tail: `rendered`'s own workflow/profile/
-/// task/step/phase/state header lines come first and matter far more than
-/// whichever selected skill happened to render last.
+/// Cap context at the head and show how much was cut; header lines outrank later skill text. (#326)
 pub(super) fn cap_workflow_context(rendered: String, max_bytes: usize) -> String {
     if rendered.len() <= max_bytes {
         return rendered;
@@ -499,13 +396,7 @@ pub(super) fn cap_workflow_context(rendered: String, max_bytes: usize) -> String
         "\n[workflow context truncated -- {omitted} bytes omitted, cap \
          workflow.max_context_bytes={max_bytes}]\n"
     );
-    // Review finding: `max_bytes.saturating_sub(marker.len())` alone still
-    // appended the FULL marker even when it alone was longer than
-    // `max_bytes` (a tiny operator-set cap), so the "capped" output could
-    // exceed its own budget. A cap too small to hold even the marker gets
-    // the marker itself, truncated -- an honest "cannot show this" beats
-    // output that overruns the ceiling it claims to enforce, the same rule
-    // `snapshot::cap_head_tail` uses for its own too-small-a-budget case.
+    // When the marker alone exceeds the cap, truncate it too so output never exceeds the configured ceiling.
     if marker.len() >= max_bytes {
         return crate::utils::truncate_bytes(marker, Some(max_bytes));
     }
@@ -515,32 +406,9 @@ pub(super) fn cap_workflow_context(rendered: String, max_bytes: usize) -> String
     truncated
 }
 
-/// Why the ACTIVE workflow refuses to let a session declare itself done, or
-/// `None` when nothing blocks it (issue #484, roadmap N15).
-///
-/// The native loop consults this at every completion attempt, so the gate is
-/// read live rather than snapshotted at session start: a session that reaches
-/// the Test step after it began is gated on the evidence that exists THEN.
-/// The shared stop service outranks any model finish token with it, which is
-/// what stops a native session declaring success over a step whose evidence
-/// is stale, missing or failing.
-///
-/// Deliberately the same predicate `advance_with_evidence`'s own Test/Verify
-/// arm applies -- `verification::latest_is_fresh_and_passing` keyed by the
-/// workflow's own recorded branch (issue #467), so a workflow started in the
-/// main checkout is satisfied by a worker worktree's evidence for the same
-/// change set and by nothing else. A duplicate rule here would be a second
-/// definition of "done" that could drift from the real one.
-///
-/// Fails open only up to the point of deciding whether there is anything to
-/// gate on at all: an unreadable state directory, an absent workflow, or an
-/// unresolvable branch all mean "nothing to gate on", the same as a step
-/// outside Test/Verify. Once that decision is made and this step's
-/// completion genuinely depends on fresh verification evidence, a failure
-/// reading THAT evidence fails closed instead (issue #599, roadmap N15):
-/// silently treating an unreadable record as passing would defeat the gate
-/// for exactly the sessions it exists to stop.
+/// Gate native completion on fresh passing Test/Verify evidence from the workflow branch. Once the step needs evidence, read failures block completion. (#484, #599)
 pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<String> {
+    // Read live at every completion attempt, and the same predicate as advance_with_evidence's Test/Verify arm: a second definition of done could drift. An unreadable state dir or absent workflow means nothing to gate on. (#484)
     let state = load_active(state_dir, repo).ok().flatten()?;
     if !matches!(
         state.status,
@@ -562,16 +430,7 @@ pub fn native_completion_gate(state_dir: &StateDir, repo: &Path) -> Option<Strin
     } else {
         "zirv test changed"
     };
-    // Issue #599 (roadmap N15): this differs from the state-load fallback
-    // above on purpose. By this point the gate has already committed to
-    // needing fresh evidence for a Test/Verify step -- unlike an unreadable
-    // state directory or an absent workflow, where there is nothing to gate
-    // on at all, a read error HERE means the evidence this step's
-    // completion depends on could not be evaluated. Treating that as
-    // "assume it passed" (`.unwrap_or(true)`) let missing permissions,
-    // corruption, or any other evidence-read failure silently satisfy the
-    // gate; failing closed with the error surfaced is the only reading that
-    // keeps "fresh passing evidence" meaning what it says.
+    // Once Test/Verify requires fresh evidence, an evidence read error must fail closed rather than count as passing. (#599)
     let fresh = match crate::commands::workflow::verification::latest_is_fresh_and_passing(
         state_dir,
         &state.repo,
@@ -642,13 +501,7 @@ pub fn render_current_context(
             .artifacts
             .get(stage.key())
             .ok_or("current workflow artifact record is missing")?;
-        // F6 (blind-review finding, 2026-09-24): the artifact is never
-        // pre-created on disk any more (see `start_workflow`'s own doc
-        // comment), so an unfilled step names its own template text here
-        // instead -- the path and the starting content stay discoverable
-        // through `zirv workflow status`/`context` either way, but nothing
-        // writes to the worktree, or touches the git index, until the agent
-        // actually fills it.
+        // An unfilled artifact exposes its path and template in context without writing to the worktree or index.
         let path = workflow_artifact_path(state, stage)?;
         if path.exists() {
             rendered.push_str(&format!(
@@ -695,14 +548,7 @@ pub fn render_current_context(
             ));
         }
     }
-    // Issue #326: a step whose selected skills happen to be large must not
-    // inject them unbounded into the session prompt (`prompt::with_workflow_
-    // layer`) or print them unbounded from `zirv workflow context` -- both
-    // consumers funnel through this one function, so capping here catches
-    // both at the single source rather than needing its own cap at each
-    // consumer. A config load failure degrades to the built-in default
-    // rather than skipping the cap entirely: this function must never fail
-    // just because config could not be read.
+    // Cap selected skills at the shared context source; unreadable config uses the built-in cap, never unbounded output. (#326)
     let max_context_bytes =
         crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
             .map_or_else(

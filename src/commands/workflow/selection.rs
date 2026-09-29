@@ -183,26 +183,7 @@ fn effects_compatible_with_legacy_intent(intent: Intent, effects: EffectClass) -
     }
 }
 
-/// A legacy-mapped intent (`Feature`/`Bugfix`/`Spike`/`Review`; `Refactor`
-/// never reaches here) still selects its own kind pack by default, but a
-/// more specialised registered pack may take over when it BOTH actually
-/// matched one of its own trigger phrases in the objective (a domain-tag or
-/// work-domain-alignment point alone never qualifies) AND its declared
-/// `effects` fits what that intent is allowed to touch -- see
-/// [`effects_compatible_with_legacy_intent`]. Scoring and the tie-break
-/// mirror `select_definition`'s own step 2/4 exactly, restricted to this
-/// smaller, gated candidate pool. `None` when no specialised pack qualifies,
-/// so the caller falls back to the plain direct mapping.
-///
-/// Review finding, trust boundary: a repository-provided pack
-/// (`WorkflowSource::Repository`) is untrusted and may only ADD a
-/// non-colliding id (see `registry.rs`'s own widening refusal) -- it must
-/// never REFINE a legacy intent's own built-in pack out from under it, since
-/// that would let an untrusted trigger/`effects` pairing silently drop the
-/// gates a trusted built-in bugfix/feature pack enforces. Only `BuiltIn` and
-/// `OperatorGlobal` packs are eligible here; a repository pack still wins
-/// outright for `Intent::Other` via `select_definition`'s ordinary scoring
-/// (step 2), which this function is never involved in.
+/// A trusted specialized pack may refine a legacy intent only with a matching trigger and compatible effects; repository packs cannot displace trusted legacy gates. (#542)
 fn refine_legacy_selection(
     classification: &Classification,
     registry: &WorkflowRegistry,
@@ -290,33 +271,7 @@ fn refine_legacy_selection(
     })
 }
 
-/// Selects which registered pack should run for `classification`/
-/// `objective` (the raw task text) -- issue #542 chunk 3b.
-///
-/// 1. A classified software-development intent (`feature`/`bugfix`/
-///    `refactor`/`spike`/`review`) selects its own legacy kind pack by
-///    DEFAULT when that id is registered. A more SPECIALISED pack may
-///    replace it (see [`refine_legacy_selection`]) when it actually matched
-///    one of its own trigger phrases in the objective -- a domain-tag or
-///    work-domain-alignment point alone never qualifies -- and its declared
-///    `effects` fits the intent: `Feature`/`Bugfix` need `Repository` or
-///    `External`, `Review` needs `None`, `Spike` accepts any effects, and
-///    `Refactor` is never displaced. When no specialised pack qualifies,
-///    behavior is exactly the old direct mapping (confidence `1.0`).
-///    `Intent::Other` has no legacy kind counterpart, so it always reaches
-///    step 2 below (no existing intent value describes a project-
-///    management/data/architecture/devops task, so this is also the only
-///    path those new packs are ever chosen through when their objective
-///    doesn't also match one of the five kinds above).
-/// 2. Every OTHER registered pack (excluding [`ADAPTIVE_WORK_ID`] itself,
-///    which never competes) is scored via [`score_pack`]. A pack that
-///    clears [`SELECTION_FLOOR`] is eligible.
-/// 3. No eligible pack -> `adaptive-work`, confidence `0.0`.
-/// 4. A single top-scoring pack wins outright. Two or more tied at the top
-///    are broken toward fewer external effects (`EffectClass`'s own `Ord`:
-///    `None < Repository < External`), then alphabetically by id -- both
-///    tied ids are recorded in `alternatives` and the tie itself is named
-///    in `reasons`.
+/// Select a registered pack by legacy intent, eligible trigger score, then fewer effects and id for ties; `adaptive-work` is the fallback. (#542)
 pub fn select_definition(
     classification: &Classification,
     registry: &WorkflowRegistry,

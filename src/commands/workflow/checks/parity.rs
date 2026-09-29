@@ -290,13 +290,7 @@ fn backticked_all(cell: &str) -> Vec<String> {
     out
 }
 
-/// The step names `.github/workflows/ci.yaml` declares, read as whole
-/// `- name: <step>` lines rather than as substrings of the file.
-///
-/// Review round 1: matching a `CI:` citation against the raw YAML meant any
-/// fragment of any line -- a job id, a `run:` word, a comment -- counted as
-/// evidence that a CI step exists, which is the same over-claim the whole
-/// check exists to prevent. A step is a list item, so only list items count.
+/// Count only YAML `- name:` list items as CI steps; arbitrary text cannot prove that a cited step exists.
 fn ci_step_names(ci: &str) -> BTreeSet<String> {
     ci.lines()
         .filter_map(|line| line.trim().strip_prefix("- name:"))
@@ -305,15 +299,7 @@ fn ci_step_names(ci: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The module path -> file map of the real source tree, plus a memoised set
-/// of the `fn` names each resolved file declares.
-///
-/// Review round 1: checking a cited test by its bare final segment against
-/// one flat set of every `fn` name under `src/` meant
-/// `totally::fake::module::a_real_test` passed as long as SOME function
-/// called `a_real_test` existed anywhere. A citation's module path is the
-/// part that says *where the evidence is*, so it is resolved to an actual
-/// file and the `fn` must be in that file.
+/// Resolve a cited module path to a real source file and require the named test function in that file.
 struct SourceModules {
     repo: PathBuf,
     /// `(module path segments, repo-relative file path)`, one entry per

@@ -43,9 +43,7 @@ impl Tracker {
         }
     }
 
-    /// Whether reserving `ceiling_usd`/`calls`, plus one more trial, plus a
-    /// dispatch that will not finish before `timeout_secs` from `now`,
-    /// would exceed any cap. Checked BEFORE every dispatch, per the design.
+    /// Check reservations before every dispatch so pending trials and timeouts cannot exceed campaign caps.
     pub fn check_reservation(
         &self,
         budgets: &Budgets,

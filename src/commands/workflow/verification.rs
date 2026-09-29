@@ -19,10 +19,7 @@ use crate::commands::ctx::state::{
 /// repository to rewrite its config, so it moves only for a real config-format
 /// change.
 const VERIFY_CONFIG_SCHEMA_VERSION: u32 = 1;
-/// The stored report's schema, which only zirv writes and reads. Bumped to 2
-/// when `narrowed_to` was added: the field is `#[serde(default)]`, so a
-/// narrowed report written by an earlier build would otherwise deserialize as
-/// un-narrowed and satisfy the freshness gate it was supposed to fail.
+/// Schema 2 records narrowed runs; older narrowed reports must not deserialize as full gate evidence.
 pub(crate) const VERIFY_REPORT_SCHEMA_VERSION: u32 = 2;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
@@ -48,10 +45,7 @@ pub enum CheckKind {
     Integration,
     Typecheck,
     Build,
-    /// Issue #275: `zirv context lint`'s own CTX001/CTX005 gate over
-    /// `.zirv/context/` and the native `CLAUDE.md`/`AGENTS.md` compat
-    /// files. Discovered (never repo-authored) whenever `.zirv/context/`
-    /// exists -- see `load_or_discover_raw`.
+    /// Discover the context lint gate when canonical context exists; repository text cannot author its command. (#275)
     ContextLint,
     Custom,
 }
@@ -123,13 +117,7 @@ impl VerificationConfig {
             )
             .into());
         }
-        // Issue #268: an explicitly empty `checks = []` used to hard-error
-        // here, which meant `zirv verify` on a checked-in but empty
-        // `.zirv/verify.toml` bricked the command outright instead of
-        // producing a report an operator could see. `run_mode` now turns
-        // zero resolved checks into an `Inconclusive` report (or a `Passed`
-        // one under the `workflow.allow_empty_verify` override) -- see its
-        // own doc comment.
+        // An empty check set produces an inconclusive report unless operator policy permits it, instead of aborting verify. (#268)
         let mut ids = std::collections::BTreeSet::new();
         for check in &self.checks {
             check.validate()?;
@@ -230,41 +218,12 @@ pub fn load_or_discover(repo: &Path) -> CtxResult<ResolvedChecks> {
 
 type SourceFor = fn(&CheckSpec) -> CheckSource;
 
-/// Issue #495: whether `cargo nextest` is installed, i.e. a `cargo-nextest`
-/// binary is on `PATH` -- the same lookup `cargo` itself does to resolve a
-/// subcommand. Reused rather than duplicated: `setup::executable_exists`
-/// already does exactly this PATH/PATHEXT walk for `zirv setup`'s own
-/// toolchain checks.
+/// Find `cargo-nextest` through the same PATH/PATHEXT lookup Cargo uses. (#495)
 fn nextest_available() -> bool {
     crate::commands::setup::executable_exists("cargo-nextest")
 }
 
-/// The discovered Rust repo's default "test" check command. `.config/
-/// nextest.toml` isolates flake-prone test families (e.g. the
-/// `exec-nudge-restart` group) into their own single-threaded groups, a
-/// protection that only applies under `cargo nextest run` -- the plain
-/// serial `cargo test -- --test-threads=1` this repo's own gate used to run
-/// reads none of it, so a documented flake there fails `zirv test changed`/
-/// `zirv workflow advance --run-checks` on an otherwise green change set.
-/// nextest was dropped as this repo's own serial-run standard on 2026-09-11;
-/// this makes the discovered gate agree, for every Rust repo, without
-/// regressing one that has not installed nextest at all.
-///
-/// Issue #495 follow-up: `cargo nextest run` never executes doctests, so
-/// running it alone silently drops doctest coverage the old `cargo test`
-/// command had -- for a repo `cargo test` would have run any for in the
-/// first place. `has_lib_target` (see its own call site,
-/// `repo.join("src/lib.rs").is_file()`) matters because `cargo test --doc`
-/// HARD ERRORS (`error: no library targets found in package`, exit 101) on
-/// a bin-only crate rather than harmlessly finding zero doctests -- verified
-/// against this repo's own `Cargo.toml`, which has no `[lib]`. Chaining it
-/// unconditionally would trade "silently drops doctest coverage" for
-/// "always fails the gate" on every bin-only Rust repo, including this one.
-/// `command_for_shell` runs this text through a real shell, so chaining
-/// `&& cargo test --doc` when there is a lib target keeps both able to fail
-/// the gate: a nextest failure short-circuits (nonzero exit, doctests don't
-/// need to run to know the gate failed), and a nextest pass still runs
-/// doctests and fails the gate if they don't.
+/// Use nextest when installed so repository test groups apply; run doctests for library crates because nextest omits them and bin-only crates reject `cargo test --doc`. (#495)
 fn default_rust_test_command(nextest_available: bool, has_lib_target: bool) -> String {
     match (nextest_available, has_lib_target) {
         (true, true) => "cargo nextest run --no-fail-fast && cargo test --doc".to_string(),
@@ -377,13 +336,7 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
             }
         }
     }
-    // Issue #275: `zirv context lint`'s own CTX001 (budget headroom) and
-    // CTX005 (dedupe leak) findings are wired into this gate as errors --
-    // discovered, like the Cargo/npm checks above, whenever the repository
-    // actually has a canonical `.zirv/context/` layer to lint. zirv's own
-    // text (`DiscoveredToolchain`), never repo-authored: a checkout cannot
-    // widen or narrow what this check runs, only whether it exists at all
-    // (by having a `.zirv/context/` directory in the first place).
+    // Discover zirv-owned context lint when canonical context exists; repository text cannot alter the check command. (#275)
     if repo.join(".zirv").join("context").is_dir() {
         checks.push(CheckSpec {
             id: "context-lint".into(),
@@ -404,9 +357,7 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<(VerificationConfig, &'static 
         schema_version: VERIFY_CONFIG_SCHEMA_VERSION,
         checks,
     };
-    // Zero checks (neither a Cargo nor a recognized package.json project) is
-    // no longer a hard error here -- see issue #268 and `run_mode`'s own
-    // handling of `resolved.checks.is_empty()`.
+    // Let `run_mode` report zero checks as inconclusive or operator-allowed pass. (#268)
     config.validate()?;
     // `npm run <id>` executes a command body written in the repository's own
     // package.json: discovered by zirv, authored by the checkout, and gated
@@ -486,14 +437,7 @@ fn git_at(repo: &Path) -> Command {
     command
 }
 
-/// `repo`'s current branch name, or an empty string when it cannot be
-/// resolved (detached HEAD, no commits, `git` missing or not a repository).
-/// Issue #467: recorded on every persisted [`VerificationReport`] and
-/// matched against a workflow's own recorded branch by
-/// [`latest_is_fresh_and_passing`]'s widened sibling-worktree read -- an
-/// empty value never matches another empty or named value, so an
-/// unresolvable branch degrades to "never widens" rather than "widens to
-/// everything".
+/// An unresolved branch never matches sibling-worktree evidence, avoiding a broad relatedness match. (#467)
 pub fn current_branch(repo: &Path) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -553,12 +497,7 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
         }
         paths.extend(
             git_paths(&output.stdout)
-                // #229/#232: the workflow's own `.zirv/work/<id>/*` artifacts
-                // (plans, execute-plan pages, raw review salvage) are not the
-                // operator's change surface. Left in, an edit to one of them
-                // -- ticking a plan checkbox, a concurrent dashboard write --
-                // shifts `change_fingerprint` out from under an in-flight
-                // review and any other `changed_paths` consumer.
+                // Exclude workflow bookkeeping under `.zirv/work` from change fingerprints so concurrent artifact edits cannot stale review evidence. (#229, #232)
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
         );
     }
@@ -567,15 +506,7 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The operator's actual change surface since the workflow's own diff base
-/// (`review::default_base`: merge-base against origin/main, then main, then
-/// HEAD^, then HEAD) -- unlike `changed_paths` above, which is uncommitted-
-/// only against bare HEAD and therefore goes blind to a frontend change the
-/// moment an earlier workflow step commits it (#251). Union of the diff
-/// against that base, the uncommitted diff against HEAD (kept for
-/// resilience when `default_base` degrades to `HEAD` itself), and untracked
-/// not-ignored files; paths that no longer exist on disk are dropped, since
-/// nothing later can scan them.
+/// Measure since the workflow diff base, including committed, uncommitted and untracked paths; ignore deleted paths that cannot be scanned. (#251)
 pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     let root = git_root(repo);
     let base = super::review::default_base(repo)
@@ -611,12 +542,7 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The checkout's current commit, trimmed. Kept independent of
-/// `change_fingerprint`'s own `rev-parse HEAD` read below (folded into a
-/// one-way hash there, so it cannot be recovered from a fingerprint alone):
-/// issue #699's per-check evidence reuse needs to compare two reports'
-/// literal HEAD shas directly (rule 1 -- same HEAD only), which a hash
-/// cannot answer.
+/// Keep literal HEAD separately because per-check reuse requires exact commit equality. (#699)
 fn head_sha(repo: &Path) -> CtxResult<String> {
     let root = git_root(repo);
     let output = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
@@ -642,11 +568,7 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
         input.push_str("\npath:");
         input.push_str(&path.to_string_lossy());
         match std::fs::symlink_metadata(root.join(&path)) {
-            // #287: a symlink retargeted between two files with identical
-            // content must still move the fingerprint -- `git hash-object`
-            // below follows the link and hashes the *target's* content, so
-            // it cannot see a retarget alone. Record the link's own target
-            // instead of hashing through it.
+            // Hash a symlink’s own target path because hashing through it misses retargets between equal-content files. (#287)
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let target = std::fs::read_link(root.join(&path))?;
                 input.push_str("\nsymlink:");
@@ -694,20 +616,11 @@ pub enum CheckStatus {
     /// Selected and reported, but deliberately not executed -- today only
     /// because `workflow.repo_checks_enabled` is off. Never counts as passing.
     Skipped,
-    /// Issue #268: the check *proves nothing either way* -- a test runner
-    /// that crashed before printing a summary, an empty selection, a command
-    /// that could not be found, or (see `run_mode`) no checks at all being
-    /// configured or discoverable. Distinct from `Failed`: a `Failed` check
-    /// is evidence something is broken; `Inconclusive` is the absence of
-    /// evidence, which must block a gate exactly as hard as `Failed` (see
-    /// `VerificationReport::passed`/`evaluate_against_baseline`) but is
-    /// reported and, per `run_baseline`, never eligible for baselining.
+    /// Inconclusive means no usable evidence and blocks a gate like failure, but cannot be baselined. (#268)
     Inconclusive,
 }
 
-/// Why one [`CheckResult`] came back `Inconclusive` (issue #268). Set only
-/// when `status == CheckStatus::Inconclusive`; see `CheckResult::
-/// inconclusive_reason`.
+/// Reason for an inconclusive check, set only with that status. (#268)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InconclusiveReason {
@@ -769,21 +682,10 @@ pub struct CheckResult {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_output: Option<String>,
-    /// Failing test names recognized *while the check's output streamed in*,
-    /// via [`FailureNameScanner`] -- independent of `failure_output`, which
-    /// is only ever a capped display tail (see `MAX_FAILURE_OUTPUT_BYTES`)
-    /// that a large enough amount of *later* output (a subprocess inheriting
-    /// the real stdout fd, say) can evict the summary from entirely, even
-    /// though the summary was seen during capture. `#[serde(default)]` so a
-    /// report persisted before this field existed still deserializes, with
-    /// callers falling back to parsing `failure_output` text exactly as they
-    /// did before -- see `evaluate_against_baseline` and `run_baseline`.
+    /// Capture failing names while output streams because the capped display tail can evict summaries; older reports fall back to parsing that tail.
     #[serde(default)]
     pub failure_test_names: Vec<String>,
-    /// Set exactly when `status == CheckStatus::Inconclusive` (issue #268).
-    /// `#[serde(default)]` so a report persisted before this field existed
-    /// still deserializes -- it never had an `Inconclusive` check to begin
-    /// with, so `None` is exactly right, not a lossy fallback.
+    /// An inconclusive reason exists only for an inconclusive status; older reports default to none. (#268)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inconclusive_reason: Option<InconclusiveReason>,
 }
@@ -792,24 +694,13 @@ fn default_check_source() -> CheckSource {
     CheckSource::RepoConfig
 }
 
-/// The three-valued verdict issue #268 asks for, everywhere a gate is
-/// evaluated: `Pass` only when every check in the report passed; `Fail` when
-/// at least one check is a genuine, evidenced failure; `Inconclusive` when
-/// at least one check proves nothing either way, which blocks a gate exactly
-/// like `Fail` (see `VerificationReport::passed`) but is announced
-/// differently (see `gate_announcement`) and is never eligible for baseline
-/// waiver or recording (see `evaluate_against_baseline`, `run_baseline`).
+/// Pass requires every check to pass; genuine failure outranks inconclusive, and either blocks the gate. (#268)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateOutcome {
     Pass,
     Fail,
     Inconclusive(InconclusiveReason),
-    /// Issue #287: the worktree is byte-identical (`change_fingerprint`) to
-    /// the one recorded by this step's previous *failing* report -- no check
-    /// was executed, since re-running would only reach the same verdict.
-    /// `since_attempt` is the attempt number this no-op turn counts as (the
-    /// step's `state.attempts`, one-indexed, after this outcome is recorded)
-    /// -- ported from Prime Agent's autonomous quality gates (see #279).
+    /// An unchanged worktree after a failing report skips rerun and records the no-progress attempt. (#287)
     Unchanged {
         fingerprint: u64,
         since_attempt: u8,
@@ -823,35 +714,16 @@ pub struct VerificationReport {
     pub mode: VerificationMode,
     pub source: String,
     pub repo: PathBuf,
-    /// The checkout's branch when this report was produced (`current_branch`),
-    /// or empty when unresolvable (detached HEAD, no commits, `git`
-    /// unavailable). Issue #467: the relatedness key
-    /// `latest_is_fresh_and_passing`'s widened sibling-worktree read matches
-    /// against a workflow's own recorded `WorkflowState::branch` -- an empty
-    /// value never matches, so an unresolvable branch safely narrows rather
-    /// than widens. `#[serde(default)]` for reports persisted before this
-    /// field existed.
+    /// An unresolved branch never matches sibling-worktree evidence; older reports default to empty. (#467)
     #[serde(default)]
     pub branch: String,
-    /// The checkout's exact commit (`git rev-parse HEAD`, trimmed) when this
-    /// report was produced. Issue #699 rule 1 (per-check evidence reuse):
-    /// committing can rewrite lockfiles, submodules, generated files, and
-    /// toolchain pins in ways a working-tree path diff would never show, so
-    /// a check may only be reused across a *moved* `change_fingerprint` when
-    /// this matches the current HEAD exactly -- see `per_check_reuse_source`.
-    /// `#[serde(default)]` (empty) for a report persisted before this field
-    /// existed, or when HEAD itself could not be resolved (an unborn
-    /// branch): either way, an empty value never equals a real HEAD sha, so
-    /// it safely disables per-check reuse rather than widening it.
+    /// Reuse across a changed fingerprint requires exact HEAD equality; missing old HEAD disables reuse. (#699)
     #[serde(default)]
     pub head_sha: String,
     pub change_fingerprint: u64,
     pub changed_paths: Vec<PathBuf>,
     pub fallback_to_full: bool,
-    /// The `--check` ids this run was narrowed to. A narrowed run is not
-    /// completion evidence for the whole change set -- see
-    /// [`latest_is_fresh_and_passing`], which used to accept a format-only run
-    /// as a satisfied gate.
+    /// A narrowed check run cannot satisfy a whole-change gate; record its check ids.
     #[serde(default)]
     pub narrowed_to: Vec<String>,
     /// Clamps, truncations, and skips applied to this run, plus which prior
@@ -873,17 +745,7 @@ impl VerificationReport {
                 .all(|check| check.status == CheckStatus::Passed)
     }
 
-    /// The report's three-valued [`GateOutcome`] (issue #268), ranked with
-    /// `Fail` above `Inconclusive` above `Pass`: a genuinely `Failed` check
-    /// -- real evidence something is broken -- always wins over an
-    /// `Inconclusive` one on the same run, even though both block the gate
-    /// identically (see `passed`). A run that is *only* ever unreliable (no
-    /// `Failed` check at all) reports the first `Inconclusive` check's
-    /// reason; announcing that reason as if it were the *whole* story when
-    /// a real failure sits alongside it would say "proves nothing" about a
-    /// run that, in fact, proved something broke -- see `gate_announcement`,
-    /// which still lists any accompanying `Inconclusive` checks by id even
-    /// when the overall outcome is `Fail`.
+    /// Rank genuine failure above inconclusive when both occur; the report still lists each inconclusive check. (#268)
     pub fn outcome(&self) -> GateOutcome {
         if self
             .checks
@@ -910,18 +772,7 @@ impl VerificationReport {
         }
     }
 
-    /// Whether this (already-failing) report's failures are covered by an
-    /// operator-recorded [`TestBaseline`] -- see issue #215. A baseline can
-    /// only ever waive a *named* test failure on a `Unit`-kind check parsed
-    /// out of that check's own captured output; a `Format`/`Lint`/`Build`/
-    /// `Typecheck`/`Custom` check that isn't `Passed`, a `Unit` check whose
-    /// status isn't exactly `Failed` (a `TimedOut`/`Skipped`/`DryRun` check
-    /// names no individual test), or a `Failed` `Unit` check whose output
-    /// yields no parseable names, always blocks the gate outright: none of
-    /// those describe a specific known failure the operator could have
-    /// looked at and chosen to baseline. `passed()` itself is untouched by
-    /// any of this -- this is a second, weaker gate the caller falls back to
-    /// only once `passed()` has already said no.
+    /// Only named Unit test failures in an operator baseline may be waived; all other non-passing checks block. (#215)
     pub fn evaluate_against_baseline(&self, baseline: Option<&TestBaseline>) -> BaselineEvaluation {
         if self.passed() {
             return BaselineEvaluation {
@@ -993,31 +844,7 @@ pub struct BaselineEvaluation {
     pub blocking: Vec<String>,
 }
 
-/// Extracts the sorted, deduplicated set of failing test names from cargo
-/// test output. Cargo prints a `failures:` section twice per test binary when
-/// run `--verbose`: first followed by each failing test's own `----  <name>
-/// stdout ----` dump, then again -- immediately before the `test result:
-/// FAILED` line -- followed by nothing but the bare, indented names. Rather
-/// than trying to tell those two sections apart by shape (a panic message
-/// inside the first section is indented exactly like a name line in the
-/// second), this walks backward from each `test result: FAILED` line to the
-/// *nearest* preceding `failures:` line, which is always the plain name list.
-/// A multi-binary `cargo test` run repeats this pattern once per binary, and
-/// every occurrence is unioned into one set. Output is only ever a capped
-/// tail (see `MAX_FAILURE_OUTPUT_BYTES`), so an early binary's failures can
-/// still be missing here even when they are present in the real, uncapped
-/// log -- this is best-effort against whatever text survived the cap, not a
-/// guarantee every failing binary is found.
-/// The failing test names for one already-`Failed` `Unit` check: the names
-/// [`FailureNameScanner`] recognized while the check's own output streamed
-/// in, when there are any, since those survive a display-tail eviction that
-/// [`parse_cargo_test_failure_names`] cannot see past (issue #215's Windows
-/// follow-up -- a real run's capped `failure_output` held no `failures:`
-/// text at all, even though the failing test's own summary had been printed
-/// well before the cap-evicting flood that followed it). Falls back to
-/// parsing `failure_output` text for a report persisted before
-/// `failure_test_names` existed, or for a `dry_run` check that was never
-/// actually executed and so was never scanned.
+/// Prefer streamed failure names over capped output; older reports fall back to parsing the nearest name list before each cargo failure summary. (#215)
 fn failure_names_for(check: &CheckResult) -> std::collections::BTreeSet<String> {
     if !check.failure_test_names.is_empty() {
         return check.failure_test_names.iter().cloned().collect();
@@ -1098,13 +925,7 @@ fn test_runner_kind(command: &str) -> Option<TestRunnerKind> {
     }
 }
 
-/// A cheap, pure signal (issue #268's "degraded-gate ban") that a check's own
-/// command could not actually be run: the shell's own "command not found"
-/// convention (POSIX exit code 127) or message, or Windows `cmd.exe`'s own
-/// wording. Deliberately heuristic text matching -- there is no portable way
-/// to ask a shell why its child failed -- so it only ever *adds* an
-/// `Inconclusive` classification on top of what would otherwise have been
-/// `Failed`, never removes one.
+/// Classify shell command-not-found signals as inconclusive; heuristic text matching can only add that status. (#268)
 fn looks_like_tool_missing(exit_code: Option<i32>, output: &str) -> bool {
     if exit_code == Some(127) {
         return true;
@@ -1241,16 +1062,7 @@ fn classify_test_outcome(total: Option<u64>, exit_success: bool) -> Option<Incon
     }
 }
 
-/// Applies both of `run_check`'s post-hoc `Inconclusive` reclassifications
-/// (issue #268) to an otherwise-final `(status, exit_code)`: a tool the
-/// shell could not find, then a recognized test runner whose result cannot
-/// be trusted. Cargo uses [`classify_test_outcome`] with `test_summary_total`
-/// from the complete stream; other runners require a successful exit and
-/// non-empty output. Never touches
-/// `CheckStatus::DryRun`/`Skipped`/`TimedOut`: a timeout already blocks every
-/// gate exactly as hard as `Inconclusive` does (see `CheckStatus::
-/// Inconclusive`'s own doc comment), and dry-run/skipped checks were never
-/// actually executed, so there is no output to classify.
+/// Reclassify missing tools and untrustworthy runner output as Inconclusive; timeouts and unexecuted checks keep their existing status. (#268)
 fn classify_gate_status(
     status: CheckStatus,
     exit_code: Option<i32>,
@@ -1308,55 +1120,8 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
     names
 }
 
-/// The streaming counterpart to [`parse_cargo_test_failure_names`]: applies
-/// the identical `failures:` -> nearest-following `test result: FAILED`
-/// matching rule, but incrementally, one line at a time, as a check's output
-/// arrives -- rather than against whatever text happens to survive
-/// `read_capped_tail`'s cap. A capped *display* tail is fine to lose an
-/// early binary's failure summary to a large enough later flood (this is
-/// still `MAX_FAILURE_OUTPUT_BYTES`-bounded, not a full second uncapped
-/// buffer); it is not fine for that flood to also erase the operator's only
-/// way of learning the failing test's *name*, which is exactly what a real
-/// Windows run of `zirv test baseline` hit: a check's own stdout fd was
-/// inherited by a later-spawned subprocess whose own output dwarfed the
-/// 16 KiB tail, leaving zero bytes of `failures:`/`test result: FAILED`
-/// text behind for [`parse_cargo_test_failure_names`] to find.
-///
-/// `pending` only ever holds the lines seen since the *most recently
-/// observed* `failures:` line -- reset on every new one -- so memory stays
-/// bounded by the shape of one such section, never by total output size;
-/// `MAX_PENDING_LINES` is a defensive backstop against a pathological
-/// producer that never resets it. `pending` is only ever drained into
-/// `names` on a `test result: FAILED` line that was itself preceded by a
-/// `failures:` line since the last such drain/reset (`saw_failures_header`)
-/// -- otherwise a `test result: FAILED` block that never printed a
-/// `failures:` header (nothing captured, or a differently-shaped tool's
-/// output) would wrongly promote unrelated non-failure lines it happened to
-/// see into failing test names.
-///
-/// `partial` -- the not-yet-newline-terminated tail of the current line --
-/// is bounded the same way: `MAX_PARTIAL_LINE_BYTES` is far larger than any
-/// real cargo `failures:`/`test result:`/test-name line, so once it grows
-/// past that a real line can never be hiding in it. The excess is discarded
-/// and `partial_overflowed` marks the rest of that (poisoned) line as
-/// ignorable up to its next newline, rather than buffering an unbounded
-/// amount of a single newline-less stream -- which would otherwise defeat
-/// the memory cap the capped *display* tail is meant to provide.
-///
-/// Also recognizes the `cargo test`/`cargo nextest run` summary line itself
-/// (`summary_seen`/`summary_total`, fed by `parse_cargo_test_result_line`/
-/// `parse_nextest_summary_line`, same as `extract_test_total`) -- for the
-/// identical reason names are recovered from the full stream rather than
-/// the capped display tail: `run_check` concatenates the stdout and stderr
-/// tails and caps the result a *second* time, and verbose compiler noise on
-/// either stream can push the entire summary line out of that second cap
-/// even though both per-stream tails individually held it. Classifying off
-/// that doubly-capped text let a real pass or failure misreport as
-/// `Inconclusive`; `classify_gate_status` now uses `summary_seen`/
-/// `summary_total` from this full-stream scan instead.
-/// Serial libtest starts are also tracked until their verdict arrives:
-/// child-process output can separate `test <name> ... ` from `FAILED`.
-/// Tracking requires a `running N test(s)` header and ends at the summary.
+/// Scan the full output stream for failure names and runner summaries before display tails are capped. Bound pending sections and partial lines, and accept names only after a failures header and failed result summary.
+// The summary must come from the full stream: run_check caps the joined stdout+stderr tails a second time, so compiler noise can evict the summary line and misreport a real pass or failure as Inconclusive.
 #[derive(Default)]
 struct FailureNameScanner {
     names: std::collections::BTreeSet<String>,
@@ -1504,14 +1269,7 @@ pub struct TestBaseline {
     #[serde(default)]
     pub failing_tests: Vec<String>,
     pub recorded_at: u64,
-    /// Issue #268's baseline hygiene: how many consecutive non-dry-run
-    /// evaluations in a row each still-baselined name has gone unseen among
-    /// this repository's own failures (see `update_baseline_after_run`).
-    /// Reset to 0 the moment a name is seen failing again; a name reaching
-    /// `PRUNE_AFTER_GREENS` becomes eligible for `zirv test baseline
-    /// --prune` (`run_baseline_prune`). `#[serde(default)]` so a baseline
-    /// recorded before this field existed still deserializes, with every
-    /// name starting at 0 greens rather than failing to load.
+    /// Count only consecutive, real green evaluations toward baseline pruning; unavailable or unexecuted checks provide no evidence. (#268)
     #[serde(default)]
     pub green_streaks: std::collections::BTreeMap<String, u32>,
 }
@@ -1535,13 +1293,8 @@ fn test_baseline_path(repo: &Path) -> CtxResult<PathBuf> {
     Ok(test_baseline_dir()?.join(format!("{}.json", repo_slug(repo))))
 }
 
-/// One advisory OS lock per repository baseline (issue #302), held across
-/// every load/modify/write of the file so two `zirv test changed` runs in
-/// sibling worktrees, or a `--prune` overlapping a run, serialize instead of
-/// each writing back its own stale copy. Same shape as `group::GroupLock`:
-/// a sibling `.lock` file that is never deleted after release, since removing
-/// a lock path can split two contenders across old and new inodes while an
-/// unlocked empty file is harmless.
+/// Hold one repository baseline lock across read, update and write to prevent concurrent lost updates. (#302)
+// The sibling .lock file is never deleted after release: removing a lock path can split two contenders across old and new inodes.
 struct BaselineLock(std::fs::File);
 
 impl Drop for BaselineLock {
@@ -1593,13 +1346,7 @@ pub fn save_baseline(
     repo: &Path,
     failing_tests: std::collections::BTreeSet<String>,
 ) -> CtxResult<TestBaseline> {
-    // Carries forward each still-baselined name's own green streak (from
-    // ordinary `zirv test changed`/`zirv verify` evaluations, see
-    // `update_baseline_after_run`) rather than resetting it just because the
-    // operator re-ran `zirv test baseline` -- a fresh full recompute is not
-    // itself evidence the name regressed. A name absent from the previous
-    // baseline (newly recorded) starts at 0, same as before this field
-    // existed.
+    // Preserve existing green streaks across baseline recording; new names start at zero because recording is not regression evidence.
     let _lock = lock_baseline(repo)?;
     let previous = load_baseline(repo).unwrap_or(None);
     let green_streaks = failing_tests
@@ -1630,35 +1377,7 @@ fn write_baseline(repo: &Path, baseline: &TestBaseline) -> CtxResult<()> {
     Ok(())
 }
 
-/// Issue #268's baseline-hygiene half: after every non-dry-run evaluation
-/// (`zirv test changed`/`zirv test all`/`zirv verify`, and `zirv test
-/// baseline` itself before it overwrites the file), advances each
-/// still-baselined name's `green_streaks` counter when this run's evidence
-/// says it is clean, or resets it to 0 the moment it is seen failing again --
-/// so a name only ever earns `zirv test baseline --prune` eligibility from
-/// repeated, real green evidence, never from a single lucky run or a run
-/// that never even exercised it.
-///
-/// Does nothing (returns `None`, touches no file) when there is no baseline
-/// yet, the baseline is empty, this run selected no `Unit`, non-repo-supplied
-/// check at all (so it has no opinion on any baselined name), or any such
-/// check came back `Inconclusive`/`TimedOut` -- an unreliable run must never
-/// advance a streak on a guess. Only ever ingests failing names from the
-/// same check sources `run_baseline` itself trusts (never `RepoConfig`/
-/// `DiscoveredScript`), so a repository-authored check can neither manufacture
-/// nor erase prune eligibility for a name it does not own.
-///
-/// Returns an operator-facing note naming how many entries just became
-/// prune-eligible, if any -- the `zirv test changed` hint the issue's design
-/// asks for.
-///
-/// The ids of checks `run_mode` reused verbatim from an earlier report
-/// (`reusable_test_evidence`) instead of actually executing in this run --
-/// parsed from the one note `run_mode` itself writes in that exact shape
-/// (`"reused test evidence from report ... for: <ids>"`, ids being
-/// `CheckSpec::validate`-restricted to lowercase/digits/`-`/`_`, so a plain
-/// `", "` split is unambiguous). H-5: a reused result is not a fresh
-/// execution, so `update_baseline_after_run` must not count it.
+/// Advance baseline green streaks only from executed, reliable, trusted Unit checks; repo-authored or reused results must not manufacture prune eligibility. (#268)
 fn reused_check_ids_from_notes(notes: &[String]) -> std::collections::BTreeSet<&str> {
     notes
         .iter()
@@ -1688,11 +1407,7 @@ fn update_baseline_after_run(repo: &Path, report: &VerificationReport) -> Option
         .filter(|check| {
             check.kind == CheckKind::Unit
                 && !check.source.repo_supplied()
-                // H-5: a reused `CheckResult` was copied verbatim from an
-                // earlier report (`run_mode`'s `Final`-mode evidence reuse)
-                // rather than actually executed here -- it is not a fresh
-                // observation, so it must not advance (or reset) a streak a
-                // second time for the same real execution.
+                // A reused check is not a new execution and must not advance or reset a baseline streak twice.
                 && !reused.contains(check.id.as_str())
         })
         .collect();
@@ -1824,20 +1539,7 @@ impl FailureOutputTail {
     }
 }
 
-/// The retained tail (whether the stream ended in a read error rather than
-/// at EOF is the second element -- an error read as a clean end silently
-/// turned a truncated failure log into a complete-looking one), plus what a
-/// [`FailureNameScanner`] recognized in the *full*, uncapped stream as it
-/// went by -- the failing test names, whether a `test result:`/`Summary
-/// [...]` line was seen at all, and the total it declared -- see that
-/// struct's doc comment for why this must happen during capture rather than
-/// against the capped tail alone. Every check's output goes through this
-/// path (`run_check`); only the retained-tail element is ever a display
-/// artifact.
-/// `pub(crate)` (issue #326): also the classifier `ctx::output`'s
-/// `zirv ctx run --compact` capture reuses, so a compacted command's failing
-/// test names and summary recognition come from THIS scanner rather than a
-/// second, independently-drifting copy of the same rules.
+/// Capture a bounded display tail plus failure names and summary from the full stream; read errors must remain distinguishable from clean EOF. (#326)
 pub(crate) fn read_capped_tail_and_scan(
     mut reader: impl Read,
     cap: usize,
@@ -1928,30 +1630,8 @@ fn check_result(check: &ResolvedCheck, status: CheckStatus) -> CheckResult {
     }
 }
 
-/// Environment variable names always passed from the zirv process's own
-/// environment (or, on macOS only, the login session -- see
-/// `launchd_getenv` below) into a verification check child, with no
-/// `[workflow] check_env_passthrough` configuration at all. `run_check`
-/// already spawns the check with `std::process::Command::new`, which
-/// inherits the parent's full environment by default (no `env_clear`/
-/// `env_remove` sits between zirv and the check child) -- so on a machine
-/// where the zirv process itself has these set, the child already sees
-/// them. This list exists as an explicit, tested guarantee for that path
-/// rather than an implicit consequence of never having called `env_clear`,
-/// and as the seam a future sandboxing change (`Command::env_clear` for
-/// stricter check isolation) would have to widen instead of quietly
-/// regressing (issue #233: a macOS/Linux desktop session's `ssh-agent`
-/// family -- `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `SSH_ASKPASS` -- plus GPG's
-/// terminal/homedir pointers -- `GPG_TTY`, `GNUPGHOME` -- so a check that
-/// shells out to `ssh`/git-over-ssh/`gpg` (e.g. `gitlab-ci-local`'s
-/// remote-variable fetch) passes without a per-command shell workaround).
-///
-/// The reported case (issue #233) was worse than "zirv's own process has
-/// the value": the harness's shell child had no `SSH_AUTH_SOCK` in ITS OWN
-/// environment either, and the reporter's working workaround was `export
-/// SSH_AUTH_SOCK="$(launchctl getenv SSH_AUTH_SOCK)"`. `launchd_getenv`
-/// below is that same command, consulted only when a name in this list is
-/// absent from zirv's own process environment, and only on macOS.
+/// Pass allowlisted environment names through to check children; on macOS consult login-session values only when absent from this process. (#233)
+// An explicit, tested guarantee (ssh-agent and gpg pointers) rather than implicit inheritance: a future env_clear sandbox must widen this list, not regress ssh/git/gpg checks.
 const DEFAULT_CHECK_ENV_PASSTHROUGH: &[&str] = &[
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
@@ -2002,14 +1682,7 @@ enum ResolvedCheckEnvValue {
     Launchd(String),
 }
 
-/// Resolution order for one allowlisted name (issue #233): a value already
-/// present in zirv's own process environment always wins; only when it is
-/// ABSENT there is the macOS login-session fallback consulted, and only a
-/// non-empty result from it is used -- otherwise the name stays unset on the
-/// check child, exactly as it does today. `process_env`/`launchd_env` are
-/// injected so this merge is unit-tested cross-platform with a fake
-/// resolver; `run_check` wires the real lookups (`std::env::var` and
-/// `launchd_getenv`, which is a no-op on every platform but macOS).
+/// Prefer this process’s value; use a nonempty macOS login-session value only when absent, otherwise leave the child unset. (#233)
 fn resolve_one_check_env_var(
     name: &str,
     process_env: &impl Fn(&str) -> Option<String>,
@@ -2024,14 +1697,7 @@ fn resolve_one_check_env_var(
     }
 }
 
-/// `launchctl getenv <name>`: macOS's per-login-session environment, which
-/// is where a variable like `SSH_AUTH_SOCK` actually lives when the zirv
-/// process itself was not launched from that session's shell -- the exact
-/// gap issue #233 reported, and the exact command the reporter's own working
-/// workaround ran by hand. Bounded to a few seconds, no shell, stdin/stderr
-/// null; any failure (binary missing, non-zero exit, timeout, unreadable
-/// stdout) is silently `None` -- this is a best-effort fallback, never a
-/// reason to fail a check.
+/// Query macOS login-session environment without a shell and with a timeout; failures are best-effort absence, never check failures. (#233)
 #[cfg(target_os = "macos")]
 pub(crate) fn launchd_getenv(name: &str) -> Option<String> {
     let mut command = Command::new("launchctl");
@@ -2231,12 +1897,7 @@ fn run_check(
             .map(|name| scrub_line(&name))
             .collect()
     };
-    // Issue #268: never trust a bare exit code alone for a test runner. A
-    // literal spawn failure (the shell binary itself missing -- vanishingly
-    // rare) and a shell-reported "command not found" (the command inside it
-    // missing -- the realistic case for a misconfigured `verify.toml`) both
-    // become `Inconclusive`, as does a recognized test runner whose result
-    // cannot be trusted.
+    // Never trust a bare test-runner exit code: missing tools and malformed output are inconclusive, not passing evidence. (#268)
     let (status, inconclusive_reason) = if spawn_tool_missing {
         (
             CheckStatus::Inconclusive,
@@ -2364,18 +2025,7 @@ pub fn load_latest(state: &StateDir, repo: &Path) -> CtxResult<Option<Verificati
     Ok(Some(report))
 }
 
-/// The `change_fingerprint` a step must see move before re-verifying is
-/// worth executing (issue #287) -- the latest persisted report's own
-/// fingerprint, but only when that report did not pass. `step_id` is
-/// accepted for the guard's own clarity at its call site but not consulted:
-/// reports are persisted one-per-repository (`report_dir`), never keyed by
-/// workflow step, so the repository's single `latest` report already IS the
-/// evidence for whichever step is currently running -- exactly the same
-/// simplification [`latest_is_fresh_and_passing`] relies on. A step
-/// transition can only ever happen once its own evidence has actually
-/// passed (see `engine.rs`'s `Test`/`Verify` gate), so a stale failing
-/// report from an earlier step can never survive into a later one's first
-/// check.
+/// Skip re-verification only after a failing repository report with the same fingerprint; passing reports never trigger the no-progress guard. (#287)
 pub fn last_failure_fingerprint(
     state: &StateDir,
     repo: &Path,
@@ -2387,12 +2037,7 @@ pub fn last_failure_fingerprint(
     if report.passed() {
         return Ok(None);
     }
-    // #302/H-2: a report whose only failures are covered by the operator's
-    // recorded baseline is gate-passing evidence (`latest_is_fresh_and_passing`
-    // treats it the same way), so it must not be mistaken for "the previous
-    // failed attempt" here -- that would make `run_required_checks` report
-    // `Unchanged` and burn an attempt on a report that actually satisfies the
-    // gate.
+    // A failure fully covered by the operator baseline is gate-passing and must not count as the previous failed attempt. (#302)
     if evaluate_against_operator_baseline(&report, repo).gate_passed {
         return Ok(None);
     }
@@ -2415,12 +2060,7 @@ pub(crate) fn latest_report_id(state: &StateDir, repo: &Path) -> CtxResult<Optio
     Ok(load_latest(state, repo)?.map(|report| report.id))
 }
 
-/// `branch` is the workflow's own recorded branch (`WorkflowState::branch`),
-/// when the caller has one -- `None` for contexts with no specific workflow
-/// in view (an advisory nudge, a presentation-only status line). It is ONLY
-/// ever used to gate the widened, cross-checkout half of this check; the
-/// literal checkout's own evidence is always trusted regardless, exactly as
-/// before #467.
+/// Use the workflow branch only to widen reads to related sibling checkouts; literal checkout evidence remains local. (#467)
 pub fn latest_is_fresh_and_passing(
     state: &StateDir,
     repo: &Path,
@@ -2430,21 +2070,7 @@ pub fn latest_is_fresh_and_passing(
     if latest_is_fresh_and_passing_at(state, repo, final_only, None)? {
         return Ok(true);
     }
-    // Issue #467 round 3 (relatedness): `report_dir`/`save_report` stay
-    // keyed by the literal checkout (plain `repo_slug`), so two sibling
-    // worktrees never clobber each other's `zirv test changed` evidence --
-    // but that also means this gate, evaluated from one checkout (typically
-    // the orchestrator's own main checkout, its tree clean), could never see
-    // a worker's fresh, passing evidence recorded in a linked worktree. This
-    // widens only the READ side, and ONLY to a sibling whose OWN recorded
-    // evidence branch matches the workflow's own recorded branch exactly --
-    // review round 2 caught that widening to ANY fresh, passing sibling
-    // (with no relatedness check at all) let an entirely unrelated worker's
-    // evidence on a DIFFERENT branch satisfy this workflow's gate, reaching
-    // as far as `deploy.rs`'s production tier. `branch.filter(|b|
-    // !b.is_empty())` also means a caller with no workflow branch context,
-    // or a workflow whose own branch could not be resolved at `start`, never
-    // widens at all -- there is nothing safe to match against.
+    // Keep reports keyed to literal checkouts; widen gate reads only to siblings whose recorded branch exactly matches a nonempty workflow branch. (#467)
     let Some(branch) = branch.filter(|b| !b.is_empty()) else {
         return Ok(false);
     };
@@ -2543,24 +2169,7 @@ fn reusable_test_evidence(
     }
 }
 
-/// Issue #699 (per-check evidence), Tier B: the prior report a `Final` run
-/// may pull *individual* checks from even though its own whole-changeset
-/// `change_fingerprint` no longer matches (`reusable_test_evidence` above --
-/// Tier A -- already covers the exact-match case, unconditionally on paths).
-/// Unlike Tier A, this is not restricted to a `Changed`/`All`-mode source:
-/// a second `zirv verify` after a small fix is exactly the same shape of
-/// problem. Still requires `narrowed_to` empty (rule 5 -- a narrowed run is
-/// evidence about the checks it ran, not a trustworthy snapshot of "what
-/// changed" for path comparison) and, per rule 1, the *exact* same HEAD
-/// commit as right now: committing can rewrite lockfiles, submodules,
-/// generated files, and toolchain pins in ways a working-tree path diff
-/// would never show, so two different HEADs are never bridged this way.
-/// A prior report with no recorded HEAD at all (persisted before #699) never
-/// matches, deliberately including against a current empty `current_head`
-/// (an unborn branch) -- "reuse nothing" is exactly as safe as always. A
-/// stale-by-mode-mismatch case does not exist here since mode is not
-/// consulted; a missing or otherwise ineligible report yields `None`,
-/// treated as "nothing to reuse".
+/// Reuse per-check evidence across a changed fingerprint only from an unnarrowed report at the same exact HEAD; missing HEAD disables reuse. (#699)
 fn per_check_reuse_source(
     state: &StateDir,
     repo: &Path,
@@ -2580,24 +2189,7 @@ fn per_check_reuse_source(
     }
 }
 
-/// Issue #699 rule 4: the paths that may have changed between `prior`'s own
-/// snapshot and now, derived honestly from recorded data rather than
-/// assumed. `prior.changed_paths` is exactly what `changed_paths(repo)` (the
-/// uncommitted diff against HEAD, plus untracked files) saw at the moment
-/// `prior` was produced; `current` is that same function's result right
-/// now. Given the identical HEAD at both times (the caller,
-/// `per_check_reuse_source`, has already checked this), a path absent from
-/// BOTH snapshots is *proven* unchanged: had its content (or existence)
-/// differed from HEAD's at either snapshot, it would appear in that
-/// snapshot's list; absent from both means it equalled HEAD's content at
-/// both times, hence equalled itself across the gap. So the union of the
-/// two snapshots is a sound upper bound on what could have changed -- it
-/// can only ever over-flag a path that in fact stayed the same (a
-/// redundant but harmless rerun), never miss one that actually changed.
-/// Owned rather than borrowed: the source report is moved alongside this set
-/// into `run_mode`'s `per_check_evidence`, so a set borrowing out of it would
-/// be self-referential. The extra clone is one run's worth of short path
-/// strings, not a hot loop.
+/// With identical HEAD, union prior and current changed paths as a safe upper bound; absent from both means unchanged at both snapshots. (#699)
 fn changed_paths_union(
     prior: &VerificationReport,
     current: &[PathBuf],
@@ -2610,12 +2202,7 @@ fn changed_paths_union(
         .collect()
 }
 
-/// Issue #699 rule 3: empty `paths` means "depends on everything", so a
-/// check that declares none can never be proven unaffected. The only caller
-/// (`run_mode`'s Tier B branch) reaches this exclusively once Tier A's
-/// exact-fingerprint reuse has already found nothing for the whole run --
-/// i.e. something in the changeset did change -- so an unscoped check must
-/// always re-run.
+/// A check with no declared paths depends on everything and must rerun when the whole fingerprint changed. (#699)
 fn check_paths_touched(paths: &[String], changed: &std::collections::BTreeSet<PathBuf>) -> bool {
     if paths.is_empty() {
         return true;
@@ -2628,16 +2215,7 @@ fn check_paths_touched(paths: &[String], changed: &std::collections::BTreeSet<Pa
     })
 }
 
-/// Weighs an already-failing `report` against the operator's recorded
-/// per-repository baseline (`zirv test baseline`), sharing this one code path
-/// between the step gate (`latest_is_fresh_and_passing`) and the review
-/// package's verification evidence (`review::VerificationEvidence`) -- see
-/// issue #238, where the review package previously had zero baseline
-/// awareness and so reported a raw, waiver-blind `passed:false` even when the
-/// gate itself had already passed via the baseline. A baseline file that
-/// fails to load (never recorded, or a genuine read error) degrades to "no
-/// baseline", reproducing the strict any-failure-closes-the-gate behavior
-/// exactly, just as it does on the gate path.
+/// Evaluate operator baseline through one shared path for gates and review evidence; unreadable baseline means no waiver. (#238)
 pub fn evaluate_against_operator_baseline(
     report: &VerificationReport,
     repo: &Path,
@@ -2646,14 +2224,7 @@ pub fn evaluate_against_operator_baseline(
     report.evaluate_against_baseline(baseline.as_ref())
 }
 
-/// The `proves:`/`fix:` announcement issue #268 asks for alongside a gate
-/// failure: an `Inconclusive` verdict is worded differently from an ordinary
-/// `Fail`, since a crashed runner or an empty selection proves nothing about
-/// the change set in either direction, whereas a real failure at least
-/// proves something is broken. Meant to be appended to the plain "run `zirv
-/// test changed`/`zirv verify`" message every `latest_is_fresh_and_passing`
-/// call site already produces on its own -- see `engine.rs`'s step gate and
-/// `deploy.rs`'s production gate.
+/// Announce inconclusive checks differently from evidenced failures while both block the gate. (#268)
 pub fn gate_announcement(state: &StateDir, repo: &Path, final_only: bool) -> String {
     let command = if final_only {
         "zirv verify"
@@ -2712,19 +2283,9 @@ fn run_mode(
     let repo_gates = super::repo_gates(repo);
     let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
-    // Issue #699: read once, up front -- before any check has a chance to
-    // run -- so both the early "no checks" return below and the main path
-    // record the exact same HEAD, and so the later Tier B lookup
-    // (`per_check_reuse_source`) compares against this same snapshot rather
-    // than a second, potentially different `git rev-parse HEAD` call.
+    // Capture HEAD once before any check runs so early and main paths compare against the same commit snapshot. (#699)
     let current_head = head_sha(repo).unwrap_or_default();
-    // Issue #268's degraded-gate ban: zero checks configured or
-    // discoverable is reported, not silently treated as a pass and not a
-    // hard `Err` either (an empty/absent `verify.toml` must not brick `zirv
-    // test`/`zirv verify` outright -- same reasoning as the repo-gate note
-    // above). Only the operator-only `workflow.allow_empty_verify` override
-    // can make this a `Passed` run instead; the override's use is recorded
-    // in `notes` either way, so it is visible in the report.
+    // Zero configured checks are inconclusive unless the operator allows empty verify; record that override in the report. (#268)
     if resolved.checks.is_empty() {
         let allow_empty = repo_gates.allow_empty_verify;
         notes.push(if allow_empty {
@@ -2814,15 +2375,9 @@ fn run_mode(
     }
 
     let started_at = now_secs();
-    // Before the checks, not after: a fingerprint taken afterwards records
-    // edits made *during* a long suite as if they had been tested.
-    // `current_head` (issue #699) was already captured above, before even
-    // `resolved.checks.is_empty()` was checked, for the same reason.
+    // Capture the change fingerprint before checks so edits during a long suite cannot appear tested.
     let change_fingerprint = change_fingerprint(repo)?;
-    // A `zirv verify` (Final) run reuses `zirv test changed`/`zirv test all`'s
-    // own fresh, un-narrowed evidence for this exact fingerprint rather than
-    // re-executing every check it already ran. `dry_run` never reuses: it
-    // exists to preview what would run, not to report history in its place.
+    // Reuse fresh, full evidence for an identical fingerprint in Final mode; dry runs only preview execution.
     let state_for_reuse = if mode == VerificationMode::Final && !dry_run {
         StateDir::resolve(&|key| std::env::var(key).ok()).ok()
     } else {
@@ -2832,13 +2387,7 @@ fn run_mode(
         .as_ref()
         .and_then(|state| reusable_test_evidence(state, repo, change_fingerprint).ok())
         .flatten();
-    // Issue #699 (per-check evidence), Tier B: Tier A above only fires when
-    // the *whole* changeset fingerprint is byte-identical. When it moved --
-    // typically a fix landing between `zirv test` and `zirv verify` -- a
-    // specific check may still be safely reused when nothing it declares in
-    // `paths` changed since the prior report. Computed only once Tier A
-    // found nothing, since an exact-fingerprint match already covers every
-    // matching check regardless of its own paths (nothing at all changed).
+    // When the whole fingerprint moved, consider per-check reuse only after exact-fingerprint reuse fails and only for unaffected paths. (#699)
     let per_check_evidence = if reusable.is_none() {
         state_for_reuse.as_ref().and_then(|state| {
             let source = per_check_reuse_source(state, repo, &current_head).ok()??;
@@ -2857,10 +2406,7 @@ fn run_mode(
     let mut budget_noted = false;
     let mut reused_ids = Vec::new();
     for check in selected {
-        // The operator's current repo-check gate is applied before any evidence
-        // reuse: the gate lives in global configuration, outside the change
-        // fingerprint, so a repo-supplied check that passed while the gate was
-        // on must report `Skipped` now, not a reused `Passed` (review finding).
+        // Apply the current operator repo-check gate before reuse because config is outside the change fingerprint.
         if !repo_checks_enabled && check.source.repo_supplied() {
             checks.push(check_result(check, CheckStatus::Skipped));
             continue;
@@ -2871,25 +2417,12 @@ fn run_mode(
                     && !matches!(prior.status, CheckStatus::Skipped | CheckStatus::DryRun)
             })
         {
-            // Never a `Skipped`/`DryRun` prior result: neither actually ran,
-            // so reusing one would carry a stale non-answer forward instead
-            // of letting this run evaluate the check for real -- e.g.
-            // `workflow.repo_checks_enabled` toggled on between the two runs.
-            // Deliberately still allows a prior `Failed` through, unlike
-            // Tier B's rule 2 below: an exact-fingerprint match means
-            // *nothing at all* changed, so a prior failure is still the
-            // correct verdict for this check right now, not a stale one.
+            // Reuse only executed prior results; an exact fingerprint may carry a prior failure, but skipped or dry-run results must rerun.
             reused_ids.push(check.spec.id.clone());
             checks.push(prior.clone());
             continue;
         }
-        // Issue #699 (per-check evidence), Tier B: only an unambiguous prior
-        // `Passed` is ever eligible (rule 2 -- a failure, `Skipped`,
-        // `DryRun`, or anything else proves nothing about *this* run and
-        // must always re-execute), and only when this check's own `paths`
-        // did not touch anything in the union of what changed between the
-        // prior report and now (rule 3/4 -- `check_paths_touched` refuses
-        // outright for a check with no declared `paths`).
+        // Across a moved fingerprint, reuse only a prior Passed result whose declared paths do not intersect the changed-path union. (#699)
         if let Some((source, changed)) = &per_check_evidence
             && !check_paths_touched(&check.spec.paths, changed)
             && let Some(prior) = source
@@ -2918,13 +2451,7 @@ fn run_mode(
         }
         checks.push(result);
     }
-    // Exactly one of the two tiers can ever have supplied a reused check in
-    // a single run (Tier B is only computed when Tier A found nothing), so
-    // there is exactly one candidate source report to name here -- extending
-    // the one existing reused-ids note (`reused_check_ids_from_notes`)
-    // rather than inventing a second, parallel mechanism (issue #699 rule
-    // 6). The note's shape is unchanged: readers that already parse it
-    // (`update_baseline_after_run`) need no update.
+    // Only one reuse tier can supply a check; preserve the existing note shape for baseline readers. (#699)
     let reuse_note_source = reusable
         .as_ref()
         .or_else(|| per_check_evidence.as_ref().map(|(source, _)| source));
@@ -2958,9 +2485,7 @@ fn run_mode(
     })
 }
 
-/// Persist the report and record telemetry. Deliberately separate from
-/// `run_mode` and called *after* the results are printed: a state-directory
-/// failure used to discard a whole verification run's results with a `?`.
+/// Print results before best-effort persistence so a state-directory error cannot erase the run output.
 fn persist(report: &VerificationReport, repo: &Path, mode: VerificationMode) -> CtxResult<()> {
     let state = StateDir::resolve(&|key| std::env::var(key).ok())?;
     save_report(&state, report)?;
@@ -3079,10 +2604,7 @@ fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> Ct
     if args.run.dry_run {
         return Ok(code);
     }
-    // Issue #268's degraded-gate ban: a run that proves nothing either way
-    // must never be recorded as evidence a set of tests is exactly this
-    // repository's known-bad list -- that is what let a crashed runner (or
-    // an empty selection) silently become "the baseline says this is fine".
+    // Never record an inconclusive run as the operator baseline; it proves no exact known-bad set. (#268)
     if let GateOutcome::Inconclusive(reason) = report.outcome() {
         crate::output::warn(format!(
             "baseline not recorded: this run was inconclusive ({}) -- re-run once the runner \
@@ -3120,13 +2642,7 @@ fn run_baseline(repo: &Path, args: &BaselineArgs, writer: &mut impl Write) -> Ct
         failing.extend(names);
     }
     let count = failing.len();
-    // A narrowed run (`--check <id>...`) only ever observed the checks it
-    // selected -- `save_baseline` otherwise replaces `failing_tests`
-    // wholesale, which would silently delete every name a *different* check
-    // previously recorded (H-4). Merge into the existing baseline instead so
-    // a narrowed recording can only ever add names, never drop ones it never
-    // looked at; a full, unnarrowed run keeps the existing replace-wholesale
-    // semantics, since that run did observe everything.
+    // A narrowed baseline run may add observed failing names but must not drop names from checks it never ran.
     let to_record = if report.narrowed_to.is_empty() {
         failing
     } else {
@@ -3364,12 +2880,7 @@ fn write_builtin_lines(
     Ok(())
 }
 
-/// Issue #640: resolves `--check` against the builtin registry (case-
-/// insensitive exact id match), in `ALL_IDS` order regardless of the order
-/// given on the command line. An empty filter means "every id". A name that
-/// matches nothing is a hard error naming every valid id -- the builtin path
-/// used to silently ignore an unknown `--check` and run (and pass) the whole
-/// registry instead.
+/// Resolve builtin check ids case-insensitively in registry order; reject unknown ids instead of silently running all. (#640)
 fn resolve_builtin_check_ids(checks: &[String]) -> CtxResult<Vec<&'static str>> {
     if checks.is_empty() {
         return Ok(super::checks::ALL_IDS.to_vec());
@@ -3480,9 +2991,7 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
             ));
         }
     }
-    // Issue #640: `--builtin` has its own fast path so `--check`/`--dry-run`
-    // can narrow it without ever running (or reporting a stale pass for) the
-    // checks the caller did not ask for.
+    // The builtin fast path applies check filters and dry-run mode without reporting unrequested checks. (#640)
     if args.builtin {
         let selected_ids = resolve_builtin_check_ids(&args.run.checks)?;
         if args.run.dry_run {
@@ -3498,10 +3007,7 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
             .into_iter()
             .filter(|check| selected_ids.contains(&check.id))
             .collect();
-        // `NotApplicable` counts as passing: most of these checks read
-        // zirv's own files, and their absence in another repository is a
-        // fact about that repository, not a failed invariant.
-        // `Inconclusive` still blocks (issue #268's degraded-gate ban).
+        // NotApplicable passes outside zirv; missing required input in zirv remains Inconclusive and blocks. (#268)
         let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
         if let Err(error) = write_builtin_report(writer, &builtins, args.run.json) {
             if !is_broken_pipe(error.as_ref()) {

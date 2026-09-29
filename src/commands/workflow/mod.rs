@@ -38,15 +38,7 @@ pub mod team;
 pub mod telemetry;
 pub mod verification;
 
-/// A workflow's position, as much as issue #209/v3's dashboard footer
-/// segment (§D) needs to show it: which methodology, which step, and
-/// whether that step is gated on the operator's approval right now.
-/// Deliberately smaller than `engine::WorkflowState` -- the dashboard reads
-/// this on its own disk-facts throttle (`ctx::dash::mod::FactsCache::
-/// refresh_if_due`) and has no use for the rest of a workflow's state
-/// (artifacts, review findings, classification, ...), the same "small data
-/// interface" this module's own doc comment above calls for rather than
-/// exposing `ctx` to workflow internals wholesale.
+/// Small workflow status view for the dashboard cache; it does not expose artifacts, findings or classification. (#209)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveWorkflowSummary {
     pub kind: &'static str,
@@ -78,9 +70,7 @@ pub fn active_workflow_summary(
     })
 }
 
-/// Reserved top-level names handled by this command tree. Later workflow
-/// layers add implementations for every name; reserving the complete surface
-/// now prevents a repository script from taking one over between releases.
+/// Reserve the full command surface so repository scripts cannot claim a name between releases.
 pub const TOP_LEVEL_COMMANDS: &[&str] = &[
     "skill", "workflow", "test", "verify", "artifact", "frontend",
 ];
@@ -92,13 +82,7 @@ pub(crate) struct RepoGates {
     pub checks: bool,
     pub skills: bool,
     pub agents: bool,
-    /// Operator-owned `[workflow] repo_workflows_enabled` (REPO_FORBIDDEN,
-    /// off by default, issue #542) -- whether untrusted repository-provided
-    /// `.zirv/workflows/` definition packs are loaded at all. Off by default,
-    /// same posture as `agents`: a checkout may propose a new pack only
-    /// after the operator explicitly enables this layer, and even then may
-    /// never replace a trusted built-in/operator id or widen authority --
-    /// see `registry::WorkflowRegistry`.
+    /// Repository packs are off until the operator enables them; they cannot replace trusted ids or widen authority. (#542)
     pub workflows: bool,
     /// Operator-owned `[workflow] check_env_passthrough` (REPO_FORBIDDEN,
     /// `~/.zirv/ctx.toml`/`ZIRV_CTX_*` only) -- extra environment variable
@@ -107,18 +91,9 @@ pub(crate) struct RepoGates {
     /// not even be read, same fail-closed posture as `checks`/`skills`/
     /// `agents` above.
     pub check_env_passthrough: Vec<String>,
-    /// Operator-owned `[workflow] allow_empty_verify` (REPO_FORBIDDEN,
-    /// `~/.zirv/ctx.toml`/`ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY`/flags only,
-    /// issue #268) -- lets `verification::run_mode` report `Passed` instead
-    /// of `Inconclusive` when zero checks are configured or discoverable.
-    /// `false` (the stricter, fail-closed reading) when the config could
-    /// not even be read, same posture as `checks`/`skills`/`agents` above.
+    /// Only operator configuration may allow an empty verify pass; unreadable config defaults to inconclusive. (#268)
     pub allow_empty_verify: bool,
-    /// Operator-owned `[workflow] builtin_checks_exclude` (REPO_FORBIDDEN,
-    /// `~/.zirv/ctx.toml`/`ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`/flags
-    /// only, issue #276) -- dotted ids of `verification::checks`'s built-in
-    /// self-checks to skip. Empty (every builtin runs) when the config
-    /// could not even be read, same fail-closed posture as the other gates.
+    /// Only operator configuration may exclude built-in checks; unreadable config runs them all. (#276)
     pub builtin_checks_exclude: Vec<String>,
 }
 
@@ -190,10 +165,7 @@ struct WorkflowCli {
     command: WorkflowCommand,
 }
 
-/// This tree's `clap::Command`, for `commands::command_entries` (issue #355)
-/// to walk alongside `CtxCli`/`MemoryCli`/etc. `WorkflowCli` itself stays
-/// private -- nothing outside this module needs the parsed `WorkflowCli`
-/// value, only its shape.
+/// Expose this command tree to shared help discovery without exposing the parsed CLI value. (#355)
 pub(crate) fn command() -> clap::Command {
     use clap::CommandFactory;
     WorkflowCli::command()
@@ -258,20 +230,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     match run(&cli, &mut std::io::stdout()) {
         Ok(code) => code,
         Err(err) => {
-            // Issue #542 review finding 17: `StartArgs`/`ShowArgs`'s
-            // positional was a closed `WorkflowKind` `ValueEnum` before
-            // #542 -- an unrecognized value failed AT CLAP PARSE TIME
-            // (exit 2, the `Err` branch above), before `run` ever ran. Now
-            // that it is a plain registry id string, clap always accepts
-            // it and the same "unknown workflow" condition only surfaces
-            // here, as an ordinary runtime error (which unconditionally
-            // exits 1) -- a user-facing behavior change the issue never
-            // asked for. Restore the old exit code for exactly this
-            // condition on exactly these two subcommands (the ones that
-            // used to be clap-validated); every other "unknown workflow"
-            // error (e.g. an unknown RUN id to `status`/`approve`) was
-            // already a plain string before #542 and keeps exiting 1,
-            // unchanged.
+            // Preserve clap’s exit code 2 for unknown start/show workflow ids; other unknown ids remain runtime errors with exit code 1. (#542)
             let is_registry_id_lookup = matches!(
                 &cli.command,
                 WorkflowCommand::Workflow(args)
