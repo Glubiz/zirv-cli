@@ -5,10 +5,7 @@ pub(super) enum EnvKind {
     Int,
     Float,
     Bool,
-    /// Same parsing as `Bool`, but the parsed value is inverted before being
-    /// inserted. `ZIRV_CTX_QUIET=true` needs to become `chrome.events =
-    /// false`, and this is the one variable in `ENV_MAP` whose meaning is the
-    /// negation of the config key it feeds.
+    /// Invert parsed booleans so quiet=true disables chrome events.
     NegatedBool,
     Str,
 }
@@ -630,8 +627,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     ("ZIRV_CTX_CHROME_BAR", &["chrome", "bar"], EnvKind::Bool),
-    // Not `["chrome", "events"], EnvKind::Bool`: quiet is the inverse of
-    // events, so this is the one entry that needs `NegatedBool`.
+    // Quiet is the inverse of events.
     (
         "ZIRV_CTX_QUIET",
         &["chrome", "events"],
@@ -751,9 +747,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["handover", "codex", "deep"],
         EnvKind::Str,
     ),
-    // Issue #699: the cost-routing lever's env override, one entry per
-    // (adapter, tier) leaf, the same enumeration `handover.<agent>.<tier>`
-    // right above uses.
+    // Operator env overrides for each adapter/tier model leaf (#699).
     (
         "ZIRV_CTX_MODEL_TIERS_CLAUDE_FAST",
         &["model_tiers", "claude", "fast"],
@@ -809,9 +803,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["task", "max_parent_outcome_bytes"],
         EnvKind::Int,
     ),
-    // Issue #352: the operator's own override for every persistent-runtime
-    // key. These are the ONLY spellings besides `~/.zirv/ctx.toml` and an
-    // explicit flag that can set them -- see `REPO_FORBIDDEN` below.
+    // Persistent-runtime settings accept only operator config, env or explicit flags (#352).
     (
         "ZIRV_CTX_SESSION_PERSISTENT",
         &["session", "persistent"],
@@ -832,20 +824,15 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["session", "stale_after_secs"],
         EnvKind::Int,
     ),
-    // Issue #483: the operator's master switch for the configured MCP/web/
-    // browser integrations, and the spelling `REPO_FORBIDDEN` names when it
-    // rejects a repo layer's `[capabilities]` table.
+    // Operator master switch; also named in forbidden repo-config errors (#483).
     (
         "ZIRV_CTX_CAPABILITIES",
         &["capabilities", "enabled"],
         EnvKind::Bool,
     ),
-    // Issue #491: the operator's opt-in native default, and the spelling
-    // `REPO_FORBIDDEN` names when it rejects a repo layer's `[runtime]` table.
+    // Operator runtime override; also named in forbidden repo-config errors (#491).
     ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
-    // Issue #537 seam: the harness proxy's own `[proxy]`/`[proxy.typesafe]`
-    // tables, every key `REPO_FORBIDDEN` -- see that const's own entries for
-    // this same set.
+    // Operator proxy overrides; every corresponding config key is repo-forbidden (#537).
     (
         "ZIRV_CTX_PROXY_ENABLED",
         &["proxy", "enabled"],
@@ -891,9 +878,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["proxy", "typesafe", "timeout_secs"],
         EnvKind::Int,
     ),
-    // Issue #537 seam extraction (task A1): the operator's own override for
-    // every `[jev]` advisory-site key -- see that same const's own entries
-    // in `REPO_FORBIDDEN`, below.
+    // Operator advisory-site overrides; every corresponding config key is repo-forbidden (#537).
     ("ZIRV_CTX_JEV_MEMORY", &["jev", "memory"], EnvKind::Bool),
     (
         "ZIRV_CTX_JEV_SUPERVISOR",
@@ -967,9 +952,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["jev", "cache_ttl_secs"],
         EnvKind::Int,
     ),
-    // Issue #803: the operator's own override for each tunable site's own
-    // `[jev.floors.<site>]` confidence/margin -- see that same const's own
-    // `[jev, "floors"]` whole-table entry in `REPO_FORBIDDEN`, below.
+    // Operator floor overrides; the whole config table is repo-forbidden (#803).
     (
         "ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE",
         &["jev", "floors", "memory", "min_confidence"],
@@ -1060,13 +1043,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["jev", "floors", "inject", "min_margin"],
         EnvKind::Float,
     ),
-    // Issue #788: the operator's own override for every `[headless]` cost
-    // lever -- see that same const's own entries in `REPO_FORBIDDEN`, below.
-    // `headless.disallowed_tools` has no `ENV_MAP` entry: like `sandbox.
-    // extra_allow`/`dash.workdir_roots`, `EnvKind` has no list-shaped
-    // variant, so `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` is a plain
-    // comma-separated override applied directly to `cfg.headless.
-    // disallowed_tools` after `ENV_MAP` runs.
+    // Operator headless overrides (#788). Lists have no EnvKind, so disallowed tools use a later CSV override.
     (
         "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
         &["headless", "prompt_cache_ttl"],
@@ -1099,13 +1076,7 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
 ];
 
-/// The `ctx.toml` key path (e.g. `["jev", "memory"]`) a compiled env var
-/// overrides, or `None` when `name` has no `ENV_MAP` entry. `ENV_MAP` itself
-/// stays module-private (it also carries each key's `EnvKind`, which is not
-/// this crate's business outside `config.rs`'s own load/merge/audit code) --
-/// this is the one narrow, read-only accessor a caller outside this module
-/// needs to render a real config-key path for an env var it already knows
-/// about (e.g. an autoresearch candidate's own `env` overlay).
+/// Expose the config path for an env override without exposing parsing kinds outside this module.
 pub(crate) fn toml_path_for_env(name: &str) -> Option<&'static [&'static str]> {
     ENV_MAP
         .iter()
@@ -1113,10 +1084,7 @@ pub(crate) fn toml_path_for_env(name: &str) -> Option<&'static [&'static str]> {
         .map(|(_, path, _)| *path)
 }
 
-/// Parsed `ctx.toml` surfaces that do not have scalar environment overrides
-/// and therefore cannot be discovered through `ENV_MAP`. Kept as an explicit
-/// table so ZCHK-FORBIDDEN-WIDENING audits them instead of silently missing a
-/// new list/table-shaped capability surface.
+/// List non-scalar surfaces explicitly so forbidden-widening audits cannot miss capabilities absent from ENV_MAP.
 pub(crate) const NON_ENV_CONFIG_SURFACES: &[&[&str]] = &[
     &["workspace", "name"],
     &["workspace", "git"],
@@ -1138,9 +1106,7 @@ pub(super) fn merge(base: &mut toml::Table, over: toml::Table) {
     }
 }
 
-/// Add two array-valued trust layers without allowing the later repository
-/// layer to replace the operator's entries. A malformed value is preserved
-/// so the real `CtxConfig` deserializer still reports its exact type error.
+/// Append layers without replacing operator entries; preserve malformed values for precise serde errors.
 pub(super) fn combine_additive_array(
     home: Option<toml::Value>,
     repo: Option<toml::Value>,
@@ -1156,15 +1122,7 @@ pub(super) fn combine_additive_array(
     }
 }
 
-/// Removes `table[section][key]` and returns it, leaving the rest of
-/// `table[section]` (if any) untouched -- the nested equivalent of
-/// `toml::Table::remove`, used to lift `sandbox.extra_deny` out of a layer
-/// before the ordinary deep merge (`merge()` above would let a later
-/// layer's array *replace* an earlier one's instead of adding to it, the
-/// same reason `[policy]` is lifted out whole via `POLICY_SECTION`). Only
-/// `extra_deny` needs this: `extra_allow` never needs lifting because it is
-/// `REPO_FORBIDDEN` outright, so a repo layer can never contribute a value
-/// for `merge()` to clobber the operator's with in the first place.
+/// Lift a nested key before merging so a repo value cannot replace operator restrictions.
 pub(super) fn take_nested(
     table: &mut toml::Table,
     section: &str,
@@ -1200,12 +1158,7 @@ pub(super) fn deploy_tier_at(
         .transpose()
 }
 
-/// A `toml::Value::Array` of strings (from `take_nested`) as owned
-/// `Vec<String>`, or empty for anything else (absent, wrong shape) -- the
-/// deserializer catches a genuinely malformed `sandbox.extra_deny` later
-/// when the merged table is deserialized into `CtxConfig` proper; this
-/// helper only needs to read the two candidate layers well enough to union
-/// them before that point.
+/// Read candidate string arrays for unioning; absent or wrong-shaped values yield an empty list.
 pub(super) fn string_array(value: Option<toml::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_array().cloned())
@@ -1215,10 +1168,7 @@ pub(super) fn string_array(value: Option<toml::Value>) -> Vec<String> {
         .collect()
 }
 
-/// A `toml::Value::Boolean` (from `take_nested`) as `Option<bool>` -- a
-/// wrong-shaped or absent value reads as `None`, the same "let the real
-/// deserializer catch malformed input later" contract `string_array` above
-/// follows.
+/// Absent or non-boolean values contribute no boolean candidate.
 pub(super) fn bool_at(value: Option<toml::Value>) -> Option<bool> {
     value.and_then(|v| v.as_bool())
 }
@@ -1238,8 +1188,7 @@ pub(super) fn string_array_at(value: Option<toml::Value>) -> Option<Vec<String>>
     })
 }
 
-/// A repo fallback order may remove entries but never add or reorder them.
-/// Empty is a legitimate "no automatic fallback candidates" narrowing.
+/// Repos may remove fallback entries but never add or reorder them; empty disables automatic candidates.
 pub(super) fn narrow_fallback_order(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<String> {
     let Some(repo) = repo else {
         return home;
@@ -1249,14 +1198,7 @@ pub(super) fn narrow_fallback_order(home: Vec<String>, repo: Option<Vec<String>>
         .collect()
 }
 
-/// A `toml::Value::Table` of per-harness `[fallback.harness.<name>]` entries
-/// (from `take_nested`) as an owned map of raw `(max_active, reserve_
-/// headroom_pct)` pairs -- absent or wrong-shaped reads as empty, same "let
-/// the real deserializer catch malformed input" contract `string_array`
-/// follows. Kept as raw `i64`/`f64` rather than `HarnessLimits` here because
-/// the narrowing fold below needs to distinguish "not present" from "present
-/// but zero" for both fields before the real deserializer's own `u32`/`f64`
-/// typing ever runs.
+/// Preserve raw numeric candidates so narrowing distinguishes absent values from explicit zero.
 pub(super) fn fallback_harness_map_at(
     value: Option<toml::Value>,
 ) -> std::collections::BTreeMap<String, (Option<i64>, Option<f64>)> {
@@ -1274,25 +1216,8 @@ pub(super) fn fallback_harness_map_at(
         .collect()
 }
 
-/// The repo-narrowing fold for `[fallback.harness.<name>]` (issue #358): per
-/// name, `max_active` may only be lowered (`min`, repo may only tighten a
-/// concurrency ceiling) and `reserve_headroom_pct` may only be raised
-/// (`max`, repo may only demand more of a safety margin) -- the same two
-/// polarities `fallback.predictive_headroom_pct`/`fallback.min_candidate_
-/// headroom_pct` already use, applied per harness instead of globally. A
-/// harness named by only one layer keeps that layer's own `max_active`
-/// outright: `None` on the missing side already means "no override, use the
-/// global limits", so the other layer's value is itself the narrowing.
-///
-/// A-2/D-3: that reasoning does NOT hold for `reserve_headroom_pct`, whose
-/// absent side means "use the global `min_candidate_headroom_pct` floor" --
-/// a real number, not "no limit". A repo-only entry naming a reserve below
-/// that floor was therefore strictly *widening*: `FallbackConfig::
-/// reserve_headroom_pct` hands it straight to the allocator's refusal gate
-/// in place of the floor the repo layer may only ever raise (the global fold
-/// is `home.max(repo)`). A repo reserve on a harness the home layer never
-/// mentioned is clamped to `global_floor` for that reason; a home-set
-/// reserve is the operator's own and stands as written.
+/// Repos may only lower concurrency ceilings and raise reserved headroom (#358).
+/// An absent home reserve means the global floor, not unlimited capacity; repo-only reserves must meet it.
 pub(super) fn narrow_fallback_harness(
     home: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
     repo: std::collections::BTreeMap<String, (Option<i64>, Option<f64>)>,
@@ -1321,12 +1246,7 @@ pub(super) fn narrow_fallback_harness(
         .collect()
 }
 
-/// A `toml::Value::Float` or `Value::Integer` (from `take_nested`) as
-/// `Option<f64>` -- TOML happily writes `max_percent = 90` with no decimal
-/// point, which parses as an `Integer`, not a `Float`; without the second
-/// arm a whole-number override would silently vanish from the narrowing
-/// fold below (read as `None`, i.e. "this layer didn't set it") while still
-/// reaching the real deserializer just fine on its own.
+/// Accept TOML integers as floats so whole-number overrides cannot silently escape narrowing.
 pub(super) fn float_at(value: Option<toml::Value>) -> Option<f64> {
     value.and_then(|v| match v {
         toml::Value::Float(f) => Some(f),
@@ -1335,43 +1255,29 @@ pub(super) fn float_at(value: Option<toml::Value>) -> Option<f64> {
     })
 }
 
-/// Shared repo-narrowing fold: the smaller of `home` and `repo` (`repo`
-/// absent treated as `absent`) wins -- used by every key below where a
-/// lower value is stricter, including `bool` (`false` stricter than
-/// `true`). Not for `f64`: use [`narrow_min_f64`], since `f64::min` treats
-/// `NaN` differently than a plain `PartialOrd` comparison.
+/// Smaller is stricter, including false for bool; use `narrow_min_f64` for its distinct NaN semantics.
 pub(super) fn narrow_min<T: PartialOrd + Copy>(home: T, repo: Option<T>, absent: T) -> T {
     let repo = repo.unwrap_or(absent);
     if repo < home { repo } else { home }
 }
 
-/// The `max` mirror of [`narrow_min`]: the larger of `home` and `repo`
-/// wins. Not for `f64`: use [`narrow_max_f64`].
+/// Larger is stricter; use `narrow_max_f64` for floating-point NaN semantics.
 pub(super) fn narrow_max<T: PartialOrd + Copy>(home: T, repo: Option<T>, absent: T) -> T {
     let repo = repo.unwrap_or(absent);
     if repo > home { repo } else { home }
 }
 
-/// [`narrow_min`] for `f64`, via the primitive `f64::min` so `NaN` is
-/// ignored rather than compared, matching the original per-key folds.
+/// Use primitive f64 min to ignore NaN rather than compare it.
 pub(super) fn narrow_min_f64(home: f64, repo: Option<f64>, absent: f64) -> f64 {
     home.min(repo.unwrap_or(absent))
 }
 
-/// [`narrow_max`] for `f64`, via the primitive `f64::max`; see
-/// [`narrow_min_f64`].
+/// Use primitive f64 max to ignore NaN rather than compare it.
 pub(super) fn narrow_max_f64(home: f64, repo: Option<f64>, absent: f64) -> f64 {
     home.max(repo.unwrap_or(absent))
 }
 
-/// Issue #358 T8: the repo-narrowing fold for `supervise.orchestrator_
-/// writes` -- `OrchestratorWrites`'s own declared `Allow < Advise < Deny`
-/// order makes `Deny` the strict end, the same shape `deploy::DeployTier`
-/// uses for `workflow.deploy.minimum_tier`, so `max` is the fold: a repo
-/// asking for a stricter posture than the operator configured wins, a repo
-/// asking for a looser one is ignored. `repo` absent contributes nothing
-/// (folds in as `Allow`, the loosest value, so an untouched repo layer never
-/// tightens a home layer that left this at `Allow`).
+/// Allow < Advise < Deny makes max the stricter fold; absent repo values add no restriction (#358).
 pub(super) fn narrow_orchestrator_writes(
     home: OrchestratorWrites,
     repo: Option<OrchestratorWrites>,
@@ -1379,9 +1285,6 @@ pub(super) fn narrow_orchestrator_writes(
     home.max(repo.unwrap_or(OrchestratorWrites::Allow))
 }
 
-/// A `toml::Value::String` (from `take_nested`) parsed as `OrchestratorWrites`
-/// through its own `Deserialize` impl, mirroring `deploy_tier_at`'s identical
-/// shape for `workflow.deploy.tier`/`minimum_tier`.
 pub(super) fn orchestrator_writes_at(
     value: Option<toml::Value>,
     key: &str,
@@ -1395,23 +1298,12 @@ pub(super) fn orchestrator_writes_at(
         .transpose()
 }
 
-/// Issue #314: the repo-narrowing fold for `objective.gates` -- the exact
-/// same shape as [`narrow_fallback_order`] (a repo checkout may drop entries
-/// from the operator's own list, never add or reorder one), reused here
-/// rather than duplicated since both are "a repo may only narrow which
-/// commands run, in the operator's own order" folds.
+/// Repos may only drop objective commands while preserving operator order (#314).
 pub(super) fn narrow_objective_gates(home: Vec<String>, repo: Option<Vec<String>>) -> Vec<String> {
     narrow_fallback_order(home, repo)
 }
 
-/// Finding 4 (review): the one comma-separated-list splitter shared by every
-/// caller that needs "trimmed, non-empty entries" -- this module's own
-/// `ZIRV_CTX_SANDBOX_EXTRA_ALLOW`/`_DENY` env values (the same shape
-/// `--allowedTools`/`--disallowedTools` themselves already take on the
-/// command line, so an operator setting one of these can paste the identical
-/// rule syntax), `memory.rs`'s `Tags`/`Paths` header parsing, and
-/// `surface_collect.rs`'s `Evidence:` line parsing. Previously three separate
-/// copies of the identical `split(',').trim().filter(!is_empty())` logic.
+/// Share trimmed, nonempty CSV parsing across config lists and persisted headers.
 pub(crate) fn split_csv_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -1455,10 +1347,7 @@ pub(super) fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
     }
 }
 
-/// `true`/`false`, plus `1`/`0`: an operator writing `ZIRV_CTX_..._TELEMETRY=0`
-/// means "off", and `bool::from_str` alone rejects that -- which for a
-/// privacy opt-out is the one failure mode that must not happen silently.
-/// Anything else is still a loud error rather than a guess.
+/// Accept 1/0 as well as true/false so privacy opt-outs work; reject every other spelling loudly.
 fn parse_bool(raw: &str) -> CtxResult<bool> {
     match raw.trim() {
         "true" | "1" => Ok(true),
@@ -1467,33 +1356,17 @@ fn parse_bool(raw: &str) -> CtxResult<bool> {
     }
 }
 
-/// Keys a repository is not allowed to set, with the environment variable that
-/// sets each one instead. Cloning a repository must not be enough to choose the
-/// binary zirv launches, the shell command it runs on failure, or the model it
-/// spends tokens on. `~/.zirv/ctx.toml`, `ZIRV_CTX_*` and flags all still may:
-/// those come from the operator, not from the checkout.
+/// Repos cannot choose launched binaries, failure commands or spending models; operator config, env and flags may.
 const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
-    // Final wave item 1: a repo `ctx.toml` setting `agent` reaches `resolve_
-    // default`'s *configured* arm (`cfg.agent.as_deref()` is `Some`), which
-    // never consults `AgentGate::disabled_only_by_repo` at all -- that check
-    // only runs in the no-`cfg.agent` fallback loop. A repo could therefore
-    // pick which vendor account gets spent (`agent = "codex"`, say) with no
-    // narrowing guard in the way, the exact outcome
-    // `the_fallback_refuses_to_silently_switch_provider_when_the_repo_
-    // disabled_the_default` exists to block for the *unconfigured* path.
-    // This was inert while codex's own `ready()` still hard-errored; codex
-    // shipping out of the box activates it. `~/.zirv/ctx.toml`, `ZIRV_CTX_
-    // AGENT` and `--agent` all still choose the agent same as before -- only
-    // a repo checkout may not.
+    // Configured agent selection bypasses the fallback loop's repo-disable guard; repos must not select the vendor account.
     (&["agent"], "ZIRV_CTX_AGENT"),
     (&["obfuscate", "mode"], "ZIRV_CTX_OBFUSCATE_MODE"),
     (&["obfuscate", "entropy"], "ZIRV_CTX_OBFUSCATE_ENTROPY"),
     (&["obfuscate", "prompt"], "ZIRV_CTX_OBFUSCATE_PROMPT"),
     (&["obfuscate", "allow"], "~/.zirv/ctx.toml only"),
     (&["obfuscate", "literals_file"], "~/.zirv/ctx.toml only"),
-    // A repository may request `mask` below, but never force the operator's
-    // `mask` back to `keep`. `load` lifts and folds this key separately.
+    // Repos may tighten email handling to mask, never restore keep; load folds this separately.
     (&["supervise", "on_failure"], "ZIRV_CTX_ON_FAILURE"),
     (&["handoff", "model"], "ZIRV_CTX_MODEL"),
     (&["optimize", "model"], "ZIRV_CTX_OPTIMIZE_MODEL"),
@@ -1505,45 +1378,26 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     ),
     (&["prompt", "enabled"], "ZIRV_CTX_PROMPT"),
     (&["prompt", "repo_layer"], "ZIRV_CTX_PROMPT_REPO"),
-    // Without this the cap would be decorative: the untrusted layer could
-    // simply raise its own limit.
+    // Untrusted content must not raise its own byte cap.
     (
         &["prompt", "max_repo_bytes"],
         "ZIRV_CTX_PROMPT_MAX_REPO_BYTES",
     ),
-    // The harness roster names which other harnesses this session may
-    // delegate to and how to reach them (`zirv agent <name> ...`) -- a repo
-    // checkout must not be able to force that layer back on for an operator
-    // who turned it off, the same trust asymmetry as `prompt.enabled` and
-    // `prompt.repo_layer` right above.
+    // Repos cannot re-enable a harness roster the operator disabled.
     (&["prompt", "harnesses"], "ZIRV_CTX_PROMPT_HARNESSES"),
-    // Issue #167: codex's own orchestrator-conventions layer
-    // (`adapters::codex::ORCHESTRATOR_PROMPT`) is the codex analogue of
-    // claude's `ORCHESTRATOR_PROMPT` -- a repo checkout must not be able to
-    // force it back on for an operator who turned it off, the same trust
-    // asymmetry as `prompt.harnesses` right above.
+    // Repos cannot re-enable the operator-disabled Codex orientation layer (#167).
     (
         &["prompt", "codex_orchestrator"],
         "ZIRV_CTX_PROMPT_CODEX_ORCHESTRATOR",
     ),
-    // Issue #755: disabling the repo-signal skill-family filter widens what
-    // every session sees (every skill family advertised again), the same
-    // trust asymmetry as `prompt.harnesses`/`prompt.codex_orchestrator`
-    // above -- only the operator may do it.
+    // Only the operator may disable skill filtering and widen standing advertisements (#755).
     (
         &["prompt", "skill_index_repo_filter"],
         "ZIRV_CTX_PROMPT_SKILL_INDEX_REPO_FILTER",
     ),
-    // Issue #427: without this a repo checkout could simply raise its own
-    // tier, making an operator's chosen `"minimal"`/`"standard"` decorative
-    // -- the same reasoning as `prompt.max_repo_bytes` above, applied to a
-    // named tier instead of a byte count.
+    // Repos cannot raise prompt verbosity past the operator's chosen tier (#427).
     (&["prompt", "verbosity"], "ZIRV_CTX_PROMPT_VERBOSITY"),
-    // The canonical `.zirv/context/{common,claude,codex}.md` layer (issue
-    // #44's compiler) is repo-owned, untrusted content injected into the
-    // composed prompt the same way the repo `system-prompt.md` layer is --
-    // without this a repo checkout could simply raise its own cap, making it
-    // decorative, the same reasoning as `prompt.max_repo_bytes` above.
+    // Repo-owned canonical context must not raise its own injection cap (#44).
     (
         &["context", "max_common_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_COMMON_BYTES",
@@ -1552,57 +1406,32 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["context", "max_harness_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_BYTES",
     ),
-    // Issue #46: the derived harness roster is folded into an Orchestrator
-    // session's composed prompt the same way (`PromptSource::Harnesses`) --
-    // without this a repo checkout could raise its own budget for the one
-    // layer that had none until this key, making it decorative like every
-    // other entry in this list.
+    // Repos cannot raise their harness-roster injection budget (#46).
     (
         &["context", "max_harness_roster_bytes"],
         "ZIRV_CTX_CONTEXT_MAX_HARNESS_ROSTER_BYTES",
     ),
-    // Issue #538 (chunk B): without this a repo checkout could raise its own
-    // aggregate budget for the native compiler's whole instruction layer,
-    // making the cap decorative -- same reasoning as every byte-cap entry
-    // above.
+    // Repos cannot raise their aggregate native-instruction budget (#538).
     (
         &["context", "instructions_max_bytes"],
         "ZIRV_CTX_CONTEXT_INSTRUCTIONS_MAX_BYTES",
     ),
-    // Issue #275: without this a repo checkout could raise its own cap on
-    // how many sentence pairs `zirv context lint`'s CTX002/CTX003 checks
-    // compare, turning a bound meant to protect the operator's own CPU time
-    // into a decorative one -- same reasoning as every byte-cap entry above.
+    // Repos cannot raise quadratic lint work beyond the operator's CPU budget (#275).
     (
         &["context", "lint_max_pairs"],
         "ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS",
     ),
-    // Same rationale as prompt.max_repo_bytes above: mail is folded into the
-    // composed prompt as its own layer (`with_mail_layer`), and without this
-    // a repo could simply raise its own delivered-mail cap, making it
-    // decorative.
+    // Repos cannot raise the delivered-mail injection cap.
     (
         &["mail", "max_delivered_bytes"],
         "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
     ),
-    // A repo could otherwise turn mail delivery back on after an operator
-    // disabled it -- the same "the checkout is not the operator" boundary
-    // every other entry here enforces, applied to a boolean instead of a
-    // number.
+    // Repos cannot re-enable mail the operator disabled.
     (&["mail", "enabled"], "ZIRV_CTX_MAIL"),
-    // Without this a repo could silence the `zirv \u{25b8}` announcement
-    // channel -- including the degradation notices it exists to surface --
-    // for anyone running zirv there, with no operator-visible sign that it
-    // happened.
+    // Repos must not silence announcements, including notices that supervision degraded.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
-    // The workflow subsystem's own trust boundary, one entry per key so the
-    // error message names the exact one a checkout tried to set. A repo must
-    // not be able to re-enable execution of its own `.zirv/verify.toml`
-    // commands or its own `package.json` scripts after an operator turned
-    // that off, put its own untrusted skill methodology back into the prompt,
-    // or -- previously a plain `std::env::var` read, which any repo script
-    // could set for itself -- turn local telemetry on/off or stretch its
-    // retention out to years.
+    // Repos cannot re-enable execution or untrusted skill injection, control telemetry, or extend retention.
+    // Separate entries identify the exact forbidden key.
     (
         &["workflow", "repo_checks_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_CHECKS",
@@ -1615,9 +1444,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "repo_agents_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_AGENTS",
     ),
-    // Issue #542: the workflow-definition-pack analogue of the two entries
-    // right above -- a repo must not be able to turn its own untrusted
-    // `.zirv/workflows/` layer on for an operator who left it off.
+    // Repos cannot enable their own untrusted workflow packs (#542).
     (
         &["workflow", "repo_workflows_enabled"],
         "ZIRV_CTX_WORKFLOW_REPO_WORKFLOWS",
@@ -1626,9 +1453,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "deploy", "tier"],
         "ZIRV_CTX_WORKFLOW_DEPLOY_TIER",
     ),
-    // A repo checkout must not be able to loosen its own adoption pressure
-    // (or falsely tighten it to `enforce`, holding an operator's own agent
-    // dispatches on a repo's say-so) -- see issue #223 and `adoption.rs`.
+    // Repos may neither evade adoption pressure nor force enforcement onto operator dispatches (#223).
     (&["workflow", "adoption"], "ZIRV_CTX_WORKFLOW_ADOPTION"),
     (&["workflow", "maintain"], "~/.zirv/ctx.toml only"),
     (&["report", "repository"], "ZIRV_CTX_REPORT_REPOSITORY"),
@@ -1644,11 +1469,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "telemetry_retention_days"],
         "ZIRV_CTX_WORKFLOW_TELEMETRY_RETENTION_DAYS",
     ),
-    // Issue #233: the SSH-agent-family passthrough allowlist a verification
-    // check child receives is operator-owned, the same widening-only
-    // asymmetry as `sandbox.extra_allow` above -- a repo checkout must not be
-    // able to name additional environment variables its own `verify.toml`
-    // checks can read from the operator's process environment.
+    // Untrusted verification commands must not widen access to operator environment variables (#233).
     (
         &["workflow", "check_env_passthrough"],
         "ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH",
@@ -1665,34 +1486,22 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["workflow", "auto_spawn_on_gate"],
         "ZIRV_CTX_WORKFLOW_AUTO_SPAWN_ON_GATE",
     ),
-    // Issue #268: a repo checkout must not be able to declare its own
-    // missing/empty `verify.toml` a pass by setting this itself.
+    // Repos must not declare their own missing verification checks a pass (#268).
     (
         &["workflow", "allow_empty_verify"],
         "ZIRV_CTX_WORKFLOW_ALLOW_EMPTY_VERIFY",
     ),
-    // Issue #276: the untrusted checkout `zirv verify`'s builtin self-check
-    // registry exists to police must never be the one that turns a check
-    // off for itself.
+    // Repos must never disable the built-in checks that police them (#276).
     (
         &["workflow", "builtin_checks_exclude"],
         "ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE",
     ),
-    // Issue #326: same reasoning as `search.max_output_bytes` -- a repo
-    // checkout must not be able to widen its own workflow-step-context
-    // output cap.
+    // Repos cannot widen their workflow-context output cap (#326).
     (
         &["workflow", "max_context_bytes"],
         "ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES",
     ),
-    // A repo checkout must not be able to switch either memory scope's own
-    // gate on or off for itself, grow its cap, or turn on automatic
-    // harvesting -- this is about the CONFIGURATION, not the shared scope's
-    // content (which is deliberately, expectedly repo-committed by design;
-    // see memory.rs's `MemoryScope::Shared`) -- the same class of decision
-    // `prompt.max_repo_bytes` guards: something the checkout must not
-    // choose for itself, only the operator (`~/.zirv/ctx.toml`, `ZIRV_CTX_*`
-    // or flags) may.
+    // Memory configuration is operator-only even when shared content is repo-owned; repos cannot alter gates, caps or harvest.
     (&["memory", "enabled"], "ZIRV_CTX_MEMORY"),
     (&["memory", "harvest"], "ZIRV_CTX_MEMORY_HARVEST"),
     (&["memory", "max_entries"], "ZIRV_CTX_MEMORY_MAX_ENTRIES"),
@@ -1704,36 +1513,24 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["memory", "max_injected_bytes"],
         "ZIRV_CTX_MEMORY_MAX_INJECTED_BYTES",
     ),
-    // `shared_enabled` is the same class of decision as `enabled` right
-    // above, for the newer repo-owned scope (`memory::MemoryScope::Shared`):
-    // a checkout must not be able to switch its own shared bank back on for
-    // an operator who disabled it. A separate entry, not folded into
-    // `enabled` above: each memory switch is forbidden individually, the
-    // same granularity `harvest`/`max_entries`/etc. already get.
+    // Repos cannot re-enable their shared memory bank after the operator disables it.
     (&["memory", "shared_enabled"], "ZIRV_CTX_MEMORY_SHARED"),
-    // Same class of decision as `max_injected_bytes` right above (which this
-    // key supersedes for actual injection sizing): a repo checkout must not
-    // be able to grow the merged core layer's own delivered-bytes cap, the
-    // same trust asymmetry `prompt.max_repo_bytes`/`mail.max_delivered_bytes`
-    // already enforce.
+    // Repos cannot raise the delivered core-memory budget.
     (
         &["memory", "core_max_bytes"],
         "ZIRV_CTX_MEMORY_CORE_MAX_BYTES",
     ),
-    // Same reasoning, for the retrieval layer's byte budget (issue #35).
+    // Repos cannot raise the retrieval byte budget (#35).
     (
         &["memory", "retrieval_max_bytes"],
         "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_BYTES",
     ),
-    // Same reasoning, for the retrieval layer's entry-count cap.
+    // Repos cannot raise the retrieval entry-count cap.
     (
         &["memory", "retrieval_max_entries"],
         "ZIRV_CTX_MEMORY_RETRIEVAL_MAX_ENTRIES",
     ),
-    // Issue #37: a repo checkout must not be able to raise how many entries
-    // or bytes one session's own automatic harvest may store, the same
-    // trust asymmetry as every other memory.* cap above, applied to the new
-    // per-session harvest pair.
+    // Repos cannot raise per-session harvest count or byte limits (#37).
     (
         &["memory", "harvest_max_entries"],
         "ZIRV_CTX_MEMORY_HARVEST_MAX_ENTRIES",
@@ -1742,25 +1539,14 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["memory", "harvest_max_bytes"],
         "ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES",
     ),
-    // Issue #295: the same class of decision as `shared_enabled` above, for
-    // the newer session tier (`memory::MemoryScope::Session`) -- a repo
-    // checkout must not be able to switch that tier's own gate on or off for
-    // an operator who set it otherwise.
+    // Repos cannot change the operator's session-memory gate (#295).
     (&["memory", "session_enabled"], "ZIRV_CTX_MEMORY_SESSION"),
-    // Issue #295: a repo checkout must not be able to grow its own memory
-    // journal's retention cap, the same trust asymmetry as `max_entries`/
-    // `max_entry_bytes` above, applied to the write history rather than the
-    // entry bank itself.
+    // Repos cannot extend their memory journal retention (#295).
     (
         &["memory", "journal_max_entries"],
         "ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES",
     ),
-    // A repo checkout must not be able to switch its own dashboard on or off,
-    // resize the sidebar, change how long a quit-time roster is offered for
-    // restore, or raise its own pane cap -- the operator's terminal, the
-    // operator's machine, the operator's call. `max_panes` in particular is
-    // the same trust asymmetry as `mail.max_delivered_bytes`: a checked-out
-    // repo raising its own limit is exactly the case the limit exists for.
+    // Dashboard layout, restore lifetime and pane caps are operator decisions; repos cannot enlarge resource limits.
     (&["dash", "enabled"], "ZIRV_CTX_DASH"),
     (&["dash", "sidebar_cols"], "ZIRV_CTX_DASH_SIDEBAR_COLS"),
     (
@@ -1768,37 +1554,22 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS",
     ),
     (&["dash", "max_panes"], "ZIRV_CTX_DASH_MAX_PANES"),
-    // Issue #133: same trust asymmetry as `dash.max_panes` right above, one
-    // level up -- a repo checkout must not be able to raise the machine-wide
-    // heavy-operation budget any more than it can raise the one dashboard's
-    // own pane cap. See `SuperviseConfig::max_heavy_operations`'s own doc
-    // comment for the BSOD incident this defends against.
+    // Repos cannot raise machine-wide heavy-operation concurrency and defeat overload protection (#133).
     (
         &["supervise", "max_heavy_workers"],
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS",
     ),
-    // Issue #155, Phase 5(e): `max_heavy_operations` is the renamed key --
-    // same trust posture as `max_heavy_workers` right above, which stays
-    // forbidden too as a deprecated alias (see `CtxConfig::load`'s pre-
-    // deserialise rewrite).
+    // Both the canonical concurrency key and its deprecated alias must remain forbidden (#155).
     (
         &["supervise", "max_heavy_operations"],
         "ZIRV_CTX_SUPERVISE_MAX_HEAVY_OPERATIONS",
     ),
-    // Issue #267: same trust asymmetry as `max_heavy_operations` right
-    // above -- a repo checkout must not be able to raise the machine-wide
-    // writer-concurrency budget, which is exactly the corrupted-diff
-    // failure this cap exists to prevent (see `SuperviseConfig::
-    // max_writers`'s own doc comment).
+    // Repos cannot raise the machine-wide writer cap that protects concurrent editing (#267).
     (
         &["supervise", "max_writers"],
         "ZIRV_CTX_SUPERVISE_MAX_WRITERS",
     ),
-    // Issue #310: same trust asymmetry as `max_writers`/`max_heavy_
-    // operations` above -- a repo checkout raising its own stall fuse or
-    // grace period could silently defeat the 3a stall detector for a
-    // session running against it (see `SuperviseConfig::idle_no_tool_secs`'s
-    // own doc comment).
+    // Repos cannot lengthen stall or grace bounds to defeat detection (#310).
     (
         &["supervise", "idle_no_tool_secs"],
         "ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS",
@@ -1811,24 +1582,17 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["supervise", "stall_grace_secs"],
         "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
     ),
-    // Issue #379: same reasoning again for the compaction fuse -- a repo
-    // checkout raising it could silently defeat the stalled-after-compaction
-    // detector for a session running against it.
+    // Repos cannot lengthen the compaction stall fuse to hide stalled sessions (#379).
     (
         &["supervise", "compact_stall_secs"],
         "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
     ),
-    // Round 4 bug 2: same trust asymmetry -- a repo checkout shortening the
-    // headless in-place compaction's hard timeout could force premature
-    // restarts of a session running against it (see `SuperviseConfig::
-    // compact_timeout_ms`'s own doc comment).
+    // Repos cannot shorten headless compaction deadlines into premature restarts.
     (
         &["supervise", "compact_timeout_ms"],
         "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS",
     ),
-    // Same reasoning, for the 3b restart-chain breaker: a repo checkout
-    // raising its own restart budget or gap window could silently defeat
-    // the breaker.
+    // Repos cannot alter restart budgets or gap windows to defeat the chain breaker.
     (
         &["supervise", "chain_max_restarts"],
         "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
@@ -1837,75 +1601,34 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["supervise", "chain_max_gap_secs"],
         "ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS",
     ),
-    // Mouse capture takes over the terminal's own text selection, so which
-    // way that trade goes is the operator's call about their own terminal,
-    // not a checked-out repo's.
+    // Mouse capture displaces native terminal selection, so only the operator may choose it.
     (&["dash", "mouse"], "ZIRV_CTX_DASH_MOUSE"),
-    // Security review (2026-08-31): a repo checkout must not be able to
-    // widen which directories a pane spawned from it may run in and write
-    // to -- the same privilege-widening asymmetry `sandbox.extra_allow`
-    // already holds. See `DashConfig::workdir_roots`'s own doc comment.
+    // Repos cannot widen pane working-directory write authority.
     (&["dash", "workdir_roots"], "ZIRV_CTX_DASH_WORKDIR_ROOTS"),
-    // A repo checkout must not be able to flip a spend decision (skipping
-    // throttle/pause gating on the operator's own vendor plan), re-enable
-    // the active API-poll fallback an operator turned off, or change its
-    // cadence -- credential reads and network calls are the operator's
-    // budget to spend, not the checkout's. `value_at` matches a table node
-    // the same way it matches a leaf, so this one entry also catches a repo
-    // setting only `[pace.use_credits]\ncodex = true` without `claude`.
+    // Overage exemptions and active polling spend the operator's account; repos cannot set them.
+    // A table-prefix check also catches entries specifying only one harness.
     (&["pace", "use_credits"], "ZIRV_CTX_PACE_USE_CREDITS_CLAUDE"),
     (&["pace", "poll_enabled"], "ZIRV_CTX_PACE_POLL"),
     (
         &["pace", "poll_min_interval_secs"],
         "ZIRV_CTX_PACE_POLL_MIN_INTERVAL_SECS",
     ),
-    // T8: the fail-safe delay applied when the gate is genuinely blind (see
-    // `PaceConfig::blind_delay_secs`'s own doc comment) is a spend-safety
-    // floor, the same class of decision as `use_credits`/`poll_*` right
-    // above -- a repo checkout must not be able to shrink or zero it out and
-    // silently restore the old fail-open behavior for anyone who checks it
-    // out.
+    // Repos cannot shrink the blind delay and turn missing usage evidence into unrestricted spend.
     (
         &["pace", "blind_delay_secs"],
         "ZIRV_CTX_PACE_BLIND_DELAY_SECS",
     ),
-    // Issue #155, Phase 6(c): `pace::spawn_gate`'s own soft/hard band --
-    // whether a NEW delegated worker may be spawned at all, never whether an
-    // already-running session gets restarted (see `SpawnGate`'s own doc
-    // comment for why the two must stay independent). A repo checkout must
-    // not be able to change when the operator's account stops accepting new
-    // work, in EITHER direction: raising either percentage would let a
-    // checkout spend past a ceiling the operator set, and lowering one would
-    // let a checkout throttle delegation for an operator who did not ask for
-    // it -- the same "the checkout is not the operator" trust asymmetry
-    // every other entry in this list enforces, applied to a refusal
-    // threshold instead of a byte cap or a switch.
+    // New-worker spend gates never control restarts; repos may neither raise spending ceilings nor impose unwanted throttling (#155).
     (&["pace", "spawn_soft_pct"], "ZIRV_CTX_PACE_SPAWN_SOFT_PCT"),
     (&["pace", "spawn_hard_pct"], "ZIRV_CTX_PACE_SPAWN_HARD_PCT"),
-    // Issue #285: the default soft budget `zirv ctx objective set` applies
-    // when the operator's own `--budget-tokens` is omitted -- a spend
-    // ceiling, so it gets the same "checkout is not the operator" treatment
-    // as every other budget key in this list.
+    // Only the operator may choose a default objective spend ceiling (#285).
     (
         &["pace", "run_budget_tokens"],
         "ZIRV_CTX_PACE_RUN_BUDGET_TOKENS",
     ),
-    // Audit finding G1: the estimator layer is what the gate falls back to
-    // when no collector reading binds, and its two window budgets are what
-    // turn a raw token sum into the percentage the gate then paces on. A
-    // repo checkout able to set all three chooses BOTH the fallback source
-    // and the scale it is measured against -- it can hand itself an
-    // arbitrary "plenty of headroom" reading with no vendor data involved at
-    // all. `count_cache_reads` moves the same number by including or
-    // excluding the dominant token class in a cached session. All four are
-    // the operator's own spend picture, not the checkout's.
+    // Estimator source, budgets and cache accounting determine the spend reading; repo control could fabricate headroom.
     (&["pace", "estimator"], "ZIRV_CTX_PACE_ESTIMATOR"),
-    // Review round 1 (R1): `collector_max_age_secs` was narrow-only on the
-    // reading that lower is stricter. It is not -- `pace::binding` holds a
-    // fresh collector window authoritative, so shortening the horizon below a
-    // real reading's age discards it and lets the estimator's own (lower)
-    // figure bind instead. Both directions hand the checkout the gate's
-    // reading, so it joins the four keys above outright.
+    // Shorter collector freshness can discard authoritative data for a lower estimate; neither direction is safe for repos.
     (
         &["pace", "collector_max_age_secs"],
         "ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS",
@@ -1922,77 +1645,23 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["pace", "count_cache_reads"],
         "ZIRV_CTX_PACE_COUNT_CACHE_READS",
     ),
-    // `chat.model` is deliberately ABSENT from this list. See `ChatConfig`'s
-    // own doc comment and the spec's "Orchestrator model" section
-    // (docs/superpowers/specs/2026-08-13-zirv-dashboard-design.md): unlike
-    // every model key above, it only shapes an interactive session the
-    // operator deliberately launched, and the choice is disclosed on the
-    // `zirv \u{25b8}` announcement channel (`chat::announce_model_choice`) --
-    // which `chrome.events`, right above, keeps repo-unsilenceable -- rather
-    // than spent silently in the background. A repo checkout may set it -- do
-    // not "fix" this by adding it here, and do not remove `chrome.events`
-    // from this list, which is what the exemption rests on.
-    //
-    // The exemption is safe against the cmd.exe argv-reparse injection class
-    // because the value is *charset-validated* at the end of `CtxConfig::load`
-    // (only `[A-Za-z0-9-._:/@]`, max 128 bytes): a validated model string can
-    // express no shell/cmd metacharacter, so it can never carry a payload even
-    // though it reaches an argv that `resolve_program` may route through
-    // `cmd.exe /c` on Windows. The disclosed operator-in-repo model-choice
-    // purpose survives (real model ids only ever use that charset); the RCE
-    // does not. This is a narrower, correctness-preserving guard than banning
-    // the key outright, which is why it stays out of `REPO_FORBIDDEN`.
-    //
-    // `chat.claude_permission_mode` (issue #504) is the opposite call from
-    // `chat.model` right above, on purpose: unlike a model choice, which is
-    // disclosed on screen and cannot itself widen what a session may DO,
-    // this key picks the interactive launch's native `--permission-mode` --
-    // `bypassPermissions` silently skips every prompt the shipped `default`
-    // posture and the safety hook both rely on. A repo checkout choosing it
-    // for the operator would be exactly the widening `sandbox.enabled`/
-    // `sandbox.extra_allow` already stand between an untrusted layer and, so
-    // it is `REPO_FORBIDDEN` outright rather than charset-validated like
-    // `chat.model`'s narrower guard above.
+    // Keep chat.model repo-settable: its interactive choice is disclosed through repo-unsilenceable chrome.events.
+    // Charset and length validation prevent cmd.exe argv-reparse injection on Windows.
+    // Permission mode can bypass prompts and widen authority, so it remains operator-only (#504).
     (
         &["chat", "claude_permission_mode"],
         "ZIRV_CTX_CHAT_CLAUDE_PERMISSION_MODE",
     ),
-    // `review.claude`/`review.codex` are the opposite call from `chat.model`
-    // right above, on purpose: those pick which model spends the operator's
-    // vendor account running review work in the *background* (every `zirv
-    // ctx chat` orchestrator session), not a model chosen and disclosed for
-    // one interactive session the operator themselves launched -- the same
-    // "spent silently" distinction that puts `handoff.model`/`optimize.model`
-    // in this list. `value_at` matches a table node the same way it matches a
-    // leaf (see `pace.use_credits` above), so this one entry blocks both
-    // `review.claude` and `review.codex` together.
+    // Review models spend in the background without interactive disclosure; block the whole table for repos.
     (&["review"], "ZIRV_CTX_REVIEW_MODEL_CLAUDE"),
-    // `worker.claude`/`worker.codex` are the same call as `review.*` right
-    // above, for the same reason: a repo checkout must not be able to pick
-    // which model -- and so which vendor account -- spends the operator's
-    // tokens running a delegated headless worker (`zirv ctx agent`, and the
-    // dashboard's own spawn-request pane variant), which is background spend
-    // an operator never explicitly launched an interactive session for. See
-    // `WorkerConfig`'s own doc comment. Unlike `review`/`pace.use_credits`
-    // above, these are two LEAF entries rather than one whole-table entry:
-    // issue #262 added `worker.max_depth`/`worker.deny_network` to this same
-    // table, and those two keys are deliberately NOT `REPO_FORBIDDEN` -- a
-    // repo checkout may narrow them (see `narrow_worker_max_depth`/
-    // `narrow_worker_deny_network`), so a whole-table entry here would wrongly
-    // block that narrowing too.
+    // Worker model selection spends operator accounts; forbid model leaves while allowing depth/network narrowing (#262).
     (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
     (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
     (
         &["worker", "bootstrap_timeout_secs"],
         "ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS",
     ),
-    // Issue #262: the delegation-envelope defaults a ROOT session's
-    // `envelope::WorkerEnvelope` starts from. See `WorkerConfig`'s own doc
-    // comment on each field for why these two -- unlike `max_depth`/
-    // `deny_network` right above -- are operator-only outright rather than
-    // repo-narrowable: they set the STARTING point a repo could otherwise
-    // only ever narrow away from, so letting a repo raise them would be
-    // indistinguishable from letting it widen the narrow-only fold itself.
+    // Root envelope defaults define the starting authority; repos cannot widen the baseline they may only narrow (#262).
     (
         &["worker", "default_depth"],
         "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
@@ -2001,80 +1670,28 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["worker", "default_read_only"],
         "ZIRV_CTX_WORKER_DEFAULT_READ_ONLY",
     ),
-    // `handover.*` (issue #84): a repo checkout must not be able to pick
-    // which model -- and so which vendor account -- the orchestrator seat
-    // swaps onto via `zirv ctx handover`, the same trust asymmetry as
-    // `agent`/`review.*`/`worker.*` above. `value_at` matches a table node
-    // the same way it matches a leaf (see `pace.use_credits`/`review`/
-    // `worker` above), so this one entry blocks the whole `[handover]`
-    // table -- both agents, all three tiers -- together.
+    // Repos cannot select the model or vendor account an orchestrator swaps onto; block the whole table (#84).
     (&["handover"], "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP"),
-    // Issue #699 (cost-routing lever): `[model_tiers.<agent>]` chooses which
-    // model a workflow seat dispatches on for its declared `ModelTier`
-    // routing hint -- the same trust asymmetry as `handover.*` right above,
-    // applied to a workflow seat's model instead of the orchestrator's own.
-    // A repo checkout picking a cheaper (or different-vendor) model for a
-    // seat is exactly the "silent provider switch" the reverted
-    // `resolve_default` change was rejected for; there is no narrowing
-    // reading of "choose this seat's model" available to a checkout. `value_
-    // at` matches a table node the same way it matches a leaf (see
-    // `handover` right above), so this one entry blocks the whole
-    // `[model_tiers]` table -- every adapter, every tier -- together.
+    // Seat model selection is never repo narrowing, even for cheaper models; forbid the entire tier map (#699).
     (&["model_tiers"], "ZIRV_CTX_MODEL_TIERS_CLAUDE_FAST"),
-    // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` choose which vendor
-    // ACCOUNT a harness spends -- picking the account is the same trust
-    // asymmetry `agent`/`review.*`/`worker.*`/`handover.*` above already
-    // hold to, applied to a whole-endpoint retarget rather than a model
-    // choice within one native account. `value_at` matches a table node the
-    // same way it matches a leaf (see `handover` right above), so this one
-    // entry blocks the whole `[endpoint]` table, both agents, every field.
-    // Deliberately no `ENV_MAP` entry backs this: an endpoint override is
-    // `~/.zirv/ctx.toml`-only by design (see `EndpointConfig`'s own doc
-    // comment), so there is no environment variable to name here the way
-    // every other entry in this table names one.
+    // Only operator home config may retarget vendor accounts; forbid every endpoint field and provide no env override (#395).
     (
         &["endpoint"],
         "the operator's own ~/.zirv/ctx.toml (there is no environment override for endpoint.*)",
     ),
-    // `safety.allow`/`safety.default` (issue #83): unlike `safety.deny`/
-    // `safety.ask` (lifted out and unioned across layers -- see
-    // `super::safety`'s module doc, the identical narrowing-fold treatment
-    // `sandbox.extra_deny` gets), adding an `allow` entry or changing the
-    // unmatched-command `default` can only ever make the effective policy
-    // *looser*, never stricter -- there is no narrowing reading of either,
-    // so both are forbidden outright rather than folded, mirroring
-    // `sandbox.extra_allow` right above.
+    // Safety allow/default choices can loosen policy; repos may only add deny/ask restrictions (#83).
     (&["safety", "allow"], "ZIRV_CTX_SAFETY_ALLOW"),
-    // `safety.escape_allow` (issue #147): the same widening-only reasoning
-    // as `safety.allow` right above, one narrower domain down -- it clears
-    // a family for a `--dangerously-disable-sandbox` retry specifically, so
-    // adding an entry can only ever loosen that gate, never narrow it.
+    // An escape allowance loosens the sandbox-bypass retry gate and cannot be repo-authorized (#147).
     (&["safety", "escape_allow"], "ZIRV_CTX_SAFETY_ESCAPE_ALLOW"),
     (&["safety", "default"], "ZIRV_CTX_SAFETY_DEFAULT"),
-    // `safety.interactive_default` (2026-08-24): the unmatched-command
-    // verdict on an interactive launch, default `allow`. Same reasoning as
-    // `safety.default` right above and then some -- `allow` is the loosest
-    // verdict there is, so a checkout that could set it could silence every
-    // prompt for the session it is checked out in.
+    // Repos cannot set an interactive default that silences unmatched-command prompts.
     (
         &["safety", "interactive_default"],
         "ZIRV_CTX_SAFETY_INTERACTIVE_DEFAULT",
     ),
-    // `safety.sql` (2026-08-24): same reasoning as the two `safety` keys
-    // above. Turning the SQL classifier off removes an `Ask` it would
-    // otherwise impose on a write statement reaching a broad allow rule or
-    // the permissive interactive default -- loosening only.
+    // Disabling SQL classification removes asks for writes that broad allows would admit.
     (&["safety", "sql"], "ZIRV_CTX_SAFETY_SQL"),
-    // Issue #155, Phase 6b: a repo checkout must not be able to move when the
-    // operator's own sessions rotate -- raising the ceiling (or the ratio
-    // that derives it) hides rot from the operator for longer; lowering the
-    // floor fires restarts, and the compaction/handoff they trigger, more
-    // often than the operator chose. Both directions are the checkout
-    // choosing spend/safety behavior for its own operator, the same trust
-    // asymmetry every other entry in this list enforces. All five keys that
-    // feed `rot::token_gates` are forbidden together, absolutes and ratios
-    // alike, so a checkout cannot route around the absolute-override block by
-    // tuning the ratio instead (or vice versa).
+    // Repos cannot tune rotation spending or safety; forbid absolute gates, ratios and capacity to block alternate paths (#155).
     (&["score", "token_floor"], "ZIRV_CTX_TOKEN_FLOOR"),
     (&["score", "token_ceiling"], "ZIRV_CTX_TOKEN_CEILING"),
     (
@@ -2089,24 +1706,18 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["score", "model_context_tokens"],
         "ZIRV_CTX_SCORE_MODEL_CONTEXT_TOKENS",
     ),
-    // Issue #264: a repo checkout must not be able to widen how long a price
-    // table is presented as trustworthy, or point pricing at a file of its
-    // own choosing -- see `PriceConfig`'s own doc comment.
+    // Repos cannot select pricing sources or conceal stale prices (#264).
     (
         &["price", "stale_after_days"],
         "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
     ),
     (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
-    // Issue #315: a repo checkout must not be able to widen its own
-    // `zirv ctx search` output cap -- same trust asymmetry as every other
-    // byte cap in this table, see `SearchConfig`'s own doc comment.
+    // Repos cannot raise their history-search output cap (#315).
     (
         &["search", "max_output_bytes"],
         "ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES",
     ),
-    // Issue #326: the compact-summary cap is the same byte-cap asymmetry as
-    // `search.max_output_bytes` above, and the two compaction switches are
-    // forbidden in BOTH directions -- see `OutputConfig`'s own doc comment.
+    // Repos cannot raise summary caps or change output compaction in either direction (#326).
     (&["output", "compact"], "ZIRV_CTX_OUTPUT_COMPACT"),
     (
         &["output", "compact_min_bytes"],
@@ -2116,49 +1727,25 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["output", "compact_generic_min_bytes"],
         "ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES",
     ),
-    // Additive-only, but still operator-only: an untrusted checkout naming a
-    // program here decides that zirv never summarizes that program's output
-    // for any session run against it.
+    // Even additive verbatim exemptions let a repo bypass summarization of its own output.
     (&["output", "verbatim"], "ZIRV_CTX_OUTPUT_VERBATIM"),
     (
         &["output", "max_summary_bytes"],
         "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
     ),
-    // Issue #414: widens what a repository checkout's own `rg`/`grep`/
-    // `find`/`fd`/`ls`/`dir`/`tree` invocations get compacted into (from
-    // never, at any size, to a shape-aware summary) -- the same forbidden-
-    // both-directions asymmetry as `compact`/`compact_min_bytes`/
-    // `compact_generic_min_bytes` above, never the checkout's call.
+    // Search-output shaping is an operator decision in both directions (#414).
     (
         &["output", "compact_search"],
         "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
     ),
-    // Bundled-defaults: same forbidden-both-directions asymmetry as
-    // `compact_search` right above -- a repo checkout must not be able to
-    // re-enable zirv's bundled `[[output.filter]]` rules for an operator
-    // who turned them off, nor turn off defaults an operator wants applied
-    // to every checkout.
+    // Repos cannot enable unwanted bundled filters or disable operator-requested defaults.
     (
         &["output", "filter_defaults"],
         "ZIRV_CTX_OUTPUT_FILTER_DEFAULTS",
     ),
-    // Issue #417: the operator-declared `[[output.filter]]` rule list is a
-    // structured value with no `ZIRV_CTX_*` scalar/CSV shape to escape
-    // through (unlike `output.verbatim`'s comma-separated list), so the
-    // only way to set it at all is `~/.zirv/ctx.toml` -- same convention as
-    // `workflow.maintain` above. A repo checkout choosing how its own
-    // output gets shaped once summarized is the same widening
-    // `compact`/`compact_min_bytes`/`compact_generic_min_bytes` above are
-    // already forbidden from doing.
+    // Structured output rules are home-only; repos cannot shape their own summarized output (#417).
     (&["output", "filter"], "~/.zirv/ctx.toml only"),
-    // Issue #358: rolling the orchestrator seat itself onto another harness
-    // is the same class of decision `handoff.model`/`optimize.model` already
-    // gate above -- a repo checkout must not be able to tune when an
-    // automatic seat rollover fires or how soon another one may follow.
-    // `fallback.auto_orchestrator_rollover` itself (the on/off switch) stays
-    // narrowing-only, like `fallback.enabled`, because a repo may safely
-    // disable it; only the keys that tune an ALREADY-enabled rollover's
-    // timing are forbidden outright.
+    // Repos may disable rollover but cannot tune the timing of operator vendor-account changes (#358).
     (
         &["fallback", "orchestrator_rollover_headroom_pct"],
         "ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT",
@@ -2171,12 +1758,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["fallback", "reactive_force_after_secs"],
         "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
     ),
-    // Issue #455: same reasoning one more time for the route-health breaker.
-    // `fallback.health.enabled` stays narrowing-only (a repo may safely
-    // switch health-aware routing off, exactly as it may `fallback.enabled`),
-    // but how many failures trip a route, over what window, and how long it
-    // stays tripped decide when the operator's vendor spend moves -- only
-    // they may set that.
+    // Repos may disable health routing but cannot tune failure thresholds or timings that move vendor spending (#455).
     (
         &["fallback", "health", "open_after_failures"],
         "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
@@ -2189,9 +1771,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["fallback", "health", "cooldown_secs"],
         "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
     ),
-    // The degrade knobs are the same class of decision one step earlier: how
-    // bad a route has to get before zirv starts ranking it behind the
-    // operator's other vendor account.
+    // Degradation thresholds rank vendor accounts and are therefore operator-only.
     (
         &["fallback", "health", "degrade_error_rate_pct"],
         "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT",
@@ -2204,21 +1784,12 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["fallback", "health", "degrade_ttft_ms"],
         "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS",
     ),
-    // Issue #326 B1: without this a repo checkout could simply raise its own
-    // parent-outcome budget, making the cap decorative -- same reasoning as
-    // every other byte cap in this table (`mail.max_delivered_bytes`,
-    // `memory.max_entry_bytes`, ...).
+    // Repos cannot raise their parent-outcome injection budget (#326).
     (
         &["task", "max_parent_outcome_bytes"],
         "ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES",
     ),
-    // Issue #352, one entry per key so the refusal names the exact one the
-    // checkout tried to set. `persistent` decides whether cloning a
-    // repository is enough to make sessions started from it outlive the
-    // operator's terminal; `history` decides whether rendered terminal
-    // output -- tokens and keys included -- is written to disk at all; and
-    // the two bounds would be decorative if the untrusted layer could simply
-    // raise its own, the same reasoning as every cap above.
+    // Repos cannot prolong session lifetimes, persist sensitive terminal output, or raise persistence bounds (#352).
     (&["session", "persistent"], "ZIRV_CTX_SESSION_PERSISTENT"),
     (&["session", "history"], "ZIRV_CTX_SESSION_HISTORY"),
     (
@@ -2229,29 +1800,11 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["session", "stale_after_secs"],
         "ZIRV_CTX_SESSION_STALE_AFTER_SECS",
     ),
-    // Issue #483: the WHOLE `[capabilities]` table, as one prefix entry
-    // rather than a leaf per key -- `value_at` matches a prefix, so a repo
-    // layer that sets anything at all under it is rejected by name. Unlike
-    // every table where only some keys are operator-only, there is no
-    // narrowing half here: each key names an MCP server command zirv then
-    // spawns, a remote endpoint it authenticates to, a credential reference,
-    // or a browser binary it launches. A checked-out repository adding one is
-    // pure widening, and "repo-owned config may only narrow" leaves nothing
-    // for it to legitimately say.
+    // Every capability adds executable, network or auth authority; no repo narrowing exists within this table (#483).
     (&["capabilities"], "ZIRV_CTX_CAPABILITIES"),
-    // Issue #491: the WHOLE `[runtime]` table, as one prefix entry, same
-    // reasoning as `[capabilities]` right above -- this decides which
-    // provider account a session with no explicit `--runtime` spends, and a
-    // checked-out repository redirecting that is pure widening in either
-    // direction. `~/.zirv/ctx.toml`, `ZIRV_CTX_RUNTIME` and the `--runtime`
-    // flag remain the only ways to set it.
+    // Either runtime switch redirects operator spending, so the whole table is operator-only (#491).
     (&["runtime"], "ZIRV_CTX_RUNTIME"),
-    // Issue #537 seam: the harness proxy decides which harness/model/
-    // workflow a launch spends the operator's own account on -- a repo
-    // checkout must not be able to turn it on, choose its decider, or loosen
-    // its confidence floor/request cap, the same trust asymmetry as
-    // `agent`/`handoff.model`/`endpoint` above. One leaf entry per key so the
-    // refusal names the exact one a checkout tried to set.
+    // Repos cannot enable proxy spending, choose a decider or loosen decision bounds (#537).
     (&["proxy", "enabled"], "ZIRV_CTX_PROXY_ENABLED"),
     (&["proxy", "decider"], "ZIRV_CTX_PROXY_DECIDER"),
     (
@@ -2279,10 +1832,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["proxy", "typesafe", "timeout_secs"],
         "ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS",
     ),
-    // Issue #537 seam extraction (task A1): the `[jev]` advisory-site gate --
-    // a repo checkout must not be able to turn on a Jev-backed decision path
-    // for any site, the same trust asymmetry as `[proxy]` right above. One
-    // leaf entry per key, same reasoning.
+    // Repos cannot enable Jev-backed advisory spending (#537).
     (&["jev", "memory"], "ZIRV_CTX_JEV_MEMORY"),
     (&["jev", "supervisor"], "ZIRV_CTX_JEV_SUPERVISOR"),
     (&["jev", "dispatch"], "ZIRV_CTX_JEV_DISPATCH"),
@@ -2307,17 +1857,12 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
     (&["jev", "launch_effort"], "ZIRV_CTX_JEV_LAUNCH_EFFORT"),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
-    // Issue #803: the WHOLE `[jev.floors]` table, as one prefix entry (like
-    // `[capabilities]`/`[runtime]` above) rather than one leaf per site x
-    // field -- every key under it loosens or tightens which advisory answers
-    // a session acts on, the same trust asymmetry as `[jev]` itself.
+    // Every advisory-floor field changes which answers are acted on; forbid the whole table (#803).
     (
         &["jev", "floors"],
         "ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN",
     ),
-    // Issue #788: `[headless]` cost levers for a headless Claude Code
-    // launch -- every key `REPO_FORBIDDEN`, one leaf entry per key, same
-    // reasoning as `[jev]` right above.
+    // Headless launch cost controls are operator-only, with each forbidden key named separately (#788).
     (
         &["headless", "prompt_cache_ttl"],
         "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL",
@@ -2341,10 +1886,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     ),
 ];
 
-/// Operator-only keys nested inside array-of-table configuration. `value_at`
-/// cannot walk through `[[workspace]]`, so these are enforced by
-/// `reject_untrusted_workspace_execution` rather than `REPO_FORBIDDEN`'s
-/// ordinary table-path lookup. ZCHK-FORBIDDEN-WIDENING reads both tables.
+/// Array-contained execution keys need a separate guard because value_at cannot traverse `[[workspace]]`; audit both tables.
 const ARRAY_REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["workspace", "git"], "~/.zirv/ctx.toml only"),
     (&["workspace", "setup"], "~/.zirv/ctx.toml only"),
@@ -2359,13 +1901,7 @@ pub(super) fn value_at<'a>(table: &'a toml::Table, path: &[&str]) -> Option<&'a 
     value_at(value.as_table()?, rest)
 }
 
-/// Marker error for a `REPO_FORBIDDEN` rejection (`reject_untrusted_keys`),
-/// distinct from every other way `CtxConfig::load` can fail (a bad env value,
-/// an unknown/mistyped key, an unreadable file). A **security refusal**, not
-/// a degrade-and-continue case like a layer that merely failed to parse (see
-/// `UnparsableLayer`) -- callers that need to tell the two apart (`zirv ctx
-/// status`'s exit code) use `is_repo_forbidden` rather than matching on the
-/// message text.
+/// Typed security refusal, never a degrade-and-continue parse error; callers must not classify it by message text.
 #[derive(Debug)]
 struct RepoForbiddenError(String);
 
@@ -2377,20 +1913,12 @@ impl std::fmt::Display for RepoForbiddenError {
 
 impl std::error::Error for RepoForbiddenError {}
 
-/// Whether `error` (as returned by `CtxConfig::load`) is a `REPO_FORBIDDEN`
-/// rejection rather than any other load failure. `zirv ctx status` uses this
-/// to decide its exit code: non-zero for a security refusal, zero for
-/// everything else (including a skipped-unparsable layer, which is not even
-/// an `Err` any more -- see `CtxConfig::load`'s own doc comment).
+/// Identify security refusals for status's nonzero exit; ordinary diagnostic load failures remain reportable.
 pub fn is_repo_forbidden(error: &(dyn std::error::Error + 'static)) -> bool {
     error.is::<RepoForbiddenError>()
 }
 
-/// Wraps a config error with "configuration error: " prefix, except for
-/// REPO_FORBIDDEN errors which have their own message format. This is the
-/// single chokepoint where all config errors get their prefix exactly once,
-/// ensuring consistency across all error paths (deserialization, validation,
-/// safety resolution, policy resolution, etc.).
+/// Add the config-error prefix once while preserving security refusals' distinct message format.
 pub(super) fn add_config_error_prefix(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
     if is_repo_forbidden(&*e) {
         e
@@ -2399,10 +1927,7 @@ pub(super) fn add_config_error_prefix(e: Box<dyn std::error::Error>) -> Box<dyn 
     }
 }
 
-/// Loud rather than silent: a repo that sets one of these gets a message
-/// naming the key and where to put it, which beats wondering why the value in
-/// the file is being ignored. Collects ALL violations before failing, so a repo
-/// config that sets multiple forbidden keys gets them all named in one error.
+/// Reject all forbidden keys together with named corrections; never silently ignore them.
 pub(super) fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResult<()> {
     let mut violations = Vec::new();
     for (key, variable) in REPO_FORBIDDEN {
@@ -2447,10 +1972,8 @@ pub(super) fn reject_untrusted_keys(layer: &toml::Table, path: &Path) -> CtxResu
     Ok(())
 }
 
-/// Reject executable fields inside repository-owned `[[workspace]]` tables.
-/// Selecting a name is not an authorization boundary: an autonomous seat can
-/// delegate by name too. Only the operator layer may introduce clone URLs or
-/// shell commands.
+/// Named workspace selection grants no authority: autonomous seats can select names too.
+/// Only operator config may introduce clone URLs or shell commands.
 pub(super) fn reject_untrusted_workspace_execution(
     layer: &toml::Table,
     path: &Path,

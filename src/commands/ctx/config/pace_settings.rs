@@ -5,51 +5,24 @@ use super::*;
 pub struct ScoreConfig {
     pub window: usize,
     pub min_turns: usize,
-    /// Explicit absolute override for the token-pressure floor. Wins outright
-    /// over `token_floor_ratio` when set -- an operator who pins a number
-    /// gets that number, capacity or not. `None` (the default) means "derive
-    /// it from the ratio and the resolved capacity instead"; see
-    /// `rot::token_gates`.
+    /// Absolute pressure floor wins over the capacity ratio; unset derives it from resolved capacity.
     pub token_floor: Option<u64>,
-    /// Same as `token_floor`, for the ceiling.
+    /// Absolute pressure ceiling wins over the capacity ratio.
     pub token_ceiling: Option<u64>,
-    /// Fraction of the resolved capacity the floor sits at when no explicit
-    /// `token_floor` is set (issue #155, Phase 6b). Default `0.5`.
+    /// Capacity fraction used when no absolute floor is set (#155).
     pub token_floor_ratio: f64,
-    /// Fraction of the resolved capacity the ceiling sits at when no
-    /// explicit `token_ceiling` is set. Default `0.8`.
+    /// Capacity fraction used when no absolute ceiling is set.
     pub token_ceiling_ratio: f64,
-    /// Operator-pinned context-window capacity, overriding whatever the
-    /// adapter itself reports (`Capabilities::context_window_tokens`): the
-    /// operator knows their own seat, and the adapter's default is a guess
-    /// about it. `None` (the default) defers to the adapter.
+    /// Operator-known context capacity overrides the adapter estimate; unset defers to the adapter.
     pub model_context_tokens: Option<u64>,
     pub weight_tool_failure: f64,
     pub weight_repetition: f64,
     pub weight_marker: f64,
-    /// Score weight for a stuck same-error loop -- the longest run of
-    /// consecutive identical (normalized) tool-result error texts within
-    /// the window (`rot::Signals::same_error_repeats`).
-    ///
-    /// Issue #763: default `120.0`, enabling the signal that used to ship
-    /// inert (`0.0`). Chosen, not measured, so that a FRESHLY-tripped streak
-    /// -- exactly `same_error_threshold` (default `3`) consecutive identical
-    /// errors, `rot::repetition_component`'s own ramp at its lowest nonzero
-    /// point, `1 / same_error_threshold` -- raises the score to exactly
-    /// `advise_at`'s default (`120.0 * (1.0 / 3.0) == 40.0`) in an otherwise
-    /// healthy session: the FIRST action this signal can ever cause is
-    /// `advise`, never `compact`/`restart`, matching `DEFAULT_PROMPT`'s own
-    /// "stuck twice on the same error: change approach" bullet. A session
-    /// that keeps repeating past that point escalates the same way every
-    /// other signal does, through the identical weighted-sum/threshold
-    /// machinery -- see `rot::score_from`/`verdict_for`. Set `0.0` to restore
-    /// the old, fully inert behaviour.
+    /// Weight consecutive identical normalized errors; zero disables the signal (#763).
+    /// The default first crossing contributes only an advise score in an otherwise healthy session, then ramps upward.
     pub same_error_weight: f64,
     pub repetition_threshold: usize,
-    /// Repeat count of the SAME normalized error text before the
-    /// same-error signal trips, ramped the same way `repetition_threshold`
-    /// ramps `weight_repetition` (via `rot::repetition_component`). Default
-    /// `3`.
+    /// Consecutive identical normalized errors required to trip the ramped repetition signal.
     pub same_error_threshold: usize,
     pub advise_at: u32,
     pub compact_at: u32,
@@ -97,27 +70,16 @@ impl Default for WrapConfig {
     }
 }
 
-/// This seat's own posture toward its guard's repository-write refusal
-/// (issue #358 T8, superseding the unconditional `deny` of issues #328/
-/// #334). Ordered `Allow < Advise < Deny` by declaration, the same shape
-/// `workflow::deploy::DeployTier` uses for its own strictness ladder: a
-/// repository layer may only TIGHTEN this (`allow` -> `advise` -> `deny`),
-/// never loosen it -- see `narrow_orchestrator_writes`. `hook::run_pretool`
-/// and `safety::run_check_hook_mode_with_env` both resolve this through
-/// `hook::orchestrator_write_posture` before deciding what an in-scope
-/// repository write actually does.
+/// Declared order is strictness: repos may only tighten Allow to Advise to Deny (#358, #328, #334).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrchestratorWrites {
-    /// The write proceeds; no advisory, still logged so `zirv ctx status`
-    /// can count it.
+    /// Allow silently but log every write for status counts.
     Allow,
-    /// The write proceeds; a rate-limited advisory note rides along in the
-    /// hook's own non-blocking channel, and every occurrence is logged.
+    /// Allow with a rate-limited advisory; log every occurrence.
     #[default]
     Advise,
-    /// Today's original behaviour (issues #328/#334): the write is refused
-    /// outright, with the existing dispatch-a-worker reason text.
+    /// Refuse the write with guidance to delegate it (#328, #334).
     Deny,
 }
 
@@ -141,187 +103,39 @@ pub struct SuperviseConfig {
     pub max_failures: u32,
     pub backoff_base_secs: u64,
     pub on_failure: Option<String>,
-    /// Consecutive `zirv ctx nudge`-driven restarts a single supervised run
-    /// (`exec`) will honor before it starts ignoring further nudges: a
-    /// separate cap from `max_restarts`, since a nudge-restart never spends
-    /// that budget (it is not rot). Past the cap the nudge's mail is left
-    /// unread rather than acted on, so it is still visible via `zirv ctx
-    /// inbox`. Not repo-forbidden: unlike `agent_bin` or `handoff.model`,
-    /// this names no binary, shell command, or model choice, only how many
-    /// times a session tolerates being interrupted.
+    /// Nudge restarts use a separate cap because they are not rot; excess mail remains unread and visible in inbox.
+    /// Repos may tune interruption counts because this selects no binary, command or model.
     pub max_nudges: u32,
-    /// Issue #155, Phase 5(e): how many HEAVY OPERATIONS may run
-    /// concurrently on this machine -- classified commands (`cargo build`/
-    /// `test`/`nextest`/`clippy`/`package`/`publish`, plus
-    /// `heavy_command_patterns`), each holding a permit for the duration of
-    /// the child process (`permit::acquire`/`permit::HeavyPermit`), checked
-    /// at `script_runner::Command::invoke`, the single seam where a zirv
-    /// script runs a shell command. Replaces `max_heavy_workers`, which
-    /// counted live `Verb::Exec | Verb::Dash` session records and so was
-    /// blind to what those sessions were actually doing: an idle worker
-    /// consumed the whole budget while a busy orchestrator running a full
-    /// nextest sweep consumed none of it.
-    ///
-    /// `max_heavy_workers` is still accepted as a DEPRECATED ALIAS,
-    /// rewritten onto this key before deserialisation: these structs are
-    /// `deny_unknown_fields`, so an operator's existing `~/.zirv/ctx.toml`
-    /// (or `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS`) would otherwise hard-fail
-    /// on upgrade. The new key wins when both are present.
-    ///
-    /// Defaults to 1, unchanged from issue #133: the two-parallel-worktree
-    /// reproduction there needed only two concurrent cold `cargo build` +
-    /// full-nextest workloads to blue-screen the host four times in twelve
-    /// minutes, so the safe default is a single heavy operation at a time --
-    /// an operator who has verified their own machine can take more raises
-    /// this explicitly.
-    ///
-    /// `REPO_FORBIDDEN` under BOTH spellings, unchanged from #133: a
-    /// checked-out repo raising the machine-wide concurrency budget is
-    /// exactly the case the cap exists for, so only `~/.zirv/ctx.toml` or
-    /// the matching `ZIRV_CTX_SUPERVISE_MAX_HEAVY_*` env var may set it.
-    /// Deliberately **not** under `[agents]` -- that table is reserved for
-    /// the distinct, per-agent `<repo>/.zirv/.settings.toml` gate (see
-    /// `agents_in_ctx_toml_is_rejected_so_the_two_files_stay_distinct`) --
-    /// this is a `[supervise]` key like every other cap in this struct.
+    /// Operator-only machine-wide heavy-command concurrency; hold each permit for the child lifetime (#155).
+    /// One operation is the safe default against host overload (#133).
+    /// The deprecated `max_heavy_workers` alias remains accepted and repo-forbidden; the canonical key wins.
     pub max_heavy_operations: usize,
-    /// Issues #267/#338: an optional machine-wide cap on how many `--mode
-    /// writing` delegated workers may hold a WRITER permit at once -- a
-    /// second, independent pool from `max_heavy_operations` above. A writer
-    /// permit is held for a worker's WHOLE LIFETIME (`agent::run_with`), not
-    /// only while it runs one classified heavy command. Regardless of this
-    /// cap, `permit::acquire_writer` never lets two writers hold the SAME
-    /// checkout at once. A `--mode read-only` worker never takes a writer
-    /// permit and does not count against this.
-    ///
-    /// Defaults to 0: no machine-wide cap, with per-tree exclusivity only.
-    /// An operator who wants the coarser machine-wide policy can set a
-    /// positive limit explicitly; 1 restores the original single-writer
-    /// behavior.
-    ///
-    /// `REPO_FORBIDDEN`: whether unrelated repositories coordinate through
-    /// a machine-wide writer cap is an operator policy, not something one
-    /// checked-out repository may choose for the whole machine.
+    /// Operator-only machine-wide lifetime writer cap, independent of heavy-command permits (#267, #338).
+    /// Zero leaves only per-checkout exclusivity; never allow two writers on one checkout, and read-only workers never count.
     pub max_writers: usize,
-    /// Extra command patterns an operator classifies as heavy on their own
-    /// machine, ADDED to the built-in set (`permit::BUILTIN_HEAVY_PATTERNS`),
-    /// never replacing it -- `permit::is_heavy` always checks the built-ins
-    /// regardless of what this holds. A repo layer may add entries (adding
-    /// is narrowing), but the built-ins can never be removed by any layer.
-    /// Not `REPO_FORBIDDEN`: unlike `max_heavy_operations` itself, adding a
-    /// pattern can only make MORE commands wait for a permit, never fewer,
-    /// so a repo checkout widening this list cannot reproduce issue #133's
-    /// ungoverned-concurrency incident.
+    /// Add heavy-command patterns without ever removing built-ins; repos may add restrictions only (#133).
     pub heavy_command_patterns: Vec<String>,
-    /// Issue #310 (3a): a session with NO PTY output, transcript growth, or
-    /// mail activity for this long, while it is not inside a tool call,
-    /// latches `stalled` (`stall::evaluate_progress`, `ToolState::Idle`).
-    /// Mirrors the Hermes Agent reference architecture's own
-    /// `_STALE_IDLE_SECONDS` (450.0).
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `max_writers`: a checked-out repo
-    /// raising its own stall fuse could silently defeat the detector for a
-    /// session running against it.
+    /// Operator-only idle progress fuse across PTY output, transcript growth and mail; repos cannot defeat detection (#310).
     pub idle_no_tool_secs: u64,
-    /// Same progress clock as `idle_no_tool_secs`, applied while the session
-    /// IS inside a tool call (`ToolState::InTool`) -- a stuck tool call is
-    /// expected to run longer than idle "thinking" time before it counts as
-    /// a stall. Mirrors Hermes's `_STALE_IN_TOOL_SECONDS` (1200.0).
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    /// Operator-only progress fuse inside a tool call, allowing more time than idle thinking (#310).
     pub in_tool_secs: u64,
-    /// Issue #310 (3a): once the stall latch arms and the one steering
-    /// nudge is sent, how long a session gets to show observed progress
-    /// before it is terminated via the existing kill path. Mirrors Hermes's
-    /// `_STALL_GRACE_SECONDS` (120.0).
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
+    /// Operator-only grace after the stall nudge before termination; repos cannot defeat the fuse (#310).
     pub stall_grace_secs: u64,
-    /// Issue #379: how long a session may sit in `Attention::Compacting` (a
-    /// `PreCompact` hook fired and nothing has been heard from the session
-    /// since) before `attention::project_at` renders it as stalled and a
-    /// dashboard pane mails its delegating session once. 600s is roughly
-    /// double the slowest compaction actually observed (a codex pane at
-    /// ~242K of 258K tokens took 5-6.5 minutes), so a compaction that is
-    /// merely slow never trips it.
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
-    /// repo raising its own compaction fuse could silently defeat the
-    /// detector for a session running against it.
+    /// Operator-only compaction stall fuse, sized for slow multi-minute compactions; repos cannot suppress detection (#379).
     pub compact_stall_secs: u64,
-    /// Round 4 bug 2: the hard upper bound `exec`'s and `loop`'s headless
-    /// in-place compaction (`exec::compact_in_place`) waits for the compact
-    /// child to exit and, after that, for the transcript's own
-    /// `compact_boundary` verification marker. Previously this reused
-    /// `wrap.inject_timeout_ms` (20s) -- a value sized for `wrap` injecting a
-    /// nudge into an already-running interactive PTY session, not for a
-    /// whole model turn's worth of headless compute. A real ~150k-token
-    /// compaction takes minutes, so the 20s reuse killed compactions that
-    /// were actively in progress (see the production incident this field
-    /// exists to fix). 600_000ms (10 minutes) mirrors `compact_stall_secs`'s
-    /// own evidence: "5-6.5 minutes" is the slowest compaction actually
-    /// observed elsewhere in this codebase, so 10 minutes is a safe margin
-    /// above it. `compact_in_place` uses no transcript-growth stall clock at
-    /// all: a single headless compaction turn writes nothing back until it
-    /// completes, so growth is not a valid liveness signal for it. This bound
-    /// is the only thing that can kill an in-progress compaction -- see
-    /// `compact_in_place`'s own doc comment.
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
-    /// repo shortening this could force premature restarts of a session
-    /// running against it, and lengthening it could hide a truly hung
-    /// compaction past its usefulness.
+    /// Operator-only headless compaction bound, covering child exit and boundary verification.
+    /// A full model turn can take minutes and writes no transcript until completion, so growth cannot prove liveness.
+    /// Repos may neither shorten it into premature restarts nor lengthen it to hide a hung compaction.
     pub compact_timeout_ms: u64,
-    /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
-    /// this many unplanned, same-class respawns, each no more than
-    /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
-    /// instead of looping forever across process boundaries
-    /// (`chain::evaluate`). Mirrors Hermes's `DEFAULT_MAX_RESTARTS` (3).
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a repo
-    /// checkout raising its own restart budget could silently defeat the
-    /// breaker.
+    /// Operator-only same-class unplanned restart limit breaks cross-process respawn loops; repos cannot raise it (#310).
     pub chain_max_restarts: u32,
-    /// See `chain_max_restarts` right above. Mirrors Hermes's
-    /// `DEFAULT_MAX_GAP_SECONDS` (300).
-    ///
-    /// `REPO_FORBIDDEN`, same reasoning as `chain_max_restarts`.
+    /// Operator-only maximum gap linking respawns into the restart chain (#310).
     pub chain_max_gap_secs: u64,
-    /// Issue #358 T8: this seat's own posture toward its guard's refusal of
-    /// a direct repository write (issues #328/#334). Defaults to `Advise`:
-    /// the original `Deny` was found too restrictive on its own -- an
-    /// orchestrator seat could not make even a one-line fix without a full
-    /// dispatch-and-review cycle -- so the write now proceeds by default,
-    /// with a rate-limited advisory and a durable count an operator can
-    /// still see in `zirv ctx status`. NOT `REPO_FORBIDDEN`: unlike every
-    /// other key in this struct, a repository checkout MAY narrow this
-    /// (`allow` -> `advise` -> `deny`, never the reverse -- see
-    /// `narrow_orchestrator_writes`), the same repo-may-only-tighten shape
-    /// `pace.enabled`/`verify_on_stop.enabled` already get, because a repo
-    /// asking for a stricter guard against its own orchestrator seat is
-    /// exactly the direction that can never reproduce issues #328/#334.
+    /// Default Advise allows writes with a rate-limited advisory and durable count (#358, #328, #334).
+    /// Repos may only tighten the posture toward Deny.
     pub orchestrator_writes: OrchestratorWrites,
-    /// Issue #311 (Hermes Agent's `/loop` self-paced mode): the ceiling
-    /// `zirv ctx loop`'s own self-pacing may grow the inter-cycle wait
-    /// toward when no explicit `--interval` was given and consecutive
-    /// successful cycles keep producing the same outcome digest --
-    /// `run_loop::next_pace`'s own `ceiling` parameter. Mirrors Hermes's
-    /// `DEFAULT_SELF_PACED_CEILING_SECONDS` (900). Has no effect at all on a
-    /// run launched with an explicit `--interval`: that opts out of self-
-    /// pacing entirely, so this value is never consulted.
-    ///
-    /// Narrow-only, the same "repo may only make it stricter" shape as
-    /// `compact_advisory.min_reclaim_tokens` -- but the OPPOSITE polarity:
-    /// here LOWER is stricter (the loop checks in more often, waiting no
-    /// longer than this many seconds between cycles even when nothing has
-    /// changed), so the fold is `home.min(repo)` like `verify_on_stop.
-    /// max_nudges`, not `home.max(repo)` like `compact_advisory`'s own keys.
-    /// A repo checkout may shorten how long its own loop can go quiet, never
-    /// lengthen it past what the operator (or another layer) already
-    /// allows. Not `REPO_FORBIDDEN`: unlike `supervise.idle_no_tool_secs`/
-    /// `in_tool_secs` right above (which gate a *safety* fuse a checkout
-    /// must not be able to loosen), this only tunes how quickly a
-    /// nothing-left-to-do loop backs off, and only in the direction that
-    /// asks for MORE supervision, not less.
+    /// Self-paced loop delay ceiling; an explicit `--interval` bypasses it (#311).
+    /// Repos may only lower it, requesting more frequent supervision rather than longer quiet periods.
     pub loop_backoff_ceiling_secs: u64,
 }
 
@@ -352,46 +166,22 @@ impl Default for SuperviseConfig {
     }
 }
 
-/// `[hooks]` -- knobs for the PreToolUse hooks themselves, alongside
-/// `[supervise] orchestrator_writes` above (the other decision
-/// `hook::run_pretool` makes on the same event).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HooksConfig {
-    /// Issue #406: repository-relative path prefixes the pre-write reuse
-    /// probe (`hook::run_pretool` -> `reuse::evaluate`) neither scans nor
-    /// advises on -- generated code, a vendored tree, a directory whose
-    /// duplication is deliberate. Empty by default, so the whole checkout is
-    /// in scope.
-    ///
-    /// NOT `REPO_FORBIDDEN` (it is on `workflow::checks::forbidden::
-    /// NARROW_ONLY_ALLOWLIST` instead): this is a SCOPE knob on an
-    /// advisory-only probe that never denies a write, so a repository
-    /// listing a prefix here can only make zirv say LESS, never widen what
-    /// the session is allowed to do.
+    /// Repo-relative exclusions for advisory reuse scanning; empty covers the checkout (#406).
+    /// Repo exclusions reduce advice but never widen authority because the probe cannot deny writes.
     pub reuse_exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandoffConfig {
-    /// The operator's own choice of distiller/judgment model, when set.
-    /// `None` -- the default -- means "let the adapter decide":
-    /// `resolve_distiller_model` (`handoff.rs`) falls back to the resolved
-    /// adapter's own `AgentAdapter::default_distiller_model`, which is a
-    /// real value for claude ("haiku") but `None` for codex, since a
-    /// hardcoded model name is specific to one agent's lineup and zirv has
-    /// no verified cheap-model default for codex's. This used to default to
-    /// the literal `"haiku"` unconditionally, which reached `codex exec
-    /// --model haiku` for a codex session and failed outright.
+    /// Unset delegates distiller choice to the adapter: Claude has a cheap default, Codex has no verified one.
     pub model: Option<String>,
-    /// How many trailing items of each kind the handoff context keeps: user
-    /// messages, assistant texts and tool errors. One knob, because
-    /// `structural_context` applies one limit to all three.
+    /// One trailing-item limit shared by user messages, assistant text and tool errors.
     pub tail_items: usize,
-    /// How long the distiller gets before the structural fallback is used
-    /// instead. `wrap` calls this from its pump, so an unbounded wait would
-    /// freeze the user's own terminal.
+    /// Bound the distiller before structural fallback: an unbounded wait in the wrap pump freezes the terminal.
     pub timeout_secs: u64,
 }
 
@@ -411,95 +201,41 @@ pub struct PaceConfig {
     pub enabled: bool,
     /// A supervised window is kept at or below this percentage.
     pub max_percent: f64,
-    /// Collector readings older than this are treated as stale.
-    /// `REPO_FORBIDDEN`: neither direction is a narrowing. Lengthening it
-    /// keeps a reading the checkout controls binding for hours; shortening it
-    /// drops a fresh vendor reading below `max_percent` out of
-    /// `pace::binding`, after which the estimator's lower figure binds
-    /// instead -- a repo bypassing the gate it cannot disable.
+    /// Operator-only reading freshness: extending it keeps stale data binding, while shortening it can bypass the gate.
     pub collector_max_age_secs: u64,
-    /// `REPO_FORBIDDEN`: the fallback source the gate paces on when no
-    /// collector reading binds, measured against the budgets below -- a
-    /// checkout choosing both chooses the whole reading.
+    /// Operator-only estimator selection; a repo choosing both source and budget would control the whole reading.
     pub estimator: bool,
-    /// `0` disables the estimator for that window: a plan's real allowance is
-    /// undocumented, so there is no honest default. `REPO_FORBIDDEN`, same
-    /// reasoning as `estimator`.
+    /// Zero disables this estimator window because no documented allowance supports a default; operator-only.
     pub five_hour_budget_tokens: u64,
-    /// `REPO_FORBIDDEN`, same reasoning as `five_hour_budget_tokens`.
+    /// Operator-only budget for the same estimator-authority constraint as `five_hour_budget_tokens`.
     pub seven_day_budget_tokens: u64,
-    /// `REPO_FORBIDDEN`: cache reads are the dominant token class in a cached
-    /// session, so this toggle alone moves the estimator's own percentage far
-    /// enough to change a pacing verdict.
+    /// Operator-only cache-read accounting; its large share can change the pacing verdict.
     pub count_cache_reads: bool,
     pub jitter_secs: u64,
     /// Used when a window's `resets_at` is unknown.
     pub fallback_delay_secs: u64,
-    /// Head-room added to a window's own length to form the default safety cap,
-    /// so a slightly wrong `resets_at` still resolves.
+    /// Slack above window length tolerates a slightly incorrect reset timestamp.
     pub wait_slack_secs: u64,
-    /// Absolute override for the safety cap. `None` scales the cap to the window
-    /// that tripped (5h or 7d, plus `wait_slack_secs`), which is what the spec's
-    /// wait-until-reset semantics require: a global cap would resume early and
-    /// spend tokens against a window that is still exhausted.
+    /// Optional wait cap; otherwise scale to the exhausted window plus slack to avoid spending before reset.
     pub max_wait_secs: Option<u64>,
-    /// Start of the soft-throttle band. At or above this (and below
-    /// `max_percent`) cycles are delayed so the remaining budget spreads
-    /// linearly over the time left in the window. `>= max_percent` means no
-    /// throttle band -- hard pause only.
+    /// Delay cycles linearly across the remaining window above this floor; at or above max-percent disables soft throttling.
     pub soft_percent: f64,
-    /// Active API-poll fallback: only consulted when the passive collector
-    /// reading is stale at a gating point.
+    /// Poll only when passive collector data is stale at a gate.
     pub poll_enabled: bool,
     /// Per-provider floor between poll attempts, shared across processes.
     pub poll_min_interval_secs: u64,
-    /// Operator declaration that a harness's vendor plan covers overage from
-    /// credits: gating (throttle and pause) is skipped for that harness.
+    /// Operator-declared overage coverage bypasses throttle and pause for that harness.
     pub use_credits: UseCreditsConfig,
-    /// T8 (fail-SAFE, not open): the bounded per-cycle delay `pace::wait_for_
-    /// window` applies when it is genuinely blind -- no binding collector
-    /// reading, and no configured estimator to fall back on -- instead of
-    /// the old behavior of skipping the gate outright and proceeding at full
-    /// speed. Deliberately small next to `fallback_delay_secs`/`wait_slack_
-    /// secs`: those pace a *known* trip against a *known* window, while this
-    /// is a floor applied with zero visibility into actual usage, so it must
-    /// not punish a single one-shot `zirv ctx agent` call (a common,
-    /// legitimate case for an operator who has not wired a statusline tee)
-    /// while still meaningfully slowing a tight automated loop of headless
-    /// cycles that would otherwise spend against the account with nobody
-    /// watching. See [[Usage and Pacing]]/[[Known Issues]].
+    /// Apply a bounded delay with no collector or estimator: never fail open at full speed.
+    /// Keep it small for one-shot calls while slowing unobserved automated spending loops.
     pub blind_delay_secs: u64,
-    /// Issue #155, Phase 6(c): the soft/hard band for `pace::spawn_gate`,
-    /// which gates whether a NEW delegated worker may be spawned at all
-    /// (`agent::run_with`, `dash::fulfill_spawn_request`) -- never whether an
-    /// already-running session gets restarted. Restarting a session because
-    /// it is expensive would discard a warm cache and re-read the whole
-    /// context, the single most expensive possible reaction to a cost
-    /// signal, so `rot.rs`/`score.rs` never read these (or any other
-    /// `pace`/`window` field) at all. Deliberately distinct from `max_
-    /// percent`/`soft_percent` above, which tune an already-running
-    /// supervised loop's own cadence: a spawn is new spend the operator has
-    /// not yet committed to, so it earns a stricter, earlier ceiling than
-    /// pacing an existing one. `REPO_FORBIDDEN`: a repo checkout must not be
-    /// able to change when the operator's account stops accepting new work,
-    /// in either direction.
+    /// Operator-only soft gate for new spend, stricter than pacing ongoing work (#155).
+    /// Never drive restarts from cost: that discards warm caches; rot and score never read pacing fields.
     pub spawn_soft_pct: f64,
-    /// See `spawn_soft_pct` just above. At or above this, `agent::run_with`/
-    /// `dash::fulfill_spawn_request` refuse the spawn outright unless
-    /// overridden (`agent::run_with`'s own `--force`, or `dash::SpawnRequest
-    /// ::force` carrying that same choice into a pane spawn).
-    /// `REPO_FORBIDDEN`, same reasoning as `spawn_soft_pct`.
+    /// Operator-only hard spawn ceiling; refusal requires an authorized force override to bypass (#155).
     pub spawn_hard_pct: f64,
-    /// Issue #285: the operator's own default soft token budget for a
-    /// durable objective (`zirv ctx objective set`) that does not pass its
-    /// own `--budget-tokens`. `None` means no default -- an objective set
-    /// with no explicit budget stays unbounded, same as today. Distinct from
-    /// `exec`'s own `--budget-tokens` hard stop (`EXIT_BUDGET_EXHAUSTED`):
-    /// this ceiling only flips the objective's status and swaps the injected
-    /// layer to the wrap-up instruction, it never kills the run.
-    /// `REPO_FORBIDDEN`: a repo checkout must not be able to raise its own
-    /// spend ceiling, same reasoning as `spawn_soft_pct`/`spawn_hard_pct`
-    /// above.
+    /// Operator-only default objective budget; unset is unbounded (#285).
+    /// Exhaustion changes objective status and wrap-up guidance, never kills the run.
     pub run_budget_tokens: Option<u64>,
 }
 
@@ -537,12 +273,7 @@ pub struct UseCreditsConfig {
 }
 
 impl UseCreditsConfig {
-    /// Keyed by agent in config (what the operator thinks in), resolved by
-    /// provider at the gate (what pacing knows). Unknown providers gate.
-    ///
-    /// Called at every pacing-gate construction site (`exec`/`run_loop` build
-    /// `PaceGate { use_credits: cfg.pace.use_credits.for_provider(..) }`) and
-    /// by the dashboard header's per-harness usage row.
+    /// Map agent-keyed config to providers; unknown providers must still gate.
     pub fn for_provider(&self, provider: &str) -> bool {
         match provider {
             "anthropic" => self.claude,
@@ -559,12 +290,7 @@ pub struct OptimizeConfig {
     pub enabled: bool,
     pub sessions_sampled: usize,
     pub max_surface_bytes: usize,
-    /// Empty reuses `handoff.model`'s own resolution (`resolve_distiller_
-    /// model` in `handoff.rs`, which already falls back to the resolved
-    /// adapter's own default when `handoff.model` itself is unset): one
-    /// cheap-model choice for the whole tool, kept as a plain `String`
-    /// rather than `Option<String>` since "empty" already means "defer" here
-    /// and always has.
+    /// Empty reuses handoff model resolution so cheap-model selection stays adapter-specific.
     pub model: String,
     pub recommend_tool_failure_rate: f64,
     pub recommend_corrections: usize,
@@ -585,17 +311,7 @@ impl Default for OptimizeConfig {
     }
 }
 
-/// Issue #309: whether the Stop hook may nudge the exact stale-gate command
-/// (`zirv test changed`/`zirv verify`) when the transcript shows a
-/// modification this session and the last persisted verification report no
-/// longer covers the current change set.
-///
-/// `enabled`/`max_nudges` both go through the same T9 repo-narrowing fold
-/// `pace.enabled`/`context.dedupe_native` already use (`narrow_verify_on_
-/// stop_enabled`/`narrow_max_nudges` below), not `REPO_FORBIDDEN`: an
-/// operator who wants the nudge is never blocked by the repo, but a repo
-/// checkout may only ever make the feature quieter (turn it off, or lower
-/// the cap), never louder.
+/// Nudge stale verification after session edits; repos may only disable it or lower the nudge cap (#309).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VerifyOnStopConfig {
@@ -612,18 +328,7 @@ impl Default for VerifyOnStopConfig {
     }
 }
 
-/// Q1 (blind-review completion quality): whether the Stop hook may block a
-/// HEADLESS Worker/Single session (`ZIRV_CTX_HEADLESS=1`) once when it
-/// edited/created non-test source files this turn but touched no test file
-/// for the change -- see `hook::missing_tests_gate_reason`'s own doc comment
-/// for the detector and `hook::run_stop`'s own doc comment for every other
-/// gate (interactive, `stop_hook_active`, already-blocked-this-session).
-///
-/// `enabled` goes through the same T9 repo-narrowing fold `verify_on_stop.
-/// enabled` already uses (`narrow_missing_tests_gate_enabled` below), not
-/// `REPO_FORBIDDEN`: an operator who wants the check is never blocked by the
-/// repo, but a repo checkout may only ever turn it off, never force it on
-/// for an operator who disabled it.
+/// Block a headless Worker/Single once for source edits without test changes; repos may disable, never enable it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MissingTestsGateConfig {
@@ -636,16 +341,7 @@ impl Default for MissingTestsGateConfig {
     }
 }
 
-/// Issue #774: whether claude's `SubagentStop` hook may block a native `Task`
-/// subagent's own final turn once, on a cheap deterministic result-contract
-/// violation -- see `hook::run_subagent_stop`'s own doc comment for the three
-/// checks and the fail-open/cap-at-one-block contract.
-///
-/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
-/// tests_gate.enabled` already uses (`narrow_subagent_stop_gate_enabled`
-/// below), not `REPO_FORBIDDEN`: an operator who wants the gate is never
-/// blocked by the repo, but a repo checkout may only ever turn it off, never
-/// force it on for an operator who disabled it.
+/// Claude SubagentStop contract gate fails open and blocks at most once; repos may disable, never enable it (#774).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubagentStopGateConfig {
@@ -658,22 +354,8 @@ impl Default for SubagentStopGateConfig {
     }
 }
 
-/// The scope-creep guard: a `UserPromptSubmit`-recorded, per-session note of
-/// any preservation/limitation language the request itself used (`hook::
-/// record_scope_guard_request`), a non-blocking `PreToolUse` checkpoint on
-/// the first `Edit`/`MultiEdit`/`NotebookEdit`/existing-file `Write` after
-/// each new prompt (`hook::scope_checkpoint_note`), and a once-per-prompt
-/// `Stop` backstop that blocks when the closing report claims an
-/// unrequested fix the request never asked for (`hook::
-/// scope_guard_stop_reason`).
-///
-/// `enabled` goes through the identical T9 repo-narrowing fold `missing_
-/// tests_gate.enabled`/`subagent_stop_gate.enabled` already use
-/// (`narrow_scope_guard_enabled` below), not `REPO_FORBIDDEN`: an operator
-/// who wants the guard is never blocked by the repo, but a repo checkout may
-/// only ever turn it off, never force it on for an operator who disabled it.
-/// Disabled means no record is ever written, no checkpoint is ever shown,
-/// and no Stop is ever blocked.
+/// Record request limits, advise at the first edit, and block an unrequested closing-report fix once per prompt.
+/// Repos may disable, never enable it; disabled means no records, checkpoints or Stop blocks.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScopeGuardConfig {
@@ -686,20 +368,8 @@ impl Default for ScopeGuardConfig {
     }
 }
 
-/// Issue #308 stage 1: whether the Stop hook may run a fast local checker
-/// (`cargo check`/`tsc --noEmit`) after a turn that edited files, and inject
-/// only the diagnostics that are NEW since this session's own baseline as one
-/// bounded advisory line-block. Off by default -- unlike `verify_on_stop`
-/// above, this spawns a real compiler/type-checker process on a qualifying
-/// turn, a real cost an operator must opt into explicitly rather than one
-/// this type defaults on.
-///
-/// `enabled`/`max_diagnostics`/`timeout_secs` all go through the identical T9
-/// repo-narrowing fold `verify_on_stop.enabled`/`max_nudges` already use
-/// (`narrow_diagnostics_enabled`/`narrow_max_diagnostics`/
-/// `narrow_diagnostics_timeout_secs` below): a repo checkout may only make
-/// the feature quieter or cheaper -- turn it off, lower the cap, shorten the
-/// timeout -- never louder, larger, or longer-running.
+/// Opt-in local compiler diagnostics after edits; emit only bounded findings new since the session baseline (#308).
+/// Off by default because it spawns a process; repos may only disable, lower the count or shorten the timeout.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsConfig {

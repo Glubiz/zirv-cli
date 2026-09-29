@@ -16,46 +16,16 @@ use super::super::result_schema::Schema;
 use super::super::worktree;
 use super::*;
 
-/// How long a delegated run waits for the dashboard's own answer before
-/// giving up and running headless instead. Generous enough for a live
-/// dashboard's own event loop (50ms poll, plus a once-per-tick request
-/// sweep) to notice the request and spawn a pane; short enough that an
-/// operator who is not actually running a dashboard right now (a stale
-/// `DASH_REQUESTS_ENV` inherited from a shell that used to be a pane, whose
-/// directory has not yet been reaped) is not kept waiting for long.
-///
-/// `pub(crate)` (issue #403): `sessions::kill_via_dashboard` waits out the
-/// same ceiling for its own request on this same channel, and the two must
-/// not drift.
+/// Shared ack ceiling balances event-loop latency against stale-channel waits; kill requests must use the same limit (#403).
 pub(crate) const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How much longer a *claimed* request is waited out past [`DASH_ACK_TIMEOUT`]
-/// before the delegation is called a failure.
-///
-/// O3: a claim used to be reported as success on the spot -- exit 0, "the
-/// dashboard accepted this request" -- for a task that might never run at all
-/// (a dashboard that crashed between claiming and spawning leaves exactly that
-/// state behind). A claim is good evidence the answer is merely slow, so it
-/// buys real extra time; but when the extra time runs out too, the honest
-/// answer is a failure, not a success.
+/// A claim buys extra ack time but cannot prove a successful spawn.
 pub(super) const DASH_CLAIM_EXTENSION: Duration = Duration::from_secs(10);
 
-/// The stdout line a delegation prints when the dashboard took the request and
-/// spawned a *pane* for it. Exit is 0, but nothing has run yet -- a caller that
-/// records evidence from a delegated run (the workflow reviewer) has to be able
-/// to tell this apart from a completed one, so the prefix is named rather than
-/// spelled out at two call sites. The printed text is unchanged.
+/// Stdout prefix for a spawned pane: exit 0 acknowledges launch, never completed work.
 pub const DASH_SPAWN_ACK_PREFIX: &str = "spawned in dashboard as ";
 
-/// Issue #307.3: every worktree linked to `repo` (`git worktree list
-/// --porcelain`), canonicalized, excluding `repo` itself -- best-effort like
-/// every other worktree helper in this module (`allocate_worktree`,
-/// `reclaim_worktree`): git missing, `repo` not a work tree, or an
-/// unparseable/uncanonicalizable path all degrade to an empty list, never a
-/// wrong hint. Unlike main's own `adapters::claude::current_worktree_grant_paths`
-/// (which this deliberately does not depend on -- that helper is `#[cfg(not
-/// (test))]`, so `workdir_visibility_hint`'s own tests could never exercise
-/// it), this always runs, the same as every other git shellout in this file.
+/// Canonical sibling worktrees; discovery failures yield no paths rather than unreliable hints (#307.3).
 fn sibling_worktree_paths(repo: &Path) -> Vec<PathBuf> {
     let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
         return Vec::new();
@@ -72,25 +42,8 @@ fn sibling_worktree_paths(repo: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Issue #307.3: a `--workdir` outside `repo` (and outside every one of
-/// `repo`'s own sibling worktrees) is invisible to THIS session's own
-/// harness -- the launch-settings work (issue #307) grants the DELEGATED
-/// worker prompt-free access to its own `--workdir`, but the delegator
-/// itself, if it happens to be a Claude Code session, still cannot read or
-/// edit that path without a prompt, because Claude Code's own workspace
-/// scope is fixed at session start. `/add-dir <path>` is that harness's own
-/// slash command for widening it live, so this nudges toward it rather than
-/// silently leaving the operator to discover the prompt themselves.
-///
-/// Claude-only (`/add-dir` is a Claude Code slash command with no codex
-/// equivalent this module knows of): silent unless THIS session's own
-/// `AGENT_ENV` reads exactly `"claude"`. Also silent whenever there is
-/// nothing to add -- no `--workdir` at all, or one already under `repo` or
-/// one of its own worktrees (`adapters::worktree_launch_write_paths`, the
-/// same best-effort git discovery `sibling_worktree_paths` above uses --
-/// best-effort here too: a detection failure just means no hint, never a
-/// wrong one). No new permission rule is added anywhere; this is purely an
-/// operator-facing suggestion.
+/// Claude fixes workspace scope at launch: suggest `/add-dir` for an external workdir (#307, #307.3).
+/// This is only a visibility hint for the delegator and never grants permissions.
 fn workdir_visibility_hint(
     workdir: Option<&Path>,
     repo: &Path,
@@ -115,40 +68,19 @@ fn workdir_visibility_hint(
     ))
 }
 
-/// Issue #452 (review round 1): the concrete facts a `--json` delegation
-/// receipt needs about how a dashboard answered this request -- computed
-/// directly from the `SpawnAck`/timeout data `answer_for_ack`/
-/// `wait_out_a_claimed_request` already hold, never inferred from the exit
-/// code alone. That distinction matters: [`EXIT_DASH_UNCONFIRMED`] and
-/// `answer_for_ack`'s own non-retryable, non-budget refusal code are BOTH
-/// `1`, but the first means "the dashboard took this request and may still
-/// be spawning it" (`launched: true`) and the second means "nothing is
-/// running or ever will" (`launched: false`) -- a code-only reading (or a
-/// text-parse of the human lines these functions print, an earlier version
-/// of this fix did exactly that) cannot tell the two apart.
+/// Derive receipt facts from ack/claim data, never exit codes: refusal and unconfirmed launch both return 1 (#452).
 #[derive(Debug, Clone, Default)]
 pub(super) struct AnswerFacts {
-    /// Whether the dashboard actually took this request: a pane was
-    /// admitted (`ack.ok`), or the request was claimed and not yet
-    /// confirmed. `false` only for a definitive refusal.
+    /// True for admitted or claimed requests; false only for definitive refusal.
     pub(super) launched: bool,
-    /// The pane's own short session id, when [`Self::launched`] came from a
-    /// confirmed spawn.
+    /// Pane session id, available only for a confirmed spawn.
     pub(super) short: Option<String>,
     pub(super) capability_warnings: Vec<String>,
-    /// The claimed-but-unconfirmed notice, or the refusal reason. `None`
-    /// only for a confirmed, successful spawn.
+    /// Unconfirmed-claim notice or refusal reason; absent only for a successful confirmed spawn.
     pub(super) reason: Option<String>,
 }
 
-/// The requester's own reading of one [`spawnreq::SpawnAck`].
-///
-/// O2: `ok: false` is two different answers. A policy refusal ends the
-/// delegation -- falling back to headless would run a task this operator's own
-/// configuration just refused. A `retryable` refusal is the channel saying it
-/// could not carry the request, which the headless path was never subject to,
-/// so the caller falls through to it with the reason printed. `None` here is
-/// exactly that fall-through.
+/// Only retryable channel refusals permit fallback; policy refusals must never be bypassed by an inline run.
 fn answer_for_ack<W: Write>(
     ack: spawnreq::SpawnAck,
     w: &mut W,
@@ -156,10 +88,7 @@ fn answer_for_ack<W: Write>(
 ) -> Option<(CtxResult<i32>, AnswerFacts)> {
     if ack.ok {
         let short = ack.short.unwrap_or_default();
-        // Issue #230 item 3: the same stdout result surface the headless
-        // fork prints to, one line per warning with full detail, so a
-        // delegator that joined a live dashboard sees what a headless fork
-        // of the same request would have.
+        // Expose the same detailed warnings for pane and inline delegations (#230).
         for warning in &ack.capability_warnings {
             if let Err(e) = writeln!(
                 w,
@@ -172,8 +101,7 @@ fn answer_for_ack<W: Write>(
         if let Err(e) = writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}") {
             return Some((Err(e.into()), AnswerFacts::default()));
         }
-        // Issue #307.3: a nudge for THIS session (the delegator), not the
-        // spawned worker -- see `workdir_visibility_hint`'s own doc comment.
+        // The hint concerns the delegator's visibility into the worker directory (#307.3).
         if let Some(hint) = workdir_hint
             && let Err(e) = writeln!(w, "{hint}")
         {
@@ -211,15 +139,8 @@ fn answer_for_ack<W: Write>(
     ))
 }
 
-/// O3: a request that was claimed but not acked within [`DASH_ACK_TIMEOUT`]
-/// gets [`DASH_CLAIM_EXTENSION`] more, and then an honest answer either way.
-///
-/// Deliberately **no** headless fallback on the timeout, whatever the outcome:
-/// the dashboard holds the claim and may still be spawning the pane, so a
-/// second run of the same prompt is the one failure worse than a clear error.
-/// A retryable refusal that arrives inside the extension is the one exception,
-/// and the ack itself authorises it: the dashboard has answered, and its answer
-/// is that it spawned nothing. `None` is that fall-through.
+/// Never fall back on a claimed timeout: the dashboard may still spawn, causing duplicate execution.
+/// Only a retryable ack proving no spawn permits fallback (`None`).
 fn wait_out_a_claimed_request<W: Write>(
     dir: &Path,
     stem: &str,
@@ -233,9 +154,7 @@ fn wait_out_a_claimed_request<W: Write>(
             const NOTICE: &str = "dashboard claimed the request but never confirmed; check zirv \
                                    ctx status / the dashboard";
             let facts = AnswerFacts {
-                // The dashboard DID take this request (it is claimed, just
-                // not yet confirmed) -- see this function's own doc comment
-                // and `AnswerFacts`'s own on why this is `true`, not `false`.
+                // A claim means the dashboard took the request, even without spawn confirmation.
                 launched: true,
                 short: None,
                 capability_warnings: Vec::new(),
@@ -251,28 +170,14 @@ fn wait_out_a_claimed_request<W: Write>(
     }
 }
 
-/// The exit code a delegation that could not be confirmed reports. A plain
-/// `1`: the task may or may not be running, which for the caller is a failure
-/// like any other -- the message on stdout is what says which kind.
+/// Unconfirmed launch is a failure; stdout distinguishes it from a definitive refusal.
 pub(super) const EXIT_DASH_UNCONFIRMED: i32 = 1;
 
-/// Where one delegation actually runs, as decided by [`try_join_dashboard`].
 #[derive(Debug)]
 pub(super) enum Dispatch {
-    /// A live dashboard gave a definitive answer -- a pane was spawned, the
-    /// request was refused on policy grounds, or it was *claimed* and then
-    /// never confirmed even after `DASH_CLAIM_EXTENSION` (O3). The caller
-    /// returns the result verbatim and never runs the task itself; the
-    /// [`AnswerFacts`] alongside it are what a `--json` delegation builds its
-    /// receipt from.
+    /// Return the dashboard answer verbatim; never launch locally after admission, policy refusal or an unconfirmed claim.
     Answered(CtxResult<i32>, AnswerFacts),
-    /// The caller runs the supervised child in this process instead
-    /// ([`exec::run_with_report`], unchanged). `no_dashboard` is true only
-    /// when no live dashboard could be found anywhere on this machine, which
-    /// is the one case that gets [`inline_notice`]'s single line -- every
-    /// other fall-through (a prompt that would be misread as a flag, a
-    /// request that could not be written, an unclaimed ack timeout, a
-    /// `retryable` refusal) has already printed its own reason.
+    /// Run locally; `no_dashboard` is true only when none is live, since other fallbacks already print their reason.
     Inline { no_dashboard: bool },
 }
 
@@ -292,31 +197,8 @@ impl Dispatch {
     }
 }
 
-/// Asks a live dashboard to spawn `name` as a fresh pane instead of running
-/// the supervised child inline in this process: writes a
-/// `spawnreq::SpawnRequest` carrying `prompt` as data (never argv, the same
-/// discipline every other delegation path in this codebase already holds),
-/// then waits up to `DASH_ACK_TIMEOUT` for the matching ack.
-///
-/// 2026-09-06 (headless removal): "a live dashboard" no longer means "the
-/// one this process was spawned inside". `live_join_target` prefers the
-/// inherited channel (`spawnreq::DASH_REQUESTS_ENV`), then a live dashboard
-/// whose own repo matches this one, then any live dashboard at all -- so a
-/// delegation issued from a plain terminal still lands in a visible pane
-/// rather than disappearing into a captured subprocess.
-///
-/// Every ceiling the operator typed travels on the request now
-/// (`--max-restarts`/`--timeout-secs`/`--max-tool-calls`, and the trailing
-/// `-- <flags>`); the hard error that used to refuse them here, pointing at
-/// `--headless`, is gone with the flag itself. What a pane cannot enforce is
-/// announced on stderr by [`pane_ceiling_notices`] rather than refused or
-/// silently dropped (the F9 rule: never a silent demotion).
-// Issue #318 added `result_schema` as this function's 8th parameter, over
-// clippy's default 7-argument threshold -- every argument here is already an
-// independent, unrelated piece of one delegation's own dashboard-join
-// attempt (target, prompt, output, repo, env, two timeouts, and now the
-// declared contract), so bundling them into a struct would only move the
-// same list one level down without making the one call site clearer.
+/// Send the prompt as data, never argv, and await a dashboard ack; announce any unenforceable ceilings.
+// Independent inputs describe one join attempt; grouping them would only obscure its sole call site (#318).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_join_dashboard<W: Write>(
     args: &AgentArgs,
@@ -328,16 +210,7 @@ pub(super) fn try_join_dashboard<W: Write>(
     claim_extension: Duration,
     result_schema: Option<&Schema>,
 ) -> Dispatch {
-    // Issue #262: recomputed here rather than threaded in as a parameter --
-    // `run_with` already resolved (and, on depth 0, already refused before
-    // ever reaching this function) the identical value from the identical
-    // `(repo, env)`, so this is one more redundant, deterministic config
-    // read, the same trade-off `run_with`'s own doc comment on its `cfg`
-    // load already accepts (`exec::run_with` loads its own copy too).
-    // `.unwrap_or_else` on a config-load failure falls back to the tightest
-    // grant rather than propagating an error out of a function whose return
-    // type has no room for one -- `run_with`'s own earlier, identical load
-    // already surfaced any real config error before this point.
+    // Config was validated before dispatch; a reread failure must fall back to the tightest grant (#262).
     let parent_envelope = CtxConfig::load_for_launch(repo, env)
         .ok()
         .map(|cfg| {
@@ -351,34 +224,16 @@ pub(super) fn try_join_dashboard<W: Write>(
     if targets.is_empty() {
         return Dispatch::Inline { no_dashboard: true };
     }
-    // A model pin is the one trailing flag a pane can carry across the
-    // untrusted request channel -- it travels in `SpawnRequest::model` and
-    // the pane re-checks it before building its own argv (`dash::mod::
-    // pane_model_args`). Everything else in `flags` is announced as dropped
-    // by `pane_ceiling_notices` below rather than refused: an operator who
-    // asked for a pane gets one, and finds out on stderr what the pane could
-    // not carry.
-    //
-    // R1-4 (2026-09-06 review): read with `last_model_flag`, not `model_only_
-    // flags`. The latter gives up on ANY non-model token, so a caller that
-    // pinned a model alongside anything else (`workflow::review::
-    // reviewer_args`, whose read-only floor rides in the same list) silently
-    // lost the pin and the pane ran on the generic worker default. The value
-    // is still re-checked at the fulfilment side (`dash::mod::pane_model_
-    // args`: `argv_unsafe_prompt` plus `validate_model_str`); the leading-dash
-    // filter here just keeps an obviously bogus pin off the request.
+    // Read the last model pin even among other flags; the dashboard revalidates it before building argv.
+    // Only the model crosses this untrusted channel; announce other dropped flags.
     let pinned_model = super::super::adapters::last_model_flag(&args.flags)
         .map(str::trim)
         .filter(|model| !model.is_empty() && !model.starts_with('-'));
     for notice in pane_ceiling_notices(args) {
         eprintln!("zirv ctx agent: {notice}");
     }
-    // Defense in depth for the same rule `dash::fulfill_spawn_request`
-    // enforces at the authority side: the request's prompt is encoded
-    // positionally into the pane's argv, so a prompt shaped like a flag
-    // would arrive at the real harness child as one. The inline path this
-    // falls back to is safe by construction -- there the prompt travels as
-    // the `-p <value>` data it is.
+    // Reject flag-shaped positional prompts before pane argv construction; the authority side checks again.
+    // The inline fallback safely carries the prompt as `-p <value>` data.
     if super::super::dash::argv_unsafe_prompt(prompt) {
         eprintln!(
             "zirv ctx agent: a prompt beginning with '-' cannot be spawned as a dashboard pane; \
@@ -399,95 +254,48 @@ pub(super) fn try_join_dashboard<W: Write>(
         cwd: repo.to_path_buf(),
         requested_by,
         model: pinned_model.map(str::to_string),
-        // This is a scripted request-file hand-off to whatever dashboard
-        // picks it up next -- this call site cannot vouch that a human is
-        // watching that dashboard, so it does not claim `interactive`.
+        // A file-drop request cannot prove that a human is watching the dashboard.
         interactive: false,
         role: args.role.clone(),
-        // Issue #228: a validated, harness-agnostic escape from the
-        // dashboard's own repo family -- by the time `run_with` reaches
-        // this call site, `args.workdir` (if any) has already passed
-        // `validate_workdir`, so this simply carries that canonical path
-        // for the fulfilment side to widen into (re-validated there too,
-        // since a `SpawnRequest` is untrusted data -- see `validate_
-        // workdir`'s own doc comment).
+        // Revalidate on fulfilment: prior requester validation does not make request data authoritative (#228).
         workdir: args.workdir.clone(),
-        // `session_identity`, not `requested_by` above: the two are
-        // deliberately separate (see `SpawnRequest::parent_session`'s own
-        // doc comment) even though this call site happens to derive both
-        // from the same `ZIRV_CTX_SESSION` env var today.
+        // Session lineage is distinct from the receipt's requested-by identity.
         parent_session: super::super::mail::session_identity(env),
         work_group_id: args.group.clone(),
         budget_tokens: dashboard_budget_tokens(env, args),
-        // Issue #155, Phase 6(c): this process's own spawn gate (`run_with`,
-        // above) already evaluated `--force` against the reading it had
-        // before this request was ever written. Carrying it forward lets
-        // `fulfill_spawn_request` honour the identical override rather than
-        // re-litigating it blind and refusing a spawn the requester already
-        // chose to force -- see `SpawnRequest::force`'s own doc comment.
+        // Carry the requested override for fulfilment-side validation (#155).
         force: args.force,
-        // Issue #267: carried for parity with the headless path's own
-        // `Delegation::mode` and for a future dashboard-side writer-pool
-        // enforcement (`SpawnRequest::mode`'s own doc comment) -- a pane
-        // spawn does not yet enforce the writer-permit pool itself.
+        // Preserve the worker mode across dispatch paths (#267).
         mode: args.mode,
         owns_workdir: args.worktree,
-        // Issue #318: the same canonical JSON `RESULT_SCHEMA_ENV` carries
-        // into a headless child's env, so `dash::fulfill_spawn_request` can
-        // push it into a fulfilling pane's own child env identically --
-        // see that field's own doc comment.
+        // Use the same canonical schema in pane and inline child environments (#318).
         result_schema: result_schema.map(Schema::to_canonical_json),
-        // Issue #262: the parent, not a pre-computed child -- see
-        // `SpawnRequest::envelope`'s own doc comment for why the pane
-        // fulfilling this request must derive its own child envelope itself.
+        // Send the parent envelope: the fulfilling pane must derive and validate its own narrower child grant (#262).
         envelope: envelope::canonical_json(parent_envelope).ok(),
         path_scope: args.path_scope.clone(),
         no_network: args.no_network,
         depth: args.depth,
-        // 2026-09-06: the ceilings a pane spawn used to hard-error on. They
-        // only ever NARROW the pane's own supervision, so the fulfilment
-        // side honours them even from this untrusted file drop -- see each
-        // field's own doc comment for which of the three a pane can
-        // actually hold.
+        // These ceilings only narrow supervision, so untrusted requests may carry them.
         max_restarts: args.max_restarts,
         timeout_secs: args.timeout_secs,
         max_tool_calls: args.max_tool_calls,
-        // Carried verbatim, and CLEARED again at the fulfilment side for
-        // every file-dropped request (`dash::mod::
-        // sanitize_file_dropped_request`) because trailing flags become argv
-        // on the pane's real harness child. `pane_ceiling_notices` above
-        // already told the operator so.
+        // The fulfilment side clears untrusted trailing flags before they can become harness argv.
         flags: args.flags.clone(),
-        // R1-4: the seat instructions this delegation asked for, as DATA --
-        // the fulfilling pane renders them through its own adapter's
-        // injection form, so they survive the sanitiser that clears `flags`
-        // and a pane-fulfilled reviewer keeps the seat it was launched for.
+        // Seat instructions travel as data for adapter-specific injection and survive trailing-flag sanitisation.
         system_prompt: args
             .system_prompt
             .as_deref()
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string),
-        // Issue #543 (review F2): this process's own seat generation, read
-        // the same way `seat::guard_from_env`/`seat::env_seat_identity` read
-        // theirs -- paired with `parent_session` above so `dash::mod::
-        // fulfill_spawn_request` can fence the eventual writer lease against
-        // the REQUESTER's identity instead of the dashboard's own env (see
-        // `SpawnRequest::parent_seat_generation`'s own doc comment).
+        // Fence the writer lease with the requester's session and generation, never the dashboard's identity (#543).
         parent_seat_generation: env(super::super::seat::GENERATION_ENV)
             .as_deref()
             .and_then(|g| g.parse::<u64>().ok()),
     };
-    // Issue #307.3: computed once, here, and threaded through both this
-    // ack and `wait_out_a_claimed_request`'s own -- a nudge for THIS
-    // session's own visibility into `--workdir`, not the worker's.
+    // Both ack paths need the same delegator visibility hint (#307.3).
     let workdir_hint = workdir_visibility_hint(args.workdir.as_deref(), repo, env);
-    // Issue #620/#627: one attempt PER live candidate. A `retryable` refusal
-    // (a foreign-repo dashboard, an unprovable parent claim, a pty that would
-    // not open) is the channel declining to carry this request, not a
-    // judgement on the task -- so the next live dashboard gets it before the
-    // delegation gives up and runs inline. Every other outcome keeps its
-    // existing single-attempt semantics.
+    // Retryable channel refusals try the next live dashboard before inline fallback; other outcomes end dispatch (#620, #627).
     let last = targets.len().saturating_sub(1);
     for (index, dir) in targets.iter().enumerate() {
         let dir = dir.as_path();
@@ -531,30 +339,8 @@ pub(super) fn try_join_dashboard<W: Write>(
                     inline
                 }
             },
-            // F10: `take_requests` takes the request the moment the dashboard
-            // picks it up, so a timeout here is ambiguous -- nobody was listening,
-            // or somebody took it and is still spawning. Both ends acting on that
-            // ambiguity is how one `zirv ctx agent` became two live sessions
-            // working the same prompt.
-            //
-            // F2: the **removal is the decision**, not a check followed by one.
-            // This used to ask `is_claimed` and then remove the request, which is
-            // check-then-act against a dashboard doing exactly one thing: renaming
-            // this very file into its claim (`spawnreq::take_requests`). A claim
-            // landing between the check and the remove sent this side headless
-            // while the dashboard was already spawning the same prompt. Removing
-            // first collapses the two into one atomic operation that only one side
-            // can win:
-            //
-            // * `Ok` -- this process took its own request back off disk before
-            //   anybody claimed it, and a dashboard's later rename now finds
-            //   nothing, so the headless fallback cannot double-run it;
-            // * `Err`, for any reason -- the file is no longer where this process
-            //   left it (or cannot be removed), and the thing that moves it is a
-            //   claim. Waiting the claim out is the safe reading: the worst case
-            //   is an honest "claimed but never confirmed" failure for a request
-            //   whose directory vanished with a quitting dashboard, against a
-            //   double-run of the operator's task if this guessed the other way.
+            // Removal must atomically win against the dashboard's claim rename before inline fallback is safe.
+            // Any removal failure means wait for the claim: refusing is safer than running the same task twice.
             None => {
                 if std::fs::remove_file(&path).is_ok() {
                     eprintln!(
@@ -582,26 +368,9 @@ pub(super) fn try_join_dashboard<W: Write>(
     }
 }
 
-/// The stderr notices a pane spawn owes an operator for everything they
-/// typed that a dashboard pane cannot hold exactly the way the inline
-/// supervised path would. Never a refusal and never silence -- the F9 rule:
-/// a demotion the operator cannot see is worse than either.
-///
-/// `--max-restarts` and `--timeout-secs` are absent on purpose: a pane's
-/// child is never restarted by zirv at all (so any restart budget is already
-/// satisfied) and its wall-clock ceiling IS enforced, by `dash::mod::
-/// enforce_pane_deadlines`. Only the genuinely unhonoured asks appear.
-///
-/// R1-7 (2026-09-06 review): `--force` is one of them. A request reaches the
-/// dashboard through the file-backed drop directory, and that channel proves
-/// nothing about who wrote it -- `dash::mod::intake_channels`' own shared
-/// `requests` leaf is writable by any process that discovered this dashboard
-/// (issue #179, accepted), so an operator's terminal and a pane's own harness
-/// child are indistinguishable there. `sanitize_file_dropped_request`
-/// therefore clears `force` for every drop, which means an operator who typed
-/// it gets a pane whose spend gate and cross-harness routing were re-decided
-/// without it. That is a demotion, so it is announced here rather than
-/// silently applied.
+/// Always announce unenforceable pane requests; never silently demote them.
+/// Pane deadlines enforce timeouts; no restarts already satisfies any restart ceiling.
+/// File drops cannot prove operator authority, so the sanitiser clears `force` and the notice explains it (#179).
 fn pane_ceiling_notices(args: &AgentArgs) -> Vec<String> {
     let mut notices = Vec::new();
     if args.max_tool_calls.is_some() {
@@ -630,55 +399,12 @@ fn pane_ceiling_notices(args: &AgentArgs) -> Vec<String> {
     notices
 }
 
-/// Rule 3's single line: no live dashboard exists anywhere on this machine,
-/// so this delegation runs its supervised child in this terminal. Never a
-/// refusal, and this process never launches a dashboard of its own.
+/// Announce inline execution when no dashboard is live; never refuse or launch a dashboard here.
 pub(super) fn inline_notice(name: &str) -> String {
     format!("zirv ctx agent: no live dashboard -- running {name} inline in this terminal")
 }
 
-/// The requests directory `try_join_dashboard` should actually offer the
-/// spawn request to, given the one directory it inherited via
-/// `DASH_REQUESTS_ENV` (`inherited`).
-///
-/// The inherited directory is tried first, exactly as before issue #145:
-/// absent outright, or present with a dead/missing `owner.pid`, both refuse
-/// immediately -- no ack wait is ever spent probing a directory that was
-/// never going to answer (issue #144's own fix). Only past that point does
-/// issue #145's fallback run: every OTHER `<state>/dash/*` token directory is
-/// scanned (`dash::discover_live_dash_dirs`) for a live dashboard to offer
-/// the request to instead. The case this recovers: a dashboard restarted (a
-/// fresh token dir, a fresh `owner.pid`) while this process's own shell still
-/// carries the old, now-dead `DASH_REQUESTS_ENV` value inherited from before
-/// the restart -- without this fallback the worker went silently headless
-/// even though a perfectly live dashboard was one directory away.
-///
-/// Selection rule (`dash::select_live_dash_dir`): the live candidate whose
-/// `owner.pid` has the newest mtime wins (`owner.pid` is written exactly
-/// once, at dashboard startup, so its mtime is that dashboard's own start
-/// time -- i.e. the most recently started dashboard wins), tied broken by
-/// the lexicographically greatest `<dash_short>-<token>` directory name for a
-/// deterministic pick when two dashboards start within the filesystem's own
-/// mtime resolution. Deliberately NOT filtered or weighted by the
-/// requester's own repo: a candidate whose repo does not match this
-/// request's `cwd` is not wasted effort to join -- `fulfill_spawn_request`'s
-/// `accepted_spawn_cwd` gate refuses such a request outright with a
-/// `retryable` ack, which `answer_for_ack` already reads as "fall back to
-/// headless" rather than a hard failure, and any request that gate DOES
-/// accept always spawns its pane at the request's own `cwd`, never the
-/// dashboard's own -- so joining a dashboard hosting a different repo is
-/// display-only (the pane simply appears in that dashboard's own sidebar)
-/// and can never misroute the task's working directory. See `dash::
-/// discover_live_dash_dirs`'s own doc comment for the full argument.
-///
-/// Every candidate considered (the inherited directory, and every fallback
-/// one) is logged via `eprintln`, live or not and whichever way this
-/// resolves -- issue #145's own acceptance criterion is that "my pane never
-/// appeared" must be diagnosable from this process's own log alone, with no
-/// need to go spelunking through dashboard-side state to find out why.
-///
-/// `None` only when nothing usable was found anywhere; the caller's existing
-/// headless fallback then runs unchanged.
+/// Reject dead inherited channels without an ack wait; discover live replacements and log every candidate (#144, #145).
 pub(super) fn inherited_dashboard_liveness(
     inherited: &Path,
 ) -> Option<super::super::sessions::OwnerLiveness> {
@@ -687,19 +413,14 @@ pub(super) fn inherited_dashboard_liveness(
         .then(|| super::super::sessions::dashboard_owner_liveness(inherited))
 }
 
-/// The dashboard registry short id encoded in a `<state>/dash/<dash_short>-
-/// <token>/requests` path -- the directory name up to its first `-`, which
-/// is exactly `spawnreq::request_dir_for`'s own format (a short id is hex,
-/// so it never contains one itself).
+/// Extract the hex dashboard id before the first `-` in `<dash_short>-<token>/requests`.
 fn dash_short_of(requests_dir: &Path) -> Option<String> {
     let token_dir = requests_dir.parent()?.file_name()?.to_str()?;
     let (short, _token) = token_dir.split_once('-')?;
     (!short.is_empty()).then(|| short.to_string())
 }
 
-/// Pure: whether `candidate` is a live dashboard whose own registry row
-/// names `repo`. `dash_shorts_for_repo` is the set of dashboard short ids
-/// registered against this repository, resolved once by the caller.
+/// Pure repo-membership check using registry identities resolved by the caller.
 fn candidate_hosts_repo(
     candidate: &super::super::dash::DashCandidate,
     dash_shorts_for_repo: &[String],
@@ -708,18 +429,7 @@ fn candidate_hosts_repo(
         .is_some_and(|short| dash_shorts_for_repo.contains(&short))
 }
 
-/// The dashboard sessions currently registered against `repo`, by short id.
-/// Best-effort: an unreadable registry simply yields no preference, and the
-/// caller falls back to the machine-wide selection rule.
-///
-/// Issue #620: `Verb::Chat` counts as well as `Verb::Dash`. A dashboard's
-/// token directory is named by the dashboard's own short id, which is the
-/// short id of the ORCHESTRATOR seat it hosts (`dash::run_dashboard`'s
-/// `dashboard_short`) -- and that seat's registry row is `Verb::Chat` from
-/// the moment `zirv ctx` restarts it with handoff and it re-registers. Keying
-/// this only on `Verb::Dash` therefore lost the live dashboard hosting the
-/// caller as soon as its seat was restarted, and a foreign-repo dashboard won
-/// the machine-wide rule in its place.
+/// Best-effort registry lookup; include Chat because restarted dashboard seats register under that verb (#620).
 fn dash_shorts_for_repo(state: &super::super::state::StateDir, repo: &Path) -> Vec<String> {
     let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     super::super::sessions::list(state)
@@ -758,17 +468,7 @@ fn select_join_target<'a>(
         .next()
 }
 
-/// The dashboard process THIS caller is hosted by, from the caller's own
-/// registry row: `Record::owner_pid` is the process that filed the record,
-/// which for a pane is the dashboard itself (`dash::pane::Pane::spawn` ->
-/// `sessions::SessionGuard::register`).
-///
-/// Issue #620: this is a stronger answer than either selection rule below,
-/// because it is not an inference about repositories at all -- it names the
-/// dashboard this delegation is literally running inside, whatever verb its
-/// row currently carries and whatever repo the registry thinks it holds. A
-/// caller with no session identity, no record, or no owner pid simply yields
-/// `None` and the ordinary rules decide.
+/// Prefer the caller's recorded owner PID: it identifies the hosting dashboard without repo or verb inference (#620).
 fn hosting_dash_pid(state: &super::super::state::StateDir, env: EnvLookup<'_>) -> Option<u32> {
     let session = env(super::super::adapters::SESSION_ENV)?;
     let short = super::super::sessions::short_id(&session);
@@ -781,20 +481,8 @@ fn hosting_dash_pid(state: &super::super::state::StateDir, env: EnvLookup<'_>) -
         .and_then(|(record, _)| record.owner_pid)
 }
 
-/// Every live dashboard this delegation may join, best first.
-///
-/// Order: the dashboard hosting this caller ([`hosting_dash_pid`]), then a
-/// live dashboard whose own registry row names THIS repository, then
-/// `dash::select_live_dash_dir`'s machine-wide rule (most recently started
-/// first) over whatever is left. Joining a dashboard that hosts a different
-/// repo is display-only and can never misroute the task's working directory
-/// -- see `dash::discover_live_dash_dirs`'s own doc comment -- so it stays a
-/// lower-ranked candidate rather than a refusal.
-///
-/// Issue #620: a LIST rather than one winner, so a foreign-repo dashboard
-/// that refuses the request (a `retryable` ack) costs the delegation one
-/// round-trip and the next live candidate, instead of ending it inline while
-/// a perfectly willing dashboard sits one directory away.
+/// Try the hosting dashboard, then repo matches, then remaining candidates newest first (#620).
+/// Foreign dashboards only affect display; retryable refusals advance without changing the task cwd.
 fn join_targets_in_order<'a>(
     state: &super::super::state::StateDir,
     candidates: &'a [super::super::dash::DashCandidate],
@@ -830,8 +518,6 @@ fn join_targets_in_order<'a>(
             }
         }
     }
-    // Whatever is left, newest-started first -- the same ordering
-    // `select_live_dash_dir` applies, just walked rather than maximised.
     let mut rest: Vec<&'a super::super::dash::DashCandidate> = candidates
         .iter()
         .filter(|c| is_live(c))
@@ -855,8 +541,7 @@ fn live_join_target(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -
     live_join_targets(inherited, env, repo).into_iter().next()
 }
 
-/// [`live_join_target`]'s whole ordered candidate list -- see
-/// [`join_targets_in_order`] for why a refusal needs a next one.
+/// Keep alternate live targets available after a retryable refusal.
 fn live_join_targets(inherited: Option<&Path>, env: EnvLookup<'_>, repo: &Path) -> Vec<PathBuf> {
     let inherited_live = matches!(
         inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))),
@@ -877,8 +562,7 @@ fn live_join_fallbacks(
     inherited_live: bool,
 ) -> Vec<PathBuf> {
     match inherited.map(|dir| (dir, inherited_dashboard_liveness(dir))) {
-        // Already the head of the list its caller built: nothing to explain,
-        // and the scan below still runs so a refusal has somewhere to go next.
+        // Still scan alternates so a refusal has another candidate.
         Some((_, Some(super::super::sessions::OwnerLiveness::Live))) => {}
         Some((dir, Some(super::super::sessions::OwnerLiveness::Dead(pid)))) => {
             eprintln!(
@@ -902,9 +586,7 @@ fn live_join_fallbacks(
                 spawnreq::DASH_REQUESTS_ENV
             );
         }
-        // Not inside a dashboard pane at all. Silent: this is the ordinary
-        // shape of `zirv agent` from a plain terminal, and the scan below is
-        // now its normal path rather than a recovery from something wrong.
+        // No inherited channel is normal for terminal callers; discovery remains silent here.
         None => {}
     }
 
@@ -918,21 +600,13 @@ fn live_join_fallbacks(
             return Vec::new();
         }
     };
-    // The inherited directory may itself live under `state.dash()` and would
-    // otherwise show up a second time here, already explained above -- this
-    // keeps the fallback log free of a duplicate line for the very directory
-    // whose rejection reason was just printed.
+    // Exclude the inherited directory to avoid logging the same candidate twice.
     let others: Vec<super::super::dash::DashCandidate> =
         super::super::dash::discover_live_dash_dirs(&state)
             .into_iter()
             .filter(|c| Some(c.requests_dir.as_path()) != inherited)
             .collect();
-    // Selected before the log loop below, not after: whether a live candidate
-    // is the winner or merely a live-but-passed-over sibling changes what
-    // gets printed for it, and every candidate -- winner included -- must
-    // appear exactly once. See this function's own doc comment: "every
-    // candidate ... is logged, live or not", which a silent `Live => {}` arm
-    // here used to violate for every live sibling that lost the selection.
+    // Select before logging so every candidate, including the winner, is reported exactly once.
     let ordered = join_targets_in_order(&state, &others, repo, env);
     let winner = ordered.first().copied();
     for candidate in &others {
@@ -955,9 +629,7 @@ fn live_join_fallbacks(
     }
     match winner {
         Some(winner) => {
-            // `instead` only when something was actually rejected above: a
-            // live inherited channel is the head of the list, not a
-            // replacement for one.
+            // A live inherited channel is the first choice, not a replacement for a rejected channel.
             if inherited_live {
                 eprintln!(
                     "zirv ctx agent: {} is also live and available if the first refuses",
@@ -994,14 +666,7 @@ fn live_join_fallbacks(
         .collect()
 }
 
-/// Issue #223 §E: `workflow.adoption = enforce`'s delegation gate. Refuses
-/// only when all four hold -- the policy is `enforce`, this call carries a
-/// session identity ([`adapters::SESSION_ENV`]), that session's own adoption
-/// record (`hook::adoption_record_path`/`load_adoption_record`, the same
-/// record `ctx::hook`'s Stop/Prompt handlers maintain) says substantial, and
-/// no `zirv workflow` is active for `repo` right now -- so an operator
-/// running `zirv agent` from a plain shell with no session identity at all is
-/// never blocked.
+/// Enforce adoption only for an identified substantial session with no active workflow; plain shells remain allowed (#223).
 pub(super) fn adoption_enforcement_refusal(
     state: &super::super::state::StateDir,
     repo: &Path,
@@ -1034,22 +699,8 @@ pub(super) fn adoption_enforcement_refusal(
     ))
 }
 
-/// Issue #328: from an orchestrator seat, `zirv agent <own harness>` is
-/// refused unless it is a work-group operation or `--force`. Same-harness
-/// delegation belongs to the harness's own native subagent tool -- it stays
-/// visible in the calling session and returns its result directly, which a
-/// zirv-supervised headless worker cannot do; `zirv agent` exists for
-/// another harness, or for a work group/sub-orchestrator (a distinct
-/// concept from "delegate to the same harness"), not as a second way to
-/// spawn a subagent on the seat's own harness.
-///
-/// Refuses only when ALL of: the seat is an orchestrator ([`adapters::
-/// SEAT_ROLE_ENV`]); this session's own harness ([`adapters::AGENT_ENV`])
-/// trimmed equals `args.name` trimmed, case-insensitively; `args.role` is
-/// not `"sub-orchestrator"`; `args.group` is unset; and `args.force` is
-/// false. Any one of those failing is enough to let the delegation through
-/// -- an unknown own-harness (`AGENT_ENV` unset) never refuses either,
-/// since there is nothing to compare `args.name` against.
+/// Prefer native same-harness subagents for visible results; work-group operations and `--force` are exempt (#328).
+/// Refuse only orchestrator seats with a known matching harness; unknown harness identity never refuses.
 pub(super) fn same_harness_refusal(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
     if env(adapters::SEAT_ROLE_ENV).as_deref() != Some("orchestrator") {
         return None;

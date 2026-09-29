@@ -12,23 +12,8 @@ use super::super::state::StateDir;
 use super::super::worktree;
 use super::*;
 
-/// Issue #228: `--workdir` is a first-class, harness-agnostic zirv flag --
-/// canonicalised and checked up front, before any spawn decision, so a bad
-/// directory fails loudly rather than surfacing as a confusing sandbox
-/// error deep inside the harness's own child process.
-///
-/// A worker's own filesystem sandbox is only ever narrowed from a directory
-/// zirv itself resolved and confirmed is a real repository checkout; there
-/// is deliberately no escape hatch for a directory that is not one (unlike,
-/// say, codex's own `--skip-git-repo-check`) -- see the acceptance criteria
-/// on issue #228.
-///
-/// `pub(crate)`, not private: `dash::mod::fulfill_spawn_request` re-runs
-/// this SAME check against `SpawnRequest::workdir` before honouring it,
-/// since a spawn request is untrusted data a same-uid pane could forge (the
-/// same trust boundary issue #179 already documents for every other field
-/// on that struct) -- defense in depth, not a second, independently
-/// drifting copy of the rule.
+/// Require a canonical existing git workdir before deriving its sandbox; no non-repo escape hatch (#228).
+/// The dashboard must rerun this check because a same-uid spawn request is untrusted data (#179).
 pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
     let canon = std::fs::canonicalize(dir)
         .map_err(|e| format!("--workdir {} does not exist: {e}", dir.display()))?;
@@ -119,8 +104,7 @@ impl WorkdirHomes {
     }
 }
 
-/// Filesystem roots and the user's home are equality-only refusals; the
-/// configuration/state roots also refuse descendants. No flag overrides this.
+/// Refuse filesystem roots/home by equality and config/state roots with descendants; no flag overrides this.
 fn refused_workdir_root(canonical: &Path, homes: &WorkdirHomes) -> Option<&'static str> {
     if canonical.has_root() && canonical.parent().is_none() {
         return Some("filesystem root");
@@ -134,22 +118,8 @@ fn refused_workdir_root(canonical: &Path, homes: &WorkdirHomes) -> Option<&'stat
         .find_map(|(name, root)| canonical.starts_with(root).then_some(*name))
 }
 
-/// Review finding (2026-09, CRITICAL, issue #718): finds an `Idle` record
-/// matching `digest` and claims + resets it as ONE operation -- called by
-/// [`allocate_worktree`] with this repo's own `worktree::lock_worktrees`
-/// already held, so two concurrent `--worktree-reuse` callers can never
-/// both [`worktree::find_reusable`] the same record before either claims
-/// it. The claim -- an `Active` record written over the old `Idle` one --
-/// is appended BEFORE `git reset --hard` ever runs, so a competing caller
-/// that takes the lock next always sees this record already claimed, never
-/// still `Idle`, even if the reset that follows is slow or fails outright.
-///
-/// A failed reset (or a `validate_workdir` failure right after) marks the
-/// now-claimed record `InspectionFailed` rather than leaving a half-reset
-/// tree `Idle` for a later call to find again: `None` tells the caller to
-/// fall back to a fresh cold worktree, and the tree itself is left for
-/// `zirv ctx worktree prune` after manual inspection, exactly like any
-/// other `decide` refusal this module already leaves in place.
+/// Under the worktree lock, claim Idle as Active before reset so concurrent callers cannot reuse the same tree (#718).
+/// Reset or validation failure marks InspectionFailed and falls back to cold allocation, never leaves a half-reset tree Idle.
 fn claim_idle_worktree(
     state: &StateDir,
     repo_slug: &str,
@@ -204,41 +174,9 @@ fn claim_idle_worktree(
     None
 }
 
-/// Issue #267/#319: `--worktree`'s own allocation -- a fresh linked `git
-/// worktree add` sibling of `repo` at `<repo>/.zirv/worktrees/<short>`,
-/// returned through [`validate_workdir`] so it is held to the identical
-/// contract every other `--workdir` value is (canonicalised, confirmed a
-/// real directory inside a git repository) before this delegation ever
-/// reads it as one.
-///
-/// `short` is a fresh v4 UUID's own [`super::super::sessions::short_id`] -- the
-/// same 8-character derivation a session id gets, reused here purely for a
-/// short, collision-resistant directory name, not because this names a
-/// session.
-///
-/// Issue #319: `repo`'s own `HEAD` is captured with `git rev-parse HEAD`
-/// BEFORE `git worktree add` runs and passed explicitly (`-b <short> <path>
-/// <base_commit>`), so the tree's base is exactly what was recorded, never
-/// implicitly "whatever HEAD happened to be when `add` ran" -- and `-b
-/// <short>` makes the branch-minting explicit rather than relying on git's
-/// own "commit-ish omitted" convenience (which this replaces: the old,
-/// implicit form checked out the same thing, since HEAD had not moved
-/// between the two calls in practice, but named nothing on the record this
-/// module now needs for every later probe/decide). The recorded base commit
-/// and the fresh ownership record (`<state>/worktrees/<repo-slug>.jsonl`)
-/// are what let [`reclaim_worktree`] later prove -- rather than merely
-/// check porcelain cleanliness -- that nothing would be lost by removing
-/// this tree.
-///
-/// Best-effort I/O, but NOT best-effort failure handling for the worktree
-/// itself: unlike most of this module's state-dir housekeeping, a
-/// `--worktree` that fails to allocate has no honest fallback (running the
-/// worker in `repo` instead would silently defeat the very isolation the
-/// operator asked for), so this fails the delegation outright rather than
-/// degrading. Recording ownership, by contrast, IS best-effort: a failed
-/// write leaves this tree without a record, which only means a later
-/// reclaim treats it conservatively (see [`reclaim_worktree`]'s own doc
-/// comment) -- never that the tree itself failed to allocate.
+/// Capture and pass the base commit before worktree creation so later removal has an exact ownership proof (#267, #319).
+/// Validate the allocated git directory; allocation failure must refuse, never fall back to the shared checkout.
+/// Ownership recording is best-effort: missing records prevent reclamation, not allocation.
 pub(super) fn allocate_worktree(
     state: &StateDir,
     repo: &Path,
@@ -262,22 +200,8 @@ pub(super) fn allocate_worktree(
         .trim()
         .to_string();
     let repo_slug = super::super::state::repo_slug(repo);
-    // Issue #718: `--worktree-reuse` tries the warm pool first -- a `git
-    // reset --hard` on an `Idle` tree `worktree::find_reusable` already
-    // re-proved clean, never a fresh `git worktree add` -- before ever
-    // falling through to the cold path below. The selected workspace's
-    // ordered setup list is encoded as JSON so command boundaries cannot
-    // collide; a changed, reordered, or removed command changes the digest.
-    // A mismatch (no matching `Idle` record) or a reset/`validate_workdir`
-    // failure falls straight through to cold allocation, never forced.
-    //
-    // Review finding (2026-09, CRITICAL): select + claim run under this
-    // repo's own worktree-store lock (`worktree::lock_worktrees`), so two
-    // concurrent `--worktree-reuse` calls can never both select the same
-    // `Idle` record -- see `claim_idle_worktree`'s own doc comment. A lock
-    // failure (best-effort, like every other housekeeping write in this
-    // function) skips reuse for this allocation rather than risking an
-    // unsynchronized claim.
+    // Reuse only a re-proved clean tree under the worktree lock; lock/reset/validation failure uses cold allocation (#718).
+    // JSON-encode ordered setup commands in the digest so command boundaries, removals and reordering cannot collide.
     let setup = if setup.is_empty() {
         String::new()
     } else {
@@ -347,76 +271,24 @@ pub(super) fn allocate_worktree(
     Ok(path)
 }
 
-/// The result of one [`reclaim_worktree`] attempt -- every non-[`Removed`]/
-/// [`Archived`] variant is best-effort: printed as a single stderr line by
-/// the caller, never turned into a delegation failure or a nonzero exit
-/// code.
-///
-/// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
-/// matches on this too, reclaiming a dashboard-hosted `--worktree` pane's
-/// own linked worktree once its child exits -- the one exit path `run_with`
-/// itself can never observe, since ownership already passed to the pane the
-/// moment the dashboard accepted it (see [`is_agent_managed_worktree`]'s own
-/// doc comment).
-///
-/// [`Removed`]: ReclaimOutcome::Removed
-/// [`Archived`]: ReclaimOutcome::Archived
+/// Reclaim failures are best-effort diagnostics, never delegation failures; dashboard exits share these outcomes.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReclaimOutcome {
-    /// Every probe allowed removal; only ignored regenerable build output
-    /// may have remained. `git worktree remove` (no `--force`) succeeded,
-    /// and the branch survives untouched.
+    /// Proved safe and removed without force; the branch survives, with only regenerable ignored output allowed.
     Removed,
-    /// The tree carried untracked or ignored content, which was copied to the
-    /// returned archive directory before the tree was removed.
+    /// Untracked or ignored content was archived before removal.
     Archived(PathBuf),
-    /// Issue #319: `worktree::decide` refused -- an unpushed commit, tracked
-    /// dirt, a cherry-unmatched commit, a probe that could not be run, or no
-    /// ownership record at all for this path. Left in place either way; the
-    /// named probe and note are exactly `worktree::InspectionFailed`'s own.
+    /// Missing ownership, unsafe content or failed probes leave the tree in place with the failed proof (#319).
     InspectionFailed { probe: &'static str, note: String },
-    /// `decide` said this tree was safe to remove (or to archive-then-remove)
-    /// but the archive copy or `git worktree remove` itself failed. Left in
-    /// place either way.
+    /// Failed archive or removal leaves the tree in place.
     Failed(String),
-    /// Issue #718: this tree's own allocation opted into `--worktree-reuse`
-    /// (its record carries a `setup_digest`), the pool had room, and the
-    /// same proof `Removed`/`Archived` require passed -- so it was marked
-    /// `Idle` and left on disk, warm build cache included, instead of being
-    /// `git worktree remove`d.
+    /// Opt-in reuse passed removal proofs and pool admission; retain the tree and warm cache as Idle (#718).
     Idled,
 }
 
-/// Issue #319: routed entirely through `worktree::prune_one` -- the same
-/// proof-required probe/decide/archive contract the `zirv ctx worktree
-/// prune` verb and startup GC use, so a dashboard-hosted pane's automatic
-/// reclaim, a headless delegation's own post-run reclaim, and an operator's
-/// explicit prune can never quietly drift apart on how much proof is
-/// required before a tree is removed.
-///
-/// Looks up `path`'s ownership record (written by [`allocate_worktree`]) to
-/// find its recorded base commit; a path with no record at all (a tree from
-/// before this record existed, or one whose write failed) is left in place
-/// as [`ReclaimOutcome::InspectionFailed`] rather than guessed at -- there
-/// is no base commit to prove anything against, so this module never
-/// pretends otherwise. Run `zirv ctx worktree prune <path>` after manually
-/// confirming such a tree is safe to discard.
-///
-/// `pub(crate)` (review finding, 2026-09): `dash::mod::reap_ended_panes`
-/// calls this directly for a dashboard-hosted `--worktree` pane -- see
-/// [`ReclaimOutcome`]'s own doc comment.
-///
-/// Issue #718: `idle_pool_max` is consulted ONLY when this tree's own record
-/// carries a `setup_digest` (it was allocated with `--worktree-reuse`) --
-/// every other tree keeps today's exact remove/archive/keep behavior,
-/// byte-for-byte. Even then, idling runs the identical `probe`/`decide`
-/// proof `prune_one` requires (never skipped), and only while
-/// `worktree::idle_count` is under the cap, both read and acted on under
-/// this repo's own `worktree::lock_worktrees` (review finding, 2026-09,
-/// CRITICAL) -- the same lock `claim_idle_worktree` holds, so an idle-count
-/// check here can never race a concurrent allocation's own claim. A `Keep`
-/// refusal, a full pool, or a lock failure all fall straight through to the
-/// normal proof-required removal below.
+/// All reclaim paths share `prune_one`'s proof requirement; missing ownership means keep the tree (#319).
+/// Reuse idling also requires that proof and a locked capacity check, preventing races with allocation (#718).
+/// A full pool, Keep refusal or lock failure falls through to ordinary proof-required reclamation.
 pub(crate) fn reclaim_worktree(
     state: &StateDir,
     repo: &Path,
@@ -433,10 +305,7 @@ pub(crate) fn reclaim_worktree(
         };
     };
     if record.setup_digest.is_some() {
-        // Review finding (2026-09, CRITICAL): the same worktree-store lock
-        // `allocate_worktree`'s own claim takes -- otherwise a reclaim
-        // idling this tree could race a concurrent allocation's own
-        // `idle_count` read/claim, over- or under-counting the pool.
+        // Use the allocation lock so idling and concurrent claims cannot race the pool count.
         match worktree::lock_worktrees(state, &repo_slug) {
             Ok(_lock) => {
                 if worktree::idle_count(state, &repo_slug) < idle_pool_max as usize {
@@ -479,16 +348,7 @@ pub(crate) fn reclaim_worktree(
     }
 }
 
-/// Review finding (2026-09), finding 2a: whether `cwd` is a worktree
-/// [`allocate_worktree`] itself created under `repo` -- the only paths a
-/// `--worktree` spawn's own cwd can ever be (that function's own
-/// `<repo>/.zirv/worktrees/<short>` contract). `dash::mod::reap_ended_panes`
-/// uses this to decide whether a just-exited pane's cwd is one of THIS
-/// repo's own agent-managed worktrees -- never an arbitrary `--workdir` the
-/// operator named directly, which no reclaim path owns or may touch.
-/// Canonicalizes both sides so a differently-spelled (but identical) path
-/// still matches; a `repo` or `cwd` that cannot be canonicalized (already
-/// gone) never matches, since there is then nothing left to reclaim anyway.
+/// Only reclaim canonical agent-allocated trees under this repo; never take ownership of an explicit workdir.
 pub(crate) fn is_agent_managed_worktree(repo: &Path, cwd: &Path) -> bool {
     let Ok(repo) = std::fs::canonicalize(repo) else {
         return false;
@@ -500,11 +360,7 @@ pub(crate) fn is_agent_managed_worktree(repo: &Path, cwd: &Path) -> bool {
     cwd.starts_with(&root)
 }
 
-/// Reclaims `path` (an allocated `--worktree`) and reports the outcome as a
-/// single stderr line -- shared by `run_with`'s own explicit post-run call
-/// and [`WorktreeReclaimGuard`]'s `Drop`, so both report identically rather
-/// than drifting. `idle_pool_max` is forwarded to [`reclaim_worktree`]
-/// unchanged -- see its own doc comment.
+/// Share reclaim reporting between explicit completion and Drop so both paths expose failures consistently.
 pub(super) fn reclaim_worktree_and_report(
     state: &StateDir,
     repo: &Path,
@@ -551,22 +407,8 @@ pub(super) fn reclaim_worktree_and_report(
     }
 }
 
-/// Review finding (2026-09), finding 2b: `allocate_worktree` runs before
-/// routing/admission/the dashboard-join fork, so EVERY subsequent early
-/// return in `run_with` -- a refusal, a validation error, an `exec` failure
-/// -- must also reclaim a clean, unused linked worktree, not just the one
-/// success path that already did. A small `Drop` guard is the least
-/// invasive way to cover every such `?`/`return` between allocation and
-/// that success path without touching each one individually.
-///
-/// Armed (`path: Some(..)`) the moment `run_with` allocates a `--worktree`;
-/// disarmed only once ownership genuinely passes elsewhere -- a spawned
-/// dashboard pane (that pane's own exit is reclaimed instead by `dash::
-/// mod::reap_ended_panes`, via [`is_agent_managed_worktree`]/
-/// [`reclaim_worktree`]), or the headless path's own explicit call to
-/// [`reclaim_worktree_and_report`] once it has already run. A REFUSED
-/// dashboard join (never actually spawned a pane) leaves the guard armed on
-/// purpose: nothing else owns that worktree, so it must still be reclaimed.
+/// Arm immediately after allocation so every later error/refusal reclaims the unused tree.
+/// Disarm only after explicit reclaim or real pane ownership transfer; a refused dashboard join retains ownership.
 pub(super) struct WorktreeReclaimGuard<'a> {
     state: &'a StateDir,
     repo: &'a Path,
@@ -589,8 +431,7 @@ impl<'a> WorktreeReclaimGuard<'a> {
         }
     }
 
-    /// Ownership of the worktree has passed elsewhere -- `Drop` must not
-    /// also reclaim it.
+    /// Disarm after ownership transfers so Drop cannot reclaim the same tree twice.
     pub(super) fn disarm(&mut self) {
         self.path = None;
     }
@@ -604,50 +445,23 @@ impl Drop for WorktreeReclaimGuard<'_> {
     }
 }
 
-/// Issue #228: the directory a headless spawn's child process cwd and
-/// per-harness sandbox actually derive from -- `workdir` when the operator
-/// gave one (by the time this is called in `run_with`, already validated
-/// and canonicalised by [`validate_workdir`]), else `repo` (today's
-/// behaviour, byte for byte unchanged). Pure so the "workdir wins when
-/// given" invariant is directly testable without spawning anything.
+/// Pure selection: validated workdir overrides repo for both child cwd and sandbox (#228).
 pub(crate) fn effective_launch_repo(workdir: Option<&Path>, repo: &Path) -> PathBuf {
     workdir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.to_path_buf())
 }
 
-/// The cap on how many path-like candidate tokens
-/// [`out_of_repo_paths_in_prompt`] will canonicalize/exists-check, so a huge
-/// prompt cannot make dispatch slow.
+/// Bound filesystem candidate probes so large prompts cannot stall dispatch.
 const MAX_WORKDIR_WARNING_CANDIDATES: usize = 32;
 
-/// Trailing punctuation a candidate token is stripped of before
-/// classification -- ordinary prose marks (`.,;:`), a closing paren, a
-/// trailing quote (belt-and-suspenders: the split below already treats a
-/// bare quote as a token boundary), and (Fix 6, issue #249/#250 review) a
-/// trailing backtick.
+/// Strip prose punctuation and closing wrappers before path classification (#249, #250).
 const TRAILING_TOKEN_PUNCTUATION: [char; 8] = ['.', ',', ';', ':', ')', '"', '\'', '`'];
 
-/// Fix 6 (issue #249/#250 review): leading wrapping punctuation stripped
-/// from a candidate token before classification -- a backtick or an opening
-/// paren. Without this, `` `/tmp/other` `` or `(/tmp/other)` failed the
-/// `starts_with('/')` check outright (the trailing mark was already
-/// stripped by [`TRAILING_TOKEN_PUNCTUATION`], but nothing stripped the
-/// leading one) and the whole token was silently dropped as a candidate.
-/// Quotes need no leading counterpart here: the split in
-/// [`candidate_path_tokens`] already treats a bare `'`/`"` as a token
-/// boundary, so a quote-wrapped path never carries one at either edge to
-/// begin with.
+/// Strip leading backticks/parentheses so wrapped absolute paths remain candidates; quotes are split boundaries (#249, #250).
 const LEADING_TOKEN_WRAPPING: [char; 2] = ['`', '('];
 
-/// Fix 6: whether `token` (already stripped of wrapping punctuation by
-/// [`candidate_path_tokens`]) looks like an absolute path -- Unix (`/...`,
-/// `~/...`), a Windows drive-letter path (`C:\...`/`C:/...`), or a Windows
-/// UNC path (`\\server\share...`). Pure classification, deliberately kept
-/// separate from [`out_of_repo_paths_in_prompt`]'s own `exists()`-on-disk
-/// gate so the tokenizer/classifier itself -- the Windows shapes included --
-/// is directly testable on any host, independent of what a drive-relative
-/// path would need to actually exist on THIS machine's disk.
+/// Pure Unix, drive-letter and UNC path classification, independent of host filesystem existence.
 fn looks_like_absolute_path_token(token: &str) -> bool {
     if token.starts_with('/') || token.starts_with("~/") || token.starts_with(r"\\") {
         return true;
@@ -661,11 +475,7 @@ fn looks_like_absolute_path_token(token: &str) -> bool {
         && matches!(chars.next(), Some('\\') | Some('/'))
 }
 
-/// The whitespace/quote-delimited candidate tokens in `prompt`, stripped of
-/// wrapping punctuation and filtered to [`looks_like_absolute_path_token`],
-/// capped at [`MAX_WORKDIR_WARNING_CANDIDATES`]. Split out of
-/// [`out_of_repo_paths_in_prompt`] (Fix 6) so the tokenizer/classifier is
-/// unit-testable without that function's own `exists()`-on-disk gate.
+/// Bound candidate parsing before filesystem probes; classify independently of disk existence.
 fn candidate_path_tokens(prompt: &str) -> impl Iterator<Item = &str> {
     prompt
         .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
@@ -679,24 +489,8 @@ fn candidate_path_tokens(prompt: &str) -> impl Iterator<Item = &str> {
         .take(MAX_WORKDIR_WARNING_CANDIDATES)
 }
 
-/// Issue #250: absolute paths named in a delegated prompt that resolve
-/// outside `launch_repo` -- the worker's writable root
-/// ([`effective_launch_repo`] with `workdir: None` is exactly `launch_repo`
-/// itself, byte for byte). Feeds `run_with`'s non-fatal dispatch-time
-/// warning: a brief naming a path outside the worker's sandbox burns a full
-/// run just to report BLOCKED, and this is the conservative heuristic that
-/// catches the disk-visible half of that up front.
-///
-/// A candidate token ([`candidate_path_tokens`]) is any whitespace- or
-/// quote-delimited run that -- once stripped of wrapping punctuation such as
-/// backticks or parentheses -- looks like an absolute path
-/// ([`looks_like_absolute_path_token`]: `/...`, `~/...`, a Windows
-/// drive-letter path, or a UNC path), `~/` expanded against `home` when
-/// given. A token that does not exist on disk, or that canonicalizes inside
-/// `launch_repo`, is silently dropped -- a false negative here is fine, a
-/// false positive is not. Pure aside from the `fs` calls each candidate
-/// needs, so a tempdir-backed test can exercise it directly without
-/// spawning anything.
+/// Warn early about existing paths outside the sandbox to avoid workers spending a run blocked by scope (#250).
+/// Only filesystem probes are impure; discard nonexistent/internal paths because false positives are unacceptable.
 fn out_of_repo_paths_in_prompt(
     prompt: &str,
     launch_repo: &Path,
@@ -717,16 +511,7 @@ fn out_of_repo_paths_in_prompt(
         .collect()
 }
 
-/// Issue #328: the one-line nudge printed when a session delegates to the
-/// SAME harness it already runs under (`ZIRV_CTX_AGENT` names `<name>`).
-/// The operator's routing rule is that zirv reaches another harness or a
-/// work group, while same-harness delegation belongs to the harness's own
-/// native subagent tool -- visible in the session, result returned directly,
-/// no mail hop. A work-group dispatch (`--group`, or an inherited
-/// `WORK_GROUP_ENV`) is exactly the case zirv exists for, so it never hints,
-/// and neither does a sub-orchestrator scope. The hint is advice, not a
-/// refusal: the run proceeds unchanged, because refusing would strand an
-/// operator who typed the command on purpose with nobody to answer.
+/// Advise same-harness callers toward visible native subagents; never refuse or hint for work-group/scope dispatches (#328).
 pub(super) fn same_harness_hint(args: &AgentArgs, env: EnvLookup<'_>) -> Option<String> {
     if args.group.is_some() || args.scope.is_some() || env(WORK_GROUP_ENV).is_some() {
         return None;
@@ -742,10 +527,7 @@ pub(super) fn same_harness_hint(args: &AgentArgs, env: EnvLookup<'_>) -> Option<
     ))
 }
 
-/// Prints [`out_of_repo_paths_in_prompt`]'s findings as non-fatal stderr
-/// warnings, one line per offending path. Never called when `--workdir` was
-/// given -- an explicit `--workdir` already says the operator meant to point
-/// the worker elsewhere, so there is nothing to warn about.
+/// Nonfatal path warnings; explicit workdir suppresses them because it already declares an intentional alternate root.
 pub(super) fn warn_about_paths_outside_launch_repo(
     prompt: &str,
     launch_repo: &Path,
@@ -772,8 +554,7 @@ pub(crate) fn codex_read_only_build_warning(
     )
 }
 
-/// Issue #364: Codex's Windows sandbox denies the resolved linked-worktree
-/// gitdir even when it is covered by the writable roots.
+/// Codex on Windows denies resolved linked-worktree gitdirs even when writable roots include them (#364).
 pub(super) fn codex_worktree_sandbox_warning(
     adapter_name: &str,
     git_dirs: Option<(PathBuf, PathBuf)>,

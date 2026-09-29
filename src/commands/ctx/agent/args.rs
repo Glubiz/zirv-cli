@@ -11,9 +11,6 @@ pub struct AgentArgs {
     /// The task prompt, or "-" to read it from stdin.
     pub prompt: String,
     /// Extra flags for the agent's own CLI, after `--`.
-    //
-    // `allow_hyphen_values`, because what gets passed through here is the
-    // agent's own flags.
     #[arg(allow_hyphen_values = true, last = true)]
     pub flags: Vec<String>,
     /// R1-4 (2026-09-06 review): seat instructions to inject as the worker's
@@ -293,10 +290,7 @@ pub struct AgentArgs {
     pub cancellation: Option<std::sync::Arc<super::super::provider::adapter::CancellationFlag>>,
 }
 
-/// The same defaults clap itself applies, so the many call sites that build
-/// an `AgentArgs` in code (the workflow engine's auto-spawn, the review
-/// launcher, tests) keep getting the harness runtime without restating it --
-/// and a field added here later cannot silently become `""` at those sites.
+/// Programmatic callers need explicit runtime defaults so an unset string cannot select the runtime.
 impl Default for AgentArgs {
     fn default() -> Self {
         Self {
@@ -340,11 +334,7 @@ impl Default for AgentArgs {
     }
 }
 
-/// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
-/// A thin, clap-facing mirror rather than teaching the engine's own type
-/// `ValueEnum` directly: `engine.rs` is owned by concurrent work this task
-/// must not touch, and this delegation-only flag has no business dictating
-/// that type's derives anyway.
+/// Keep clap derives local to the delegation flag instead of coupling the workflow engine to CLI parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ArtifactStageArg {
     Intent,

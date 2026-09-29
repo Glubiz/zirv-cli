@@ -1,26 +1,9 @@
 //! `zirv ctx agent <name> <prompt> [-- flags]`: a one-shot delegation to a
 //! supervised worker on another enabled harness.
 //!
-//! A delegation is one of exactly two visible shapes, never a third invisible
-//! one: a DASHBOARD PANE when any dashboard is live on this machine
-//! (`try_join_dashboard`, which prefers the channel this process inherited,
-//! then a dashboard hosting this repo, then any live one), or an INLINE
-//! supervised run in this terminal when none is, announced by
-//! [`inline_notice`]'s single line. `--headless` -- which used to force the
-//! second shape even from inside a dashboard -- was removed on 2026-09-06:
-//! delegating work is not a reason for it to disappear.
-//!
-//! The inline shape builds the same `ExecArgs` a hand-written `zirv ctx exec
-//! --agent <name> --prompt <text> -- ...` invocation would, and drives it
-//! through `exec::run_with` directly, so it gets the identical pacing, rot
-//! detection and restart-with-handoff behavior as running `zirv ctx exec`
-//! from the command line. The prompt always travels as `ExecArgs::prompt`
-//! (data), never encoded into the trailing `command` argv: a prompt shaped
-//! like a flag must never be misread as one.
-//!
-//! Always a worker session (`exec::run_with` never takes a `PromptRole`; it
-//! is hardcoded to `Worker`), which is what keeps a delegated run from being
-//! taught to delegate further.
+//! Delegations use a visible dashboard pane or an announced inline supervised run.
+//! Inline prompts always travel as data, never trailing command argv where they could become flags.
+//! Exec uses Worker role so a delegated session is not taught to delegate further.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,10 +38,6 @@ pub(crate) use worktree_lifecycle::{
     validate_workdir,
 };
 
-/// Issue #452: which of the two visible delegation shapes (see this module's
-/// own doc comment) a [`DelegationReceipt`] describes. No `Headless` variant:
-/// `--headless` was removed 2026-09-06 and nothing in this module
-/// distinguishes a third shape today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationMode {
@@ -66,55 +45,33 @@ pub enum DelegationMode {
     Inline,
 }
 
-/// Issue #452: a [`DelegationReceipt`]'s own read of how far this
-/// delegation got. `Launched` and `LaunchFailed` both mean "nothing has
-/// actually run yet" (a dashboard pane admitted/claimed the request, or an
-/// inline attempt never reached a worker at all); the rest all mean an
-/// inline worker process actually ran to some exit.
+/// Launch states record admission only; remaining states require an inline worker to have exited (#452).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationState {
-    /// A dashboard pane was admitted (or claimed) for this request; nothing
-    /// has run yet.
+    /// Pane admitted or claimed; does not establish completed work.
     Launched,
-    /// A dashboard pane refused this request with no inline fallback, or an
-    /// inline attempt could not reach a worker process at all.
+    /// Pane refusal without fallback, or failure to start an inline worker.
     LaunchFailed,
-    /// An inline worker process exited and no final assistant text could be
-    /// extracted from its transcript.
+    /// Worker exited without extractable final assistant text.
     ExitedNoReport,
-    /// Final text was extracted; no `--result-schema`/`--result-kind`
-    /// contract was declared.
+    /// Final text extracted without a declared result contract.
     Reported,
-    /// A declared contract was satisfied, after the one bounded retry when
-    /// applicable.
+    /// Declared contract satisfied, possibly after one bounded retry.
     ReportedValidated,
     /// A declared contract was not satisfied even after the bounded retry.
     ReportedContractFailed,
 }
 
-/// Issue #452: a typed, machine-readable summary of one `zirv ctx agent`
-/// delegation, printed as the sole stdout line when `--json` is passed
-/// (`AgentArgs::json`). Built once, at the end of whichever of the three
-/// paths this delegation actually took (a dashboard answer, an inline
-/// completion, or a pre-launch/launch failure) -- see [`print_receipt`] and
-/// its callers, never sprinkled piecemeal alongside the human-facing prints
-/// those same paths already make.
+/// One typed JSON receipt is the sole stdout object for --json, emitted after the chosen dispatch path finishes (#452).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DelegationReceipt {
     pub schema_version: u32,
     pub harness: String,
-    /// Issue #479 (roadmap N10): which backend actually drove this worker's
-    /// conversation -- `harness` or `native`. Additive: a pre-#479 consumer
-    /// that ignores the field reads exactly what it read before, and one that
-    /// reads it never has to infer the backend from `harness`, which names a
-    /// route rather than an adapter for a native worker.
+    /// Actual backend; native harness labels name routes, so backend must not be inferred from them (#479).
     pub runtime: &'static str,
-    /// Issue #479: the STABLE delegation handle every follow-up, status,
-    /// result and cancel is addressed to -- independent of the worker's
-    /// provider conversation id, which a resume changes. `None` for the two
-    /// pre-launch receipts, where no delegation record exists yet.
+    /// Stable follow-up/status/result/cancel handle across provider resumes; absent before delegation recording (#479).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,13 +94,7 @@ pub struct DelegationReceipt {
     pub errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capability_warnings: Vec<String>,
-    /// Change 5 follow-up (blocked-command observability): "<family>
-    /// (<count>)" lines, one per family zirv's own command-safety hook
-    /// denied during THIS delegation's own worker session -- shaped
-    /// exactly like `capability_warnings` above (a formatted `Vec<String>`,
-    /// omitted when empty), populated by [`blocked_family_lines`]. Puts the
-    /// block in front of the orchestrator unprompted, rather than relying
-    /// on it to think to check `zirv ctx status`.
+    /// Denied command families as `<family> (<count>)` lines expose worker blocks without a separate status query.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_families: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,26 +102,19 @@ pub struct DelegationReceipt {
     pub note: String,
 }
 
-/// Issue #479: the label a receipt carries for the backend this delegation
-/// asked for. An unrecognised `--runtime` never reaches a receipt (it is
-/// refused before any work starts, see [`resolve_runtime`]), so mapping an
-/// unparseable value onto `harness` here is only ever describing the default.
+/// Receipt backend label; invalid runtime values must already have been refused before work starts (#479).
 pub(crate) fn runtime_label(args: &AgentArgs) -> &'static str {
     resolve_runtime(args)
         .unwrap_or(super::runtime::RuntimeKind::Harness)
         .as_str()
 }
 
-/// The one place `--runtime` is turned into a decision. An unknown value is a
-/// hard error, never a silent fall back to the harness -- exactly the rule
-/// `exec::run_with` already applies to its own identical flag.
+/// Unknown runtime values must hard-error, never silently select the harness.
 pub(crate) fn resolve_runtime(args: &AgentArgs) -> CtxResult<super::runtime::RuntimeKind> {
     super::runtime::selected(&args.runtime)
 }
 
-/// One sentence of orchestrator guidance derived purely from `state` --
-/// short and factual, never repeating fields the receipt already carries
-/// structurally.
+/// Pure state-derived guidance without repeating structured receipt fields.
 pub(crate) fn receipt_note(state: DelegationState) -> String {
     match state {
         DelegationState::Launched => {
@@ -193,12 +137,7 @@ pub(crate) fn receipt_note(state: DelegationState) -> String {
     }
 }
 
-/// The `"<capability> -- <mechanism>: <detail>"` line this module already
-/// prints, one per capability warning, on both the pane-ack surface
-/// (`answer_for_ack`) and the inline completion surface (the loop at the end
-/// of `run_with`) -- shared so a [`DelegationReceipt`]'s own
-/// `capability_warnings` always carries the identical text a watching caller
-/// would have read on stdout.
+/// Share warning formatting so pane, inline and JSON receipt surfaces expose identical details.
 pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -> Vec<String> {
     warnings
         .iter()
@@ -206,18 +145,8 @@ pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -
         .collect()
 }
 
-/// Change 5 follow-up: `"<family> (<count>)"` lines for every family
-/// zirv's own command-safety hook denied in `session`, most-blocked first
-/// (ties broken alphabetically) -- the sibling of `capability_warning_
-/// lines` above, and the same idiom `status::blocked_commands_status_line`
-/// already uses for the orchestrator's own `zirv ctx status`. Bounded,
-/// like that caller: `log::read_recent_safety_decisions` (the identical
-/// day-window/limit the consecutive-denial breaker already relies on),
-/// never the unbounded `log::read_safety_decisions`. `family` is read
-/// as-is from the log -- already the strict `safety::safety_family` value
-/// `audit_hook_decision` persisted, never re-derived here -- so this never
-/// leaks an argument, flag, path, or secret: a session with nothing denied
-/// yields an empty `Vec`.
+/// Bounded recent-denial counts, ordered by count then family; never read the unbounded safety log.
+/// Use stored family names only, never arguments, paths or sensitive values.
 pub(crate) fn blocked_family_lines(state: &super::state::StateDir, session: &str) -> Vec<String> {
     let now_day = super::state::now_secs() / 86_400;
     let recent = super::log::read_recent_safety_decisions(state, session, 50, now_day);
@@ -241,26 +170,14 @@ pub(crate) fn blocked_family_lines(state: &super::state::StateDir, session: &str
         .collect()
 }
 
-/// Prints exactly one pretty JSON object -- `receipt` -- to `w`, the sole
-/// stdout output a `--json` delegation ever produces.
+/// Emit one pretty JSON object as the sole stdout output for a JSON delegation.
 pub(crate) fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
     let json = serde_json::to_string_pretty(receipt)?;
     writeln!(w, "{json}")?;
     Ok(())
 }
 
-/// Issue #452: the shared shape every "nothing ran" / "the worker never
-/// launched" receipt takes -- three pre-DISPATCH refusals reached before
-/// this delegation even knows whether it would have joined a dashboard or
-/// run inline (a malformed envelope, delegation depth 0, a `--task` claim
-/// failure -- none of which have a `worker_session`/`workdir` to report
-/// yet, hence the `Option`s), the three pre-LAUNCH refusals reached once
-/// `try_join_dashboard` has already resolved to [`Dispatch::Inline`]
-/// (`resolve_worker_budget` admission-exhausted, the delegation envelope
-/// refused, a writer permit refused), and the one genuine launch failure
-/// (`exec::run_with_report` returning `Err`) -- `mode` is always `Inline`
-/// here since a dashboard-pane refusal has its own
-/// [`dashboard_answer_receipt`].
+/// Inline pre-launch/failure receipt; optional session/workdir fields remain absent before dispatch (#452).
 #[allow(clippy::too_many_arguments)]
 fn launch_failure_receipt(
     args: &AgentArgs,
@@ -288,23 +205,14 @@ fn launch_failure_receipt(
         mail_delivered: false,
         errors: Vec::new(),
         capability_warnings: capability_warning_lines(capability_warnings),
-        // Nothing has run yet at any of this shape's three call sites
-        // (see this function's own doc comment) -- no worker session ever
-        // reached a command-safety hook, so there is nothing to report.
+        // No worker launched, so no command-safety decisions can belong to this run.
         blocked_families: Vec::new(),
         reason: Some(reason),
         note: receipt_note(DelegationState::LaunchFailed),
     }
 }
 
-/// Issue #452 (review round 1): the `--json` receipt for a delegation
-/// `try_join_dashboard` answered definitively, built from the [`AnswerFacts`]
-/// `answer_for_ack`/`wait_out_a_claimed_request` computed directly from the
-/// `SpawnAck`/timeout data they already held -- never inferred from `code`
-/// alone (`EXIT_DASH_UNCONFIRMED` and a plain non-retryable refusal are both
-/// `1`; only `facts.launched` tells them apart) and never parsed back out of
-/// the human lines those functions print (an earlier version of this fix did
-/// exactly that).
+/// Use ack/claim facts, never exit codes or parsed human text: refusal and unconfirmed launch both return 1 (#452).
 fn dashboard_answer_receipt(
     args: &AgentArgs,
     model: Option<&str>,
@@ -333,31 +241,24 @@ fn dashboard_answer_receipt(
         mail_delivered: false,
         errors: Vec::new(),
         capability_warnings: facts.capability_warnings.clone(),
-        // `Launched`/`LaunchFailed` both mean "nothing has actually run
-        // yet" (this function's own doc comment) -- an admitted or
-        // claimed dashboard pane worker has not reached a command-safety
-        // hook decision from THIS process's perspective at this point.
+        // This process has only admission evidence, not worker command-safety observations.
         blocked_families: Vec::new(),
         reason: facts.reason.clone(),
         note: receipt_note(state),
     }
 }
 
-/// The soft threshold, as a fraction of a budget. At or above it the worker
-/// is nudged to wrap up and checkpoint while it still has room to write a
-/// usable result; at the budget itself it is stopped.
+/// Warn before exhaustion so the worker can checkpoint a usable result; stop at the ceiling.
 pub const BUDGET_SOFT_FRACTION: f64 = 0.8;
 
-/// What a delegated worker is allowed to spend. `None` on a field means no
-/// ceiling for it -- which is every delegation before 2.35.0.
+/// Unset fields impose no ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkerBudget {
     pub tokens: Option<u64>,
     pub tool_calls: Option<u32>,
 }
 
-/// A budget's state against what a worker has spent so far. Never a
-/// downgrade signal: see `budget_state`'s own doc comment.
+/// Spend state never authorizes model downgrades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetState {
     Ok,
@@ -374,22 +275,8 @@ fn rank(state: BudgetState) -> u8 {
     }
 }
 
-/// Pure: no clock, no filesystem. The worst state across both ceilings wins
-/// (HardStop > SoftWarn > Ok), the same "most restrictive answer" fold
-/// `safety::evaluate_candidates` uses.
-///
-/// Spend is `usage.context_total() + usage.output_tokens`, not
-/// `usage.input_tokens`: uncached input is near zero in a cached session, so
-/// budgeting on it alone would mean the budget effectively never fires.
-///
-/// A budget CHECKPOINTS, it never downgrades the model: this function only
-/// ever reports `Ok`/`SoftWarn`/`HardStop`, never anything that could be read
-/// as "switch to a cheaper model" -- that path does not exist, on purpose
-/// (issue #155's own architect ruling: a cheaper answer to the wrong
-/// question is not a saving, and an automatic downshift is out of scope).
-///
-/// A ceiling of `Some(0)` is a ceiling, not an absent one: it hard-stops from
-/// the first tick. "No ceiling" is spelled `None`, and only `None`.
+/// Pure: no clock, filesystem or env reads; the worst ceiling wins and Some(0) stops immediately (#155).
+/// Count cached context plus output, not uncached input alone; budgets checkpoint or stop, never downgrade models.
 pub fn budget_state(
     budget: &WorkerBudget,
     usage: &TranscriptUsage,
@@ -423,9 +310,7 @@ pub(crate) fn token_spend(usage: &TranscriptUsage) -> u64 {
     usage.context_total().saturating_add(usage.output_tokens)
 }
 
-/// A group's own token budget is a ceiling its children may only TIGHTEN. An
-/// explicit `--budget-tokens` larger than the group's own is clamped, never
-/// honoured: a child must not be able to raise the batch's own limit.
+/// Children may only tighten the group budget; clamp explicit requests that exceed it.
 pub fn resolve_budget_tokens(group: Option<u64>, explicit: Option<u64>) -> Option<u64> {
     match (group, explicit) {
         (Some(group), Some(explicit)) => Some(group.min(explicit)),
@@ -434,9 +319,7 @@ pub fn resolve_budget_tokens(group: Option<u64>, explicit: Option<u64>) -> Optio
     }
 }
 
-/// `--role` accepts exactly two spellings; anything else is refused before
-/// this delegation ever launches, the same discipline `validate_flags`
-/// applies to `flags`.
+/// Reject unknown role spellings before launch.
 pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
     match role.as_deref() {
         None | Some("worker") | Some("sub-orchestrator") => Ok(()),
@@ -446,68 +329,20 @@ pub fn validate_role(role: &Option<String>) -> CtxResult<()> {
     }
 }
 
-/// Issue #170: exported into a SubOrchestrator delegation's own env
-/// (`resolve_group_binding`'s caller, once the child actually launches) so
-/// every `zirv agent` call ITS OWN harness makes -- with no `--group` of its
-/// own -- lands in the same work group by lineage rather than by the
-/// harness remembering to type `--group` every time.
+/// Carry group identity into descendants so unstated group requests inherit lineage (#170).
 pub const WORK_GROUP_ENV: &str = "ZIRV_CTX_WORK_GROUP";
 
-/// Issue #249: names the session that spawned THIS one, set explicitly at
-/// every worker-spawn seam (never inherited -- see [`parent_identity`]'s own
-/// doc comment) from the spawning process's own `mail::session_identity`, or
-/// from a dashboard's own server-verified requester. Consumed by every mail
-/// trust-render seam (`mail::render_delivery_message`, `prompt::
-/// render_mail_block`, `wrap::mail_advisory_line`, `dash::mod::mail_
-/// injection_label`) to decide whether a message's zirv-recorded sender
-/// matches this session's own supervising session -- the ONLY signal any of
-/// those seams may use for that decision; the payload body and any
-/// caller-supplied JSON are never trusted for it (issue #249's own security
-/// invariant).
+/// Set parent identity at every spawn seam, never inherit it; only recorded sender identity proves supervising mail (#249).
+/// Message bodies and caller-supplied JSON never establish that authority.
 pub const PARENT_SESSION_ENV: &str = "ZIRV_CTX_PARENT_SESSION";
 
-/// The short id of the session THIS process's own environment names as its
-/// parent, or `None` when [`PARENT_SESSION_ENV`] is unset or not a plain
-/// short id ([`super::prompt::is_addressable_short`], the same bound
-/// `spawnreq::SpawnRequest::requested_by` is already held to).
-///
-/// Deliberately re-reads `env` fresh on every call rather than being cached:
-/// the one property this whole mechanism depends on is that the value never
-/// silently survives past the session it names, and a cache is exactly the
-/// kind of place that could paper over `env` having been re-scoped between
-/// two calls.
+/// Reread and validate parent identity on every call; caching could retain lineage after env rescoping.
 pub(crate) fn parent_identity(env: EnvLookup<'_>) -> Option<String> {
     env(PARENT_SESSION_ENV).filter(|id| super::prompt::is_addressable_short(id))
 }
 
-/// Issue #170: resolves what `--group` this delegation actually binds to,
-/// mutating `args.group` in place -- called once, at the very top of
-/// [`run_with`], before the dashboard-join fork so BOTH forks of this
-/// delegation (a live pane, or the headless fallback) see the same answer.
-///
-/// Three cases, in order:
-/// 1. `args.group` already named -- unchanged. An operator's own explicit
-///    choice always wins.
-/// 2. Unstated, but [`WORK_GROUP_ENV`] is set -- inherited. This is the
-///    "lineage rather than convention" binding itself: a SubOrchestrator's
-///    own further `zirv agent` calls, run from inside its own harness with
-///    no `--group` of their own, pick up the same group its OWN launch was
-///    bound to.
-/// 3. Unstated, no inherited env, but `args.scope` names one and `args.role`
-///    is `sub-orchestrator` -- mints a fresh group scoped to it
-///    (`group::create`, `--budget-tokens` as its ceiling) so a coordinator
-///    can be launched in one command rather than requiring `zirv ctx group
-///    create` as a separate step first.
-///
-/// Neither case touches an existing group's own terms: case 2 only ever
-/// reads an id, and case 3 only ever creates a brand new one.
-///
-/// Returns the id it MINTED (case 3), if any -- `None` for an explicit or
-/// inherited binding, which this delegation does not own and must never
-/// unwind. Security review round 2 (Finding 4): the caller rolls a minted
-/// group back (`group::discard_if_unused`) on every path that ends without
-/// the delegation actually starting, and this call now happens only after
-/// that caller's own spawn gate has already passed.
+/// Resolve before dispatch: explicit group wins, then inherited group, then new sub-orchestrator scope (#170).
+/// Never mutate existing group terms; return only newly owned ids for rollback when launch does not occur.
 fn resolve_group_binding(
     args: &mut AgentArgs,
     state: &super::state::StateDir,
@@ -542,22 +377,7 @@ fn resolve_group_binding(
     Ok(None)
 }
 
-/// Security review round 2 (Finding 3): folds the group this delegation
-/// actually resolved ([`resolve_group_binding`]) into the env lookup its
-/// headless launch runs under, exactly as `chat::quiet_env` folds `--quiet`
-/// -- `exec::run_with`'s own `turn_env_for`/`apply_session_env` exports
-/// [`WORK_GROUP_ENV`] from it into the child, so a headless coordinator's
-/// children inherit the binding by lineage the same way a dashboard-spawned
-/// coordinator's already did (`dash::fulfill_spawn_request` pushes the same
-/// pair into its pane's `turn_env`). Reusing the env lookup, rather than
-/// adding a parallel parameter or an `ExecArgs` field, is the same trade-off
-/// `quiet_env`'s own doc comment spells out: one lookup already threaded
-/// through every downstream signature, carrying exactly the fact the child
-/// needs to read back.
-///
-/// `None` leaves the lookup untouched, so an inherited `WORK_GROUP_ENV` (a
-/// coordinator's own child calling `zirv agent` with no `--group`) still
-/// reaches the child unchanged.
+/// Export the resolved group through the launch env so inline and pane descendants inherit the same binding.
 fn group_env<'a>(
     env: EnvLookup<'a>,
     group: Option<String>,
@@ -568,22 +388,8 @@ fn group_env<'a>(
     }
 }
 
-/// Issue #249: folds this delegation's own resolved parent id into the env
-/// lookup its headless launch runs under, the same shape [`group_env`]
-/// already established -- except, unlike [`WORK_GROUP_ENV`], [`PARENT_
-/// SESSION_ENV`] must NEVER fall through to whatever `env` already carries
-/// for that key: `parent` is always substituted outright, `None` included,
-/// so a value this process happened to inherit from further up its own
-/// delegation chain (its own parent's own parent) can never leak through to
-/// a child that must see THIS session's id, and no one else's.
-///
-/// `pub(crate)`, not private: issue #249/#250 review found the same
-/// unconditional-substitute shape is exactly what `exec::run`/`run_loop::
-/// run`/`wrap::run` (the direct CLI entry points, whose own `env` is the raw
-/// ambient process environment) need to scrub an inherited `PARENT_SESSION_
-/// ENV` with -- passing `parent: None` there, since only a supervisor spawn
-/// seam (this fold, or dash's `verified_parent`) may ever establish parent
-/// lineage.
+/// Always replace parent identity, including None, so a grandparent cannot leak into the child (#249, #250).
+/// Direct CLI entry points scrub it; only supervisor spawn seams may establish lineage.
 pub(crate) fn parent_session_env<'a>(
     env: EnvLookup<'a>,
     parent: Option<String>,
@@ -597,20 +403,10 @@ pub(crate) fn parent_session_env<'a>(
     }
 }
 
-/// Issue #318: the child's own env key for the canonical JSON of the
-/// [`Schema`] this delegation declared via `--result-schema`/`--result-
-/// kind`, if any. Read back by `mail::run_send_with` so a worker's own
-/// self-report through `zirv ctx send --to-session` is held to the same
-/// contract the headless retry path validates against -- one declaration,
-/// enforced on whichever fork (pane or headless) actually ran the worker.
+/// Canonical report schema shared by pane mail self-reports and inline validation (#318).
 pub const RESULT_SCHEMA_ENV: &str = "ZIRV_CTX_RESULT_SCHEMA";
 
-/// Folds this delegation's own resolved `--result-schema`/`--result-kind`
-/// into the env lookup its launch runs under, the same unconditional-
-/// substitute shape [`parent_session_env`] already established: `schema`
-/// always wins outright, `None` included, so a stray inherited
-/// [`RESULT_SCHEMA_ENV`] from further up this process's own delegation
-/// chain can never leak into a worker whose own delegation declared none.
+/// Always replace the schema, including None, so inherited contracts cannot leak into unrelated delegations.
 fn result_schema_env<'a>(
     env: EnvLookup<'a>,
     schema: Option<String>,
@@ -674,13 +470,7 @@ pub(crate) fn evaluate_report(
     Ok(value)
 }
 
-/// Issue #452: the typed shape [`store_result`]/[`store_report_only`] write
-/// to `<state>/logs/delegation-results/<session>.json` -- kept alongside the
-/// writer purely so a reader (a test, or a future consumer) has one
-/// authoritative shape to deserialize into. Every field but `outcome`/
-/// `agent`/`ts` is `#[serde(default)]`: a record written by an OLDER zirv
-/// binary, before `report`/`report_truncated` existed, still deserializes
-/// cleanly.
+/// Persisted result format; defaulted added fields keep older records readable (#452).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct DelegationResultRecord {
     /// Canonical repository authorized to retrieve this report. Old records
@@ -702,16 +492,10 @@ pub(crate) struct DelegationResultRecord {
     pub report_truncated: bool,
 }
 
-/// The cap [`cap_report`] holds a worker's own final report text to before
-/// it is persisted to disk -- generous enough for any real final message, a
-/// hard ceiling so an adversarial or runaway worker cannot grow a
-/// delegation-results file without bound.
+/// Bound persisted report size against runaway or adversarial workers.
 const MAX_STORED_REPORT_BYTES: usize = 1024 * 1024;
 
-/// Caps `text` at [`MAX_STORED_REPORT_BYTES`] on a real `char` boundary,
-/// returning the (possibly capped) text and whether it was actually cut.
-/// `None` in, `None` out: there is nothing to cap when no report was
-/// extracted at all.
+/// Cap reports on character boundaries and report truncation; preserve absent reports as None.
 pub(crate) fn cap_report(text: Option<&str>) -> (Option<String>, bool) {
     let Some(text) = text else {
         return (None, false);
@@ -726,17 +510,7 @@ pub(crate) fn cap_report(text: Option<&str>) -> (Option<String>, bool) {
     (Some(text[..end].to_string()), true)
 }
 
-/// Shared writer for [`store_result`]/[`store_report_only`]/the
-/// `ExitedNoReport` case in [`run_with`]: all three persist the identical
-/// record shape (`DelegationResultRecord`) to the identical path, differing
-/// only in what `outcome`/`validated`/`errors`/`undeclared`/`report` mean
-/// for the delegation that produced them. Returns the path written to,
-/// regardless of whether the write itself actually succeeded (best-effort,
-/// like every other piece of state-dir housekeeping in this module) -- a
-/// [`DelegationReceipt`]'s own `result_path` names where the record was
-/// *meant* to land. `pub(crate)` so `mcp::coordination`'s own tests can
-/// write the exact record shape their readers are meant to handle without
-/// re-implementing this writer.
+/// Best-effort shared writer returns the intended path even if persistence fails; a receipt path is not proof of a write.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_delegation_result(
     state: &super::state::StateDir,
@@ -771,10 +545,7 @@ pub(crate) fn write_delegation_result(
     path
 }
 
-/// Issue #318 (extended by #452 with `report`/`report_truncated`): persists
-/// a contract-declared delegation's own validation outcome. `outcome` is
-/// derived from `validated` exactly as before this issue: `"validated"` when
-/// the worker's report satisfied the schema, `"contract_failed"` otherwise.
+/// Persist validated or contract-failed outcomes together with the extracted report (#318, #452).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn store_result(
     state: &super::state::StateDir,
@@ -806,10 +577,7 @@ pub(crate) fn store_result(
     )
 }
 
-/// Issue #452: persists a plain (no `--result-schema`/`--result-kind`
-/// declared) delegation's own extracted final report -- the no-contract
-/// counterpart to [`store_result`]. `outcome` is always `"reported"`: there
-/// is no contract to have validated or failed against.
+/// Persist an uncontracted report as reported; never imply it was validated (#452).
 pub(crate) fn store_report_only(
     state: &super::state::StateDir,
     repo: &Path,
@@ -832,12 +600,7 @@ pub(crate) fn store_report_only(
     )
 }
 
-/// Issue #452: the human `result: ...` line an inline no-contract
-/// delegation prints -- pure so it is testable without spawning a real
-/// harness process. `Some(path)` is the extracted-and-stored case
-/// (`code` is not part of that message); `None` is the "the worker exited
-/// but no final assistant text could be found" case, where `code` is the
-/// only evidence left to report.
+/// Pure no-contract result line; without a report the exit code is the only remaining evidence (#452).
 pub(crate) fn no_contract_result_line(result_path: Option<&Path>, code: i32) -> String {
     match result_path {
         Some(path) => format!("result: report stored at {}", path.display()),
@@ -867,27 +630,12 @@ pub(crate) fn recorded_contract_exit(
     }
 }
 
-/// Issue #262: the child's own env key for the canonical JSON of the
-/// [`envelope::WorkerEnvelope`] this delegation narrowed for it -- read back
-/// by a nested `zirv agent` as ITS OWN parent envelope
-/// (`resolve_parent_envelope`), and by `zirv ctx safety check`/`explain` to
-/// enforce/explain the envelope's own contribution to a verdict.
+/// Canonical narrowed child envelope, consumed by nested delegation and safety checks (#262).
 pub const ENVELOPE_ENV: &str = "ZIRV_ENVELOPE";
-/// Issue #262: the child's own env key for the `"<parent short>/<child
-/// short>"` delegation chain (`envelope::WorkerEnvelope::principal`).
-/// Carried alongside `ENVELOPE_ENV` rather than folded into the envelope's
-/// own JSON reader, so a caller that only wants the human-readable chain
-/// (`zirv ctx status`, a log line) need not parse JSON to get it -- though
-/// the two always agree, since both are derived from the same `principal`
-/// binding at the same fold site.
+/// Readable delegation chain must agree with the envelope principal; derive both at the same fold (#262).
 pub const PRINCIPAL_ENV: &str = "ZIRV_PRINCIPAL";
 
-/// Folds this delegation's own resolved envelope and principal chain into
-/// the env lookup its launch runs under, the same unconditional-substitute
-/// shape [`result_schema_env`] already established: both always win
-/// outright, `None` included, so a stray inherited [`ENVELOPE_ENV`]/
-/// [`PRINCIPAL_ENV`] from further up this process's own delegation chain can
-/// never leak into a worker whose own envelope was computed fresh here.
+/// Always replace envelope and principal, including None, so stale ancestor grants cannot leak into a fresh child.
 pub(crate) fn envelope_env<'a>(
     env: EnvLookup<'a>,
     envelope_json: Option<String>,
@@ -904,14 +652,8 @@ pub(crate) fn envelope_env<'a>(
     }
 }
 
-/// Issue #262: the envelope a ROOT session (no [`ENVELOPE_ENV`] in its own
-/// process env) starts from -- computed from operator posture
-/// (`WorkerConfig`), never unbounded by default. `default_read_only`
-/// narrows `destructive`/`tools.edit`/`paths` together, the same three
-/// fields `--mode read-only` narrows for a non-root delegation
-/// (`requested_envelope_from_args`), so a repo/operator that wants every
-/// top-level delegation to start read-only gets the identical restriction a
-/// `--mode read-only` flag would have asked for by hand.
+/// Root authority comes from operator posture, never unbounded defaults (#262).
+/// Read-only narrows destructive access, edit tools and write paths together.
 pub(crate) fn root_envelope(cfg: &CtxConfig) -> envelope::WorkerEnvelope {
     let read_only = cfg.worker.default_read_only;
     envelope::WorkerEnvelope {
@@ -937,13 +679,7 @@ pub(crate) fn root_envelope(cfg: &CtxConfig) -> envelope::WorkerEnvelope {
     }
 }
 
-/// Issue #262: this session's OWN parent envelope -- what a delegating
-/// session (if any) narrowed for THIS session when it spawned it. Absence
-/// (no [`ENVELOPE_ENV`] in the process env at all) means this session is a
-/// ROOT: freshly computed from operator posture ([`root_envelope`]), never
-/// treated as unbounded by omission. A PRESENT but malformed value is
-/// refused outright rather than treated as absent: a corrupted envelope
-/// must never silently upgrade a bounded child into an unbounded root.
+/// Absent parent env creates an operator-bounded root; malformed present env must refuse, never upgrade a child (#262).
 pub(crate) fn resolve_parent_envelope(
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
@@ -956,21 +692,8 @@ pub(crate) fn resolve_parent_envelope(
     }
 }
 
-/// Issue #262: this delegation's own REQUESTED envelope fields, built from
-/// `args`' flags and `parent` -- before narrowing.
-/// [`envelope::WorkerEnvelope::narrow`] is what actually enforces every
-/// rule; this only resolves what to ASK for, so a request that merely
-/// repeats what `parent` already allows never trips `CannotGrow`.
-///
-/// `--path-scope` unstated defers to `parent`'s own paths (`--mode
-/// writing`) or no paths at all (`--mode read-only`, which holds no writer
-/// permit and so needs none -- see `AgentArgs::mode`'s own doc comment).
-/// `--depth` unstated defers to the automatic `parent.delegation_depth - 1`
-/// decrement every delegation gets. `--no-network` and `--mode read-only`
-/// only ever narrow toward `false`; leaving both unstated carries `parent`'s
-/// own `network`/`destructive` forward UNCHANGED (never re-requests `true`),
-/// so an ordinary `--mode writing` delegation under an already-restricted
-/// parent never spuriously hits `CannotGrow` merely by existing.
+/// Resolve requested fields only; `WorkerEnvelope::narrow` enforces authority (#262).
+/// Unstated flags preserve parent restrictions, depth decrements, and read-only requests no write paths.
 pub(crate) fn requested_envelope_from_args(
     args: &AgentArgs,
     parent: &envelope::WorkerEnvelope,
@@ -993,10 +716,7 @@ pub(crate) fn requested_envelope_from_args(
     )
 }
 
-/// Workspace setup is a zirv-owned shell process that runs before the child
-/// harness can enforce an envelope. Until it has a sandbox that can impose a
-/// narrower path or network grant, an executable workspace needs the complete
-/// writing/shell/network grant over its launch root.
+/// Setup runs before the harness sandbox, so executable workspaces require full writing/shell/network grant over the root.
 fn workspace_execution_allowed(
     workspace: &super::workspace::WorkspaceConfig,
     args: &AgentArgs,
@@ -1031,14 +751,7 @@ fn workspace_execution_allowed(
     Ok(())
 }
 
-/// Issue #318: resolves `--result-schema`/`--result-kind` into the actual
-/// [`Schema`] this delegation's worker report gets held to, or `None` when
-/// neither flag was given -- today's behaviour, byte for byte unchanged.
-/// `--result-schema`'s value is read as a file path when it names one that
-/// exists, and as inline JSON text otherwise. The two flags are also
-/// enforced mutually exclusive here (`clap`'s own `conflicts_with` already
-/// refuses this on real argv, but `run_with` is called directly in tests
-/// with a hand-built `AgentArgs`, which bypasses that layer entirely).
+/// Resolve an existing schema file or inline JSON; enforce exclusivity for programmatic callers that bypass clap (#318).
 fn resolve_result_schema(args: &AgentArgs) -> CtxResult<Option<Schema>> {
     if args.result_schema.is_some() && args.result_kind.is_some() {
         return Err("--result-schema and --result-kind are mutually exclusive".into());
@@ -1065,11 +778,7 @@ fn resolve_result_schema(args: &AgentArgs) -> CtxResult<Option<Schema>> {
     Ok(None)
 }
 
-/// Appends [`result_schema::render_contract_block`] (if a schema was
-/// declared) to `prompt`, after [`attach_artifact_to_prompt`]'s own splice
-/// point -- the same "both forks read this one `prompt` binding" seam that
-/// function's own doc comment describes, so a live dashboard pane and the
-/// headless fallback both see the identical OUTPUT CONTRACT text.
+/// Append the output contract after artifacts at the shared prompt seam so pane and inline workers see identical terms.
 fn attach_result_contract_to_prompt(schema: Option<&Schema>, prompt: String) -> String {
     match schema {
         Some(schema) => format!(
@@ -1088,30 +797,9 @@ pub(crate) fn automatic_route_message(route: &super::fallback::Route, seat: pace
     )
 }
 
-/// Resolves this delegation's [`WorkerBudget`] from `--budget-tokens`/
-/// `--max-tool-calls` and, when `--group` names one, that group's token
-/// budget's remaining, unreserved ceiling (`group::admit_child` already
-/// tightens it by `--budget-tokens` itself, issue #301). An unknown or
-/// closed group is a hard error: silently ignoring it would let a mistyped
-/// `--group` run unbounded work a batch's own budget was meant to cap.
-/// `--max-tool-calls` has no group-level counterpart (`group::WorkGroup`
-/// carries no such field) and so is never clamped.
-///
-/// This is also the headless admission choke point for the group's child,
-/// token, and deadline limits -- `group::admit_child` is called here, once,
-/// only on the path that actually runs the delegation headlessly. The
-/// dashboard-pane fork of the same request (`agent::try_join_dashboard`,
-/// tried BEFORE this function is ever reached -- see `run_with`) never
-/// admits here; `dash::fulfill_spawn_request` admits on that side instead,
-/// so a single `zirv ctx agent --group` invocation is counted exactly once
-/// regardless of which fork actually spawns.
-///
-/// The second return value is the exact token ceiling `admit_child` reserved
-/// in the group's own ledger for this admission (`None` for no `--group`, or
-/// a `--group` with no `token_budget` and no `--budget-tokens` override) --
-/// `run_with` carries it forward to release it via `group::rollback_
-/// admission` on a spawn that never happens, or settle it via `group::
-/// settle_reservation` once the delegation actually completes.
+/// Admit the group exactly once on the executing side; dashboard admission happens in fulfilment instead (#301).
+/// Unknown/closed groups refuse rather than run unbounded; remaining unreserved budget clamps the worker ceiling.
+/// Return the exact reservation for rollback on failed spawn or settlement on completion.
 pub(crate) fn resolve_worker_budget(
     env: EnvLookup<'_>,
     args: &AgentArgs,
@@ -1142,10 +830,7 @@ pub(crate) fn resolve_worker_budget(
     ))
 }
 
-/// Preview of the ceiling an honest dashboard request carries. The
-/// dashboard still performs serialized admission and clamps this value
-/// against the then-current group record, so a forged or stale request can
-/// never widen the group's remaining budget.
+/// Dashboard admission serializes and reclamps this preview; stale or forged requests cannot widen group budgets.
 fn dashboard_budget_tokens(env: EnvLookup<'_>, args: &AgentArgs) -> Option<u64> {
     let group_tokens = args.group.as_deref().and_then(|id| {
         let state = super::state::StateDir::resolve(env).ok()?;
@@ -1159,10 +844,7 @@ fn dashboard_budget_tokens(env: EnvLookup<'_>, args: &AgentArgs) -> Option<u64> 
     resolve_budget_tokens(group_tokens, args.budget_tokens)
 }
 
-/// Everything wrong with `flags` that can be seen without running anything.
-/// Mirrors `AgentCommand::validate`'s rule for a script `agent:` step:
-/// `flags` reach the agent's own CLI directly, so a leading bare word would
-/// be read as the program rather than as a flag.
+/// Reject leading bare passthrough words before launch because the agent CLI would read them as the program.
 pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
     if let Some(first) = flags.first()
         && !first.starts_with('-')
@@ -1175,32 +857,14 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
     Ok(())
 }
 
-/// Whether `flags` already pins an explicit model choice -- any form
-/// `adapters::classify_model_flag` recognises: `--model`/`-m` bare, the
-/// `--model=value`/`-m=value` joined form, or the attached `-mvalue` short
-/// form. The operator's own choice always wins, so `worker_launch_flags`
-/// below never overrides it.
-///
-/// `-m` is codex's own verified short alias for `--model` (`CodexAdapter`'s
-/// doc comments around `distiller_cmd`/`model_args` in `adapters/codex.rs`,
-/// citing `codex exec --help`/top-level `codex --help`), so without it
-/// `zirv ctx agent codex "<prompt>" -- -m opus` (or the attached
-/// `-mopus`) with `worker.codex` configured got a conflicting `--model`
-/// prepended ahead of the operator's own flag. Recognising `-m` is harmless
-/// for claude, which has no such alias: treating it as pinning there only
-/// ever skips a prepend that would otherwise have happened, never breaks a
-/// launch. Shared with `adapters::last_model_flag` via `classify_model_flag`
-/// so the two can never drift on what counts as a model flag.
+/// Recognize all model pins, including Codex -m/attached forms, so explicit operator choices are never overwritten.
 fn flags_pin_model(flags: &[String]) -> bool {
     flags
         .iter()
         .any(|f| adapters::classify_model_flag(f).is_some())
 }
 
-/// Cross-harness fallback cannot forward arbitrary vendor CLI flags: a claude
-/// flag may mean something different (or be invalid) on codex and vice versa.
-/// Empty passthrough is safe, and a model-only passthrough can be replaced by
-/// the verified equivalent tier. Anything else declines automatic routing.
+/// Vendor flags are not portable: only empty or model-only passthrough may be automatically rerouted.
 pub(crate) fn translated_route_flags(
     flags: &[String],
     target: &dyn AgentAdapter,
@@ -1222,56 +886,7 @@ pub(crate) fn translated_route_flags(
     Some(target.model_args(target_model))
 }
 
-/// The effective trailing flags a delegated headless spawn launches with.
-///
-/// Unchanged when the operator's own `flags` already pin `--model`
-/// themselves -- the operator's own choice always wins. Otherwise
-/// `worker.<name>`'s configured model, or `adapter`'s own hard default
-/// (`AgentAdapter::default_worker_model`), is prepended ahead of `flags` via
-/// `adapters::worker_model_args`, so a delegated headless worker stops
-/// silently inheriting the operator's own (often far pricier) interactive
-/// default model.
-///
-/// Mirrors `chat.rs`'s own `extra_with_model`: the model flags are prepended
-/// as trailing extras rather than spliced into an already-built argv, which
-/// is what keeps them from ever landing inside a launcher prefix.
-///
-/// This resolution runs only on the delegation spawn path -- `zirv ctx
-/// agent`'s own headless fallback (this function's caller, `run_with`,
-/// below) and the dashboard's own spawn-request pane variant
-/// (`dash::mod::fulfill_spawn_request`). It deliberately never touches `zirv
-/// ctx exec`/`zirv ctx loop`, whose trailing command the operator typed
-/// verbatim, nor `chat`/`wrap`, whose model comes from the orchestrator seat
-/// (`chat.model`) instead.
-///
-/// Bug B (harness/model parity): also prepends `adapters::policy_launch_
-/// args`, the same argv one `cfg.policy`/`cfg.sandbox` produces on whichever
-/// adapter this delegates to -- since 2026-08-22 that includes the shipped-
-/// default "sandboxed, no prompts" posture (`AgentAdapter::default_sandbox_
-/// args`), not only an explicit `[policy]` `Deny`. A delegated headless
-/// worker has nobody present to answer an approval prompt, which is exactly
-/// why this seam -- not only the interactive `wrap`/`chat` launches, which
-/// still have an operator watching -- is where this is wired into a real
-/// launch first; see `config.rs`'s `a_repo_cannot_widen_its_way_to_a_
-/// permissive_launch_on_either_adapter` for the end-to-end repo-narrow-only
-/// guarantee `cfg.policy` carries, and `SandboxConfig`'s own doc comment for
-/// `cfg.sandbox`'s identical guarantee. `policy_launch_args` itself declines
-/// to prepend anything when the operator's own `flags` already pin one of
-/// the same CLI flags (`adapters::flags_pin_policy`), so an operator's own
-/// explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
-/// `--disallowedTools` demonstrably wins rather than merely surviving
-/// because a CLI takes the last occurrence of a repeated flag.
-/// R1-4: the trailing flags one delegation actually launches an INLINE
-/// supervised child with -- `--system-prompt`'s text rendered through the
-/// target adapter's own injection form (`AgentAdapter::system_prompt_args`),
-/// then whatever the operator typed after `--`.
-///
-/// Order matters and is deliberately this way round: the seat instructions
-/// come first, so an explicit passthrough (a `--model` pin, a policy flag)
-/// still wins under CLI last-occurrence semantics, and so the argv is
-/// byte-identical to what a caller spelling the adapter flag itself used to
-/// produce. Pure, so both forks' parity is testable without launching
-/// anything.
+/// Pure flag composition: adapter-rendered seat instructions precede explicit passthrough so last-occurrence choices win.
 fn flags_with_system_prompt(args: &AgentArgs, adapter: &dyn AgentAdapter) -> Vec<String> {
     let Some(text) = args
         .system_prompt
@@ -1286,6 +901,8 @@ fn flags_with_system_prompt(args: &AgentArgs, adapter: &dyn AgentAdapter) -> Vec
     out
 }
 
+/// Delegation-only model defaults avoid inheriting costly interactive models; operator model and policy pins always win.
+/// Use trailing extras to protect launcher prefixes and a no-prompt sandbox because unattended workers cannot answer approvals.
 fn worker_launch_flags(
     cfg: &CtxConfig,
     name: &str,
@@ -1310,7 +927,6 @@ fn worker_launch_flags(
     out
 }
 
-/// Compose the headless worker's model, policy and requested seat flags.
 pub(crate) fn headless_worker_flags(
     cfg: &CtxConfig,
     args: &AgentArgs,
@@ -1328,14 +944,7 @@ pub(crate) fn headless_worker_flags(
     flags
 }
 
-/// Track C (#383): the pinned model a delegation's own usage/pacing/
-/// reservation seam (`run_with`'s own `provider` local, just below its call
-/// site) should resolve `AgentAdapter::provider_for_model` against --
-/// `route`'s own translated model when `route_new_delegation` rerouted this
-/// delegation to a different harness/model pair, else the originally
-/// requested `--model` (`requested_model`). Pure and standalone so the exact
-/// model-selection rule this seam depends on is testable without a live
-/// route or adapter.
+/// Pure model selection for usage/pacing: translated route model wins over the original requested model (#383).
 fn effective_delegation_model<'a>(
     route: Option<&'a super::fallback::Route>,
     requested_model: Option<&'a str>,
@@ -1343,20 +952,8 @@ fn effective_delegation_model<'a>(
     route.map(|route| route.model.as_str()).or(requested_model)
 }
 
-/// Issue #252 (2026-09-01): appends the same extra writable-root argv
-/// `dash::worker_pane_extra_args` has always added unconditionally for a
-/// dashboard-spawned worker pane, to a headless `zirv agent` delegation's own
-/// launch flags -- see `AgentAdapter::extra_writable_root_args`'s own doc
-/// comment for the caller contract and why this needed a second call site.
-/// A separate, directly-testable function rather than folded into
-/// `worker_launch_flags` itself: that function is also called once, earlier
-/// in `run_with`, purely to resolve the requested model for a routing
-/// decision that has not committed to a real launch (and so has no
-/// `launch_repo`/`mail_dir` worth shelling out to git for yet) -- only the
-/// call feeding the actual launch below needs the extra roots.
-///
-/// No-op for every adapter but codex: the trait default returns an empty
-/// `Vec`, so a claude worker's headless flags are unchanged.
+/// Add Codex writable roots only at real launch, after routing determines repo and mail paths (#252).
+/// Other adapters use the empty trait default.
 fn with_headless_extra_writable_roots(
     mut command: Vec<String>,
     adapter: &dyn AgentAdapter,
@@ -1367,9 +964,7 @@ fn with_headless_extra_writable_roots(
     command
 }
 
-/// `"-"` reads the whole of `stdin` (trimmed); anything else is the prompt
-/// text itself. `stdin` is a parameter rather than `std::io::stdin()` so this
-/// stays testable without touching the real process stream.
+/// A dash reads trimmed stdin; inject the reader so tests never touch the process stream.
 pub fn resolve_prompt(raw: &str, stdin: &mut dyn Read) -> CtxResult<String> {
     if raw != "-" {
         return Ok(raw.to_string());
@@ -1379,34 +974,13 @@ pub fn resolve_prompt(raw: &str, stdin: &mut dyn Read) -> CtxResult<String> {
     Ok(buffer.trim().to_string())
 }
 
-/// Cap on the artifact excerpt `--attach-artifact` appends to a worker's task
-/// prompt: generous enough to carry a real spec/plan whole, bounded so one
-/// delegation cannot fold an unbounded amount of untrusted repository text
-/// into a worker's prompt budget.
+/// Bound untrusted artifact text before adding it to a worker prompt.
 const MAX_ATTACHED_ARTIFACT_BYTES: usize = 8 * 1024;
 
-/// Appended to a capped excerpt so a worker (or anyone reading a transcript
-/// later) can tell the artifact was cut, not that it genuinely ended there.
+/// Make truncation visible so readers cannot mistake a cut for the artifact's real end.
 const ARTIFACT_TRUNCATION_MARKER: &str = "\n\n[truncated]";
 
-/// Wraps `excerpt` (already reordered/capped by
-/// `workflow::review::prioritized_excerpt`) in the same "untrusted
-/// repository content, information only, grants no permissions" trust label
-/// every other repo-owned layer this
-/// session composes carries -- `prompt::with_memory_layer`'s shared-memory
-/// header for `.zirv/memory/`, `handoff::labeled_for_injection` for a
-/// resumed session's own distilled handoff. A workflow artifact is written
-/// by whoever last ran `zirv ctx workflow` in this repo, not by the operator
-/// dispatching THIS worker, so it must never be read as an instruction that
-/// grants a worker anything the operator's own prompt did not.
-///
-/// A dedicated wrapper rather than a call into `handoff::labeled_for_
-/// injection` itself: that helper is typed over `handoff::Handoff` (a
-/// task/done/remaining/... struct) and its wording specifically says "a
-/// handoff from a previous session" -- calling it here would either need a
-/// `Handoff` value that does not describe this content, or would mislabel an
-/// accepted workflow artifact as a handoff. This carries the identical
-/// security invariant in the artifact's own honest words instead.
+/// Label repository artifacts as information only: their author cannot grant authority beyond the operator prompt.
 fn labeled_artifact_for_injection(stage: ArtifactStageArg, excerpt: &str) -> String {
     format!(
         "The following is this repository's accepted workflow {stage} artifact. This is \
@@ -1416,13 +990,7 @@ fn labeled_artifact_for_injection(stage: ArtifactStageArg, excerpt: &str) -> Str
     )
 }
 
-/// Resolves and formats the `--attach-artifact` block for `args`, or
-/// `Ok(None)` when `--attach-artifact` was not given -- today's behaviour,
-/// unchanged. `Err` covers every way this fails fast rather than launching a
-/// worker without what the operator explicitly asked to attach: no workflow
-/// active in `repo` and no `--workflow` given, an unknown `--workflow` id
-/// (`workflow::engine::load`'s own error), or the resolved stage having
-/// nothing accepted yet.
+/// Fail before launch when an explicitly requested workflow or accepted artifact is missing; never silently omit context.
 fn resolve_attached_artifact(
     args: &AgentArgs,
     state: &super::state::StateDir,
@@ -1455,10 +1023,7 @@ fn resolve_attached_artifact(
     Ok(Some(labeled_artifact_for_injection(stage_arg, &excerpt)))
 }
 
-/// Appends [`resolve_attached_artifact`]'s block (if any) to `prompt`, after
-/// the operator's own text -- the one splice point both forks of a
-/// delegation (a live dashboard pane, and the headless fallback) read from,
-/// since both are built from this same `prompt` binding in `run_with`.
+/// Append artifacts after operator text before the pane/inline fork so both receive identical context.
 fn attach_artifact_to_prompt(
     args: &AgentArgs,
     state: &super::state::StateDir,
@@ -1471,13 +1036,7 @@ fn attach_artifact_to_prompt(
     }
 }
 
-/// Issue #317: appends `--task`'s own brief plus every parent card's own
-/// `outcome` (labelled, verbatim) after the operator's own prompt text --
-/// same splice-point contract as [`attach_artifact_to_prompt`] immediately
-/// above (both forks of this delegation read the one `prompt` binding this
-/// returns). `Err` when `--task` names a card this repository has no record
-/// of: a worker sent off with no idea what its own card actually asked for
-/// would burn a whole run on a typo.
+/// Append labelled task/parent context before dispatch; unknown cards fail early rather than waste a worker run (#317).
 pub(crate) fn attach_task_context_to_prompt(
     args: &AgentArgs,
     state: &super::state::StateDir,
@@ -1508,15 +1067,8 @@ pub(crate) fn attach_task_context_to_prompt(
     ))
 }
 
-/// Issue #317: resolves (reaping/promoting) and claims `--task`'s own card
-/// through `task::claim_locked` -- the SAME locked read -> decide -> append
-/// helper `zirv ctx task claim` itself goes through, so this delegation's
-/// own claim can never race a concurrent `zirv ctx task claim` (or another
-/// delegation) against the same card: whichever caller's lock acquisition
-/// loses re-reads the winner's already-written state before deciding.
-/// Refuses before any spawn when the card cannot be claimed -- see
-/// [`AgentArgs::task`]'s own doc comment for the full contract. `Err`'s text
-/// is written verbatim to the delegator's stdout by the caller.
+/// Claim through the shared locked read/decide/append path so concurrent delegations cannot claim the same card (#317).
+/// Refuse before spawning if admission fails.
 fn claim_task_for_delegation(
     state: &super::state::StateDir,
     repo: &Path,
@@ -1567,17 +1119,8 @@ fn claim_task_for_delegation(
     }
 }
 
-/// Issue #317: closes `--task`'s own card once this delegation has finished,
-/// entirely best-effort -- a delegation that ran must never fail because its
-/// task-card bookkeeping could not be written, the same discipline every
-/// other accounting call in this function's own completion block already
-/// holds. `Reported` (a genuine report-back, or a plain successful exit with
-/// no structural contract declared) marks the card `Done` with `outcome`
-/// verbatim; anything else runs [`super::task::respawn_decision_with_jev`]
-/// and applies its verdict, so a crash or an unvalidated report-back returns
-/// the card to `Ready` for a fresh delegation to pick up, or auto-blocks it
-/// once the retry ceiling is reached (or, issue #537 A4, once a confident
-/// Jev crash triage says so first) -- NEVER a silent `Done`.
+/// Task bookkeeping must never fail a completed delegation (#317).
+/// Only Reported marks Done; other outcomes use bounded respawn/triage, never silent success (#537).
 pub(crate) fn finish_task_card(
     state: &super::state::StateDir,
     repo: &Path,
@@ -1685,9 +1228,7 @@ pub(crate) fn finish_task_card(
     }
 }
 
-/// The supervisor's own two outcomes (rot-exhausted, timed out) get a
-/// human-readable line; every other exit code -- including a plain success --
-/// gets none, since that is either self-explanatory or the agent's own doing.
+/// Explain supervisor-owned exits; ordinary worker exit codes need no extra note.
 pub fn exit_note(code: i32) -> Option<String> {
     matches!(
         code,
@@ -1701,10 +1242,7 @@ pub fn exit_note(code: i32) -> Option<String> {
     .then(|| exec::describe_exit(code))
 }
 
-/// Which of the supervisor's outcomes this exit code represents. Mirrors
-/// `exit_note`'s own special cases: those are zirv giving up (or, for
-/// `EXIT_BUDGET_EXHAUSTED`, zirv stopping the run on purpose), not the
-/// worker failing, and they cost very differently.
+/// Distinguish supervisor stops from worker failures for cost/outcome accounting.
 pub(crate) fn delegation_outcome(code: i32) -> &'static str {
     match code {
         0 => "ok",
@@ -1721,11 +1259,7 @@ pub(crate) fn delegation_outcome(code: i32) -> &'static str {
     }
 }
 
-/// Issue #230 item 3: the short `"<cap> (<mechanism>); ..."` rendering the
-/// report-back mail body uses for a launch's capability warnings. `detail`
-/// is left out of this one-line summary on purpose; it travels in full on
-/// the structured `CapabilityWarning` (the dashboard `SpawnAck` field) and on
-/// the per-warning stdout result lines.
+/// Keep mail warnings compact; full details remain in structured warnings and stdout (#230).
 pub(crate) fn format_capability_warnings(warnings: &[policy::CapabilityWarning]) -> String {
     warnings
         .iter()
@@ -1734,20 +1268,8 @@ pub(crate) fn format_capability_warnings(warnings: &[policy::CapabilityWarning])
         .join("; ")
 }
 
-/// Issue #227: the report-back mail a `zirv agent` spawn sends to its own
-/// requester on a supervisor-detected failure, so the requester has a
-/// durable record even when it was not watching this delegation
-/// synchronously (a background/dashboard-pane spawn). Carries the same
-/// structured reason `exit_note`/`describe_exit` already produce for the
-/// stderr note, so the two never say different things about the same
-/// failure. Pure: no fs/clock/env, so the envelope shape is table-tested
-/// without a real mailbox.
-///
-/// Issue #230 item 3: also carries the delegation's own capability warnings
-/// (`PolicyReport::degraded_capabilities`, computed once by the caller) when
-/// non-empty, so a requester who was not watching this delegation
-/// synchronously still learns its launch was not fully enforced -- the same
-/// warnings a watching caller reads on the stdout result lines.
+/// Pure failure-mail formatting: no filesystem, clock or env reads (#227).
+/// Include capability degradation so asynchronous requesters receive the same warning as synchronous callers (#230).
 fn report_back_message(
     code: i32,
     worker_session: &str,
@@ -1773,23 +1295,8 @@ fn report_back_message(
     }
 }
 
-/// Issue #318: runs ONE bounded resume turn against `session`, feeding it
-/// `retry_prompt` (`result_schema::build_retry_message`'s own text) so a
-/// worker whose report failed [`result_schema::validate`] gets exactly one
-/// chance to correct it before this delegation gives up and reports
-/// `contract_failed`. Reuses the identical resume-launch/supervise/drain
-/// sequence `exec::compact_in_place` already verifies a headless resume
-/// with -- not a second, independently drifting spawn path.
-///
-/// `Ok(())` says only that the command ran to some exit, not that the reply
-/// is now valid -- the caller re-reads the transcript and re-validates
-/// itself. `Err` covers the adapter having no resume support at all (never
-/// reached in practice: callers check `headless_resume_cmd(..).is_some()`
-/// first, since a resume attempt on an adapter with no resume support at
-/// all would spend a retry the bounded budget never gets back -- issue
-/// #303 gave codex its own real `headless_resume_cmd`, so it now takes
-/// this same bounded retry like any other resume-capable adapter) and the
-/// command failing to start or run.
+/// Allow exactly one supported resume retry; unsupported adapters must not spend the retry budget (#318, #303).
+/// Ok only proves the command ran; callers must reread and revalidate the report.
 fn run_contract_retry(
     adapter: &dyn AgentAdapter,
     session: &SessionId,
@@ -1835,11 +1342,7 @@ fn run_contract_retry(
     }
 }
 
-/// Truncates `text` to at most `max` bytes on a real `char` boundary, for
-/// the capped raw-candidate excerpt a `contract_failed` report-back mail
-/// carries -- a worker's own final message is untrusted, unbounded free
-/// text, and a mail body must not grow without limit just because a worker
-/// wrote a very long non-conforming reply.
+/// Cap untrusted failed-report excerpts on character boundaries so mail cannot grow without limit.
 fn cap_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();

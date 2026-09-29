@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 
-/// Tracks the source origin of top-level config keys as layers merge.
-/// Maps from top-level key name to a human-readable source description.
+/// Track top-level key provenance so errors can identify the contributing layer.
 #[derive(Debug, Clone)]
 enum KeyOrigin {
     Home,
@@ -16,18 +15,14 @@ enum KeyOrigin {
 
 pub const DEFAULT_MARKER: &str = "[zirv]";
 pub const CTX_CONFIG_FILE: &str = "ctx.toml";
-/// The one `ctx.toml` table `CtxConfig` never deep-merges -- see the `policy`
-/// field's own doc and `super::policy`'s module doc.
+/// Resolve policy asymmetrically; deep merge could replace operator restrictions.
 const POLICY_SECTION: &str = "policy";
-/// The other `ctx.toml` table `CtxConfig` never deep-merges, for the
-/// identical reason -- see the `safety` field's own doc and
-/// `super::safety`'s module doc.
+/// Resolve safety separately so repo additions cannot replace operator restrictions.
 const SAFETY_SECTION: &str = "safety";
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// Wraps process env access so callers can pass a closure in tests instead of
-/// mutating global state.
+/// Inject env lookup for tests without mutating process-global state.
 pub fn env_from_process() -> impl Fn(&str) -> Option<String> {
     |key: &str| std::env::var(key).ok()
 }
@@ -63,12 +58,8 @@ pub(crate) use validate::{
 pub struct CtxConfig {
     pub agent: Option<String>,
     pub agent_bin: Option<String>,
-    /// Explicitly selected harness-worker environments. Both the operator and
-    /// repository layers may add entries, but neither layer replaces the
-    /// other's list; duplicate names are rejected after the additive fold.
-    /// Repository entries may only carry inert requirements (`name`, MCP
-    /// servers, and skills). The executable `git` and `setup` fields are
-    /// operator-only and rejected before the layers are combined.
+    /// Append workspace entries across layers and reject duplicate names, never replace a layer's list.
+    /// Repo requirements are inert; executable git/setup fields are operator-only and rejected before merging.
     pub workspace: Vec<super::workspace::WorkspaceConfig>,
     pub score: ScoreConfig,
     pub wrap: WrapConfig,
@@ -98,14 +89,9 @@ pub struct CtxConfig {
     pub chat: ChatConfig,
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
-    /// Issue #718: the warm-worktree pool `--worktree --worktree-reuse`
-    /// draws from. See [`WorktreeConfig`].
     pub worktree: WorktreeConfig,
     pub handover: HandoverConfig,
-    /// Issue #699's cost-routing lever: the operator's `[model_tiers.
-    /// <adapter>]` map from a workflow seat's declared `ModelTier` to a
-    /// concrete model id. The whole table is `REPO_FORBIDDEN`; see
-    /// [`ModelTiersConfig`].
+    /// Operator-only seat model-tier map; see [`ModelTiersConfig`] (#699).
     pub model_tiers: ModelTiersConfig,
     pub endpoint: EndpointConfig,
     pub fallback: FallbackConfig,
@@ -114,90 +100,43 @@ pub struct CtxConfig {
     pub screen: ScreenConfig,
     pub obfuscate: ObfuscateConfig,
     pub task: TaskConfig,
-    /// Issue #537 seam: the harness proxy's decision core (`zirv ctx proxy`,
-    /// `proxy::decide`). The whole table is `REPO_FORBIDDEN`; see
-    /// [`ProxyConfig`].
+    /// Operator-only proxy decisions; see [`ProxyConfig`] (#537).
     pub proxy: ProxyConfig,
-    /// Issue #537 seam extraction: which advisory sites besides the harness
-    /// proxy may consult the shared Jev client. Every key is
-    /// `REPO_FORBIDDEN`; see [`JevConfig`].
+    /// Operator-only shared Jev advisory gates; see [`JevConfig`] (#537).
     pub jev: JevConfig,
-    /// Issue #788: operator-only, off-by-default cost levers for a headless
-    /// (`-p`) Claude Code launch. Every key is `REPO_FORBIDDEN`; see
-    /// [`HeadlessConfig`].
+    /// Operator-only opt-in headless Claude controls; see [`HeadlessConfig`] (#788).
     pub headless: HeadlessConfig,
-    /// Issue #352's experimental persistent-runtime gate. Every key is
-    /// `REPO_FORBIDDEN`; see [`SessionConfig`].
+    /// Operator-only experimental runtime persistence; see [`SessionConfig`] (#352).
     pub session: SessionConfig,
-    /// Issue #483's configured MCP/web/browser integrations. The whole table
-    /// is `REPO_FORBIDDEN`; see [`CapabilitiesConfig`].
+    /// Operator-only MCP/web/browser integrations; see [`CapabilitiesConfig`] (#483).
     pub capabilities: CapabilitiesConfig,
-    /// Issue #491's opt-in native runtime default. The whole table is
-    /// `REPO_FORBIDDEN`; see [`RuntimeConfig`].
+    /// Operator-only runtime defaults; see [`RuntimeConfig`] (#491).
     pub runtime: RuntimeConfig,
-    /// Per-agent enable/disable state from `.settings.toml`, a file this type
-    /// deliberately never deserializes (see `crate::settings`): loaded
-    /// separately at the end of `load`, and rejected outright if it appears
-    /// as an `[agents]` table inside `ctx.toml` itself, so the two files stay
-    /// distinct.
+    /// Loaded separately from `.settings.toml`; reject `[agents]` in ctx.toml to keep the files distinct.
     #[serde(skip)]
     pub agents: crate::settings::AgentGate,
-    /// zirv's canonical permissions policy, from `ctx.toml`'s `[policy]`
-    /// table. `skip`ped for the same reason `agents` is: it does **not** go
-    /// through this type's deep merge. `[policy]` is lifted out of each layer
-    /// before the merge and folded asymmetrically by `policy::resolve`
-    /// instead, so a repo checkout can only ever ratchet a stance stricter --
-    /// see that function and `policy`'s module doc for why `REPO_FORBIDDEN`
-    /// (all-or-nothing per key) cannot express "may narrow, never widen".
+    /// Lift policy before deep merge and resolve asymmetrically so repos can only tighten stances.
     #[serde(skip)]
     pub policy: super::policy::EffectivePolicy,
-    /// zirv's harness-neutral command safety policy (issue #83), from
-    /// `ctx.toml`'s `[safety]` table. `skip`ped for the same reason `policy`
-    /// is: `[safety]` is lifted out of each layer before the deep merge and
-    /// folded by `safety::resolve` instead -- see that module's doc comment
-    /// for the fold (repo may add `deny`/`ask` entries; `allow`/`default`
-    /// are operator-only, enforced via `REPO_FORBIDDEN` upstream of the
-    /// fold rather than by the fold itself).
+    /// Lift safety before deep merge; repos may add deny/ask, while allow/default remain operator-only (#83).
     #[serde(skip)]
     pub safety: super::safety::SafetyPolicy,
-    /// Layers that failed to *parse* as TOML (not a schema/`REPO_FORBIDDEN`
-    /// rejection -- see `read_layer`) and were skipped rather than aborting
-    /// the whole load. Empty on the ordinary path. `skip`ped for the same
-    /// reason `agents`/`policy` are: it is populated by `load` directly, not
-    /// deserialized from any layer. `zirv ctx status` renders one line per
-    /// entry and `zirv ctx optimize` reports one finding per entry; `load`
-    /// itself announces once per process on the `zirv \u{25b8}` channel (see
-    /// `announce_unparsable_layers_once`).
+    /// Skipped TOML syntax failures, announced once per process and exposed to status/optimize; schema errors still fail.
     #[serde(skip)]
     pub unparsable_layers: Vec<UnparsableLayer>,
 }
 
-/// One `ctx.toml` layer (`~/.zirv/ctx.toml` or `<repo>/.zirv/ctx.toml`) that
-/// failed to parse as TOML at all -- a syntax error, not a rejected key or an
-/// unknown field. `message` is a single line: the parser's own "at line X,
-/// column Y" location plus its description, so the operator can find and fix
-/// the byte without needing the multi-line diagram `toml::de::Error`'s
-/// `Display` renders.
+/// A skipped syntax failure with a single-line location and message, distinct from schema rejection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnparsableLayer {
     pub path: std::path::PathBuf,
     pub message: String,
-    /// `true` for the operator's own `~/.zirv/ctx.toml`, `false` for the
-    /// repo's `<repo>/.zirv/ctx.toml`. `load` (the plain, diagnostic-safe
-    /// entry point) treats both the same -- skip and continue. `load_for_
-    /// launch` (used by every verb that actually launches or supervises a
-    /// harness) refuses outright when this is `true`: a broken *home* layer
-    /// silently falling back to permissive pacing/policy/sandbox defaults
-    /// right before a harness spawns is a security regression, not a mere
-    /// inconvenience -- see `load_for_launch`'s own doc comment.
+    /// Diagnostic loads may skip either layer; launch loads must refuse broken home policy rather than widen permissions.
     pub is_home: bool,
 }
 
-/// Extracts the field name from a serde error message.
-/// Serde errors typically include the field name in backticks, e.g.
-/// "unknown field `future_feature`" or "invalid type: string `native`, expected struct RuntimeConfig in `runtime`"
+/// Extract the first backtick-delimited field candidate from a serde error.
 fn extract_field_name(error_msg: &str) -> Option<String> {
-    // Look for field names in backticks: `fieldname`
     if let Some(start) = error_msg.find('`')
         && let Some(end) = error_msg[start + 1..].find('`')
     {
@@ -206,13 +145,9 @@ fn extract_field_name(error_msg: &str) -> Option<String> {
     None
 }
 
-/// Formats a configuration error message that includes the source layer.
-/// For unknown fields or type mismatches, tries to identify which file or
-/// env var contributed the problematic key, then provides a forward-compatible
-/// error message.
+/// Attribute unknown keys and type errors to their contributing config layer when available.
 fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>) -> String {
     if let Some(field) = extract_field_name(error_msg) {
-        // Check if this is an unknown field error
         if error_msg.contains("unknown field") {
             if let Some(origin) = key_origins.get(&field) {
                 let source = match origin {
@@ -228,7 +163,6 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
                     field, source
                 );
             } else {
-                // Field not in our origins map, it came from env or unknown
                 return format!(
                     "unknown key `{}` — this is usually from a newer zirv \
                      version. Remove the key from your config files or environment variables, or upgrade zirv.",
@@ -236,7 +170,6 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
                 );
             }
         }
-        // Check if this is a type error
         if error_msg.contains("invalid type")
             && let Some(origin) = key_origins.get(&field)
         {
@@ -250,25 +183,14 @@ fn format_config_error(error_msg: &str, key_origins: &HashMap<String, KeyOrigin>
             return format!("wrong type for `{}` in {} — {}", field, source, error_msg);
         }
     }
-    // Fallback for errors we can't enhance
     format!("invalid ctx config: {}", error_msg)
 }
 
-/// A `toml::de::Error`'s own `Display` renders a multi-line diagram (a
-/// location line, a gutter, the offending source line, a caret, then the
-/// message). `zirv ctx status`/the `zirv \u{25b8}` announcement both want one
-/// line: the location (`"TOML parse error at line X, column Y"`, `Display`'s
-/// own first line) plus `Error::message()`, which is exactly what an
-/// operator needs to find and fix the byte without the diagram. Deliberately
-/// does not include the path -- callers already have it (`UnparsableLayer::
-/// path`) and show it separately.
+/// Keep location and message on one line for status and announcements; callers supply the path.
 fn summarize_parse_error(error: &toml::de::Error) -> String {
     let rendered = error.to_string();
     let first_line = rendered.lines().next().unwrap_or("TOML parse error");
-    // `Display` only prints a location line when it actually has a span to
-    // point at; without one (rare -- `toml::de::Error::custom` with no span)
-    // the first line already *is* the message, and prefixing it with itself
-    // would just repeat it.
+    // Spanless errors already start with the message; do not duplicate it as a location.
     if first_line.starts_with("TOML parse error") {
         format!("{first_line}: {}", error.message())
     } else {
@@ -276,15 +198,8 @@ fn summarize_parse_error(error: &toml::de::Error) -> String {
     }
 }
 
-/// Reads one config layer, merging it into `into` on success and tracking
-/// origins in `key_origins`. Returns `Ok(Some(_))`, not `Err`, when the file
-/// exists but fails to *parse* as TOML: a syntax error in an untrusted layer
-/// (either one -- `~/.zirv/ctx.toml` is operator-owned but still a hand-edited
-/// file a stray keystroke can break) must not abort the whole load, only that
-/// layer. `into` is left unchanged in that case, so the caller's merge sees
-/// nothing from it and defaults/the other layer apply. An I/O error (unreadable
-/// file, permission denied) is a different failure mode and still propagates
-/// via `?` -- this only degrades a *parse* failure.
+/// Syntax failure leaves the merge unchanged and returns a diagnostic; I/O failures still propagate.
+/// Launch callers must separately reject broken operator policy rather than trust defaults.
 fn read_layer(
     path: &Path,
     into: &mut toml::Table,
@@ -306,7 +221,6 @@ fn read_layer(
             } else {
                 KeyOrigin::Repo
             };
-            // Track all top-level keys from this layer
             for key in layer.keys() {
                 key_origins.insert(key.clone(), origin.clone());
             }
@@ -334,8 +248,7 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
     super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
     let cfg: CtxConfig = toml::Value::Table(table).try_into().map_err(|e| {
         let error_msg = e.to_string();
-        // For operator validation, we can't track full provenance, but we can still
-        // improve the message for common cases
+        // Without layered provenance, still provide a useful unknown-key diagnosis.
         if error_msg.contains("unknown field")
             && let Some(field) = extract_field_name(&error_msg)
         {
@@ -356,13 +269,7 @@ pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
 }
 
 impl CtxConfig {
-    /// Whether the orchestrator seat may roll over automatically, resolving
-    /// `fallback.auto_orchestrator_rollover`'s "decide from the roster"
-    /// default: ON whenever more than one harness named in `fallback.order`
-    /// is enabled by the agent gate, OFF otherwise (a single-harness roster
-    /// has nowhere to roll over to, which `rollover::evaluate` refuses on
-    /// its own anyway). An explicit value from any layer wins outright --
-    /// see the field's own doc comment for the narrowing rules.
+    /// Unset enables rollover only with multiple enabled fallback harnesses; a single harness has no destination.
     pub fn auto_orchestrator_rollover(&self) -> bool {
         self.fallback.auto_orchestrator_rollover.unwrap_or_else(|| {
             self.fallback
@@ -374,23 +281,9 @@ impl CtxConfig {
         })
     }
 
-    /// Layers `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`, then
-    /// `ZIRV_CTX_*`. Flags are applied by each verb after loading.
-    ///
-    /// A layer that fails to *parse* as TOML (either one -- a stray keystroke
-    /// in the untrusted repo file, or a hand-edit gone wrong in the
-    /// operator's own home file) is skipped, not fatal: `read_layer` reports
-    /// it as an `UnparsableLayer` instead of erroring, this function collects
-    /// every one it sees into the returned config's own `unparsable_layers`,
-    /// and the remaining layers plus defaults are used exactly as if the
-    /// broken layer had never existed. Defaults are the safe posture
-    /// (sandboxed, pacing on), so skipping a layer never *widens* anything --
-    /// see the type's own doc comment. This is never silent: `load` announces
-    /// once per process on the `zirv \u{25b8}` channel (`announce_unparsable_
-    /// layers_once`), and `zirv ctx status`/`zirv ctx optimize` both surface
-    /// the same list. A `REPO_FORBIDDEN` rejection is a different thing
-    /// entirely -- a key that *did* parse but names something a repo may not
-    /// set -- and still fails this call outright (see `is_repo_forbidden`).
+    /// Merge home, repo, then environment; verbs apply flags afterward.
+    /// Skip and announce TOML syntax failures for diagnostics; schema and forbidden-key errors remain fatal.
+    /// Launching callers must use `load_for_launch` to refuse broken operator policy.
     pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
         let mut merged = toml::Table::new();
         let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
@@ -401,85 +294,45 @@ impl CtxConfig {
         {
             unparsable_layers.push(bad);
         }
-        // `[policy]` is lifted out of every layer before the deep merge: a
-        // merge would let the repo layer's stance simply replace the
-        // operator's, which is the one thing a permissions surface must never
-        // allow. `policy::resolve` folds the same three layers with `max`
-        // instead, so the repo half can only narrow.
+        // Lift policy before merging so repo stances cannot replace operator restrictions; resolve with stricter-wins.
         let home_policy = merged.remove(POLICY_SECTION);
-        // `[safety]` (issue #83) gets the identical whole-section lift, for
-        // the identical reason -- see `super::safety`'s module doc and the
-        // `safety` field's own doc comment.
+        // Lift safety for the same no-replacement trust constraint (#83).
         let home_safety = merged.remove(SAFETY_SECTION);
-        // `[[workspace]]` is additive across trust layers. An ordinary TOML
-        // deep merge would replace the operator's entire array with the
-        // repository's array; lift both and append below instead. A duplicate
-        // name remains a loud validation error, never an override.
+        // Append workspace layers instead of replacing arrays; duplicate names must fail loudly.
         let home_workspaces = merged.remove("workspace");
-        // `sandbox.extra_deny` gets the identical treatment, one level
-        // deeper: a repo checkout may *add* deny entries (narrowing is
-        // always safe), but the ordinary merge would let its array replace
-        // the operator's home-layer one instead of adding to it. Resolved
-        // as a union below, once both layers are in hand. `extra_allow`
-        // needs no such lift: it is `REPO_FORBIDDEN` outright, so the repo
-        // layer never has a value here for `merge()` to clobber anything
-        // with.
+        // Union denials so repo arrays cannot erase operator entries; extra-allow is operator-only and needs no lift.
         let home_extra_deny = string_array(take_nested(&mut merged, "sandbox", "extra_deny"));
-        // T9 (repo-narrowing fold): `pace.enabled`/`max_percent`/`soft_percent`
-        // get the identical treatment, for the identical reason -- lifted out
-        // before the deep merge so a repo layer's value can never simply
-        // replace the operator's. Unlike `sandbox.extra_deny`'s union, these
-        // fold like `[policy]`'s own `Stance::max` (see `narrow_pace_bool`/
-        // `narrow_pace_percent` below): the *stricter* of the two layers wins,
-        // never the later one. `soft_percent`/`max_percent` share the same
-        // rule (lower is stricter); `enabled` uses the bool-ordering
-        // equivalent (`true` is stricter than `false`).
+        // Lift before merge so stricter pacing wins: enabled=true and lower percentages.
         let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
         let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
         let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
-        // Issue #155, Phase 3: `context.dedupe_native` gets the identical
-        // lift-before-merge treatment as `pace.enabled` right above, folded
-        // by `narrow_dedupe_bool` instead of `narrow_pace_bool` -- see that
-        // function's own doc comment for why the polarity is inverted.
+        // Lift before merge; false is stricter because it injects more context (#155).
         let home_context_dedupe_native =
             bool_at(take_nested(&mut merged, "context", "dedupe_native"));
-        // Issue #539 fix round: `prompt.skill_index` gets the identical
-        // lift-before-merge treatment, folded by `narrow_skill_index_bool` --
-        // unlike every other `[prompt]` key, this one is not `REPO_FORBIDDEN`.
+        // Lift before merge so repos can only disable the standing skill index (#539).
         let home_prompt_skill_index = bool_at(take_nested(&mut merged, "prompt", "skill_index"));
         let home_prompt_intake_discipline =
             bool_at(take_nested(&mut merged, "prompt", "intake_discipline"));
-        // Issue #309: `verify_on_stop.enabled`/`max_nudges` get the identical
-        // lift-before-merge treatment -- see `narrow_verify_on_stop_enabled`/
-        // `narrow_max_nudges` below for each field's strict direction.
+        // Lift before merge so repos can only disable verification advice or lower its cap (#309).
         let home_verify_on_stop_enabled =
             bool_at(take_nested(&mut merged, "verify_on_stop", "enabled"));
         let home_verify_on_stop_max_nudges =
             integer_at(take_nested(&mut merged, "verify_on_stop", "max_nudges"));
-        // Issue #308 stage 1: `diagnostics.enabled`/`max_diagnostics`/
-        // `timeout_secs` get the identical lift-before-merge treatment -- see
-        // `narrow_diagnostics_enabled`/`narrow_max_diagnostics`/
-        // `narrow_diagnostics_timeout_secs` below for each field's strict
-        // direction.
+        // Lift before merge so repos can only disable diagnostics, lower the count or shorten runtime (#308).
         let home_diagnostics_enabled = bool_at(take_nested(&mut merged, "diagnostics", "enabled"));
         let home_diagnostics_max =
             integer_at(take_nested(&mut merged, "diagnostics", "max_diagnostics"));
         let home_diagnostics_timeout =
             integer_at(take_nested(&mut merged, "diagnostics", "timeout_secs"));
-        // Q1: `missing_tests_gate.enabled` gets the identical lift-before-merge
-        // treatment -- see `narrow_missing_tests_gate_enabled` below.
+        // Lift before merge so repos cannot enable a missing-tests gate the operator disabled.
         let home_missing_tests_gate_enabled =
             bool_at(take_nested(&mut merged, "missing_tests_gate", "enabled"));
-        // Issue #774: `subagent_stop_gate.enabled` gets the identical
-        // lift-before-merge treatment -- see `narrow_subagent_stop_gate_
-        // enabled` below.
+        // Lift before merge so repos cannot enable a subagent Stop gate the operator disabled (#774).
         let home_subagent_stop_gate_enabled =
             bool_at(take_nested(&mut merged, "subagent_stop_gate", "enabled"));
-        // `scope_guard.enabled` gets the identical lift-before-merge
-        // treatment -- see `narrow_scope_guard_enabled` below.
+        // Lift before merge so repos cannot enable a scope guard the operator disabled.
         let home_scope_guard_enabled = bool_at(take_nested(&mut merged, "scope_guard", "enabled"));
-        // Issue #312: both `compact_advisory` keys are narrow-only in the
-        // "less eager" direction -- see `narrow_compact_advisory_min_reclaim`.
+        // Repo compaction advice may only become less eager (#312).
         let home_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut merged,
             "compact_advisory",
@@ -490,28 +343,15 @@ impl CtxConfig {
             "compact_advisory",
             "window_fraction",
         ));
-        // Issue #262: `worker.max_depth`/`worker.deny_network` get the
-        // identical lift-before-merge treatment -- see `narrow_worker_
-        // max_depth`/`narrow_worker_deny_network` below for each field's
-        // strict direction. `worker.claude`/`worker.codex`/`worker.
-        // default_depth`/`worker.default_read_only` are NOT lifted here:
-        // they are `REPO_FORBIDDEN` outright, so `reject_untrusted_keys`
-        // (below) catches a repo file naming them before a repo layer could
-        // ever reach this merge.
+        // Lift only narrowable depth/network bounds; operator-only worker keys are rejected before merge (#262).
         let home_worker_max_depth = integer_at(take_nested(&mut merged, "worker", "max_depth"));
         let home_worker_deny_network = bool_at(take_nested(&mut merged, "worker", "deny_network"));
-        // Issue #718: `worktree.idle_pool_max`/`worktree.idle_ttl_secs` get
-        // the identical lift-before-merge treatment -- see
-        // `narrow_worktree_idle_pool_max`/`narrow_worktree_idle_ttl_secs`
-        // below for each field's strict direction.
+        // Lift before merge so repos can only shrink the idle pool or shorten retention (#718).
         let home_worktree_idle_pool_max =
             integer_at(take_nested(&mut merged, "worktree", "idle_pool_max"));
         let home_worktree_idle_ttl_secs =
             integer_at(take_nested(&mut merged, "worktree", "idle_ttl_secs"));
-        // Issue #314: `objective.gates`/`max_cycles_without_progress`/`judge`
-        // get the identical lift-before-merge treatment -- see
-        // `narrow_objective_gates`/`narrow_max_cycles_without_progress`/
-        // `narrow_objective_judge` below for each field's strict direction.
+        // Lift before merge so repos can only drop gates, lower cycles or disable the judge (#314).
         let home_objective_gates = string_array_at(take_nested(&mut merged, "objective", "gates"));
         let home_objective_max_cycles = integer_at(take_nested(
             &mut merged,
@@ -519,9 +359,7 @@ impl CtxConfig {
             "max_cycles_without_progress",
         ));
         let home_objective_judge = bool_at(take_nested(&mut merged, "objective", "judge"));
-        // Issue #272: every `[screen]` key gets the identical lift-before-
-        // merge treatment -- see `narrow_screen_threshold`/`narrow_screen_
-        // dominance_pct` below for the shared "lower is stricter" direction.
+        // Lift before merge so repos can only lower detection thresholds (#272).
         let home_screen_min_fragment = integer_at(take_nested(
             &mut merged,
             "screen",
@@ -538,50 +376,30 @@ impl CtxConfig {
         ));
         let home_obfuscate_email_domain = take_nested(&mut merged, "obfuscate", "email_domain");
         let home_obfuscate_patterns = take_nested(&mut merged, "obfuscate", "patterns");
-        // `supervise.heavy_command_patterns` gets the identical treatment as
-        // `sandbox.extra_deny` above, for the identical reason: the field's
-        // own doc comment promises a repo layer may only ADD patterns, never
-        // replace the operator's own list, but the ordinary `merge()` below
-        // would let a repo `heavy_command_patterns = []` (or any other
-        // array) silently clobber the home layer's entries instead of
-        // adding to them. Lifted out and unioned once both layers are in
-        // hand, same as `extra_deny`.
+        // Union heavy patterns: even an empty repo array must never erase operator restrictions.
         let home_heavy_patterns = string_array(take_nested(
             &mut merged,
             "supervise",
             "heavy_command_patterns",
         ));
-        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
-        // lift-before-merge treatment as `pace.enabled` above -- see
-        // `narrow_orchestrator_writes` for the strict direction.
+        // Lift before merge so repos can only tighten write posture (#358).
         let home_orchestrator_writes = orchestrator_writes_at(
             take_nested(&mut merged, "supervise", "orchestrator_writes"),
             "supervise.orchestrator_writes",
         )?;
-        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
-        // identical lift-before-merge treatment -- see `narrow_loop_backoff_
-        // ceiling_secs` below for the strict direction.
+        // Lift before merge so repos can only shorten quiet loop intervals (#311).
         let home_loop_backoff_ceiling = integer_at(take_nested(
             &mut merged,
             "supervise",
             "loop_backoff_ceiling_secs",
         ));
-        // Issue #412: `output.diff_max_bytes` gets the identical lift-before-
-        // merge treatment -- see `narrow_diff_max_bytes` below for the strict
-        // direction.
+        // Lift before merge so repos can only lower the diff-output ceiling (#412).
         let home_output_diff_max_bytes =
             integer_at(take_nested(&mut merged, "output", "diff_max_bytes"));
 
-        // Issue #186: every fallback field is lifted before the repo merge.
-        // The repo may only narrow automatic vendor steering; see the
-        // re-insertion below for each field's strict direction.
+        // Lift before merge so repos can only narrow automatic vendor steering (#186).
         let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
-        // Issue #455: `fallback.health.enabled` gets the identical AND fold
-        // as `fallback.enabled` right above -- a repo may switch the
-        // route-health breaker off, never on for an operator who disabled
-        // it. Its three timing knobs need no lift: they are `REPO_FORBIDDEN`
-        // outright, so `reject_untrusted_keys` has already refused the whole
-        // load if a repo layer named one.
+        // Repos may only disable the route breaker; its timing settings are operator-only (#455).
         let home_fallback_health_enabled =
             bool_at(take_nested3(&mut merged, "fallback", "health", "enabled"));
         let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
@@ -625,12 +443,7 @@ impl CtxConfig {
             "workflow.deploy.minimum_tier",
         )?;
 
-        // Read on its own first: the repo layer is the one layer that comes
-        // from a checkout rather than from the operator. If `repo` IS the
-        // operator's own home directory (`zirv`/`zirv chat` run from `~`),
-        // there is no repository layer at all -- without this check,
-        // `~/.zirv/ctx.toml` would be read a second time as the repo layer
-        // and hard-error on `agent`, a key only the operator layer may set.
+        // When launched from home, do not reread operator config as untrusted repo config and reject its authorized keys.
         let repo_path = repo
             .join(crate::utils::SCRIPT_DIR_NAME)
             .join(CTX_CONFIG_FILE);
@@ -640,20 +453,11 @@ impl CtxConfig {
         {
             unparsable_layers.push(bad);
         }
-        // Before the lift, so a future `policy.*` entry in `REPO_FORBIDDEN`
-        // still gets its loud rejection rather than being quietly folded.
-        // Trivially satisfied when the repo layer above failed to parse:
-        // `repo_layer` is empty in that case, so there is nothing here for it
-        // to reject -- an unparsable repo file can name no forbidden key,
-        // parsed or not.
+        // Reject forbidden keys before lifting sections so narrowing folds cannot silently swallow forbidden settings.
         reject_untrusted_keys(&repo_layer, &repo_path)?;
         reject_untrusted_workspace_execution(&repo_layer, &repo_path)?;
         let repo_policy = repo_layer.remove(POLICY_SECTION);
-        // Removed only after the rejection check above has already run, so a
-        // repo file naming `safety.allow`/`safety.default` (both
-        // `REPO_FORBIDDEN`) is still caught loudly here rather than being
-        // silently dropped by this lift -- see `super::safety::resolve`'s
-        // own doc comment for the defense-in-depth half of this guarantee.
+        // Lift safety only after rejecting repo allow/default keys; resolution adds defense in depth.
         let repo_safety = repo_layer.remove(SAFETY_SECTION);
         let repo_workspaces = repo_layer.remove("workspace");
         let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
@@ -807,10 +611,7 @@ impl CtxConfig {
             merged.insert("workspace".to_string(), workspaces);
         }
 
-        // A repo may only tighten email handling to `mask`. `keep` never
-        // overrides an operator's `mask`. Pattern tables are additive so a
-        // checkout cannot discard an operator detector by replacing its
-        // array during the ordinary deep merge.
+        // Repo mask handling can only tighten; union pattern tables so repos cannot replace operator detectors.
         let home_masks_email = matches!(
             home_obfuscate_email_domain.as_ref(),
             Some(toml::Value::String(value)) if value == "mask"
@@ -861,11 +662,7 @@ impl CtxConfig {
             );
         }
 
-        // Issue #358 T8: `supervise.orchestrator_writes` gets the identical
-        // re-insertion as `pace.enabled` right below -- narrowed by `narrow_
-        // orchestrator_writes`, then still overwritable by `ZIRV_CTX_
-        // SUPERVISE_ORCHESTRATOR_WRITES` (`ENV_MAP`, below) the same as
-        // every other narrow-only key.
+        // Reinsert narrowed write posture before environment overrides, which remain the operator's final word (#358).
         let default_supervise = SuperviseConfig::default();
         insert_path(
             &mut merged,
@@ -879,11 +676,7 @@ impl CtxConfig {
                 .to_string(),
             ),
         );
-        // Issue #311: `supervise.loop_backoff_ceiling_secs` gets the
-        // identical re-insertion, narrowed by `narrow_loop_backoff_ceiling_
-        // secs`, then still overwritable by `ZIRV_CTX_SUPERVISE_LOOP_
-        // BACKOFF_CEILING_SECS` (`ENV_MAP`, below) the same as every other
-        // narrow-only key.
+        // Reinsert the narrowed backoff ceiling before operator environment overrides (#311).
         insert_path(
             &mut merged,
             &["supervise", "loop_backoff_ceiling_secs"],
@@ -898,10 +691,7 @@ impl CtxConfig {
                 .unwrap_or(i64::MAX),
             ),
         );
-        // Issue #412: `output.diff_max_bytes` gets the identical
-        // re-insertion, narrowed by `narrow_diff_max_bytes`, then still
-        // overwritable by `ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES` (`ENV_MAP`, below)
-        // the same as every other narrow-only key.
+        // Reinsert the narrowed diff ceiling before operator environment overrides (#412).
         let default_output = OutputConfig::default();
         insert_path(
             &mut merged,
@@ -918,9 +708,7 @@ impl CtxConfig {
             ),
         );
 
-        // Re-inserted after the merge, before env: env (below) must still be
-        // able to overwrite this outright, the same final-word precedence
-        // every other key already gets.
+        // Reinsert after merge but before env so the operator can still override the result outright.
         let default_pace = PaceConfig::default();
         insert_path(
             &mut merged,
@@ -1333,11 +1121,7 @@ impl CtxConfig {
             &["fallback", "adaptive_delegation"],
             toml::Value::Boolean(home_adaptive && repo_fallback_adaptive.unwrap_or(true)),
         );
-        // Left ABSENT when neither layer decided, so the roster default in
-        // `CtxConfig::auto_orchestrator_rollover` applies: writing the
-        // struct default back in would freeze today's answer into the merged
-        // table. A repo `true` on an unset home layer is a widening and is
-        // discarded; a repo `false` narrows and sticks.
+        // Leave an undecided rollover absent so the live roster determines it; repo true cannot widen an unset home value.
         let merged_auto_rollover = match (home_fallback_auto_rollover, repo_fallback_auto_rollover)
         {
             (Some(home), repo) => Some(home && repo.unwrap_or(true)),
@@ -1383,7 +1167,6 @@ impl CtxConfig {
         for (var, path, kind) in ENV_MAP {
             if let Some(raw) = env(var) {
                 let value = env_value(&raw, *kind).map_err(|e| format!("{var}: {e}"))?;
-                // Track top-level key origin for env vars
                 if let Some(first_key) = path.first() {
                     key_origins.insert(first_key.to_string(), KeyOrigin::Env(var.to_string()));
                 }
@@ -1391,19 +1174,8 @@ impl CtxConfig {
             }
         }
 
-        // Issue #155, Phase 5(e): `supervise.max_heavy_workers` is a
-        // deprecated alias for `max_heavy_operations`, rewritten here --
-        // after every layer, including the `ENV_MAP` loop just above, has
-        // already contributed -- because `SuperviseConfig` is
-        // `deny_unknown_fields` and an old key surviving to `try_into()`
-        // below would hard-fail the load rather than degrade gracefully.
-        // Positioned after `ENV_MAP` rather than alongside the `pace`/
-        // `context` re-insertions above so the deprecated
-        // `ZIRV_CTX_SUPERVISE_MAX_HEAVY_WORKERS` env var (still in
-        // `ENV_MAP`, unchanged) gets the identical rewrite a deprecated TOML
-        // key gets, instead of leaving its own stray `max_heavy_workers`
-        // entry behind. The new key wins whenever both spellings ended up
-        // set, regardless of which layer or env var supplied either one.
+        // Rewrite the deprecated heavy-worker alias after env merging so old env and TOML keys both load (#155).
+        // The canonical key wins whenever both exist; no unknown alias may reach serde.
         if let Some(old) = take_nested(&mut merged, "supervise", "max_heavy_workers")
             && value_at(&merged, &["supervise", "max_heavy_operations"]).is_none()
         {
@@ -1418,10 +1190,7 @@ impl CtxConfig {
         })?;
         super::workspace::validate_catalogue(&cfg.workspace).map_err(add_config_error_prefix)?;
 
-        // See `PromptConfig::orchestrator_writes`'s own doc comment: copied
-        // over here, once the full config (both layers, narrowing and env
-        // already resolved) is assembled, rather than threading a new
-        // parameter through every prompt-composition call site.
+        // Copy write posture only after narrowing and env resolution so every prompt consumer sees the effective value.
         cfg.prompt.orchestrator_writes = cfg.supervise.orchestrator_writes;
 
         if let Some(raw) = env("ZIRV_CTX_FALLBACK_ORDER") {
@@ -1481,11 +1250,7 @@ impl CtxConfig {
                 .into(),
             ));
         }
-        // Issue #455 (review round 1, finding 9): the breaker's own knobs.
-        // `open_after_failures` above the observation ring can never be
-        // reached, so the breaker would silently never open; a zero window
-        // discards every observation the instant it is recorded, and a zero
-        // cooldown makes every poll a trial.
+        // Keep the breaker threshold reachable within its observation ring; zero windows erase evidence and zero cooldowns thrash (#455).
         if !(1..=super::health::MAX_OBSERVATIONS as u32)
             .contains(&cfg.fallback.health.open_after_failures)
         {
@@ -1514,10 +1279,7 @@ impl CtxConfig {
                 ));
             }
         }
-        // Slice A: the degrade knobs. A 0% rate degrades every route that
-        // ever sees one failure and a rate above 100 can never be reached;
-        // a single sample is not a rate at all; and a sub-second first-token
-        // threshold would mark every thinking model degraded.
+        // Bound degradation rates and sample counts; sub-second latency thresholds would mark thinking models degraded.
         if !(1..=100).contains(&cfg.fallback.health.degrade_error_rate_pct) {
             return Err(add_config_error_prefix(
                 format!(
@@ -1527,12 +1289,7 @@ impl CtxConfig {
                 .into(),
             ));
         }
-        // Finding 12: bounded above by the ring the samples land in, or the
-        // signal can never fire at all -- a minimum the evidence store
-        // cannot physically reach is a silently dead knob, exactly what the
-        // `open_after_failures` bound above exists to prevent. The latency
-        // ring is the smaller of the two, so enabling the latency signal
-        // tightens the ceiling.
+        // The sample minimum must fit the evidence ring; enabling latency uses the smaller ring's ceiling.
         let sample_ceiling = if cfg.fallback.health.degrade_ttft_ms.is_some() {
             super::health::MAX_OBSERVATIONS as u32
         } else {
@@ -1584,14 +1341,7 @@ impl CtxConfig {
             }
         }
 
-        // The union: the operator's own home-layer entries plus the repo's,
-        // never fewer than either -- narrowing can only add restriction.
-        // `ZIRV_CTX_SANDBOX_EXTRA_DENY`, when set, replaces this outright
-        // (the operator's own final word, same as every other env escape
-        // hatch), and `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` replaces the plain
-        // merged (operator-only, `REPO_FORBIDDEN`) `extra_allow` the same
-        // way. Neither goes through `ENV_MAP`/`EnvKind`, which has no
-        // list-shaped variant; both are simple comma-separated overrides.
+        // Union home and repo denials so neither loses restrictions; operator CSV env overrides replace the result outright.
         cfg.sandbox.extra_deny = match env("ZIRV_CTX_SANDBOX_EXTRA_DENY") {
             Some(raw) => split_csv_list(&raw),
             None => {
@@ -1604,56 +1354,32 @@ impl CtxConfig {
             cfg.sandbox.extra_allow = split_csv_list(&raw);
         }
 
-        // Same operator-only override shape as `extra_allow` right above:
-        // `dash.workdir_roots` is `REPO_FORBIDDEN` outright (see its own doc
-        // comment), so there is no repo contribution to union in -- only the
-        // operator's own home layer, or `ZIRV_CTX_DASH_WORKDIR_ROOTS`
-        // replacing it outright when set.
+        // Operator env replaces workdir roots; repo contributions are forbidden.
         if let Some(raw) = env("ZIRV_CTX_DASH_WORKDIR_ROOTS") {
             cfg.dash.workdir_roots = split_csv_list(&raw);
         }
 
-        // Same operator-only override shape as `dash.workdir_roots` right
-        // above: `headless.disallowed_tools` is `REPO_FORBIDDEN` outright, so
-        // there is no repo contribution to union in -- only the operator's
-        // own home layer, or `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` replacing
-        // it outright when set.
+        // Operator env replaces the disallowed-tool list; repo contributions are forbidden.
         if let Some(raw) = env("ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS") {
             cfg.headless.disallowed_tools = split_csv_list(&raw);
         }
 
-        // Same operator-only override shape as `extra_allow` right above:
-        // when set, `ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH` replaces
-        // whatever `workflow.check_env_passthrough` the merged TOML layers
-        // produced (`REPO_FORBIDDEN` already means that can only be the
-        // operator's own `~/.zirv/ctx.toml`). This list is itself only ever
-        // ADDED to `verification::DEFAULT_CHECK_ENV_PASSTHROUGH` at the
-        // point of use, never a replacement for those built-in defaults.
+        // Operator env replaces the configured list, which only adds to built-in check passthrough at use.
         if let Some(raw) = env("ZIRV_CTX_WORKFLOW_CHECK_ENV_PASSTHROUGH") {
             cfg.workflow.check_env_passthrough = split_csv_list(&raw);
         }
 
-        // Same operator-only override shape, for issue #276's builtin
-        // self-check exclude list: `ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE`
-        // replaces whatever `workflow.builtin_checks_exclude` the merged TOML
-        // layers produced.
+        // Operator env replaces the built-in check exclusion list (#276).
         if let Some(raw) = env("ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE") {
             cfg.workflow.builtin_checks_exclude = split_csv_list(&raw);
         }
 
-        // Issue #326: same list-valued env convention -- `ZIRV_CTX_OUTPUT_
-        // VERBATIM` replaces whatever `[output] verbatim` the merged TOML
-        // layers produced (which, being `REPO_FORBIDDEN`, can only ever have
-        // come from the operator's own home layer anyway).
+        // Operator CSV env replaces the verbatim list; repos cannot contribute (#326).
         if let Some(raw) = env("ZIRV_CTX_OUTPUT_VERBATIM") {
             cfg.output.verbatim = split_csv_list(&raw);
         }
 
-        // A cap below `MIN_MAX_SUMMARY_BYTES` cannot hold a header, a failure
-        // line and the retrieval line at once, so honoring it literally would
-        // mean emitting summaries with the failures cut off -- the one thing
-        // `output::render_summary` must never do. Refused by name rather than
-        // silently clamped.
+        // Reject caps too small for header, failure and retrieval lines; never silently clamp or emit a summary hiding failures.
         if cfg.output.max_summary_bytes < MIN_MAX_SUMMARY_BYTES {
             return Err(add_config_error_prefix(
                 format!(
@@ -1665,21 +1391,11 @@ impl CtxConfig {
             ));
         }
 
-        // Issue #417: every `[[output.filter]]` rule's regexes must compile,
-        // `match_command` must be fully anchored, and names must be unique --
-        // see `validate_output_filter_rules`'s own doc comment. `output.filter`
-        // being `REPO_FORBIDDEN` means this list can only ever have come from
-        // the operator's own home layer by the time we reach here.
+        // Validate operator rule names and anchored regexes once so application can trust them (#417).
         validate_output_filter_rules(&cfg.output.filter)?;
 
-        // Bundled defaults (see `OutputConfig::filter_defaults`'s own doc
-        // comment): appended AFTER validating the operator's own rules above,
-        // so an operator rule always precedes every bundled rule, and skipped
-        // for any bundled `name` the operator already declared -- an operator
-        // rule with a bundled rule's name REPLACES it outright rather than
-        // running alongside it. `bundled_output_filter_rules` ships its own
-        // rules already anchored/compiling/unique, so no second `validate_
-        // output_filter_rules` pass is needed here.
+        // Validate operator rules before appending bundled defaults; operator order and duplicate names take precedence.
+        // Bundled rules already satisfy regex and uniqueness validation.
         if cfg.output.filter_defaults {
             let operator_names: Vec<String> = cfg
                 .output
@@ -1694,43 +1410,18 @@ impl CtxConfig {
             );
         }
 
-        // Same union as `extra_deny` above, for `heavy_command_patterns`: the
-        // operator's own home-layer patterns plus whatever the repo adds,
-        // never fewer than either -- a repo layer may only add a pattern
-        // (narrowing), never remove or replace the operator's own list. No
-        // env override exists for this key today, unlike `extra_deny`/
-        // `extra_allow`.
+        // Union heavy patterns so repos can only add restrictions, never remove operator entries.
         let mut heavy_patterns = home_heavy_patterns;
         heavy_patterns.extend(repo_heavy_patterns);
         cfg.supervise.heavy_command_patterns = heavy_patterns;
 
-        // SECURITY (command-injection defense): `chat.model` is one of the few
-        // keys a repo `ctx.toml` may set (see `REPO_FORBIDDEN`'s `chat.model`
-        // note), and it is appended to an interactive launch's argv via
-        // `AgentAdapter::model_args`. On Windows an npm-installed agent resolves
-        // to a `.cmd` shim that zirv routes through `cmd.exe /c`, which
-        // re-parses that argv -- so an unconstrained model string is a repo-
-        // controlled path into a shell command line. Constrain it to a charset
-        // that cannot express any shell/cmd metacharacter (space, quote,
-        // `& | ^ < > ( ) % ! ` backtick, newline are all excluded), so the
-        // repo-settable exemption cannot carry a payload. `:` `/` `@` are kept
-        // so Bedrock/Vertex ids (`us.anthropic.claude-...-v1:0`,
-        // `claude-...@20250101`) stay valid. The `ZIRV_CTX_CHAT_MODEL` env path
-        // merged above is validated identically, since it merges before here,
-        // and every downstream surface (banner, dashboard header, `model_args`)
-        // reads the value only after this point.
+        // Windows npm `.cmd` shims reparse argv through cmd.exe; reject model metacharacters to prevent repo command injection.
+        // Apply the same guard after env merging; preserve `:`, `/` and `@` for vendor model ids.
         if let Some(model) = cfg.chat.model.as_deref() {
             validate_model_str("chat.model", model)?;
         }
 
-        // Issue #504: `chat.claude_permission_mode` reaches an interactive
-        // launch's own `--permission-mode` argv (`ClaudeAdapter::default_
-        // sandbox_args`) verbatim, so it is constrained to exactly the fixed
-        // set Claude Code's own CLI accepts, the same "loud rather than
-        // silent" style `validate_endpoint_target`'s `wire_api` check uses --
-        // an unrecognized value is a load-time error naming the key, never a
-        // value that reaches argv unexamined or silently falls back to
-        // `"default"`.
+        // Validate permission mode before argv construction; unknown values hard-error instead of silently defaulting (#504).
         if let Some(mode) = cfg.chat.claude_permission_mode.as_deref()
             && !matches!(mode, "default" | "acceptEdits" | "bypassPermissions")
         {
@@ -1743,10 +1434,7 @@ impl CtxConfig {
             ));
         }
 
-        // Issue #788: `headless.prompt_cache_ttl` reaches a headless launch's
-        // `CLAUDE_CODE_PROMPT_CACHE_TTL` env verbatim -- the same "loud
-        // rather than silent" constraint as `chat.claude_permission_mode`
-        // right above, against the two values Claude Code's own docs name.
+        // TTL reaches Claude's environment verbatim; reject unsupported values at load time (#788).
         if let Some(ttl) = cfg.headless.prompt_cache_ttl.as_deref()
             && !matches!(ttl, "5m" | "1h")
         {
@@ -1775,17 +1463,7 @@ impl CtxConfig {
             }
         }
 
-        // `review.claude`/`review.codex` land in injected prompt text (see
-        // `review_roster_line` in `adapters/mod.rs`, the harness-roster line
-        // an Orchestrator session's own base prompt reads), not in argv
-        // directly -- but that session may itself later re-type the value
-        // onto a real command line (e.g. `zirv agent <name> ...`), so the
-        // same charset/length/leading-dash guard is defense for both: the
-        // prompt-injection surface today, and the argv it may be re-typed
-        // onto tomorrow. `REPO_FORBIDDEN` (see its own comment on the
-        // `review` entry) is what keeps a checked-out repo from setting
-        // these at all; this is the second, independent layer that bounds
-        // what even an operator's own value can carry.
+        // Guard review model text against injection and later reuse as argv; operator-only provenance is not enough.
         if let Some(model) = cfg.review.claude.as_deref() {
             validate_model_str("review.claude", model)?;
         }
@@ -1793,10 +1471,7 @@ impl CtxConfig {
             validate_model_str("review.codex", model)?;
         }
 
-        // `worker.claude`/`worker.codex` reach a real launch argv directly
-        // (`adapters::worker_model_args` -> `AgentAdapter::model_args`), an
-        // even more direct path than `review.*`'s own prompt-text injection
-        // above, so the same guard applies.
+        // Worker models reach launch argv directly and need the same injection guard.
         if let Some(model) = cfg.worker.claude.as_deref() {
             validate_model_str("worker.claude", model)?;
         }
@@ -1809,10 +1484,7 @@ impl CtxConfig {
             ));
         }
 
-        // `handover.<agent>.<tier>` reach a real launch argv directly too
-        // (`handover::resolve_swap_launch` -> `AgentAdapter::model_args`),
-        // the same path `worker.claude`/`worker.codex` take, so the same
-        // guard applies to all six leaves.
+        // Every handover model leaf reaches argv and needs the same injection guard.
         if let Some(model) = cfg.handover.claude.cheap.as_deref() {
             validate_model_str("handover.claude.cheap", model)?;
         }
@@ -1832,10 +1504,7 @@ impl CtxConfig {
             validate_model_str("handover.codex.deep", model)?;
         }
 
-        // `model_tiers.<agent>.<tier>` (issue #699) reach a real launch argv
-        // directly (`adapters::resolve_tiered_model` -> `dispatch_agent` ->
-        // `AgentAdapter::model_args`), the same path `worker.*`/`handover.*`
-        // take, so the same guard applies to all six leaves.
+        // Every seat-tier model leaf reaches argv and needs the same injection guard (#699).
         if let Some(model) = cfg.model_tiers.claude.fast.as_deref() {
             validate_model_str("model_tiers.claude.fast", model)?;
         }
@@ -1855,13 +1524,7 @@ impl CtxConfig {
             validate_model_str("model_tiers.codex.deep", model)?;
         }
 
-        // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` are `REPO_
-        // FORBIDDEN` outright (see that entry's own comment), so by this
-        // point either is `Some` only from the operator's own home layer.
-        // Validated here, once, rather than at every read site: a launch
-        // that reaches `AgentAdapter::ready()`/`base()`/`model_args` with a
-        // resolved `EndpointTarget` in hand can trust `vendor` names a real
-        // catalogue vendor without re-checking.
+        // Validate operator endpoints once so downstream launch code can trust catalogue membership (#395).
         if let Some(target) = cfg.endpoint.claude.as_ref() {
             validate_endpoint_target("endpoint.claude", target)?;
         }
@@ -1869,10 +1532,7 @@ impl CtxConfig {
             validate_endpoint_target("endpoint.codex", target)?;
         }
 
-        // Issue #537 seam: `[proxy]` bounds, checked once here rather than
-        // re-clamped or re-floored at every read site -- see `ProxyConfig`'s
-        // own doc comment for why this is a load-time error, not a silent
-        // clamp, matching the `fallback.*` percentage checks above.
+        // Reject proxy bounds at load time; downstream readers must not silently clamp them (#537).
         if !(0.0..=1.0).contains(&cfg.proxy.min_confidence) {
             return Err(add_config_error_prefix(
                 format!(
@@ -1891,8 +1551,7 @@ impl CtxConfig {
                 .into(),
             ));
         }
-        // Issue #803: `[jev.floors.<site>]` bounds, same load-time-error
-        // convention as `proxy.min_confidence`/`proxy.min_margin` right above.
+        // Reject out-of-range advisory floors at load time (#803).
         for (site, floor) in [
             ("memory", &cfg.jev.floors.memory),
             ("context", &cfg.jev.floors.context),
@@ -1955,19 +1614,8 @@ impl CtxConfig {
         Ok(cfg)
     }
 
-    /// `load`, plus a refusal a plain `load` deliberately does not make: a
-    /// verb that is about to launch or supervise a harness (`chat`, `wrap`,
-    /// `exec`, `loop`, `agent`, `handover`, and `dash`'s pane spawns, which
-    /// all route through `wrap::run_with`) must not silently fall back to
-    /// permissive `[pace]`/`[policy]`/`[sandbox]` defaults just because the
-    /// operator's own `~/.zirv/ctx.toml` has a syntax error. A REPO-layer
-    /// parse failure is still skipped exactly as `load` does -- that file is
-    /// untrusted, user-reported input, and skipping it can only ever narrow
-    /// (defaults are the safe posture) or leave the operator's own stricter
-    /// home settings in force. Read-only/diagnostic verbs (`status`,
-    /// `optimize`, `safety list`/`explain`, and everything else that never
-    /// spawns a harness) call `load` directly and keep reporting a broken
-    /// home layer inline rather than refusing -- see each call site.
+    /// Refuse malformed home config before any launch: falling back could widen operator pacing, policy or sandbox settings.
+    /// Untrusted repo parse failures remain skippable; diagnostic-only callers may use `load`.
     pub fn load_for_launch(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
         let cfg = Self::load(repo, env)?;
         if let Some(layer) = cfg.unparsable_layers.iter().find(|l| l.is_home) {
@@ -1987,14 +1635,7 @@ impl CtxConfig {
     }
 }
 
-/// Emits [`super::announce::Event::ConfigUnparsable`] on the `zirv \u{25b8}`
-/// channel, exactly once per process and only when the operator has not
-/// opted out (`cfg.chrome.events`) -- the same latch discipline `poll.rs`'s
-/// `announce_keychain_prompt_once` uses, applied here as a process-wide
-/// `AtomicBool` for the same reason: `CtxConfig::load` has no per-run state
-/// of its own to carry a flag in, and it is called from dozens of call sites
-/// across one process. A no-op when `cfg.unparsable_layers` is empty, so
-/// every ordinary `load` call pays only the one cheap check.
+/// Announce malformed layers once per process unless operator event settings suppress them; loads share no per-run state.
 fn announce_unparsable_layers_once(cfg: &CtxConfig) {
     if cfg.unparsable_layers.is_empty() || !cfg.chrome.events {
         return;
@@ -2021,33 +1662,8 @@ fn announce_unparsable_layers_once(cfg: &CtxConfig) {
         .emit(&super::announce::Event::ConfigUnparsable { detail });
 }
 
-/// The shared "config failed to load" fallback `surface_collect.rs` (report-only)
-/// and `hook.rs` (the `Stop` hook) both need: neither may hard-fail a run
-/// over a bad config, but degrading all the way to `CtxConfig::default()`
-/// hands back a fully permissive `AgentGate` (review finding 1, see
-/// `hook.rs`'s own `cfg_or_operator_only_gate` doc) and, since issue #44
-/// made `cfg.policy` load-bearing (the context compiler attaches it to every
-/// `CompiledContext`), a fully permissive `EffectivePolicy` too -- `Allow`
-/// on every capability, the widest policy zirv can state, minted from a
-/// config that could not even be parsed. That is a fail-open on the one
-/// surface this module exists to keep narrowing-only. `AgentGate::load_
-/// operator_only` and `EffectivePolicy::fail_closed` are substituted for
-/// those two fields; every other field keeps its ordinary default, since
-/// nothing else in `CtxConfig` is a security boundary the way the gate and
-/// the policy are.
-///
-/// Finding #5 (issue #358 review): `supervise.orchestrator_writes` is a
-/// THIRD such boundary, and it is not exempt just because it defaults to
-/// `Advise` rather than the fully-permissive extreme -- an operator who set
-/// `deny` still has that narrower posture WIDENED to `Advise` the moment a
-/// config load fails, and a repository-owned layer (`ctx.toml`, `.settings.
-/// toml`) can induce that failure at will. Forced to `Deny` here for the
-/// same reason `policy` is forced `fail_closed`: a config that could not
-/// even be read must never be read as permission to write. `prompt.
-/// orchestrator_writes` is kept in lockstep (it is `CtxConfig::load`'s own
-/// synced copy of this same field -- see `PromptConfig::orchestrator_writes`'s
-/// doc comment) so every consumer, not just `hook::orchestrator_write_
-/// posture`'s own read of `supervise`, sees the same degraded posture.
+/// Degrade nonfatal config failures with the operator-only agent gate and closed policy, never permissive defaults (#44).
+/// Force both write-posture copies to Deny: unreadable config is never authority to write (#358).
 pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     let mut cfg = CtxConfig {
         agents: crate::settings::AgentGate::load_operator_only(env),
@@ -2058,10 +1674,7 @@ pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     };
     cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
     cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
-    // The bundled `[[output.filter]]` rules are `load`'s doing, not
-    // `OutputConfig::default()`'s, so a degraded config adds them itself:
-    // they only ever strip noise from a summary, so a config that could not
-    // be read still compacts the way an absent one does.
+    // Defaults omit bundled filters; degraded loads add them so unreadable config still receives ordinary noise compaction.
     cfg.output.filter = super::output_filters::bundled_output_filter_rules();
     cfg
 }
