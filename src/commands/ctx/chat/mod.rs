@@ -559,6 +559,9 @@ fn run_native_chat<E: Write>(
     // Nesting was refused before config loading; that guard also covers native dispatch.
     let state = StateDir::resolve(env)?;
     // Run native intake after runtime/flag/TTY refusals and before pane creation, sharing the wrapped path's guards (#537).
+    // Known before intake so its Jev call is attributed to the session this launch will use.
+    let session = uuid::Uuid::new_v4().to_string();
+    super::jev::adopt_session(&[(adapters::SESSION_ENV.to_string(), session.clone())]);
     let intake = proxy_intake(cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
@@ -567,7 +570,6 @@ fn run_native_chat<E: Write>(
     // Share role mapping with wrapped launches so direct decisions stay Single (#537).
     let seat_role = proxy_prompt_role(&intake);
     // Use the ordinary dashboard so native conversations share roster, mail, attention and worker panes (#490).
-    let session = uuid::Uuid::new_v4().to_string();
     // Carry the decided model as a route candidate alongside its role; spawn must still validate it (#703).
     let model = proxy_decided_model(&intake);
     let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role, model);
@@ -685,6 +687,9 @@ pub fn run_with<W: Write, E: Write>(
     let state = StateDir::resolve(env)?;
 
     // Resolve intake before adapter selection or dashboard/wrap launch (#537).
+    // Known before intake so its Jev call is attributed to the session this launch will use.
+    let session = SessionId::new_v4();
+    super::jev::adopt_session(&[(adapters::SESSION_ENV.to_string(), session.to_string())]);
     let intake = proxy_intake(&cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
@@ -740,7 +745,6 @@ pub fn run_with<W: Write, E: Write>(
         _ => resolve_initial_prompt(args.resume, &state, repo, w, &cfg.screen.thresholds())?,
     };
     let resuming = args.resume && initial_prompt.is_some();
-    let session = SessionId::new_v4();
 
     // Start the workflow once before prompt/argv construction so all launch shapes name the same live instance.
     // Compose unsupported-injection fallback before positional argv is fixed; Windows Codex shell shims need this channel.

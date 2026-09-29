@@ -10,19 +10,15 @@ use crate::commands::ctx::config::ProxyTypesafeConfig;
 use crate::commands::ctx::jev;
 
 /// Runs one bounded `/systemone` call via [`jev::ask`] and converts its
-/// answers into the neutral [`Answers`] shape. The `cached` half of `ask`'s
-/// own result is dropped here: the harness proxy's own persistence
-/// (`proxy::persist`, a different file from `jev::record`'s) does not yet
-/// carry that flag, so a caller wanting it should call `jev::ask` directly.
+/// answers into the neutral [`Answers`] shape; the `bool` is `ask`'s own `cached`.
 pub fn decide(
     cfg: &ProxyTypesafeConfig,
     state_dir: &std::path::Path,
     cache_ttl_secs: u64,
     intake: &IntakeState,
     questions: &[Question],
-) -> Result<(Answers, Usage), TypesafeError> {
+) -> Result<(Answers, Usage, bool), TypesafeError> {
     jev::ask(cfg, state_dir, cache_ttl_secs, intake, questions)
-        .map(|(answers, usage, _cached)| (answers, usage))
 }
 
 #[cfg(test)]

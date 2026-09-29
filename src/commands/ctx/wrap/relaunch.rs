@@ -260,6 +260,7 @@ pub fn quit_child(
 /// values; a failed bind must leave the child unsupervised.
 pub(super) fn apply_session_env(builder: &mut CommandBuilder, turn_env: &[(String, String)]) {
     super::sessions::scrub_supervision_env(builder);
+    super::jev::adopt_session(turn_env);
     for (key, value) in turn_env {
         builder.env(key, value);
     }

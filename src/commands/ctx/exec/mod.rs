@@ -500,7 +500,9 @@ fn run_with_clock_inner<W: Write>(
             jev_relay_session = Some(session.as_str().to_string());
         }
         super::sessions::scrub_supervision_env_cmd(command);
-        for (key, value) in turn_env_for(session) {
+        let turn_env = turn_env_for(session);
+        jev::adopt_session(&turn_env);
+        for (key, value) in turn_env {
             command.env(key, value);
         }
         // Headless launches cannot answer permission prompts; export their

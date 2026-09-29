@@ -317,17 +317,15 @@ pub fn decide(
         fallbacks.push(format!("sensitive-data masking: {error}"));
     }
 
+    let model_call_started = Instant::now();
     let typesafe_result = if let Some((input, questions)) = &safe_input {
-        Some(
-            jev::ask(
-                &cfg.proxy.typesafe,
-                state_dir,
-                cfg.jev.cache_ttl_secs,
-                input,
-                questions,
-            )
-            .map(|(answers, usage, _)| (answers, usage)),
-        )
+        Some(jev::ask(
+            &cfg.proxy.typesafe,
+            state_dir,
+            cfg.jev.cache_ttl_secs,
+            input,
+            questions,
+        ))
     } else if matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
         && let Some(Ok((intake, questions))) = &model_input
     {
@@ -341,6 +339,45 @@ pub fn decide(
     } else {
         None
     };
+    // Every live Jev request leaves a decision row, like the other Jev sites; the spend row is `persist`'s.
+    if let Some(call) = &typesafe_result {
+        let wall_ms = model_call_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let intake_state = state::StateDir::from_path(state_dir.to_path_buf());
+        let no_usage = decision::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        match call {
+            Ok((answers, usage, cached)) => {
+                jev::record_decision_row(
+                    &intake_state,
+                    "intake",
+                    answers,
+                    usage,
+                    wall_ms,
+                    &[],
+                    *cached,
+                );
+            }
+            Err(jev::JevError::UnsafeState) => {}
+            Err(error) => {
+                jev::record_decision_row(
+                    &intake_state,
+                    "intake",
+                    &Answers::new(),
+                    &no_usage,
+                    wall_ms,
+                    &[error.to_string()],
+                    false,
+                );
+            }
+        }
+    }
+    let typesafe_result =
+        typesafe_result.map(|call| call.map(|(answers, usage, _)| (answers, usage)));
     if let Some(typesafe_result) = typesafe_result {
         match typesafe_result {
             Ok((answers, model_usage)) => {
@@ -828,6 +865,52 @@ mod tests {
         server.join().expect("one batched request");
         assert_eq!(decision.clarification_category.as_deref(), Some("target"));
         assert!(decision.needs_clarification_decisive);
+    }
+
+    /// A live intake call left only `proxy-decisions.jsonl` and a spend row, so `zirv ctx jev status`
+    /// and the dashboard never counted it; it must also leave one `intake` decision row.
+    #[test]
+    fn a_live_intake_call_writes_one_intake_decision_row_and_one_spend_row() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_ROW".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let body = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let (base_url, server) = jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_ROW", "test-key") };
+        let decision = decide(
+            &cfg,
+            state_tmp.path(),
+            repo.path(),
+            "change the service",
+            false,
+        );
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_ROW") };
+        server.join().expect("one request");
+        assert_eq!(decision.decider, Decider::Typesafe);
+
+        let text = std::fs::read_to_string(state_tmp.path().join("jev-decisions.jsonl"))
+            .expect("jev-decisions.jsonl");
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0]["site"], "intake");
+        assert_eq!(rows[0]["cached"], false);
+        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
+        assert_eq!(spend.len(), 1, "exactly one spend row per live call");
     }
 
     #[test]
