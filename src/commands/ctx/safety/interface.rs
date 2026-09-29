@@ -37,8 +37,11 @@ pub struct CheckArgs {
     /// payload on stdin).
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
-    /// Adapt a non-Claude hook payload and verdict; omitted or `claude` preserves
-    /// the Claude envelope (#418).
+    /// Issue #418: hook mode only -- project a non-claude agent's own native
+    /// `PreToolUse`-equivalent payload onto this hook's claude shape before
+    /// evaluating, then translate the verdict back into that agent's own
+    /// response envelope. Omitted (or `claude`) leaves this byte-for-byte
+    /// identical to the original claude-only hook.
     #[arg(long)]
     pub agent: Option<String>,
 }
