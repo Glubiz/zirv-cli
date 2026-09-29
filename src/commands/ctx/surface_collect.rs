@@ -573,15 +573,8 @@ fn collect_surfaces_and_exclusions(
         );
     }
 
-    // Issue #41: zirv's own canonical instruction layer, pushed before every
-    // native repo instruction file (fix round 1, review finding 11-1): both
-    // `lint_redundancy` and `drift.rs` treat the first occurrence in
-    // collection order as an exact-duplicate group's "home", so the
-    // canonical copy must be seen first -- otherwise `lint_redundancy`'s own
-    // proposed diff would delete the canonical line and keep the native one,
-    // directly contradicting `drift.rs`'s "the native copy is the redundant
-    // one" finding. Repo-owned and entirely optional in every part, read the
-    // same capped/absent-is-fine way as every other fixed-path surface here.
+    // Collect canonical instructions first: duplicate detection keeps the
+    // first copy, so the native copy must be the removable one (#41).
     push_surface_tracking(
         &mut surfaces,
         &mut excluded,
@@ -2230,14 +2223,8 @@ pub struct OptimizeArgs {
     pub out: Option<PathBuf>,
 }
 
-// (2026-08-23, issue #108) A hand-rolled `PATH` walk here used to check only
-// the bare name, so a program that resolves through `PATHEXT` on Windows
-// (an npm-installed `.cmd`/`.bat` shim -- `zirv`, `bash` under Git for
-// Windows, etc.) was reported "not installed" even though the OS itself
-// launches it fine. `adapters::program_is_present` already does the correct,
-// PATHEXT-aware `PATH` walk (the same resolution `adapters::resolve_program`
-// uses to route a shim through `cmd.exe`); reuse it instead of maintaining a
-// second, extension-blind PATH search here.
+// Use the adapter's PATHEXT-aware lookup so Windows `.cmd`/`.bat` shims count
+// as installed programs (#108).
 fn on_path(program: &str) -> bool {
     adapters::program_is_present(program)
 }

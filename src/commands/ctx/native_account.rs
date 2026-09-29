@@ -45,11 +45,8 @@ pub(crate) struct NativePlacement {
 
 /// Places one native request through the SHARED allocator (issue #554).
 ///
-/// `None` when there is no native configuration to build a row from, which
-/// is exactly the pre-#554 behaviour: nothing placed, nothing refused. A
-/// configured route the allocator excludes on HEALTH carries a typed
-/// refusal naming the breaker that stopped the work; see the comment on the
-/// refusal below for why a capacity exclusion is reported but not enforced.
+/// `None` without native configuration; unhealthy routes carry a typed
+/// breaker refusal. Capacity exclusions are advisory for native routes.
 pub(crate) fn native_placement(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -155,23 +152,8 @@ pub(crate) struct Settlement<'a> {
     pub exit_code: i32,
 }
 
-/// Closes out one finished native run's accounting, and returns the total it
-/// settled (issue #554).
-///
-/// Four things happen here, in one place so they can never disagree:
-///
-/// 1. the billing-pool reservation is settled with the TOTAL usage -- prompt,
-///    cache write, cache read and completion. Settling on the completion
-///    alone under-reported what the account actually spent by however much
-///    context the run carried, which on a long session is most of it;
-/// 2. the work-group ledger settles the same total;
-/// 3. the persistent route breaker folds this run's outcome in, in the scope
-///    the loop already decided it belongs to -- so a rate limit, a context
-///    overflow, a refusal and a cancellation reach no breaker at all;
-/// 4. one `log::Delegation` row is appended, which is the ledger `zirv ctx
-///    spend` reads. Without it a native worker's usage existed only inside
-///    its own JSON status: real tokens, on a real account, invisible to
-///    every spend surface zirv has.
+/// Settles full provider usage into the pool, group and spend ledger, then
+/// records only outcomes the loop assigned to the route breaker (#554).
 pub(crate) fn settle_native_run(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -256,14 +238,8 @@ pub(crate) fn record_route_health(
     );
 }
 
-/// Admission, reservation and settlement for one native SEAT turn -- a
-/// dashboard-hosted pane or a headless `zirv ctx exec` run (issue #554).
-///
-/// A seat is not a delegation: there is no worker handle, no work group and
-/// no delegation mode, so those fields are absent rather than invented. What
-/// it does owe is identical to a delegated worker's: the pool's ledger sees
-/// every token the provider metered, the breaker sees the outcome in the
-/// scope the loop decided, and `zirv ctx spend` sees the row.
+/// Settles a native seat turn without inventing delegation fields; the pool,
+/// breaker and spend ledger still receive its full usage and outcome (#554).
 pub(crate) fn settle_seat_turn(
     state: &StateDir,
     cfg: &CtxConfig,

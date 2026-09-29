@@ -170,36 +170,18 @@ impl Evaluation {
 /// session at that address ends, since a seat outlives nothing: a short id
 /// is derived from a session id, and a new launch gets a new one.
 pub fn forget(state: &StateDir, seat_short: &str) {
-    // Issue #440: a PARKED seat is the one kind that outlives its session on
-    // purpose -- it is the record of a rollover that failed and a source
-    // waiting out its own window. A relaunch that could not bring the source
-    // back leaves the pane `Ended`, and the reap behind it used to delete the
-    // park along with everything else. A restore reuses the same session id,
-    // so the short id matches and `seat::register` (which preserves `phase`)
-    // hands the restored pane its park back.
+    // A parked seat records a failed rollover waiting for its source window;
+    // keep it after session exit so a restored pane can inherit it (#440).
     let seat = seat::load(state, seat_short);
-    // Delta review: only a park that is still RUNNING outlives its session.
-    // Once the window has elapsed there is nothing left to wait for, and
-    // holding the record would leak `<short>.seat.json` and its pool state
-    // for every pane that was killed for good while parked.
+    // Retain a park only while its window is open; an expired park would
+    // leak the seat record and pool state (#440).
     if seat.as_ref().is_some_and(|seat| {
         matches!(seat.phase, seat::Phase::Parked { until, .. } if until > super::state::now_secs())
     }) {
         return;
     }
-    // Issue #440: a session released with a rollover still OPEN ends that
-    // transaction here. Both teardown paths reach this seam -- the
-    // dashboard's own shutdown sweep and wrap's session-end release -- and
-    // neither settles a pending rollover of its own, so quitting inside the
-    // prepare-to-ready window used to leave `prepared` followed by silence,
-    // the incident signature exactly.
-    //
-    // Residual (delta review, accepted): under a disk fault that persists
-    // across both writes, `release_prepared` cannot clear the phase and this
-    // arm then writes a SECOND terminal row for the same generation. Two
-    // rows beat none -- an operator reading the log still sees the
-    // transaction end -- and a state dir that cannot be written has already
-    // lost more than this.
+    // A released session must terminate any prepared rollover. Persistent
+    // disk failure may produce two terminal rows, which still records an end (#440).
     if let Some(open) = seat.as_ref()
         && let seat::Phase::Prepared { generation, .. } = open.phase
     {
@@ -818,14 +800,8 @@ pub fn evaluate(
                 Ok(direction) => direction,
                 Err(e) => return Evaluation::Skip(e.to_string()),
             };
-            // Issue #488 review, finding 3: the successor is VALIDATED before
-            // the source is given up -- policy, capability, context room and
-            // billing authority -- which is what README states and what makes
-            // item 7's restore possible. A candidate that cannot take the work
-            // must never reach the boundary, let alone `prepare_onto`. Inert
-            // for a route that declares no offer (every harness row today),
-            // exactly as `allocator::place` already treats an undeclared
-            // offer.
+            // Validate policy, capability, context room and billing authority
+            // before the source reaches its boundary (#488).
             if let Some(refusal) = forward_refusal(&snapshot, &current, &agent, direction) {
                 let mut ledger = rollover::runtime::Record::open(
                     &current,
@@ -854,13 +830,8 @@ pub fn evaluate(
                 );
                 return Evaluation::Skip(reason);
             }
-            // Issue #488 review, finding 2: the boundary durably cancels tool
-            // calls that never began, so asking whether a prepare is even
-            // admissible comes FIRST. This does not close the race -- only the
-            // lock inside `prepare_onto` does -- but it turns the ordinary
-            // case (an operator pinned the seat a tick ago, a manual handover
-            // already holds the transaction) into a plain skip that touches no
-            // journal. The residual race is compensated below.
+            // Check admission before the boundary cancels pending calls;
+            // `prepare_onto` locks against a concurrent seat change (#488).
             if let Err(e) = seat::may_prepare(state, seat_short) {
                 return Evaluation::Skip(e.to_string());
             }
@@ -1835,11 +1806,8 @@ pub fn on_startup(
     };
     let now = super::state::now_secs();
     let recovered = seat::recover(state, seat_short, successor_alive, now);
-    // Issue #440: a stale `Prepared` seat is a rollover that never ended, so
-    // it always ends HERE -- committed when the successor is genuinely
-    // answering, failed otherwise. Recovery that itself fails (or a seat that
-    // vanished between the load above and the recover) used to return
-    // silently, leaving the interrupted transaction with no terminal row.
+    // Every stale Prepared rollover needs a terminal row: commit only when
+    // the successor answers; otherwise record failure (#440).
     let committed = matches!(&recovered, Ok(Some(seat)) if seat.generation == generation);
     let reason = match &recovered {
         Ok(Some(_)) => "interrupted rollover recovered at supervisor startup".to_string(),

@@ -202,15 +202,8 @@ fn emit_limit_wording_drift<W: Write>(
 /// backoff). Each entry needs more context than a bare `capacity`/
 /// `overloaded` word match, by design.
 ///
-/// Security review (2026-08-31): every entry here must be a phrase a
-/// PROVIDER is documented to emit, never a bare HTTP status/reason phrase or
-/// other generic text an unrelated process could plausibly print --
-/// `"503 service unavailable"` used to be in this table and was removed for
-/// exactly that reason: a proxy, a local dev server, or any other tool this
-/// worker's output happens to contain could print that line with nothing to
-/// do with the harness's own provider account, and matching it would
-/// misclassify an unrelated failure as a transient, auto-retried capacity
-/// condition.
+/// Match only documented provider phrases: generic HTTP text can come from
+/// unrelated processes and must not trigger a capacity retry (#227).
 const CAPACITY_PATTERNS: &[(&str, &str)] = &[
     (
         "selected model is at capacity",
@@ -1121,15 +1114,8 @@ const SLEEP_CHUNK_SECS: u64 = 30;
 /// configured, the estimator. Walking every transcript is not free, so it is
 /// skipped whenever its result could not be used.
 ///
-/// E: `provider`-scoped since 2026-08-15, via `window::load_for` rather than
-/// the legacy unscoped `window::load` -- the pacing gate used to read the
-/// single global `usage.json` regardless of which adapter's session it was
-/// pacing, so a codex run was paced against whatever Anthropic data claude's
-/// statusline tee happened to have written. `load_for` falls back to that
-/// same legacy file for claude's own provider (`window::LEGACY_USAGE_
-/// PROVIDER`), so this is a no-op for the common case; a provider with no
-/// usage source at all (codex/openai today) now reads as "nothing known"
-/// (`UsageWindows::default()`) rather than another provider's real numbers.
+/// Load only this provider's usage; another provider's reading must never
+/// pace this run. Claude retains its legacy-file fallback (#358).
 /// Whether `cfg` alone -- regardless of what the collector has ever
 /// recorded -- means the estimator layer can contribute a decision: enabled,
 /// and at least one window has a nonzero budget configured. Shared by
@@ -1277,17 +1263,8 @@ fn is_blind(decision: &PaceDecision, slow_latched: bool) -> bool {
 /// (that check only knows "nothing was ever recorded", not "what was
 /// recorded is now too old to trust").
 ///
-/// This is the fix for the fail-open gap: previously both call sites simply
-/// returned `Proceed` with zero delay, once per cycle, forever -- a
-/// supervised loop with no usage data span at full speed with nothing
-/// slowing it down. Now every call pays a bounded `cfg.blind_delay_secs`
-/// safety delay (small next to `fallback_delay_secs`/`wait_slack_secs` by
-/// design -- see `PaceConfig::blind_delay_secs`'s own doc comment), and the
-/// operator is told once per run, not once per cycle (`flags.no_source_
-/// announced`, the same latch discipline every other once-per-run line in
-/// this module already follows) -- but the *delay* is not deduplicated: it
-/// applies on every call, since that is the actual safety mechanism, not
-/// just the narration of it.
+/// Apply the bounded blind delay on every call with no usable reading;
+/// announce it once per run. The delay is the safety mechanism (#358).
 ///
 /// A `writeln!`/`log::append` failure here degrades exactly like every
 /// other decision-logging call in this module: this must never become a
@@ -1788,10 +1765,8 @@ pub fn wait_for_window<W: Write>(
         if announced != fingerprint {
             announced = fingerprint;
             let _ = writeln!(w, "zirv ctx {verb}: {}", describe(&decision));
-            // Item 4: `Slow` used to be invisible on the `zirv ▸` channel --
-            // only `WaitUntil` ever reached `announcer.emit`, so a
-            // potentially hours-long soft throttle produced no announcement
-            // at all. See `pacing_event` for the actual mapping.
+            // Announce Slow as well as WaitUntil so soft throttling remains
+            // visible on the `zirv ▸` channel (#358).
             if let (Some(announcer), Some(event)) = (announcer, pacing_event(&decision)) {
                 announcer.emit(&event);
             }

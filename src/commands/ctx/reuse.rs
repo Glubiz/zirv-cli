@@ -206,18 +206,9 @@ fn kind_word(captured: Option<&str>) -> Option<&'static str> {
 /// line wins regardless.
 const BLOCK_DELIMITERS: [(&str, &str); 3] = [("/*", "*/"), ("\"\"\"", "\"\"\""), ("'''", "'''")];
 
-/// Review round 2, finding 3: whether the scan is currently inside a
-/// `/* ... */` block or a `"""`/`'''` string, carried line to line across
-/// ONE file (or one payload). [`DEF_PATTERNS`] anchor at column 0 and know
-/// nothing of context, so a `def foo():` in a Python module docstring, or a
-/// `pub fn example()` in a Rust block comment, was extracted as a real
-/// definition on the payload side and on the repository side alike, and
-/// advised on.
-///
-/// Deliberately a delimiter counter rather than a lexer: it only has to be
-/// right about text that would otherwise LOOK like a top-level definition,
-/// and both of its error directions cost at most one advisory this probe
-/// never owed anyone.
+/// Tracks block comments and docstrings per file so prose matching an
+/// anchored definition pattern is not treated as code (#39). A delimiter
+/// counter, not a lexer: its errors cost at most one advisory.
 #[derive(Debug, Default)]
 struct BlockState {
     /// The closer being looked for, when a block is open.
@@ -304,27 +295,9 @@ fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {
 /// never closes the literal early -- this is what lets `"a \" /* b"` still
 /// find its real closing quote instead of the escaped one.
 ///
-/// Review round 3, finding 3: for a single quote (`'`) specifically, this
-/// now folds the closing-quote search and the [`BLOCK_DELIMITERS`]
-/// opener search into one forward pass, and only reports a close when it is
-/// found BEFORE any block opener. `'` almost never opens a genuine
-/// multi-character string in the languages this heuristic cares about --
-/// it is a Rust lifetime (`'a`) or a one-character literal (`'a'`, `'\n'`)
-/// -- so the earlier version, which searched only for the closing quote,
-/// let a stray lifetime tick pair with an unrelated LATER apostrophe (an
-/// English contraction like "can't" inside real prose) with a genuine `/*`
-/// sitting in between; treating that whole span as string content skipped
-/// right over the `/*` and the block it should have opened never did.
-/// Once such an opener is seen first, the tick is not a literal at all: the
-/// caller's existing "no close on this line" fallback already treats it as
-/// plain text and lets the normal per-character scan reach -- and open --
-/// the real block opener on its own.
-///
-/// A double quote (`"`) keeps the old, opener-blind search: a `"..."`
-/// string is unambiguous in these languages, and a real one routinely
-/// contains a `/*`-shaped substring (documentation, examples) that must
-/// stay inert -- see `added_definitions_ignores_delimiters_inside_strings_
-/// and_comments`'s own `"see /* usage"` case.
+/// For single quotes, a block opener before the close wins: a Rust lifetime
+/// tick must not hide a later comment. Double-quoted strings may contain
+/// inert `/*` text, so their close search ignores block openers (#39).
 fn find_closing_quote(chars: &[char], start: usize, quote: char) -> Option<usize> {
     let mut i = start;
     while i < chars.len() {
@@ -623,9 +596,8 @@ impl Scan<'_> {
         let Some(path) = repo_relative(self.repo, file) else {
             return Ok(());
         };
-        // Review round 2, finding 3: the same block/docstring tracker the
-        // payload side runs, so prose is not evidence that a definition
-        // already exists here either. Per file, by construction.
+        // Ignore block comments and docstrings in each file; prose cannot
+        // prove that a definition already exists (#39).
         let mut blocks = BlockState::default();
         for (number, line) in text.lines().enumerate() {
             if blocks.admits(line) {

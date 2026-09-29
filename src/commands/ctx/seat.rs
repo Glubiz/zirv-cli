@@ -888,14 +888,8 @@ pub(crate) fn seat_identity_from_env_values(
     Some((short, generation))
 }
 
-/// Issue #543: [`super::adapters::SESSION_ENV`]/[`GENERATION_ENV`] read
-/// straight from this process's own environment and resolved into the same
-/// (short, generation) pair [`guard_from_env`] already reads -- so a
-/// `permit::acquire_writer` caller that used to pass `None` unconditionally
-/// (getting `guard_from_env`'s supersession-only verdict, which lets an
-/// uncommitted generation's writer lease through) can instead build a
-/// strict [`super::permit::SeatFence`] from it. `None` when there is nothing
-/// to fence against, same as `guard_from_env`.
+/// Reads this process's seat identity for a strict writer fence; an
+/// uncommitted generation must not receive a writer lease (#543).
 pub fn env_seat_identity() -> Option<(String, u64)> {
     seat_identity_from_env_values(
         std::env::var(super::adapters::SESSION_ENV).ok().as_deref(),

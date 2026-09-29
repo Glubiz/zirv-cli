@@ -79,23 +79,9 @@ pub fn posture_for(role: PromptRole) -> Posture {
     }
 }
 
-/// Applies `posture` to the CURRENT process, best-effort. Call it before the
-/// supervised child is spawned: a Windows priority class and a unix nice
-/// value are both inherited at creation time, so a call made after the spawn
-/// reaches the supervisor and nothing it launched.
-///
-/// The worker half is called from a process's own DISPATCH, never from the
-/// supervisor functions themselves: `ctx::dispatch` (for the `exec`, `loop`
-/// and `agent` verbs, which is also how `zirv agent ...` arrives) and `main`
-/// (for a script that has an `agent:` step). Every one of those supervisors
-/// is driven in-process by unit tests, and a test binary must never lower a
-/// process it does not own -- so a call inside `exec::run`/`run_loop::run`/
-/// `agent::run`/`run_supervised` would silently leave the whole serial test
-/// run at a below-normal class. The interactive half has no such hazard (it
-/// only raises a thread) and is called from the launch itself,
-/// `wrap::run_with`, where the role is already known.
-///
-/// Never fails the caller and never prints: see this module's contract.
+/// Apply before spawning: Windows priority and Unix nice are inherited.
+/// Lower worker priority only at dispatch, so in-process tests cannot lower
+/// their own runner. Best effort, silent, and never fails the caller.
 pub fn apply_process(posture: Posture) {
     match posture {
         // Deliberately NOT a process-class change. See `Posture::Interactive`.

@@ -34,11 +34,8 @@ use super::config::CtxConfig;
 use super::memory::{Entry, LoadedMemory, MemoryScope};
 use super::state::StateDir;
 
-/// One memory entry as input to ranking, tagged with scope and with
-/// verification staleness pre-computed in whole days (issue #35: this
-/// module reads no clock; the caller computes this from `now`, mirroring
-/// how `memory::render_for_prompt` computed age before issue #34 dropped
-/// it from rendering).
+/// Ranking input with scope and age supplied by the caller; this module
+/// reads no clock (#35).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetrievalCandidate {
     pub entry: Entry,

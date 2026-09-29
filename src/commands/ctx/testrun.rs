@@ -141,11 +141,8 @@ impl FamilyExtraction {
     }
 }
 
-// Argv recognition, factored out once `matches_known_family` (review finding
-// F4) needed the identical family-routing checks `extract`/`extract_streaming`
-// already used -- one source of truth for "does this argv claim to be a
-// `cargo test`/pytest/vitest/jest/go test run" rather than three copies that
-// could drift apart.
+// Share argv recognition across extractors so test-family routing cannot
+// drift between streaming and stored output (#413).
 fn is_cargo_family(lower: &str) -> bool {
     lower.contains("cargo test") || lower.contains("cargo-nextest") || lower.contains("nextest")
 }
@@ -159,15 +156,8 @@ fn is_go_test_family(lower: &str) -> bool {
     lower.contains("go test")
 }
 
-/// Review finding F4: the family extractors, run as a bounded streaming line
-/// scan over the FULL stored file at `path` rather than only the capped
-/// display tail (`output::MAX_FAILURE_OUTPUT_BYTES`) --
-/// a `pytest`/`vitest`/`jest`/`go test` failure earlier than the last ~16
-/// KiB of a chatty run must still be found. Memory stays bounded the same
-/// way [`workflow::verification::FailureNameScanner`] bounds its own
-/// full-stream cargo scan: at most [`MAX_FAMILY_FAILURES`] recovered
-/// failures are ever held at once, past which further ones are dropped and
-/// `truncated` is set, never a second unbounded accumulator.
+/// Scans the full stored file so early failures survive a capped display
+/// tail; holds at most [`MAX_FAMILY_FAILURES`] and marks overflow (#413).
 pub(crate) fn extract_streaming(command: &str, path: &std::path::Path) -> Option<FamilyExtraction> {
     let lower = command.to_ascii_lowercase();
     if is_cargo_family(&lower) {
@@ -187,13 +177,8 @@ pub(crate) fn extract_streaming(command: &str, path: &std::path::Path) -> Option
 
 /// Whether `command`'s argv identifies one of the test-runner families this
 /// module models, independent of whether that family's own markers were
-/// ever confirmed in its output. Review finding F4: lets
-/// `output::render_summary` refuse to call a run "clean" on ambiguous
-/// silence alone when the command itself claims to be a test run -- an
-/// unconfirmed family extraction (nothing recognisable, or a read error cut
-/// the scan short) is not the same thing as a confirmed green run, and must
-/// fall back to the ordinary head/tail summary instead of a false "ok (...)"
-/// one-liner.
+/// ever confirmed in its output. An unconfirmed test run cannot be called
+/// clean from silence alone (#413).
 pub(crate) fn matches_known_family(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     // `pytest --version`, `cargo nextest list`, `jest --help` name a runner

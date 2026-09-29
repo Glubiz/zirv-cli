@@ -64,17 +64,8 @@ pub(crate) enum ShapeKind {
 pub(crate) fn detect_shape(command: &str) -> Option<ShapeKind> {
     let segments = super::safety::normalize_segments(command);
 
-    // Verbatim wins outright over Shape, across EVERY candidate segment --
-    // mirrors `output::classify_compaction`'s own fix for the identical
-    // "first candidate is the whole unsplit string" pathology (a compound
-    // command's first `normalize_segments` candidate is the whole unsplit
-    // string, so a leading shape-eligible program could route before a
-    // later segment naming a real reader was ever inspected). In practice
-    // this never fires: `detect_shape` is only called once
-    // `classify_compaction` has already decided `Shape`, which already rules
-    // out any reader segment. Kept as defense in depth so a wrong shape
-    // choice can never silently drop a reader's content the way a wrong
-    // `Shape` classification would.
+    // Check every segment for a reader before choosing Shape, so compaction
+    // cannot hide content from a later verbatim segment (#414).
     for segment in &segments {
         let collapsed = super::safety::collapse_whitespace(segment);
         let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
@@ -156,13 +147,8 @@ pub(crate) struct SearchScan {
 pub(crate) fn scan_search(mut reader: impl BufRead) -> SearchScan {
     let mut scan = SearchScan::default();
     loop {
-        // `read_until` directly, never `BufRead::split`: its `Ok` count is
-        // the EXACT number of bytes consumed (delimiter included when one
-        // was found) -- mirrors `output::scan_for_display`'s fix for the
-        // same over-count (issue #410). `split(b'\n')` strips the delimiter
-        // from every chunk and unconditionally adding 1 back assumes one was
-        // always there, over-counting by a byte whenever the input's last
-        // chunk (or the whole input) has no trailing newline.
+        // `read_until` counts the delimiter only when present; `split` plus
+        // one would overcount a final line without a newline (#410).
         let mut raw = Vec::new();
         let n = match reader.read_until(b'\n', &mut raw) {
             Ok(n) => n,

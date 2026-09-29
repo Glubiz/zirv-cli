@@ -603,7 +603,7 @@ pub fn screen(text: &str) -> ScreenReport {
 /// difference whenever the two differ. Used by `score.rs`'s capped
 /// transcript-tail screening (issue #272 design item 1) and by every other
 /// screening surface that has resolved a repo-narrowed `[screen]` config
-/// (`config.rs`'s `ScreenConfig::thresholds`, review round 1) -- pass
+/// (`config.rs`'s `ScreenConfig::thresholds`) -- pass
 /// `text.len()` for `total_bytes` and `&Thresholds::default()` for
 /// `thresholds` to recover plain [`screen`]'s own behavior exactly.
 pub fn screen_with_thresholds(

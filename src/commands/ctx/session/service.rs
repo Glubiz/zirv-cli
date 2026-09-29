@@ -83,12 +83,8 @@ pub fn claim_for(
 /// `<state>/runtime/<name>.shutdown` -- the file `zirv session stop --runtime`
 /// drops and the serve loop notices.
 ///
-/// A file rather than a protocol method on purpose: protocol v1 is frozen (see
-/// `api::wire::METHODS`), and inventing a private `server.shutdown` frame for
-/// one CLI verb is exactly the "split the daemon through private messages"
-/// shape issue #352 rules out. The file is written into the same owner-only
-/// state directory the endpoint itself lives in, so whoever can request a
-/// shutdown could already connect and stop every session individually.
+/// Protocol v1 is frozen, so shutdown uses an owner-only state file instead
+/// of a private wire method (#352).
 pub fn shutdown_path(state: &StateDir, name: &str) -> PathBuf {
     namespace::runtime_dir(state).join(format!("{}.shutdown", state::provider_slug(name)))
 }
@@ -371,10 +367,8 @@ impl RuntimeService {
     /// instead of sleeping.
     pub fn tick(&self, heartbeat: bool) {
         self.host.pump();
-        // Issue #489 (issue #352's mail-injection residual): the service
-        // delivers mail to its OWN sessions, attached or not. On the
-        // heartbeat rather than every 25 ms pump, because a mailbox scan is a
-        // directory read and a queue nobody is watching is not a hot path.
+        // Deliver to attached and detached sessions on the heartbeat; a
+        // mailbox directory scan does not belong on each pump tick (#489).
         if heartbeat {
             self.deliver_mail();
         }

@@ -21,35 +21,10 @@ pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
         .map(|root| root.join(tail))
 }
 
-/// The canonical repository identity behind `workflow::engine::load_active`'s
-/// main-checkout fallback and [`sibling_checkouts`]: for a linked `git worktree add` checkout (its
-/// own gitdir differs from the shared common dir) this is the common dir's
-/// own parent -- the main checkout's working-tree root, since every
-/// worktree's `--git-common-dir` resolves back to that main checkout's
-/// `.git` directory -- and `path` itself, canonicalized, for everything else
-/// (a main checkout, a bare repository, or anywhere `git` does not resolve
-/// at all: no `git` on `PATH`, or not a repository).
-///
-/// Deliberately NOT wired into `state::repo_slug` itself (issue #467
-/// review): most `repo_slug` consumers must stay keyed by the literal
-/// checkout a process is actually in, never merged across worktrees --
-/// `workflow::engine::load_active` (main-checkout fallback) and
-/// `sibling_checkouts` are the two call sites this is reserved for.
-///
-/// A relocated main-checkout `.git` (`git init --separate-git-dir=...`)
-/// breaks the "common dir's parent is the main checkout" assumption -- a
-/// known, accepted limitation (see the accompanying design note), not
-/// attempted here.
-///
-/// Memoized per canonical path with no invalidation for the life of the
-/// process: resolving this shells out to `git`, and `load_active` runs from
-/// a hook that fires once per agent turn, so paying that cost
-/// more than once per path per process would be wasteful. Safe only because
-/// both consumers ask a question ("is this the
-/// same repository as that one") that cannot change out from under a single
-/// process, and neither runs as a long-lived daemon that would accumulate
-/// entries for many unrelated repositories over time -- a future caller with
-/// either property must not reuse this cache uncritically.
+/// Maps a linked worktree to the main checkout through the common git dir;
+/// other paths use their canonical identity. Keep checkout-specific state
+/// keyed to the literal path. A separate git dir breaks this mapping.
+/// Cache only for short-lived callers whose repository cannot move (#467).
 pub(crate) fn worktree_identity(path: &Path) -> PathBuf {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());

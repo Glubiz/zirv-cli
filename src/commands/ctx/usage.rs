@@ -443,32 +443,16 @@ pub fn run_with<W: Write>(
                 now,
                 cfg.pace.collector_max_age_secs,
             );
-            // Gated on `pace.enabled` (review finding): pacing disabled means
-            // zirv makes no proactive vendor request on this operator's
-            // behalf -- `ZIRV_CTX_PACE=false` must not still send an OAuth
-            // token to a usage endpoint. Passive sources above still refresh;
-            // only the active poll is withheld. The gate paths need no such
-            // check here because `wait_for_window` already returns before its
-            // own `refresh_sources` when pacing is off.
+            // With pacing disabled, refresh passive sources only; do not
+            // contact a provider endpoint on the operator's behalf (#225).
             let poll_reading = if cfg.pace.enabled {
                 poll::maybe_poll(&state, &cfg.pace, now, provider, &http_poller)
             } else {
                 None
             };
 
-            // Check whether anything has been recorded for this provider,
-            // now that the refresh above has had its chance to acquire some.
-            //
-            // Item 4 (review): a fresh claude machine has no usage source
-            // either -- there is no active poll for anthropic, only the
-            // statusline tee, and it has never run yet. The generic
-            // "<provider>: no usage source" line used to be printed for
-            // every provider alike here, which made `report`'s "not
-            // reported ... wire your statusline through `zirv ctx usage
-            // tee`" guidance unreachable exactly where it used to help.
-            // Anthropic alone falls through to the old, richer report;
-            // every other provider (no collector, no guidance to give)
-            // keeps the plain line.
+            // Claude may have no reading before its passive statusline tee
+            // runs; let the richer report explain how to enable it (#225).
             if window::has_no_usage_source(&state, provider)
                 && provider != window::LEGACY_USAGE_PROVIDER
             {

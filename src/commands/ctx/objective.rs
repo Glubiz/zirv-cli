@@ -191,10 +191,8 @@ pub fn layer_text(record: &Objective) -> String {
         text.push('\n');
         text.push_str(WRAP_UP_INSTRUCTION);
     }
-    // Issue #314: a red (or skipped-as-still-red) gate's own failure detail,
-    // set by `run_loop`'s gate check and cleared the next time a gate comes
-    // back green -- injected the same way the wrap-up instruction above is,
-    // volatile rather than part of the record's own long-lived shape.
+    // Inject pending gate failure detail until the gate passes; this note is
+    // volatile rather than part of the durable objective (#314).
     if let Some(note) = &record.pending_note {
         text.push('\n');
         text.push_str(note);
@@ -258,11 +256,8 @@ pub fn run_set<W: Write>(
         evidence: Vec::new(),
     };
     store(state, &key, &record)?;
-    // Issue #485 (roadmap N16) item 7: setting an objective IS the operator
-    // steering. The coordinator's own durable record picks the new target up
-    // as a constraint the native coordinator reads (`objective_status`,
-    // `team_status`), and a previously stopped coordinator starts dispatching
-    // again -- a new objective is exactly the instruction to continue.
+    // A new objective is operator steering: the coordinator reads its durable
+    // constraint and resumes dispatch if stopped (#485).
     if let Err(error) = super::coordinator::update(state, repo, |graph| {
         graph.objective = Some(args.objective.clone());
         graph.steer(&args.objective, now);
@@ -351,13 +346,8 @@ pub fn record_completion(state: &StateDir, repo: &Path, evidence: Vec<String>) -
     Ok(true)
 }
 
-/// Review finding on issue #485: `run_set` and `record_completion` above
-/// both fold operator intent into the coordinator's durable graph as a
-/// best-effort side effect of the authoritative objective write, which must
-/// never fail or roll back because the graph could not be stored. A store
-/// failure must not vanish silently either, so it gets one decision-log
-/// line -- the same idiom `delegation::log_boundary`/`compile::
-/// log_truncation_decisions` use for their own best-effort writes.
+/// Logs a best-effort graph write failure without rolling back the
+/// authoritative objective write (#485).
 fn log_coordinator_store_error(
     state: &StateDir,
     key: &str,

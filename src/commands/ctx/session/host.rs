@@ -132,12 +132,8 @@ pub struct TopologyEntry {
 }
 
 impl TopologyEntry {
-    /// Issue #352's tier-2 honesty rule in one predicate: a session is
-    /// resumable only when there is a verified native conversation reference
-    /// to hand the harness. Everything else -- an arbitrary process the
-    /// operator happened to run under a pty, a harness with no resume flag --
-    /// is topology that can be RECREATED, never a process that survived, and
-    /// nothing in zirv may claim otherwise.
+    /// Only a verified conversation reference makes a session resumable;
+    /// other topology can be recreated but never claimed as surviving (#352).
     pub fn is_resumable(&self) -> bool {
         self.conversation
             .as_ref()
@@ -553,23 +549,8 @@ impl RuntimeHost {
         prune_ended(&mut sessions, self.ended_cap());
     }
 
-    /// Issue #489 (and issue #352's mail-injection residual): delivers mail to
-    /// the runtime's own sessions, whether or not anybody is attached.
-    ///
-    /// Before this, mail ADDRESSING worked headless (the service files the
-    /// registry record, so a sender could always reach a detached session) but
-    /// the dashboard was still what typed a delivered message into a pane --
-    /// so a detached session accumulated mail in its queue and only saw it
-    /// when a client attached. The service owns the terminal, so the service
-    /// is what should type into it, and it does so through the dashboard's own
-    /// sweep (`dash::sweep_one_pane` for a worker's body delivery,
-    /// `dash::advise_one_pane` for an orchestrator seat's one-line advisory)
-    /// rather than a second delivery path with its own trust framing, its own
-    /// caps and its own consumption rules.
-    ///
-    /// The idle gate is the same one a pane applies: a session with a turn in
-    /// flight, or one already carrying an unsubmitted injection, is left alone
-    /// until the next tick.
+    /// Delivers mail to attached or detached sessions through the dashboard's
+    /// framing and caps. Waits for an idle turn with no pending submit (#489).
     pub fn deliver_mail(
         &self,
         cfg: &super::super::config::CtxConfig,
@@ -689,14 +670,8 @@ impl RuntimeHost {
             }
         });
 
-        // The registry half, lifted from `dash::pane::Pane::spawn` rather
-        // than reinvented: the same socket, the same published path, the same
-        // record with the CHILD's pid and start time (not the supervisor's,
-        // or every liveness probe compares the wrong process). The difference
-        // that matters for issue #352 is only whose process holds the guard --
-        // the service's, so detaching every client leaves the registry entry,
-        // and therefore pacing, budgets, rot, mail and permits, exactly where
-        // they were.
+        // Record the child's pid and start time for liveness probes. The
+        // service holds the guard so client detach cannot end the session (#352).
         let signal = signal::SignalServer::bind(&self.state.socket_for(&spec.session_id)).ok();
         if let Some(server) = &signal {
             wrap::publish_socket_path(&self.state, &spec.session_id, server.path());

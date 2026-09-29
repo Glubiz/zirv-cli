@@ -323,9 +323,7 @@ fn recent_rot_verdicts(state: &StateDir, session: Option<&str>, limit: usize) ->
 /// Safety-decision counts by verdict, and by `matched_pattern`, over
 /// `decisions.jsonl`'s own `safety-decisions/` bucket (issue #147's
 /// `log::read_safety_decisions`), optionally filtered to one session.
-/// Takes already-read `records` rather than reading them: this and
-/// [`latest_attestation`] each used to re-read every day bucket, which on
-/// one real machine was 248 ms of a 446 ms `zirv ctx snapshot`.
+/// Reuses the caller's records so each day bucket is read only once (#147).
 fn safety_decision_counts(records: &[log::SafetyDecisionRecord], session: Option<&str>) -> String {
     let mut records = records.to_vec();
     if let Some(session) = session {

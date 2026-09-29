@@ -297,12 +297,8 @@ pub(crate) fn render_diff_summary(
     body.push_str(&retrieval);
     body.push('\n');
     debug_assert!(body.len() <= max_bytes);
-    // Review finding F2: same never-worse guard as `output::render_summary`
-    // (#410) and `output_shape::render_json_summary` -- a repo-lowered
-    // `diff_max_bytes` can make the per-file listing itself larger than the
-    // raw diff it replaces (e.g. a single small hunk vs. a multi-line
-    // listing plus totals plus the retrieval line). A summary that grew is
-    // not compression.
+    // A low `diff_max_bytes` can make the listing larger than the raw diff;
+    // only replace output when the summary shrinks it (#410).
     if body.len() >= scan.total_bytes as usize {
         return None;
     }

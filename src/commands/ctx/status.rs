@@ -1942,28 +1942,9 @@ fn render_report<W: Write>(
         )?;
     }
 
-    // Third surface, same fix as `usage.rs`'s no-subcommand branch and
-    // `wrap.rs`'s status bar: the machine-wide `window::load` used to show
-    // whichever provider's numbers happened to be on disk regardless of
-    // which adapter this repo is actually configured for, so a codex-only
-    // repo could show a stale claude session's Anthropic percentages as if
-    // they were its own.
-    //
-    // Low 5: `provider` is derived from the *configured* agent, same as
-    // `usage.rs`, rather than from a successful `adapters::select` -- a
-    // repo-disabled or unready adapter used to make this whole line vanish
-    // silently (`select(...).ok()` collapsing straight to `None`), so
-    // `zirv ctx usage` and `zirv ctx status` could disagree about whether a
-    // usage line existed at all for the exact same repo. A config-load
-    // failure still omits the line: that failure already has its own
-    // `chat: unavailable (...)` line above, and there is no `cfg.agent` to
-    // read a name from at all in that case.
-    //
-    // Final wave item 4: `adapters::provider_for_usage_readout` (not the
-    // bare `provider_for_agent_name`) so an *unset* `agent` with an
-    // operator-disabled claude reports codex's own provider -- what
-    // `resolve_default`'s own fallback loop would actually select --
-    // rather than guessing the legacy default.
+    // Attribute usage to the configured or resolved default provider, even
+    // when its adapter is unavailable. A config-load failure has its own
+    // status line and supplies no provider name (#358).
     let provider = cfg_result
         .as_ref()
         .ok()
@@ -2626,11 +2607,8 @@ pub fn run_with<W: Write>(
     if args.json {
         return render_pool_json(w, repo, env);
     }
-    // Issue #326: `--full` overrides `--brief`/`--diff` back to their
-    // pre-#326 off state, regardless of the (now default-true) values those
-    // two carry -- one place to shadow `args`, so every read site below
-    // (already written against `args.brief`/`args.diff`) needs no change of
-    // its own.
+    // `--full` disables the default brief and diff views at one shared
+    // `args` binding (#326).
     let full_args;
     let args = if args.full {
         full_args = StatusArgs {

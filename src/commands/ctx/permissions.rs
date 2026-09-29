@@ -180,15 +180,8 @@ fn family_depth(program: &str) -> usize {
         // family `"uv run"` -- distinct from `uv sync`/`uv add`/`uv pip`,
         // which are not arbitrary-code executors and stay compileable.
         //
-        // Review round 2 (2026-08-28, issue #178): `glab` joins `gh` here --
-        // both are subcommand-based CLIs with the identical stable two-token
-        // shape (`gh pr create` / `glab mr create`). Without this, `glab`
-        // fell to the `_ => 1` default, collapsing EVERY glab invocation to
-        // the single-token family `"glab"` -- which made
-        // `is_family_too_generic` wrongly flag every `glab mr`/`glab issue`
-        // collaboration command as "too generic" in `permissions::propose`'s
-        // classifier, even though `collaboration_triple` already establishes
-        // exact `(program, resource, verb)` specificity independently.
+        // `glab` needs the same two-token family depth as `gh` so its
+        // collaboration commands are classified precisely (#178).
         "git" | "gh" | "glab" | "cargo" | "npm" | "docker" | "kubectl" | "npx" | "pnpm"
         | "yarn" | "uv" => 2,
         _ => 1,
@@ -432,12 +425,8 @@ pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
         .filter(|t| !t.is_empty())
         .map(str::to_ascii_lowercase)
         .collect();
-    // Review round 1 (2026-08-26): matches a bare flag OR that same flag
-    // carrying an `=`-joined value (`--force-with-lease=origin/main`) --
-    // `has("--force-with-lease")` used to check exact token equality only,
-    // so the `=`-joined spelling escaped every arm below that checks for it.
-    // Fixed once, here, rather than per call site, so every existing and
-    // future `has(...)` check gets the fix automatically.
+    // Match both bare flags and `=`-joined values so protected options
+    // cannot bypass the checks below (#178).
     let has = |word: &str| {
         tokens
             .iter()
@@ -521,14 +510,8 @@ pub(crate) fn is_protected_family(family: &str, sample: &str) -> bool {
         // see `api_call_is_mutating`'s own doc comment. A bare read
         // (`gh api repos/x/y`, an implicit GET) stays compileable.
         //
-        // Review round 3 (2026-08-28): `glab api` joins it here. Without
-        // this arm, `family_depth("glab") == 2` (added in review round 2 to
-        // fix `glab mr`/`glab issue` families) made `"glab api"` a
-        // REACHABLE two-token family with no protection arm at all -- a
-        // mutating `glab api -X DELETE ...`/`glab api -X POST -f ...` would
-        // fall through to `_ => false` and could be auto-written into
-        // `[safety] allow` by `zirv ctx permissions compile`, directly
-        // contradicting "arbitrary API calls stay gated."
+        // Protect mutating `glab api` calls; its two-token family must not
+        // fall through to an allow recommendation (#178).
         "gh api" | "glab api" => api_call_is_mutating(&tokens),
         _ => false,
     };
@@ -1077,14 +1060,8 @@ pub(crate) fn group_requests(requests: &[PermissionRequest]) -> Vec<FamilyGroup>
 /// Runs the extractor for `agent` over every transcript file in `files`,
 /// tagging each request with its file stem as the session id.
 pub fn audit_report(agent: AuditAgent, files: &[PathBuf]) -> AuditReport {
-    // Issue #147: read once per call, not once per transcript file --
-    // `extract_claude_requests` takes the slice rather than reading it
-    // itself, keeping that function a pure fold over its two inputs. A
-    // resolution failure (no state dir, e.g. `ZIRV_CTX_STATE_DIR` unset on
-    // a machine with no platform state dir) degrades to an empty slice:
-    // every claude request then falls back to its pre-#147 cause wording,
-    // exactly the graceful-degradation contract `correlate_safety_decision`
-    // callers already rely on.
+    // Read decisions once per call and pass them into the pure extractor.
+    // Without a state dir, use an empty slice and preserve fallback wording (#147).
     let log_records: Vec<SafetyDecisionRecord> = if matches!(agent, AuditAgent::Claude) {
         super::state::StateDir::resolve(&super::config::env_from_process())
             .map(|state| log::read_safety_decisions(&state))
@@ -3084,11 +3061,8 @@ fn run_propose_with<W: Write>(
     let mut all_records = existing;
     all_records.extend(newly_recorded);
 
-    // Review round 2 (2026-08-28) fix 2: guidance for every captured-but-
-    // excluded family, printed unconditionally -- even a run that ends up
-    // proposing nothing new still tells the operator WHY, and toward what,
-    // rather than a bare "nothing to propose." Never gated on `--dry-run`:
-    // it names no machine-specific detail to preview away.
+    // Explain every excluded family, even when nothing is proposed. This
+    // guidance does not depend on `--dry-run` (#178).
     let excluded = group_excluded_evidence(&all_records);
     render_excluded_guidance(w, &excluded)?;
 
@@ -3101,14 +3075,8 @@ fn run_propose_with<W: Write>(
         return Ok(0);
     }
 
-    // Review round 2 (2026-08-28) fix 1: a family whose evidence is BYTE-
-    // FOR-BYTE identical to what was already reported (the persisted
-    // watermark) needs no new comment -- re-running `propose` over an
-    // overlapping transcript window must never re-comment identical
-    // evidence onto a public issue. Only a family with new/changed evidence
-    // is "actionable"; `previous` (when `Some`) is what makes the follow-up
-    // comment body delta-marked rather than a silent repeat of the running
-    // total.
+    // The persisted watermark suppresses identical evidence on overlapping
+    // runs; only changed evidence merits a follow-up comment (#178).
     let already_reported = read_reported_evidence(state);
     let mut newly_reported = already_reported.clone();
     let mut actionable: Vec<(&ProposalEvidence, Option<ReportedEvidence>)> = Vec::new();

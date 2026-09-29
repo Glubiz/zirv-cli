@@ -116,24 +116,8 @@ pub enum Trust {
     RepoUntrusted,
 }
 
-/// One context/instruction surface: provenance plus enough metadata for
-/// analysis to reason about it without re-deriving trust by hand.
-///
-/// Deliberately holds no content: `path` plus `provider`/`kind`/`scope` is
-/// provenance, not the surface's text, which callers already have from their
-/// own read (`surface_collect::Surface::text`, for instance) and cap independently.
-///
-/// Constructed only through `for_path` (which derives `Global` vs. repo-owned
-/// from the path itself, not from a caller-supplied flag) and the two
-/// refinement methods below, which can only move `scope` among the
-/// repo-owned variants. There is deliberately no general constructor that
-/// takes a free-standing `Scope` alongside an unrelated `path`: a prior
-/// version of this type did, and `ContextSurface::new(Provider::Claude,
-/// Kind::Instructions, Scope::Global, repo.join("CLAUDE.md"))` would have
-/// minted `Trust::Operator` for a repo-controlled path despite this module's
-/// own claim that such a promotion is impossible by construction. Closing
-/// that required removing the free parameter, not just documenting against
-/// using it.
+/// Context provenance without content. Construction derives scope from path;
+/// callers cannot label a repo-owned path as operator-trusted (#40).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSurface {
     provider: Provider,
@@ -143,23 +127,8 @@ pub struct ContextSurface {
 }
 
 impl ContextSurface {
-    /// The classifier every real collector should use. `scope` starts as
-    /// `Global` or `Repo` purely from whether `path` sits inside `repo` --
-    /// the one distinction that is actually trust-relevant (`Scope::trust`
-    /// only distinguishes `Global` from everything else). A caller with more
-    /// specific provenance than "this path is inside the repo checkout"
-    /// (found via nested/bounded discovery, or known to be a
-    /// personal/uncommitted override) refines the result with
-    /// `into_nested()`/`into_local_private()` below, which can only move `scope`
-    /// among the repo-owned variants -- never back to `Global`, and never set
-    /// independently of this classification. This is what makes a
-    /// repo-owned path minting `Trust::Operator` unreachable through the
-    /// public API, not merely discouraged by convention. The same now holds
-    /// for a path that is neither repo-owned nor verifiably under the given
-    /// `home`: `Global` is minted only on a positive match against `home`,
-    /// never merely because `path` failed the repo check (see this
-    /// function's own fix note -- an earlier version defaulted every such
-    /// path straight to `Global`).
+    /// Classifies a path as Global only with positive evidence it is under
+    /// the operator's home. Refinements may only narrow repo-owned scope (#40).
     pub fn for_path(
         provider: Provider,
         kind: Kind,
@@ -167,17 +136,8 @@ impl ContextSurface {
         repo: &Path,
         home: Option<&Path>,
     ) -> Self {
-        // `Global` is only ever minted when it can be positively verified --
-        // `home` given, and `path` actually under it. A path this function
-        // cannot place under either the repo or a known home (including
-        // every call where the caller does not know `home` at all, `home:
-        // None`) falls back to `Repo`/`RepoUntrusted` rather than `Global`:
-        // erring toward untrusted is safe (analysis still reads the file),
-        // erring toward `Operator` is not. An earlier version of this
-        // function defaulted anything outside the repo straight to
-        // `Global`, which minted `Trust::Operator` for a path it had no
-        // actual evidence was the operator's home -- fail-open on the one
-        // axis this module exists to protect.
+        // Grant Global trust only when the path is verified under the operator's
+        // home; unknown paths stay repo-untrusted by default (#40).
         let scope = if path.starts_with(repo) {
             Scope::Repo
         } else if home.is_some_and(|home| path.starts_with(home)) {

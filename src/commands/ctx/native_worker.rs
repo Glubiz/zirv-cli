@@ -224,11 +224,8 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
         Some(child_envelope.principal.clone()),
     );
 
-    // Issue #554: a reservation of ZERO reserved nothing -- a worker with no
-    // explicit `--budget-tokens` took its capacity without ever holding any.
-    // The estimate falls back to the loop's own output ceiling, which is the
-    // only number this seam has before the run, and the settlement below
-    // replaces it with the truth.
+    // Reserve the loop's output ceiling when no explicit budget is set;
+    // zero would hold no capacity. Settlement uses actual usage (#554).
     let reserved_estimate = worker_budget
         .tokens
         .unwrap_or_else(|| NativeLimits::default().max_output_tokens);
@@ -252,19 +249,9 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let tree =
         std::fs::canonicalize(&request.launch_repo).unwrap_or_else(|_| request.launch_repo.clone());
     let writer_permit = if args.mode == WorkerMode::Writing {
-        // Issue #543: this process's own seat identity (if any), read the
-        // same way `seat::guard_from_env` does, but fed into the STRICT
-        // `seat::guard` verdict via an explicit `SeatFence` -- an uncommitted
-        // successor delegating a writing worker must not hand that worker a
-        // lease before its own rollover commits, which `guard_from_env`'s
-        // supersession-only check let through. This is NOT the delegated
-        // worker's own future seat: `child_short`'s eventual native session
-        // seat is still created later inside `runtime::native::run_session`
-        // under a fresh identity, and pre-registering one here remains wrong
-        // for the reason PR #535 already gave (an orphaned record `seat::
-        // register`'s hardcoded `RuntimeKind::Harness` couldn't even stand in
-        // for correctly) -- see issue #543's own tracking comment for closing
-        // that separate gap.
+        // Check this process's seat with the strict verdict before granting
+        // a writing worker a lease; an uncommitted successor has no authority.
+        // The worker's own native seat is registered by its runtime (#543).
         let identity = super::seat::env_seat_identity();
         let fence = identity
             .as_ref()
@@ -413,14 +400,8 @@ pub(crate) fn run<W: Write>(request: Request<'_>, w: &mut W, env: EnvLookup<'_>)
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            // Issue #554 (integration review): "the worker never ran" is only
-            // true for a LAUNCH failure. A loop that aborted after billing
-            // real turns carries what it spent (`AbortedRun`), and those
-            // tokens are spent whatever happens next -- so they settle here,
-            // with this delegation's own identity, before anything is torn
-            // down. `delegation::close` below would otherwise merely release
-            // the estimate and the real spend would vanish from
-            // `zirv ctx spend`.
+            // Settle billed turns from an aborted run before closing the
+            // delegation; close only releases the estimate (#554).
             if let Some(aborted) = error.downcast_ref::<super::runtime::native::AbortedRun>() {
                 native_account::settle_native_run(
                     state,

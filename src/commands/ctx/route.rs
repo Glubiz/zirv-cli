@@ -669,10 +669,8 @@ pub fn offers_from_config(config: &super::provider::config::NativeConfig) -> Vec
 /// Which scope a provider failure is evidence about, and whether it is
 /// evidence for the health breaker at all.
 ///
-/// This is item 4 of #487, and the whole reason it is a type: folding all of
-/// these into one per-route breaker meant one wrong API key disabled an
-/// account's other models, one over-long prompt looked like an outage, and a
-/// model that simply declined to answer counted as a failure.
+/// Failure scope prevents one route's refusal or invalid request from
+/// tripping unrelated models and accounts (#487).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "kebab-case")]
 pub enum FailureRouting {
