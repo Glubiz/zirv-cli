@@ -1034,6 +1034,13 @@ pub(crate) fn ask(
         ));
     }
 
+    // Checked before choosing relay or direct: a live relay would otherwise send it from a non-test process.
+    #[cfg(test)]
+    if !is_loopback_url(&cfg.base_url) {
+        return Err(JevError::Transport(
+            "tests may only reach a loopback Jev endpoint".to_string(),
+        ));
+    }
     // Wait out the relay for as long as a direct call could take: giving up sooner re-sends the
     // request directly while the relay's copy is still in flight, a second live request.
     let relay_wait = Duration::from_secs(cfg.timeout_secs) + Duration::from_secs(3);
