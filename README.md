@@ -4384,11 +4384,14 @@ uses, `<state>/s/jev-<hash-of-session-id>` — a sibling of that command's own
 SESSION`, to reuse the supervisor's warm connection instead of paying a
 fresh TCP+TLS handshake. The client never sends its credential over that
 socket — the relay forwards with its own `[proxy.typesafe]` credential — and
-falls straight through to a normal direct call whenever there is no relay to
-dial, the relay times out, or it reports its own failure; caching, decision
-recording and error mapping are identical either way. A relay is always an
-optimisation: it is never required, and its absence never changes an answer,
-only how fast it arrives.
+falls straight through to a normal direct call only when there is no relay to
+dial or the request cannot be handed to it. Once the relay has the request,
+the client waits up to `timeout_secs` plus 3 seconds for its answer and never
+re-sends it directly: a relay timeout, error or lost answer is recorded as a
+fallback and the deterministic path runs, so one decision is never billed
+twice. Caching, decision recording and error mapping are identical either
+way. A relay is always an optimisation: it is never required, and its absence
+never changes an answer, only how fast it arrives.
 
 Jev requests now accept only a bounded numeric metadata envelope with static
 questions. The shared client rejects text, paths, diffs, secrets, dynamic
