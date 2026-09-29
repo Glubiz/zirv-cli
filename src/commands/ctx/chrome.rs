@@ -447,8 +447,8 @@ fn banner_box(facts: &BannerFacts, colour: bool, cols: u16) -> String {
         .map(|segs| plain_width_of(segs))
         .max()
         .unwrap_or(0);
-    let box_width = (cols as usize).min(widest + 4).max(BANNER_BOX_MIN_WIDTH);
-    let avail = box_width.saturating_sub(4);
+    let box_width = (cols as usize).min(widest + 6).max(BANNER_BOX_MIN_WIDTH);
+    let avail = box_width.saturating_sub(6);
 
     let mut out = String::new();
     out.push_str(&banner_box_top(box_width, colour));
@@ -456,7 +456,7 @@ fn banner_box(facts: &BannerFacts, colour: bool, cols: u16) -> String {
         out.push('\n');
         out.push_str(&paint_seg("│  ", Paint::CyanDim, colour));
         out.push_str(&render_line(segs, avail, colour, true, true));
-        out.push_str(&paint_seg("│", Paint::CyanDim, colour));
+        out.push_str(&paint_seg("  │", Paint::CyanDim, colour));
     }
     out.push('\n');
     out.push_str(&banner_box_bottom(box_width, colour));
@@ -1113,6 +1113,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_box_tier_pads_the_widest_line_two_columns_from_each_border() {
+        let text = banner(&facts(), false, true, Some(120));
+        let lines: Vec<&str> = text.lines().collect();
+        let top_width = style::display_width(lines[0]);
+        assert!(
+            lines.iter().all(|l| style::display_width(l) == top_width),
+            "every row has the same display width: {text}"
+        );
+        let rows = &lines[1..lines.len() - 1];
+        assert!(
+            rows.iter().any(|l| {
+                let body = l.trim_end_matches('\u{2502}');
+                body.ends_with("  ") && !body.ends_with("   ")
+            }),
+            "the widest line has exactly 2 spaces before the right border: {text}"
+        );
     }
 
     #[test]
