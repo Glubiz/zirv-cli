@@ -561,7 +561,7 @@ fn run_native_chat<E: Write>(
     // Run native intake after runtime/flag/TTY refusals and before pane creation, sharing the wrapped path's guards (#537).
     // Known before intake so its Jev call is attributed to the session this launch will use.
     let session = uuid::Uuid::new_v4().to_string();
-    super::jev::adopt_session(&[(adapters::SESSION_ENV.to_string(), session.clone())]);
+    super::jev::adopt_session_id(&session);
     let intake = proxy_intake(cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;
@@ -689,7 +689,7 @@ pub fn run_with<W: Write, E: Write>(
     // Resolve intake before adapter selection or dashboard/wrap launch (#537).
     // Known before intake so its Jev call is attributed to the session this launch will use.
     let session = SessionId::new_v4();
-    super::jev::adopt_session(&[(adapters::SESSION_ENV.to_string(), session.to_string())]);
+    super::jev::adopt_session_id(session.as_str());
     let intake = proxy_intake(&cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;

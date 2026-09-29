@@ -924,9 +924,8 @@ fn shared_agent() -> &'static ureq::Agent {
 
 #[cfg(test)]
 fn is_loopback_url(url: &str) -> bool {
-    let host = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host = host.split(['/', ':']).next().unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost")
+    let host = crate::commands::ctx::health::dependency_from_base_url(url).unwrap_or_default();
+    matches!(host.split(':').next(), Some("127.0.0.1" | "localhost"))
 }
 
 /// Posts one already-encoded Jev request body to `{base_url}/systemone`
@@ -1043,7 +1042,7 @@ pub(crate) fn ask(
     }
     // Wait out the relay for as long as a direct call could take: giving up sooner re-sends the
     // request directly while the relay's copy is still in flight, a second live request.
-    let relay_wait = Duration::from_secs(cfg.timeout_secs) + Duration::from_secs(3);
+    let relay_wait = Duration::from_secs(cfg.timeout_secs).saturating_add(Duration::from_secs(3));
     let body = match relay_send(state_dir, &payload, relay_wait) {
         Some(result) => result?,
         None => send_request(&cfg.base_url, &credential, cfg.timeout_secs, payload)?,
@@ -1117,14 +1116,18 @@ static PROCESS_SESSION: Mutex<Option<String>> = Mutex::new(None);
 
 /// Remember the session in a supervisor's child env, replacing any earlier one (handover swaps it).
 pub(crate) fn adopt_session(turn_env: &[(String, String)]) {
-    let Some((_, session)) = turn_env
+    if let Some((_, session)) = turn_env
         .iter()
         .find(|(key, _)| key == adapters::SESSION_ENV)
-    else {
-        return;
-    };
+    {
+        adopt_session_id(session);
+    }
+}
+
+/// [`adopt_session`] for a caller that holds the id itself (exec/chat before any Jev call).
+pub(crate) fn adopt_session_id(session: &str) {
     if let Ok(mut current) = PROCESS_SESSION.lock() {
-        *current = Some(session.clone());
+        *current = Some(session.to_string());
     }
 }
 
@@ -2382,6 +2385,30 @@ pub(crate) mod tests {
             matches!(&result, Err(JevError::Transport(reason)) if reason.contains("loopback")),
             "got {result:?}"
         );
+    }
+
+    /// A loopback name in the userinfo must not make the real host look local.
+    #[test]
+    fn the_loopback_check_reads_the_host_not_the_userinfo() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/v1"));
+        assert!(is_loopback_url("http://localhost/v1"));
+        assert!(!is_loopback_url("https://127.0.0.1@api.typesafe.ai/v1"));
+        assert!(!is_loopback_url("https://localhost:80@api.typesafe.ai"));
+    }
+
+    /// An exec restart adopts a new session id; later calls must follow it.
+    #[test]
+    fn adopting_a_new_session_replaces_the_previous_one() {
+        unsafe {
+            std::env::remove_var(adapters::SESSION_ENV);
+        }
+        adopt_session_id("first-session");
+        adopt_session_id("second-session");
+        let (session, _) = session_and_principal();
+        if let Ok(mut current) = PROCESS_SESSION.lock() {
+            *current = None;
+        }
+        assert_eq!(session, "second-session");
     }
 
     /// A supervisor process never has `ZIRV_CTX_SESSION` itself (only its child does), so its own

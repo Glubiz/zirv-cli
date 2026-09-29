@@ -339,7 +339,7 @@ pub fn decide(
     } else {
         None
     };
-    // Every live Jev request leaves a decision row, like the other Jev sites; the spend row is `persist`'s.
+    // Every live Jev request leaves a decision row, like the other Jev sites; a success's spend row is `persist`'s.
     if let Some(call) = &typesafe_result {
         let wall_ms = model_call_started
             .elapsed()
@@ -363,17 +363,17 @@ pub fn decide(
                 );
             }
             Err(jev::JevError::UnsafeState) => {}
-            Err(error) => {
-                jev::record_decision_row(
-                    &intake_state,
-                    "intake",
-                    &Answers::new(),
-                    &no_usage,
-                    wall_ms,
-                    &[error.to_string()],
-                    false,
-                );
-            }
+            // Like `advise_detailed`, a failed call leaves a decision row and a zero-usage spend row.
+            Err(error) => jev::record(
+                &intake_state,
+                cfg,
+                "intake",
+                &Answers::new(),
+                &no_usage,
+                wall_ms,
+                &[error.to_string()],
+                false,
+            ),
         }
     }
     let typesafe_result =
@@ -909,6 +909,38 @@ mod tests {
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0]["site"], "intake");
         assert_eq!(rows[0]["cached"], false);
+        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
+        assert_eq!(spend.len(), 1, "exactly one spend row per live call");
+    }
+
+    /// A failed intake call is still a live request: one fallback decision row and one zero-usage
+    /// spend row, as `advise_detailed` writes.
+    #[test]
+    fn a_failed_intake_call_writes_one_fallback_row_and_one_spend_row() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.jev.intake_savings = true;
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_FAIL_ROW".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let (base_url, server) = jev::tests::one_shot_server(503, "unavailable");
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_FAIL_ROW", "test-key") };
+        decide(
+            &cfg,
+            state_tmp.path(),
+            repo.path(),
+            "change the service",
+            false,
+        );
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_FAIL_ROW") };
+        server.join().expect("one request");
+
+        let text = std::fs::read_to_string(state_tmp.path().join("jev-decisions.jsonl"))
+            .expect("jev-decisions.jsonl");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("503"), "the row carries the fallback: {text}");
         let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
         assert_eq!(spend.len(), 1, "exactly one spend row per live call");
     }

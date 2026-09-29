@@ -202,6 +202,8 @@ fn run_with_clock_inner<W: Write>(
         .or(resumed_session_id)
         .unwrap_or_else(|| SessionId::new_v4().to_string());
     let mut session = SessionId::parse(&session_raw);
+    // Before any Jev call (launch effort included) so its rows carry this session.
+    jev::adopt_session_id(session.as_str());
 
     // Deliver only to this stable registry address. Consume mail after a
     // successful spawn, never during pacing or before an attempted launch.
@@ -1122,6 +1124,7 @@ fn run_with_clock_inner<W: Write>(
                 &mut prior_tool_calls,
             );
             session = SessionId::new_v4();
+            jev::adopt_session_id(session.as_str());
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
             transcript_derived = true;
@@ -1624,6 +1627,7 @@ fn run_with_clock_inner<W: Write>(
                 &mut prior_tool_calls,
             );
             session = SessionId::new_v4();
+            jev::adopt_session_id(session.as_str());
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
             transcript_derived = true;
@@ -1916,6 +1920,7 @@ fn run_with_clock_inner<W: Write>(
         let objective_block =
             objective_layer_for_restart(&state, repo, now_fn(), agent::token_spend(&prior_usage));
         session = SessionId::new_v4();
+        jev::adopt_session_id(session.as_str());
         session_guard.refresh_session(session.as_str());
         // A fresh child needs its own transcript watcher.
         transcript = derive_transcript(&session);
