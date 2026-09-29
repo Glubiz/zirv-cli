@@ -193,11 +193,7 @@ pub(crate) fn display_line(raw: &str) -> String {
     format!("{} [...]", &trimmed[..cut])
 }
 
-/// How much a diagnostic line is allowed to cost. The distinction is the
-/// whole point of issue #326's review finding 3: a `warning:` is nice to
-/// have, a `fatal:`/`error:`/panic is the reason anyone reads the summary at
-/// all, and a summary that drops the second to make room for sixty of the
-/// first is worse than no summary.
+/// Bounds diagnostic lines while giving fatal errors priority over warnings (#326).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
     Failure,
@@ -450,20 +446,9 @@ pub(crate) fn render_summary(
     let budget = max_bytes.checked_sub(retrieval.len() + 1)?;
     let raw_bytes = scan.total_bytes as usize;
 
-    // Issue #409b: nothing flagged at all -- no failure/warning block, no
-    // test-runner summary line, no named failing test -- and an exit code
-    // that is either a clean `0` or altogether absent (the `PostToolUse`
-    // path: claude's own tool result carries no status of its own, so "no
-    // diagnostic of any kind" is the only signal available there). A clean
-    // run costs one line instead of a head, a tail and a retrieval line.
-    // Never on a non-zero exit code: a scanner false negative must not hide
-    // a real failure behind "nothing flagged". Review finding F4: nor when
-    // the command itself claims to be a `cargo test`/pytest/vitest/jest/go
-    // test run and no family extraction confirmed anything -- "nothing
-    // flagged" here would already have to be a confirmed green marker to
-    // reach this point (a confirmed family always pushes its own summary
-    // line into `scan.summaries`, which is required empty above), so silence
-    // from an argv that claims to be a test run is ambiguity, not a pass.
+    // A one-line clean result requires no diagnostic and a clean or absent
+    // status. Nonzero exits and unconfirmed test runs are ambiguous, never
+    // silently called clean (#409b, #413).
     let clean = !scan.read_error
         && scan.failures.is_empty()
         && scan.warnings.is_empty()
@@ -575,13 +560,8 @@ pub(crate) fn render_summary(
             shaped_head,
         );
         if body.len() + head.len() <= budget {
-            // The head goes ABOVE the tail when both are shown, so the
-            // summary still reads in the order the output was produced.
-            // Review finding 3: that subtraction is only valid when the tail
-            // was actually appended above -- when it did not fit the budget
-            // (`tail_pushed` false), `body` carries none of `optional`'s
-            // bytes at all, and subtracting its length spliced the head
-            // somewhere inside the mandatory block instead of after it.
+            // Keep output order. Subtract tail bytes only when they were
+            // appended; otherwise the head must follow the mandatory block.
             let tail_at = if tail_pushed {
                 body.len() - optional.len().min(body.len())
             } else {
@@ -943,10 +923,8 @@ pub(crate) fn classify_compaction(
     if let Some(scope) = classes.iter().find_map(|class| class.scope) {
         return scope;
     }
-    // Review finding 5 (unchanged): OR'd across every segment/candidate,
-    // never assigned outright -- an unrecognised git subcommand in one
-    // candidate must never erase a `Known` match an earlier segment already
-    // established.
+    // Preserve a Known match across all segments, even if a later candidate
+    // has an unrecognised git subcommand (#412).
     if classes.iter().any(|class| class.known) {
         CompactionScope::Known
     } else {
@@ -1401,29 +1379,16 @@ pub(crate) fn summarize_stored(
     };
     scan.read_error |= read_errored;
 
-    // Issue #413: a known test family's own structural shape (a pytest
-    // `FAILED path::test - message` line, a jest/vitest bullet, a go
-    // `--- FAIL:` block) merges into the generic diagnostic blocks above with
-    // exact failing-test names and locations. Review finding F4: run as a
-    // bounded streaming scan over the FULL stored file (`extract_streaming`),
-    // never just the capped tail Pass 1 kept for display -- a failure earlier
-    // than the last `MAX_FAILURE_OUTPUT_BYTES` of a chatty run must still be
-    // found. Declines (leaving `scan.failures` untouched) for anything that
-    // is not a confirmed match, so an unrecognised producer or a compile
-    // error before any test ran still gets the generic scan's own answer.
+    // Scan the full stored file for confirmed test failures; the display tail
+    // may miss earlier failures. Unconfirmed families retain generic
+    // diagnostics (#413).
     if scope == CompactionScope::Known
         && let Some(family) = super::testrun::extract_streaming(&command.join(" "), path)
     {
         let family_blocks = family.failure_blocks();
         if !family_blocks.is_empty() {
-            // Review finding F3: a confirmed family extraction only MERGES
-            // with the generic scan's own diagnostic blocks -- family blocks
-            // first (the failing test names/locations this family
-            // recognises), then any generic block not already covered (e.g.
-            // an `error: linker command failed` block a test-family marker
-            // has nothing to do with) -- never a wholesale replace, which
-            // used to let a confirmed family extraction silently drop a real
-            // failure the generic scan had already found.
+            // Merge family blocks with unmatched generic diagnostics so a
+            // confirmed test failure cannot hide another error (#413).
             let mut truncated = family.truncated || scan.failures_truncated;
             let mut merged = family_blocks;
             for block in std::mem::take(&mut scan.failures) {
@@ -1890,10 +1855,8 @@ fn show_output<W: Write>(
     let mut body = String::new();
     let mut next_line: Option<usize> = None;
     let mut next_byte: Option<(usize, usize)> = None;
-    // BYTE lines, never `BufRead::lines`: one non-UTF-8 byte from a legacy
-    // code page used to end the loop early and render as a confident,
-    // header-only success. Every line is kept; only the DISPLAY decoding is
-    // lossy, and the stored file itself is never rewritten.
+    // Scan byte lines so non-UTF-8 output cannot stop the scan early. Only
+    // display decoding is lossy; stored output remains intact (#326).
     for (index, chunk) in std::io::BufReader::new(file).split(b'\n').enumerate() {
         let number = index + 1;
         let bytes = chunk.map_err(|e| {
@@ -1919,15 +1882,8 @@ fn show_output<W: Write>(
         // BYTES within that line instead, and the hint names the next byte
         // offset rather than a line number that would return the same cut.
         let slice = slice_from(&line, byte_start);
-        // Review finding 4: `byte_end` used to do nothing but stop the LINE
-        // loop after this iteration -- the slice itself was never truncated
-        // to the requested window, so `--bytes 5-10` returned everything
-        // from byte 5 to the end of the line rather than exactly bytes 5
-        // through 10. Truncating here (char-boundary-safe, like every other
-        // cut in this function) keeps the existing continuation-hint
-        // semantics below: a truncation that still leaves more of the line
-        // unread is reported exactly the way a budget-driven mid-line cut
-        // already is.
+        // Truncate the line at `byte_end` on a character boundary, then show
+        // the continuation hint if part of the line remains (#326).
         let slice = if byte_end == usize::MAX {
             slice
         } else {

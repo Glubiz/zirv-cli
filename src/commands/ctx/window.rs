@@ -394,48 +394,12 @@ pub fn projects_root() -> CtxResult<PathBuf> {
     Ok(crate::utils::home_dir()?.join(".claude").join("projects"))
 }
 
-// Issue #779: `sum_transcripts`/`session_spend` used to `std::fs::read_to_
-// string` and re-parse every line of EVERY transcript under `projects_root`
-// on every single call -- no matter that `zirv ctx usage`/`status` are run
-// dozens of times an hour against the same, mostly-unchanged files. On a
-// machine with a few thousand transcripts (hundreds of benchmark runs plus
-// one long-lived orchestrator transcript) that is gigabytes of JSON re-
-// parsed from scratch every time, which is exactly what made both commands
-// take tens of seconds to minutes instead of the sub-second reads they
-// actually need to do (issue #779).
-//
-// The fix caches each transcript's own parsed, deduplicated usage EVENTS
-// (`CachedUsageEvent`: a unix-second timestamp plus the four raw token
-// counts) on disk, keyed by the transcript's path -- never a pre-summed
-// total, because a total already commits to one `now`, one window length and
-// one `count_cache_reads` choice, and this cache has to answer all of
-// `session_spend`'s 24h window, `sum_transcripts`' 5h/7d windows, and the
-// `count_cache_reads` toggle alike. Only `now`/the window/`count_cache_reads`
-// are ever applied when FOLDING cached events (`fold_events_into_sums`/
-// `fold_events_for_session`), never baked into the cache itself, so the
-// numbers this reports are identical to a fresh full re-parse for any of
-// those choices -- see `the_cache_matches_a_full_reparse_for_both_readers`.
-//
-// A cache entry records `parsed_len`, the byte offset its `events` already
-// account for, so a transcript that grew since the last read is re-parsed
-// only from that offset onward -- an actively-written transcript is never
-// more than one turn's worth of new lines behind. Every byte read is treated
-// as consumed (`sum_file`/`session_spend_of`'s own `str::lines` contract: a
-// final line with no trailing `\n` still counts), so a finished transcript
-// whose last write never appended a trailing newline is still fully counted,
-// not held back forever waiting for one. A transcript whose length has gone
-// BACKWARDS since the cache was written (log rotation, not ordinary growth)
-// invalidates the whole entry: `load_transcript_cache` refuses it and the
-// file is re-parsed from byte 0, exactly the pre-cache behaviour for that
-// one file.
-//
-// On top of the incremental read, a transcript whose own mtime is already
-// older than the longest window any caller folds against cannot contain a
-// single event any such window would still count -- see `sum_file`'s and
-// `session_spend_of`'s own per-row age checks -- so it is skipped without
-// being opened at all (`is_older_than_retention`), which is what makes a
-// machine with hundreds of long-finished benchmark transcripts cheap to
-// scan: only transcripts touched inside the window are ever read.
+// Cache parsed events by transcript path, not pre-summed totals: callers
+// apply their own window, current time and cache-read setting when folding.
+// `parsed_len` lets a growing file be read incrementally; a shorter file
+// invalidates its cache. Finished final lines count without a newline, while
+// a partial JSON line waits for the next read. Files older than every
+// supported window can be skipped without opening them (#779).
 
 /// Bumped when [`CachedTranscript`]'s on-disk shape changes: an older cache
 /// entry is discarded and the transcript re-parsed from byte 0 rather than
@@ -742,19 +706,8 @@ fn transcript_events(
         return cached.events;
     };
 
-    // F2 (codex review fix): a live transcript can be read mid-append, so
-    // `text` may end with a partial JSON row with no trailing `\n` yet.
-    // `extract_usage_events`'s own `str::lines()` still yields that trailing
-    // partial row as its own line, fails to parse it as JSON, and silently
-    // skips it -- but `consumed` used to cover it regardless, permanently
-    // losing that row's usage once the rest of it lands (the next read
-    // starts AFTER it, so only the suffix is ever parsed). Held back here
-    // instead: a trailing, `\n`-less line that fails to parse as a complete
-    // JSON value is trimmed off `text` before anything is counted as
-    // consumed, so the next call re-reads it whole. A trailing `\n`-less
-    // line that DOES parse as complete JSON (an ordinary finished session's
-    // last write, which commonly omits the final newline) is unaffected --
-    // still consumed immediately, exactly as before.
+    // Do not advance `consumed` past an incomplete final JSON line; the next
+    // read must see the whole row. A complete line needs no newline (#779).
     let mut text = text.as_str();
     if !text.ends_with('\n') {
         let last_line_start = text.rfind('\n').map_or(0, |idx| idx + 1);

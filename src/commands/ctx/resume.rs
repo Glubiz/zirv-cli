@@ -33,18 +33,9 @@ pub struct ResumeArgs {
     pub allow_nested: bool,
 }
 
-/// The launch `resume` hands the terminal to.
-///
-/// Split out of `run_with` so the environment it gives the child is testable:
-/// `run_with` itself `exec`s on unix, which would replace the test binary.
-///
-/// N1: the scrub comes first and is unconditional. `resume` sets a fresh
-/// `SESSION_ENV` but used to leave `ZIRV_CTX_SOCKET` and
-/// `ZIRV_CTX_TRANSCRIPT` inherited from whatever session launched it, so the
-/// resumed agent's hooks reported their turn boundaries onto the *outer*
-/// supervisor's socket -- under a session id that supervisor had never heard
-/// of. Same rule the supervisors follow: a child speaks with its own
-/// identity or with none.
+/// Builds the child launch separately from Unix `exec` so it is testable.
+/// Scrub inherited session channels before setting the new identity: a
+/// resumed child must report to its own supervisor or none (#281).
 fn launch_command(
     adapter: &dyn adapters::AgentAdapter,
     prompt: &str,
@@ -156,25 +147,9 @@ pub fn resume_prompt_preview(
 /// Composes the system prompt and merges the operator's own command-line
 /// prompt flag for a resumed session, as `PromptRole::Orchestrator`.
 ///
-/// A resumed run is interactive: `run_with` `exec`s over itself into an agent
-/// the operator sits in front of, exactly like `chat` and the bare `wrap`
-/// verb, so it takes the same role those two do -- the harness-teaching
-/// layer, the adapter's orchestrator layer, and `~/.zirv/system-prompt.md`
-/// rather than `~/.zirv/system-prompt.worker.md`. This used to pass
-/// `PromptRole::Worker`, which silently coached an operator's own interactive
-/// session as a delegated worker and dropped their user layer.
-///
-/// Issue #44: goes through `compile::compile_with_harness_roster` rather than
-/// calling `prompt::compose` directly, so a resumed session gets the same
-/// memory gathering and canonical `.zirv/context/` layer every other launch
-/// path gets -- this used to assemble context independently, the exact
-/// duplication issue #44 exists to remove. It calls the `_with_harness_
-/// roster` variant, not plain `compile::compile`, to keep one piece of
-/// pre-existing behavior unchanged: a resumed session has never composed a
-/// harness roster (`include_harness_roster: false`), even though it composes
-/// as `PromptRole::Orchestrator`, because it is picking up one specific piece
-/// of handoff work, not opening a fresh orchestrator seat that might go spawn
-/// other harnesses. See `compile_with_harness_roster`'s own doc comment.
+/// Resume is interactive and uses the orchestrator prompt layers. Compile
+/// through the shared context path, without a fresh harness roster because
+/// this launch continues one specific handoff (#44).
 ///
 /// Split out of `run_with` for the same reason `launch_command` is: `run_with`
 /// `exec`s over itself on unix, so composition needs its own seam a test can

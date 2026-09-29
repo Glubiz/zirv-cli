@@ -130,16 +130,8 @@ pub fn send(path: &Path, signal: &TurnSignal) -> CtxResult<()> {
     Ok(())
 }
 
-/// Issue #99 (2026-08-23): whether a turn-signal endpoint still answers a
-/// connection -- used by `sessions::sweep_orphan_endpoints` to tell a marker
-/// that belongs to a genuinely dead supervisor (nothing accepts the
-/// connection) apart from one whose supervisor is alive but was never (or no
-/// longer) recorded in the session registry. Built on the same `connect`
-/// `send` itself uses, deliberately stopping short of writing anything: the
-/// accept loop on the other end only ever acts on a complete,
-/// newline-terminated `TurnSignal` line, so a connect-then-drop probe can
-/// never inject a phantom turn into a live supervisor's rot engine the way
-/// reusing `send` with a made-up signal would.
+/// Probes endpoint liveness without writing a turn signal; only complete,
+/// newline-terminated messages affect the supervisor (#99).
 #[cfg(unix)]
 pub fn probe(path: &Path) -> bool {
     connect(path).is_ok()
@@ -190,18 +182,9 @@ mod win {
     /// even hands the accepted one off for draining (see `SignalServer::
     /// bind`'s own comment on that ordering).
     ///
-    /// Issue #770: every caller of `send` is fire-and-forget (`let _ =
-    /// send(...)`, every call site) and NONE needs guaranteed delivery, so
-    /// this is a short bound rather than the 1-second one it used to be.
-    /// `connect` retries on `ERROR_FILE_NOT_FOUND` too -- there being no such
-    /// pipe at all, which is exactly the stale/orphaned-supervisor case --
-    /// and that retry can never succeed by waiting, since nothing is ever
-    /// going to create the pipe underneath it. The Windows Stop hook
-    /// (`hook::run_stop`) calls `send` on every single turn, so paying out
-    /// this whole budget once per turn against a dead endpoint was a real,
-    /// measured stall; 50ms is generous for the live, momentarily-busy case
-    /// this constant actually exists for, while bounding the dead-endpoint
-    /// cost to near nothing instead of a full second.
+    /// Bound fire-and-forget retries against a busy or missing pipe; a dead
+    /// endpoint must not stall every Windows Stop hook turn (#770). `connect`
+    /// also retries ERROR_FILE_NOT_FOUND (no pipe), which waiting never fixes.
     const CONNECT_RETRY: Duration = Duration::from_millis(50);
     const POLL: Duration = Duration::from_millis(10);
 

@@ -291,12 +291,8 @@ fn write_events_atomic_locked(
     let dir = state.tasks().join(repo_slug);
     create_private_dir_all(&dir)?;
     let path = dir.join(EVENTS_FILE);
-    // E-4: a missing file is legitimately empty (nothing has ever been
-    // appended yet), but any OTHER read error -- e.g. one invalid UTF-8
-    // byte from a torn append -- must not be treated the same way.
-    // `unwrap_or_default()` used to collapse both cases to "empty", so a
-    // single corrupt byte anywhere in the existing log silently wiped
-    // every prior event the next time this ran.
+    // A missing log is empty; any other read error must fail so corrupt
+    // content cannot erase the recorded event history (#317).
     let mut content = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

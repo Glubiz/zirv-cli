@@ -395,13 +395,8 @@ pub fn run<W: Write>(args: &ReconcileArgs, w: &mut W) -> CtxResult<i32> {
         .map(|cfg| cfg.worktree.idle_ttl_secs)
         .unwrap_or_else(|_| super::config::WorktreeConfig::default().idle_ttl_secs);
 
-    // Issue #720 review (item 1): `--dry-run` must never reach `sessions::
-    // list`/`list_with_retention` (its sweep is an unavoidable side effect
-    // of listing -- see `reconcile_sessions`'s own doc comment). The live
-    // pass takes exactly ONE snapshot for the whole reconcile pass and
-    // shares it between `reconcile_groups`'s coordinator-liveness check and
-    // `reconcile_sessions`'s own stale-record report, mirroring `status.rs`'s
-    // `group_header`/`group_tree_lines`' single `live_shorts` set per render.
+    // Dry run must not list sessions: listing sweeps stale records. Live
+    // reconciliation shares one snapshot across resources (#720).
     let session_snapshot = if args.dry_run {
         None
     } else {

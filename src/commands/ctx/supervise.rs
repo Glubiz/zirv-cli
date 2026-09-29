@@ -176,15 +176,8 @@ pub(crate) fn terminate_group(child: &mut Child, grace: Duration) -> CtxResult<(
     Ok(())
 }
 
-/// What [`terminate_pid`] actually achieved. Issue #403: it used to report a
-/// bare `bool`, and both of its `kill` calls discarded their return value --
-/// so a signal the kernel REFUSED (`EPERM`: the caller runs inside a
-/// sandboxed harness shell that may not signal processes outside it) was
-/// indistinguishable from one that was delivered and ignored. `is_alive`
-/// reads `EPERM` as alive (see its own doc comment), so the caller printed
-/// "sent SIGTERM/SIGKILL" for a signal that was never sent at all, and
-/// deregistered a session whose process was still running and still holding
-/// its writer permit.
+/// Distinguishes termination from a refused signal; `EPERM` can leave the
+/// process alive and holding its writer permit (#403).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
     /// The pid is gone -- either it exited under the ladder below, or it was

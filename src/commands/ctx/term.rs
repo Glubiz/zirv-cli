@@ -183,24 +183,9 @@ pub fn bracketed_paste_on() -> bool {
     BRACKETED_PASTE.load(Ordering::SeqCst)
 }
 
-/// Issue #206. A terminal only wraps a paste in `ESC[200~ ... ESC[201~` while
-/// bracketed-paste mode is on, and a paste that arrives *without* those
-/// markers is indistinguishable from the operator typing each line and
-/// pressing Enter -- which is exactly what the wrapped agent then does with
-/// it, one submitted turn per pasted line.
-///
-/// The wrapped agent asks for the mode itself, and `wrap` forwards its output
-/// verbatim so that request does reach the real terminal. But it only holds
-/// for as long as some child has asked and the request has landed: not before
-/// the agent starts, not in the gap a relaunch opens while the replacement
-/// agent is still booting, and not at all for a command that never asks. zirv
-/// is the process that owns the operator's terminal for the whole session, so
-/// zirv sets the mode for the whole session, and puts it back on the way out.
-/// Both supported adapters parse the markers, so there is nothing to make
-/// this adapter-aware about.
-///
-/// Constants for the same async-signal-safety reason [`DASH_RESET`] is one:
-/// the off sequence is written from the emergency handler.
+/// Keep bracketed paste on for the full session so a relaunch gap cannot
+/// turn pasted lines into separate submitted turns. The emergency handler
+/// writes the constant off sequence without allocation (#206).
 const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
 const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 
@@ -270,34 +255,11 @@ pub fn dash_reset_bytes() -> &'static [u8] {
 /// as), `?1002` (button-event tracking -- motion reports only while a button
 /// is held down), and `?1006` (SGR extended coordinates).
 ///
-/// Deliberately **not** crossterm's `EnableMouseCapture`, and deliberately
-/// without `?1003`. `?1003` is the any-motion mode, and a probe on a real
-/// Windows Terminal session confirmed what it costs: it reports *every*
-/// pointer movement, so simply sweeping the mouse across the window produced
-/// dozens of `MouseEventKind::Moved` events with no button ever held. Inside
-/// the dashboard's bounded per-tick input drain that flood competes directly
-/// with the operator's keystrokes, and it would buy nothing beyond what
-/// `?1002` already gives the one thing that needs motion at all: the
-/// dashboard's own tmux-style click-drag text selection (`dash::mod`'s
-/// `MouseEventKind::Drag` handling), which only ever needs to know where the
-/// pointer is *while a button is down*. Do not "simplify" this back to
-/// `EnableMouseCapture`, and do not add `?1003`.
-///
-/// `?1002` used to be excluded for the same "nothing reads it" reason `?1003`
-/// still is -- before drag selection existed, a `Drag` event landed in the
-/// same bounded drain and was simply dropped, so turning the mode on bought
-/// nothing but the theoretical flood risk. It is turned on now because
-/// something finally consumes it: enabling mouse reporting at all (any of
-/// `?1000`/`?1002`/`?1006`) already displaced the terminal's own native
-/// click-drag selection, and until this change nothing in the dashboard
-/// offered a replacement -- selecting text out of a pane was simply
-/// impossible. A `?1002` drag event only ever arrives while the operator is
-/// already holding a button down, which is a bounded, self-limiting stream,
-/// unlike `?1003`'s free-running one.
-///
-/// `?1006` is not optional either: the default X10 encoding packs the column
-/// into a single byte and so cannot express a column past 223, and terminals
-/// are routinely wider than that.
+/// Deliberately not crossterm's `EnableMouseCapture`; do not add `?1003`.
+/// Windows Terminal reports every pointer movement, which
+/// can crowd keystrokes out of the bounded input drain. `?1002` provides
+/// drag selection only while a button is held; `?1006` supports columns
+/// beyond the X10 encoding's 223-column limit.
 pub fn dash_mouse_on_bytes() -> &'static [u8] {
     DASH_MOUSE_ON
 }
@@ -625,18 +587,10 @@ pub fn is_terminal_console_event(ctrl_type: u32) -> bool {
 /// one, which terminates the process -- still runs. This exists to put the
 /// console back on the way out, not to swallow the event.
 ///
-/// P2: on a *terminal* event it also tree-kills every supervised child pid
-/// before returning. A pane's (or `wrap`'s) child lives on a ConPTY of its
-/// own and is not attached to this console, so it never receives
-/// `CTRL_CLOSE_EVENT` itself -- closing the window used to leave every agent
-/// running, invisible, holding the repo. Unlike a POSIX signal handler, a
-/// Windows console control handler runs on an ordinary thread, so spawning
-/// `taskkill` here is legal; the sweep is bounded (see `CLOSE_KILL_BUDGET`)
-/// because the OS will not wait past about five seconds. The console is
-/// restored *first*: whatever else happens, the operator gets their terminal
-/// back. The unix signal handler deliberately gains none of this -- none of
-/// it is async-signal-safe, and unix does not need it (portable-pty's
-/// `setsid` + `TIOCSCTTY` means closing the master SIGHUPs the child).
+/// Restore the console first, then stop ConPTY children on terminal events:
+/// they do not receive this console's close event. The sweep is bounded by
+/// Windows' short handler deadline; Unix signal handlers cannot do this
+/// work safely and closing the pty master already sends SIGHUP.
 #[cfg(windows)]
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows_sys::core::BOOL {
     restore_console_from_handler();

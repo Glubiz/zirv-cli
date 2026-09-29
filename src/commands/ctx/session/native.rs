@@ -442,18 +442,8 @@ impl NativeSessions {
         let _ = write_topology(&self.state, &self.namespace, &topology);
     }
 
-    /// Issue #489 (issue #352's mail-injection residual), for conversations.
-    ///
-    /// A native session has no terminal to type into, so delivery here is
-    /// what it should always have been: the message becomes an ordinary
-    /// durable input, recorded in the journal and queued as a turn. Its
-    /// idempotency identity is the delivered text itself, so a delivery
-    /// re-attempted after a crash between the injection and the consume
-    /// records nothing twice.
-    ///
-    /// Delivery goes through the dashboard's OWN sweep -- the same trust
-    /// framing, the same budget cap, the same "consume only if the injection
-    /// succeeded" rule -- rather than a second delivery path.
+    /// Queues mail as durable native input through the dashboard's trust
+    /// framing and caps. Delivered text identifies retries after a crash (#489).
     pub fn deliver_mail(
         &self,
         cfg: &super::super::config::CtxConfig,

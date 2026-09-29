@@ -161,13 +161,8 @@ fn expand_home(path: &str) -> PathBuf {
 /// every other vendor `catalogue` now carries. See this module's own doc
 /// comment for why the numbers are deliberately approximate.
 ///
-/// Issue #381: built by collecting `catalogue::built_in_prices()` rather
-/// than a hand-written map -- the equivalence test below pins every price
-/// the old hand-written map gave, so the migration cannot silently change
-/// one. `as_of` stays `BUILT_IN_AS_OF` even though the survey vendors were
-/// priced later (`catalogue::CATALOGUE_AS_OF`): `PriceTable` carries one
-/// stamp for the whole table, and the pre-existing rows are what that stamp
-/// has always described.
+/// Collect catalogue rates while retaining `BUILT_IN_AS_OF` as the table's
+/// single timestamp; the table has no per-vendor date (#381).
 pub fn built_in_table() -> PriceTable {
     PriceTable {
         as_of: BUILT_IN_AS_OF.to_string(),

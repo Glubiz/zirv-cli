@@ -274,28 +274,9 @@ pub fn render_contract_block(schema: &Schema) -> String {
     lines.join("\n")
 }
 
-/// Issue #326 B7: a field only gets its own field-list line when it carries a
-/// constraint [`example_value`]'s JSON example genuinely cannot show --
-/// whether the field is `required` (the example fills in a placeholder value
-/// for every field regardless of requiredness) or an `enum`'s full set of
-/// allowed values (the example can only show one of them). For every other
-/// field -- an optional, non-enum one -- the example's own name/value pair
-/// already says everything the field list would have repeated, so the OUTPUT
-/// CONTRACT block no longer names it twice.
-///
-/// Issue #326 B7 (review round, P2): an `ObjArray` parent's own line is ALSO
-/// kept whenever any NESTED field renders one of its own, even when the
-/// parent itself is optional and non-enum. Without this, two differently-
-/// named optional `obj_array` fields whose nested constraint happens to
-/// share a field name -- `a` and `b` each containing a `bool` field `ok`,
-/// one schema requiring `a[].ok` and another requiring `b[].ok` -- rendered
-/// byte-for-byte identical indented `- ok: bool (required)` lines with no
-/// visible parent to tell them apart, since the parent heading naming
-/// WHICH array `ok` belongs to had been dropped as "redundant." A nested
-/// line's own association with its parent is not a constraint the JSON
-/// example can show either (the example nests `ok` inside `a`'s own array
-/// value, but nothing in the field LIST said so once the parent line was
-/// gone), so the parent's line is restored precisely in that case.
+/// Show only constraints absent from the JSON example: requiredness, full
+/// enum choices, and parent array names needed to identify nested fields
+/// (#326).
 fn render_fields(fields: &[Field], indent: usize, lines: &mut Vec<String>) {
     let pad = "  ".repeat(indent);
     for field in fields {

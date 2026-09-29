@@ -325,15 +325,8 @@ pub fn route_for_role(config: &NativeConfig, role: &str) -> Result<RouteId, Rout
             role: role.to_string(),
             configured: configured_roles(config),
         })?;
-    // Issue #595 (roadmap N02): a repository's own `policy.allowed_routes`
-    // narrowing excludes this route from the checkout without touching the
-    // operator's global `[roles]` table (a checkout may only narrow, never
-    // edit, `roles` itself). The exclusion has to surface HERE, at the point
-    // this specific role is selected, not at `NativeConfig::load` -- the
-    // same `policy.allowed_routes` gate `route::eligible`/`offers_from_config`
-    // already apply to a REQUESTED route in `authorize_route`, and the same
-    // wording `offers_from_config` already gives a refused route's
-    // `PolicyVerdict`.
+    // Enforce repo route narrowing when this role is selected; the repo may
+    // exclude a global role's route but cannot edit the role table (#595).
     if !config.allowed_routes().contains(&route_id) {
         return Err(RouteRefusal::Ineligible {
             role: role.to_string(),

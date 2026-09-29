@@ -183,16 +183,8 @@ pub fn reserve(
     Ok(reservation)
 }
 
-/// Finding #11 (issue #358 review): like [`reserve`], but atomic against a
-/// CONCURRENT reservation on the same provider ledger. Placement (`agent::
-/// run_with`'s own routing, `dash::fulfill_spawn_request`) is computed
-/// against a `CapacitySnapshot` taken BEFORE this call, outside any lock --
-/// two admissions racing the same provider can both read "room enough" from
-/// that stale snapshot and both call [`reserve`], jointly over-committing
-/// it. Here the "is there room" check and the reservation itself happen
-/// under the SAME lock acquisition (the one [`lock_ledger`] already
-/// serializes every mutation through), so only one of two racing callers
-/// against a tight `limit_tokens` can ever win.
+/// Checks capacity and reserves under one ledger lock; placement snapshots
+/// may be stale when concurrent callers target the same pool (#358).
 ///
 /// `limit_tokens` is the caller's own ceiling -- typically the provider's
 /// projected headroom for its binding window, converted to a raw token

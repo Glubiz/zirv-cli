@@ -491,11 +491,8 @@ pub fn render_window_text(lines: &[WindowLine], center: usize, max_bytes: usize)
     out
 }
 
-/// Issue #326 (audit finding): the JSON counterpart of `render_window_text`'s
-/// own byte budget -- `--json` used to serialize the whole `window` array
-/// with no cap at all, so a wide search window (a long transcript message,
-/// or a generous `--around` radius) could still flood a caller's context
-/// even though the plain-text render right next to it was always capped.
+/// Caps the JSON window array so a wide search result cannot exceed the
+/// caller's display budget (#326).
 /// Greedily drops the line farthest from `center` first (by ordinal
 /// distance), so the hit's own immediate context is the last thing to go --
 /// the mirror image of `render_window_text`'s tail-truncation, adapted for

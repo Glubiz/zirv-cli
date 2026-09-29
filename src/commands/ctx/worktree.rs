@@ -369,16 +369,8 @@ pub struct WorktreeRecord {
     /// exactly today's behavior.
     #[serde(default)]
     pub setup_digest: Option<String>,
-    /// Review finding (2026-09, issue #718): when this record last
-    /// transitioned to [`WorktreeStatus::Idle`] -- set by [`update_status`]
-    /// exactly then, never carried forward from an earlier `Active` line.
-    /// [`gc`]/[`gc_candidates`] age an `Idle` record from THIS field, not
-    /// `created_at` (which `update_status` otherwise carries forward
-    /// unchanged): `created_at` is fixed at the tree's original allocation,
-    /// so measuring the pool TTL against it would treat a tree released
-    /// after a long-running task as already expired the moment it went
-    /// idle. `#[serde(default)]` so a record written before this field
-    /// existed still parses as `None`.
+    /// Time of the last transition to Idle; GC ages from this, not the
+    /// tree's creation time. Absent in older records (#718).
     #[serde(default)]
     pub idled_at: Option<u64>,
 }
@@ -530,11 +522,8 @@ pub fn latest_for_path(state: &StateDir, repo_slug: &str, path: &Path) -> Option
 /// forward every other field unchanged. A no-op (never fabricates a record)
 /// when `path` has none -- there is nothing honest to update.
 ///
-/// Issue #718 review: transitioning TO [`WorktreeStatus::Idle`] stamps
-/// `idled_at` with the current time -- the one place this ever happens, so
-/// [`gc`]/[`gc_candidates`] can age the pool TTL from the moment a tree
-/// actually went idle rather than from its original `created_at`. Any other
-/// transition leaves `idled_at` exactly as it was; nothing else reads it.
+/// Stamp `idled_at` only on transition to Idle; pool TTL starts when the
+/// tree actually becomes idle, not when it was created (#718).
 pub fn update_status(
     state: &StateDir,
     repo_slug: &str,
@@ -675,33 +664,9 @@ pub fn prune_one(
     outcome
 }
 
-/// Startup GC (issue #319, design item 4): conservative on purpose. A
-/// record is a candidate only when its `owner_pid` is known AND
-/// `is_alive(pid)` says dead -- `owner_pid: None` (an unrecorded or
-/// pre-#319 owner) is left alone, since there is nothing to disprove
-/// liveness against, and a `status != Active` record (already removed or
-/// already flagged) is left alone too. Every candidate still goes through
-/// the exact same [`prune_one`] proof an explicit `zirv ctx worktree prune`
-/// would -- GC never removes anything more cheaply than an operator could.
-/// A tree whose directory is already gone from disk (removed by some other
-/// means) is simply marked `removed` without running any probe -- there is
-/// nothing left to inspect.
-///
-/// Issue #718: an `Idle` record is a GC candidate once it has sat in the pool
-/// at least `idle_ttl_secs` (`[worktree] idle_ttl_secs`), in place of
-/// `Active`'s own dead-owner test -- an idle tree has no live owner to check
-/// liveness against in the first place. Either way the SAME proof-required
-/// [`prune_one`] runs before anything is actually removed: TTL expiry only
-/// decides which records this loop even considers, never widens what
-/// `prune_one` itself would allow.
-///
-/// Review finding (2026-09): aged from `idled_at`, the moment
-/// [`update_status`] actually marked the record `Idle`, never from
-/// `created_at` (fixed at the tree's original allocation, long before it
-/// ever went idle). An `Idle` record with no `idled_at` at all -- one
-/// written before this field existed -- counts as already expired: there is
-/// no honest "moment it went idle" to age it from, so this is the
-/// conservative choice over letting it linger in the pool indefinitely.
+/// GC considers active trees only with a known dead owner, and idle trees
+/// only after TTL measured from `idled_at`; missing `idled_at` expires.
+/// Every candidate still requires [`prune_one`]'s removal proof (#319, #718).
 pub fn gc(
     state: &StateDir,
     repo: &Path,

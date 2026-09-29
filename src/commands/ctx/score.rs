@@ -916,36 +916,8 @@ impl IncrementalScorer {
     }
 }
 
-/// Bumped whenever the checkpoint or `RotState` changes shape, so an older
-/// file is ignored and rebuilt instead of misread. Issue #155 D1: bumped to
-/// 2 for the new `model` field -- a checkpoint written before that field
-/// existed would otherwise resume with `model: None` until the next poll
-/// happens to carry a fresh assistant line, which is usually immediate but
-/// not guaranteed; the version bump forces one clean rebuild instead.
-/// Bumped to 3 for `rot::Segment`'s new `error_hashes` field (same-error
-/// repetition, `rot::Signals::same_error_repeats`), and independently (main,
-/// same version number before the two lines merged) for the model history
-/// needed to report changes across fresh-process Stop-hook polls: an older
-/// checkpoint simply fails to deserialize without this bump too
-/// (`load_checkpoint` degrades to `None` on any doubt), but the version bump
-/// makes that a clean, immediate rebuild rather than depending on a lenient
-/// decode.
-/// Bumped to 4 for review finding F1: `error_hashes: Vec<u64>` was replaced
-/// by `result_errors: Vec<Option<u64>>` (one entry per `ToolResult`, not just
-/// per erroring one with extractable text) so a successful result -- or a
-/// textless error -- can interrupt a same-error streak instead of being
-/// invisible to it. A checkpoint written under the old field name would fail
-/// to deserialize on its own, but the bump forces a clean rebuild rather than
-/// depending on that.
-/// Bumped to 5 for `rot::Signals`/`Segment`'s new `provider_overflows` field
-/// (provider-error/model-drift handling): same rationale as every bump
-/// above -- a checkpoint written before this field existed must rebuild
-/// clean rather than resume with a silently-zeroed count.
-/// Bumped to 6 for the new `context_window` field (the session-reported
-/// model context window `AgentAdapter::context_window_hint` resolves): an
-/// older checkpoint would resume with `None` and score the next poll against
-/// the fallback token gates rather than the seat's real capacity, which is
-/// exactly the mis-gating that field exists to fix.
+/// Increment when checkpoint or `RotState` shape changes; reject and rebuild
+/// older files so missing fields cannot silently alter scoring (#155).
 const CHECKPOINT_VERSION: u32 = 6;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
@@ -1123,15 +1095,8 @@ const SCREEN_FALLBACK_CAP_BYTES: usize = 64 * 1024;
 /// Screens the last `cap` bytes of `path`. `ScreenReport::default()` (clean)
 /// on any read failure -- a screening miss must never fail a scoring cycle.
 ///
-/// Issue #272 design item 1: the tail actually screened is a truncated view
-/// of the whole file whenever the file is bigger than `cap`, so this calls
-/// `screen::screen_with_thresholds` (not `screen::screen`) with the FULL
-/// file length as `total_bytes` -- the report then carries a `ScanTruncated`
-/// finding with the correct byte counts whenever `start > 0`, instead of the
-/// unscanned head silently reading as clean. `thresholds` is the caller's
-/// own resolved `[screen]` config (review round 1: this fallback used to
-/// hardcode `Thresholds::default()` via `screen::screen_prefix`, so a
-/// repo-narrowed `RepetitionDominated` threshold never reached it).
+/// Pass the full file length and resolved thresholds so a truncated tail is
+/// reported as incomplete and respects the caller's policy (#272).
 fn screen_tail(path: &Path, cap: usize, thresholds: &screen::Thresholds) -> ScreenReport {
     let Ok(text) = std::fs::read_to_string(path) else {
         return ScreenReport::default();
@@ -1172,14 +1137,9 @@ fn score_with_checkpoint(
         None => IncrementalScorer::new(transcript.to_path_buf()),
     };
 
-    // A poll that reports nothing new cannot be answered from a checkpoint
-    // alone (an unreadable or empty transcript lands here too), so it falls
-    // back rather than guessing. `screening` is `None` in exactly the same
-    // case `score` is (issue #243 review round, F5: both are set together,
-    // once, the instant `IncrementalScorer::poll` confirms it actually read
-    // appended bytes), so matching on `Some(score)` alone already implies
-    // `Some(screening)` here -- this fallback runs a fresh tail scan either
-    // way, never forwarding a stale/idle `None`.
+    // An empty or unreadable poll cannot be answered from a checkpoint.
+    // Score and screening arrive together only after appended bytes are read;
+    // otherwise scan the tail rather than forwarding stale data (#243).
     let Ok((Some(score), Some(screening))) = scorer.poll(adapter, cfg, screen_thresholds) else {
         let score = full_score(adapter, transcript, cfg)?;
         return Ok((

@@ -692,12 +692,8 @@ pub fn settle_subagents(
 
 /// One live swap's successor, fully decided before anything is started.
 ///
-/// Issue #552: the four runtime DIRECTIONS are one field, not four code
-/// paths. `from`/`to` are the resolved runtimes of the session leaving the
-/// seat and the one taking it, so a seam cannot accidentally start a harness
-/// child for a native successor (which is exactly what every live swap seam
-/// did before this existed: `handover::resolve_swap_launch` resolves an
-/// adapter unconditionally).
+/// Carries resolved source and target runtimes so the launcher selects the
+/// successor's actual backend (#552).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuccessorPlan {
     pub from: RuntimeKind,
@@ -1003,16 +999,8 @@ pub struct Record {
     pub boundary: Option<Boundary>,
     #[serde(default)]
     pub subagents: Vec<(String, Disposition)>,
-    /// Issue #488 review, finding 2: tool calls this rollover's own safe
-    /// boundary durably CANCELLED on a run that then failed to prepare a
-    /// successor, and therefore kept the original session.
-    ///
-    /// Cancelling a call that never began is honest at a boundary the seat
-    /// actually crosses. When the seat does NOT cross it, the retained source
-    /// is a session with work removed from under it, so the fact is recorded
-    /// here rather than dropped: a "kept the original session" settlement with
-    /// a non-empty list is something the source's next turn has to be told,
-    /// not a footnote. Empty on every rollover that commits.
+    /// Pending calls cancelled at the boundary when the source is retained;
+    /// its next turn must be told what was removed (#488).
     #[serde(default)]
     pub source_cancelled: Vec<String>,
     #[serde(default)]
@@ -1079,16 +1067,8 @@ impl Record {
         self.updated_at = now;
     }
 
-    /// Item 7's failure half, with finding 2's compensation (issue #488
-    /// review): the seat never moved, so the ORIGINAL session is retained --
-    /// and anything this rollover's own safe boundary already cancelled is
-    /// carried into [`Record::source_cancelled`] so the retained source is
-    /// told, rather than being handed a journal with work quietly removed
-    /// from under it.
-    ///
-    /// The one place a `Restored` settlement is written on a run that reached
-    /// a boundary, so there is no path on which the cancellation is silently
-    /// "kept".
+    /// Restores the source and records cancelled calls so its next turn can
+    /// reconcile work removed at the boundary (#488).
     pub fn restore(&mut self, reason: &str, now: u64) {
         if let Some(cancelled) = self
             .boundary

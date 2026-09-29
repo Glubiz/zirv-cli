@@ -95,16 +95,8 @@ pub fn codex_final_assistant_message(jsonl: &str) -> Option<String> {
 /// A sibling of [`StateDir::rollouts`], with the same short-id derivation
 /// ([`sessions::short_id`]).
 ///
-/// There is deliberately no separate cursor file recording how much of a
-/// source has already been synced: an earlier revision kept one, and a
-/// crash between appending rows to the shadow and writing the cursor's new
-/// value left the cursor behind what the shadow already held, so the next
-/// sync trusted the stale cursor and replayed rows the shadow already had,
-/// duplicating them. The shadow file is now the only record of its own
-/// position -- [`Self::shadow_row_count`] (for [`Self::sync_json_array`])
-/// and [`Self::shadow_last_rowid`] (for [`Self::sync_sqlite`]) read it
-/// directly off the shadow's own bytes, so there is nothing left that can
-/// fall out of sync with it.
+/// Derive sync position from the shadow itself; a separate cursor can lag
+/// behind appended rows after a crash and replay them (#382).
 pub struct ShadowTranscript {
     jsonl: PathBuf,
 }
