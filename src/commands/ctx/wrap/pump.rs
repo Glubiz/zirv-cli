@@ -5,21 +5,17 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pump(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    // P2/P3/P5: both are swapped over to the fresh child on every relaunch,
-    // so the replaced child's tree can never outlive the supervisor that
-    // replaced it and the registry record never points at a dead pid.
+    // Swap both guards on relaunch so the old child cannot outlive this
+    // supervisor and the registry follows the new pid.
     child_guard: &mut super::supervise::ChildGuard,
     session_guard: &mut super::sessions::SessionGuard,
     rx: &mpsc::Receiver<PumpEvent>,
     pair: &mut portable_pty::PtyPair,
     supervision: &mut InjectionState,
     server: Option<&super::signal::SignalServer>,
-    // T84: `&mut Box<dyn AgentAdapter>`, not `&dyn AgentAdapter` -- a live
-    // `zirv ctx handover` swap replaces the boxed trait object in place
-    // (`*adapter = new_adapter`) once the swap has actually happened, so
-    // every later tick's `adapter.<method>()` call (unchanged syntax, thanks
-    // to auto-deref through `&mut Box<dyn _>`) resolves against the new
-    // harness. See the handover request check near the top of this loop.
+    // `&mut Box<dyn AgentAdapter>`, not `&dyn AgentAdapter`: a handover swap
+    // replaces the boxed adapter in place, so every later pump tick must see
+    // the new one.
     adapter: &mut Box<dyn AgentAdapter>,
     writer: &std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     transcript: &mut TranscriptSource,
@@ -28,54 +24,36 @@ pub(super) fn pump(
     debounce: Duration,
     inject_timeout: Duration,
     repo: &Path,
-    // Issue #780: needed for `LiveAutoRollover`'s own fresh, layered
-    // `CtxConfig::load` -- see the seat-rollover-enabled gate below.
     env: EnvLookup<'_>,
     tail_items: usize,
-    // T84: `&mut String`, not `&str` -- a handover swap recomputes this for
-    // the new adapter's own distiller default, so a rot-triggered restart
-    // *after* a handover does not keep quoting the predecessor's model name.
+    // `&mut String`, not `&str`: a handover swap recomputes this for the new
+    // adapter's own distiller default, so a later rot restart does not keep
+    // quoting the predecessor's model name.
     distiller_model: &mut String,
     distiller_timeout: Duration,
-    // N6: read alongside `distiller_model`/`distiller_timeout` at the one
-    // restart site below (`Action::Restart`), never anywhere else in the
-    // pump -- the harvest call is gated on `cfg.memory.harvest` internally.
     cfg: &CtxConfig,
     memory_slug: &str,
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     extra: &[String],
-    // T84: `&mut Vec<_>`, not `&[_]` -- a handover swap rebuilds this for the
-    // new adapter/model (fresh `AGENT_ENV`/`SEAT_MODEL_ENV`/turn-signal env),
-    // so a *later* rot-triggered restart relaunches with the right identity.
+    // `&mut Vec<_>`, not `&[_]`: a handover swap rebuilds this for the new
+    // adapter/model, so a later rot restart relaunches with the right identity.
     turn_env: &mut Vec<(String, String)>,
     cpr_filter: &std::sync::Arc<std::sync::Mutex<CprFilter>>,
     announcer: &Announcer,
     bar: &mut BarRuntime,
-    // T84: needed to recompute `SEAT_MODEL_ENV` on a handover swap
-    // (`adapters::seat_model_env`), the same role this session's own first
-    // launch was composed for.
     role: super::prompt::PromptRole,
-    // Issue #249: this session's own supervising session, if any -- resolved
-    // once by `run_with` from `env` (`agent::parent_identity`) and passed
-    // straight through, never re-derived per poll.
+    // Resolve the supervising session once at launch. (#249)
     parent_short: Option<&str>,
     native_successor: &mut Option<super::dash::Pane>,
 ) -> CtxResult<i32> {
     let mut last_size = window_size(STDIN_FD).unwrap_or(DEFAULT_SIZE);
-    // T13: the live mail wake-up. See `mail_polling_enabled` for the gates: a
-    // session that cannot receive mail at all never reads the mailbox once.
     let mut mail_watch = MailWatch::default();
-    // Issue #785: the `[jev] inject` gate's pump-local state; off => every
-    // `check` proceeds at once and the paths below run as before.
     let mut inject_gate = super::inject_gate::AsyncGate::default();
-    // Finding #7: `handover::take_request`'s own polling cadence, tracked
-    // independently of `mail_watch` -- see the check site's own doc comment.
+    // Handover file reads have their own cadence, independent of mail.
     let mut last_handover_poll: Option<Instant> = None;
-    // Issue #358 (task 5): the automatic rollover's own cadence, seeded with
-    // this pump's start so no usage I/O runs during session startup, and the
-    // one rollover transaction that may be open at a time.
+    // Delay rollover I/O until after startup; only one transaction may be open. (#358)
     let mut last_rollover_eval: Option<Instant> = Some(Instant::now());
     let seat_short = bar.session_short.clone();
     let mut reactive_pending = super::seat::load(state_dir, &seat_short)
@@ -83,25 +61,15 @@ pub(super) fn pump(
         .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
     let mut pending_rollover: Option<PendingRollover> = None;
     let is_orchestrator = role == PromptRole::Orchestrator;
-    // Issue #780: `cfg` above is loaded once at this session's launch and
-    // held for the whole (potentially very long) wrapped session, so a gate
-    // reading `cfg.auto_orchestrator_rollover()` never sees a later `zirv ctx
-    // config set fallback.auto_orchestrator_rollover false` -- see
-    // `rollover::LiveAutoRollover`'s own doc comment. Seeded from `cfg`'s own
-    // value so the very first tick (before either `ctx.toml` could possibly
-    // have changed) matches what launch already decided. The readiness watch
-    // for an already-open transaction (below, gated only on `pending_rollover
-    // .is_some()`) is deliberately NOT behind this switch either -- a live
-    // disable must stop a NEW rollover from being prepared, but a
-    // transaction already open must still reach commit or abort.
+    // Reload the rollover switch on cadence because this session may be
+    // long-lived. A live disable prevents new swaps, but an open transaction
+    // must still commit or abort. (#780)
     let mut auto_rollover =
         super::rollover::LiveAutoRollover::new(repo, env, cfg.auto_orchestrator_rollover());
 
     loop {
         if let Some(status) = child.try_wait()? {
-            // Issue #358: the successor of an automatic rollover never came
-            // up (or died before it ever answered), so the transaction that
-            // launched it is a failure, not a commit.
+            // A successor that never answered cannot commit its transaction. (#358)
             if let Some(pending) = pending_rollover.take() {
                 let _ = super::rollover::fail(
                     state_dir,
@@ -115,9 +83,7 @@ pub(super) fn pump(
             // Let the reader thread flush whatever is still buffered.
             while rx.recv_timeout(Duration::from_millis(50)).is_ok() {}
             let code = status.exit_code() as i32;
-            // Item 6 audit: the wrapped session just ended, whether the
-            // agent quit cleanly or crashed. Previously silent -- nothing
-            // printed at all, so the session appeared to just stop.
+            // Announce the child exit even when no supervisory action fired.
             announcer.emit(&Event::SessionEnded {
                 agent: adapter.name().to_string(),
                 code,
@@ -157,14 +123,8 @@ pub(super) fn pump(
                 );
                 return Ok(code);
             }
-            // Issue #281: the operator's own keystroke reaching this pty is
-            // the one edge that reliably means a fresh turn is starting for
-            // every turn after the first (the first is stamped once, above
-            // this loop, since it never goes through `Input` at all -- see
-            // that call site's own comment). `supervision.last_turn` is
-            // still the PREVIOUS completed turn's number here (`on_event`
-            // below runs after this), so `+ 1` names the turn this input is
-            // about to start.
+            // Input starts the next turn; the first turn is stamped at spawn.
+            // The last completed turn number is still current here. (#281)
             if matches!(event, PumpEvent::Input(_)) {
                 let verb = session_guard.record().verb.as_str();
                 session_guard.stamp_in_flight(verb, supervision.last_turn + 1);
@@ -178,11 +138,8 @@ pub(super) fn pump(
             transcript.adopt(signal.transcript_path.as_deref());
             let previous_verdict = supervision.verdict;
             supervision.on_turn(&signal);
-            // Issue #281: the turn just reported by `signal` has reached its
-            // clean boundary -- clear the marker `stamp_in_flight` set for
-            // it, so a crash from this point until the NEXT turn's own start
-            // (the next `Input`, or a fresh spawn on restart) is correctly
-            // read as "idle between turns", not "interrupted mid-turn".
+            // Clear in-flight state at the turn boundary so a later crash
+            // between turns is not marked as interrupted. (#281)
             session_guard.clear_in_flight();
             if let Some(event) =
                 super::announce::verdict_change(previous_verdict, supervision.verdict, signal.score)
@@ -190,20 +147,8 @@ pub(super) fn pump(
                 announcer.emit(&event);
             }
 
-            // T13: mail is no longer read here. The poll arm below owns it
-            // end to end -- it runs on its own `MAIL_POLL` cadence rather
-            // than only when the agent happens to report a turn, so a
-            // message that arrives mid-turn no longer waits for one.
-
-            // N4: an interactive session is only ever *advised* of a nudge:
-            // never restarted, and never handed the nudge's own message
-            // body. Claiming the marker here (rather than on a byte-pump or
-            // per-tick path) keeps this arm as cheap as it always was.
-            // C4: `from` is the *sender*, read out of the marker file, and
-            // the disposition is `Advisory` -- an interactive session never
-            // receives message bodies, so the line has to point the operator
-            // at `zirv ctx inbox` rather than promise the guidance will
-            // "be picked up as mail".
+            // Interactive nudges are advisory only: never restart or deliver
+            // message bodies through the pty.
             if let Some(from) = super::sessions::claim_nudge_marker(state_dir, &bar.session_short) {
                 announcer.emit(&Event::Nudge {
                     from,
@@ -212,45 +157,21 @@ pub(super) fn pump(
             }
         }
 
-        // T84: `zirv ctx handover`. `take_request` is a real file read +
-        // remove, and used to run on *every* ~100ms pump tick for the
-        // session's entire lifetime -- the overwhelming majority of which
-        // find nothing there (finding #7, issue-close review). Gated on the
-        // same `MAIL_POLL` (2s) cadence the mail poll arm below already
-        // uses, tracked independently (`last_handover_poll`) so a session
-        // with mail polling disabled/degraded still gets its own cadence,
-        // and vice versa -- a handover request still answers within one
-        // cadence tick either way, since the request sits in a state-dir
-        // file until this loop notices it regardless of how often it looks.
-        // `may_inject` is exactly the "verified-idle turn boundary" check
-        // every other injection already gates on -- reusing it here is what
-        // "quiesce" means for this feature, per the module's own doc
-        // comment on `handover.rs`.
+        // Poll handover files on their own cadence and act only at verified
+        // idle; this read/remove must stay off the 100ms pump path. (#84)
         let now = Instant::now();
         let handover_poll_due = handover_poll_due(last_handover_poll, now);
         if handover_poll_due {
             last_handover_poll = Some(now);
         }
-        // Issue #358 (task 5): the automatic rollover shares this exact
-        // seam, so an automatically decided swap and an operator's own are
-        // executed by the same code. A manual request always wins: it is
-        // claimed first, and its presence skips the automatic evaluation for
-        // this tick entirely (and clears whatever `pending` cause the seat
-        // was still carrying -- the operator just answered the question).
+        // Manual handover wins over automatic rollover on the same tick. (#358)
         let manual_req = handover_poll_due
             .then(|| super::handover::take_request(state_dir, &bar.session_short))
             .flatten();
         let swap_req = match manual_req {
             Some(req) => {
-                // Finding #1 (issue #358 review): a manual request must not
-                // let an already-open automatic rollover transaction linger.
-                // If it did, the readiness watch below would later commit
-                // that transaction's generation against whatever session id
-                // this manual swap put in the seat -- the wrong agent for
-                // that generation. Close the open transaction first (the
-                // successor it named already lost the pty to this manual
-                // request, so it never got to prove itself ready) before
-                // honouring the manual request.
+                // Abort an open automatic transaction before manual swap, or
+                // its generation could commit against the wrong successor. (#358)
                 if let Some(pending) = pending_rollover.take() {
                     let _ = super::rollover::fail(
                         state_dir,
@@ -266,22 +187,9 @@ pub(super) fn pump(
                 reactive_pending = false;
                 Some(req)
             }
-            // Issue #780: `pending_rollover.is_none()` and `is_orchestrator`
-            // come first so nothing below runs when there is nothing to
-            // prepare or this is not the orchestrator seat at all. The
-            // cadence check (`rollover_eval_due`, a cheap `Instant`
-            // comparison) runs BEFORE `auto_rollover.is_enabled()` (two
-            // `stat`s), so the live reload only ever costs a syscall once
-            // per interval, not on every tick. `last_rollover_eval` advances
-            // whenever the cadence comes due, whether or not the switch is
-            // enabled: otherwise a disabled switch would leave `due()`
-            // permanently true and `is_enabled()` would run every tick again
-            // anyway. `auto_rollover.is_enabled()` re-derives the switch from
-            // a fresh layered load rather than this session's stale start-up
-            // `cfg`, so a live operator disable takes effect on the very next
-            // check -- no restart required. A failed reload never enables it
-            // (see `LiveAutoRollover`'s own doc comment), and a disable
-            // always wins over an eval that came due.
+            // Check cadence before reloading config so disabled rollover
+            // does not stat files every tick; advance cadence even while off.
+            // Failed reload must not enable rollover. (#780)
             None if pending_rollover.is_none() && is_orchestrator => {
                 let eval_due = rollover_eval_due_advancing(
                     &mut last_rollover_eval,
@@ -317,9 +225,7 @@ pub(super) fn pump(
             let may_act = handover_may_act(supervision, Instant::now(), debounce, req.force);
             if !may_act {
                 let reason = "mid-turn; retry once idle, or pass --force".to_string();
-                // An automatic request has no waiting requester to ack, and
-                // its seat transaction is already open -- close it here so
-                // the seat is not left `Prepared` for a swap that never ran.
+                // Abort a transaction when its automatic swap never ran.
                 if let Some(generation) = req.generation {
                     let _ = super::rollover::fail(
                         state_dir,
@@ -358,12 +264,8 @@ pub(super) fn pump(
                 );
             } else {
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
-                // Same P5 reasoning as a rot-triggered restart: park the
-                // record on zirv's own (unquestionably alive) pid for the
-                // duration of the swap, since a concurrent `sessions::list`
-                // sweep must never delete this very much live session's
-                // record while its old child is being killed and no new one
-                // exists yet.
+                // Park the registry on zirv during the swap so a concurrent
+                // liveness sweep cannot delete this live session.
                 session_guard.adopt_child_pid(std::process::id());
                 match perform_handover_swap(
                     child,
@@ -399,18 +301,9 @@ pub(super) fn pump(
                             Ok(path) => path.display().to_string(),
                             Err(e) => format!("not stored: {e}"),
                         };
-                        // Issue #358: the pty now runs the successor, but the
-                        // seat is only committed once that successor has
-                        // actually answered -- watched from the tick below,
-                        // never blocked on here (a blocking probe would
-                        // freeze the operator's own terminal).
-                        // T4 (C-3): only a manual request has a `zirv ctx
-                        // handover` process waiting on an ack -- writing one
-                        // for an automatic rollover leaves a stale `ok: true`
-                        // on disk that the operator's NEXT handover would
-                        // read as an answer to its own request. Same
-                        // manual/automatic discriminator the refusal arm
-                        // above already uses.
+                        // Commit only after the successor answers, without
+                        // blocking the terminal. Only manual requests get a
+                        // waiting-process acknowledgment. (#358)
                         if let Some(generation) = req.generation {
                             pending_rollover = Some(PendingRollover {
                                 generation,
@@ -467,13 +360,8 @@ pub(super) fn pump(
                     }
                     Err(e) => {
                         let reason = e.to_string();
-                        // Issue #358: the transaction is closed against the
-                        // successor that failed, so `seat::abort`'s own visit
-                        // record keeps the next evaluation at this same epoch
-                        // from picking it again.
-                        // T4 (C-3): as in the refusal arm above -- an automatic
-                        // rollover closes its own transaction and has nobody
-                        // waiting on an ack; only a manual request writes one.
+                        // Abort against the failed successor to avoid choosing
+                        // it again this epoch; only manual requests need ack. (#358)
                         if let Some(generation) = req.generation {
                             let _ = super::rollover::fail(
                                 state_dir,
@@ -525,11 +413,8 @@ pub(super) fn pump(
             }
         }
 
-        // Issue #358 (task 5): the open rollover transaction's readiness
-        // watch. Purely local state (a signal count, two instants), so it is
-        // cheap enough for the ordinary tick and never blocks the pty pump.
-        // Reaching this line at all means the child is alive: the loop's own
-        // `try_wait` arm above returns before it otherwise.
+        // Watch successor readiness using local state on the ordinary tick;
+        // never block the pty pump. (#358)
         if let Some(pending) = pending_rollover.as_ref() {
             let readiness = super::rollover::successor_readiness(
                 true,
@@ -556,15 +441,9 @@ pub(super) fn pump(
                     pending_rollover = None;
                 }
                 super::rollover::Readiness::TimedOut => {
-                    // DEVIATION (documented): wrap quits the predecessor
-                    // before it can launch the successor, so unlike
-                    // `Pane::handover` there is no source left to restore --
-                    // and killing a live-but-silent successor here would end
-                    // the operator's session outright, which `wrap` may never
-                    // do. The transaction is aborted (recording the visit, so
-                    // the next evaluation tries the NEXT candidate) and the
-                    // seat is re-registered onto the successor that is in
-                    // fact running, so the record still describes reality.
+                    // The predecessor is gone, so a silent but live successor
+                    // cannot be killed without ending the operator session.
+                    // Abort the transaction and register the running successor. (#358)
                     let now_secs = super::state::now_secs();
                     let _ = super::rollover::fail(
                         state_dir,
@@ -595,11 +474,7 @@ pub(super) fn pump(
             }
         }
 
-        // T12b: ticks on the ordinary ~100ms poll, so the bar still
-        // refreshes (usage, mail, a still-degrading session) both right
-        // after a turn signal and during a long turn with none at all.
-        // `redraw_bar_if_due` is what actually enforces the 1s throttle and
-        // the no-op-when-unchanged check; this call is cheap otherwise.
+        // Tick frequently; redraw itself throttles disk reads to one second.
         redraw_bar_if_due(bar, supervision, state_dir, repo, Instant::now());
 
         let action = match action_for(supervision, Instant::now(), debounce) {
@@ -634,7 +509,6 @@ pub(super) fn pump(
                     score: supervision.score,
                     tokens: 0,
                 });
-                // Advise once per turn.
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
             }
             Action::Compact => {
@@ -643,14 +517,8 @@ pub(super) fn pump(
                     supervision.signals_seen,
                 );
                 let defer = adapter.capabilities().defer_injection_submit;
-                // Issue #798 (`[jev] compaction_select`): best-effort, off by
-                // default -- `compaction_focus_for_transcript` checks the
-                // gate and credential BEFORE touching the transcript at all
-                // (review of 6bdd7675, defect #1), so with the gate off
-                // (today's default) this never reads or parses the
-                // transcript inline in the pump loop, and with the gate on
-                // it bounds the Jev call so it cannot stall the pump for the
-                // full configured typesafe timeout.
+                // Gate and bound Jev selection before reading a transcript
+                // on the pty pump path. (#798)
                 let compact_focus = handoff::compaction_focus_for_transcript(
                     cfg,
                     state_dir,
@@ -668,13 +536,10 @@ pub(super) fn pump(
                             .map_err(|e| e.to_string())
                     });
 
-                // Arm the cooldown before verifying so a failed verification
-                // cannot turn into a retry loop.
+                // Arm cooldown before verification to prevent retry loops.
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
 
-                // No transcript means no verification is possible, and a
-                // deadline spent polling a file nobody writes would block the
-                // pump for nothing.
+                // Without a transcript, verification cannot succeed.
                 let failure = match (injected, transcript.path()) {
                     (Err(_), _) => Some("compact injection failed"),
                     (Ok(()), None) => Some("no transcript reported, compaction unverifiable"),
@@ -731,12 +596,8 @@ pub(super) fn pump(
                     supervision.signals_seen,
                 );
 
-                // Before anything is torn down: a restart chain that has
-                // already tripped means this session is in a loop that
-                // relaunching will not break, so `wrap` stands down to plain
-                // passthrough (the child keeps running, untouched) rather than
-                // spending another distiller call and another pty on it. Same
-                // breaker `exec` gates on -- see `tripped_restart_chain`.
+                // A tripped restart chain degrades to passthrough without
+                // touching the child or spending another distillation.
                 if let Some(boots) =
                     tripped_restart_chain(state_dir, repo, cfg, super::state::now_secs())
                 {
@@ -768,18 +629,8 @@ pub(super) fn pump(
                     break 'restart;
                 }
 
-                // P5: park the record on zirv's own (unquestionably alive) pid
-                // for the duration of the restart. Everything from here to the
-                // respawn below -- the distiller call, `quit_child`'s grace
-                // ladder, the fresh pty -- happens while the *old* child is
-                // being killed, and `sessions::list` sweeps any record whose
-                // pid is dead. That listing runs on other processes' schedules
-                // (`zirv ctx status`, `nudge`, `send --to-session`, a
-                // dashboard's own ~1s registry refresh), so leaving the record
-                // pointing at the child being killed meant a concurrent reader
-                // could delete this very much live session's record mid-restart
-                // and strand every message addressed to it. The real child pid
-                // is adopted again the moment there is one.
+                // Park the record on zirv during restart; concurrent liveness
+                // sweeps must not delete a live session while its child exits.
                 session_guard.adopt_child_pid(std::process::id());
 
                 let jsonl = transcript
@@ -802,10 +653,8 @@ pub(super) fn pump(
                     previous.as_ref(),
                 );
                 let stored = handoff::store(state_dir, repo, session.as_str(), &note);
-                // N6: opt-in (`cfg.memory.harvest`, default off) and only
-                // from a genuinely distilled handoff -- never the mechanical
-                // structural fallback. Best-effort: a harvest failure must
-                // never turn a successful restart into a failed one.
+                // Harvest only enabled, genuinely distilled handoffs; failure
+                // cannot turn a successful restart into an error.
                 if source == "distilled" {
                     let _ = super::memory::harvest_durable(
                         adapter.as_ref(),
@@ -818,24 +667,12 @@ pub(super) fn pump(
                     );
                 }
 
-                // The writer is taken first, and the generation is bumped only
-                // once this restart is genuinely under way. The two used to be
-                // the other way round, which meant a poisoned writer -- the
-                // one way `quit` can fail -- left the generation bumped over a
-                // child that had never even been asked to quit: `relaunched`
-                // stayed false, the pump fell through to `child.wait()`, and
-                // the old reader thread's `still_current` was already false, so
-                // that very much alive TUI painted to nobody for the rest of
-                // the run.
+                // Lock the writer before advancing generation; a failed lock
+                // must leave the current child's reader active.
                 let (new_generation, quit) = match writer.lock() {
                     Ok(mut sink) => {
-                        // Bumped before the old child is even asked to quit:
-                        // its reader thread's own EOF can land at any point
-                        // from here on (quit_child alone may take up to
-                        // `grace`), and once bumped that thread's
-                        // `still_current` check is already false, so a pty
-                        // closing on its way out can never be mistaken for the
-                        // fresh one that is about to replace it.
+                        // Advance generation before quitting the old child so
+                        // its EOF cannot masquerade as the successor's.
                         let bumped =
                             generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let quit = quit_child(&mut *sink, child, adapter.quit_sequence(), grace)
@@ -845,15 +682,10 @@ pub(super) fn pump(
                     Err(_) => (None, Err("pty writer poisoned".to_string())),
                 };
 
-                // That session is over. Whatever it was writing is now a dead
-                // file, and the replacement reports its own on its first turn.
+                // A replacement reports on its own transcript file.
                 transcript.forget();
 
-                // Item 6 audit: captured so `note_failure`'s own announcement
-                // can name *why* the restart failed -- quit/writer-lock
-                // trouble, or the fresh pty/spawn itself -- rather than the
-                // same generic "relaunch failed" either way. Neither error
-                // used to be kept past this match at all.
+                // Preserve the relaunch failure reason for the announcement.
                 let mut relaunch_error = quit.as_ref().err().cloned();
                 let relaunched = match (new_generation, quit.is_ok()) {
                     (Some(new_generation), true) => {
@@ -879,35 +711,22 @@ pub(super) fn pump(
                                 if let Ok(mut sink) = writer.lock() {
                                     *sink = fresh_writer;
                                 }
-                                // A CR still owed to the replaced child must
-                                // not be typed into the fresh one (same rule
-                                // as the handover swap above).
+                                // Do not send an owed submit to a replacement
+                                // that never received its text.
                                 mail_watch.clear_pending_submit();
-                                // The fresh pty ran its own console-host probe,
-                                // so the terminal is about to answer that one
-                                // too; see `CprFilter`.
+                                // Re-arm the console probe filter for this pty.
                                 if let Ok(mut filter) = cpr_filter.lock() {
                                     filter.arm(Instant::now());
                                 }
                                 *pair = fresh_pair;
                                 *child = fresh_child;
-                                // P1/P2/P3: the old child was tree-killed by
-                                // `quit_child` above, so releasing its guard
-                                // now only takes it out of the console-close
-                                // registry and closes a job with nothing left
-                                // in it. Released *before* the new adoption
-                                // so a pid the OS has already recycled cannot
-                                // be deregistered out from under the fresh
-                                // child.
+                                // Release the old guard before adopting the
+                                // new pid, which the OS may have recycled.
                                 child_guard.release();
                                 *child_guard =
                                     super::supervise::ChildGuard::adopt(child.process_id());
-                                // P5: and the registry record follows the
-                                // child it names. Left pointing at the
-                                // replaced child's dead pid, `sessions::list`
-                                // would sweep the record and this very much
-                                // live session would disappear from `zirv ctx
-                                // status`.
+                                // Point the record at the fresh child before
+                                // a liveness sweep sees the old pid.
                                 if let Some(child_pid) = child.process_id() {
                                     session_guard.adopt_child_pid(child_pid);
                                 }
@@ -962,9 +781,8 @@ pub(super) fn pump(
                 if !relaunched {
                     let status = child.wait()?;
                     let code = status.exit_code() as i32;
-                    // The `Degraded` announcement just above already said
-                    // *why* (the relaunch failure reason); this says the
-                    // session is over, the same as every other exit point.
+                    // The prior announcement gave the failure reason; now
+                    // report session end.
                     announcer.emit(&Event::SessionEnded {
                         agent: adapter.name().to_string(),
                         code,
@@ -974,20 +792,9 @@ pub(super) fn pump(
             }
         }
 
-        // T13: the live mail wake-up.
-        //
-        // Deliberately *after* the escalation ladder above: a compaction or
-        // restart that just fired armed `cooldown_at_signal`, which makes
-        // `may_inject` false here, so this arm falls back to the
-        // announcement channel rather than typing a second line into a child
-        // that was just handed a `/compact`. The existing cooldown is the
-        // mutual exclusion; nothing extra is needed for it.
-        //
-        // Every failure here is a no-op by construction: an unreadable
-        // mailbox yields `None` and nothing happens, a poisoned writer
-        // degrades to the announcement channel, and neither ever calls
-        // `note_failure` -- mail is advisory, and a wrapped session must
-        // never be made worse by it.
+        // Run after escalation: cooldown prevents an advisory from being
+        // typed into a child just given compact or restart. Mail failures
+        // remain advisory and never degrade the session.
         let now = Instant::now();
         if mail_polling_enabled(bar.mail_enabled, &bar.session_short, supervision.degraded)
             && mail_watch.due(now)
@@ -1002,15 +809,8 @@ pub(super) fn pump(
             ) {
                 let facts = mail_facts(&unread);
                 mail_watch.forget_missing(&facts);
-                // A signal-less adapter (codex today) never satisfies
-                // `may_inject`'s own `signals_seen > 0` precondition -- see
-                // `signal_less_mail_ready`'s own doc comment. `cfg.dash.
-                // idle_quiet_ms` is reused rather than a new wrap-only knob:
-                // it already means exactly "how long a signal-less session's
-                // pty must be quiet before zirv treats it as idle", the same
-                // question this is, and it is already an operator-only,
-                // non-`REPO_FORBIDDEN` timing knob over a session the
-                // operator chose to run interactively.
+                // Signal-less adapters use the configured idle quiet interval
+                // as their injection gate.
                 let caps = adapter.capabilities();
                 let ready = mail_inject_ready(
                     caps.turn_signal,
@@ -1046,8 +846,6 @@ pub(super) fn pump(
                         ),
                         ..Default::default()
                     };
-                    // Held exactly as an unready child would be: announced
-                    // on the `zirv ▸` channel, injection still owed.
                     if inject_gate.check(
                         cfg,
                         state_dir,
@@ -1063,32 +861,19 @@ pub(super) fn pump(
                 match action {
                     MailAction::None => {}
                     MailAction::Announce { count, ids } => {
-                        // R5: `try_emit`, not `emit` -- an advisory the
-                        // channel swallowed must stay unannounced so the next
-                        // poll retries it. See `MailWatch::note_announcement`.
+                        // Only a landed announcement can clear its retry.
                         let landed = announcer.try_emit(&Event::MailWaiting { count });
                         mail_watch.note_announcement(&ids, landed);
                     }
-                    // Issue #118: single-burst for a turn-signal-capable
-                    // adapter (claude); `inject_compact` above now shares
-                    // this same capability-gated two-phase shape, for the
-                    // same reason -- see that function's own doc comment.
-                    // For a `defer_injection_submit` adapter (codex)
-                    // `write_mail_advisory` splits this into a phase-1 write
-                    // and a deadline the drain just below this match
-                    // submits later; either way `commit_injected` fires on
-                    // `wrote` alone, i.e. at phase 1, the same "advised"
-                    // moment `dash::pane::inject_visible` already commits
-                    // its own state at.
+                    // Commit a split advisory when text lands; its submit
+                    // follows on a later pump tick. (#118)
                     MailAction::Inject {
                         count,
                         from_agent,
                         from_short,
                         ids,
                     } => {
-                        // Issue #249: `from_short` is already `sessions::
-                        // short_id`'s own vocabulary (`mail_facts`), the
-                        // same one `parent_short` is in -- a direct compare.
+                        // Both ids use the registry short-id vocabulary. (#249)
                         let is_parent = parent_short.is_some_and(|p| p == from_short);
                         let wrote = write_mail_advisory(
                             &mut mail_watch,
@@ -1106,9 +891,8 @@ pub(super) fn pump(
                                 supervision.signals_seen,
                             );
                         } else {
-                            // Same R5 rule on the degrade path: a poisoned
-                            // writer plus a swallowed announcement must leave
-                            // the advisory owed, not quietly discharged.
+                            // A failed writer and announcement leave the
+                            // advisory owed.
                             let landed = announcer.try_emit(&Event::MailWaiting { count });
                             mail_watch.note_announcement(&ids, landed);
                         }
@@ -1117,14 +901,8 @@ pub(super) fn pump(
             }
         }
 
-        // Issue #118: drains a still-owed mail-advisory `\r`
-        // (`MailWatch::pending_submit`) once its deadline has passed --
-        // unconditioned by `mail_polling_enabled`/`mail_watch.due` above,
-        // because this is finishing a write an earlier tick already
-        // committed (`commit_injected` already fired at phase 1), not a new
-        // poll, so it must not wait on either gate. A failed write here is
-        // safe to simply retry on a later tick -- see
-        // `dash::pane::write_submit_cr`'s own doc comment.
+        // Finish an owed submit independently of new mail polling; failed
+        // writes remain retryable on later ticks. (#118)
         if mail_watch.pending_submit_due(Instant::now())
             && let Ok(mut sink) = writer.lock()
             && super::dash::pane::write_submit_cr(&mut *sink).is_ok()
@@ -1136,11 +914,8 @@ pub(super) fn pump(
             && size != last_size
         {
             last_size = size;
-            // B1: `chrome::resize_decision` is the single source of truth for
-            // what a resize does to the bar and the pty -- see its own tests
-            // for the shrink-below-floor and widen-after-degrade cases this
-            // used to get wrong (the child pinned at a stale reserved size
-            // forever, even once the terminal widened back out).
+            // One resize decision governs both bar and pty dimensions,
+            // including recovery after degradation.
             let decision = super::chrome::resize_decision(bar.active(), size);
             if decision.disables_bar {
                 disable_bar_at_current_size(bar, size);
@@ -1159,13 +934,8 @@ pub(super) fn pump(
                     Err(_) => false,
                 };
                 bar.disabled = super::chrome::after_redraw_attempt(bar.disabled, region_ok);
-                // C5: set on success, never *cleared* on failure. A resize
-                // whose region write failed leaves whatever region was
-                // already in effect still fencing the console, so clearing
-                // the flag here would tell the emergency handler it owes the
-                // terminal nothing while the terminal was still fenced.
-                // `BAR_ACTIVE` means "we have set a region that is still
-                // outstanding", and only a successful `reset_bar` retires it.
+                // A failed resize may leave the old scroll region active;
+                // only successful reset clears the emergency-reset flag.
                 if region_ok {
                     super::term::set_bar_active(true);
                 }
@@ -1183,12 +953,7 @@ pub(super) fn pump(
             });
         }
 
-        // B1: catches a disable that just happened above (this tick's
-        // resize shrank below the floor) *and* one that happened earlier
-        // with no resize event at all (a redraw or lock failure) -- either
-        // way, `bar_needs_recovery` makes this a one-time, idempotent
-        // reaction, so calling it unconditionally every tick is cheap and
-        // correct in both cases.
+        // Recover once whether resize or redraw disabled the bar.
         recover_bar_to_full_size(bar, pair, last_size);
 
         std::thread::sleep(PUMP_POLL);

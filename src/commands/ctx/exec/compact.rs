@@ -20,9 +20,8 @@ pub(crate) fn action_for_verdict(
     }
 }
 
-/// Maps a turn signal to an action only when it belongs to this supervisor's
-/// current session. The socket name is short enough that a stale hook can
-/// reach it, so ownership remains the first and non-negotiable gate.
+/// Reject stale turn signals before deciding any action; socket names alone
+/// do not prove session ownership.
 pub fn action_for_signal(
     adapter: &dyn adapters::AgentAdapter,
     signal: &TurnSignal,
@@ -34,8 +33,8 @@ pub fn action_for_signal(
     action_for_verdict(adapter, signal.verdict)
 }
 
-/// One bounded in-place attempt per cooldown window, and never another until
-/// the resumed conversation has reported progress after the previous attempt.
+/// One bounded attempt per cooldown, followed by reported progress before
+/// another attempt.
 #[derive(Debug, Default)]
 pub(crate) struct CompactBudget {
     attempted_at: Option<Instant>,
@@ -62,10 +61,8 @@ impl CompactBudget {
     }
 }
 
-/// A provider-limit notice discovered by the final output drain outranks a
-/// compaction requested by the preceding supervision tick. The limit path
-/// parks or hands over; compacting and continuing here would discard that
-/// evidence and immediately spend the exhausted seat again.
+/// A final-drain provider limit outranks compaction; continuing would
+/// spend the exhausted provider again.
 pub(crate) fn should_attempt_compact(compact_requested: bool, limit_hit: bool) -> bool {
     compact_requested && !limit_hit
 }
@@ -142,33 +139,9 @@ where
     let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt)
         .map_err(|error| format!("compact command failed to start: {error}"))?;
     let poll = poll.max(Duration::from_millis(10));
-    // Round 4 bug 2: a real ~150k-token compaction ran past the single flat
-    // deadline `compact_in_place` used to wait on the compact child's exit
-    // (20s, `cfg.wrap.inject_timeout_ms` -- a value meant for `wrap`'s
-    // interactive nudge injection, not for a whole model turn's worth of
-    // headless compute), so zirv killed a compaction that was actively making
-    // progress.
-    //
-    // The fix used to be a transcript-growth "stall" clock reset on every
-    // observed byte -- but a single headless compaction turn appends NOTHING
-    // to the transcript until the whole turn completes, so that clock could
-    // just as easily kill a real, healthy compaction that simply has not
-    // written anything back yet. There is no reliable mid-turn liveness
-    // signal for a single headless child, so the child's exit is bounded by
-    // `hard_timeout` alone (`SuperviseConfig::compact_timeout_ms`, default 10
-    // minutes, REPO_FORBIDDEN so a repo cannot weaken it) and `on_tick` never
-    // asks to stop early.
-    // F4 (codex review fix): one deadline covers the whole call -- the
-    // compact child's own exit AND the verification that follows -- rather
-    // than each phase getting its own fresh `Instant::now() + hard_timeout`.
-    // A compact child that takes close to the full `hard_timeout` to exit
-    // used to hand verification an entirely new, equally long window on top
-    // of that, so a real (if slow) compaction could block this call for
-    // close to twice `hard_timeout`. `verify_compaction`'s own loop already
-    // treats a deadline that has already passed as "not verified" rather
-    // than erroring, so a child that consumed nearly the whole budget just
-    // exiting correctly leaves little to no time to verify, instead of a
-    // second full window.
+    // A headless compaction may emit no transcript bytes until completion,
+    // so only one hard deadline may bound child exit and verification.
+    // Early silence cannot prove a stall.
     let deadline = Instant::now() + hard_timeout;
     let outcome = supervise::supervise_child(&mut child, deadline, poll, &mut || Tick::Continue)
         .map_err(|error| format!("compact command failed: {error}"))?;

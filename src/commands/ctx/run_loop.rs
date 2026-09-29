@@ -14,10 +14,9 @@ use super::{CtxResult, adapters, handoff, jev, judge, log, mail, objective, scor
 
 /// Repeated cycle failures, escalated to the caller.
 pub const EXIT_FAILED: i32 = 75;
-/// Issue #314: the judge called the objective `blocked`.
+/// Objective judge reported blocked. (#314)
 pub const EXIT_OBJECTIVE_BLOCKED: i32 = 76;
-/// Issue #314: `[objective] max_cycles_without_progress` consecutive
-/// no-progress cycles.
+/// Consecutive no-progress cycles exceeded the objective limit. (#314)
 pub const EXIT_OBJECTIVE_NO_PROGRESS: i32 = 77;
 
 #[derive(Debug, clap::Args)]
@@ -47,9 +46,6 @@ pub struct LoopArgs {
     #[arg(long)]
     pub cycles: Option<u32>,
     /// Extra arguments passed through to the agent.
-    //
-    // `allow_hyphen_values`, because what gets passed through here is the
-    // agent's own flags: `--extra --model --extra opus`.
     #[arg(long, allow_hyphen_values = true)]
     pub extra: Vec<String>,
     /// Simple run: skip every zirv-injected instruction, including the shipped
@@ -76,19 +72,8 @@ pub fn resolve_prompt(args: &LoopArgs) -> CtxResult<String> {
     Err("no prompt: pass --prompt or --prompt-file".into())
 }
 
-/// Whether this cycle's own headless launch reparses its downstream argv on
-/// a Windows launcher -- `cmd.exe /c <shim>` (an npm-installed `.cmd`) or
-/// `powershell -NoProfile -File <script>` (a `.ps1`) -- so the prompt has to
-/// go on stdin instead of argv (FIX B). `adapter.launches_through_cmd_shim()`
-/// only recognises the `cmd.exe` form; probing the real launcher prefix this
-/// cycle's headless spawn will use (`headless_cmd("", ...)`, no prompt token
-/// yet) and asking `adapters::launch_reparses_through_shim` covers both,
-/// matching the M1 fix `dash/mod.rs`'s `task_prompt_fallback_is_safe` made
-/// for the pty path. Split out for the same reason that one was: testable
-/// without spawning anything. Mirrors `exec.rs`'s own `prompt_delivery_via_
-/// stdin` (not shared: the two modules' `Command`-building context differs
-/// enough -- `extra` here, none there -- that a shared helper would need
-/// its own extra parameter for the one caller that has it).
+/// Windows cmd and PowerShell launchers reparse argv, so this cycle's
+/// prompt must go on stdin for those launch shapes.
 fn prompt_delivery_via_stdin(
     adapter: &dyn super::adapters::AgentAdapter,
     session: &SessionId,
@@ -98,8 +83,7 @@ fn prompt_delivery_via_stdin(
     super::adapters::launch_reparses_through_shim(&probe)
 }
 
-/// T11: real-clock wrapper, identical role to `exec::run_with`'s own -- see
-/// that function's doc comment.
+/// Use the real clock for production loop pacing.
 pub fn run_with<W: Write>(
     args: &LoopArgs,
     w: &mut W,
@@ -116,8 +100,7 @@ pub fn run_with<W: Write>(
     )
 }
 
-/// T11 (sleep injection): see `exec::run_with_clock`'s own doc comment --
-/// same fix, same reason, applied here for `loop`'s own pacing gate calls.
+/// Inject sleep for deterministic pacing tests.
 pub(crate) fn run_with_clock<W: Write>(
     args: &LoopArgs,
     w: &mut W,
@@ -137,12 +120,7 @@ pub(crate) fn run_with_clock<W: Write>(
     )
 }
 
-/// Issue #690 (remaining scope): [`run_with_clock`] with the launch
-/// pre-flight's presence oracle injected -- see `exec::run_with_clock_and_
-/// presence`'s own doc comment, same seam, same reason. `loop` always builds
-/// its own launch from the adapter (`adapter.headless_cmd`, never an
-/// operator-supplied argv), so unlike `exec` it needs no second condition
-/// before the pre-flight applies.
+/// Inject the presence oracle; loop always builds an adapter launch. (#690)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_clock_and_presence<W: Write>(
     args: &LoopArgs,
@@ -162,33 +140,16 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
-    // Issue #690 (remaining scope): the same launch pre-flight `exec` runs,
-    // for the same reason -- every cycle below opens with `pace::wait_for_
-    // window`, whose blind-mode safety delay and usage refresh (macOS
-    // Keychain included) have nothing to pace when there is no program to
-    // launch. Unconditional here: this supervisor's spawn is always
-    // `adapter.headless_cmd`, never an operator's own argv.
+    // Refuse a missing adapter program before pacing or usage I/O. (#690)
     adapters::refuse_if_program_absent_with_presence(adapter.as_ref(), &cfg, present)?;
-    // The pinned model this run actually launches with, if an operator's own
-    // `--extra -- --model <name>` (or codex's `-m` alias) names one -- the
-    // same `last_model_flag` scan `exec::run_with_clock_inner` uses for its
-    // own `execution_model`. Resolved once here, since `args.extra` never
-    // changes across cycles, and reused by every `provider_for_model` call
-    // below so this loop's usage/pacing state files under the account this
-    // pinned model actually spends rather than the adapter's static default.
+    // Bucket usage by the model actually pinned in operator flags.
     let cycle_model = adapters::last_model_flag(&args.extra);
     let state = StateDir::resolve(env)?;
-    // Issue #249: this loop's own supervising session, if any -- resolved
-    // once, from `env` alone, and reused for every cycle's mail rendering.
+    // Resolve the supervising session once from this launch environment. (#249)
     let parent_short = super::agent::parent_identity(env);
 
-    // Issue #285: `--objective` sets (or replaces) this repository's durable
-    // objective once, before the first cycle -- a shorthand for `zirv ctx
-    // objective set`. Set here, outside the `loop {}` below, so a long run
-    // does not reset `spent_tokens` to zero on every cycle: each cycle's own
-    // `compile::compile` call (further down) reloads the SAME durable
-    // record fresh from disk, which is how the objective layer's live
-    // counters reach every cycle without this needing to re-set anything.
+    // Set the durable objective once; each cycle reloads live progress
+    // rather than resetting accumulated spend. (#285)
     if let Some(text) = &args.objective {
         let key = super::state::repo_slug(repo);
         let record = objective::Objective {
@@ -213,48 +174,23 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
 
     let mut cycle = 0u32;
     let mut failures = 0u32;
-    // One registry record for the whole run, refreshed (not re-registered)
-    // each cycle since every cycle mints a fresh session id -- see
-    // `SessionGuard::refresh_session`. `None` until the first cycle actually
-    // has a session to register. Released explicitly at every arm that
-    // leaves this loop, matching the explicit-arm discipline `RawGuard`
-    // follows under this binary's `panic = "abort"` release profile.
+    // Keep one registry record across cycles and release explicitly on exit;
+    // panic = "abort" makes Drop unreliable for cleanup.
     let mut session_guard: Option<super::sessions::SessionGuard> = None;
-    // C7: this run's stable delivery address. The first cycle's short id
-    // becomes the registry key and stays put for the whole run (see
-    // `SessionGuard::refresh_session`), so `None` here only for the window
-    // before the first cycle has registered -- in which case this cycle's
-    // own short *is* the address about to be registered.
+    // Keep one stable mail and nudge address while session ids rotate.
     let mut registry_short: Option<String> = None;
-    // Item 10: owned across every cycle, so the no-usage-source skip line
-    // (pace.rs's own `wait_for_window`) prints once for the whole run
-    // rather than once per cycle.
+    // Deduplicate pacing and screening notices across cycles.
     let mut pace_flags = pace::PaceGateFlags::default();
     let http_poller = super::poll::HttpPoller::new(cfg.chrome.events);
-    // Issue #243 (review round, F4): owned across every cycle too, so a
-    // screening summary that has not changed since the last poll is
-    // announced once for the whole run, not once per cycle.
     let mut screening_announced: Option<String> = None;
-    // Issue #314: the objective completion-judge's own progress tracker,
-    // owned across every cycle -- see `judge::progress_made`'s own doc
-    // comment for what "progress" means. `None` until the first cycle this
-    // run has actually evaluated an objective for.
+    // Keep objective progress across cycles. (#314)
     let mut objective_progress = ObjectiveProgress::default();
-    // Issue #311: this run's own self-pacing memory, owned across every
-    // cycle the identical way `objective_progress` right above is --
-    // `Some` only when self-pacing is engaged at all (no explicit
-    // `--interval`, the opt-in condition the design calls for), so an
-    // explicit `--interval` run carries `None` for its whole life and
-    // `handle_cycle_outcome` is byte-for-byte what it was before this issue.
+    // Self-pacing state exists only without an explicit interval. (#311)
     let mut self_pace_state = args
         .interval_secs
         .is_none()
         .then(|| SelfPaceState::new(interval));
-    // Issue #358 (T9): true for exactly the first trip through this loop --
-    // the pre-launch call that decides whether a brand-new worker gets to
-    // start at all. Cleared unconditionally right after that first call, so
-    // every later trip (an ordinary cycle, or resuming after an objective
-    // park) paces normally instead of being read as another fresh launch.
+    // Only the first cycle skips pre-launch pacing; resumes are continuations. (#358)
     let mut initial_launch = true;
     let mut last_unread_counts = None;
     loop {
@@ -294,14 +230,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
         initial_launch = false;
 
         let mail_slug = super::state::repo_slug(repo);
-        // Recomposed every cycle -- the same seam as `injection_args_for_
-        // session` a few lines down -- because each cycle is a fresh,
-        // stateless session: it must pick up whatever mail has arrived since
-        // the previous cycle, not a snapshot taken once before the loop
-        // started. Issue #44: `compile::compile` also re-reads the memory
-        // bank fresh every call (N5's own reasoning -- a fact remembered or
-        // verified since the previous cycle must be picked up too), adds the
-        // canonical `.zirv/context/` layer, and attaches the policy report.
+        // Recompose each stateless cycle so newly arrived mail, memory,
+        // and context reach it. (#44)
         let composed = super::compile::compile(
             crate::utils::home_dir().ok().as_deref(),
             repo,
@@ -315,30 +245,11 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             true,
         )
         .composed;
-        // A fresh session id per cycle is the whole point: the orchestrator
-        // never accumulates context across cycles. Minted here, ahead of
-        // mail listing and the nudge-marker check below, both of which need
-        // it.
+        // Mint the cycle id before scoped mail and nudge checks.
         let session = SessionId::new_v4();
         let session_short = super::sessions::short_id(session.as_str());
-        // C7: scoped to this run's stable registry address. `loop` used to
-        // pass `None` here -- "no session filter at all" -- because its
-        // session id rotated every cycle and a directed message would
-        // otherwise become unaddressable the moment the next cycle started.
-        // The cost was that a `loop` swallowed and consumed mail addressed
-        // to *other* sessions entirely: `None` means every directed message
-        // in the repo is visible, and delivery consumes what it lists.
-        // Now that the registry short is stable for the whole run
-        // (`SessionGuard::refresh_session`), the narrow filter gives both
-        // properties at once -- this run's own directed mail stays
-        // addressable across cycles, and nobody else's is touched.
-        //
-        // `mut`: drained right after this cycle's own spawn actually
-        // succeeds (Item 3), not here -- a launch that fails to spawn, or a
-        // pacing park ahead of it, must not move mail to `read/` before any
-        // session has actually started to see it. `loop` always owns a task
-        // prompt channel, so mail remains deliverable even when `--simple`
-        // suppresses the composed system prompt.
+        // Filter by stable registry address so other sessions' directed
+        // mail cannot be read or consumed. Consume only after spawn.
         let mut mail_entries: Vec<(PathBuf, super::mail::Message)> = if cfg.mail.enabled {
             let for_session =
                 super::sessions::delivery_filter(registry_short.as_deref(), &session_short);
@@ -365,13 +276,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 count: mail_messages.len(),
             });
         }
-        // An adapter with no system-prompt injection mechanism never reaches
-        // `injection_args_for_session`'s output at all -- folding mail into
-        // `composed` for one only would silently destroy it, so it is
-        // instead appended straight onto the task prompt text below
-        // (`task_prompt_with_mail_fallback`), the one channel such an
-        // adapter does have. A capable adapter (claude) is unaffected: this
-        // still folds mail into `composed` exactly as before.
+        // Adapters without system-context injection receive mail through
+        // task prompt text instead.
         let system_prompt_supported = adapter.system_prompt_supported(&[]);
         let composed = if system_prompt_supported {
             super::prompt::with_mail_layer(
@@ -403,7 +309,6 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             Some(guard) => guard.refresh_session(session.as_str()),
             None => {
                 registry_short = Some(session_short.clone());
-                // Issue #139: see `wrap.rs::run_with`'s identical comment.
                 let safety_policy_sha256 = super::safety::policy_fingerprint(&cfg.safety).ok();
                 session_guard = Some(super::sessions::SessionGuard::register(
                     &state,
@@ -417,9 +322,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 ));
             }
         }
-        // M7: rebuilt per cycle because the private prompt file is named after
-        // the session it belongs to, and every cycle is a new session. The
-        // adapter builds this launch itself, so the probe gets an empty argv.
+        // Rebuild the private prompt path for each fresh session.
         let prompt_args = super::prompt::injection_args_for_session(
             adapter.as_ref(),
             &[],
@@ -427,15 +330,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             &state,
             session.as_str(),
         )?;
-        // Bug B (harness/model parity, 2026-08-22): the same seam every real
-        // launch now calls (`adapters::policy_launch_args`) -- the shipped-
-        // default "sandboxed, no prompts" posture plus any explicit
-        // `[policy]` restriction, recomputed every cycle since `loop` is a
-        // fresh, stateless session each time and `user_extra` (the operator's
-        // own trailing flags) can itself change cycle to cycle if the
-        // operator's own config did. `flags_pin_policy` reads `user_extra`,
-        // so an operator's own `--sandbox`/`--ask-for-approval`/
-        // `--permission-mode`/`--disallowedTools` still wins.
+        // Resolve policy every cycle; explicit operator flags win.
         let policy_extra = adapters::policy_launch_args(
             &cfg,
             adapter.as_ref(),
@@ -443,10 +338,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             adapters::LaunchMode::Headless,
             super::prompt::PromptRole::Worker,
         );
-        // Visible, not silent: announced every cycle, the same "at every
-        // session start" discipline the M2 injection-attribution comment
-        // just below already follows -- each `loop` cycle genuinely is a
-        // fresh session, so this is not a repeat of the same announcement.
+        // Announce policy for each new session.
         announcer.emit(&super::announce::Event::SandboxPosture {
             detail: if policy_extra.is_empty() {
                 "not applied (operator flags or [sandbox] enabled = false)".to_string()
@@ -454,10 +346,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 super::announce::posture_detail(&policy_extra)
             },
         });
-        // Issue #420: same seam as every other supervisor-start launch path
-        // -- heal any self-healable (`Outdated`) hook entry, then warn at
-        // most once per 24h if something still drifted. Best-effort: no
-        // home directory is not a reason to fail the launch.
+        // Heal hooks best-effort; unavailable home state cannot fail launch. (#420)
         if let Ok(home) = crate::utils::home_dir() {
             let _ = super::hook_integrity::heal_outdated(&state, &home);
             if let Some(summary) = super::hook_integrity::drift_warning_if_due(&state, &home) {
@@ -478,9 +367,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             &extra,
         );
         super::mcp::launch::append(&mut extra, mcp_args);
-        // M2: README promises injection attribution "at every session start",
-        // and every cycle is a new session, so the entry is written here under
-        // that cycle's own id rather than once under a literal "loop".
+        // Attribute injected context under each cycle's id.
         super::prompt::log_injection(
             &state,
             "loop",
@@ -507,10 +394,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
         let mail_in_composed = composed
             .as_ref()
             .is_some_and(|prompt| prompt.sources.contains(&super::prompt::PromptSource::Mail));
-        // Mail is the one composed layer that still has somewhere to go for
-        // an adapter with no system-prompt mechanism: the task prompt text
-        // itself. A capable adapter (claude) gets the unchanged `prompt`
-        // back, since its mail already rode the `composed` fold above.
+        // Task text carries mail for adapters without system-context injection.
         let prompt = super::prompt::task_prompt_with_mail_fallback(
             &prompt,
             (system_prompt_supported && composed.is_some()) || mail_in_composed,
@@ -522,18 +406,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             super::obfuscate_store::protect_text(&state, repo, &cfg, &prompt, "loop_task_prompt")?
                 .0;
 
-        // FIX B: on a Windows npm `.cmd` shim launch, cmd.exe reparses the
-        // downstream argv, so the prompt is delivered on stdin instead of as
-        // the `-p <prompt>` argv token. Off Windows and for a direct `.exe` it
-        // stays on argv, so `sh`-based fake-agent cycles are unchanged.
-        //
-        // Final wave item 1: `adapter.launches_through_cmd_shim()` only
-        // recognises `cmd.exe /c <shim>`; a `.ps1`-resolved `agent_bin` still
-        // reached a `powershell -File` launch with the prompt on the
-        // reparsed argv (the same M1 gap dash/mod.rs closed for the pty
-        // path). Probed the same way exec.rs now does: the real headless
-        // launcher prefix, no prompt token yet, checked with `launch_
-        // reparses_through_shim`, which covers both forms.
+        // Windows cmd and PowerShell launchers reparse argv; keep prompts
+        // on stdin for those launch shapes.
         let (mut command, mut stdin_prompt) =
             if prompt_delivery_via_stdin(adapter.as_ref(), &session, &extra) {
                 match adapter.headless_cmd_stdin(&session, &extra) {
@@ -544,26 +418,17 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 (adapter.headless_cmd(&prompt, &session, &extra), None)
             };
         command.current_dir(repo);
-        // F3: `loop` binds no turn-signal socket of its own, so it has no
-        // session identity to set here at all -- which is precisely why the
-        // scrub matters. Without it, a cycle launched from inside another
-        // agent's session inherited that session's `ZIRV_CTX_SESSION` and
-        // `ZIRV_CTX_SOCKET` and reported its own turn boundaries into the
-        // outer supervisor's rot engine.
+        // Loop has no socket of its own; scrub inherited identity so its
+        // child cannot report turns to an outer supervisor.
         let apply_session_env = |command: &mut std::process::Command| {
             super::sessions::scrub_supervision_env_cmd(command);
-            // Names the same fact `ctx.toml`'s own `agent` key would, so a
-            // nested `zirv ctx ...` call inside this cycle's own child
-            // processes defaults to this cycle's harness rather than
-            // re-resolving from scratch.
+            // Export this cycle's harness for nested command defaults.
             command.env(super::adapters::AGENT_ENV, adapter.name());
         };
         apply_session_env(&mut command);
 
         writeln!(w, "zirv ctx loop: cycle {cycle} session {session}")?;
-        // C7: the stable registry address this run answers to, resolved once
-        // per cycle so each tick closure below borrows a plain `String`
-        // rather than the `Option` the outer loop keeps mutating.
+        // Use this run's stable registry address for tick closures.
         let nudge_address = registry_short
             .clone()
             .unwrap_or_else(|| session_short.clone());
@@ -572,24 +437,14 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
         let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
 
         let (outcome, rotted, limit_hit, limit_confirmation_detail) = loop {
-            // P2/P3: see the matching comment in `exec.rs` -- each child in
-            // this cycle is registered for the console-close sweep and held
-            // in a kill-on-close job for exactly that child's life.
+            // Hold each child in the console-close registry and kill-on-close
+            // job for its own lifetime.
             let (mut child, tap, _child_guard) =
                 supervise::spawn_tapped(command, stdin_prompt.clone()).map_err(|error| {
                     adapters::format_launch_error(error.as_ref(), adapter.name(), adapter.program())
                 })?;
-            // Item 3: consumed right after the first spawn that actually
-            // carried this cycle's prompt. The drain makes every in-place
-            // continuation a no-op here.
-            //
-            // T4 (I-1): as the STABLE registry short -- the same identity
-            // `delivery_filter` above listed under. A fan-out's read marker
-            // is `<stem>.read/<reader>` (see `mail::consume_and_log`), so
-            // consuming as this cycle's own fresh `session_short` filed the
-            // marker under an id that rotates every cycle: the message stayed
-            // unread forever and was re-delivered, and re-counted as "new
-            // mail", on every single cycle.
+            // Consume delivered mail only after successful spawn, using
+            // the stable registry address so fan-out read state does not rotate.
             for (path, _) in mail_entries.drain(..) {
                 let _ = super::mail::consume_and_log(
                     &state,
@@ -637,17 +492,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                         }
                     }
                 }
-                // N4: `loop` never restarts for a nudge -- each cycle is
-                // already a fresh, stateless session that re-lists mail on
-                // its own natural boundary (see the mail block above), so
-                // the nudge's payload arrives there regardless. Claiming the
-                // marker here only stops it from re-firing and lets the
-                // operator see that it arrived.
-                // C7: claimed under the run's stable registry address, not
-                // this cycle's own short id -- a nudge is addressed to the
-                // supervisor, which outlives any one cycle.
-                // C4: `from` is the sender read out of the marker, not our
-                // own id.
+                // A nudge waits for the next natural cycle; claim it under
+                // the run's stable address and name the sender.
                 if let Some(from) = super::sessions::claim_nudge_marker(&state, &nudge_address) {
                     announcer.emit(&super::announce::Event::Nudge {
                         from,
@@ -656,15 +502,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 }
                 let poll_result =
                     scorer.poll(adapter.as_ref(), &cfg.score, &cfg.screen.thresholds());
-                // Issue #243 (review round, F4/F5): same shared helper the
-                // Stop hook and `exec`'s own supervision loop use -- a
-                // codex/wrap-supervised cycle (no Claude Stop hook at all)
-                // otherwise never surfaces a live-detected injection
-                // marker or credential shape. `Some(report)` only when
-                // this poll actually consumed new bytes -- an IDLE poll
-                // (`None`) must never reach `record_screening`, or its
-                // fabricated-clean default would clobber an already-
-                // persisted flagged summary on every idle gap.
+                // Record screening only for newly read transcript bytes; an
+                // idle poll must not erase a flagged summary. (#243)
                 if let Ok((_, Some(report))) = &poll_result {
                     super::sessions::record_screening(
                         &state,
@@ -674,13 +513,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                         &mut screening_announced,
                     );
                 }
-                // Issue #455 (review round 1, finding 4): this loop owns
-                // its own uncheckpointed scorer, so it feeds route health
-                // itself -- before the limit short-circuit below can
-                // return, so a transcript carrying both a rate limit and a
-                // transport failure still records the transport one.
-                // Double counting against a checkpointed reader of the same
-                // rows is prevented by row identity, not by exclusivity.
+                // Feed route health before a limit short-circuit so a
+                // simultaneous transport failure is still recorded. (#455)
                 super::score::observe_route_health(
                     &state,
                     adapter.as_ref(),
@@ -737,8 +571,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 limit_hit = scorer.provider_limit_hit();
             }
 
-            // See the matching comment in exec.rs: supervise_child checks
-            // exit before the tick, so final output needs one bounded drain.
+            // Drain final output after child exit; the last tick may miss it.
             if !limit_hit {
                 let limit_text_seen = pace::scan_for_limit(
                     &tap.drain_to_eof(supervise::FINAL_DRAIN_BUDGET),
@@ -774,12 +607,8 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
 
             if super::exec::should_attempt_compact(compact_requested, limit_hit) {
-                // Issue #798 (`[jev] compaction_select`): same best-effort,
-                // off-by-default seam as `exec.rs`'s own `zirv ctx exec`
-                // compaction -- `zirv ctx loop` composes the identical
-                // `compact_in_place` call, so it gets the identical
-                // gate-checked-before-any-read treatment (review of
-                // 6bdd7675, defect #1).
+                // With this gate off, do not read transcripts for Jev
+                // compaction selection. (#798)
                 let compact_focus = handoff::compaction_focus_for_transcript(
                     &cfg,
                     &state,
@@ -920,15 +749,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             },
         );
 
-        // Issue #285 (review): fold this cycle's spend into the durable
-        // objective so its soft budget can trip; the next cycle's own
-        // `compile::compile` reloads the record and renders the wrap-up.
-        //
-        // Issue #311: the SAME read also feeds `cycle_outcome_digest` below
-        // -- self-pacing must never add a second read of this transcript on
-        // top of the one this cycle already needed for spend roll-up, so the
-        // body is captured once here and shared, regardless of whether
-        // `transcript_usage` happens to parse it.
+        // Read transcript once for objective spend and self-pacing digest. (#285, #311)
         let transcript_body = std::fs::read_to_string(&transcript).ok();
         if let Some(body) = transcript_body.as_deref()
             && let Some(usage) = adapter.transcript_usage(body)
@@ -940,19 +761,13 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 now_fn(),
             );
         }
-        // Issue #311: `None` only when the transcript itself could not be
-        // read at all -- `handle_cycle_outcome` treats that the same as a
-        // digest CHANGE (never as "unchanged"), since an unreadable
-        // transcript is never evidence of repetition.
+        // Unreadable transcript cannot prove a repeated outcome. (#311)
         let cycle_digest = transcript_body
             .as_deref()
             .map(|body| cycle_outcome_digest(adapter.as_ref(), body));
 
-        // Issue #314: deterministic gates first, a cheap-model verdict
-        // second, for an active durable objective -- see `judge.rs`'s own
-        // module doc. A missing/non-`Active` objective is a complete no-op
-        // (`ObjectiveOutcome::Inactive`), so a `loop` run with no objective
-        // set is byte-for-byte unaffected by everything below.
+        // Run deterministic gates before judging an active objective;
+        // absent objectives leave cycles unchanged. (#314)
         match evaluate_objective_after_cycle(
             &cfg,
             &state,
@@ -982,20 +797,15 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
             ObjectiveOutcome::Park(wait_on) => {
                 park_on(&wait_on, now_fn, sleep_fn);
-                // Resuming after a park must not count as a cycle: the next
-                // iteration's own `cycle += 1` at the top of this loop
-                // restores the value this decrements, a net no-op on the
-                // counter across the parked iteration.
+                // Park resume does not consume a cycle.
                 cycle -= 1;
                 continue;
             }
         }
 
         if limit_hit {
-            // A confirmed vendor refusal is authoritative even when the
-            // operator disabled proactive pacing. Re-enable only this park;
-            // otherwise the next loop cycle would launch straight back into
-            // the refusal it just confirmed.
+            // Vendor refusal overrides disabled proactive pacing; do not
+            // relaunch straight into the same refusal.
             let mut confirmed_limit_pace = cfg.pace.clone();
             confirmed_limit_pace.enabled = true;
             pace::wait_for_window(
@@ -1009,28 +819,20 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 None,
                 adapter.provider_for_model(cycle_model),
                 pace::PaceGate {
-                    // A vendor-reported limit hit parks even with use_credits
-                    // enabled: the vendor limiting us means credits are
-                    // exhausted or not actually enabled plan-side, and an
-                    // immediate relaunch would just re-hit it.
+                    // Vendor limit parks even when credit use is enabled.
                     use_credits: false,
                     poller: cfg
                         .pace
                         .poll_enabled
                         .then_some(&http_poller as &dyn super::poll::UsagePoller),
-                    // A confirmed vendor refusal on a session already
-                    // running is exactly the mid-run pacing T9 leaves
-                    // intact -- never the pre-launch call that never blocks.
                     initial_launch: false,
                 },
                 &mut pace_flags,
             );
         }
 
-        // Issue #311: new mail is a reset trigger alongside a digest change,
-        // and tracks unread counts even across failures so an old unread
-        // message cannot keep resetting the wait after recovery. An explicit
-        // `--interval` never consults mail for pacing.
+        // Only newly arrived mail resets self-pacing; explicit intervals
+        // bypass mail-based pacing. (#311)
         let unread_counts = if self_pace_state.is_some() {
             mail::unread_counts(
                 &state,
@@ -1074,11 +876,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
     }
 }
 
-/// Issue #314: this run's own progress tracker for the objective completion
-/// judge, owned across every cycle by `run_with_clock` -- see
-/// `judge::progress_made`'s own doc comment for what "progress" means.
-/// `Default` (`None`/`false`/`0`) is exactly right for a run that has not
-/// evaluated an objective yet.
+/// Progress state for the objective judge across cycles. (#314)
 #[derive(Debug, Default)]
 struct ObjectiveProgress {
     last_digest: Option<u64>,
@@ -1090,13 +888,9 @@ struct ObjectiveProgress {
 /// What `run_with_clock` does after `evaluate_objective_after_cycle` runs.
 #[derive(Debug)]
 enum ObjectiveOutcome {
-    /// No active objective (none set, or its status left `Active`): a
-    /// complete no-op, the loop proceeds exactly as it would without this
-    /// feature at all.
+    /// No active objective; cycle proceeds unchanged.
     Inactive,
-    /// A step was taken (a gate failure was recorded, the judge said
-    /// `continue`, or it was unavailable/disabled/parse-failed) but the
-    /// cycle otherwise proceeds normally.
+    /// Gate or judge completed a step without ending the loop.
     Continue,
     /// Pause on a concrete external event without counting a cycle.
     Park(WaitOn),
@@ -1104,25 +898,14 @@ enum ObjectiveOutcome {
     Stop(i32),
 }
 
-/// Overrides the gate/judge binary word `"zirv"` resolves to when running a
-/// configured `[objective] gates` command, mirroring `ZIRV_CTX_AGENT_BIN`'s
-/// own space-separated "interpreter path" shape (`"sh <script>"`). Test-only
-/// in practice: production always resolves via `std::env::current_exe()`.
+/// Override gate binary resolution for tests; production uses current_exe.
 const GATE_BIN_ENV: &str = "ZIRV_CTX_OBJECTIVE_GATE_BIN";
 
-/// Cap on how long a single `Step::Park` ever blocks before giving up and
-/// letting the cycle continue -- the design calls for this explicitly on a
-/// `Wait(Seconds(n))`; a `Pid`/`File` target gets the identical cap so a
-/// judge that names a target that never resolves cannot wedge the loop
-/// forever.
+/// Cap each park so an unresolved target cannot wedge the loop.
 const MAX_PARK_SECS: u64 = 3600;
 
-/// The literal `"zirv"` word in a configured gate command, resolved to this
-/// process's own executable (or, in a test, `GATE_BIN_ENV`'s override) --
-/// see `run_gate`'s own doc comment for why this is a `Vec`, not a single
-/// path: the override mirrors `ZIRV_CTX_AGENT_BIN`'s "interpreter path"
-/// shape (`"sh <script>"`, two words), while `current_exe()` is always
-/// exactly one word regardless of any space its own path might contain.
+/// Resolve the literal zirv gate word to its executable and optional
+/// interpreter prefix.
 fn zirv_invocation(env: EnvLookup<'_>) -> CtxResult<Vec<String>> {
     if let Some(bin) = env(GATE_BIN_ENV) {
         return Ok(bin.split_whitespace().map(str::to_string).collect());
@@ -1137,15 +920,8 @@ fn tail_of_bytes(bytes: &[u8], max_bytes: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
-/// Runs one configured gate command in `repo`. Applies the #287 unchanged-
-/// workspace skip first (`verification::last_failure_fingerprint`): a gate
-/// whose current `change_fingerprint` matches the fingerprint recorded on
-/// its own last failure is not re-run at all (`GateOutcome::Skipped`) --
-/// re-running it would only reproduce the identical failure. Any I/O error
-/// along the way (this is not a git repository, the gate command could not
-/// be spawned, ...) is itself conservative evidence: it degrades to `Red`
-/// rather than ever being mistaken for `Green`, and never propagates out of
-/// this function -- a gate check must never be able to abort the loop.
+/// Run a gate with unchanged-workspace skip; any I/O error is Red, never
+/// Green or a loop-aborting exception. (#287)
 fn run_gate(gate_cmd: &str, state: &StateDir, repo: &Path, env: EnvLookup<'_>) -> GateOutcome {
     let attempt = || -> CtxResult<GateOutcome> {
         let fingerprint = crate::commands::workflow::verification::change_fingerprint(repo)?;
@@ -1204,20 +980,14 @@ fn park_on(wait_on: &WaitOn, now_fn: &dyn Fn() -> u64, sleep_fn: &dyn Fn(Duratio
     }
 }
 
-/// The strict judge output contract, appended to every judge prompt this
-/// module sends -- `judge::parse_verdict`'s own doc comment names exactly
-/// what it accepts.
+/// Judge output must satisfy the strict parser contract.
 const JUDGE_OUTPUT_CONTRACT: &str = "\n\n---\nRespond with EXACTLY one JSON object and nothing \
 else: {\"verdict\": \"done\"|\"blocked\"|\"continue\"|\"wait\", \"reason\": \"...\"}. When (and \
 only when) verdict is \"wait\", also include \"wait_on\": {\"pid\": <n>} or {\"file\": \"<path>\"} \
 or {\"seconds\": <n>}.";
 
-/// Issue #537 (A4): a confident `continue` from Jev, at or above this floor,
-/// skips this cycle's helper judge call entirely -- `done`/`blocked`/`wait`
-/// stay the helper's sole authority, and Jev is never asked to produce them.
-/// Chosen from a live 2026-09-18 probe. Shared with `zirv ctx jev probe
-/// --site judge`, which reports this exact floor unless overridden by its
-/// own `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`.
+/// Jev may skip only a helper `continue` check above this confidence;
+/// done, blocked, and wait remain the helper's authority. (#537)
 pub(crate) const JUDGE_CONTINUE_FLOOR: f32 = 0.7;
 const MAX_CONSECUTIVE_JEV_SKIPS: u8 = 2;
 
@@ -1276,12 +1046,7 @@ pub(crate) fn judge_continue_question() -> jev::Question {
     )
 }
 
-/// [`jev_judge_continue`]'s per-call decision: `"continue"` only for a
-/// decisive `continue` choice, `"helper"` otherwise (any other choice,
-/// indecisive, or no answer -- production keeps its own missing-vs-
-/// indecisive `Uncertain` distinction around this call, so `"helper"` alone
-/// does not tell them apart). Shared with `zirv ctx jev probe --site
-/// judge`, which reports exactly this outcome per call.
+/// Decisive continue skips the helper; every other answer uses it.
 pub(crate) fn judge_continue_action(
     answer: Option<&jev::Answer>,
     min_confidence: f32,
@@ -1296,9 +1061,8 @@ pub(crate) fn judge_continue_action(
     }
 }
 
-/// Advises on a bounded numeric projection of local progress. Only a
-/// decisive `continue` may skip a helper call; the caller forces a helper
-/// recheck after two consecutive skips.
+/// Advise from bounded numeric progress; force a helper check after two
+/// consecutive Jev skips.
 fn jev_judge_continue(
     cfg: &CtxConfig,
     state: &StateDir,
@@ -1366,11 +1130,8 @@ fn jev_judge_continue(
     }
 }
 
-/// The core flow issue #314 asks for: deterministic gates first, a cheap-
-/// model verdict second, `blocked`/`wait` as first-class outcomes. Every
-/// side effect (gate spawn, judge model call, objective record writes,
-/// mail, handoff, logging) lives here; `judge.rs`'s `next_step`/
-/// `progress_made` make every decision this function only carries out.
+/// Run deterministic gates before the helper judge, preserving blocked
+/// and wait as distinct outcomes. (#314)
 #[allow(clippy::too_many_arguments)]
 fn evaluate_objective_after_cycle<W: Write>(
     cfg: &CtxConfig,
@@ -1470,9 +1231,7 @@ fn evaluate_objective_after_cycle<W: Write>(
                 .map(|bytes| tail_of_bytes(&bytes, 4 * 1024))
                 .unwrap_or_default();
 
-            // Issue #537 (A4): a confident Jev `continue` skips the helper
-            // call for this cycle entirely -- see `jev_judge_continue`'s own
-            // doc comment for the full merge rule.
+            // A confident Jev continue skips only this cycle's helper call. (#537)
             let force_helper = progress.consecutive_jev_skips >= MAX_CONSECUTIVE_JEV_SKIPS;
             let advice = if force_helper {
                 None
@@ -1504,9 +1263,7 @@ fn evaluate_objective_after_cycle<W: Write>(
                 "{}\n\n---\nRecent transcript (tail):\n{transcript_tail}{JUDGE_OUTPUT_CONTRACT}",
                 objective::layer_text(&record),
             );
-            // `env`, not the process env: `state` and `cfg` above were
-            // resolved through it, and the judge must see the same ones --
-            // see `helper_answer_with_env`.
+            // Judge uses the same resolved environment as state and config.
             let answer = handoff::helper_answer_with_env(
                 super::helper::ROLE_DISTILLER,
                 adapter,
@@ -1618,23 +1375,9 @@ pub fn backoff_for(failures: u32, base: Duration, interval: Duration) -> Duratio
     if scaled > cap { cap } else { scaled }
 }
 
-/// Issue #311: a normalized digest of one cycle's outcome, derived from the
-/// SAME transcript read `run_with_clock` already performs for its spend
-/// roll-up (`adapter.transcript_usage`) -- never a second file read for
-/// self-pacing's own sake, see the call site's own comment.
-///
-/// Walks `adapter.parse_events` for the LAST non-empty `NormalizedEvent::
-/// AssistantFinal::text` in the cycle and hashes just that text with
-/// [`input_hash`]. `AssistantFinal::text` is already exactly "the
-/// concatenated text blocks of one assistant turn" -- no id, timestamp, or
-/// session-specific data rides along with it -- so two cycles that ended on
-/// the same reply digest identically regardless of session id, wall-clock
-/// time, or anything else that happened earlier in either transcript. Falls
-/// back to hashing the whole transcript body when no assistant text could be
-/// found at all (a cycle that produced no assistant turns, or a transcript
-/// shape `parse_events` does not recognise) -- a coarser digest still
-/// changes whenever the cycle's raw output does, which is all self-pacing
-/// needs from it.
+/// Hash the last assistant final text from this cycle's existing
+/// transcript read, falling back to raw body when no final text parses.
+/// The digest ignores session id and clock so repeated outcomes match. (#311)
 fn cycle_outcome_digest(adapter: &dyn adapters::AgentAdapter, body: &str) -> u64 {
     let last_text = adapter
         .parse_events(body)
@@ -1650,40 +1393,20 @@ fn cycle_outcome_digest(adapter: &dyn adapters::AgentAdapter, body: &str) -> u64
     }
 }
 
-/// Issue #311 (Hermes Agent's own `/loop` self-paced mode): why `next_pace`
-/// chose the wait it did, carried into the decision-log detail `handle_
-/// cycle_outcome` writes under `action: "loop-pace"`.
+/// Reason chosen for the next wait and decision log. (#311)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaceReason {
-    /// This cycle's digest differs from the previous one, or there was no
-    /// previous one at all (the first cycle self-pacing ever evaluated, or
-    /// one whose transcript could not be read): reset straight to the
-    /// floor.
+    /// New or changed digest resets wait to the floor.
     Changed,
-    /// New mail arrived for this run since the last cycle: reset to the
-    /// floor even though the digest itself did not change.
+    /// Newly arrived mail resets wait to the floor.
     Mail,
-    /// The digest matched the previous cycle's and no new mail arrived: the
-    /// wait grows geometrically toward the ceiling.
+    /// Unchanged digest without new mail grows wait toward ceiling.
     Unchanged,
 }
 
-/// Issue #311 (T4/I-1): whether mail ARRIVED since the previous cycle, from
-/// the two `mail::unread_counts` readings either side of it. Pure, so the
-/// edge-vs-level distinction is a plain unit test.
-///
-/// This is deliberately an EDGE, not a level: `next_pace`'s `new_mail` used
-/// to be `unread > 0`, which pinned a self-paced loop at its floor forever
-/// the moment one message sat in the mailbox unconsumed (a park, a refused
-/// launch, or -- before the same fix's other half -- a fan-out the cycle
-/// delivered under a reader id that never marked it read). A message that is
-/// still merely PRESENT is not news; only a count that GREW is.
-///
-/// Broadcast and direct counts are compared independently so a fan-out
-/// arriving in the same cycle a directed message is consumed still reads as
-/// new mail. `None` (mail disabled, or self-pacing off) is never new mail,
-/// and an absent previous reading is treated as `(0, 0)` -- anything unread
-/// on the first cycle is genuinely news to this run.
+/// Compare broadcast and direct unread counts independently; only growth
+/// means new mail, while persistent unread mail must not pin the wait
+/// at its floor. (#311)
 fn mail_arrived_since(previous: Option<(usize, usize)>, current: Option<(usize, usize)>) -> bool {
     let Some((broadcast, direct)) = current else {
         return false;
@@ -1692,28 +1415,8 @@ fn mail_arrived_since(previous: Option<(usize, usize)>, current: Option<(usize, 
     broadcast > previous_broadcast || direct > previous_direct
 }
 
-/// Issue #311: the next wait between `zirv ctx loop` cycles when no explicit
-/// `--interval` was given, mirroring Hermes's own self-paced `/loop` mode
-/// (`_digest_response` + `s.current_delay = min(max(s.current_delay, floor)
-/// * 2, ceiling)` on a match, reset to `floor` on any change). Pure and
-/// clock/digest-source-free so every curve is a plain unit test: `prev`/
-/// `curr` are the previous and current cycle's own outcome digest
-/// ([`cycle_outcome_digest`]), `new_mail` is whether `mail::unread_counts`
-/// saw anything new for this run since the last cycle, `current_wait` is the
-/// wait this same function chose last time (or `floor` before the first
-/// call), and `floor`/`ceiling` bound the result.
-///
-/// - `prev != Some(curr)` (a genuine change, OR no previous digest at all)
-///   -- reset to `floor`, [`PaceReason::Changed`].
-/// - otherwise, `new_mail` -- also reset to `floor`, [`PaceReason::Mail`]:
-///   checked second so a cycle that is BOTH a digest change AND carries new
-///   mail still reports the more specific `Changed` reason (the wait is
-///   `floor` either way).
-/// - otherwise -- `min(max(current_wait, floor) * 2, ceiling)`,
-///   [`PaceReason::Unchanged`]. `floor == 0` (an `--interval` that resolved
-///   to a literal `0`, e.g. every inline test in this module) never grows:
-///   `max(0, 0) * 2 == 0`, so a run that opted out of any inter-cycle wait
-///   at all stays at zero forever instead of drifting upward from nothing.
+/// Pure pacing curve: changed digest or new mail resets to floor; unchanged
+/// output doubles wait up to ceiling. Zero floor remains zero. (#311)
 pub fn next_pace(
     prev: Option<u64>,
     curr: u64,
@@ -1732,26 +1435,14 @@ pub fn next_pace(
     (doubled.min(ceiling), PaceReason::Unchanged)
 }
 
-/// Issue #311: this run's own self-pacing memory, owned across every cycle
-/// by `run_with_clock` the identical way `ObjectiveProgress` is -- see that
-/// struct's own doc comment. Constructed only when self-pacing is engaged at
-/// all (`args.interval_secs.is_none()`), so an explicit `--interval` run
-/// never allocates one and `handle_cycle_outcome` sees `None` for its whole
-/// life.
+/// Self-pacing memory exists only when no explicit interval was given. (#311)
 #[derive(Debug)]
 struct SelfPaceState {
-    /// The previous cycle's outcome digest self-pacing actually compared
-    /// against, `None` before the first cycle this run has evaluated (or
-    /// right after a failure -- see `handle_cycle_outcome`'s own comment on
-    /// why that is left untouched, not reset, by a failed cycle).
+    /// Last successful cycle digest; failed cycles leave it intact.
     last_digest: Option<u64>,
-    /// The wait `next_pace` chose last time, starting at the floor
-    /// (`interval`) and only ever changed by `next_pace`'s own return value
-    /// or a failure-path reset back to the floor.
+    /// Last chosen wait, reset to floor after failure.
     wait: Duration,
-    /// Consecutive [`PaceReason::Unchanged`] decisions in a row, purely for
-    /// the decision-log detail ("unchanged x3, ..."); `next_pace` itself
-    /// never sees or needs this.
+    /// Consecutive unchanged decisions for reporting only.
     unchanged_streak: u32,
 }
 
@@ -1765,16 +1456,7 @@ impl SelfPaceState {
     }
 }
 
-/// Issue #311: everything `handle_cycle_outcome` needs to run self-pacing
-/// for one cycle, bundled into a single argument so that function's already-
-/// long parameter list does not grow by four more scalars for one opt-in
-/// feature. Passing `None` for the whole `handle_cycle_outcome` call (the
-/// call site's own `args.interval_secs.is_none()` check) is what disables
-/// self-pacing entirely -- `state` is a mutable borrow of the run's own
-/// [`SelfPaceState`], `ceiling` is `cfg.supervise.loop_backoff_ceiling_secs`,
-/// `digest` is this cycle's own [`cycle_outcome_digest`] (`None` only when
-/// the transcript could not be read), and `new_mail` is whether `mail::
-/// unread_counts` saw anything new for this run since the last cycle.
+/// Bundle one cycle's pacing inputs; None disables self-pacing. (#311)
 struct SelfPaceInput<'a> {
     state: &'a mut SelfPaceState,
     ceiling: Duration,
@@ -1802,10 +1484,8 @@ fn handle_cycle_outcome<W: Write>(
         *failures = 0;
         let wait = match self_pace {
             Some(pace) => {
-                // Issue #311: an unreadable transcript is never evidence of
-                // repetition, so it is treated exactly like a digest change
-                // -- reset to the floor -- without ever calling `next_pace`
-                // with a fabricated `curr` value.
+                // Unknown transcript is not evidence of repetition; reset
+                // wait without fabricating a digest. (#311)
                 let (wait, reason) = match pace.digest {
                     Some(curr) => next_pace(
                         pace.state.last_digest,
@@ -1863,14 +1543,8 @@ fn handle_cycle_outcome<W: Write>(
         *failures
     )?;
 
-    // Issue #311: a failing cycle proves nothing about repetition, so it
-    // never grows the self-paced wait -- the existing `backoff_for` path
-    // right below is unchanged and takes priority (see `next_pace`'s own
-    // doc comment: this function never even calls it here). The self-paced
-    // wait itself resets to the floor so the NEXT success starts fresh
-    // rather than resuming the growth curve this failure interrupted;
-    // `last_digest` is deliberately left untouched, since it still reflects
-    // the last cycle that actually produced output worth comparing against.
+    // A failed cycle uses failure backoff and resets the pacing wait,
+    // while preserving the last real digest for later comparison. (#311)
     if let Some(pace) = self_pace {
         pace.state.wait = interval;
         pace.state.unchanged_streak = 0;
@@ -1924,30 +1598,11 @@ fn handle_cycle_outcome<W: Write>(
 pub fn run<W: Write>(args: &LoopArgs, _w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
-    // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
-    // `zirv ctx loop` launch is not a supervisor spawn seam, so an inherited
-    // `PARENT_SESSION_ENV` off this process's own ambient env must be
-    // scrubbed rather than trusted; `agent::parent_session_env`'s fold with
-    // `parent: None` does that unconditionally.
+    // Direct loop launch cannot establish parent lineage from inherited
+    // environment; scrub it before classifying mail as steering. (#249/#250)
     let env = super::agent::parent_session_env(&ambient, None);
-    // Round 4B (stdout/stderr separation), applied here the same way
-    // `exec::run` applies it to its own harness branch: each cycle's child
-    // inherits nothing of its own -- `supervise::spawn_tapped`'s `forward`
-    // echoes the CHILD's stdout line by line straight to this process's own
-    // real `std::io::stdout()`, on its own thread, entirely independent of
-    // `w`. Every "zirv ctx loop: ..." notice `run_with` writes to `w` used to
-    // go to that SAME real stdout too -- on this, the one production call
-    // site (`mod.rs`'s `CtxVerb::Loop` dispatch), `w` IS `std::io::Stdout` --
-    // racing the forwarding thread and landing a notice (a cycle-failed
-    // line, a backoff line, an objective-gate line, and so on) in front of a
-    // child's own output, which a machine consumer piping this process's
-    // stdout cannot recover from. Unlike `exec::run`, `zirv ctx loop` has no
-    // `--runtime native`/`--view json` branch to preserve: every launch here
-    // supervises a real harness child, so the redirect is unconditional.
-    // `run_with` itself is untouched -- this function alone owns the real-
-    // process CLI entry, so redirecting here cannot perturb a test that
-    // asserts on a loop notice via its own `Vec<u8>` writer through
-    // `run_with` directly.
+    // Send supervisor notices to stderr so child stdout stays parseable
+    // by a machine consumer.
     run_with(args, &mut std::io::stderr(), &repo, &env)
 }
 

@@ -1,13 +1,6 @@
 //! Session registry: `<state>/sessions/<short8>.json`, one file per live
-//! supervisor, keyed by the same short id `StateDir::socket_for` names its
-//! turn-signal socket after. Best-effort throughout, matching the rest of
-//! the state dir's own housekeeping: a registry write, refresh or removal
-//! that fails must never fail a launch, and a listing must never fail just
-//! because one file on disk is unreadable or malformed.
-//!
-//! `state.rs` is shared with a concurrent change adding `memory()`; this
-//! module only ever calls `StateDir::sessions()` from there rather than
-//! reaching into its internals, so the two changes stay independent.
+//! supervisor, keyed by the socket short id. Registry writes are best-effort;
+//! malformed entries cannot fail a listing or a launch.
 
 use std::path::{Path, PathBuf};
 
@@ -50,12 +43,8 @@ pub use ops::{
     run_nudge, run_nudge_with, stall_marker, write_stall_marker,
 };
 
-/// Mirrors `StateDir::socket_for`'s own derivation exactly: the first eight
-/// ASCII-alphanumeric characters of the session id. Duplicated rather than
-/// factored out of `state.rs` (the one file a concurrent change also
-/// touches) -- `the_record_key_is_the_same_short_id_the_socket_is_named_
-/// after` below pins the two derivations against each other so a future
-/// edit to either cannot drift silently.
+/// First eight ASCII-alphanumeric session-id characters, matching the
+/// socket address derivation.
 pub fn short_id(session: &str) -> String {
     session
         .chars()
@@ -70,11 +59,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Which supervisor filed a record. `Chat` is `wrap`'s own orchestrator
-/// launch, threaded through as a distinct verb from `chat.rs` rather than
-/// derived from `PromptRole`: the two are independent facts about a session
-/// (role governs prompt injection permissions; verb only names the calling
-/// verb for the registry).
+/// Registry verb is independent of prompt role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verb {
@@ -82,10 +67,7 @@ pub enum Verb {
     Loop,
     Wrap,
     Chat,
-    /// A dashboard worker pane (`zirv ctx dash`'s own supervised child):
-    /// distinct from `Chat`, which stays the dashboard's own orchestrator
-    /// pane, so a registry row can tell "the orchestrator" from "a pane the
-    /// dashboard spawned" apart.
+    /// Dashboard worker pane, distinct from its orchestrator pane.
     Dash,
 }
 
@@ -117,133 +99,41 @@ pub struct Record {
     pub verb: Verb,
     pub pid: u32,
     pub started_at: u64,
-    /// NEW-3: whether this supervisor can actually *act* on a wake-up.
-    ///
-    /// A supervisor only claims nudge markers from its turn-signal arm, so
-    /// one that never bound a `SignalServer` (`wrap --no-supervise`, or a
-    /// bind that failed) can never notice a nudge -- not even to advise
-    /// about it. Such a session used to be dropped from the registry
-    /// entirely, which fixed the silent-nudge bug by making the session
-    /// invisible: it vanished from `zirv ctx status` too, so an operator
-    /// watching a bind-failed `wrap` simply could not see it was running.
-    ///
-    /// Recorded instead of hidden: `status` renders it as `unreachable`, and
-    /// `nudge` refuses it with a reason. `#[serde(default = ...)]` returns
-    /// `true` so a record written by an older build still parses as a normal
-    /// reachable session.
+    /// False when no turn-signal socket can claim nudges; status still shows
+    /// the session as unreachable. Old records default to true.
     #[serde(default = "reachable_default")]
     pub reachable: bool,
-    /// The process that registered this session, stamped by
-    /// [`SessionGuard::register`] itself (unless a caller already set it) --
-    /// so it is always `Some(pid)` for a record written by this build, and
-    /// `None` only for one written by an older build before this field
-    /// existed. A dashboard pane carries the *dashboard's* pid because
-    /// `Pane::new` registers from inside the dashboard process itself; any
-    /// other session simply carries the pid of whichever process actually
-    /// called `register`. That is not always the dashboard even for a
-    /// session a dashboard pane is morally responsible for: `zirv ctx
-    /// agent`'s dashboard-refused-but-retryable fallback (`agent.rs`'s
-    /// headless path, `agent.rs:126` onward into `exec::run_with`) runs in
-    /// the *requester's* process -- a pane's own child shell, or a plain
-    /// terminal -- never inside the dashboard's, so that fallback session
-    /// registers the requester's pid and is not shown in that dashboard's
-    /// sidebar. Accepted residual: pid-based ownership has no way to express
-    /// "spawned on this dashboard's behalf, but from outside its process," so
-    /// that session is only visible via mail (its own report-back) and `zirv
-    /// ctx status`, same as any other unowned-by-this-dashboard record. The
-    /// dashboard sidebar merge (`dash::assemble_sidebar`) keeps only records
-    /// whose `owner_pid` matches its own pid, so a second, concurrently
-    /// running dashboard's panes never bleed into this one's panel.
-    /// `#[serde(default)]` so an on-disk record from an older build
-    /// deserializes as `None` rather than failing to parse.
+    /// Registering process pid; panes belong to their dashboard process.
+    /// Requester-side fallbacks remain outside its sidebar.
     #[serde(default)]
     pub owner_pid: Option<u32>,
-    /// Issue #139: the `safety::policy_fingerprint` of the LAUNCH-TIME
-    /// snapshot this session was pinned to (the same fingerprint value
-    /// written to `POLICY_FINGERPRINT_ENV`/read back by `evaluate_with_
-    /// attestation_evidence`), when the launch computed one at all. `None`
-    /// for a record written by an older build, a launch that never
-    /// attempted attestation (no adapter support, or the fingerprint could
-    /// not be computed), or any session type this field is not yet threaded
-    /// through to. `status.rs` compares this against a freshly loaded
-    /// policy's own fingerprint for `record.repo` to surface a "policy
-    /// snapshot stale" line -- see `Modules/Ctx Subsystem.md`.
-    /// `#[serde(default)]` so an on-disk record from an older build
-    /// deserializes as `None` rather than failing to parse.
+    /// Launch policy fingerprint for later drift checks; absent when no
+    /// attestation snapshot exists. (#139)
     #[serde(default)]
     pub safety_policy_sha256: Option<String>,
-    /// Issue #169: the `prompt::PromptRole` label (`"orchestrator"`,
-    /// `"sub-orchestrator"` or `"worker"`) this session was ACTUALLY spawned
-    /// with, stamped once by the server that spawned it (`Pane::spawn`,
-    /// `wrap::run_with`) -- never by anything the session itself later
-    /// claims. Plain `String`, not the `prompt::PromptRole` type itself: this
-    /// module has no reason to depend on `prompt.rs`, and every other
-    /// plain-vocabulary field here (`agent`, `roster::RosterPane::role`)
-    /// already follows the same "label string, not an enum" convention.
-    ///
-    /// Read by `dash::mod::parent_role_for` (via [`load_record`]) for a
-    /// requesting session this dashboard hosts no pane for -- an operator's
-    /// own terminal, or a headless coordinator -- which is the only place a
-    /// role can be recovered for such a session at all. `None` for a record
-    /// written by an older build, or any session type this was never threaded
-    /// through to; that reader then falls back to the verb (`Verb::Chat` is
-    /// an orchestrator seat, anything else a worker), never to a wider role
-    /// than the session could already have had.
+    /// Spawned prompt role, stamped by the supervisor rather than claimed
+    /// by the session; missing roles fall back conservatively. (#169)
     #[serde(default)]
     pub role: Option<String>,
-    /// Issue #152: epoch seconds the process that registered this session
-    /// itself started, stamped once by [`Record::new`] via
-    /// [`process_start_secs`]. Exists so `record_is_alive` can tell the
-    /// original process apart from an unrelated one the OS later recycles
-    /// this record's `pid` to -- `is_alive`'s own `EPERM` branch has no way
-    /// to make that distinction with the pid alone (see its doc comment).
-    /// `None` for a record written by an older build, a non-unix platform
-    /// (`process_start_secs` has no reader there), or any environment
-    /// `process_start_secs` could not read (no `ps` on `PATH`, refused,
-    /// unparsable output) -- every one of those degrades `record_is_alive`
-    /// back to today's EPERM-is-alive behavior, never to a false "dead".
-    /// `#[serde(default)]` so an on-disk record from an older build
-    /// deserializes as `None` rather than failing to parse, the same
-    /// back-compat pattern `owner_pid` already established.
+    /// Registered process start time for recycled-pid checks; unavailable
+    /// probes leave liveness uncertain rather than falsely dead. (#152)
     #[serde(default)]
     pub start_time: Option<u64>,
-    /// Issue #281: set while a turn is actively being worked, cleared once it
-    /// reaches a clean boundary -- see [`InFlight`]'s own doc comment. `None`
-    /// for a record written by an older build, the ordinary "idle between
-    /// turns" state, or once [`take_interrupted_in_flight`] has consumed it.
-    /// `#[serde(default)]` so an on-disk record from before this field
-    /// existed deserializes as `None`, the same back-compat pattern every
-    /// other optional field on this struct already follows.
+    /// Active-turn crash witness, cleared at a clean boundary. (#281)
     #[serde(default)]
     pub in_flight: Option<InFlight>,
-    /// Issue #470: which backend actually drives this session --
-    /// `runtime::RuntimeKind::Harness` for every session this build spawns
-    /// today. `#[serde(default)]` so a record written by an older build
-    /// (before this field existed) deserializes as `Harness`, the same
-    /// value `Record::new` itself always stamps right now -- the only
-    /// runtime this codebase can actually run a session under yet.
+    /// Session backend; old records default to Harness. (#470)
     #[serde(default)]
     pub runtime: RuntimeKind,
 }
 
-/// Issue #281: the crash-interruption witness marker. Stamped by a
-/// supervisor ([`SessionGuard::stamp_in_flight`]) when a turn starts and
-/// cleared ([`SessionGuard::clear_in_flight`]) once that turn reaches a
-/// clean boundary -- a turn signal, for both `wrap.rs` and `exec.rs`. A
-/// record still carrying one after its own process has died
-/// ([`record_is_alive`] is `false`) means that process stopped mid-turn
-/// rather than at a clean boundary: [`take_interrupted_in_flight`] is what a
-/// resumed session's injection reads this through.
+/// A marker left by a dead supervisor identifies a turn interrupted before
+/// its clean boundary. (#281)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InFlight {
-    /// The supervisor verb doing the work (`Verb::as_str()` -- `"wrap"`,
-    /// `"exec"`, ...), not a per-tool label: this witness only ever needs to
-    /// say WHICH supervised run was interrupted, not what it was doing.
+    /// Supervisor verb to name in an interruption witness.
     pub verb: String,
-    /// The turn number this supervisor last knew about when it stamped this
-    /// marker -- `InjectionState::last_turn + 1` for `wrap`, the transcript's
-    /// own turn count for `exec`. Display only, like `InjectionState::
-    /// last_turn` itself.
+    /// Last known turn number for display only.
     pub turn: u64,
     pub since: u64,
 }
@@ -253,9 +143,7 @@ fn reachable_default() -> bool {
 }
 
 impl Record {
-    /// `pid` is always this process's own: a registry entry describes the
-    /// supervisor that filed it, and every registration happens from inside
-    /// that same process.
+    /// Registry starts with the filing supervisor's own pid.
     pub fn new(session: &str, agent: &str, repo: &Path, verb: Verb) -> Self {
         Self {
             session: session.to_string(),
@@ -266,71 +154,38 @@ impl Record {
             verb,
             pid: std::process::id(),
             started_at: super::state::now_secs(),
-            // Reachable unless a caller says otherwise: every headless
-            // supervisor binds a socket as a matter of course, so only
-            // `wrap` (which can run `--no-supervise`, or fail to bind) has
-            // any reason to call `unreachable()` below.
+            // Default reachable; wrap alone may lack a signal socket.
             reachable: true,
-            // Left unset here: `SessionGuard::register` stamps this
-            // process's own pid on the way to disk, unless a caller has
-            // already set one (see its own doc comment).
             owner_pid: None,
-            // Left unset here too: only a caller that actually resolved a
-            // launch-time policy snapshot (and its fingerprint) has
-            // anything to record -- see `with_safety_policy_sha256`.
             safety_policy_sha256: None,
-            // Left unset here too: only a caller that actually knows the
-            // role it spawned (`with_role`) has anything to record.
             role: None,
-            // Issue #152: this process's own start time, read the same way
-            // `record_is_alive` will later re-read whoever holds this pid --
-            // see the field's own doc comment. `None` wherever
-            // `process_start_secs` cannot tell, which callers other than
-            // `record_is_alive` never need to know about.
+            // Stamp this process's start time for later pid checks. (#152)
             start_time: process_start_secs(std::process::id()),
-            // Left unset here too: nothing is in flight until a supervisor's
-            // own `stamp_in_flight` call says otherwise.
             in_flight: None,
-            // Issue #470: every session this build spawns runs on the
-            // existing harness-process backend.
             runtime: RuntimeKind::Harness,
         }
     }
 
-    /// Marks this record as one that can never act on a wake-up -- see the
-    /// `reachable` field. Chained onto `new` at the one call site that knows
-    /// whether a turn-signal socket actually bound.
+    /// Mark a session unable to claim wake-up markers after failed bind.
     pub fn unreachable(mut self) -> Self {
         self.reachable = false;
         self
     }
 
-    /// Issue #139: stamps the launch-time safety-policy fingerprint (see the
-    /// field's own doc comment), chained onto `new` at whichever call site
-    /// already resolved one for this launch. `None` is a legitimate value
-    /// (leaves the field unset, the same as never calling this at all) so a
-    /// caller that only sometimes has a fingerprint (e.g. attestation is
-    /// disabled, or fingerprinting failed) does not need its own branch.
+    /// Stamp the launch policy fingerprint when available. (#139)
     pub fn with_safety_policy_sha256(mut self, fingerprint: Option<String>) -> Self {
         self.safety_policy_sha256 = fingerprint;
         self
     }
 
-    /// Issue #169: stamps the role (a `prompt::PromptRole::label()` string)
-    /// this session was actually spawned with, chained onto `new` at the
-    /// call site that resolved one. Forgery-proof by construction: the
-    /// caller is the server that decided what to spawn (`Pane::spawn`'s own
-    /// `PaneSpec::role`, `wrap::run_with`'s own `role` parameter), never
-    /// anything read back from the session's own request.
+    /// Stamp the role chosen by the spawning server, never from a session
+    /// request. (#169)
     pub fn with_role(mut self, role: &str) -> Self {
         self.role = Some(role.to_string());
         self
     }
 
-    /// Issue #186 hardening: preserves a supervisor's already-established
-    /// delivery address while the underlying vendor session changes. This is
-    /// only used by Zirv's own cross-harness continuation path; callers must
-    /// supply the short id of the logical supervisor that is being continued.
+    /// Keep the supervisor's delivery address through a harness change. (#186)
     pub fn with_stable_short(mut self, short: &str) -> Self {
         if !short.is_empty() {
             self.short = short.to_string();
@@ -343,9 +198,7 @@ fn record_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.json"))
 }
 
-/// Best-effort write: a registry that cannot be written must never be the
-/// reason a launch fails, matching every other piece of state-dir
-/// housekeeping in this codebase.
+/// Registry write failure must never fail launch.
 fn write_record(state: &StateDir, record: &Record) -> PathBuf {
     let path = record_path(state, &record.short);
     let _ = super::state::create_private_dir_all(&state.sessions());
@@ -355,11 +208,8 @@ fn write_record(state: &StateDir, record: &Record) -> PathBuf {
     path
 }
 
-/// Registered at spawn, best-effort, and removed when the supervisor exits.
-/// `Drop` covers a panic-free early return; `release()` is called explicitly
-/// in every arm that leaves the supervisor loop, the same explicit-arm
-/// discipline `RawGuard` follows because this binary's release profile is
-/// `panic = "abort"` and Drop is therefore not guaranteed to run.
+/// Explicitly release on every exit path; panic = "abort" makes Drop
+/// unreliable for cleanup.
 #[derive(Debug)]
 pub struct SessionGuard {
     state: StateDir,
@@ -369,18 +219,8 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
-    /// Stamps `owner_pid` with this process's own pid before writing the
-    /// record, unless the caller already set one -- see the field's own doc
-    /// comment. Every registration path goes through this one function, so
-    /// this is the single seam: a dashboard pane and a standalone `wrap`/
-    /// `exec`/`loop` session both end up attributed to whichever process
-    /// actually called this, without each caller having to remember to stamp
-    /// itself. That is the dashboard's own pid for a pane (registered from
-    /// inside the dashboard process) and the calling process's own pid for
-    /// everything else -- including `zirv ctx agent`'s headless fallback,
-    /// which runs in the *requester's* process rather than the dashboard's
-    /// even when the request named one (see the field's own doc comment for
-    /// that residual).
+    /// Stamp the registering process as owner; panes register from their
+    /// dashboard, while requester-side fallbacks own themselves.
     pub fn register(state: &StateDir, mut record: Record) -> Self {
         if record.owner_pid.is_none() {
             record.owner_pid = Some(std::process::id());
@@ -394,42 +234,19 @@ impl SessionGuard {
         }
     }
 
-    // Issue #281: `wrap.rs`'s pump loop reads `.verb` off this to label its
-    // `stamp_in_flight` calls with the actual verb this guard was
-    // registered under (`Wrap` or `Chat` -- `chat.rs` reuses `wrap::
-    // run_with`), rather than assuming `"wrap"` unconditionally.
+    // Use the guard's actual verb when marking an in-flight turn. (#281)
     pub fn record(&self) -> &Record {
         &self.record
     }
 
-    /// Points this run's record at a new session id: `loop`'s per-cycle
-    /// refresh, and `exec`'s per-restart one. One guard, and one record, for
-    /// the whole supervised run.
-    ///
-    /// C7: `short` and the record's path are deliberately **not** refreshed
-    /// with it. The short id is this supervisor's *address* -- what
-    /// `resolve_prefix` hands a sender, what `send --to-session` and `zirv
-    /// ctx nudge` store on a message, and what `zirv ctx status` prints for
-    /// a human to type. Rotating it every cycle or restart meant a message
-    /// addressed to a live session became permanently undeliverable the
-    /// moment that session was replaced, which is the whole "stranded mail"
-    /// class of bug: the sender resolved a real address, and the supervisor
-    /// then stopped answering to it. The session *id* rotates (that is the
-    /// point of a fresh session); the address it can be reached at does not.
+    /// Refresh the native session id while retaining this supervisor's
+    /// stable short delivery address across cycles and restarts.
     pub fn refresh_session(&mut self, new_session: &str) {
         if self.released {
             return;
         }
-        // Review round 1, finding 7: the OLD session id's own memory tier
-        // (`memory::MemoryScope::Session`, issue #295) is not this run's
-        // stable address -- `short` is -- so a `loop`/`exec` cycle that
-        // rotates `record.session` would otherwise leave that tier's
-        // directory behind forever, cleaned up only when `release()`
-        // eventually fires for whichever session id happens to be current
-        // at that point. Purged here instead, best-effort, the same way
-        // every other memory cleanup in this module is: a failed removal
-        // costs a leaked directory, never data loss for anything still
-        // live (a no-op if the old id never wrote anything there).
+        // Remove the old session's memory tier on rotation; release only
+        // sees the current id. Failure is best-effort. (#295)
         let old_session = std::mem::replace(&mut self.record.session, new_session.to_string());
         if old_session != new_session {
             let _ = super::memory::forget_session_all(
@@ -442,40 +259,9 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
-    /// Points this run's record at the pid of the agent child the supervisor
-    /// actually spawned, rather than at the supervisor's own pid.
-    ///
-    /// P5: `Record::new` stamps `std::process::id()`, which for `wrap` is
-    /// zirv's pid -- so a `wrap` record stayed "alive" (and stayed offered
-    /// for restore, and stayed nudge-targetable) for exactly as long as the
-    /// *wrapper* lived, whether or not the agent underneath it was still
-    /// there. `dash::pane::Pane::spawn` has always stamped the real child pid
-    /// for the same reason; this is that same override, on the one seam
-    /// `wrap` has for it. Called right after the spawn, and again after every
-    /// relaunch: a record left pointing at a replaced child's dead pid would
-    /// be swept by `list` and the live session would vanish from `zirv ctx
-    /// status`.
-    ///
-    /// `owner_pid` is deliberately untouched -- it answers "which process
-    /// filed this record", which is still zirv's own, and is what
-    /// `dash::assemble_sidebar` scopes its panel by. Like every other write
-    /// here, best-effort: `short` and the record's path do not move (see
-    /// `refresh_session`), so a failed write costs a stale pid, never an
-    /// address.
-    ///
-    /// Review round 2 finding 1 (issue #152): `start_time` MUST move with
-    /// `pid`, not just `pid` alone. `record_is_alive`'s `EPERM` branch
-    /// compares whoever currently holds `record.pid` against `record.
-    /// start_time` -- leaving the old value in place after repointing `pid`
-    /// at a fresh child would compare the CHILD's real start time against
-    /// the SUPERVISOR's, which is a guaranteed mismatch (the child always
-    /// starts meaningfully after the supervisor that goes on to spawn it).
-    /// That is not a hypothetical: it is exactly the everyday sandboxed
-    /// case issue #146 was written for -- a live child, probed with `EPERM`
-    /// -- and would have `list` delete a perfectly live pane's record.
-    /// Re-reading via `process_start_secs(pid)` keeps the two in lockstep;
-    /// `None` (no usable `ps`) degrades `start_time` to `None` too, which
-    /// is `record_is_alive`'s own "cannot tell" case, never a false mismatch.
+    /// Adopt the child pid after spawn and each relaunch, keeping owner pid
+    /// unchanged. Move start time with pid or liveness may reject a live
+    /// child under EPERM. (#152, #146)
     pub fn adopt_child_pid(&mut self, pid: u32) {
         if self.released || self.record.pid == pid {
             return;
@@ -485,14 +271,8 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
-    /// Issue #281: stamps `Record::in_flight`, marking a turn as started.
-    /// Called from `wrap.rs`'s pty spawn/relaunch sites and its pump loop's
-    /// `PumpEvent::Input` arm, and from `exec.rs`'s per-cycle spawn -- the
-    /// existing edges each supervisor already observes for a turn beginning.
-    /// Best-effort, like every other registry write here: a failed write
-    /// costs a missed witness on a future crash, never this turn itself.
-    /// Idempotent per turn: `wrap`'s `Input` arm fires on every keystroke
-    /// chunk, so only the first chunk of a turn touches the disk.
+    /// Mark one turn in flight best-effort; repeated input chunks must not
+    /// rewrite the witness. (#281)
     pub fn stamp_in_flight(&mut self, verb: &str, turn: u64) {
         if self.released
             || self
@@ -511,12 +291,7 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
-    /// The turn-boundary counterpart to `stamp_in_flight`: called from
-    /// `wrap.rs`'s turn-signal arm and `exec.rs`'s tick loop the instant a
-    /// turn signal lands, i.e. the moment a turn is known to have reached a
-    /// clean boundary. A no-op when nothing is stamped, so calling it on
-    /// every turn signal regardless of whether `stamp_in_flight` ran first is
-    /// always safe.
+    /// Clear the witness at a clean turn boundary.
     pub fn clear_in_flight(&mut self) {
         if self.released || self.record.in_flight.is_none() {
             return;
@@ -525,27 +300,12 @@ impl SessionGuard {
         self.path = write_record(&self.state, &self.record);
     }
 
-    /// This run's stable delivery address -- see `refresh_session`. Every
-    /// mail listing a supervisor performs on its own behalf is scoped to
-    /// this, never to `short_id(current session)`.
-    ///
-    /// Read back by `exec`'s nudge-relaunch mail listing specifically because
-    /// it is the one value demonstrably unaffected by the
-    /// `refresh_session` call immediately above it.
+    /// Stable short address for this supervisor's mail and nudges.
     pub fn short(&self) -> &str {
         &self.record.short
     }
 
-    /// Gives up this guard's claim on its registry record WITHOUT removing
-    /// anything (issue #552).
-    ///
-    /// One case only: a rollover successor has registered under the SAME
-    /// short id -- the seat's stable address, which by design does not move
-    /// across a rollover -- and the source is retired afterwards. Letting the
-    /// source's guard run its ordinary `release` there would delete the
-    /// record file the successor has just written, so the address would
-    /// answer for nobody. Disowning states the truth instead: this guard no
-    /// longer speaks for that address, and something else does.
+    /// Give up the guard without removing its registry record. (#552)
     pub fn disown(&mut self) {
         self.released = true;
     }
@@ -557,26 +317,12 @@ impl SessionGuard {
         }
         self.released = true;
         let _ = std::fs::remove_file(&self.path);
-        // Issue #243 (review round, F1): the screening sibling file
-        // (`screening_path`) is this record's own, so it goes with it --
-        // best-effort, like the record removal right above; a crashed
-        // supervisor's own leftover is still cleaned up by `list()`'s own
-        // `sweep_orphaned_screening_summaries`.
+        // Remove screening and workflow siblings with the record; orphan
+        // sweeps handle crashed supervisors. (#243)
         let _ = std::fs::remove_file(screening_path(&self.state, &self.record.short));
-        // The bound-workflow sibling file (`workflow_path`) goes with the
-        // record the same way -- best-effort, and swept up by `list()`'s own
-        // `sweep_orphaned_workflow_markers` for a crashed supervisor's leftover.
         let _ = std::fs::remove_file(workflow_path(&self.state, &self.record.short));
-        // Issue #295: a session-tier memory entry must never outlive the
-        // session it belongs to -- best-effort, like every other cleanup
-        // here; a failed removal leaves an orphaned directory, never data
-        // loss for anything still live. Keyed on `record.session` (the
-        // CURRENT session id this guard's record carries at release time,
-        // which may have rotated since `remember_session` was actually
-        // called for a `loop`/`exec` supervisor's earlier cycle -- see
-        // `memory::MemoryScope::Session`'s own doc comment for this
-        // accepted residual): an id that never held any session-tier
-        // entries removes nothing.
+        // Session-tier memory must not outlive its session; cleanup is
+        // best-effort and keyed by the current session id. (#295)
         let _ = super::memory::forget_session_all(
             &self.state,
             &self.record.repo_slug,
@@ -598,10 +344,7 @@ pub enum Liveness {
     Stale,
 }
 
-/// The three possible outcomes of a `kill(pid, 0)` signal-0 probe, named so
-/// `record_is_alive` (issue #152) can react to the middle one -- `EPERM` --
-/// differently from the other two, which `is_alive` folds together (`EPERM`
-/// reads as alive there, same as `CanSignal` -- see its own doc comment).
+/// Distinguish signal-0 permission denial from missing process. (#152)
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SignalProbe {
@@ -625,40 +368,9 @@ fn probe_signal(pid: u32) -> SignalProbe {
     }
 }
 
-/// Signal-0 liveness probe (`kill -0`, the same check a shell's own `kill -0
-/// <pid>` makes: existence and permission only, nothing is actually sent).
-///
-/// Issue #146: a plain `kill() == 0` check reads a non-zero return as "dead"
-/// outright, which conflates two very different errno values. `ESRCH` (no
-/// such process) genuinely does mean dead. `EPERM` means the process exists
-/// but this caller lacks permission to signal it -- exactly what a sandboxed
-/// `zirv ctx send`/`zirv ctx nudge`, running as a Bash-tool child inside a
-/// dash pane, gets when probing the very sessions it is trying to reach.
-/// Treating that as "dead" made `list` sweep every live record as `Stale`,
-/// so `resolve_prefix` saw zero `Live` candidates and every send/nudge
-/// failed with "no sessions are registered" -- issue #146's exact symptom,
-/// with genuinely live sessions sitting right there in the registry.
-///
-/// `pub(crate)`: the single liveness check shared by this whole module
-/// (`dashboard_owner_liveness`, `short_is_live` before issue #152, `list`
-/// before issue #152) and, since issue #145/#146's fix, by `dash::mod` too
-/// (`sweep_stale_token_dirs` and its own discovery scan) -- which used to
-/// carry an independent, identically EPERM-blind copy of this exact check
-/// rather than importing this one.
-///
-/// Documented trade-off, not a bug: reading `EPERM` as alive means a pid the
-/// kernel has recycled to an unrelated, foreign-uid process keeps a stale
-/// session/dashboard record alive until that pid frees again, since this
-/// bare pid-only check has no start-time (or any other) disambiguator to
-/// tell the original process apart from its replacement. Issue #152
-/// addresses this for the one caller that actually has more than a bare pid
-/// to work with: a `Record` also carries a `start_time`, and `record_is_alive`
-/// below uses it to make exactly that distinction for `short_is_live` and
-/// `list`, which now call it instead of this function. This function keeps
-/// its original bare-pid, EPERM-is-alive contract unchanged -- callers with
-/// no `Record` (`supervise`, `permit`, `dashboard_owner_liveness`,
-/// `dash::mod`'s sweeps) still have no disambiguator available and keep
-/// today's behavior exactly.
+/// Signal 0 proves existence when allowed; EPERM also means alive, since
+/// sandboxed callers may lack permission to signal a live process. A bare
+/// pid cannot distinguish an unrelated process that reused its number. (#146, #145, #152)
 #[cfg(unix)]
 pub(crate) fn is_alive(pid: u32) -> bool {
     probe_signal(pid) != SignalProbe::NoSuchProcess
@@ -693,62 +405,14 @@ pub(crate) fn is_alive(_pid: u32) -> bool {
     true
 }
 
-/// How far apart a record's stamped `start_time` and a freshly read one may
-/// be before they are considered two different processes rather than the
-/// same one read twice.
-///
-/// Review round 2 finding 2 (issue #152): 10s was too tight. This
-/// disambiguator's whole job is to catch a pid the OS recycled to an
-/// unrelated process well AFTER the original session died -- in practice
-/// hours or days later, since a pid only frees once the original process is
-/// long gone and the kernel's pid counter wraps back around to it. It has no
-/// business firing on ordinary clock noise: an NTP correction or a manual
-/// clock change between registration and a later check can plausibly move
-/// either `now_secs()` reading by more than a few seconds without any
-/// process having changed at all, and `record_is_alive`'s `EPERM` branch is
-/// exactly the sandboxed-probe path issue #146 exists for -- a genuinely
-/// live, unrelated-uid session, not a recycled one. 300s (5 minutes) absorbs
-/// realistic NTP steps, `ps -o etime=` rounding, and this reader's own
-/// now-minus-age derivation slack, while still being a small fraction of the
-/// "hours or days" gap the actual recycled-pid failure mode produces. Never
-/// sweep a live record on a difference the clock environment alone could
-/// plausibly explain.
-///
-/// Compare `RECYCLED_PID_TOLERANCE_SECS` (`kill`'s own recycled-pid guard,
-/// above): both absorb clock/reading slack, but they answer different
-/// questions at different magnitudes and must not be unified. `kill`'s guard
-/// compares a target's own freshly-read age against `registered_at` -- a
-/// ONE-SIDED "is this process younger than its own record" heuristic, where
-/// even a few seconds of slack (5s) is enough margin because a genuine
-/// session's process always predates its record by a wide, predictable
-/// margin (registration happens moments after the process starts). This
-/// disambiguator instead compares two INDEPENDENT start-time readings of the
-/// same claimed process, taken at different times, against each other --
-/// exactly the kind of comparison a clock step disturbs, and with no
-/// registration-order assumption to lean on, hence the much wider 300s.
-///
-/// Only `record_is_alive`'s `#[cfg(unix)]` branch reads this outside of
-/// tests -- see its own `#[cfg_attr]`, matching `parse_etime`'s identical
-/// non-unix dead-code allowance below.
+/// Allow clock steps and ps rounding when comparing independent start-time
+/// readings; this wider tolerance must not be unified with kill's one-sided
+/// registration-order check. (#152, #146)
 #[cfg_attr(not(unix), allow(dead_code))]
 const START_TIME_TOLERANCE_SECS: u64 = 300;
 
-/// Pure: whether a mismatch between a record's stamped `start_time` and a
-/// freshly read one is large enough to mean "a different process now holds
-/// this pid" -- issue #152's disambiguator for `is_alive`'s `EPERM` branch
-/// (see its own doc comment on the trade-off this closes for `Record`-based
-/// liveness).
-///
-/// Either side missing degrades to "cannot tell", which must read as NOT
-/// disambiguating -- i.e. still alive -- per `record_is_alive`'s contract: a
-/// record from a build or platform that cannot stamp/read a start time keeps
-/// today's EPERM-is-alive behavior exactly, and must never read as falsely
-/// dead just because one side of the comparison is missing.
-///
-/// `pub(crate)` since audit finding G4: `reservation::is_owner_alive` needs
-/// the identical comparison for a ledger entry that carries a stamped
-/// `pid_start_time` but no whole `Record`, and duplicating it there would
-/// fork `START_TIME_TOLERANCE_SECS` into two constants that could drift.
+/// Compare recorded and current start times only when both exist; missing
+/// data preserves EPERM-is-alive rather than falsely sweeping a record. (#152)
 pub(crate) fn start_time_disambiguates_dead(recorded: Option<u64>, current: Option<u64>) -> bool {
     match (recorded, current) {
         (Some(recorded), Some(current)) => recorded.abs_diff(current) > START_TIME_TOLERANCE_SECS,
@@ -756,48 +420,15 @@ pub(crate) fn start_time_disambiguates_dead(recorded: Option<u64>, current: Opti
     }
 }
 
-/// Epoch seconds the process holding `pid` started, if this platform and
-/// environment can tell -- built directly on [`process_age_secs`] (`now -
-/// age`), so it inherits that reader's exact "cannot tell" cases (`ps`
-/// missing/refused, unparsable output) with no cfg split of its own:
-/// `process_age_secs` is already `None` on every non-unix target, which is
-/// exactly issue #152's own scope note -- Windows liveness stays on its
-/// existing `OpenProcess`/`GetExitCodeProcess` mechanism, unaffected, since
-/// `record_is_alive` never calls this off unix.
-///
-/// `pub(crate)`: every place `Record::pid` is ever repointed at a different
-/// process after `Record::new` -- `SessionGuard::adopt_child_pid` here, and
-/// `dash::pane::Pane::spawn`'s own `record.pid = child_pid` -- must re-derive
-/// `start_time` for the NEW pid in the same breath, or `record_is_alive`
-/// compares the new process against the old one's start time and reads a
-/// guaranteed, false mismatch (review round 2 finding 1, issue #152).
+/// Derive start time where supported and available; repointing a record's
+/// pid must also refresh this timestamp. (#152)
 pub(crate) fn process_start_secs(pid: u32) -> Option<u64> {
     let age = process_age_secs(pid)?;
     Some(super::state::now_secs().saturating_sub(age))
 }
 
-/// [`is_alive`], sharpened for a [`Record`]: unlike a bare pid, a record also
-/// carries the `start_time` its own process stamped at registration, which
-/// is exactly the disambiguator `is_alive`'s own doc comment says a bare
-/// signal-0 probe cannot have -- issue #152.
-///
-/// Unix: a `kill(pid, 0)` that can signal the process answers alive
-/// unconditionally (this caller reached it, full stop -- no reason to doubt
-/// a start time on top of that), and `ESRCH` answers dead unconditionally,
-/// identical to `is_alive`. Only `EPERM` -- "exists, but not one I may
-/// signal" -- gets a second opinion: whether the process now holding this pid
-/// started around the same time this record's own process did, or
-/// meaningfully later (the kernel recycled the pid to something unrelated
-/// after the original exited). Missing or unreadable start times on either
-/// side degrade to alive, exactly matching `EPERM`'s treatment before this
-/// existed.
-///
-/// Non-unix: identical to `is_alive(record.pid)` -- issue #152's acceptance
-/// leaves the Windows liveness mechanism unchanged.
-///
-/// `short_is_live` and `list`'s sweep are this function's only callers;
-/// every other liveness check in this module and `dash::mod` has no
-/// `Record` to read a start time from and keeps calling bare `is_alive`.
+/// On Unix, only EPERM requires start-time disambiguation; missing times
+/// preserve alive. Other signal-0 outcomes and non-Unix follow is_alive. (#152)
 #[cfg(unix)]
 pub fn record_is_alive(record: &Record) -> bool {
     match probe_signal(record.pid) {
@@ -814,38 +445,21 @@ pub fn record_is_alive(record: &Record) -> bool {
     is_alive(record.pid)
 }
 
-/// Whether the registry still holds a record for `short` whose pid is alive.
-///
-/// P4: a dashboard that was killed (rather than quit) leaves both a restore
-/// roster *and* the sessions its panes registered -- and on Windows, before
-/// the job-object backstop, those panes' agents genuinely outlived it.
-/// Restoring such a candidate spawns a second agent onto a conversation the
-/// first one is still holding. Reads the record file directly rather than
-/// going through `list`, which sweeps as a side effect: this is a question,
-/// not a cleanup. A missing, unreadable or malformed record answers `false`
-/// -- nothing to collide with, so the restore may proceed.
+/// Read liveness without sweeping the registry, so restore cannot duplicate
+/// an agent whose pane process survived its dashboard.
 pub fn short_is_live(state: &StateDir, short: &str) -> bool {
     load_record(state, short).is_some_and(|record| record_is_alive(&record))
 }
 
-/// One registry record, read straight off disk by its short id -- a question,
-/// never a cleanup: unlike [`list`], nothing is swept and no liveness is
-/// judged here, so a caller that only wants what was RECORDED about a session
-/// (`Record::role`, issue #169) does not have to walk, and mutate, the whole
-/// registry to find it. `None` for a missing, unreadable or malformed record.
+/// Read one record without liveness judgment or registry cleanup. (#169)
 pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
     std::fs::read_to_string(record_path(state, short))
         .ok()
         .and_then(|contents| serde_json::from_str::<Record>(&contents).ok())
 }
 
-/// Every record currently on disk, alongside whether its own process is
-/// still alive. Crash witnesses survive until consumed or past the dashboard
-/// restore horizon. A stale record (its process is gone) is swept -- its file
-/// removed -- as a side effect of this read, but is still reported in the
-/// returned list so a caller can say what it just cleaned up. A file that
-/// fails to parse is skipped outright: one malformed record must never fail
-/// the whole listing.
+/// List records with liveness and sweep stale files, still returning swept
+/// records for reporting; malformed files cannot fail the listing.
 pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     let cfg = CtxConfig::load(Path::new("."), &env_from_process()).unwrap_or_default();
     list_with_retention(state, cfg.dash.roster_max_age_secs)
@@ -854,14 +468,8 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
 pub fn list_with_retention(state: &StateDir, retention_secs: u64) -> Vec<(Record, Liveness)> {
     let mut found = Vec::new();
     let now = state::now_secs();
-    // Issue #99 (2026-08-23): an absent `sessions/` directory used to make
-    // this whole function return immediately, before `sweep_orphan_endpoints`
-    // below ever ran. That is exactly the state a fresh install, or a
-    // machine where every registry record has already been cleaned up some
-    // other way, is in -- precisely the case a stray `*.sock` file left by an
-    // older zirv build (which predates the registry entirely) needs the
-    // sweep to still run. `state.sessions()` missing now only means "no
-    // records to list", not "skip every other sweep this function does".
+    // A missing sessions directory means no records, but endpoint and
+    // marker sweeps must still run. (#99)
     if let Ok(entries) = std::fs::read_dir(state.sessions()) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -887,13 +495,8 @@ pub fn list_with_retention(state: &StateDir, retention_secs: u64) -> Vec<(Record
                 found.push((record, Liveness::Stale));
             }
         }
-        // `read_dir` yields records in a filesystem-dependent order, so a
-        // caller that indexes the list positionally (the dashboard sidebar
-        // re-reads it every ~1s) would see rows reorder under the operator
-        // whenever an unrelated session registers or exits. Sort by a stable
-        // key -- the launch time, then the short id as a tiebreak -- so the
-        // ordering is deterministic across refreshes regardless of how the
-        // directory happened to enumerate.
+        // Sort by launch time and short id so dashboard rows stay stable
+        // across filesystem enumeration orders.
         found.sort_by(|a, b| {
             a.0.started_at
                 .cmp(&b.0.started_at)
@@ -908,18 +511,8 @@ pub fn list_with_retention(state: &StateDir, retention_secs: u64) -> Vec<(Record
     found
 }
 
-/// The same "no live record, so remove it" sweep [`sweep_orphan_endpoints`]
-/// runs for `*.sock` markers, for the `<state>/socket-path-<short>` files
-/// `wrap::publish_socket_path` writes. Only `wrap`'s own graceful exit
-/// unpublishes one, and this binary is `panic = "abort"`, so every kill or
-/// crash leaves one behind forever (46 of them on one real machine) --
-/// and `wrap::read_socket_path` with no session picks the NEWEST published
-/// file by mtime, with no liveness check of its own, so a dead session's
-/// leftover can be handed to a reader as if it were current.
-///
-/// Same probe-before-remove rule as the endpoint sweep, on the socket path
-/// the file NAMES: a supervisor that is alive but was never (or no longer)
-/// recorded in the registry still answers, and must keep its file.
+/// Remove a published socket path only when no live record or answering
+/// endpoint owns it; a live unregistered supervisor keeps its path.
 fn sweep_orphan_socket_paths(state: &StateDir, found: &[(Record, Liveness)]) {
     let Ok(entries) = std::fs::read_dir(state.root()) else {
         return;
@@ -952,24 +545,8 @@ fn sweep_orphan_socket_paths(state: &StateDir, found: &[(Record, Liveness)]) {
     }
 }
 
-/// C9 (issue #99, 2026-08-23): an orphaned turn-signal endpoint -- a
-/// `*.sock` file in `state.sockets()` with no matching live session record.
-/// `SignalServer::bind` writes one for every supervised session (a real Unix
-/// domain socket, or on Windows a marker file naming the pipe), and only
-/// `Drop for SignalServer` removes it, which never runs for a killed or
-/// crashed process (this binary's release profile is `panic = "abort"`).
-/// Left behind, these accumulate and `zirv ctx status` lists every one of
-/// them forever as `(no record)` (`status.rs`'s own `sessions_lines`).
-///
-/// Only a marker whose endpoint fails a connection probe
-/// (`signal::probe`) is removed: one that still answers belongs to a
-/// supervisor that is alive but was never (or no longer) recorded in the
-/// registry -- an older build, or a registry write that failed -- and must
-/// stay both on disk and listed. `found` is the same list `list` just
-/// computed, so this never calls back into `list` itself, and every record
-/// with a live entry is skipped outright without ever touching the network
-/// (matching `sweep_orphaned_markers`'s own "only markers with no live
-/// record" rule immediately above).
+/// Sweep orphan endpoints only after probing them; an answering socket
+/// may belong to a live supervisor whose registry write failed. (#99)
 fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
     let Ok(entries) = std::fs::read_dir(state.sockets()) else {
         return;
@@ -996,9 +573,7 @@ fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
     }
 }
 
-/// A turn-signal endpoint file: a seat's live `<short>.sock`, or a staged
-/// rollover successor's `<short>.<4-hex nonce>` (`dash::pane`'s
-/// `staged_socket_path`), which a crashed dashboard leaves behind just the same.
+/// Live or staged turn-signal endpoint file.
 pub(crate) fn is_endpoint_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -1009,16 +584,9 @@ pub(crate) fn is_endpoint_file(path: &Path) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
-    /// No live session's short id or full session id starts with the given
-    /// prefix. Names every currently known live session, so the caller
-    /// learns what it could have typed instead.
+    /// No live prefix match; include available short ids.
     NotFound { existing: Vec<String> },
-    /// More than one candidate matches; every candidate's short id is named
-    /// so the caller can disambiguate. Issue #721: shared with
-    /// `resolve_prefix_or_parked`'s own multi-parked-seat case, which has no
-    /// live [`Record`] to name -- only the short id survives a `Seat`, so
-    /// this holds ids rather than full records (`resolve_prefix`'s own
-    /// `Display` text never used anything else from them).
+    /// Ambiguous prefix; report candidate short ids, including parked seats. (#721)
     Ambiguous(Vec<String>),
 }
 
@@ -1045,20 +613,8 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Extends a [`ResolveError`]'s own display text with where the registry was
-/// actually checked -- the state dir's `sessions()` subdirectory -- and
-/// whether `ZIRV_CTX_STATE_DIR` pinned it or the platform default was used.
-///
-/// Issue #146: "no sessions are registered" alone gives no way to tell "the
-/// registry really is empty" apart from "this call resolved a different
-/// state dir than the one the session actually registered under" -- which is
-/// exactly the shape of the EPERM-blind liveness bug this same issue fixed
-/// (see `is_alive`'s own doc comment): a caller and the supervisor it means
-/// to reach can end up looking at different state dirs, or the same dir
-/// while one of them can no longer confirm the other alive, and either way
-/// the operator sees the identical unhelpful message. Appended, not
-/// substituted: the existing `{err}` text stays the prefix, so anything
-/// already asserting on it keeps passing (`send`/`nudge`'s own call sites).
+/// Add the checked state-dir path to a resolution error so an empty
+/// registry can be distinguished from a mismatched location. (#146)
 pub fn resolve_error_with_diagnostics(
     err: &ResolveError,
     state: &StateDir,
@@ -1077,9 +633,7 @@ pub fn resolve_error_with_diagnostics(
     )
 }
 
-/// Resolves a short-id (or full session-id) prefix to the one live record it
-/// names. Only live records are candidates: a stale one has already been
-/// swept from disk by the time a caller could act on it.
+/// Resolve a prefix only among live records; listing sweeps stale ones.
 pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveError> {
     let live: Vec<Record> = list(state)
         .into_iter()
@@ -1104,30 +658,15 @@ pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveE
     }
 }
 
-/// What addressing a short id (or full session id) prefix finds: the one
-/// live record [`resolve_prefix`] already resolves, or -- issue #721 -- a
-/// still-parked seat whose owning session record no longer exists.
-/// `rollover::forget` deliberately keeps `<short>.seat.json` alive past its
-/// own session's teardown while the park's window has not yet elapsed (its
-/// own doc comment calls this a "ghost park"), so a bare registry miss
-/// cannot tell a genuinely unknown id apart from one whose supervisor
-/// already exited but is still owed a wake-up.
+/// Address resolves to one live record or a ghost-parked seat. (#721)
 #[derive(Debug)]
 pub enum Addressed {
     Live(Box<Record>),
     Parked(Box<super::seat::Seat>),
 }
 
-/// [`resolve_prefix`], extended to recognize a ghost-parked seat (issue
-/// #721) instead of reporting it as a bare [`ResolveError::NotFound`].
-/// Every other outcome is untouched and byte-identical to calling
-/// `resolve_prefix` directly: a live match, an ambiguous live prefix, and a
-/// prefix that matches neither a live record nor any parked seat all fall
-/// straight through unchanged -- only a `NotFound` whose prefix names one or
-/// more parked seats is reinterpreted: exactly one becomes `Parked`, and two
-/// or more become the identical [`ResolveError::Ambiguous`] a multi-match
-/// among live records already returns, naming each candidate's short id so
-/// the caller can disambiguate.
+/// Interpret a registry miss as a parked seat only for a unique parked
+/// prefix; ambiguity still reports candidate short ids. (#721)
 pub fn resolve_prefix_or_parked(state: &StateDir, prefix: &str) -> Result<Addressed, ResolveError> {
     match resolve_prefix(state, prefix) {
         Ok(record) => Ok(Addressed::Live(Box::new(record))),
@@ -1145,12 +684,7 @@ pub fn resolve_prefix_or_parked(state: &StateDir, prefix: &str) -> Result<Addres
     }
 }
 
-/// Pure: POSIX `ps -o etime=` output (`[[dd-]hh:]mm:ss`) as seconds. `None`
-/// for anything that does not parse, which every caller reads as "cannot
-/// tell" rather than as any particular age.
-///
-/// Only called from the `#[cfg(unix)]` `process_age_secs` and from tests; the
-/// non-unix `process_age_secs` never reaches it.
+/// Parse POSIX elapsed time; malformed output means unknown age.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn parse_etime(raw: &str) -> Option<u64> {
     let (days, clock) = match raw.trim().split_once('-') {
@@ -1170,15 +704,8 @@ fn parse_etime(raw: &str) -> Option<u64> {
     Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
 }
 
-/// How long the process holding `pid` has been running, in seconds.
-///
-/// POSIX `ps -o etime=`, deliberately rather than a platform-specific
-/// interface (`/proc/<pid>/stat` plus `btime`, `sysctl KERN_PROC_PID`): this
-/// answers one question, on one code path, and a platform-abstraction layer
-/// for it would be more machinery than the question is worth. `None` --
-/// `ps` missing, refused (a sandbox), or output this cannot parse -- means
-/// "cannot tell", and every caller then behaves exactly as it did before this
-/// check existed rather than refusing to act.
+/// Read process age with ps; missing or refused probes mean unknown age,
+/// never evidence that a record is stale.
 #[cfg(unix)]
 fn process_age_secs(pid: u32) -> Option<u64> {
     let output = std::process::Command::new("ps")
@@ -1191,9 +718,7 @@ fn process_age_secs(pid: u32) -> Option<u64> {
     parse_etime(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// No portable start-time probe on this platform, so a recycled pid is
-/// indistinguishable from the session's own -- see [`run_kill_with`]'s doc
-/// comment for the residual this leaves.
+/// This platform cannot distinguish a recycled pid by start time.
 #[cfg(not(unix))]
 fn process_age_secs(_pid: u32) -> Option<u64> {
     None

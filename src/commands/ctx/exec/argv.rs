@@ -1,45 +1,18 @@
 //! Prompt extraction, restart flags, and launch prompt propagation.
 
-/// Flags that pin a launch to a conversation that already exists. A restart is
-/// a deliberate escape from the session that rotted, so inheriting any of them
-/// would march the fresh child straight back into it and burn the whole
-/// restart budget re-entering rot. The first two carry a value; the rest are
-/// bare.
-///
-/// These are claude's own verified flags (`--session-id`/`--resume`,
-/// `-c`/`--continue`/`--fork-session`) -- see `ClaudeAdapter::resume_args`/
-/// `session_pin_args`. Every matcher below only ever consults this list for
-/// an adapter that actually recognises it (issue #143): codex's own `-c` is
-/// `-c, --config <key>=<value>`, an unrelated WITH-VALUE flag that happens to
-/// share claude's bare resume spelling. Matching it here regardless of
-/// adapter used to strip the bare `-c` token as claude's valueless resume
-/// flag while leaving codex's own value (e.g. `approval_policy=never`)
-/// behind, orphaned on argv -- which real codex-cli then rejects outright.
+/// Claude conversation pins to strip on restart; apply only to Claude,
+/// because Codex uses `-c` for a value-bearing configuration flag. (#143)
 pub(crate) const RESUME_FLAGS_WITH_VALUE: [&str; 2] = ["--session-id", "--resume"];
 
 pub(crate) const RESUME_FLAGS_BARE: [&str; 3] = ["-c", "--continue", "--fork-session"];
 
-/// Whether `adapter_name` is the one adapter [`RESUME_FLAGS_WITH_VALUE`]/
-/// [`RESUME_FLAGS_BARE`] actually describe. Shared by every matcher below so
-/// they cannot drift on which adapter this list applies to.
+/// Restrict Claude resume flags to the adapter that owns them.
 fn adapter_has_resume_flags(adapter_name: &str) -> bool {
     adapter_name.eq_ignore_ascii_case("claude")
 }
 
-/// Pure: whether `args` already pins this launch to a conversation that
-/// exists -- any of [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`], in
-/// either the two-token or the `--flag=value` spelling. Always `false` for an
-/// adapter that does not recognise these flags at all (see
-/// `adapter_has_resume_flags`) -- codex mints its own session id and has no
-/// verified pin flag, so nothing in its own argv could mean this.
-///
-/// D3: a caller that adds a pin of its own (`chat::dash_orchestrator_pane`,
-/// via `AgentAdapter::session_pin_args`) has to ask this first. `zirv chat --
-/// --resume <id>` produced `--resume <id> --session-id <fresh-uuid>`, which
-/// the harness refuses outright: two contradictory conversation ids in one
-/// launch. Inside a dashboard the resulting pane died immediately and its
-/// corpse was reaped, so the operator saw the session vanish with no error at
-/// all.
+/// Detect existing conversation pins before adding another; conflicting ids
+/// can make a launch fail before the operator sees it.
 pub(crate) fn pins_an_existing_conversation(args: &[String], adapter_name: &str) -> bool {
     if !adapter_has_resume_flags(adapter_name) {
         return false;
@@ -59,25 +32,8 @@ fn is_joined_form(arg: &str, flags: &[&str]) -> bool {
         .is_some_and(|(name, _)| flags.contains(&name))
 }
 
-/// Issue #778: the resume-pinning tokens already in `command` (a
-/// [`RESUME_FLAGS_WITH_VALUE`]/[`RESUME_FLAGS_BARE`] flag, either spelling),
-/// verbatim, plus the explicit conversation id when the flag names one
-/// directly. `(Vec::new(), None)` when nothing pins a conversation, or the
-/// adapter does not recognise these flags at all (`adapter_has_resume_
-/// flags`) -- codex mints its own session id and has no verified pin flag,
-/// so this is always a no-op for it. The id is `None` for a bare pin (`-c`/
-/// `--continue`/`--fork-session`, which resumes "whichever conversation is
-/// most recent" with no id readable off argv) even though the tokens
-/// themselves are still returned.
-///
-/// The single source of truth `run_with_clock_inner`'s very first launch
-/// reads to honour an operator's own `-- --resume <id>`/`--continue`
-/// instead of silently minting an unrelated fresh session -- see that
-/// function's own `resume_pin` call site and `ClaudeAdapter::headless_cmd`,
-/// which skips its own `--session-id` injection whenever the tokens this
-/// returns (or any equivalent already on `extra`) are present. At most one
-/// flag is ever returned: claude itself refuses more than one
-/// conversation-pinning flag per launch.
+/// Return an operator-supplied conversation pin verbatim, plus an explicit
+/// id if present; bare continuation has no id to recover. (#778)
 pub(super) fn resume_pin(command: &[String], adapter_name: &str) -> (Vec<String>, Option<String>) {
     if !adapter_has_resume_flags(adapter_name) {
         return (Vec::new(), None);
@@ -104,19 +60,9 @@ pub(super) fn resume_pin(command: &[String], adapter_name: &str) -> (Vec<String>
     (Vec::new(), None)
 }
 
-/// Locates the token that carries the prompt in a headless agent command, and
-/// the prompt itself when that token is followed by one.
-///
-/// `known` is the prompt zirv already holds for this run (`--prompt`, or an
-/// agent step's own text). Given it, the value is recognised by equality
-/// instead of by shape, which is the only way to tell a prompt that happens to
-/// begin with `-` -- a markdown bullet list, say -- from a genuine second
-/// flag. Without it the shape heuristic still applies, because guessing wrong
-/// about a restart's prompt is worse than not restarting.
-///
-/// The value is `None` for a bare flag: `-p` with another flag after it (or
-/// nothing at all) means the prompt arrives on stdin. The flag itself still
-/// has to be stripped from a restart argv, but the token after it must not be.
+/// Locate the prompt by known value when available, since a prompt may start
+/// with `-`; without it, prefer refusing a restart to guessing.
+/// A bare `-p` consumes no following flag because the prompt comes from stdin.
 pub(super) fn locate_prompt(
     command: &[String],
     prefix: usize,
@@ -148,25 +94,9 @@ pub fn extract_prompt(command: &[String]) -> Option<String> {
     locate_prompt(command, 1, None).and_then(|(_, prompt)| prompt)
 }
 
-/// M8: the user's own flags from the original `--` command, with only what
-/// zirv itself re-supplies on every restart removed. Everything else the
-/// operator passed -- `--model`, `--allowedTools`, anything at all -- must
-/// reach a restarted child exactly as it reached the first one; silently
-/// dropping it here was the asymmetry M8 fixed (zirv's own added flags, e.g.
-/// the system prompt, always survived a restart; the operator's own did not).
-///
-/// Three kinds of token are dropped. The prompt, because every relaunch
-/// regenerates it to carry a handoff. Anything pinning the launch to an
-/// existing conversation, because the relaunch is escaping one -- only for
-/// `adapter_name` that actually recognises those flags at all (issue #143,
-/// `adapter_has_resume_flags`); every other adapter's own flags pass through
-/// untouched, including one that happens to share a bare `-c` spelling for a
-/// completely different, value-carrying purpose (codex's `-c, --config
-/// <key>=<value>`). And the leading tokens of the program invocation itself
-/// -- `prefix` of them from the adapter, plus any further positional before
-/// the first flag, which is how `npx claude ...` and a positional prompt both
-/// look -- because `headless_cmd` rebuilds the invocation and re-appending
-/// them would leave a stray argument the agent reads as a second prompt.
+/// Preserve operator flags across restart, removing only the regenerated
+/// prompt, conversation pins, and launch prefix. Apply pin removal only to
+/// adapters that recognize those flags. (#143)
 pub fn extra_launch_flags(
     command: &[String],
     prefix: usize,

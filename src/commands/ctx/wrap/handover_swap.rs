@@ -2,18 +2,8 @@
 
 use super::*;
 
-/// Issue #37: the clean-session-end companion to the pre-existing rot/
-/// timeout-restart harvest call in the `Action::Restart` arm inside `pump`
-/// below. Called from both places `pump` reports a genuinely clean
-/// `SessionEnded` (a `try_wait` exit and a `PtyClosed` event) -- never from
-/// the relaunch-failed exit further down, which already ran a harvest as
-/// part of its own `Action::Restart` handling just above it: two harvest
-/// model calls at the same boundary is exactly what issue #37's "one entry
-/// point" rule forbids. Gated on `cfg.memory.harvest` here too, before the
-/// transcript is even read, so an operator who left harvesting off never
-/// pays for the read or either model call `memory::harvest_at_session_end`
-/// can make. Best-effort: any failure is discarded, never surfaced to the
-/// caller, so it can never turn a clean exit into a failed one.
+/// Harvest once at a clean session end, only when enabled; failure must not
+/// turn a clean exit into an error. (#37)
 #[allow(clippy::too_many_arguments)]
 pub(super) fn harvest_at_clean_exit(
     adapter: &dyn AgentAdapter,
@@ -46,10 +36,7 @@ pub(super) fn harvest_at_clean_exit(
     );
 }
 
-/// What a successful [`perform_handover_swap`] changed, for the ack and the
-/// `zirv ▸` announcement -- both models named, matching the decision-log
-/// entry's own contract (CLAUDE.md, "Record in the decision log with both
-/// models named").
+/// Names both models in the swap acknowledgment and announcement.
 pub(super) struct HandoverOutcome {
     pub(super) from_agent: String,
     pub(super) from_model: String,
@@ -60,14 +47,8 @@ pub(super) struct HandoverOutcome {
     pub(super) native: Option<super::dash::Pane>,
 }
 
-/// `zirv ctx wrap`'s successor backend.
-///
-/// Harness successors still swap onto the existing pty below. A native
-/// successor is instead opened completely through the shared runtime seam,
-/// retained here, and handed to the dashboard only after the old child has
-/// exited and wrap has restored the real terminal. Admission checks the
-/// release gate first, so a gated build keeps the source untouched and parks
-/// exactly as it did before issue #632.
+/// Opens a native successor through the shared runtime only after admission;
+/// hands it to the dashboard after the old child exits and raw mode is restored. (#632)
 struct WrapSwapLauncher<'a> {
     session: &'a str,
     native_available: bool,
@@ -117,32 +98,11 @@ impl super::rollover::runtime::SuccessorLauncher for WrapSwapLauncher<'_> {
     }
 }
 
-/// Issue #84: swaps the orchestrator seat's model or harness in place,
-/// mirroring `pump`'s own `Action::Restart` arm (distill via the existing
-/// handoff machinery, quit the old child, open a fresh pty, relaunch) but
-/// generalized to a possibly *different* adapter and model, resolved from
-/// `req`. The caller (`pump`) has already decided this is a safe moment to
-/// act (idle, or `--force`) and has already parked the registry record on
-/// zirv's own pid.
-///
-/// On success, `*adapter`/`*distiller_model`/`*turn_env` are all updated in
-/// place so every later tick of the same `pump` loop -- a subsequent
-/// compact/quit sequence, a capabilities-gated mail delivery, a rot-
-/// triggered restart -- runs against the new harness, not the old one.
-/// `session_guard`/`session` are never touched here beyond `adopt_child_pid`:
-/// the session keeps its existing registry short id throughout, which is
-/// what makes mail sent before the swap still deliverable after it, and
-/// `zirv ctx nudge` still resolve to the same address. `mail_watch` IS
-/// touched, though, at the moment the writer sink is swapped: any owed
-/// `\r` armed against the old child (`MailWatch::pending_submit`) is
-/// cleared there, since the fresh successor never saw the text that CR
-/// would submit.
-///
-/// The handoff packet rides the same channel every wrap restart already
-/// uses -- the interactive launch's own positional/task prompt
-/// (`relaunch_command`/`restart_prompt`), never a system-prompt injection --
-/// so a successor with no system-prompt injection mechanism at all (codex)
-/// receives it exactly the same way a same-harness restart already would.
+/// Swaps the orchestrator harness at a safe boundary while retaining its
+/// session address; update all adapter-derived state together. (#84)
+/// Clear any mail submit owed to the old child; the successor never saw its text.
+/// Deliver the handoff as the interactive task prompt, including to adapters
+/// without system-prompt injection.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn perform_handover_swap(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -189,9 +149,8 @@ pub(super) fn perform_handover_swap(
         .ok()
         .flatten()
         .map(|(_, h)| h);
-    // Issue #358: a reactive rollover fires precisely because this provider
-    // has stopped answering, and the distiller call runs against that same
-    // provider -- spending it could only ever time out and delay the swap.
+    // A reactive rollover cannot rely on the failing provider to distill
+    // its handoff; that would delay the swap. (#358)
     let (note, source) = if req.structural_only {
         (handoff::structural(&ctx), "structural")
     } else {
@@ -205,8 +164,7 @@ pub(super) fn perform_handover_swap(
         )
     };
     let stored = handoff::store(state_dir, repo, session.as_str(), &note);
-    // N6: same rule the ordinary restart arm follows -- opt-in, and only
-    // from a genuinely distilled handoff.
+    // Harvest only when enabled and the handoff was genuinely distilled.
     if source == "distilled" {
         let _ = super::memory::harvest_durable(
             adapter.as_ref(),
@@ -219,15 +177,8 @@ pub(super) fn perform_handover_swap(
         );
     }
 
-    // Issue #552 (review round 1): WHICH RUNTIME the successor is, decided
-    // before a harness adapter is resolved for it. Everything below this
-    // point assumes a harness child; a rollover that chose a native route
-    // used to arrive here and be swapped onto `req.target_agent` anyway.
-    // Routed through the one seam every live swap shares, so this seat's
-    // subagents are settled by the same `settle_subagents` a dashboard swap
-    // runs -- and, because `admits` is asked first, NOT settled when the
-    // swap is refused. Nothing has been torn down yet, so the `?` parks the
-    // seat on its current harness with the handoff already stored.
+    // Admit the successor runtime before settling subagents or touching the
+    // source pty; a refused swap leaves the current seat intact. (#552)
     let successor_generation_for_plan = req
         .generation
         .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation))
@@ -307,21 +258,12 @@ pub(super) fn perform_handover_swap(
         });
     }
 
-    // Everything from here on names the *new* harness. Resolved before the
-    // old child is touched, so an unknown target agent (a race against the
-    // operator's own config change, or a stale request) fails before
-    // anything is torn down.
-    // `relaunch` below always hands the successor the handoff packet as its
-    // initial prompt, so this launch can only resume a conversation on a
-    // harness that accepts both.
+    // Resolve the successor before touching the old child; an unknown agent
+    // must fail without tearing down the current session.
     let (new_adapter, new_extra_flags) =
         super::handover::resolve_swap_launch(cfg, req, true, role)?;
-    // Finding #10 (issue #358 review): the successor must carry a fencing
-    // generation of its own. `req.generation` is the PREPARED generation an
-    // automatic swap's `seat::commit` is about to promote to `Seat::
-    // generation`; a manual swap (`req.generation: None`) opens no
-    // transaction and never changes the seat's generation at all, so it
-    // falls back to whatever is on disk right now.
+    // Automatic swaps use the prepared fencing generation; manual swaps
+    // retain the seat generation on disk. (#358)
     let successor_generation = req
         .generation
         .or_else(|| super::seat::load(state_dir, &bar.session_short).map(|seat| seat.generation));
@@ -343,12 +285,9 @@ pub(super) fn perform_handover_swap(
         }
         Err(_) => (None, Err("pty writer poisoned".into())),
     };
-    // That session is over, same as an ordinary restart: whatever it was
-    // writing is now a dead file, and the successor reports its own on its
-    // first turn.
+    // The successor must use its own transcript file.
     transcript.forget();
-    // R6: the successor keeps this session's id, so codex's rollout pin would
-    // otherwise keep answering the dead child's file for the rest of the run.
+    // Clear the rollout pin even when the successor retains the session id.
     super::adapters::codex::forget_transcript_pin(
         state_dir,
         &super::sessions::short_id(session.as_str()),
@@ -377,9 +316,7 @@ pub(super) fn perform_handover_swap(
     );
     if let Ok(mut sink) = writer.lock() {
         *sink = fresh_writer;
-        // Issue #118 follow-up: a mail advisory's owed `\r` was armed
-        // against the OLD child; the fresh successor never saw the text it
-        // would submit, so it must not inherit the obligation either.
+        // A submit armed for the old child must not reach the successor. (#118)
         mail_watch.clear_pending_submit();
     }
     if let Ok(mut filter) = cpr_filter.lock() {
@@ -387,9 +324,8 @@ pub(super) fn perform_handover_swap(
     }
     *pair = fresh_pair;
     *child = fresh_child;
-    // P1/P2/P3: released before the new adoption, same ordering the ordinary
-    // restart arm uses, so a pid the OS has already recycled can never be
-    // deregistered out from under the fresh child.
+    // Release the old child before adopting the successor, so a recycled pid
+    // cannot deregister the fresh child.
     child_guard.release();
     *child_guard = super::supervise::ChildGuard::adopt(child.process_id());
     if let Some(child_pid) = child.process_id() {
@@ -402,9 +338,7 @@ pub(super) fn perform_handover_swap(
         .clone()
         .unwrap_or_else(|| "default".to_string());
 
-    // Commit the swap: the boxed adapter and everything derived from it are
-    // replaced together, so the rest of this `pump` loop's life runs against
-    // the new harness consistently.
+    // Replace the adapter and all derived state together.
     *adapter = new_adapter;
     *distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());

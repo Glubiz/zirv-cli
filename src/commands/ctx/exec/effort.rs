@@ -2,15 +2,8 @@
 
 use super::*;
 
-/// Issue #788: the operator-only `[headless]` cost levers, applied to a
-/// CLAUDE headless launch `command` right after it is built. A no-op for
-/// every other adapter and for every unset key, so an unconfigured launch
-/// stays byte-identical to one built before this table existed.
-///
-/// `prompt` is `None` only when this run's own prompt text is genuinely
-/// unknown here (a bare resume with no new text). `state`/`session` key the
-/// sticky effort decision -- see [`sticky_headless_effort`] -- and are
-/// otherwise unused by the TTL lever.
+/// Apply operator-only Claude headless cost settings; unset settings and
+/// other adapters leave the launch unchanged. (#788)
 pub(super) fn apply_headless_cost_levers(
     command: &mut Command,
     cfg: &CtxConfig,
@@ -50,33 +43,9 @@ pub(super) fn apply_headless_cost_levers(
     }
 }
 
-/// Issue #788 follow-up (benchmark-verified): the effort lever's decision for
-/// `session`'s WHOLE conversation, decided ONCE -- at its first headless
-/// launch -- and replayed byte-identically for every later launch of the SAME
-/// session id (a `--resume` relaunch, an in-place compaction, any other
-/// relaunch that keeps the id), regardless of that later launch's own prompt
-/// text, and even when it has none (`prompt == None`, a bare resume with
-/// nothing new to say). A benchmarked 9-step resume chain that let effort
-/// flip between turns wrote 164k prompt-cache tokens; pinned to the first
-/// turn's decision, the same chain wrote 49k -- flipping `CLAUDE_CODE_
-/// EFFORT_LEVEL` mid-conversation invalidates Claude's WHOLE prompt cache,
-/// not just this turn's own addition to it.
-///
-/// Both the read and the write are best-effort: any state-dir I/O doubt --
-/// missing, corrupt, unwritable -- falls back to today's behaviour, classify
-/// THIS launch from its own prompt and record nothing, since supervision
-/// must stay a pure passthrough on failure here (never `unwrap`/`expect`).
-///
-/// `[jev] launch_effort` (off by default): when the deterministic classifier
-/// produces a `Classification` from a real prompt, [`jev_launch_effort`] gets
-/// a chance to steer the pick toward `headless.effort.trivial`/`substantial`
-/// instead, from local numeric facts only -- see its own doc comment. Its
-/// `None` (gate off, no credential, indecisive, or the chosen tier itself has
-/// no configured value) falls through to the same deterministic value this
-/// function computed before the gate existed, so a fully off-by-default
-/// operator sees byte-identical behaviour. Either way the result goes through
-/// the SAME sticky record below: a Jev-steered pick, like a deterministic
-/// one, is decided once and replayed for every later launch of this session.
+/// Pin effort for a whole conversation: changing it on resume invalidates
+/// Claude prompt caching. I/O failure falls back to this launch's classifier.
+/// A gated Jev choice uses numeric facts only and shares the same pin. (#788)
 fn sticky_headless_effort(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -109,10 +78,7 @@ fn sticky_headless_effort(
     effort
 }
 
-/// The metadata-only envelope [`jev_launch_effort`] sends: no prompt text, no
-/// classifier reasons, only the bounded numeric row [`launch_effort_facts`]
-/// computes locally -- the same `_zirv_metadata_only` contract every other
-/// `[jev]`-gated site uses (see `hook.rs`'s `DispatchAdviseState`).
+/// Send only bounded numeric metadata, never prompt text, to Jev.
 #[derive(Debug, Serialize)]
 struct LaunchEffortAdviseState {
     #[serde(rename = "_zirv_metadata_only")]
@@ -120,8 +86,6 @@ struct LaunchEffortAdviseState {
     facts: Vec<Vec<u32>>,
 }
 
-/// One Noul: is this launch's request unusually hard, or a small,
-/// low-deliberation follow-up? Answered from [`launch_effort_facts`] alone.
 pub(crate) fn launch_effort_question() -> [jev::Question; 1] {
     [jev::Question::metadata_noul(
         "launch_effort_high",
@@ -134,11 +98,7 @@ reasoning effort (not just long)? False for an ordinary/small follow-up. False i
     )]
 }
 
-/// Local, numeric-only facts for [`launch_effort_question`] -- never the
-/// prompt text itself crosses the Jev boundary. Item detection mirrors
-/// `proxy::decision`'s own `request_size_floor` (bullets `- `/`* `, or a
-/// `N.`/`N)` line marker), kept as its own small copy here rather than
-/// widening that function's visibility for a fact-gathering caller.
+/// Derive local numeric facts without sending prompt text to Jev.
 fn launch_effort_facts(prompt: &str, complexity: Complexity) -> Vec<u32> {
     let words = prompt.split_whitespace().count();
     let word_bucket: u32 = match words {
@@ -171,16 +131,9 @@ fn launch_effort_facts(prompt: &str, complexity: Complexity) -> Vec<u32> {
     vec![word_bucket, items, complexity_index, looks_like_a_question]
 }
 
-/// [`jev_launch_effort`]'s own floor default -- named (issue: `zirv ctx jev
-/// probe`) so a later retune targets exactly this constant.
 pub(crate) const LAUNCH_EFFORT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
 
-/// [`jev_launch_effort`]'s per-call decision: `"high"`/`"low"` for a
-/// decisive answer, `"classifier"` otherwise (missing, indecisive, or
-/// unparseable -- the deterministic classifier's own pick applies). Shared
-/// with `zirv ctx jev probe`, which reports exactly this outcome, never
-/// touching the `[headless.effort]` value lookup that follows in
-/// production.
+/// A decisive answer selects high or low; other outcomes use the classifier.
 pub(crate) fn launch_effort_action(
     answer: Option<&jev::Answer>,
     min_confidence: f32,
@@ -199,16 +152,8 @@ pub(crate) fn launch_effort_action(
     }
 }
 
-/// Issue #802 (`[jev] launch_effort`): may steer `sticky_headless_effort`'s
-/// pick toward `headless.effort.trivial` (a decisive low-effort answer) or
-/// `headless.effort.substantial` (a decisive high-effort answer) instead of
-/// the plain classifier's own class, from local numeric facts only -- never
-/// the prompt text. `None` -- meaning "use the deterministic value instead",
-/// exactly as if the gate were off -- on gate-off, a missing `[proxy.
-/// typesafe]` credential, an indecisive answer, or a decisive answer whose
-/// chosen tier has no configured `headless.effort` value at all: every one of
-/// those already has the same deterministic fallback available at the call
-/// site, so this never needs to invent one.
+/// Jev may steer configured effort tiers from numeric facts only; missing
+/// settings or uncertain answers fall back to classification. (#802)
 fn jev_launch_effort(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -255,37 +200,27 @@ fn jev_launch_effort(
     Some(chosen)
 }
 
-/// The persisted record [`sticky_headless_effort`] reads and writes.
-/// `effort` is `None` when the first launch's own classification produced no
-/// configured value for its complexity class -- still a real, sticky
-/// decision ("no effort" for this whole conversation), not a signal to
-/// reclassify on the next launch.
+/// Persist even a decision of no configured effort for this conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HeadlessEffortRecord {
     effort: Option<String>,
 }
 
-/// `<state>/headless-effort/<hash of session id>.json`, mirroring `hook.rs`'s
-/// `adoption_record_path`/`status.rs`'s `status_snapshot_path` exactly.
+/// Per-conversation effort record path.
 fn headless_effort_record_path(state: &StateDir, session: &SessionId) -> PathBuf {
     state
         .headless_effort()
         .join(format!("{:016x}.json", input_hash(session.as_str())))
 }
 
-/// Best-effort, like `hook.rs`'s `load_adoption_record`: missing, corrupt, or
-/// otherwise unreadable all read as "no decision recorded yet" (`None`)
-/// rather than an error.
+/// Missing or invalid state means no stored decision, without failing launch.
 fn load_headless_effort_record(path: &Path) -> Option<HeadlessEffortRecord> {
     let body = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&body).ok()
 }
 
-/// Best-effort, like `hook.rs`'s `save_adoption_record`: a record that fails
-/// to write costs the NEXT launch of this session a re-classification (the
-/// pre-fix behaviour), never this launch's own success. Prunes the directory
-/// to `KEEP_NEWEST` after a successful write, the same retention `adoption()`/
-/// `intake()` get (`hook.rs::claim_first_prompt`).
+/// Failed persistence may cause reclassification later but cannot fail
+/// this launch; prune old records after successful writes.
 fn save_headless_effort_record(state: &StateDir, path: &Path, record: &HeadlessEffortRecord) {
     let Ok(json) = serde_json::to_string(record) else {
         return;
@@ -298,14 +233,8 @@ fn save_headless_effort_record(state: &StateDir, path: &Path, record: &HeadlessE
     }
 }
 
-/// The configured `CLAUDE_CODE_EFFORT_LEVEL` for a classified `complexity`,
-/// or `None` when that class has no configured value. `Complexity::
-/// Architectural` reads the SAME `substantial` value: `try_classify_request`
-/// (the only caller that ever produces a `Classification` here) is
-/// text-only, and `infer_complexity`/its own request-size floor can never
-/// return `Architectural` from text alone, so there is no separate
-/// `headless.effort.architectural` key -- this arm exists only so the match
-/// stays exhaustive against a future caller that does pass real diff data.
+/// Resolve configured effort; text-only classification cannot produce an
+/// architectural tier, so it shares substantial effort.
 fn headless_effort_for(
     effort: &super::config::HeadlessEffortConfig,
     complexity: Complexity,

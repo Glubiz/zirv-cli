@@ -2,15 +2,7 @@
 
 use super::*;
 
-/// Mutable T12b bookkeeping for the reserved status bar, bundled into one
-/// struct rather than further widening `pump`'s already-long parameter list.
-/// `disabled` is a one-way switch exactly like `InjectionState::degraded`:
-/// once a probe, lock or write failure sets it, nothing here ever clears it
-/// again, and the child is never touched by that decision (see
-/// `chrome::after_redraw_attempt`). `recovered` (B1) is a second, later
-/// one-way switch: it tracks whether the *disable* has already been reacted
-/// to (row cleared, pty widened back to full size), so that reaction runs
-/// exactly once no matter which caller noticed the disable first.
+/// Bar state degrades once; recovery clears its row and restores child size exactly once.
 pub(super) struct BarRuntime {
     pub(super) chrome: super::chrome::Chrome,
     pub(super) disabled: bool,
@@ -18,30 +10,17 @@ pub(super) struct BarRuntime {
     pub(super) last_text: Option<String>,
     last_draw: Instant,
     pub(super) harness: String,
-    /// The resolved adapter's own `AgentAdapter::provider()` (`"anthropic"`
-    /// for claude, `"openai"` for codex), so `redraw_bar_if_due` reads the
-    /// usage window for *this* session's account rather than the legacy
-    /// unscoped file every session used to share. See `window::has_no_usage_
-    /// source`/`load_for` and [[Usage and Pacing]].
+    /// Provider-specific usage source for this session.
     pub(super) provider: String,
-    /// This session's own short id (`sessions::short_id`'s vocabulary), used
-    /// to scope the mail count `unread_mail_count` reads to messages this
-    /// session may actually see, not every session's mail in the repo.
+    /// Short session id used to scope its unread mail count.
     pub(super) session_short: String,
     pub(super) mail_enabled: bool,
     pub(super) stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub(super) rows: u16,
     pub(super) cols: u16,
-    /// Unix-seconds timestamp of the last passive codex rollout scan this
-    /// bar ran (`0` means never), throttled to `CODEX_BAR_SCAN_SECS` --
-    /// wrap's own version of the freshness a wrapped codex session would
-    /// otherwise only get from an inner session's own pacing gate or a
-    /// statusline tee it does not have.
+    /// Last passive codex scan; zero permits an immediate first scan.
     last_codex_scan: u64,
-    /// Copied from `cfg.pace.collector_max_age_secs` at construction: how
-    /// stale a stored codex reading has to be before `refresh_codex_usage`
-    /// bothers scanning at all (its own internal staleness gate, separate
-    /// from `CODEX_BAR_SCAN_SECS`'s call-rate floor).
+    /// Stored reading age required before a passive codex scan.
     collector_max_age_secs: u64,
 }
 
@@ -61,12 +40,8 @@ impl BarRuntime {
             disabled: !chrome.bar,
             chrome,
             recovered: false,
-            // Never drawn yet, so the first due check always draws. Process
-            // uptime under a second (a fast test run, a fresh container)
-            // would make a bare subtraction panic (an abort, on the release
-            // profile this ships with); `checked_sub` degrades to "draw
-            // immediately" instead, which is the same outcome a real elapsed
-            // second would have produced anyway.
+            // A fresh process can have less than one second of uptime; subtraction
+            // must not panic when the first draw is due.
             last_text: None,
             last_draw: Instant::now()
                 .checked_sub(BAR_THROTTLE)
@@ -78,9 +53,7 @@ impl BarRuntime {
             stdout_lock,
             cols: size.0,
             rows: size.1,
-            // Never scanned yet, so the very first redraw due is eligible
-            // immediately (`now.saturating_sub(0) >= CODEX_BAR_SCAN_SECS` is
-            // true for any real `now`).
+            // The first scan is due immediately.
             last_codex_scan: 0,
             collector_max_age_secs,
         }
@@ -91,42 +64,22 @@ impl BarRuntime {
     }
 }
 
-/// The 1s redraw throttle: usage and mail are read from disk only when this
-/// has elapsed, never on the byte-pump path.
+/// Disk-backed bar data is read at most once per redraw interval.
 const BAR_THROTTLE: Duration = Duration::from_secs(1);
 
-/// Floor between a wrapped codex session's own passive rollout scans
-/// (`BarRuntime::last_codex_scan`), independent of `BAR_THROTTLE`'s 1s
-/// redraw cadence: a rollout scan is a real filesystem walk, not a single
-/// stat call, so it must not run on every redraw tick just because the bar
-/// text happened to change. Never HTTP -- see `redraw_bar_if_due`.
-///
-/// Item 5: shared with `pace::refresh_sources`'s own codex scan floor via
-/// `window::CODEX_SCAN_FLOOR_SECS` rather than a second, independently
-/// numbered constant.
+/// Passive rollout scans are costlier than redraws and never use HTTP here.
+/// Share the scan floor with `pace::refresh_sources`.
 use super::window::CODEX_SCAN_FLOOR_SECS as CODEX_BAR_SCAN_SECS;
 
-/// Item 2 (regression fix): applies a `ResizeDecision::disables_bar` outcome
-/// to `bar`'s own bookkeeping. The dims move to the *current* size *before*
-/// `disabled` flips, not after or never: `reset_bar`'s later `bar_reset_
-/// sequence(bar.rows)` (both the recovery call right after a disabling
-/// resize, and the final session cleanup) addresses `bar.rows` to clear the
-/// reserved row, and a stale, larger row number left over from before the
-/// shrink points past the now-smaller terminal. A real terminal clamps an
-/// out-of-range cursor move to its own last row and blanks a line of the
-/// child's own live output there instead of the row that actually used to
-/// hold the bar.
+/// Update dimensions before disabling: reset must address the current row,
+/// or a terminal may clamp the cursor and erase child output.
 pub(super) fn disable_bar_at_current_size(bar: &mut BarRuntime, size: (u16, u16)) {
     bar.cols = size.0;
     bar.rows = size.1;
     bar.disabled = true;
 }
 
-/// Writes the reset sequence: region cleared, reserved row blanked. Called
-/// from two places -- the final cleanup alongside `RawGuard::restore`, and
-/// (B1) `recover_bar_to_full_size` the moment the bar degrades mid-session --
-/// so callers decide when it is due; this just performs it. A no-op when the
-/// bar was never eligible in the first place.
+/// Clear the reserved row on degradation or final cleanup; no-op if unused.
 pub(super) fn reset_bar(bar: &BarRuntime) {
     if !bar.chrome.bar {
         return;
@@ -140,24 +93,15 @@ pub(super) fn reset_bar(bar: &BarRuntime) {
             .and_then(|()| stdout.flush())
             .is_ok();
     }
-    // F4: `BAR_ACTIVE` means "the real console currently has a scroll region
-    // we set", so it is cleared only once the undo actually landed. A reset
-    // that failed leaves the console still fenced, and the emergency handler
-    // still owes it a `CSI r`.
+    // A failed reset leaves the scroll region active; the emergency handler
+    // must still clear it.
     if reset_ok {
         super::term::set_bar_active(false);
     }
 }
 
-/// B1 (blocking fix): the moment the bar shows disabled -- whichever caller
-/// noticed first, a too-small resize or a redraw/lock failure with no resize
-/// event of its own -- this clears the reserved row exactly once and widens
-/// the child pty to the full current size. Without it the pty stayed pinned
-/// at its last reserved height forever, and a later widen never reached the
-/// child: a degraded session must behave exactly like a bar-less one from
-/// here on, including tracking every resize after this at full size.
-/// Idempotent (`bar.recovered` guards it), so calling this every tick is
-/// cheap and safe.
+/// On degradation, clear the bar and restore the full child pty size once;
+/// subsequent resizes must also use the full size.
 pub(super) fn recover_bar_to_full_size(
     bar: &mut BarRuntime,
     pair: &mut portable_pty::PtyPair,
@@ -176,12 +120,8 @@ pub(super) fn recover_bar_to_full_size(
     });
 }
 
-/// Redraws the bar when it is active, its rendered text actually changed,
-/// and the 1s throttle has elapsed. Usage and mail are read from disk only
-/// here, gated by that same throttle, never from the byte-pump path. Any
-/// lock or write failure disables the bar permanently and leaves the child
-/// untouched; `now` is threaded in rather than read internally so the
-/// throttle itself stays testable without a real clock.
+/// Redraws changed bar text after the throttle; disk reads stay off the byte
+/// pump, and a write failure disables only the bar.
 pub(super) fn redraw_bar_if_due(
     bar: &mut BarRuntime,
     supervision: &InjectionState,
@@ -194,21 +134,14 @@ pub(super) fn redraw_bar_if_due(
     }
     bar.last_draw = now;
 
-    // Passive refresh only: a wrapped codex session has no statusline tee, so
-    // the bar would otherwise stay a permanent placeholder for its entire
-    // life. Scans are floored to once per `CODEX_BAR_SCAN_SECS`; HTTP stays
-    // off this path entirely -- `wrap` must never make a session worse, and
-    // a network call on the redraw path could stall it.
+    // A wrapped codex session lacks a statusline tee; scan rollouts at a
+    // bounded rate, with no network call on the redraw path.
     if bar.provider == super::window::CODEX_USAGE_PROVIDER {
         let now_secs = super::state::now_secs();
         if now_secs.saturating_sub(bar.last_codex_scan) >= CODEX_BAR_SCAN_SECS {
             bar.last_codex_scan = now_secs;
-            // Resolved via `crate::utils::home_dir()`, the same as `pace::
-            // refresh_sources` and `usage.rs`'s own refresh -- not left to
-            // `refresh_codex_usage`'s internal `dirs::home_dir()` fallback,
-            // which calls `SHGetKnownFolderPath` directly on Windows and so
-            // ignores `HOME`/`USERPROFILE`, the one thing a test's
-            // `HomeGuard` can actually override.
+            // Use the overridable home path; Windows known-folder lookup ignores
+            // HOME and USERPROFILE overrides.
             let sessions_dir = crate::utils::home_dir()
                 .ok()
                 .map(|h| h.join(".codex").join("sessions"));
@@ -221,22 +154,8 @@ pub(super) fn redraw_bar_if_due(
         }
     }
 
-    // Per-provider since this fix: `window::load` is the legacy machine-wide
-    // file every session used to share, so a wrapped codex session's bar
-    // used to render whatever Anthropic numbers a claude session happened to
-    // leave there. `load_for` falls back to that same legacy file for
-    // claude's own provider (`anthropic`), so this is a no-op for the common
-    // case; for a provider with no usage source at all (codex/openai today)
-    // it now reads as `UsageWindows::default()`, which `status_bar` already
-    // renders as the placeholder dash, never a misleading `0%`. No renderer
-    // change needed at all, only which windows are read.
-    //
-    // `window::available` drops any window whose `resets_at` has provably
-    // passed (or, absent a `resets_at`, that has outlived its own span)
-    // before the reading ever reaches the bar: a reading that old is a stale
-    // number pretending to be current, exactly what motivated this filter.
-    // Still a pure in-memory/file read -- no scan, no network -- on this
-    // throttled redraw path.
+    // Read this provider's usage only; expired windows must not render as
+    // current readings. Keep this redraw path free of scans and network calls.
     let windows = super::window::available(
         &super::window::load_for(state_dir, &bar.provider).unwrap_or_default(),
         super::state::now_secs(),

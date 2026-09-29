@@ -2,27 +2,8 @@
 
 use super::*;
 
-/// Issue #243 (review round, F1): `short`'s own screening-summary sibling
-/// file -- `record_path`'s exact directory, one file per session, kept
-/// entirely separate from the record itself so writing one can never touch
-/// the other. A deliberately bare, non-`.json` extension (mirroring
-/// `nudge_marker_path`'s own `.nudge`): `list()`'s own record scan matches
-/// on `path.extension() == Some("json")`, and `<short>.json` and
-/// `<short>.screening.json` would share that extension despite naming two
-/// different files, wastefully feeding this one through `Record`
-/// deserialization (where it would fail and be skipped) on every listing.
-///
-/// A screening write used to be a read-modify-write of the WHOLE registry
-/// record: `write_record` is a plain whole-file overwrite with no lock
-/// anywhere in this module, and `SessionGuard::refresh_session`/
-/// `adopt_child_pid` are exactly that kind of write, issued by the ONE
-/// process that holds the live guard. A hook (or a supervision loop
-/// reporting through this same seam, `record_screening` below) runs as an
-/// UNRELATED process; racing a guard's own write could restore stale
-/// `session`/`pid`/`start_time` data over it, and a stale dead `pid` could
-/// then make a perfectly live session vanish from the next `list()` sweep.
-/// A dedicated sibling file makes that impossible by construction: nothing
-/// in `set_last_screening`/`last_screening` ever opens `record_path`.
+/// Keep screening in a non-json sibling file: registry listings scan json,
+/// and unrelated hook writes must never race guard whole-record writes. (#243)
 pub(super) fn screening_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.screening"))
 }
@@ -32,11 +13,7 @@ struct ScreeningSummary {
     summary: String,
 }
 
-/// Stores (or clears, on `None`/empty) `short`'s own screening summary in
-/// its sibling file (`screening_path`), atomically -- temp file then
-/// rename, via `state::write_private`, the identical primitive
-/// `write_record` itself uses -- and never opens the registry record at
-/// all. Best-effort, like every other piece of state-dir housekeeping here.
+/// Store screening atomically without touching the registry record.
 pub fn set_last_screening(state: &StateDir, short: &str, summary: Option<String>) {
     let path = screening_path(state, short);
     match summary {
@@ -52,10 +29,7 @@ pub fn set_last_screening(state: &StateDir, short: &str, summary: Option<String>
     }
 }
 
-/// The screening summary `set_last_screening` last stored for `short`, if
-/// any -- `status.rs`'s own reader, consulted alongside the record `list`/
-/// `load_record` already read; `None` for a clean session, one with no
-/// screening cycle yet, or a summary this build could not parse back.
+/// Return the stored screening summary, or none when absent or unreadable.
 pub fn last_screening(state: &StateDir, short: &str) -> Option<String> {
     let text = std::fs::read_to_string(screening_path(state, short)).ok()?;
     serde_json::from_str::<ScreeningSummary>(&text)
@@ -63,26 +37,8 @@ pub fn last_screening(state: &StateDir, short: &str) -> Option<String> {
         .map(|s| s.summary)
 }
 
-/// Issue #243 (review round, F3/F4): the one place a scoring cycle's
-/// screening result becomes persisted session state (`set_last_screening`
-/// above) and, when it changed since the last call for this `short`, a
-/// `zirv \u{25b8}` announcement -- shared by the Stop hook and the `exec`/
-/// `loop` supervision loops so there is exactly one copy of this policy.
-///
-/// `last_announced` is the caller's own de-duplication memory: the two
-/// live supervision loops own one for the life of the whole supervised run
-/// (surviving restarts, since it lives above the per-restart scope, same
-/// as `registry_short` itself), so an unchanged flagged summary is
-/// reported once, not on every poll. The Stop hook is a fresh process
-/// every turn with nothing to compare against, so it passes a fresh
-/// `&mut None` and an `Announcer::silent()` -- it already has its own
-/// decision-log line for this; announcing again would just be a second
-/// copy of the same fact. Returns whether an announcement actually fired,
-/// which is what this function's own tests assert against rather than
-/// scraping the real announce channel.
-///
-/// `rot.rs` and the verdict are never touched by any of this -- screening
-/// is a pure side channel; see `screen.rs`'s own module doc.
+/// Persist screening as a side channel without changing rot verdicts;
+/// announce changed summaries once per supervised run. (#243)
 pub fn record_screening(
     state: &StateDir,
     short: &str,
@@ -102,18 +58,8 @@ pub fn record_screening(
     announce
 }
 
-/// `short`'s own bound-workflow sibling file, next to `record_path` -- the
-/// same `screening_path` pattern, and for the same reason (read its own doc
-/// comment). Round 2 coordinator review: `bind_workflow_id` used to be a
-/// read-modify-write of the WHOLE `Record`, and a wrap-supervised session's
-/// `SessionGuard` holds its OWN cached `Record` (captured at `register`)
-/// that it rewrites whole on every turn (`stamp_in_flight`/`refresh_session`,
-/// both `write_record(&self.state, &self.record)`) -- so a workflow bound by
-/// the separate `zirv workflow start` process was silently reverted to
-/// `None`/stale the moment that guard's next turn landed. A dedicated
-/// sibling file makes that impossible by construction: nothing in
-/// `bind_workflow_id`/`workflow_id_for` ever opens `record_path`, and no
-/// in-memory `Record` anywhere carries this field to go stale.
+/// Keep workflow binding in a sibling file so another process cannot race
+/// the guard's whole-record writes or lose the binding.
 pub(super) fn workflow_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.workflow"))
 }
@@ -123,16 +69,7 @@ struct WorkflowBinding {
     workflow_id: String,
 }
 
-/// Dash refresh PR1: stamps `short`'s own bound workflow id into its sibling
-/// file (`workflow_path`), best-effort, atomically -- the identical
-/// `write_private` primitive `write_record`/`set_last_screening` already
-/// use. `zirv workflow start` calls this onto whatever `ZIRV_CTX_SESSION`
-/// names once the workflow it just started already has an id; `chat.rs`
-/// calls it for a session it launches with a proxy-decided workflow already
-/// running. Only patches an ALREADY-REGISTERED session (mirrors the old
-/// read-modify-write's own contract) -- a short id with no live record gets
-/// no marker file at all, matching `bind_workflow_id_is_a_quiet_no_op_with_
-/// no_registered_record`.
+/// Bind only an already registered session, atomically and best-effort.
 pub fn bind_workflow_id(state: &StateDir, short: &str, workflow_id: &str) {
     if load_record(state, short).is_none() {
         return;
@@ -146,12 +83,7 @@ pub fn bind_workflow_id(state: &StateDir, short: &str, workflow_id: &str) {
     }
 }
 
-/// The workflow id `bind_workflow_id` last stored for `short`, if any -- the
-/// dashboard's own per-pane workflow resolution reads this instead of a
-/// `Record` field (removed; see `bind_workflow_id`'s own doc comment for
-/// why a field on the record could never be made safe against the guard's
-/// own whole-record rewrites). `None` for a session with no bound workflow,
-/// or one this build could not parse back.
+/// Read the bound workflow independently of registry rewrites.
 pub fn workflow_id_for(state: &StateDir, short: &str) -> Option<String> {
     let text = std::fs::read_to_string(workflow_path(state, short)).ok()?;
     serde_json::from_str::<WorkflowBinding>(&text)
@@ -159,36 +91,13 @@ pub fn workflow_id_for(state: &StateDir, short: &str) -> Option<String> {
         .map(|b| b.workflow_id)
 }
 
-/// Issue #281: the crash-interruption witness lookup a resumed session's
-/// injection reads (`handoff::render_crash_witness`, called from
-/// `resume::resume_prompt` and `hook::run_session_start`). Scans every
-/// record for `repo` (matched by `repo_slug`, the same key `handoff::store`/
-/// `latest_for_repo` already use, rather than a raw `PathBuf` comparison
-/// that a differently-spelled but identical path would fail) whose OWN
-/// process is dead -- [`record_is_alive`], this module's only liveness
-/// check, reused rather than duplicated -- but whose `in_flight` marker is
-/// still set: that process stopped mid-turn, not at a clean boundary.
-///
-/// Deliberately narrower than [`list`]: `list` sweeps and removes every
-/// OTHER stale record, orphaned marker and orphaned socket endpoint on disk
-/// as a side effect of being called at all, which is more housekeeping than
-/// an injection-composition read should trigger. This only ever touches the
-/// one record it returns something for, and only clears its `in_flight`
-/// marker (never the whole record -- `list`'s own later sweep still cleans
-/// that up in its own time) -- consumed so a second call for the same crash
-/// (a second `resume`, a second SessionStart) never re-fires.
-///
-/// Best-effort throughout, matching every other piece of registry
-/// housekeeping in this module: an unreadable or malformed record is
-/// skipped, never an error, and a write that fails to clear the marker costs
-/// a possible second witness block, never a wrong one.
+/// Consume one dead session's in-flight witness without sweeping other
+/// records; malformed state is ignored and a failed clear may repeat it. (#281)
 pub fn take_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
     interrupted_in_flight(state, repo, true)
 }
 
-/// The non-consuming counterpart to [`take_interrupted_in_flight`], for a
-/// dry run (`resume --print-prompt`) that must show what a real resume would
-/// inject without spending the one-shot marker on it.
+/// Read a crash witness without consuming it for prompt previews.
 pub fn peek_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
     interrupted_in_flight(state, repo, false)
 }
@@ -251,13 +160,7 @@ fn interrupted_record(state: &StateDir, repo: &Path) -> Option<(PathBuf, Record)
     None
 }
 
-/// Issue #243 (review round, F1): the same "no live record, so remove it"
-/// sweep `sweep_orphaned_markers` runs for `.nudge` files, for the
-/// screening-summary sibling `screening_path` writes. `SessionGuard::
-/// release` already removes its own on a clean exit; this is the crash
-/// path -- a supervisor that never released leaves both its record (swept
-/// by `list`'s own read-dir loop, right above) and this sibling behind, on
-/// the same read.
+/// Sweep screening siblings whose session record is no longer live. (#243)
 pub(super) fn sweep_orphaned_screening_summaries(state: &StateDir, found: &[(Record, Liveness)]) {
     let Ok(entries) = std::fs::read_dir(state.sessions()) else {
         return;
@@ -279,9 +182,7 @@ pub(super) fn sweep_orphaned_screening_summaries(state: &StateDir, found: &[(Rec
     }
 }
 
-/// The same orphan sweep as [`sweep_orphaned_screening_summaries`], for the
-/// `.workflow` sibling files [`bind_workflow_id`] writes: a crashed
-/// supervisor's own leftover is cleaned up here rather than living forever.
+/// Sweep workflow siblings whose session record is no longer live.
 pub(super) fn sweep_orphaned_workflow_markers(state: &StateDir, found: &[(Record, Liveness)]) {
     let Ok(entries) = std::fs::read_dir(state.sessions()) else {
         return;
@@ -303,38 +204,17 @@ pub(super) fn sweep_orphaned_workflow_markers(state: &StateDir, found: &[(Record
     }
 }
 
-/// Issue #462: the conversation id the HARNESS itself minted for a
-/// supervised session, recorded from the one place both identities are
-/// known at once -- an adapter lifecycle hook, whose payload carries the
-/// harness's native conversation id while `adapters::SESSION_ENV` carries
-/// zirv's own uuid for the same session.
-///
-/// These two are equal only when the launch was pinned
-/// (`AgentAdapter::session_pin_args`); a `zirv chat -- --resume <id>` launch,
-/// or any harness with no pin flag, mints its own id and zirv's uuid is a
-/// zirv-side handle that no `--resume` can ever resolve. Recovery paths that
-/// need to put a seat back into its OWN conversation (`dash::
-/// settle_pending_rollover`'s failed-rollover arm) must resume THIS id.
+/// Record the harness-minted conversation id because zirv's session id
+/// may not be resumable by that harness. (#462)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NativeConversation {
-    /// The harness this conversation belongs to, so a short id that has since
-    /// been rolled over to a different agent never resumes the old harness's
-    /// conversation.
+    /// Harness identity prevents resuming under a later successor.
     agent: String,
-    /// zirv's own uuid for the session that observed it, so a marker left
-    /// behind by an earlier session at this same (stable) short address is
-    /// never mistaken for the current one's conversation.
+    /// Session identity prevents reuse of a stale short-address marker.
     session: String,
-    /// The harness's own conversation id.
     conversation: String,
-    /// Issue #470: which backend recorded this conversation. Issue #488 makes
-    /// this genuinely vary -- `record_conversation_on` lets a native session
-    /// record its own journal session id here -- and [`native_conversation`]
-    /// refuses a marker whose runtime does not match the reader's, so a
-    /// return can never resume a harness resume-id as a native conversation
-    /// or the other way round. `#[serde(default)]` so a marker written by an
-    /// older build still parses (and, correctly, still answers as
-    /// `Harness`, the only runtime that existed when it was written).
+    /// Backend identity prevents using a harness resume id as a native
+    /// journal id; old markers default to Harness. (#470/#488)
     #[serde(default)]
     runtime: RuntimeKind,
 }
@@ -343,14 +223,8 @@ fn conversation_marker_path(state: &StateDir, short: &str) -> PathBuf {
     state.sessions().join(format!("{short}.conversation"))
 }
 
-/// Records `conversation` as the native conversation id `agent` is actually
-/// running for zirv session `session` (short address `short`). Best-effort in
-/// every direction, like every other marker in this module: a marker that
-/// fails to write only costs a later recovery its resume, never this turn.
-///
-/// Written on every turn boundary rather than once at launch: a harness can
-/// mint a fresh conversation mid-session (claude's own `/clear`), and the
-/// most recent turn is the conversation a recovery should resume.
+/// Update the actual conversation on every turn; the harness can mint a
+/// new one mid-session. Failure only limits later recovery.
 pub fn record_native_conversation(
     state: &StateDir,
     short: &str,
@@ -368,16 +242,7 @@ pub fn record_native_conversation(
     )
 }
 
-/// [`record_native_conversation`], naming the BACKEND the reference belongs
-/// to (issue #488).
-///
-/// A conversation id is opaque and its meaning is the backend's: a coding
-/// harness's own resume id and a native journal session id are not
-/// interchangeable, and [`native_conversation`] already refuses to hand back
-/// a marker whose runtime does not match what the reader asked for.
-/// Recording the runtime honestly is what makes that refusal mean anything
-/// for a session that is not a harness -- and it is what stops a rollover
-/// return resuming the wrong kind of conversation id.
+/// Record the backend that defines this opaque conversation id. (#488)
 pub fn record_conversation_on(
     state: &StateDir,
     short: &str,
@@ -402,13 +267,8 @@ pub fn record_conversation_on(
     let _ = super::state::write_private(&conversation_marker_path(state, short), &body);
 }
 
-/// The native conversation id recorded for `short`, but only when the marker
-/// names this exact `agent`, this exact zirv `session`, AND this exact
-/// `runtime` (issue #470: a marker a harness-process backend recorded must
-/// never be handed to a native backend as if it could resume it, and vice
-/// versa). `None` for a missing, unreadable, malformed or mismatched marker
-/// -- the caller then has no proof about which conversation the harness is
-/// in, which is a reason to relaunch cold, never to guess.
+/// Return a conversation only when agent, session, and runtime all match;
+/// otherwise recovery must relaunch cold instead of guessing. (#470)
 pub fn native_conversation(
     state: &StateDir,
     short: &str,

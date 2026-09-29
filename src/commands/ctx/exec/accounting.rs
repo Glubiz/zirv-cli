@@ -18,24 +18,12 @@ pub struct ExecutionSegment {
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionReport {
     pub segments: Vec<ExecutionSegment>,
-    /// Issue #358 review finding #4: a harness-handover restart (below)
-    /// moves this run's own token reservation to the NEW provider's ledger
-    /// mid-recursion, inside `run_with_clock_inner`'s own tail call --
-    /// `ExecArgs::reservation_id`/its caller's `provider` local only ever
-    /// name the FIRST provider a delegation reserved against. Set every
-    /// time such a swap happens (the last one wins across however many
-    /// further handovers follow), so a caller that settles once the whole
-    /// chain returns reads the ledger the run actually finished on, never
-    /// the one it started on.
+    /// Provider whose ledger holds the final reservation after any handover. (#358)
     pub final_reservation: Option<(String, &'static str)>,
 }
 
-/// Reads `transcript` fresh and returns its own usage and tool-call count
-/// (via `adapter.parse_events`), or `None` if it cannot be read yet -- a read
-/// failure here must never be fatal, since it can just mean the child has not
-/// flushed its first line. Shared by [`evaluate_worker_budget`] and
-/// [`harvest_spend`] (issue #169.2), so the two can never drift on how one
-/// transcript's own spend is computed.
+/// Read transcript usage fresh; an unreadable initial transcript is not fatal.
+/// Budget and harvest must compute one child's spend identically. (#169.2)
 pub(super) fn record_execution_segment(
     report: &mut ExecutionReport,
     adapter: &dyn adapters::AgentAdapter,
@@ -71,10 +59,7 @@ fn read_transcript_spend(
     Some((usage, u32::try_from(tool_calls).unwrap_or(u32::MAX)))
 }
 
-/// Field-wise saturating sum of two [`TranscriptUsage`]s -- how a restart's
-/// outgoing child's spend is folded into the running total, and how that
-/// total is folded into the current child's own reading before a budget
-/// check.
+/// Saturating sum used across child restarts and budget checks.
 fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptUsage {
     TranscriptUsage {
         input_tokens: a.input_tokens.saturating_add(b.input_tokens),
@@ -88,13 +73,8 @@ fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptUsage {
     }
 }
 
-/// Issue #169.2: folds `transcript`'s own usage and tool-call count into the
-/// running `prior_usage`/`prior_tool_calls` accumulators. Called once, on the
-/// OUTGOING transcript, at every restart/nudge/park site in `run_with` --
-/// before a fresh session (and therefore a fresh transcript) is minted for
-/// the next child. A transcript that cannot be read yet contributes nothing
-/// rather than failing the restart it is called from (best-effort, matching
-/// `evaluate_worker_budget`'s own tolerance).
+/// Harvest the outgoing transcript before minting the next session; unreadable
+/// data contributes nothing and cannot fail the restart. (#169, #169.2)
 pub(super) fn harvest_spend(
     adapter: &dyn adapters::AgentAdapter,
     transcript: &Path,
@@ -107,17 +87,8 @@ pub(super) fn harvest_spend(
     }
 }
 
-/// Issue #285: reloads this repository's durable objective (if any),
-/// advances its status against `now`/`spent` (`objective::advance`),
-/// persists the update, and renders the layer text to append beside the
-/// handoff at a restart -- the one channel its own volatile counters (spend
-/// changes every restart, not just every recompose) can reach. `None` for no
-/// objective set, or one already `Closed`: a closed objective is never
-/// reseeded, and reloading it here must not be the thing that reopens it.
-///
-/// Unlike `composed` (built once at launch and reused across a nudge/rot/
-/// timeout/park restart -- see this module's own doc comment), this cannot
-/// reuse a launch-time snapshot: the objective's status can flip mid-run.
+/// Reload the durable objective at restart so changing status and spend reach
+/// the handoff; a closed objective must not be reopened. (#285)
 pub(super) fn objective_layer_for_restart(
     state: &StateDir,
     repo: &Path,
@@ -134,20 +105,8 @@ pub(super) fn objective_layer_for_restart(
     Some(objective::layer_text(&record))
 }
 
-/// Reads `transcript` fresh and evaluates `budget` against it PLUS every
-/// prior child's own already-harvested spend (`prior_usage`/`prior_tool_
-/// calls`, issue #169.2) -- so the ceiling bounds the whole supervised run
-/// across every restart, not just whichever child happens to be running
-/// right now. `None` when neither ceiling is configured (the common case,
-/// and every delegation before 2.35.0) or the CURRENT transcript cannot be
-/// read yet -- a read failure here must never be fatal, since it can just
-/// mean the child has not flushed its first line; the next tick that can
-/// read it still sees the full cumulative total, prior spend included.
-///
-/// Shared by `supervise_run`'s own tick (checked on every poll while the
-/// child is alive) and its post-exit check just below (issue #155 review
-/// finding C1): factored out so the two call sites can never drift on how
-/// "spent" is computed.
+/// Evaluate a fresh transcript plus all prior child spend, so limits cover
+/// the whole supervised run. Unreadable data waits for a later tick. (#155, #169.2)
 pub(super) fn evaluate_worker_budget(
     adapter: &dyn adapters::AgentAdapter,
     budget: agent::WorkerBudget,

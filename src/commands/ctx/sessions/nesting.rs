@@ -2,36 +2,9 @@
 
 use super::*;
 
-/// The environment variables that carry one supervised session's *identity*
-/// into everything it spawns: which session id turn signals should claim,
-/// which socket to post them on, and which transcript file the supervisor is
-/// watching. A child that inherits these from an outer session reports its
-/// own turns as if they belonged to that outer session -- which is exactly
-/// how a nested launch drove the outer rot engine to a `Restart` verdict and
-/// had it kill the outer agent (see `nested_session_evidence`).
-///
-/// Every supervisor scrubs all three off a child command builder before
-/// setting whichever of them it actually owns, so "no socket of my own"
-/// degrades to *unsupervised*, never to *supervised by somebody else*.
-/// `SEAT_MODEL_ENV` rides along for the same reason: it names *this*
-/// session's seat, and a worker that inherits an orchestrator's copy would
-/// have its own subagent dispatches refused by a guard describing a seat it
-/// is not sitting in. `HEADLESS_ENV` rides along for the mirror-image
-/// reason: it is proof THIS launch is a headless worker, and an interactive
-/// session (`wrap`, `chat`, a dashboard pane) that inherited it from
-/// whatever spawned it would wrongly refuse its own interactive `brainstorm`
-/// step.
-///
-/// Issue #249: `PARENT_SESSION_ENV` rides along too -- it names the session
-/// THIS one's own env says spawned it, and a child that inherited a copy
-/// unscrubbed would see its grandparent's id instead of never having one of
-/// its own set at all (see `agent::parent_session_env`'s own doc comment for
-/// the same rule at the fold that sets it fresh).
-///
-/// Issues #328/#334: `SEAT_ROLE_ENV` rides along for the same reason
-/// `SEAT_MODEL_ENV` does -- it names *this* session's own seat role, and a
-/// worker that inherited an orchestrator's copy would be mistaken for the
-/// seat it is not sitting in.
+/// Scrub inherited session, seat, headless, and parent identity before
+/// setting this child's own values; failed bind must mean unsupervised,
+/// never supervised by an outer session. (#249/#328/#334)
 pub const SUPERVISION_ENV: [&str; 11] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
@@ -46,9 +19,7 @@ pub const SUPERVISION_ENV: [&str; 11] = [
     super::agent::RESULT_WORKDIR_ENV,
 ];
 
-/// `portable_pty::CommandBuilder::new` seeds itself from `std::env::vars_os`,
-/// so an unset key on the builder still means "inherit". Only an explicit
-/// `env_remove` actually keeps the value out of the child.
+/// CommandBuilder inherits ambient env unless keys are explicitly removed.
 pub fn scrub_supervision_env(builder: &mut portable_pty::CommandBuilder) {
     for key in SUPERVISION_ENV {
         builder.env_remove(key);
@@ -62,67 +33,21 @@ pub fn scrub_supervision_env_cmd(command: &mut std::process::Command) {
     }
 }
 
-/// Set to `true` to bypass the interactive nesting guard, for the operator
-/// who genuinely means to run a session inside a session. Mirrored by
-/// `--allow-nested` on `wrap` and `chat`.
+/// Operator override for intentional interactive nesting.
 pub const ALLOW_NESTED_ENV: &str = "ZIRV_ALLOW_NESTED";
 
-/// Claude Code exports both of these into every process it spawns; either one
-/// alone is too weak to key on (`CLAUDECODE` is a plain flag a user could
-/// export by hand), so the pair is required together.
+/// Require both Claude environment markers; either alone is too weak.
 const CLAUDE_PID_ENV: &str = "CLAUDE_PID";
 const CLAUDE_CODE_ENV: &str = "CLAUDECODE";
 
-/// Why this process looks like it is already running *inside* an agent
-/// session, or `None` when nothing says so. Reads the caller's `EnvLookup`
-/// only, never the process environment -- and the filesystem only to ask
-/// whether the one directory-valued piece of evidence
-/// (`DASH_REQUESTS_ENV`) still exists (O5, below).
-///
-/// Interactive supervision nested inside an existing session is not merely
-/// redundant, it is destructive. The nested `wrap` binds its own turn-signal
-/// socket, but when that bind fails it still spawns a child -- and that child
-/// inherits the *outer* `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`, so its hooks
-/// post phantom turns into the outer supervisor's rot engine until the outer
-/// engine verdicts `Restart` and kills its own child: the session the user
-/// was actually talking to. `SUPERVISION_ENV` scrubbing closes the inherit
-/// half of that; this closes the "should we be here at all" half.
-/// Whether the dashboard that owns `requests_dir` is still alive, per its
-/// `owner.pid` file. The pidfile lives in the requests dir's PARENT (i.e.
-/// `<state>/dash/<short>-<token>/owner.pid`) and holds the dashboard's pid as
-/// decimal ASCII. A missing, unreadable, unparseable, or dead-pid pidfile all
-/// mean "no live dashboard" -- so an abnormally-exited dashboard's leftover
-/// requests directory never wedges a future interactive launch. Only a
-/// readable pidfile naming a live process counts.
-///
-/// `pub(crate)` (issue #144): also the liveness half of `agent::
-/// try_join_dashboard`'s own gate, so the two readers of `DASH_REQUESTS_ENV`
-/// cannot drift on what "live" means the way they did before -- this guard
-/// used to be the only one of the two that checked `owner.pid` at all, so a
-/// dashboard that exited abnormally left a directory `try_join_dashboard`
-/// still treated as a live channel: a request was written into it, nobody
-/// was listening, and the caller burned the whole ack timeout finding that
-/// out.
-///
-/// A thin `bool` projection of [`dashboard_owner_liveness`] -- see that
-/// function's own doc comment for the reason `try_join_dashboard` needs
-/// instead of just this yes/no answer (fix round 1, both reviewers: a silent
-/// refusal here is undiagnosable, the same complaint issue #144's own
-/// acceptance criteria raised about the three "dashboard did not answer"
-/// messages).
+/// Detect an existing interactive owner before launching another supervisor.
+/// Dashboard requests directories count only when owner.pid names a live
+/// process; stale or malformed state grants no ownership. (#144)
 pub(crate) fn dashboard_owner_is_live(requests_dir: &Path) -> bool {
     matches!(dashboard_owner_liveness(requests_dir), OwnerLiveness::Live)
 }
 
-/// Why [`dashboard_owner_is_live`] answered the way it did for `requests_dir`
-/// -- the same three-way distinction its own doc comment already draws
-/// ("missing, unreadable, unparseable, or dead-pid... all mean 'no live
-/// dashboard'"), just not collapsed to a bool: `agent::try_join_dashboard`
-/// needs the reason to report ("dead owner pid N" vs "missing owner.pid") to
-/// an operator who would otherwise see this refusal in total silence.
-/// `Missing` folds the unreadable and unparseable cases in with a genuinely
-/// absent file -- all three mean the same thing to a caller reporting this
-/// upward: no pid was ever recorded to check liveness against.
+/// Preserve why dashboard ownership failed so callers can report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnerLiveness {
     Live,
@@ -162,32 +87,8 @@ pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<Stri
     if non_empty(env(super::adapters::SOCKET_ENV)).is_some() {
         found.push(format!("{} is set", super::adapters::SOCKET_ENV));
     }
-    // A dashboard pane's own child inherits this (the dashboard exports it
-    // into every pane's turn_env, never into its own process environment --
-    // see `dash::run_dashboard`), so a set value here means a dashboard pane
-    // owns this terminal, and starting another interactive supervisor (or
-    // dashboard) inside it is exactly the nested-session hazard this guard
-    // exists to catch. Deliberately not added to `SUPERVISION_ENV`: a pane
-    // child's own further children (e.g. a nested `zirv ctx agent`) must
-    // still be able to reach the same spawn-request channel, which scrubbing
-    // it there would break.
-    //
-    // O5: the directory has to still exist, exactly as `agent::
-    // try_join_dashboard` requires before it will use the channel. The
-    // dashboard removes it on quit, so a shell that survived one -- a pane
-    // child still sitting at a prompt after the dashboard closed -- carries a
-    // stale value naming nothing. Treating that as evidence refused a session
-    // no dashboard owns any more, and the two readers of this variable
-    // disagreeing about what "set" means was the bug: one channel, one
-    // liveness test.
-    //
-    // A directory alone is not enough, though: an *abnormal* dashboard exit
-    // (crash, kill) leaves the directory behind, and a surviving pane shell
-    // still carrying this env would then wedge every future interactive
-    // launch forever. The dashboard writes its own pid into `owner.pid` (the
-    // requests dir's parent, `<state>/dash/<short>-<token>/owner.pid`), so
-    // only a pidfile naming a *live* process counts as a dashboard actually
-    // owning this terminal -- a stale or dead one is no evidence.
+    // A pane channel may identify its owner, but must stay available to
+    // child spawn requests; require a live owner pid before refusing nesting.
     if non_empty(env(super::dash::spawnreq::DASH_REQUESTS_ENV))
         .is_some_and(|dir| dashboard_owner_is_live(Path::new(&dir)))
     {
@@ -204,16 +105,11 @@ pub fn nested_session_evidence(env: super::config::EnvLookup<'_>) -> Option<Stri
     (!found.is_empty()).then(|| found.join("; "))
 }
 
-/// The refusal message an interactive verb prints, or `None` when it may
-/// start. `allow_nested` is the verb's own `--allow-nested` flag; the
-/// `ZIRV_ALLOW_NESTED` environment variable is the second, equivalent
-/// override (strict `true`, matching every other boolean this codebase reads
-/// out of the environment).
-///
-/// Only the interactive verbs (`wrap`, `chat`) call this. Headless workers
-/// (`exec`, `loop`, `agent`) legitimately run inside a session -- delegating
-/// to one is the whole point of `zirv ctx agent` -- and they never take over
-/// the shared console, so they are deliberately not gated.
+/// Refuse nesting unless the operator explicitly allows it. Only the
+/// interactive verbs (`wrap`, `chat`) call this: headless workers legitimately
+/// run inside a session -- delegation is the whole point of `zirv ctx agent`
+/// -- and never take over the shared console, so they are deliberately not
+/// gated here.
 pub fn nesting_refusal(
     verb: &str,
     env: super::config::EnvLookup<'_>,
