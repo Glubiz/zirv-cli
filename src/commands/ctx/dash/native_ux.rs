@@ -1092,7 +1092,7 @@ pub fn notice_compaction(before: usize, after_tokens: u64, checkpoint: Option<&s
         kind: NoticeKind::Compacted,
         headline: format!("compacted {before} messages \u{2192} {after_tokens} tokens"),
         detail: vec![format!(
-            "checkpoint {} \u{b7} draft, selection, focus and scrollback preserved",
+            "checkpoint {} \u{b7} draft, focus and scrollback preserved",
             checkpoint.unwrap_or(style::PLACEHOLDER)
         )],
         at: 0,
