@@ -54,7 +54,10 @@ pub(crate) fn run(cfg: &CtxConfig, state: &StateDir, repo: &Path) -> io::Result<
     let outcome = match terminal {
         Ok(mut terminal) => {
             let flow = run_flow(&mut terminal, cfg, state, repo);
+            // clear() restores the cursor to the last draw's cell (mid-line); output after intake must start at the viewport origin.
             let _ = terminal.clear();
+            let origin = terminal.get_frame().area().as_position();
+            let _ = terminal.set_cursor_position(origin);
             flow
         }
         Err(e) => Err(e),
