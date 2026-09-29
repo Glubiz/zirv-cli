@@ -1186,7 +1186,6 @@ pub struct Continuity {
     pub draft: String,
     pub cursor: usize,
     pub queued: Vec<QueuedInput>,
-    pub selection: Option<(usize, usize)>,
     pub focus: Focus,
     pub scroll: ScrollState,
     /// The last input this pane has seen ACKNOWLEDGED by the runtime. Input
@@ -1201,7 +1200,6 @@ impl Continuity {
             draft: String::new(),
             cursor: 0,
             queued: Vec::new(),
-            selection: None,
             focus: Focus::Composer,
             scroll: ScrollState::default(),
             acknowledged_upto: 0,
@@ -1225,7 +1223,7 @@ pub enum Retarget {
 
 impl Continuity {
     /// Moves this pane's state onto the seat's new session. The draft,
-    /// cursor, selection, focus, scrollback and acknowledged watermark are
+    /// cursor, focus, scrollback and acknowledged watermark are
     /// carried verbatim; the queued input is RE-TARGETED, never replayed
     /// into the retired session.
     pub fn carry_across(&mut self, next: SeatIdentity) -> Retarget {
@@ -3267,7 +3265,6 @@ mod tests {
         let mut continuity = Continuity::new(SeatIdentity::from_seat(&seat_fixture("s7", 1)));
         continuity.draft = "keep the shim".to_string();
         continuity.cursor = 4;
-        continuity.selection = Some((2, 6));
         continuity.focus = Focus::Transcript;
         continuity.scroll.scroll_up(3, 50);
         continuity.acknowledged_upto = 17;
@@ -3291,7 +3288,6 @@ mod tests {
         );
         assert_eq!(continuity.draft, "keep the shim");
         assert_eq!(continuity.cursor, 4);
-        assert_eq!(continuity.selection, Some((2, 6)));
         assert_eq!(continuity.focus, Focus::Transcript);
         assert_eq!(continuity.scroll.items_back, 3);
         assert_eq!(continuity.acknowledged_upto, 17);
