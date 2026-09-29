@@ -30,17 +30,7 @@ use crate::commands::ctx::config::EnvLookup;
 const API_VERSION: &str = "2023-06-01";
 const CONTEXT_EDITING_BETA: &str = "context-management-2025-06-27";
 
-// Issue #756: server-side context editing for native Anthropic sessions
-// (https://platform.claude.com/docs/en/build-with-claude/context-editing).
-// `clear_tool_uses_20250919` clears stale tool_use/tool_result content once
-// a threshold is crossed, so a long tool-heavy session sheds dead weight
-// before it hits context exhaustion instead of being compacted or restarted.
-// Values below mirror the documented Anthropic defaults for `trigger` and
-// `keep`, so behaviour matches what the API already considers reasonable;
-// `clear_at_least` is set high enough that a clear is worth the cache
-// invalidation it causes, but well under `trigger` so it can actually be met.
-/// Only fires once a session is genuinely context-heavy, not on ordinary
-/// short turns.
+// Server-side context editing clears stale tool results only after enough context accumulates to outweigh cache invalidation. (#756)
 const CONTEXT_EDITING_TRIGGER_INPUT_TOKENS: u64 = 100_000;
 /// Keeps the most recent tool_use/tool_result pairs intact so the model
 /// still has immediate tool context to work from after a clear.
@@ -49,9 +39,7 @@ const CONTEXT_EDITING_KEEP_TOOL_USES: u64 = 3;
 /// invalidation it causes; the strategy simply does not fire in that case.
 const CONTEXT_EDITING_CLEAR_AT_LEAST_INPUT_TOKENS: u64 = 5_000;
 
-/// Issue #756: set once Anthropic has rejected the context-editing beta for
-/// this process (a 400 naming it). A stale beta or field name should not
-/// cost every subsequent request a failed round-trip before falling back.
+/// Disable context editing process-wide after a 400 names its beta or field, avoiding repeated failed attempts. (#756)
 static CONTEXT_EDITING_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// The direct providers share one timeout contract; the alias keeps the
@@ -63,10 +51,7 @@ pub struct AnthropicMessagesAdapter {
     target: ProviderTarget,
     credential: Credential,
     timeouts: AnthropicTimeouts,
-    /// Issue #756: operator/repo-resolved policy for this route. Default
-    /// `true`; `from_config` overrides it from `native.toml`'s
-    /// `[policy].context_editing`. The process-wide `CONTEXT_EDITING_DISABLED`
-    /// kill switch is checked separately and always wins over this.
+    /// Context editing defaults on, may be narrowed by repository policy, and is always overridden by the process-wide rejection switch. (#756)
     context_editing: bool,
 }
 
@@ -310,9 +295,7 @@ impl AnthropicMessagesAdapter {
             beta_headers.push("thinking-display-updates-2026-08-18");
         }
 
-        // Issue #756: first-party Anthropic only, gated by both the
-        // operator/repo policy and the process-wide kill switch a prior 400
-        // may have tripped.
+        // Request context editing only for first-party Anthropic when policy allows and no prior rejection disabled it. (#756)
         let context_editing =
             self.context_editing && !CONTEXT_EDITING_DISABLED.load(Ordering::Relaxed);
         if context_editing {
@@ -458,16 +441,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let requested_context_editing = encoded.context_editing;
         match self.perform(&encoded, cancellation, sink) {
             Err(failure) if requested_context_editing && is_context_editing_rejection(&failure) => {
-                // Issue #756: never let an unrecognized beta/field name fail
-                // a request that would otherwise have succeeded. Disable it
-                // process-wide first so every adapter instance stops
-                // offering it, then retry this one request without it.
-                // `compare_exchange` (not `store`) so that when several
-                // concurrent requests each hit the 400 before any of them
-                // has flipped the flag, only the ONE that actually wins the
-                // false-to-true transition prints the diagnostic -- every
-                // other concurrent loser still disables (redundantly, but
-                // harmlessly) and retries, it just doesn't also print.
+                // Disable the unsupported beta before retrying; compare-exchange lets only one concurrent request announce it. (#756)
                 let this_call_disabled_it = CONTEXT_EDITING_DISABLED
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok();
@@ -485,9 +459,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
     }
 }
 
-/// Issue #756: a 400 whose message names the context-editing beta or its
-/// request field -- as opposed to any other bad-request cause -- is the only
-/// case worth retrying without it.
+/// Retry without context editing only when a 400 names its beta or request field. (#756)
 fn is_context_editing_rejection(failure: &ProviderFailure) -> bool {
     if failure.http_status != Some(400) {
         return false;
@@ -502,8 +474,7 @@ fn is_context_editing_rejection(failure: &ProviderFailure) -> bool {
 struct EncodedRequest {
     body: Value,
     beta_headers: Vec<&'static str>,
-    /// Issue #756: whether this encoding included `context_management`, so
-    /// `stream()` knows whether a 400 naming it is worth retrying without.
+    /// Track whether context editing was sent so only its own rejection triggers fallback. (#756)
     context_editing: bool,
 }
 
@@ -1065,10 +1036,7 @@ fn process_sse_event(
                 .cloned()
                 .map(OpaqueProviderData::new);
             merge_usage(&mut accumulator.usage, value.get("usage"));
-            // Issue #756: `context_management.applied_edits` reports on the
-            // final `message_delta` event whether the server actually
-            // cleared anything this turn. Sibling to `usage`, not nested
-            // under `delta`.
+            // Read applied edits from the final `message_delta`, beside usage rather than inside delta. (#756)
             for edit in value
                 .pointer("/context_management/applied_edits")
                 .and_then(Value::as_array)

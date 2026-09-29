@@ -795,22 +795,8 @@ pub fn discover(cfg: &CtxConfig, repo: &Path) -> Vec<IntegrationStatus> {
         &capabilities.web,
     ));
 
-    // F5 (wrapper-overhead benchmark, 2026-09-24): computed ONCE and shared
-    // by the Browser and FrontendRender rows below (this used to call
-    // `browser_binary` -- a live `--headless ... --version` LAUNCH probe,
-    // `match` on it as the scrutinee so it ran even when the guard below it
-    // would refuse anyway -- separately, unconditionally, for BOTH rows).
-    // On a machine where that flag combination does not exit promptly (a
-    // real Chrome/Edge install can spend most of a minute tearing its own
-    // process tree back down rather than the sub-second the flags promise),
-    // `zirv workflow start`'s capability check measured ~15s of idle wall
-    // time here alone. `browser_present` is launch-free (an existence check
-    // only), so this row is now `unverified` rather than `available` --
-    // the identical "configured/present but not contacted this run" honesty
-    // already given a configured MCP server above, never claiming a launch
-    // that was never attempted actually works. The real capture path still
-    // resolves through `discover_browser`/a direct launch, so a present but
-    // broken browser is still caught the moment something tries to render.
+    // Share one browser check across both rows; presence alone is unverified until
+    // the render path launches it. A version probe may hang on Chrome/Edge.
     let browser = if capabilities.browser.binary.is_some() {
         browser_binary(&capabilities.browser)
     } else {

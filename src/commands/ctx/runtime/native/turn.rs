@@ -1951,14 +1951,7 @@ impl<'a> NativeLoop<'a> {
         let mut interrupted = false;
 
         loop {
-            // Issue #554 (integration review): a HARD error -- not a captured
-            // `TurnState::Failed`, which the match below already handles --
-            // used to return straight out of the loop. Every token earlier
-            // turns of this same loop had already been billed for was then
-            // never settled: the estimate was released and the real spend
-            // vanished from `zirv ctx spend`. The abort now carries a status
-            // built from exactly what was billed, so the caller settles it
-            // before propagating.
+            // Carry already-billed usage in a hard abort so the caller settles real spend before propagating. (#554)
             let outcome = match self.run_turn() {
                 Ok(outcome) => outcome,
                 Err(error) => return Err(self.abort(last, error)),

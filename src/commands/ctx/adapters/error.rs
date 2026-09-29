@@ -19,10 +19,7 @@ const PROVIDER_RATE_LIMIT_PREFIXES: &[&str] = &["throttling error:"];
 
 const PROVIDER_RATE_LIMIT_PATTERNS: &[&str] = &["rate limit", "too many requests"];
 
-/// Issue #455: the request never reached the provider. `"firewall or proxy"`
-/// and `"ConnectionRefused"` are Claude Code's own wording for the incident
-/// this classification exists for (`API Error: Connection refused -- a
-/// firewall or proxy may be blocking it (ConnectionRefused)`).
+/// Classify transport reachability from the harness's explicit connection-failure wording. (#455)
 const PROVIDER_TRANSPORT_PATTERNS: &[&str] = &[
     "connection refused",
     "connection reset",
@@ -46,15 +43,7 @@ const PROVIDER_TRANSPORT_PATTERNS: &[&str] = &[
     "timed out waiting for the first token",
 ];
 
-/// It reached the provider and the provider failed. Checked before the
-/// overflow wording, like the rate-limit list above and for the same reason:
-/// a 5xx body can quote the rejected request.
-///
-/// Review round 1, finding 3: bare numeric status fragments (`" 503 "`) are
-/// deliberately NOT here. A number in prose is not evidence -- an HTTP
-/// status reaches this function through `ProviderErrorHints::status`, which
-/// is a structured field, and codex's `task_complete.error.message` is task
-/// text that can contain any number at all.
+/// Classify explicit provider failure before quoted overflow wording; a bare status number is not evidence. (#455)
 const PROVIDER_SERVER_PREFIXES: &[&str] = &["service unavailable:"];
 
 const PROVIDER_SERVER_PATTERNS: &[&str] = &[
@@ -66,14 +55,7 @@ const PROVIDER_SERVER_PATTERNS: &[&str] = &[
     "upstream connect error",
 ];
 
-/// The provider rejected the caller rather than failing.
-///
-/// Finding 3: only explicit PROVIDER tokens, never English that an agent's
-/// own task text produces. `"permission denied"` is what a sandbox says
-/// about a file, and a bare `404` is as likely a transient proxy as a wrong
-/// model id -- both used to read as `Auth`, which is the one class no
-/// cooldown was allowed to clear. Everything else arrives as a structured
-/// hint (see [`classify_from_hints`]).
+/// Match explicit provider rejection only; sandbox wording and bare status numbers must not suppress cooldown. (#455)
 const PROVIDER_AUTH_PATTERNS: &[&str] = &[
     "authentication_error",
     "invalid_api_key",
@@ -145,14 +127,7 @@ pub(crate) fn classify_provider_error(
     classify_from_hints(hints)
 }
 
-/// Issue #455: a stable identity for one provider-error row whose transcript
-/// shape carries none of its own -- the row's own millisecond timestamp plus
-/// a fingerprint of its message.
-///
-/// `None` without a timestamp: consecutive retries of one failing turn carry
-/// the SAME message text, so content alone would collapse three real
-/// failures into one observation. With no time to separate them, no identity
-/// is honest, and `health::observe` simply does not de-duplicate.
+/// Deduplicate provider-error rows by timestamp and message fingerprint; without a timestamp, retries must remain distinct. (#455)
 pub(crate) fn provider_error_id(at_ms: Option<u64>, message: &str) -> Option<String> {
     let at_ms = at_ms?;
     Some(format!(

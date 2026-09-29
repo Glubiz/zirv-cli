@@ -7,11 +7,7 @@ pub mod bedrock;
 pub mod capability;
 pub mod config;
 pub mod credential;
-/// Live-contract evidence recorder for issue #592's ignored `live_*` tests
-/// (`anthropic.rs`, `openai.rs`, `google.rs`, `openai_chat.rs`). Test-only,
-/// the same way `testhttp` below is: nothing in the production path ever
-/// records evidence, only an operator explicitly running an `--ignored`
-/// test with real credentials does.
+/// Live evidence is recorded only by ignored tests, never production routes. (#592)
 #[cfg(test)]
 pub(crate) mod evidence;
 pub mod google;

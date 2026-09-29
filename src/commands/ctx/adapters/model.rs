@@ -2,19 +2,7 @@
 //! launches.
 use super::*;
 
-/// Low 5: the account a usage readout should report for `name`, without
-/// needing that adapter to be enabled or ready -- adapter name -> provider
-/// is a static fact through the registry (`ctor(None).provider()` never
-/// touches the filesystem, a gate, or `ready()`), so it stays answerable
-/// even when `adapters::select(name, ...)` itself would refuse. `zirv ctx
-/// usage`'s no-subcommand branch and `zirv ctx status`'s usage-windows line
-/// used to fall back to `window::LEGACY_USAGE_PROVIDER` on *any* `select`
-/// refusal, which silently showed Anthropic percentages for a repo
-/// configured for a disabled codex rather than "openai: no usage source" --
-/// a guess dressed up as a fact. Falls back to `LEGACY_USAGE_PROVIDER` only
-/// when `name` is `None` or matches no registered adapter at all (an unknown
-/// or absent configuration, where there truly is nothing more specific to
-/// say than the legacy default).
+/// Resolve usage account from the static adapter registry even when that adapter is absent or disabled. (#690)
 pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
     provider_for_agent_and_model(name, None)
 }
@@ -56,11 +44,7 @@ pub fn provider_for_agent_and_model(name: Option<&str>, model: Option<&str>) -> 
 /// operator configured one -- the same field `seat_model_env` and
 /// `wrap::run_with`'s `seat_cfg_model` already read for that seat.
 pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
-    // Issue #690: presence is not consulted here. This names the account a
-    // readout belongs to, not a harness to launch, and letting an absent
-    // binary fall this through to `LEGACY_USAGE_PROVIDER` would put
-    // Anthropic percentages under a repo configured for another vendor --
-    // the guess this function was written to stop making.
+    // Account identity does not depend on binary presence; a fallback could misattribute usage. (#690)
     resolve_default_with_presence(cfg, &presence_not_consulted)
         .map(|(adapter, _origin)| adapter.provider_for_model(cfg.chat.model.as_deref()))
         .unwrap_or_else(|_| {
@@ -68,20 +52,13 @@ pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
         })
 }
 
-/// The resolved review-model choice for one enabled harness: either the
-/// operator's own `cfg.review.<agent>` value, or `adapter`'s own
-/// `AgentAdapter::review_model_below` ladder default computed from the
-/// orchestrator seat (`cfg.chat.model`, or the top tier when unset). This is
-/// the one place both halves are combined -- `review_roster_line` below is
-/// its only caller.
+/// Resolve an operator review-model override or the adapter's below-seat default once for roster and launch.
 pub(crate) struct ReviewModelChoice {
     pub(crate) model: String,
     pub(crate) configured: bool,
 }
 
-/// `pub(crate)`: also the seam `reviewer_args` (`workflow::review`) uses to
-/// enforce the same resolved model on the reviewer's own launch, not just to
-/// advise it in the roster line below.
+/// The reviewer launch uses this resolved model, matching the roster guidance.
 pub(crate) fn resolve_review_model(
     cfg: &CtxConfig,
     name: &str,
@@ -138,15 +115,7 @@ pub(crate) fn resolve_tiered_model<'a>(
     configured.filter(|model| !model.trim().is_empty())
 }
 
-/// The resolved `worker.<name>` model for a delegated headless worker: the
-/// operator's own `cfg.worker.<name>` value if set, else `adapter`'s own
-/// `AgentAdapter::default_worker_model`. `None` means neither exists, so a
-/// delegation spawn adds no `--model` flag at all and the agent's own
-/// configuration picks (codex, with no `worker.codex` set). Unlike
-/// `resolve_review_model` above, there is no ladder to fall back to: a
-/// delegated worker has no orchestrator seat of its own to be "one tier
-/// below", so the adapter-owned default is a fixed model name, not a
-/// function of `cfg.chat.model`.
+/// Resolve the worker override or adapter default; `None` leaves model selection to the launched agent.
 fn resolve_worker_model<'a>(
     cfg: &'a CtxConfig,
     name: &str,

@@ -1,20 +1,8 @@
 //! Issue #387 (wave 2): the GitHub Copilot CLI adapter (`@github/copilot`).
 //!
-//! Copilot CLI ships as a tiny npm loader (`npm-loader.js`, `package.json`'s
-//! `bin.copilot`) that `spawnSync`s a per-platform COMPILED binary pulled in
-//! via an `optionalDependencies` package (`@github/copilot-win32-x64` etc.,
-//! verified: `npm pack @github/copilot@latest` -> `1.0.83`, extracted under
-//! this worktree's `target/copilot-survey/package/`, 2026-09-07). Unlike
-//! `gemini-cli`/`pi-coding-agent`, there is no bundled JS to read source facts
-//! from -- every fact below is either (a) GitHub's own published reference
-//! docs, fetched as raw Markdown straight from `github/docs@main` (not the
-//! rendered site, to quote verbatim and avoid a summarizer's paraphrase), or
-//! (b) a real, independent open-source parser that reads the exact on-disk
-//! file this adapter reads, cited by file. Copilot CLI itself is not
-//! installed on this machine and was never run; nothing below was exercised
-//! against a live process. Anything not cited to a specific doc file or
-//! external source is UNSUPPORTED and left at the trait default rather than
-//! guessed.
+//! Copilot CLI loads a compiled platform binary. The contracts below come
+//! from GitHub reference docs and an independent session-file parser;
+//! unsupported behavior stays on the adapter default. (#387)
 //!
 //! # Verified facts and their source
 //!

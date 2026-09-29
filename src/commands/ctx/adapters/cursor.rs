@@ -1,31 +1,8 @@
 //! Issue #392 (wave 3): the Cursor CLI adapter (`cursor-agent`).
 //!
-//! Not installed on this machine; every fact below is exactly what issue
-//! #392's own "Verified facts" section states, sourced from
-//! `cursor.com/docs/cli/{headless,reference/output-format,reference/
-//! permissions}` and `cursor.com/docs/hooks` (2026-09-07). Headless
-//! `--model`, compaction, and the exact hooks schema are explicitly called
-//! out in the issue as unverified and are left on the trait's own "no
-//! verified mechanism" default rather than guessed.
-//!
-//! Cursor's read-only posture is a CONFIG FILE (`.cursor/cli.json` /
-//! `~/.cursor/cli-config.json`'s `permissions.allow`/`deny`), not a CLI flag
-//! -- unlike every adapter this crate ships today, whose `read_only_args`
-//! returns argv tokens. Materializing that file (the same "I/O inside a
-//! method that looks pure" shape `opencode::OpenCodeAdapter::system_prompt_
-//! args` already sets precedent for) is a real feature this pass does not
-//! attempt, since the exact JSON schema for `Shell()`/`Read()`/`Write()`/
-//! `WebFetch()`/`Mcp()` entries is not spelled out in the issue beyond their
-//! bare names -- see [`read_only_args`](CursorAdapter::read_only_args)'s own
-//! doc comment.
-//!
-//! **No row-level transcript schema is documented anywhere in issue #392**
-//! (only the file location). [`capabilities`](CursorAdapter::capabilities)
-//! therefore reports `events: false` -- see `grok.rs`'s own doc comment for
-//! why that is the honest answer rather than an invented schema.
-//! [`transcript_path`](CursorAdapter::transcript_path) still resolves a
-//! real, best-effort location via [`super::pin_newest_transcript`], since
-//! the exact per-project directory naming is not given.
+//! Read-only policy requires a config file with an unverified schema, so
+//! this adapter leaves that mechanism unsupported. Transcript rows are
+//! undocumented; events stay disabled while path lookup remains best effort. (#392)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

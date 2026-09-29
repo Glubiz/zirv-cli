@@ -9,15 +9,7 @@ use crate::commands::ctx::catalogue;
 use crate::commands::ctx::provider::RouteId;
 use crate::commands::ctx::provider::config::NativeConfig;
 
-/// The configured route whose `model` equals the decision's own orchestrator
-/// model, matched against either the alias the decision carries (e.g.
-/// `"fable"`) or the canonical catalogue id it resolves to on that harness's
-/// vendor (e.g. `"claude-fable-5"`). `None` when no route matches -- the
-/// caller keeps its configured role route in that case, exactly as the
-/// spec's "Apply -- native runtime" section describes.
-// `runtime::native`'s own route resolution now calls this; `spawn_interactive`'s
-// submit loop (T2) is still the pending live-wiring caller outside the
-// not-yet-wired native runtime (see `runtime/mod.rs`'s own doc comment).
+// Native route resolution uses this helper for both interactive and headless launches.
 pub fn route_for_decision(decision: &ProxyDecision, cfg: &NativeConfig) -> Option<RouteId> {
     let vendor_slug = adapters::provider_for_agent_name(Some(&decision.orchestrator.harness));
     let canonical_id = catalogue::vendor(vendor_slug)

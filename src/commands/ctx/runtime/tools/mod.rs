@@ -179,10 +179,7 @@ pub const WORKFLOW_ADVANCE: &str = "workflow_advance";
 pub const WORKFLOW_APPROVE: &str = "workflow_approve";
 pub const WORKFLOW_LIST: &str = "workflow_list";
 pub const WORKFLOW_START: &str = "workflow_start";
-/// Issue #539 chunk E1: an agent's own skill discovery/load/resource tools,
-/// mirrored on the read-only MCP bridge (`ctx::mcp`) with the same names,
-/// arg shapes and result shapes -- both surfaces call
-/// `workflow::skill_tools` rather than rendering a skill twice.
+/// Skill tools share names, shapes, and the workflow service with the read-only MCP bridge. (#539)
 pub const SKILL_LIST: &str = "skill_list";
 pub const SKILL_LOAD: &str = "skill_load";
 pub const SKILL_READ_RESOURCE: &str = "skill_read_resource";
@@ -207,10 +204,7 @@ pub enum ResourceClaimKind {
     OutputStore,
     MemoryStore,
     SearchIndex,
-    /// Issue #479: the shared delegation store -- task cards, worktree write
-    /// claims, provider reservations and the durable delegation records
-    /// themselves. Named separately from `WorktreeWrite` because owning a
-    /// delegation is not the same claim as holding a checkout.
+    /// Delegation state is distinct from worktree writing; owning a task does not itself grant repository writes. (#479)
     DelegationStore,
 }
 

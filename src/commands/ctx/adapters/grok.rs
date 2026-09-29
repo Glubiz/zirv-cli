@@ -1,23 +1,7 @@
 //! Issue #390 (wave 3): the xAI Grok Build CLI adapter (`grok`).
 //!
-//! Not installed on this machine; every fact below is exactly what issue
-//! #390's own "Verified facts" section states, sourced from
-//! `github.com/xai-org/grok-build` docs and `docs.x.ai/build/features/hooks`
-//! (2026-09-07). Facts the issue itself calls out as unverified (an append
-//! form of the system prompt, compaction, the exact read-only/plan-mode flag
-//! names, and the url-encoding scheme for a session's cwd segment) are left
-//! on the trait's own "no verified mechanism" default rather than guessed.
-//!
-//! **No row-level transcript schema is documented anywhere in issue #390** --
-//! only the file location (`updates.jsonl`/`summary.json`), never a field
-//! shape for a row inside it. [`capabilities`](GrokAdapter::capabilities)
-//! therefore reports `events: false`: every currently-registered adapter in
-//! this crate ships `events: true`, but inventing field names with no
-//! citation would be exactly the guess issue #390 (and the wave-3 brief)
-//! rules out. [`transcript_path`](GrokAdapter::transcript_path) still
-//! resolves a real, best-effort location -- useful for `zirv ctx status` --
-//! via [`super::pin_newest_transcript`], since the exact url-encoding of a
-//! session's cwd segment is not given.
+//! Transcript row fields and the read-only flag are unverified; events
+//! stay disabled and path lookup remains best effort. (#390)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

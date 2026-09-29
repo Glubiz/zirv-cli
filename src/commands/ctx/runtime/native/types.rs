@@ -91,7 +91,7 @@ pub enum LimitKind {
     RequestsPerTurn,
     ToolCalls,
     WallClock,
-    /// Issue #637: `--budget-tokens` on the native runtime.
+    /// Native token budget supplied by `--budget-tokens`. (#637)
     Tokens,
 }
 
@@ -162,7 +162,7 @@ pub enum ToolState {
     Started,
     Completed,
     Failed,
-    /// Never started, and now never will be.
+    /// Never started and will not start.
     Cancelled,
     /// Started, outcome unknown. Requires reconciliation before any retry.
     OutcomeUnknown,
@@ -422,12 +422,7 @@ pub struct NativeFinalStatus {
     pub requests: u32,
     pub tool_calls: u32,
     pub usage: ProviderUsage,
-    /// Issue #487 (item 7): what this session actually settled, separated
-    /// into billable and unpriced tokens and counted once per PROVIDER
-    /// REQUEST rather than once per fold. `usage` above is the running
-    /// accumulation the loop reports; this is the reconciliation that says
-    /// how many distinct requests it came from and what each was billed as,
-    /// which is what a spend readout can be checked against.
+    /// Settled spend counts each provider request once, split into billable and unpriced usage. (#487)
     pub reconciliation: super::super::super::route::Reconciliation,
     pub finish_reason: Option<String>,
     pub final_text: Option<String>,
@@ -436,34 +431,19 @@ pub struct NativeFinalStatus {
     pub queued_input: Vec<String>,
     pub limit: Option<LimitKind>,
     pub failure: Option<String>,
-    /// Issue #487 (item 4) / #554: WHICH SCOPE the failure above is evidence
-    /// about, decided purely by `route::route_failure`. The loop writes no
-    /// health record itself -- the decision is pure and replayable, and the
-    /// durable breaker write belongs to the supervisor that owns a state
-    /// directory (`native_worker::record_route_health`). `None` when the run
-    /// did not fail on a provider failure at all.
+    /// Pure route failure scope used by the durable breaker; the loop writes no health record itself. (#487, #554)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_routing: Option<super::super::super::route::FailureRouting>,
     pub blocked_reason: Option<String>,
-    /// Issue #486: the compactions this run committed, oldest first, and the
-    /// newest compaction decision -- including one that was only advice.
-    /// Durable facts: every entry names a journal sequence a reader can go
-    /// and check.
+    /// Committed compactions are ordered oldest first and name verifiable journal sequences. (#486)
     pub compactions: Vec<CompactionRecord>,
     pub compaction_decision: Option<CompactionDecision>,
     pub evidence: Vec<NativeEvidence>,
     pub exit_code: i32,
 }
 
-/// A hard loop failure that still has real spend attached (issue #554,
-/// integration review).
-///
-/// `NativeLoop::run_to_completion` can fail outright -- a journal write, a
-/// transport that cannot be rebuilt -- after earlier turns of the SAME loop
-/// have already been billed by the provider. Those tokens are spent whatever
-/// happens next, so the error carries the status that names them and every
-/// caller settles it before propagating. Implements `std::error::Error`, so
-/// a caller with nothing to settle can still write `?` exactly as before.
+/// Carries already-billed work through a hard loop failure so every caller
+/// can settle it before propagating the error. (#554)
 #[derive(Debug)]
 pub struct AbortedRun {
     /// What this loop had already billed when it failed. Boxed because a
@@ -503,32 +483,13 @@ pub struct NativeSessionConfig {
     /// instead, so the gate is read LIVE at every completion attempt rather
     /// than snapshotted before the session had done anything.
     pub workflow_gate: Option<String>,
-    /// Issue #486: how this session compacts itself. Default is a working
-    /// configuration -- automatic policy, unknown context window, the shared
-    /// scoring config's own thresholds -- so a caller that says nothing still
-    /// gets compaction rather than a silently unprotected session.
+    /// Default compaction policy works without caller overrides; unknown capacity stays unknown. (#486)
     pub compaction: CompactionSettings,
-    /// Issue #484 (roadmap N15): the repository whose ACTIVE workflow gates
-    /// this session's completion. `None` for a session with no workflow in
-    /// view -- a helper call, a fixture run -- which is gated by nothing.
+    /// Repository whose active workflow gates completion; `None` leaves the session ungated. (#484)
     pub workflow_repo: Option<PathBuf>,
-    /// Issue #484: the standing instructions this session runs under, compiled
-    /// once by the native context compiler (`runtime::context`) -- the
-    /// engineering standard, the role methodology, the model profile, the
-    /// operator's and repository's own instruction files, and the active
-    /// workflow's current step. Sent as the provider's system prompt on every
-    /// request.
-    ///
-    /// Compiled ONCE, at session start, deliberately: it is the cacheable
-    /// stable prefix, and rebuilding it each turn would defeat prompt caching
-    /// for a refresh the session can ask for explicitly through the
-    /// `workflow_context` tool. What must stay live is the workflow GATE, and
-    /// that is read at every completion attempt (see `finalize`).
+    /// Stable, cacheable system instructions compile once; the live workflow gate is checked at every completion. (#484)
     pub system: Vec<String>,
-    /// Issue #484: the untrusted DATA half of the same compilation --
-    /// repository instruction files, canonical context, memory. Delivered as
-    /// one leading user message rather than as instructions, because that is
-    /// what it is.
+    /// Repository context is untrusted data delivered as a user message, never as system instructions. (#484)
     pub preamble: Vec<String>,
 }
 

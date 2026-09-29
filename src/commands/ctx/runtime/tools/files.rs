@@ -389,13 +389,8 @@ pub(super) fn write_file(path: &Path, args: &WriteFileArgs) -> Result<FileOutcom
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(ToolError::io)?;
     }
-    // Re-verified immediately before the rename, not just here: an edit
-    // landing after this point but before the replace must still be
-    // refused, not silently overwritten (same race as #582's patch fix).
-    // `before_sha` mirrors what was just validated above: the real content
-    // hash when the file already existed, or the empty-bytes hash when it
-    // did not -- `write_atomic_bytes_if_unchanged` reads a missing
-    // destination the same way.
+    // Recheck at rename to refuse concurrent edits; a missing destination
+    // uses the empty-content hash for compare-and-swap. (#582)
     let before_sha = current
         .as_deref()
         .map(sha256)
@@ -461,9 +456,7 @@ pub(super) fn apply_patch(path: &Path, args: &ApplyPatchArgs) -> Result<FileOutc
     }
     let desired = encode_text(&text, encoding);
     let desired_sha = sha256(&desired);
-    // Re-verified immediately before the rename, not just here: an edit
-    // landing after this point but before the replace must still be
-    // refused, not silently overwritten (issue #582 / roadmap N05).
+    // Recheck at rename so a concurrent edit is refused, never overwritten. (#582)
     if let Some(current_sha) =
         state::write_atomic_bytes_if_unchanged(path, &desired, false, &actual_sha)
             .map_err(ToolError::io)?

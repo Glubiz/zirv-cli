@@ -107,13 +107,7 @@ pub struct SessionIdentity {
     pub generation: u64,
     pub task: Option<TaskId>,
     pub route: RouteIdentity,
-    /// Issue #639: the canonical repository root this session started in,
-    /// recorded once at [`Journal::create_session`] and never rewritten.
-    /// `--resume` from any other root is refused (`run_session`'s own
-    /// affinity check) -- a native session's journal, its checkpoints and
-    /// every tool receipt in it are all relative to the tree it began
-    /// working in, so continuing it against a different one would silently
-    /// hand a stale plan a different checkout's files.
+    /// Canonical session root is recorded once; resume from another worktree must be refused. (#639)
     pub repo: PathBuf,
     pub created_at: u64,
     pub completed_at: Option<u64>,
@@ -285,16 +279,7 @@ pub enum JournalEvent {
     SessionEnded {
         reason: String,
     },
-    /// Issue #538 (chunk B): the native context compiler's own stable-prefix
-    /// version and instruction-layer provenance as of one compile or
-    /// recompile. `context_version` is `CompiledNativeContext::stable_
-    /// prefix_sha256`; `sources` is a JSON array of `{path, scope, trust,
-    /// decision, sha256}` (`runtime::context::ResolvedInstructionSource`,
-    /// serialized directly). Recorded once at session start and once per
-    /// recompile (`NativeLoop::recompile_instructions_if_changed`), always
-    /// scoped to the turn in progress via `EventScope::turn` -- "which
-    /// compiled version shaped each turn" is then `the latest ContextCompiled
-    /// event at or before that turn's own sequence`.
+    /// Context compile event records stable-prefix version and source provenance for the current turn. (#538)
     ContextCompiled {
         context_version: String,
         sources: serde_json::Value,
@@ -631,9 +616,7 @@ impl ConversationState {
                 JournalEvent::SessionEnded { reason } => {
                     state.ended_reason = Some(reason.clone());
                 }
-                // Issue #538 (chunk B): informational provenance only -- read
-                // back via `latest_event_of_type`/`events`, not folded into
-                // this reduced conversation state.
+                // Context provenance remains informational, outside reduced conversation state. (#538)
                 JournalEvent::ContextCompiled { .. } => {}
             }
         }
@@ -1168,11 +1151,7 @@ impl Journal {
         )
     }
 
-    /// Issue #538 (chunk B): records which compiled context version shaped
-    /// this turn (or the session, before its first turn). `scope.turn`
-    /// should name the turn in progress when one exists, so a later reader
-    /// can find "the latest `ContextCompiled` at or before this turn's own
-    /// sequence" via [`Self::latest_event_of_type`].
+    /// Scope this context version to the active turn so later readers can identify the instructions it saw. (#538)
     pub fn record_context_compiled(
         &mut self,
         session: &JournalSessionId,
@@ -2399,10 +2378,7 @@ fn read_events_after(
     Ok(events)
 }
 
-/// Issue #614: counts every `payload_json` decode, so a test can prove
-/// reporting surfaces such as `ctx status` read a bounded projection instead
-/// of decoding a whole session's history. Test-only; production pays no
-/// cost for it.
+/// Test-only decode counter checks that reporting reads a bounded projection. (#614)
 #[cfg(test)]
 pub(crate) static DECODED_PAYLOAD_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);

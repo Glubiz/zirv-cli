@@ -1,38 +1,9 @@
 //! Redacted live-contract evidence manifest for the native provider routes
 //! (issue #592).
 //!
-//! Every production route's transport is proven against replayed fixtures,
-//! never against a real vendor endpoint -- see `docs/design/2026-09-14-
-//! native-release-evidence.md` §3.1. Closing that gap needs an operator's
-//! own API key and spends that operator's money, so nothing in this
-//! repository can collect the evidence itself. What this module gives an
-//! operator instead is the tooling that records it correctly once they can:
-//! the ignored `live_*` contract tests in `anthropic.rs`, `openai.rs`,
-//! `google.rs` and `openai_chat.rs` are the ONLY callers of
-//! [`record_stream_result`]; they require real credentials to run at all,
-//! and they do nothing in ordinary CI (`#[ignore]`, never selected by a
-//! bare `cargo test`/`cargo nextest`).
-//!
-//! `record_stream_result` never receives a credential directly -- callers
-//! have none to pass, by construction -- but a failure body can still echo
-//! one back verbatim (a self-hosted OpenAI-compatible proxy putting the raw
-//! bearer token in its JSON `error.message`, say), so every free-text field
-//! goes through two redaction passes before it is written: first the
-//! calling adapter's own [`super::adapter::ProviderAdapter::redact_failure`],
-//! which knows the exact credential it authenticated with and blanks any
-//! literal occurrence of it, then the generic
-//! [`crate::commands::ctx::pace::redact_for_log`] heuristic, which catches
-//! common secret *shapes* the exact pass cannot know about. `record_stream_
-//! result` takes the adapter as a required argument specifically so this
-//! ordering cannot be skipped by a future caller -- there is no lower-level
-//! entry point that writes to the manifest without it.
-//!
-//! The manifest states its own collection status on every row precisely so
-//! it can never be mistaken for evidence it does not contain: a fresh
-//! checkout's [`template`] has every row `NotCollected` with no model, no
-//! outcome and no detail, and only a real live run -- which only an
-//! operator with real credentials can trigger -- flips a row to
-//! `Collected`.
+//! Live route tests are ignored in ordinary CI and start as `NotCollected`.
+//! Free-text results are redacted by the adapter and then the generic scrub
+//! before writing; a required adapter argument preserves that order. (#592)
 
 use std::path::{Path, PathBuf};
 
@@ -87,12 +58,7 @@ pub struct Manifest {
     pub routes: Vec<EvidenceRow>,
 }
 
-/// Every production route issue #592 names (N07, N08, N12, and the N13
-/// OpenAI-compatible family's representative generic route), in fixed row
-/// order, each carrying the exact command that collects it.
-/// [`record_stream_result`] refuses a route name absent from this list
-/// rather than silently appending one, so the manifest can never grow a row
-/// nothing in this codebase actually produces.
+/// Fixed route rows ensure live evidence cannot silently append an unrecognized route. (#592)
 fn template_rows() -> Vec<EvidenceRow> {
     let row = |route: &str, protocol: &str, operator_command: &str| EvidenceRow {
         route: route.to_string(),

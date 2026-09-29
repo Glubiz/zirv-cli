@@ -20,25 +20,7 @@ use super::types::{
     CompactionSettings, NativeFinalStatus, NativeLimits, NativeSessionConfig, RecompileContext,
 };
 
-/// Issue #537 (T2b): applies the harness proxy's decision to a native
-/// session's first submitted turn -- starts the decided workflow (if any;
-/// a skip is logged through `progress_tx`'s own notice channel, the pane's
-/// existing "tell the operator, don't fail the turn" mechanism) and, when
-/// the decision names a route on this harness's configured route table,
-/// records that [`super::super::super::provider::RouteId`] onto `route` -- the
-/// journal/accounting identity only. The transport this session already
-/// opened (`provider`/`tools`, built once in `build_transport` before the
-/// worker thread starts) is NOT rebuilt: doing so would mean re-deriving a
-/// writer lease already consumed into `retained_writer`, re-running the
-/// brokered-tools wrap and the native-account placement check, all from
-/// inside the first-turn hot path. Both branches say so explicitly through
-/// a notice, so the pane never claims a provider switch that did not
-/// happen. `route` is left exactly as the caller's role configured it when
-/// no native route matches or none is configured.
-///
-/// A no-op in every other respect: `proxy::activation` gates the whole
-/// thing, so a disabled proxy, or one enabled with the deterministic
-/// decider (which never takes over a launch), touches nothing here.
+/// Apply the proxy decision on the first turn; an existing transport is never rebuilt, and any route mismatch or workflow skip is announced rather than silently claimed. (#537)
 pub(super) fn apply_proxy_first_turn(
     cfg: &super::super::super::config::CtxConfig,
     state: &super::super::super::state::StateDir,
@@ -248,10 +230,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         state: Some(state.clone()),
     };
 
-    // Issue #484 (N15): the SAME standing context a headless run compiles --
-    // the engineering standard, the role methodology, the model profile and
-    // the operator's and repository's own instruction files. A hosted turn
-    // that skipped it would be a session told less than every other one.
+    // Compile the same standing context as a headless native run. (#484)
     let (system, preamble) = compile_standing_context(
         &state,
         &home,
@@ -275,8 +254,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
             task,
             workflow_gate: None,
             compaction,
-            // Issue #484: gated by the repository this session actually works
-            // whenever it performs real effects, exactly as a headless run is.
+            // Gate real effects against this session's repository workflow. (#484)
             workflow_repo: brokered.then(|| turn.repo.to_path_buf()),
             system,
             preamble,
@@ -288,8 +266,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         &now_ms,
         env,
     );
-    // Issue #538 (chunk C), decision 1: opts this loop into automatic
-    // per-turn recompile checking -- see `set_recompile_context`'s own doc.
+    // Recheck standing instructions at each turn boundary. (#538)
     driver.set_recompile_context(RecompileContext {
         state: state.clone(),
         home: home.clone(),

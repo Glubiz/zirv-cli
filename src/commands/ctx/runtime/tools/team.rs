@@ -1,21 +1,9 @@
 //! Typed arguments for the native coordinator's team tools (issue #485,
 //! roadmap N16).
 //!
-//! A native coordinator runs the SAME task, group and objective services a
-//! `zirv ctx task|group|objective` command runs, over the same durable state.
-//! These are thin argument shapes in front of those services -- exactly the
-//! shape N10's delegation tools and N15's workflow tools already have. None
-//! of them contains a state machine of its own: a second definition of "this
-//! card is claimed" would be a second answer to the question the claim exists
-//! to settle.
-//!
-//! Everything that MUTATES shared state (`task_create`, `task_claim`,
-//! `group_create`) crosses the broker as a shared-scope knowledge WRITE, so a
-//! session with no writer permit for its own worktree -- a read-only helper,
-//! a reviewer seat -- is refused at effect time rather than by a prompt it
-//! could be talked out of. The three reads (`task_list`, `group_status`,
-//! `objective_status`) and the coordinator's own view (`team_status`) are
-//! inert.
+//! The CLI and native tools share one durable task/group/objective service.
+//! Mutations require a worktree writer permit at the broker effect boundary;
+//! a request is data, never authority.
 
 use std::path::PathBuf;
 
@@ -32,8 +20,7 @@ pub const GROUP_CREATE: &str = "group_create";
 pub const GROUP_STATUS: &str = "group_status";
 pub const OBJECTIVE_STATUS: &str = "objective_status";
 pub const TEAM_STATUS: &str = "team_status";
-/// Issue #541 chunk C, decision 1: compile the proportional team for an
-/// objective and persist it (coordinator/sub-orchestrator seats only).
+/// Compile and persist a proportional team only for coordinator or sub-orchestrator seats. (#541)
 pub const TEAM_PLAN: &str = "team_plan";
 
 /// Every team tool name, in registry order. One list, so the registry, the
@@ -233,11 +220,8 @@ impl super::NativeToolClient {
             .clone()
             .unwrap_or_else(|| crate::commands::ctx::team::DEFAULT_ROLE.to_string());
         let now = state::now_secs();
-        // Review finding on issue #485: the task card minted above is the
-        // authoritative record, so a coordinator-graph store failure must
-        // never block it -- but it must not vanish silently either, so it
-        // gets the same decision-log line `delegation::delegate` and
-        // `objective::run_set` write for their own best-effort graph writes.
+        // A graph-write failure must not block the durable task card, but must
+        // appear in the decision log. (#485)
         if let Err(error) = coordinator::update(&self.state, &self.repo, |graph| {
             graph.plan(&id, &role, &args.parents, now);
             graph.decide(
@@ -496,17 +480,10 @@ impl super::NativeToolClient {
     pub(super) fn team_plan(&mut self, args: &TeamPlanArgs) -> Result<Value, ToolError> {
         use crate::commands::workflow::team;
 
-        // Issue #541 chunk C review finding: `team_plan` writes the SAME
-        // plan `coordinator::check` later enforces every delegation
-        // against, so any writable seat that could call it could silently
-        // replace a coordinator's compiled plan -- dropping independent
-        // review/test seats and hollowing out that whole enforcement.
-        // Restricted to the two roles `team::Authority::may_delegate` is
-        // true for (`Coordinator`/`SubOrchestrator`) -- the SAME authority
-        // table `coordinator::check` itself reads, so this gate cannot
-        // silently drift from the delegation bounds it protects. Gates the
-        // WHOLE call, `--seat` explicit compiles included: they reach the
-        // identical `store_plan`.
+        // Only delegation-authorized roles may replace the plan enforced by
+        // coordinator checks; evaluate this at the tool boundary. Reads the same
+        // authority table `coordinator::check` enforces against, so this gate
+        // cannot silently drift from the bounds it protects. (#541)
         let role = self.broker.identity().role.clone();
         if !crate::commands::ctx::team::authority(&role).may_delegate {
             return Err(ToolError::new(

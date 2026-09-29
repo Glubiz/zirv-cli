@@ -52,33 +52,14 @@ pub struct InteractiveRequest {
     /// mirrors a read-only session: every write this session's tools
     /// attempt is refused by the execution broker, on purpose.
     pub writing: bool,
-    /// `HeadlessRequest::provider`'s own escape hatch, threaded through for
-    /// PR #531 review finding 1's own test: a `Some("fixture:<path>")`
-    /// opens the session against `fixture::FixtureProvider` instead of the
-    /// operator's real native provider configuration, the same way a
-    /// headless run's `--provider` flag does. `None` (every production
-    /// caller today) resolves the real configuration exactly as before this
-    /// field existed.
+    /// Optional provider override lets a fixture-backed session bypass the
+    /// operator route; production callers use the configured provider. (#531)
     pub provider: Option<String>,
-    /// Issue #552: the SEAT this session is taking over, as
-    /// `(short, generation)`.
-    ///
-    /// `None` -- every ordinary pane -- mints a fresh short id and starts at
-    /// generation 1. `Some` is a rollover successor: it keeps the seat's
-    /// stable short id (the address mail, nudge and status resolve, which by
-    /// design does not move across a rollover) and runs under the generation
-    /// `seat::commit` promoted, so every fence on its writes compares against
-    /// the right one. The conversation itself is still brand new.
+    /// Optional seat takeover retains the stable short ID and advances generation; ordinary panes mint a new seat. (#552)
     pub seat: Option<(String, u64)>,
 }
 
-/// One update from the worker thread, coarse on purpose: `dash::
-/// native_pane` never learns anything about a turn's CONTENT from this
-/// channel -- it re-reads the journal (`Journal::replay`, already proven
-/// deterministic by `native_pane::build_transcript`'s own tests) for that.
-/// This channel exists only to know when a re-read is worth doing and to
-/// carry the one thing the journal alone cannot: a turn that failed before
-/// committing anything durable.
+/// Signals when to reread the journal and carries failures that occurred before any durable event was committed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InteractiveProgress {
     /// A submitted turn started running.
@@ -90,12 +71,8 @@ pub enum InteractiveProgress {
     /// provider failure -- a provider failure is a normal journaled
     /// `Failed` turn and reaches `Idle` instead).
     Failed(String),
-    /// PR #531 review finding 5: a non-fatal condition worth telling the
-    /// operator about even though the session keeps running -- today, only
-    /// a standing-context compile failure at [`spawn_interactive`] time
-    /// (previously swallowed by `.unwrap_or_default()`). `dash::native_pane`
-    /// renders it on the status line rather than the journal, since it
-    /// describes the SESSION, not any one turn.
+    /// Reports a session-level context failure on the status line while the
+    /// session continues. (#531)
     Notice(String),
     /// The worker thread's loop has exited; no more progress will ever
     /// follow. Sent once, always last.
@@ -116,9 +93,7 @@ pub struct InteractiveSession {
     /// the same direct route `NativeBackend::interrupt` already documents
     /// for "a caller that drives a `NativeLoop` itself".
     pub cancel: Arc<CancellationFlag>,
-    /// Issue #490 (N21 item B): the in-process approval gate this session's
-    /// execution broker asks. The pane answers through
-    /// [`Self::next_approval`]; `interrupt` cancels whatever is blocked on it.
+    /// Approval gate for this session's broker; pane responses complete it, and interrupt cancels it. (#490)
     approvals: Arc<super::super::enforcement::InteractiveApprovals>,
     approval_prompts: mpsc::Receiver<super::super::enforcement::ApprovalPrompt>,
     submit_tx: mpsc::Sender<String>,
@@ -194,10 +169,7 @@ impl InteractiveSession {
         Arc::clone(&self.cancel)
     }
 
-    /// Issue #490 (N21 item B): interrupting also cancels whatever tool call
-    /// is blocked on the operator's dialog. Without this, `Esc` would end the
-    /// turn's provider work and leave a worker thread parked forever on an
-    /// answer the dialog it belonged to no longer draws.
+    /// Interrupt cancels an approval dialog with the tool call, so the worker cannot remain parked after the turn ends. (#490)
     pub fn interrupt(&self) {
         self.approvals.cancel();
         self.cancel.cancel();
@@ -352,11 +324,7 @@ pub(super) fn record_seat_conversation(
     );
 }
 
-/// The writer-lease acquisition [`spawn_interactive`] performs once its own
-/// session's seat exists (issue #488 review finding 1 follow-up, PR #535).
-/// Split out so a test can drive it directly against a `handle`-shaped short
-/// and generation it controls, without needing to predict the random
-/// `logical_id`/`short` `NativeBackend::start` mints for a real session.
+/// Acquire the writer lease only after this session has a real seat to fence against. (#488)
 fn acquire_pane_writer_permit(
     state: &super::super::super::state::StateDir,
     max_writers: usize,
@@ -391,13 +359,7 @@ pub fn spawn_interactive(
 
     let tree = std::fs::canonicalize(&request.repo).unwrap_or_else(|_| request.repo.clone());
 
-    // Issue #488 (review finding 1 follow-up, PR #535): the writer lease is
-    // acquired AFTER this session's own seat is stored below, so it can
-    // fence on the STRICT `seat::guard` verdict (`Some(SeatFence)`) instead
-    // of the env-derived, supersession-only one -- `build_transport` reads
-    // nothing off `headless.writer`, so leaving it `None` here and filling
-    // it in once `handle`/the seat exist costs nothing. `writer` therefore
-    // starts unset and is populated in place further down.
+    // Store the seat before acquiring its writer lease, so the strict seat-generation fence applies. (#488)
     let mut headless = HeadlessRequest {
         repo: &request.repo,
         prompt: "",
@@ -480,17 +442,10 @@ pub fn spawn_interactive(
         },
     )?;
 
-    // Issue #488 (review finding 4): this seat's conversation reference,
-    // recorded under the runtime it belongs to.
+    // Record this seat's conversation under its owning runtime. (#488)
     record_seat_conversation(&state, &handle, &session);
 
-    // Issue #488 (review finding 1 follow-up): the seat this session was
-    // just stored under is real now, so the writer lease can be fenced on
-    // its actual generation (`Some(SeatFence)`, the STRICT `seat::guard`
-    // verdict) rather than only the env-derived supersession check every
-    // unseated caller gets -- see `acquire_pane_writer_permit`'s own doc
-    // comment for why this is the honest fence for a session whose identity
-    // did not exist a moment ago.
+    // Fence the writer lease against this stored seat's actual generation. (#488)
     let writer_permit_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if request.writing {
         match acquire_pane_writer_permit(&state, cfg.supervise.max_writers, &tree, &handle) {
@@ -542,12 +497,7 @@ pub fn spawn_interactive(
         .cancellation(&handle)
         .unwrap_or_else(|| Arc::new(CancellationFlag::default()));
 
-    // Issue #484: the same standing context a headless session compiles,
-    // degraded to none rather than refusing to open the pane. PR #531
-    // review finding 5: a compile failure used to be swallowed here by
-    // `.unwrap_or_default()` with no trace at all -- it is now carried
-    // forward as a `Notice` so the pane can tell the operator the session
-    // is running without it, rather than silently doing less.
+    // Compile standing context as headless does; failure keeps the pane open and surfaces a notice. (#484, #531)
     let (system, preamble, standing_context_notice) = match compile_standing_context(
         &state,
         &home,
@@ -569,10 +519,7 @@ pub fn spawn_interactive(
         ),
     };
 
-    // Issue #554 (review round 1): the operator's own pane is a request on a
-    // real account too, so it is admitted through the SHARED allocator and
-    // refused by the same persistent breaker a delegated worker is. Resolved
-    // off the route this session actually resolved, not re-derived.
+    // Admit the pane through the shared billing allocator and persistent breaker for its resolved route. (#554)
     if let Some(refusal) = super::super::super::native_account::native_placement(
         &state,
         &cfg,
@@ -634,9 +581,7 @@ pub fn spawn_interactive(
     let worker_cancel = Arc::clone(&cancel);
     let worker_handle = handle.clone();
     let worker_session = session.clone();
-    // Issue #554 (review round 1): what the worker thread needs to account
-    // each turn, cloned in rather than re-resolved -- a pane's turns must
-    // settle against the same pool its admission was granted on.
+    // Pass the admitted billing pool to the worker thread; turns must settle against the pool that admitted them. (#554)
     let worker_state = state.clone();
     let worker_cfg = cfg.clone();
     // Issue #538 (chunk C): captured here (owned) so the spawned thread below
@@ -711,13 +656,7 @@ pub fn spawn_interactive(
                 cfg: worker_cfg.clone(),
                 repo: worker_repo.clone(),
             });
-            // Issue #554 (review round 1): a pane's turn is accounted like
-            // any other native request -- an estimate held against the
-            // route's BILLING POOL while it runs, replaced by what the
-            // provider actually metered, plus the breaker and the spend row.
-            // Per TURN rather than per session: a pane is long-lived, and a
-            // seat whose spend only landed when the operator finally closed
-            // it would be invisible to `zirv ctx spend` for its whole life.
+            // Settle each pane turn separately against its billing pool, breaker, and spend ledger. (#554)
             let turn_reservation = super::super::super::native_account::reserve_seat_turn(
                 &worker_state,
                 &worker_pool,

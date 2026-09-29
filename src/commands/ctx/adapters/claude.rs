@@ -19,49 +19,13 @@ use super::super::event::{
 use super::super::window::parse_iso8601_utc_ms;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
-/// Claude Code's own base layer, injected on every claude session zirv starts
-/// (see `AgentAdapter::base_system_prompt`). Claude-specific by construction:
-/// it names the Agent tool, `.claude/agents` and the `/code-review` skill, so
-/// handing it to another agent would be handing it instructions about tools
-/// that agent does not have.
-///
-/// Names the Agent tool's own `model` parameter tiers (`haiku`/`sonnet`/
-/// `opus`) directly, unlike the rest of this file's model-agnostic framing:
-/// that parameter's enum is the harness's own fixed vocabulary, not a vendor
-/// lineup that renames out from under this text, so naming it here is the
-/// only way to make "set the model parameter explicitly" concrete enough to
-/// follow. It still never asks for `--model`: that flag picks *this seat's*
-/// model, which stays the operator's choice, untouched by this text.
-///
-/// Issue #175: carries an explicit delegation-sizing rule so a seat does not
-/// default to minting a sub-orchestrator for ordinary work -- native
-/// Agent-tool subagents stay the default for any bounded task, and `zirv ctx
-/// agent --role sub-orchestrator` is reserved for work that genuinely
-/// decomposes into multiple coherently-scoped areas or must run under zirv's
-/// own supervision independently of this seat.
-///
-/// Wrapper behaviour redesign (2026-09-01): rewritten so trivial and bounded
-/// changes stay on this seat instead of always delegating -- the prior text's
-/// "delegate every substantive piece of work" was absolute regardless of task
-/// size, one of the process rules the wrapper-behaviour audit found was
-/// turning small fixes into a full dispatch-and-review cycle. Model routing,
-/// the fork ban, self-contained briefs and the sub-orchestrator carve-out are
-/// unchanged. See
-/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
-///
-/// Issues #328/#334 (2026-09-04): the wrapper-behaviour redesign's own
-/// "trivial and bounded changes stay on this seat" carve-out turned out to be
-/// the wrong fix -- it let an orchestrator seat write tests and
-/// implementations itself, which is exactly what this role must never do.
-/// That size-based carve-out is gone: an orchestrator seat never implements,
-/// a PreToolUse hook enforces it (`hook::run_pretool`,
-/// `safety::run_check_hook_mode_with_env`) by denying this seat's own
-/// repository writes, so a denial is the cue to dispatch rather than retry
-/// another way. Same-harness delegation is the native Agent tool, not `zirv
-/// agent`: `zirv agent <name>` now reaches only a DIFFERENT harness
-/// (`agent::run_with` refuses a same-harness target from an orchestrator
-/// seat) or a work group / sub-orchestrator. Task size now only decides how
-/// many workers and how large a brief, never whether this seat implements.
+/// Claude-only orchestration rules; the PreToolUse hook denies this seat's
+/// repository writes, and same-harness work uses the native Agent tool.
+/// Task size determines the worker brief, never this seat's authority. (#175, #328, #334)
+/// Names the Agent tool's own model tiers directly, unlike this file's usual
+/// model-agnostic framing: that enum is the harness's own fixed vocabulary,
+/// not a vendor lineup that renames. Never asks for `--model`: that flag
+/// picks this seat's own model, which stays the operator's choice.
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
@@ -149,18 +113,8 @@ by ONE designated integrator worker; a writer touching one says so in its report
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
 seat.";
 
-/// The same layer as [`ORCHESTRATOR_PROMPT`], but with the write-guard
-/// bullet (its own first bullet, above) posture-dependent (issue #358 T8)
-/// instead of hardcoded to `deny`'s wording. `Deny` returns
-/// [`ORCHESTRATOR_PROMPT`] itself, unchanged -- the exact, already-shipped,
-/// already-tested text -- rather than a reconstruction that could drift
-/// from it; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
-/// shared, adapter-neutral text in front of
-/// [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`], the same tail
-/// [`ORCHESTRATOR_PROMPT`] carries either way. Claude's own PreToolUse hook
-/// (`hook::run_pretool`) is what makes `orchestrator_write_lines`'s
-/// `Advise` sentence about writes being "recorded" true here (issue #358
-/// review, finding #6) -- passed `true`, unlike codex's own splice.
+/// `Deny` preserves the canonical prompt; other postures splice the shared
+/// write rule, with Claude's PreToolUse hook recording advised writes. (#358)
 fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
     use super::super::config::OrchestratorWrites;
     if posture == OrchestratorWrites::Deny {
@@ -200,24 +154,8 @@ raw file contents into it.
 - For test, build and log commands, run `zirv ctx run --compact -- <cmd>`: it keeps the full output \
 on disk and gives you a summary plus the id to retrieve it.";
 
-/// Claude's own layer for a `PromptRole::SubOrchestrator` session (see
-/// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
-/// [`ORCHESTRATOR_PROMPT`] and [`WORKER_PROMPT`] for that role. Unlike a
-/// Worker, a sub-orchestrator may split its own scope and dispatch Workers
-/// via `zirv agent` -- so it gets that delegation vocabulary -- but unlike
-/// the Orchestrator it must never learn to spawn another coordinator: an
-/// unbounded delegation tree is exactly the cost failure this role exists to
-/// bound. It also does not carry the Orchestrator layer's own review-round
-/// rules -- the Orchestrator owns review gates.
-///
-/// Issue #170: extended with the scope contract a work group actually
-/// enforces (`group::WorkGroup`) -- own one area end to end, dispatch at the
-/// cheapest fitting tier per child, only ever Workers, and report ONE
-/// integrated result against the group's completion contract rather than
-/// each child's own outcome individually. `--group` itself is never named
-/// here as something to type: `agent::resolve_group_binding`'s env fallback
-/// (`WORK_GROUP_ENV`) already binds every child this session spawns to the
-/// same group without it needing to remember to pass one.
+/// Sub-orchestrators dispatch only Workers and report one result against their
+/// work group's contract; inherited group binding keeps every child scoped. (#170)
 pub const SUB_ORCHESTRATOR_PROMPT: &str = "\
 zirv sub-orchestrator conventions (claude)
 
@@ -306,12 +244,7 @@ pub fn usage_categories(usage: &Value) -> TranscriptUsage {
     }
 }
 
-/// Real context size is `input_tokens` plus both cache fields; the bare
-/// `input_tokens` field is near zero once prompt caching kicks in. Now a
-/// DERIVED helper over [`usage_categories`] rather than the only thing that
-/// survives the adapter boundary -- same signature, same value, so
-/// `parse_events`' `AssistantFinal { input_tokens }` (which feeds rot's
-/// context gate) is byte-for-byte unchanged.
+/// Context size includes cache fields; bare `input_tokens` can be near zero with caching.
 pub fn context_tokens_of(usage: &Value) -> u64 {
     usage_categories(usage).context_total()
 }
@@ -320,10 +253,7 @@ pub fn context_tokens_of(usage: &Value) -> u64 {
 /// `context_status.rs`: four bytes to a token.
 const THINKING_BYTES_PER_TOKEN: u64 = 4;
 
-/// The literal size of an assistant message's own thinking text, or `None`
-/// when the row carries no thinking block with any text left in it -- the
-/// shape every live transcript now has, which [`reported_thinking_bytes`]
-/// answers instead.
+/// Returns thinking text size only when a row retains nonempty thinking text.
 fn thinking_text_bytes(message: &Value) -> Option<u64> {
     let total: u64 = message
         .get("content")
@@ -376,23 +306,13 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
             continue;
         }
 
-        // Issue #293: every row carries its own top-level `timestamp`
-        // (verified in `tests/fixtures/claude-real-session.jsonl`), read
-        // once per line and reused for whichever event(s) that line
-        // produces below. `None` -- never a guess -- for a line with no
-        // parseable timestamp.
+        // Parse each row's timestamp once for its events; leave it unknown if invalid. (#293)
         let at_ms = row
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(parse_iso8601_utc_ms);
 
-        // Issue #455: the two structured fields these rows carry alongside
-        // the text (`error: "server_error"`, `apiErrorStatus: 429`) are read
-        // here and handed to the classifier as hints. The gate stays
-        // `isApiErrorMessage` alone: an ordinary assistant row whose prose
-        // happens to mention "API Error: 503" must never produce a
-        // `ProviderError`, or route health would be poisoned by a session
-        // merely talking about an outage.
+        // Classify only flagged API-error rows, using structured fields as hints; quoted errors in ordinary prose must not count. (#455)
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             let message = row.get("message").cloned().unwrap_or(Value::Null);
             let hints = super::ProviderErrorHints {
@@ -400,13 +320,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                 status: row.get("apiErrorStatus").and_then(Value::as_u64),
             };
             let text = text_of(&message);
-            // Issue #455 (review round 1, finding 2): the row's OWN time,
-            // not the clock -- `at_ms` above is already parsed from this
-            // row's `timestamp`. `uuid` is claude's own row identity
-            // (verified on every row of `claude-real-session.jsonl`);
-            // `provider_error_id` falls back to a time-plus-content
-            // fingerprint so consecutive retries of one failing turn stay
-            // DISTINCT observations while the same row seen twice does not.
+            // Use the row timestamp and UUID; a time-plus-content fallback keeps retries distinct without reread duplicates. (#455)
             let at = at_ms.map(|ms| ms / 1000);
             let id = row
                 .get("uuid")
@@ -442,11 +356,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
 
                 if results.is_empty() {
                     events.push(NormalizedEvent::TurnStart { at_ms });
-                    // Issue #312: the literal human-typed text of this turn,
-                    // for `breakdown::attribute_window`'s `user_text` bucket
-                    // -- a sibling of `TurnStart`, never a field on it, for
-                    // the same reason `ToolErrorText` is one (see that
-                    // variant's own doc comment).
+                    // Emit user text separately for attribution without changing the turn event shape. (#312)
                     let byte_len = user_message_text(message.get("content")).len() as u64;
                     if byte_len > 0 {
                         events.push(NormalizedEvent::UserText { byte_len });
@@ -459,21 +369,13 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     events.push(NormalizedEvent::ToolResult { is_error });
-                    // Issue #312: the result's own raw content, sized and
-                    // hashed for `breakdown::attribute_window`'s dedup and
-                    // live/stale accounting -- computed unconditionally
-                    // (unlike the error-only `detail` read this replaces)
-                    // since every result needs a byte length regardless of
-                    // whether it errored.
+                    // Size and hash every tool result for deduplication and live/stale attribution, including successes. (#312)
                     let detail = tool_result_text(block);
                     events.push(NormalizedEvent::ToolResultSize {
                         byte_len: detail.len() as u64,
                         content_hash: input_hash(&detail),
                     });
-                    // Issue #293: a sibling event, never a new field on
-                    // `ToolResult` -- see `ToolResultTimestamp`'s own doc
-                    // comment for why, the same reasoning
-                    // `ToolErrorText` (right below) already applies.
+                    // Emit result time as a sibling event to preserve the `ToolResult` shape. (#293)
                     if at_ms.is_some() {
                         events.push(NormalizedEvent::ToolResultTimestamp { at_ms });
                     }
@@ -495,10 +397,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                 }
                 let input_tokens = message.get("usage").map(context_tokens_of).unwrap_or(0);
                 let text = text_of(&message);
-                // Issue #293: a CANDIDATE first-text point, per row rather
-                // than tracked across the whole parse -- see
-                // `NormalizedEvent::AssistantFirstText`'s own doc comment
-                // for why this must stay line-local.
+                // First-text candidates remain row-local; the scorer resolves the turn-wide first event. (#293)
                 if !text.trim().is_empty() {
                     events.push(NormalizedEvent::AssistantFirstText { at_ms });
                 }
@@ -507,20 +406,10 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                     input_tokens,
                     at_ms,
                 });
-                // Issue #312: `text_of` above already drops `thinking`
-                // blocks entirely when building `AssistantFinal::text`, so
-                // without this sibling event that content is invisible to
-                // `breakdown::attribute_window`'s `thinking` bucket.
-                //
-                // Current Claude Code writes every thinking block with its
-                // text stripped to `""` and only a `signature` (or as a
-                // `redacted_thinking` block), so that sum is now zero for a
-                // live session no matter how much the model thought. The
-                // response's own `usage.output_tokens_details.thinking_tokens`
-                // still reports the real count; scaled here to the BYTE unit
-                // every other `breakdown::attribute_window` weight is in, at
-                // this codebase's own 4-bytes-per-token estimate (see
-                // `context_status::BYTES_PER_TOKEN`).
+                // Emit thinking separately from final text; empty or redacted thinking has no measurable bytes. (#312)
+                // Claude Code strips thinking blocks' text to "" (or emits redacted_thinking),
+                // so `thinking_text_bytes` is usually zero; the fallback below reads the real
+                // count from `usage.output_tokens_details.thinking_tokens` instead.
                 let thinking_bytes = thinking_text_bytes(&message)
                     .or_else(|| reported_thinking_bytes(&message))
                     .unwrap_or(0);
@@ -549,12 +438,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                             input_hash: input_hash(&raw),
                             at_ms,
                         });
-                        // Issue #312: the call's file-shaped argument, when
-                        // its transcript shape exposes one, so
-                        // `breakdown::attribute_window` can mark an earlier
-                        // live result STALE once a modifying call names the
-                        // same path. A sibling of `ToolCall`, never a field
-                        // on it, for the same reason `ToolErrorText` is one.
+                        // Emit call paths separately so modifying calls can stale earlier results. (#312)
                         if let Some(path) = block.get("input").and_then(|input| {
                             FILE_KEYS
                                 .iter()
@@ -565,11 +449,7 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
                                 is_modification,
                             });
                         }
-                        // Issue #294 (`zirv ctx measure`): a sibling of
-                        // `ToolCall`, never a field on it, for the same
-                        // reason `ToolCallPath` is one -- see
-                        // `NormalizedEvent::ToolCallRead`/`ToolCallEdit`'s
-                        // own doc comments.
+                        // Emit read/edit classification as sibling events without changing `ToolCall`. (#294)
                         if name.eq_ignore_ascii_case("Read") {
                             let ranged = block.get("input").is_some_and(|input| {
                                 input.get("offset").is_some() || input.get("limit").is_some()
@@ -748,22 +628,9 @@ pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 pub(crate) const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
 pub(crate) const MAX_SUBAGENT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The modern home of subagent spend (2026-09-06). Current Claude Code writes
-/// NO `isSidechain` rows into the main transcript at all -- 0 of 15,510 rows
-/// across twelve recorded real sessions -- so [`sidechain_transcript_usage`]'s
-/// in-file fold is now a legacy branch that answers `None` for every live
-/// session. Subagent turns live in sibling files instead:
-/// `<transcript-dir>/<session-id>/subagents/agent-<id>.jsonl`, whose rows do
-/// carry `isSidechain: true`.
-///
-/// `main_range` is the caller's own phase slice of the MAIN transcript; its
-/// first parseable `timestamp` is the phase boundary this fold floors at, so
-/// the answer keeps the "since the checkpoint" meaning the byte-range read
-/// gave the legacy branch. A range with no parseable timestamp yields `None`
-/// -- an honest "cannot place this window", never the whole session's subagent
-/// spend attributed to one phase. A subagent row with no timestamp of its own
-/// cannot be placed either and is skipped, the same convention
-/// `window::sum_file` already applies.
+/// Subagent usage lives in sibling transcript files; the main transcript has no sidechain rows.
+/// Returns `None` -- an honest "cannot place this window", never a guess -- when `main_range`
+/// has no parseable timestamp; a subagent row with no timestamp of its own is skipped the same way.
 pub fn subagent_transcript_usage(transcript: &Path, main_range: &str) -> Option<TranscriptUsage> {
     let since_ms = first_timestamp_ms(main_range)?;
     let dir = subagents_dir(transcript)?;
@@ -894,9 +761,7 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 /// marker in the model id in this environment.
 const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
 
-/// This adapter's own vendor slug in `catalogue`'s registry (issue #381):
-/// claude's ladder, strengths, windows and prices all now live there rather
-/// than as literals in this file.
+/// Claude model metadata resolves through the shared catalogue. (#381)
 const CATALOGUE_VENDOR: &str = "anthropic";
 
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
@@ -910,35 +775,19 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     // `event::last_verification_run` over it is.
     let mut pending_bash: HashMap<String, String> = HashMap::new();
     let mut invocations: Vec<ToolInvocation> = Vec::new();
-    // Issue #455: every `tool_use` id seen, keyed by its own id, removed the
-    // moment a `tool_result` for it arrives -- whatever is left at the end
-    // never resolved within the scanned range. `seq` records encounter
-    // order (a `HashMap` does not) so the final list can still be rendered
-    // oldest-first, newest-last, like every other capped field.
+    // Track pending tool calls by ID and encounter sequence so unresolved calls render in order. (#455)
     let mut pending_calls: HashMap<String, (usize, String, String)> = HashMap::new();
     let mut call_seq: usize = 0;
-    // Every modification-shaped tool_use call's id that ever named a given
-    // path, by that path -- ALL of them, not just the first: a path is
-    // unconfirmed if ANY call that touched it is still unresolved at the
-    // end of the scan, regardless of order (review finding: a path first
-    // touched by a call that later resolved, then touched again by one that
-    // never did, must still end up unconfirmed -- the unsafe direction is
-    // claiming a write landed when the LAST attempt on it never reported
-    // back).
+    // Track every modifying call per path: any unresolved call leaves the path unconfirmed,
+    // regardless of order -- the unsafe direction is claiming a write landed when the last
+    // attempt on it never reported back. (#455)
     let mut path_source_calls: HashMap<String, Vec<String>> = HashMap::new();
     // The most recent tool_use's own name, for the "after tool call X"
     // clause in a `tail_cut` reason -- rolling state because the row that
     // reveals the cut (a provider-error row) carries no tool reference of
     // its own.
     let mut last_tool_name: Option<String> = None;
-    // Issue #455 review round 2: text pushed by an assistant row whose own
-    // turn has not yet reached a boundary (a `tool_result`/user row, or a
-    // successful `end_turn`) -- the ONLY text a cut can legitimately mark
-    // partial. Flushed into `assistant_texts` the moment a boundary is
-    // reached (a prior reply demonstrably was not the one cut), and moved
-    // into `out.partial_text` instead when the cut itself arrives, so an
-    // unrelated, already-closed reply from earlier in the transcript is
-    // never the one withheld.
+    // Only text still open at the cut can be partial; settle it at the next turn boundary. (#455)
     let mut pending_open_text: Option<String> = None;
 
     for line in jsonl.lines() {
@@ -953,14 +802,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
             continue;
         }
 
-        // Issue #455: gated on `isApiErrorMessage` alone, exactly like
-        // `parse_events` above -- never on the row's own text, so an
-        // ordinary assistant reply that merely QUOTES "API Error: 503"
-        // can never be mistaken for one. Handled before the `type` match
-        // below (an API-error row's own `type` is `"assistant"`) so its
-        // placeholder text ("API Error: ...") never reaches
-        // `assistant_texts` and gets shown as though it were a finished
-        // reply -- exactly the bug this issue reports.
+        // Handle only flagged API errors before assistant text, so a quoted error cannot become provider failure or final prose. (#455)
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             let kind = row
                 .get("error")
@@ -970,10 +812,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                 Some(name) => format!("API error ({kind}) after tool call {name}"),
                 None => format!("API error ({kind})"),
             });
-            // Issue #455 review round 2: only text still OPEN at this exact
-            // moment is the cut turn's own -- `None` when the cut turn
-            // carried no text of its own (e.g. a bare tool_use), which must
-            // never be confused with "nothing was cut".
+            // Only the open cut turn can supply partial text; an empty cut is still a cut. (#455)
             out.partial_text = pending_open_text
                 .take()
                 .map(|raw| super::redacted_tool_summary(&raw));
@@ -984,11 +823,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
 
         match row.get("type").and_then(Value::as_str) {
             Some("user") => {
-                // Issue #455 review round 2: a user-type row (a fresh
-                // prompt, or a tool_result) is a turn boundary -- its mere
-                // presence proves the assistant text still open before it
-                // was not cut, so it settles into `assistant_texts` rather
-                // than staying eligible to be marked partial later.
+                // A user or tool-result row closes earlier assistant text before a later cut. (#455)
                 if let Some(prev) = pending_open_text.take() {
                     out.assistant_texts.push(prev);
                 }
@@ -1037,10 +872,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                 }
             }
             Some("assistant") => {
-                // Issue #455 review round 2: this row is itself further
-                // activity, so whatever was still open from an EARLIER row
-                // demonstrably was not the one cut -- settle it before
-                // deciding what this row's own text does.
+                // Settle earlier open text before processing this row's activity. (#455)
                 if let Some(prev) = pending_open_text.take() {
                     out.assistant_texts.push(prev);
                 }
@@ -1123,10 +955,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
         }
     }
 
-    // Issue #455 review round 2: whatever is still open at the end of the
-    // scanned range was never claimed by a cut (that path already moved it
-    // into `partial_text` and cleared this), so it is a normal, uncut reply
-    // -- the pre-#455 behaviour for a session that simply ends there.
+    // Open text left at scan end without a cut is an ordinary reply. (#455)
     if let Some(text) = pending_open_text.take() {
         out.assistant_texts.push(text);
     }
@@ -1144,12 +973,7 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     keep_last(&mut out.files_read, last_n);
     keep_last(&mut out.files_modified, last_n);
 
-    // Issue #455: `pending_calls` left over is every call whose result never
-    // arrived in the scanned range. `unresolved_ids` (the FULL set, before
-    // the display cap below) drives the `files_modified` unconfirmed check,
-    // so a call old enough to be dropped from the rendered list still marks
-    // its file -- the file is no less unconfirmed for not being individually
-    // listed.
+    // Use the full unresolved set for file confirmation even when display caps omit older calls. (#455)
     let mut unresolved: Vec<(usize, String, String, String)> = pending_calls
         .into_iter()
         .map(|(id, (seq, name, summary))| (seq, id, name, summary))
@@ -1189,31 +1013,11 @@ pub struct ClaudeAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
-    /// Issue #395: an operator-only `[endpoint.claude]` override, attached
-    /// post-construction via `AgentAdapter::apply_endpoint` (production) or
-    /// `with_endpoint` (tests/direct construction) -- never set from a repo
-    /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
+    /// Operator-only endpoint override; repository configuration cannot set it. (#395)
     endpoint: Option<super::super::config::EndpointTarget>,
-    /// Issue #504 (revised 2026-09-20, permission-prompts.jsonl audit): an
-    /// operator-only `chat.claude_permission_mode` override for the
-    /// INTERACTIVE launch's `--permission-mode`, attached post-construction
-    /// via `AgentAdapter::apply_chat_config` (production) or
-    /// `with_claude_permission_mode` (tests/direct construction) -- mirrors
-    /// `endpoint`'s own pattern immediately above, and never set from a repo
-    /// layer (see `config.rs`'s `REPO_FORBIDDEN` entry for
-    /// `chat.claude_permission_mode`). `None` (the operator has not set this
-    /// key) now OMITS `--permission-mode` from the launch argv entirely --
-    /// see `default_sandbox_args`'s own doc comment for why forcing
-    /// `"default"` on every launch turned out to be zirv silently
-    /// overriding the operator's own `permissions.defaultMode`, which a CLI
-    /// flag outranks.
+    /// Operator-only interactive permission mode; an explicit operator choice wins over the shipped default. (#504)
     claude_permission_mode: Option<String>,
-    /// Issue #788: an operator-only `[headless]` cost-lever table, attached
-    /// post-construction via `AgentAdapter::apply_headless_config`
-    /// (production) or `with_headless_config` (tests/direct construction) --
-    /// mirrors `claude_permission_mode`'s own pattern immediately above.
-    /// Default (unset) is byte-identical to every launch before this table
-    /// existed.
+    /// Operator-only headless cost policy; absent configuration preserves the default launch. (#788)
     headless: super::super::config::HeadlessConfig,
     #[cfg(test)]
     forced_file_support: Option<bool>,
@@ -1382,16 +1186,7 @@ impl ClaudeAdapter {
         let fingerprint = super::super::safety::policy_fingerprint(safety).ok()?;
         let policy_dir = dir.join("policies");
         let policy_path = policy_dir.join(format!("{fingerprint}.json"));
-        // Issue #788 review finding L1: `fingerprint` is hashed from
-        // `SafetyPolicy` alone, so a `lean` and a non-`lean` launch under the
-        // identical safety policy used to collide on the SAME settings file
-        // (`claude-launch-settings-{fingerprint}.json`) while writing
-        // DIFFERENT content -- a concurrent headless-lean worker and an
-        // interactive dash pane under the same policy raced that one path,
-        // and the interactive session could start with the lean settings.
-        // The `-lean` suffix folds the lever into the file name itself, so
-        // the two contents never share a path; `lean == false` keeps the
-        // pre-#788 name byte-identical.
+        // Include lean mode in the settings-file identity; concurrent lean and interactive launches must not share different content at one path. (#788)
         let path = if lean {
             dir.join(format!("claude-launch-settings-{fingerprint}-lean.json"))
         } else {
@@ -1465,42 +1260,9 @@ impl ClaudeAdapter {
     }
 }
 
-/// A launch-local settings layer is stronger than relying on a one-time
-/// `zirv setup apply`: every process Zirv starts attests the classifier it is
-/// using, and a later reset or minimal Claude profile cannot silently remove
-/// it. The operator's ordinary settings remain in force for keys omitted
-/// here; Claude merges hook arrays across settings levels and applies the
-/// most restrictive PreToolUse verdict (`deny > ask > allow`) among hooks.
-///
-/// Issue #147: this layer deliberately carries NO native
-/// `permissions.ask`/`permissions.deny` rule naming
-/// `Bash(dangerouslyDisableSandbox:true)`. One used to sit here; it is
-/// documented behavior (code.claude.com/docs/en/permissions, "Extend
-/// permissions with hooks") that a native settings rule is evaluated
-/// independently of a PreToolUse hook's own decision -- a settings `ask`
-/// rule still prompts even when the hook returns `allow`. That made every
-/// hook-side `allow` for a sandbox-escape retry a no-op, including the
-/// existing read-only-`gh` carve-out and the new `[safety] escape_allow`
-/// gate (`safety::run_check_hook_mode_with_env`): an operator who pre-
-/// cleared a family kept getting re-prompted on every repeat regardless.
-/// The attested, fail-closed safety hook remains the final zirv-side decision
-/// point for an escape; the operator's own native rules, if any, still apply
-/// on top, per the same documented precedence.
-///
-/// Reserved Zirv built-ins and the explicit command-family table below form
-/// the native projection. PreToolUse still evaluates every invocation before
-/// execution, so dangerous `gh` and push forms and repo `deny`/`ask` rules
-/// continue to narrow the broad native families.
-///
-/// Issue #334: `launch_settings_value`'s own consolidated `PreToolUse` entry
-/// (issue #769 folded what used to be four separate matchers into this one --
-/// see that entry's own comment) covers `Edit|Write|MultiEdit|NotebookEdit`
-/// tool names too, running `zirv ctx hook pretool`'s orchestrator-write guard
-/// that makes an orchestrator seat technically unable to edit repository
-/// files itself, alongside (not instead of) `Agent|Task` coverage for the
-/// same command: that half attests the existing expensive-seat-inheritance
-/// guard on every launch, rather than depending on a one-time `zirv setup
-/// apply` having installed it into the operator's own global settings first.
+/// Attest the safety hook on every launch. Native permission rules and
+/// PreToolUse hooks are independent gates; omit an escape-specific native
+/// ask rule so hook-approved retries can proceed. (#147, #334, #769)
 struct CommandFamilyProjection {
     pattern: &'static str,
     sandbox_excluded: bool,
@@ -1631,48 +1393,11 @@ impl LaunchEnvironment {
 
 const MAX_SIBLING_REPOS: usize = 32;
 
-/// Issue #329 item 2 (the biggest single source of prompts in that report,
-/// 9 of 21): the launch repository's sibling checkouts -- every direct child
-/// of the repo's parent directory that is itself a git checkout (a `.git`
-/// directory, or the `.git` file of a linked worktree) -- followed by each
-/// sibling's own linked worktrees. A cross-repo change (`crm` plus the
-/// `marketing-automation-client` library it calls, plus a worktree of the
-/// service that serves it) is ordinary work in a services directory, and
-/// every gate in the other two checkouts failed `Operation not permitted`
-/// under the sandbox until the operator retried it unsandboxed.
-///
-/// Scope, deliberately narrow: only git checkouts, never the parent itself
-/// (a non-repo directory next to the launch repo stays untouched); nothing
-/// when the parent is a filesystem root (`/workspace/repo`, `C:\repo` -- the
-/// container/CI layout, where "siblings" would mean every path on the
-/// machine) or the home directory (`~/repo` -- "never the whole home", and
-/// its children are not a workspace). Capped at [`MAX_SIBLING_REPOS`] in
-/// sorted order, [`MAX_LINKED_WORKTREES`] per sibling.
-///
-/// A sibling's worktrees come from `<sibling>/.git/worktrees/*/gitdir` --
-/// the file git itself keeps, naming `<worktree>/.git` -- rather than one
-/// `git worktree list` per sibling: a services directory can hold dozens of
-/// checkouts, and this runs on every launch. A stale entry whose worktree
-/// is gone no longer canonicalises and is skipped, the same way `git
-/// worktree prune` would drop it.
-///
-/// Trust boundary (codex review on #329): a sibling checkout is repo-owned,
-/// so nothing it can write may widen the grant beyond itself. A `gitdir`
-/// file is only believed when the named worktree's own `.git` file points
-/// BACK at that exact `.git/worktrees/<name>` entry -- the mutual link git
-/// maintains -- so a sibling cannot nominate `~` or `/` as its "worktree".
-/// A sibling reached through a symlink is skipped (its canonical path must
-/// be a direct child of the parent), so a `link -> ~` entry with a `.git`
-/// inside cannot grant the whole home. Every root additionally passes
-/// [`is_grantable_root`]: never a filesystem root, never the home directory
-/// or an ancestor of it, never the launch repo or an ancestor of it. Without
-/// a resolvable home directory nothing is granted at all (fail closed).
-///
-/// Siblings are write grants and `additionalDirectories` only, never
-/// `--add-dir`: `--add-dir` also loads that directory's own `.claude/`
-/// hooks and skills, and another checkout's repo-owned hooks must not run
-/// in this session (the launch repo's own worktrees keep `--add-dir`, since
-/// they share its `.claude/`).
+/// Grant only bounded sibling checkouts and mutually linked worktrees.
+/// Reject symlinks, roots, home ancestors, and unresolved home; never use
+/// `--add-dir` for siblings because it loads repo-owned hooks. (#329)
+/// Trust boundary: a sibling checkout is repo-owned, so nothing it can write
+/// may widen the grant beyond itself.
 fn sibling_repo_roots(canonical_repo: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let Some(parent) = canonical_repo.parent() else {
         return Vec::new();
@@ -1818,19 +1543,7 @@ fn launch_settings_value(
             .filter(|family| family.sandbox_excluded)
             .map(|family| family.pattern.to_string()),
     );
-    // Issue #769: every `PreToolUse` matcher this launch used to register
-    // separately -- the standalone safety check (`Bash|PowerShell`), the
-    // rehydration/lookup-tool set, the file-modification-tool set (already a
-    // strict subset of the rehydration set, so already redundant with it
-    // before this change), and `Agent|Task` -- collapses into ONE slot here.
-    // `hook::run_pretool` dispatches by `tool_name` itself (safety for
-    // `Bash`/`PowerShell`, rehydration/orchestrator-write guards for the file
-    // tools, the expensive-seat/skill-pointer guards for `Agent`/`Task`), so
-    // one union matcher naming every tool name any of the four used to name,
-    // running the identical `zirv ctx hook pretool` command every non-safety
-    // entry already ran, is behaviourally the same coverage as before -- just
-    // one registered hook instead of four, and one spawned process per tool
-    // call instead of up to two.
+    // One PreToolUse hook dispatches by tool name, covering safety, rehydration, and orchestrator write/delegation guards. (#769)
     let pretool_matcher = {
         let mut tools: Vec<&str> = super::super::hook::REHYDRATION_TOOLS.to_vec();
         tools.push("Agent");
@@ -2346,18 +2059,7 @@ impl AgentAdapter for ClaudeAdapter {
     fn headless_cmd(&self, prompt: &str, session: &SessionId, extra: &[String]) -> Command {
         let mut cmd = self.base();
         cmd.arg("-p").arg(prompt);
-        // Issue #778: `extra` may already pin this launch to an existing
-        // conversation -- `exec::run_with_clock_inner`'s very first launch
-        // forwards an operator's own `-- --resume <id>`/`--continue` here
-        // verbatim (`exec::resume_pin`), and a dashboard restore pane can
-        // carry `session_pin_args`'s own `--session-id` the same way. Minting
-        // a fresh `--session-id` on top of one used to make claude silently
-        // start a brand-new, unrelated conversation (ignoring `--resume`
-        // entirely), or refuse outright with "Session ID ... is already in
-        // use" once a caller's own explicit `--session-id` rode alongside it.
-        // Skipped only when nothing in `extra` already claims this launch --
-        // `exec::pins_an_existing_conversation` is the same check `chat.rs`'s
-        // own dashboard-restore path already trusts for this exact question.
+        // Honor an existing resume or session pin in forwarded flags; adding a fresh ID would start an unrelated conversation. (#778)
         if !crate::commands::ctx::exec::pins_an_existing_conversation(extra, self.name()) {
             cmd.arg("--session-id").arg(session.as_str());
         }
@@ -2466,21 +2168,7 @@ impl AgentAdapter for ClaudeAdapter {
         Some(cmd)
     }
 
-    /// The distillation prompt is piped to stdin so a long transcript tail
-    /// never hits argv length limits. This child embeds untrusted repo
-    /// CLAUDE.md text in its prompt (the judgment call) and its only job is
-    /// to answer with text, so it never needs a tool. Verified against the
-    /// real CLI (docs/superpowers/notes/2026-08-01-system-prompt-injection-facts.md,
-    /// "I6 fix round"): `Bash` must be denied alongside `Write`/`Edit`, since
-    /// a shell redirect otherwise recreates a Write tool, and the value must
-    /// be one `=`-bound argv token, since the two-token form was verified to
-    /// swallow the next argv entry.
-    /// Review finding (#395 follow-up): the `--model` here now goes through
-    /// `model_args`, exactly like every other `--model` emission on this
-    /// adapter -- without that, an `[endpoint.claude]` override pinned the
-    /// interactive/headless launches to the endpoint vendor's own ladder but
-    /// left this one sending claude's native cheap alias (`"haiku"`)
-    /// straight to that endpoint, where it is not a valid model at all.
+    /// Pipe untrusted context through stdin and deny Write, Edit, Bash, and NotebookEdit so the judgment child cannot mutate the checkout. (#89)
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("-p")
@@ -2491,6 +2179,9 @@ impl AgentAdapter for ClaudeAdapter {
         cmd
     }
 
+    // Bash is denied alongside Write/Edit: a shell redirect otherwise recreates a Write
+    // tool. The value must stay one `=`-bound argv token -- the two-token form was
+    // verified to swallow the next argv entry.
     fn read_only_args(&self) -> Vec<String> {
         vec!["--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string()]
     }
@@ -2692,132 +2383,13 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
-    /// The claude side of the shipped-default "sandboxed, no prompts"
-    /// posture (2026-08-22) -- verified against the actually-installed
-    /// `claude 2.1.240` (`claude --help`, and confirmed at runtime against a
-    /// real authenticated `-p` launch; both quoted in full in the
-    /// 2026-08-22 addendum below and in [[Ctx Adapters]]). Claude has **no**
-    /// real sandbox mechanism analogous to codex's `--sandbox
-    /// workspace-write`: there is no flag that scopes writes/execution to
-    /// the workspace while still allowing them freely. The two candidates
-    /// that came closest were probed for real, not guessed:
-    ///
-    /// - `--dangerously-skip-permissions`/`bypassPermissions` removes the
-    ///   permission system entirely -- explicitly excluded, per this fix's
-    ///   own hard constraint: it satisfies "no prompts" only by also
-    ///   satisfying "dangerous commands run", which this posture must never
-    ///   do.
-    /// - `--permission-mode acceptEdits` was probed live in headless `-p`
-    ///   mode and, with no TTY to prompt through, silently **allowed**
-    ///   both a `Write` and a destructive `rm <file>` `Bash` call with no
-    ///   denial and no prompt -- effectively as permissive as the bypass
-    ///   flag above in this launch shape. Disqualified for the same
-    ///   reason.
-    ///
-    /// `--permission-mode dontAsk` is the one verified-safe match: probed
-    /// live, it silently **denies** `Write`/`Bash` calls that are not
-    /// pre-approved (`.claude/settings.json`'s own `permissions.allow`,
-    /// which zirv reads and never writes) rather than prompting *or*
-    /// running them, and its own embedded `--help` text (extracted from the
-    /// installed binary) confirms this by design: `"'dontAsk' - Don't
-    /// prompt for permissions, deny if not pre-approved."` This closes both
-    /// halves of the posture's hard requirement (no prompts, nothing
-    /// dangerous auto-runs), but `dontAsk` **alone**, with no pre-approved
-    /// rules, is not "runs freely inside the workspace" -- it is inert: a
-    /// legitimate in-repo `Write`/`Edit`/`Bash` action is denied outright.
-    ///
-    /// **Fix round 2 (2026-08-22): `SHIPPED_POSTURE_ALLOW`/`_DENY`**
-    /// (`adapters/mod.rs`) is what makes `dontAsk` usable rather than merely
-    /// safe -- generated `--allowedTools=...`/`--disallowedTools=...` argv,
-    /// derived from that one shared list so this and codex's own posture
-    /// cannot independently drift. Passed at launch, never written to
-    /// `.claude/settings.json`: the operator's own file is untouched, and
-    /// their own `permissions.allow`/`deny` there still governs anything
-    /// this list is silent on. Verified live against the installed `claude
-    /// 2.1.240` (see `SHIPPED_POSTURE_ALLOW`'s own doc comment for the
-    /// specific findings -- `Edit(./**)` vs. bare `Write`, deny-over-allow
-    /// precedence, prefix-wildcard semantics): an in-repo write succeeds
-    /// with no prompt, a `cargo test` runs with no prompt, a write outside
-    /// the workspace is refused, and `rm -rf` is refused even alongside a
-    /// broader unrelated allow rule.
-    ///
-    /// **Fix round 3 (2026-08-22): `sandbox.extra_allow`/`extra_deny`**
-    /// are appended after the shipped pair, not merged into it, so an
-    /// operator's own addition can never silently replace a shipped entry --
-    /// only add to either side. Deny still wins over allow regardless of
-    /// which list (shipped or operator) an entry came from: both end up in
-    /// the same `--allowedTools=`/`--disallowedTools=` argv, and the
-    /// underlying CLI mechanism does not distinguish their origin.
-    /// Projects `safety` (issue #83's harness-neutral command policy) onto
-    /// claude's own `--allowedTools=`/`--disallowedTools=` vocabulary: every
-    /// `SHIPPED_POSTURE_ALLOW` entry that is not a `Bash(...)` rule (file-
-    /// scope and bare-tool rules -- outside `[safety]`'s own domain, see
-    /// `safety::command_pattern_from_bash_rule`'s doc comment) is prepended
-    /// directly, in declared order, then every `safety` rule is re-wrapped
-    /// as `Bash(<pattern>)`, then `sandbox.extra_allow`/`extra_deny` are
-    /// appended last, unchanged from before this method took a
-    /// `SafetyPolicy` parameter.
-    ///
-    /// The static permission families still round-trip byte-identically:
-    /// `safety::builtin_deny`/`builtin_allow` strip
-    /// `SHIPPED_POSTURE_DENY`/`_ALLOW`'s own `Bash(...)` wrapper and this
-    /// method re-adds it in the original order. Issue #224 then appends the
-    /// reserved zirv patterns generated from `utils::RESERVED_COMMANDS`, and
-    /// the launch-computed scratchpad rules remain last. The full order is
-    /// pinned by `the_headless_projection_is_byte_exact_against_the_shipped_
-    /// constants` below.
-    ///
-    /// **Fix round 4 (2026-08-23, issue #104):** `SHIPPED_POSTURE_ALLOW`
-    /// gained more non-`Bash` entries (`Read(~/.claude/**)`, `Edit(~/.claude
-    /// /projects/**)`, `Read(~/.zirv/**)`, `WebFetch`, `WebSearch`), all
-    /// filtered out of `safety.allow` the same way `Read(./**)`/`Edit(./**)`
-    /// always were (outside `[safety]`'s own command-only domain -- see
-    /// `safety::command_pattern_from_bash_rule`). Rather than hand-list each
-    /// one here too, every non-`Bash(` entry in the constant is now
-    /// prepended in its original declared order, which also reproduces
-    /// `Read(./**)`/`Edit(./**)` first exactly as before. The two scratchpad
-    /// rules (`adapters::scratchpad_rules`) are computed here, from the real
-    /// `std::env::temp_dir()`, rather than baked into the constant -- the
-    /// path is per-machine, and the constant has to stay `&'static`.
-    /// Appended after the safety-derived allow entries, before the
-    /// operator's own `sandbox.extra_allow`.
-    ///
-    /// **Cross-harness permissions (2026-08-24): Design B.** A live probe
-    /// against Claude Code 2.1.241 reached `permissionMode: default`, but the
-    /// account rate-limited before the Bash request, so whether a hook's
-    /// `"ask"` overrides a native `Bash(*)` allow could not be established
-    /// live. **Answered (2026-08-26, issue #147) by the documented behavior**
-    /// (code.claude.com/docs/en/permissions, "Extend permissions with
-    /// hooks"; code.claude.com/docs/en/hooks, "Decision control"): a native
-    /// settings rule is evaluated INDEPENDENTLY of a PreToolUse hook's own
-    /// decision -- a settings `ask` rule still prompts even when the hook
-    /// returns `allow`, and a settings `deny` beats a hook `allow` outright.
-    /// So a hook's `"ask"`/`"allow"` never overrides a native `Bash(*)`
-    /// allow OR ask/deny rule either way; native rules and the hook are two
-    /// independent gates a command must clear. The conservative projection
-    /// therefore still emits no blanket Bash allow: the hook's explicit
-    /// `"allow"` carries ordinary commands, while an ask verdict cannot
-    /// accidentally be bypassed by native pre-approval. Issue #224's narrow
-    /// reserved-built-in rules are projected separately into that launch
-    /// settings layer; the hook remains an independent gate, so repo ask/deny
-    /// rules still narrow them. Every projected launch carries the Zirv-owned
-    /// `--settings` layer
-    /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
-    /// Claude's OS sandbox in auto-allow mode when available; Claude Code
-    /// warns and runs without it if unavailable. The sandbox denies common
-    /// credential paths to Bash; the launch settings also deny them to the
-    /// built-in Read tool and scrub cloud credentials from child environments.
-    /// Native Windows receives the hook/read/env layer but no unsupported
-    /// sandbox key.
-    ///
-    /// `network_allowlist` (issue #727 round 2): when non-empty, this method
-    /// itself removes `WebFetch`/`WebSearch` from the pre-approved surface
-    /// above and replaces them with one `WebFetch(domain:<host>)`/
-    /// `WebSearch(domain:<host>)` rule per configured target -- see the
-    /// implementation below and `network_allowlist_support`'s own doc
-    /// comment for the mechanism and its `Bash`-scoping gap. This is no
-    /// longer report-only: an empty list (today's shipped default) leaves
-    /// this argv byte-identical to before the parameter existed.
+    /// Claude has no workspace-scoped sandbox flag. Headless `dontAsk` denies
+    /// unapproved actions; projected allows support ordinary work, and denies
+    /// win. Native permission rules and PreToolUse hooks are independent
+    /// gates. Scratchpad paths resolve at launch; the network allowlist
+    /// narrows WebFetch/WebSearch but cannot scope Bash. (#104, #147, #224, #727)
+    /// Never emits a blanket native Bash allow: that would let native pre-approval
+    /// bypass an "ask" verdict from the hook.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
@@ -3039,13 +2611,7 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
-    /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
-    /// own spawn-request pane variant) used to silently inherit whatever the
-    /// operator's own interactive default model happened to be -- often a
-    /// far pricier model than the delegated task actually needs. The
-    /// catalogue's `Standard` tier (`"sonnet"`) is the user-approved hard
-    /// default that stops that, used only when the operator has not set
-    /// `worker.claude` explicitly (see `adapters::resolve_worker_model`).
+    /// Use the catalogue Standard tier only when the operator has no worker model override, avoiding inheritance of the interactive seat model.
     fn default_worker_model(&self) -> Option<&'static str> {
         catalogue::vendor(CATALOGUE_VENDOR)
             .and_then(|v| catalogue::tier_model(v, catalogue::Tier::Standard))
@@ -3193,11 +2759,7 @@ impl AgentAdapter for ClaudeAdapter {
         vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
     }
 
-    /// Review finding (#395 follow-up): the shared pinning `model_args`
-    /// above and `distiller_cmd` now both route every `--model` through,
-    /// and `review_roster_line` routes its advisory text through too, so
-    /// the roster's displayed review model can never name a model the
-    /// actual launch would replace.
+    /// Apply endpoint model pinning to both launch argv and roster guidance so they name the same model. (#395)
     fn pin_model_for_endpoint(&self, model: &str) -> String {
         match &self.endpoint {
             Some(ep) => ep.pin_model(Some(model)),

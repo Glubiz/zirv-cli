@@ -34,13 +34,7 @@ const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 const TYPESAFE_MODEL_ID: &str = "jev-latest";
 const CLARIFICATION_CATEGORY_ID: &str = "clarification_category";
 
-/// Issue #537 (A2): a `decision.needs_clarification` at or above this floor
-/// is worth interrupting an interactive launch for one round of follow-up
-/// (`chat.rs::proxy_intake`); the same floor also gates the `clarify:` line
-/// [`prompt_layer`] adds for a session launched non-interactively (e.g. a
-/// resumed clarification a dashboard pane never got to ask). Chosen as the
-/// midpoint of the noul's own `[0, 1]` confidence range -- above it, "too
-/// ambiguous" is the more likely reading than "clear enough".
+/// Clarification at this confidence floor may interrupt an interactive launch or guide an unattended session. (#537)
 pub(crate) const CLARIFY_THRESHOLD: f32 = 0.5;
 
 /// [`prompt_layer`]'s `clarify:` line for an interactive (non-headless)
@@ -411,22 +405,7 @@ pub fn decide(
     result
 }
 
-/// One line, shaped by `decision.seat_role` -- issue #537 field evidence
-/// problem (c): the operator experienced both a single-seat and a full team
-/// launch as "the full orchestrator setup", so this now says which one it
-/// actually is, and names the resolved seat tier alongside the model:
-///
-/// - `Single`: `proxy: <execution> \u{b7} single seat \u{b7} <harness>/<model> (<seat-tier>) \u{b7}
-///   <workflow-or-none> \u{b7} <decider> [\u{b7} domains: <tag>, ...] [<mean-confidence>]`
-/// - `Orchestrator`: `proxy: <execution> \u{b7} orchestrator <harness>/<model> (<seat-tier>) \u{b7}
-///   workers <worker-tier> \u{b7} <workflow-or-none> \u{b7} <decider> [\u{b7} domains: <tag>, ...]
-///   [<mean-confidence>]`
-///
-/// `<workflow-or-none>` is `no workflow` when `decision.workflow` is `None`
-/// (the common case now that a `Direct` execution always clears it, see
-/// `decision::apply_direct_execution_workflow_rule`), else `workflow <id>
-/// (<complexity>/<risk>)`. The `domains` segment (issue #537 A2) is omitted
-/// entirely when `decision.domains` is empty, the common case.
+/// Announce the actual seat role, resolved tier, workflow, and decider in one line. (#537)
 pub fn announce_line(decision: &ProxyDecision) -> String {
     let execution = lower_debug(decision.execution);
     let seat = format!(
@@ -492,32 +471,7 @@ fn mean_confidence(decision: &ProxyDecision) -> Option<f32> {
     Some(total / decision.confidence.len() as f32)
 }
 
-/// The bounded `[zirv proxy]` context layer (T2 folds this into the compiled
-/// prompt): at most 7 lines -- a header, execution/complexity/risk, the
-/// seat(s), the workflow, (issue #537 A2, both conditional) the domain tags
-/// and a clarify instruction, and (`Single` only) one line telling the
-/// session plainly that it is the one doing the work, not an orchestrator.
-///
-/// The clarify line (issue #537 headless follow-up) reads `decision.
-/// headless` to pick its text: [`INTERACTIVE_CLARIFY_LINE`] ("ask the user")
-/// for an ordinary decision, [`HEADLESS_CLARIFY_LINE`] ("nobody can answer
-/// in this run") for one `decide()` computed with `headless: true` -- an
-/// unattended launch telling itself to "ask the user" would just stall.
-/// Gating (the `needs_clarification`/`needs_clarification_decisive`
-/// threshold check) is identical either way; only the wording changes.
-///
-/// `started_workflow_id` (wrapper-overhead benchmark, 2026-09-22 change 2):
-/// the instance id `proxy::launch::start_workflow_for` actually started for
-/// this launch, when it did -- `chat.rs` threads it through from the SAME
-/// start call that names `decision.workflow`'s kind, so the workflow line
-/// can point the seat at that concrete instance instead of only naming the
-/// kind (the field evidence gap: a workflow started in 27/36 replayed runs,
-/// never consulted, because nothing named the running id or what to do with
-/// it). `None` when the intake never decided, the start was skipped
-/// (already-active workflow) or failed, or a decision names no workflow --
-/// every one of those keeps today's plain `workflow: <kind or none>` line.
-// T2 is the first caller (folds this into `compile.rs`'s composed context);
-// exercised here only by this module's own tests in the meantime.
+/// Bounded prompt layer carries execution, seat, workflow, domains, and a clarification instruction suited to launch mode. (#537)
 pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>) -> String {
     let mut lines = vec!["[zirv proxy]".to_string()];
     lines.push(format!(
@@ -725,9 +679,7 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
             "needs_clarification",
             format!("{:.2}", decision.needs_clarification),
         ),
-        // Issue #537 (A2): a plain field, not `row()` -- `domains` aggregates
-        // up to six separate Noul confidences (one per tag question), which
-        // does not fit `row()`'s one-field-one-confidence shape.
+        // Domain confidence aggregates several questions, so render it without the single-field helper. (#537)
         (
             "domains",
             if decision.domains.is_empty() {

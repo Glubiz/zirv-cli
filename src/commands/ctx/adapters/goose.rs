@@ -1,33 +1,8 @@
 //! Issue #393 (wave 3): the Block Goose CLI adapter (`goose`).
 //!
-//! Not installed on this machine; every fact below is exactly what issue
-//! #393's own "Verified facts" section states, sourced from
-//! `goose-docs.ai/docs/guides/{goose-cli-commands,context-engineering/
-//! hooks}` and the `goose-run(1)` manpage (2026-09-07). The interactive
-//! `goose session --system` flag and the exact hook schema are explicitly
-//! called out in the issue as unverified and are left on the trait's own "no
-//! verified mechanism" default rather than guessed.
-//!
-//! Goose's transcript is a single shared SQLite database
-//! (`~/.local/share/goose/sessions/sessions.db`, or
-//! `%APPDATA%\Block\goose\data\sessions\sessions.db` on Windows) covering
-//! EVERY session, not one file per session -- unlike every JSONL-per-session
-//! adapter elsewhere in this crate. Its internal table/column names are not
-//! documented anywhere in issue #393 (only the file's existence and that it
-//! stores per-session token usage), so [`ShadowTranscript::sync_sqlite`]
-//! cannot be called with a real, non-guessed query.
-//! [`transcript_path`](GooseAdapter::transcript_path) returns this real,
-//! verified database path directly (informational, e.g. for `zirv ctx
-//! status`) rather than guessing a schema; [`capabilities`](GooseAdapter::
-//! capabilities) reports `events: false`, which is what keeps this path from
-//! ever being opened and parsed as JSONL (`score::full_score`/
-//! `IncrementalScorer::poll` both gate on `capabilities().events` before any
-//! read).
-//!
-//! Goose is genuinely multi-provider (`--provider`/`--model`, issue #393's
-//! own "per-launch provider resolution" note), so [`provider_for_model`]
-//! resolves the billed vendor via `catalogue::vendor_of`, mirroring
-//! `pi::PiAdapter`/`opencode::OpenCodeAdapter`.
+//! The shared SQLite session database lacks a verified row schema, so
+//! event parsing stays disabled; its path remains available for status.
+//! Model billing resolves through the multi-provider catalogue. (#393)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

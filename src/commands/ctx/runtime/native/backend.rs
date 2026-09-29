@@ -14,8 +14,7 @@ use super::super::{
 use super::turn::{acknowledge_input, resume_journal};
 use super::types::SessionState;
 
-/// What [`NativeBackend::accept_input`] recorded: the durable identity the
-/// input now has, and whether it was already there.
+/// Durable input identity and whether the journal already held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedInput {
     pub message_id: MessageId,
@@ -241,26 +240,7 @@ impl NativeBackend {
         )
     }
 
-    /// Issue #489: the durable acknowledgement a PROTOCOL caller's input goes
-    /// through, carrying that caller's own idempotency key.
-    ///
-    /// The key becomes the journal's own `MessageId`, so the deduplication is
-    /// a uniqueness constraint on disk rather than a cache in a process's
-    /// memory. A retry after a reconnect -- or after the service itself
-    /// restarted, which loses every in-memory idempotency cache there is --
-    /// hits that constraint, records nothing a second time, and is reported
-    /// back as a duplicate so the caller knows no second turn was queued.
-    ///
-    /// Without a key the id is minted fresh, exactly as `submit`/`steer` do:
-    /// a caller that did not ask for deduplication does not get it silently.
-    ///
-    /// Unlike [`RuntimeBackend::submit`] this does NOT refuse a session with a
-    /// turn in flight. A hosted conversation queues input the way the agent
-    /// loop is built to take it -- `run_to_completion` drains everything
-    /// unconsumed at the next delivery boundary -- so refusing here would
-    /// reject a message the loop was about to deliver anyway. Whether a turn
-    /// is running is the HOST's fact, not this table's; `session::native`
-    /// owns it, because the host is what spawned the runner.
+    /// Persist caller idempotency keys as journal message IDs so retries across restarts deduplicate; unkeyed input remains fresh, and hosted input may queue during a turn. (#489)
     pub fn accept_input(
         &mut self,
         session: &SessionHandle,
@@ -454,14 +434,7 @@ impl RuntimeBackend for NativeBackend {
         Ok(())
     }
 
-    /// Brings a session back under this runtime.
-    ///
-    /// With a journal bound this is the real thing: every execution that was
-    /// durably `Started` when the previous generation stopped becomes
-    /// `OutcomeUnknown` (never silently retried), and the generation advances,
-    /// fencing the old one out of the journal and out of the N04 broker. See
-    /// [`resume_journal`]. Without a journal it is the in-memory generation
-    /// bump a protocol-shape test needs.
+    /// Resume with a new generation; unfinished durable executions become `OutcomeUnknown` and are never silently retried.
     fn resume(&mut self, session: &SessionHandle, input: Option<&str>) -> CtxResult<SessionHandle> {
         let logical_id = session.logical_id.clone();
         let journal_session = self

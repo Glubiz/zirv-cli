@@ -1,13 +1,8 @@
 //! T2 (issue #537): starts and, on a failed spawn, closes the workflow a
-//! harness-proxy decision names, immediately before a wrapped-harness or
-//! dashboard-pane launch actually spawns. Shared by `chat.rs`'s wrapped-
-//! harness apply path and the native runtime's own guarded call.
+//! harness-proxy decision names.
 //!
-//! Reuses `workflow::engine`'s own `start_workflow`/`close`/`load_active`
-//! rather than reimplementing any state handling: "what starting a workflow
-//! means" has exactly one implementation in this crate (see `engine::
-//! start_workflow`'s own doc comment), and this module is one more caller of
-//! it, not a second one.
+//! Uses the workflow engine to start immediately before spawn and close
+//! after a failed spawn, so workflow state has one owner. (#537)
 
 use std::path::Path;
 

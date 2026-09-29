@@ -16,75 +16,9 @@ use super::super::event::{
 use super::super::window::{self, RolloutRecord};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
-/// Codex's own base layer (see `AgentAdapter::base_system_prompt`), the codex
-/// analogue of `claude::ORCHESTRATOR_PROMPT` (issue #167). Revised 2026-08-28:
-/// the original text assumed no native subagent/task facility was verifiable
-/// for codex; `learn.chatgpt.com/docs/agent-configuration/subagents` (checked
-/// against this adapter's own `capabilities()` and `docs/superpowers/notes/
-/// 2026-07-31-codex-cli-facts.md`) confirms codex DOES have one: custom
-/// agents are TOML files in `~/.codex/agents/` (personal) or `.codex/agents/`
-/// (project) with required `name`/`description`/`developer_instructions` and
-/// optional `model`/`model_reasoning_effort`, plus built-in `default`/
-/// `worker`/`explorer` agents, all gated by the `[agents]` block in `~/
-/// .codex/config.toml` (`enabled`, `max_concurrent_threads_per_session`,
-/// `default_subagent_model`, `default_subagent_reasoning_effort`). This layer
-/// now teaches native subagent threads as the primary in-repo delegation
-/// path, with `zirv agent` -- the same cross-harness mechanism `HARNESS_
-/// PROMPT` already documents in full (dashboard pane behavior, `zirv ctx
-/// send`/`nudge`, mail report-back) -- reserved for cross-harness delegation
-/// and as the fallback when native subagents are unavailable or turned off
-/// (`[agents] enabled = false`). This layer still does not repeat `HARNESS_
-/// PROMPT`'s own mechanism, only the orchestrator mandate and model-tier
-/// discipline on top of it.
-///
-/// Tiers are framed by role first ("smallest, fastest tier", "mid tier",
-/// "this seat's own top tier") so the guidance survives a model rename, the
-/// same discipline `harness_prompt_never_names_vendor_specific_models`
-/// enforces for `HARNESS_PROMPT` -- but each role now also carries a
-/// "currently `gpt-5.6-luna`"/"currently `gpt-5.6-terra`" example (matching
-/// this adapter's own ladder, see `review_model_below_walks_the_codex_
-/// ladder`), since a concrete example is worth naming even though a codex
-/// account's own model names are operator-chosen strings.
-///
-/// The "never omit a model" rule is tighter here than `HARNESS_PROMPT`'s own
-/// generic "...or omit it to use the operator's own default worker tier"
-/// allowance: `CodexAdapter::default_worker_model` is verified `None` (no
-/// zirv-managed cheap default for a `zirv agent codex ...` worker, unlike
-/// claude's hard `"sonnet"` fallback -- see `codex_has_no_default_worker_
-/// model`), and the same gap applies to a native subagent spawn with no
-/// model named -- it resolves through the parent's own model unless `[agents]
-/// default_subagent_model` is set. Naming a tier explicitly, subagent or
-/// `zirv agent` alike, is the only way to actually avoid that inheritance.
-///
-/// Gated by `PromptConfig::codex_orchestrator` (issue #167, `REPO_FORBIDDEN`
-/// like `prompt.harnesses`): `prompt::with_adapter_layer` is where that
-/// operator switch is applied, not here -- this constant is unconditional
-/// content, the same way `claude::ORCHESTRATOR_PROMPT` has no switch of its
-/// own.
-///
-/// Issue #175: carries the same delegation-sizing rule as claude's layer,
-/// extended with this file's own native-subagents-first framing -- native
-/// codex subagent threads stay the default for any bounded task, and `zirv
-/// ctx agent --role sub-orchestrator` is reserved for work that genuinely
-/// decomposes into multiple coherently-scoped areas or must run under
-/// zirv's own supervision independently of this seat.
-///
-/// Wrapper behaviour redesign (2026-09-01): rewritten so trivial and bounded
-/// changes stay on this seat instead of always delegating, mirroring the
-/// same fix applied to `claude::ORCHESTRATOR_PROMPT` -- the prior "delegate
-/// every substantive piece of work" framing was one of the absolute process
-/// rules the wrapper-behaviour audit found was inflating small tasks.
-/// Native-subagent-first framing, model-tier discipline and the
-/// sub-orchestrator carve-out are unchanged. See
-/// `docs/superpowers/specs/2026-09-01-wrapper-behaviour-redesign.md`.
-///
-/// Issues #328/#334 (2026-09-04): mirrors the same fix now applied to
-/// `claude::ORCHESTRATOR_PROMPT` -- the "trivial and bounded changes stay on
-/// this seat" carve-out is gone, because it let an orchestrator seat
-/// implement small changes itself. Codex has no PreToolUse-equivalent hook
-/// to enforce this mechanically, so here the never-implement rule is
-/// prompt-only. Task size now only decides how many worker subagents and how
-/// large a brief, never whether this seat implements.
+/// Codex-only orchestration rules use native subagent threads for work in this
+/// harness. An omitted subagent model inherits the seat unless configured;
+/// the no-write rule is prompt-only because Codex has no PreToolUse hook. (#167, #328, #334)
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (codex)
 
@@ -160,17 +94,7 @@ by ONE designated integrator worker; a writer touching one says so in its report
 integration -- branching, merging worker results, committing, opening the PR -- stays on this \
 seat.";
 
-/// The same layer as [`ORCHESTRATOR_PROMPT`], but with the write-guard
-/// bullet (its own first bullet, above) posture-dependent (issue #358 T8)
-/// instead of hardcoded to `deny`'s wording, mirroring `claude::
-/// orchestrator_prompt_for`. `Deny` returns [`ORCHESTRATOR_PROMPT`] itself,
-/// unchanged; `Advise`/`Allow` splice `prompt::orchestrator_write_lines`'s
-/// text in front of [`ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET`].
-/// Codex has no PreToolUse-style hook at all (`hook::run_pretool` is
-/// claude-only), so unlike `claude::orchestrator_prompt_for` this passes
-/// `false`: `Advise`'s claim that a write is "recorded" and nudged on would
-/// be false for a harness with no mechanism to record anything (issue #358
-/// review, finding #6).
+/// Preserve the canonical deny prompt; other postures splice the shared write rule without claiming Codex records advised writes. (#358)
 fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) -> String {
     use super::super::config::OrchestratorWrites;
     if posture == OrchestratorWrites::Deny {
@@ -237,40 +161,13 @@ or write code yourself unless the change is trivial.
 group's completion contract -- not each child's own outcome individually -- including any \
 failures.";
 
-/// Verified facts backing this adapter live in
-/// `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`. Current Codex
-/// releases expose both lifecycle hooks and the external `notify` program;
-/// `zirv setup` uses the documented lifecycle-hook schema.
-///
-/// `ready()` no longer hard-errors: codex is a supported adapter with an
-/// honestly degraded capability set, while direct launches support developer
-/// instructions. It is selectable and launchable in the common case (`codex`
-/// resolves to a real binary) and also when nothing named `codex` is
-/// installed at all -- `resolve_program` fails open for that case, so
-/// `--agent codex` on a machine without it fails at spawn time with the OS's
-/// own "not found", not here. The one launch `ready()` actually refuses is a
-/// bare `codex` that resolves via `PATH` to a file this OS cannot execute at
-/// all.
-///
-/// `parse_events`/`structural_context` (issue #86, 2026-08-23) derive real
-/// normalized events from the same rollout JSONL `window.rs` already parses
-/// for usage-window state, via the shared `window::parse_rollout_record`
-/// collector -- see that function's own doc comment and `parse_events`
-/// below for exactly which rollout shapes are verified and mapped. Tool
-/// calls, tool results, compaction boundaries, and assistant text outside
-/// `task_complete.last_agent_message` still have no verified rollout shape
-/// (see `docs/superpowers/notes/2026-07-31-codex-cli-facts.md`) and are not
-/// modeled -- tracked as the residual half of
-/// [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
+/// Selectable Codex adapter; only an unexecutable resolved program fails readiness. Rollout parsing includes verified event shapes only. (#11, #86)
 #[derive(Debug, Clone)]
 pub struct CodexAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
-    /// Issue #395: an operator-only `[endpoint.codex]` override, attached
-    /// post-construction via `AgentAdapter::apply_endpoint` (production) or
-    /// `with_endpoint` (tests/direct construction) -- never set from a repo
-    /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
+    /// Operator-only endpoint override; repository configuration cannot set it. (#395)
     endpoint: Option<super::super::config::EndpointTarget>,
     /// Test seam only: forces `ignore_flags_supported`'s answer instead of
     /// spawning a real `--help` probe against whatever "codex" happens to
@@ -392,21 +289,10 @@ impl CodexAdapter {
         self
     }
 
-    /// Whether the installed codex-cli's own top-level `codex --help`
-    /// documents the `on-request` value of `-a, --ask-for-approval`
-    /// (2026-08-24, cross-harness permissions design).
-    ///
-    /// Probed, never assumed, for exactly the reason `ignore_flags_supported`
-    /// above is: the real minimum supporting version is unknown, and passing
-    /// a value an older install does not recognize is an
-    /// unrecognized-argument error that breaks the launch outright. Fails
-    /// closed (`false`) on any doubt at all: binary missing, timeout, or
-    /// `--help` output that does not name both the flag and the value.
-    ///
-    /// The TOP-LEVEL `--help` is probed, not `exec --help`: this gates the
-    /// INTERACTIVE launch (`codex [PROMPT]`, built by `interactive_cmd`),
-    /// which is a different command surface from the headless `codex exec`
-    /// that `ignore_flags_supported` probes.
+    /// Probe top-level approval values before use; unsupported values must not break launch.
+    /// Fails closed (`false`) on any doubt. Probes the TOP-LEVEL `--help`
+    /// (gates the interactive launch), not `exec --help`: the two surfaces
+    /// can disagree on which values they document.
     fn on_request_approval_supported(&self) -> bool {
         #[cfg(test)]
         if let Some(forced) = self.forced_on_request_approval_support {
@@ -475,30 +361,7 @@ impl CodexAdapter {
         probe_exec_ask_for_approval_support(&self.program, &self.bin_args)
     }
 
-    /// Issue #134: `codex exec --help` on current codex-cli (0.149.x) no
-    /// longer documents `--ask-for-approval` at all -- passing it breaks a
-    /// headless launch outright (`error: unexpected argument
-    /// '--ask-for-approval' found`) even though the SAME flag is still
-    /// accepted on the top-level interactive `codex` launch. Probed via
-    /// `exec_ask_for_approval_supported` (an `exec`-scoped `--help` probe,
-    /// deliberately separate from `on_request_approval_supported`'s
-    /// top-level probe -- see that method's own doc comment for why the two
-    /// surfaces can disagree), never assumed.
-    ///
-    /// On an interactive launch, or a headless launch whose installed CLI
-    /// still documents the flag, this returns the plain `--ask-for-approval
-    /// <value>` pair -- byte-for-byte what every caller emitted before this
-    /// method existed, so an install that still supports the flag sees no
-    /// change at all. Only when BOTH conditions hold (headless AND
-    /// unsupported) does this fall back to `-c approval_policy=<value>`:
-    /// `-c/--config key=value` overrides are documented on both the
-    /// interactive and `exec` command surfaces (`system_prompt_args`'s own
-    /// doc comment), and `approval_policy` is the config key codex's own
-    /// `~/.codex/config.toml` schema uses for this exact setting (surfaced
-    /// in `codex exec`'s own stdout preamble as `approval: <value>`,
-    /// `policy_support`'s `CONFIG` constant), so this fallback carries the
-    /// identical posture through a mechanism the binary still accepts
-    /// rather than silently dropping the suppression.
+    /// Probe exec approval support separately from interactive Codex; unsupported flags require the config override fallback. (#134)
     fn approval_suppression_args(&self, mode: super::LaunchMode, value: &str) -> Vec<String> {
         if !mode.is_interactive() && !self.exec_ask_for_approval_supported() {
             vec!["-c".to_string(), format!("approval_policy={value}")]
@@ -618,10 +481,9 @@ impl CodexAdapter {
             }
         }
         let record = super::super::sessions::load_record(&state, &short)?;
-        // Review round 1 (R6): a handover keeps the same session id, so the
-        // registration floor below would keep admitting the DEAD child's
-        // rollout (earliest wins). `forget_transcript_pin` records the swap's
-        // own moment here; `max` of the two is this child's real floor.
+        // A handover keeps the same session id, so without a floor the registration
+        // below (earliest wins) would keep admitting the dead child's rollout; take
+        // the max of the recorded floor and this swap's own moment.
         let handover_floor_ms = std::fs::read_to_string(handover_floor(&state, &short))
             .ok()
             .and_then(|text| text.trim().parse::<u64>().ok())
@@ -649,13 +511,8 @@ fn handover_floor(state: &super::super::state::StateDir, short: &str) -> PathBuf
     state.rollouts().join(format!("{short}.floor"))
 }
 
-/// Review round 1 (R6): drops this session's rollout pin and floors any later
-/// resolution at `now_secs`. A handover -- `dash::pane::Pane::handover` or
-/// `wrap`'s own swap -- replaces the child but keeps the zirv session id, so
-/// without this the pin kept answering the DEAD child's rollout forever, and
-/// merely deleting it re-resolved onto that same file (the registration floor
-/// still admits it, and earliest wins). Best-effort throughout: a floor that
-/// cannot be written costs a stale resolution, never a wrong session.
+/// Drop the old rollout pin and floor discovery at handover time so a replacement child cannot reuse the prior rollout.
+/// Best-effort: a floor that fails to write costs a stale resolution, never a wrong session.
 pub fn forget_transcript_pin(state: &super::super::state::StateDir, short: &str, now_secs: u64) {
     let rollouts = state.rollouts();
     let _ = std::fs::remove_file(rollouts.join(format!("{short}.path")));
@@ -719,12 +576,7 @@ pub fn codex_approval_advisory(posture: CodexApprovalPosture) -> Option<String> 
 /// `HELP_PROBE_TIMEOUT`.
 const IGNORE_FLAGS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// This adapter's own vendor slug in `catalogue`'s registry (issue #381):
-/// codex's ladder, strengths and prices all now live there rather than as
-/// literals in this file. `default_worker_model`/`default_distiller_model`/
-/// `context_window_tokens` stay on the trait default (`None`) -- codex has
-/// no verified default of its own to guess, same as before this module
-/// existed.
+/// Codex model metadata comes from the catalogue; unsupported defaults remain unset. (#381)
 const CATALOGUE_VENDOR: &str = "openai";
 
 /// Process-wide cache of `detect_ignore_flags`'s answer, keyed by the exact
@@ -749,16 +601,7 @@ fn probe_ignore_flags_support(program: &str, bin_args: &[String]) -> bool {
     detected
 }
 
-/// Runs `<program> [bin_args] exec --help` and reports whether its output
-/// names BOTH `--ignore-rules` and `--ignore-user-config`. Verified against
-/// the real installed `codex-cli 0.147.0`'s own `codex exec --help`
-/// (2026-08-23), which documents both; the npm-published `0.105.0` most
-/// operators get documents neither (see `distiller_cmd`'s own doc comment).
-/// Any doubt at all -- binary missing, timeout, output missing either flag
-/// -- reads as unsupported: passing just one on an install that does not
-/// recognize it is very likely an unrecognized-argument error that breaks
-/// the distiller/reviewer outright, worse than the residual these flags
-/// exist to close.
+/// Probe both exec-only ignore flags; any missing or uncertain result leaves them disabled.
 fn detect_ignore_flags(program: &str, bin_args: &[String]) -> bool {
     // The same resolution the real launch uses, exactly like claude's own
     // `detect_help_flag` -- otherwise the probe and the spawn could disagree
@@ -893,22 +736,7 @@ fn detect_exec_ask_for_approval_support(program: &str, bin_args: &[String]) -> b
 /// [`IGNORE_FLAGS_PROBE_TIMEOUT`] bounds the `codex exec --help` one.
 const ON_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Process-wide cache of `detect_on_request_approval`'s answer, keyed by the
-/// exact program invocation -- the identical `ProbeKey` shape
-/// [`IGNORE_FLAGS_SUPPORT`] uses, for the identical reason: `agent_bin` can
-/// point at a different binary, or a different version resolved off a
-/// different `PATH`, and each has its own answer.
-///
-/// KNOWN LIMITATION (2026-08-24, filed rather than guessed at): the cache
-/// is keyed on `(program, bin_args)`, not on the resolved binary's mtime or
-/// version string, so it never invalidates if the SAME path is upgraded or
-/// downgraded mid-process (a codex-cli reinstall while a long-lived `zirv
-/// ctx` session, dashboard, or supervisor keeps running). A stale cached
-/// `true` after a downgrade that dropped `--approve-for-me`/on-request
-/// approval support would pass an unsupported flag; a stale cached `false`
-/// after an upgrade that added it merely withholds a capability, the safe
-/// direction. Bounding this needs a cache-busting signal (mtime/version)
-/// this module does not currently probe for; out of scope for this pass.
+/// Cache approval-flag support per invocation; a changed binary at the same path needs a new process to refresh the answer.
 static ON_REQUEST_APPROVAL_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 static AUTO_REVIEW_SUPPORT: OnceLock<Mutex<HashMap<ProbeKey, bool>>> = OnceLock::new();
 
@@ -1045,20 +873,7 @@ fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The `(start_ms, cwd, session id)` a rollout's own first record reports, or
-/// `None` for a file whose first line is not a parseable `session_meta`. Only
-/// the first line is read: a rollout grows to megabytes, and the one record
-/// that says when, where, and under what id the session began is always its
-/// first.
-///
-/// The filename's own timestamp is deliberately NOT used -- codex names the
-/// file in LOCAL time (`rollout-2026-09-06T07-50-08-...`) while the record
-/// inside it is UTC (`2026-09-06T05:50:08.783Z`), so a filename comparison
-/// would be wrong by the machine's own UTC offset.
-///
-/// Issue #303 follow-up (review round 1): `payload.id` is codex's own minted
-/// session id -- the one `codex exec resume` actually needs, never zirv's own
-/// id (`resume_target` is this field's only reader for that purpose).
+/// Read rollout identity from the first `session_meta` record; filenames use local time and cannot establish start time.
 fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>, Option<String>)> {
     use std::io::BufRead as _;
     let file = std::fs::File::open(path).ok()?;
@@ -1085,17 +900,7 @@ fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>, Option<Stri
     Some((started, cwd, id))
 }
 
-/// The rollout a session that began at `started_ms` and runs in `cwd` most
-/// plausibly created: the EARLIEST one that began at or after this session
-/// did, restricted to rollouts recorded in this session's own `cwd` whenever
-/// any of them are.
-///
-/// Earliest, not newest: with two codex runs live at once, "newest after my
-/// start" hands the older session the younger one's transcript, while "the
-/// first rollout to appear after I started" is exactly the one this session
-/// launched. The residual is two codex runs started in the SAME directory
-/// within the same second, which no signal available here can separate --
-/// which is why the caller pins the answer rather than recomputing it.
+/// Choose the earliest rollout at or after session start, preferring this cwd, so concurrent runs do not swap transcripts.
 fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<PathBuf> {
     let mut files = Vec::new();
     collect_rollouts(sessions_root, &mut files);
@@ -1323,40 +1128,14 @@ impl AgentAdapter for CodexAdapter {
         super::launches_through_cmd_shim(&self.program)
     }
 
-    /// `codex exec [PROMPT]` reads its prompt from stdin when the positional
-    /// argument is omitted (verified:
-    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md, line 8 -- "If
-    /// `[PROMPT]` is omitted (or is `-`), instructions are read from stdin"),
-    /// so the same `exec` invocation `headless_cmd` builds works here with
-    /// just the positional prompt token dropped. This is what lets
-    /// `launches_through_cmd_shim` above move a headless prompt off argv on a
-    /// Windows `.cmd` shim launch, exactly like claude's own stdin form.
+    /// Omit positional prompt to send it through stdin, keeping Windows shim argv safe.
     fn headless_cmd_stdin(&self, _session: &SessionId, extra: &[String]) -> Option<Command> {
         let mut cmd = self.base();
         cmd.arg("exec").args(extra);
         Some(cmd)
     }
 
-    /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]` (verified
-    /// against the installed codex-cli's own `--help`, 0.153.4) resumes a
-    /// previously recorded exec session and, unlike interactive `codex
-    /// resume`, accepts a prompt to send once resumed -- a real headless
-    /// resume, the missing half of the honest-refusal default this trait
-    /// method otherwise falls back to. `PROMPT`'s own help text documents
-    /// exactly one non-argv delivery ("If `-` is used, read from stdin");
-    /// nothing documents an *omitted* PROMPT reading stdin the way plain
-    /// `codex exec` does, so `prompt: None` passes the literal token `-`
-    /// rather than dropping the argument, mirroring the one delivery `resume`
-    /// itself actually documents.
-    ///
-    /// Review round 1 (issue #303): `session_id` here is NOT zirv's own
-    /// minted id -- `headless_cmd`'s own doc comment already established
-    /// codex mints its own, unrelated id and ignores zirv's entirely, so
-    /// resuming zirv's own id would target a session codex never created.
-    /// `resume_target` below is what recovers the real one; this method
-    /// stays a pure argv builder and trusts its caller (`exec::
-    /// headless_resume_launch`, the sole caller) to have already resolved
-    /// `session_id` through it.
+    /// Resume a recorded exec session with its exact ID; send the prompt through stdin when supported. (#303)
     fn headless_resume_cmd(
         &self,
         prompt: Option<&str>,
@@ -1372,18 +1151,7 @@ impl AgentAdapter for CodexAdapter {
         Some(cmd)
     }
 
-    /// Issue #303 follow-up (review round 1): recovers the id `headless_
-    /// resume_cmd` above must actually target. Reuses `transcript_path`'s own
-    /// resolution (`find_rollout`/`pinned_rollout`/`resolve_rollout`) to find
-    /// the rollout THIS zirv session's codex child minted, then reads that
-    /// file's own `session_meta.payload.id` off its first line -- the exact
-    /// id codex itself would resume. `None`, never a guess and never codex's
-    /// own `--last` (unsafe: races any other codex session live in the same
-    /// repo), whenever the rollout cannot be resolved (`transcript_path`'s
-    /// own fallback is a placeholder path that was never written) or its
-    /// first line does not parse as a `session_meta` record -- `rollout_
-    /// session_meta` returns `None` for either. Callers must fail closed on
-    /// `None` rather than resume the wrong conversation.
+    /// Read the session ID from this child's pinned rollout metadata; never guess or use the racy `--last`. (#303)
     fn resume_target(&self, session: &SessionRef) -> Option<String> {
         let path = self.transcript_path(session);
         let (_, _, id) = rollout_session_meta(&path)?;
@@ -1449,66 +1217,11 @@ impl AgentAdapter for CodexAdapter {
         Some(SUB_ORCHESTRATOR_PROMPT)
     }
 
-    /// Verified via `codex exec --help` (quoted verbatim in the notes file):
-    /// `-m, --model <MODEL>` is a real flag, and the prompt is read from
-    /// stdin when none is given as an argument, so the distillation prompt
-    /// never hits an argv length limit. `model` is empty when neither the
-    /// operator's own config nor `default_distiller_model` (`None` for
-    /// codex, since zirv has no verified cheap model name for this lineup)
-    /// named one -- omitting `--model` entirely rather than passing an empty
-    /// value lets codex's own `~/.codex/config.toml` default apply instead
-    /// of zirv guessing a model name that may not exist on the operator's
-    /// account.
-    ///
-    /// `--sandbox read-only` is codex's own analogue of claude's
-    /// `--disallowedTools=Write,Edit,Bash,NotebookEdit` pin: it is what backs
-    /// `zirv ctx optimize`'s report-only guarantee for a codex judgment
-    /// child. Verified against the real installed CLI (`codex exec --help`,
-    /// codex-cli 0.105.0): `-s, --sandbox <SANDBOX_MODE>`, possible values
-    /// `read-only`/`workspace-write`/`danger-full-access`. It blocks the
-    /// class of risk claude's own restriction was verified to close (this
-    /// child writing a file, running a shell command, or otherwise mutating
-    /// the checkout via a tool) -- but it is not the identical guarantee:
-    /// `--sandbox` restricts what codex-*executed shell commands* may touch,
-    /// not which of codex's own tools may run at all, and codex's own
-    /// AGENTS.md (this repo's equivalent of CLAUDE.md, read into context the
-    /// same way) is still embedded in this child's prompt just like claude's
-    /// distiller embeds CLAUDE.md -- read-only scopes what the sandbox lets
-    /// an executed command do, it does not stop the model from reading that
-    /// text or from answering based on it.
-    ///
-    /// ISSUE #89 UPDATE (2026-08-23): `read_only_args` below now adds
-    /// `--ignore-rules --ignore-user-config` automatically, but only once a
-    /// live `--help` probe (`ignore_flags_supported`) confirms the installed
-    /// codex-cli actually documents both. codex-cli 0.146.0's `codex exec
-    /// --help` (the brew-installed capture in `docs/superpowers/notes/
-    /// 2026-07-31-codex-cli-facts.md`) documents both; the npm-published
-    /// `0.105.0` most operators get documents neither, and passing either on
-    /// an install that does not recognize it would very likely be an
-    /// unrecognized-argument error, breaking every distiller call for that
-    /// install rather than sandboxing it further -- which is exactly why
-    /// this is probed live rather than gated on a hardcoded version cutoff
-    /// (see `ignore_flags_supported`'s own doc comment). On an install
-    /// where the probe says "no", the operator's own `.rules` execpolicy
-    /// files and `~/.codex/config.toml` still shape this judgment child's
-    /// behavior (unlike claude's distiller, whose CLAUDE.md-reading is the
-    /// one thing `--disallowedTools` cannot touch either, so the two
-    /// residuals are not symmetric: claude's is "still reads the file",
-    /// codex's un-upgraded residual is "still reads the file *and* still
-    /// honors config it did not ask for") -- `sandbox_residual_note` names
-    /// this for the operator via a one-time `zirv ▸` announcement.
-    /// Review finding (#395 follow-up): routed through `model_args` (which
-    /// pins via `EndpointTarget::pin_model` when `self.endpoint` is set),
-    /// exactly like every other `--model` emission on this adapter --
-    /// without that, an `[endpoint.codex]` override pinned the interactive/
-    /// headless/resume launches to the endpoint vendor's own ladder but left
-    /// this one sending codex's native cheap alias straight to that
-    /// endpoint, where it is not a valid model at all. Still omits the flag
-    /// entirely when there is no endpoint AND no model was requested --
-    /// `resolve_distiller_model`'s documented "let the agent's own
-    /// configuration pick" case -- but under an endpoint override there is
-    /// no native config to fall back to, so `model_args` always emits a
-    /// pinned model (the endpoint's own default, at minimum) in that case.
+    /// Distillation uses stdin and an optional operator model, with `--sandbox read-only` and probed exec-only ignore flags so untrusted context cannot mutate the checkout.
+    /// `--sandbox read-only` is narrower than claude's tool-deny: it restricts what an
+    /// executed shell command may touch, not which tools run at all -- AGENTS.md is
+    /// still embedded in this child's prompt, so the model still reads and can answer
+    /// from it. (#89)
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("exec");
@@ -1535,20 +1248,7 @@ impl AgentAdapter for CodexAdapter {
         args
     }
 
-    /// Bug fix (2026-09-06): `--ignore-rules`/`--ignore-user-config` are
-    /// documented only on `codex exec --help`, never on the top-level
-    /// interactive `codex [OPTIONS] [PROMPT]` launch a dashboard pane uses
-    /// (no `exec` subcommand) -- verified by hand against codex-cli 0.153.4:
-    /// `codex --ignore-rules --model gpt-6-astra x` exits 2 with a clap
-    /// usage error, while `codex --help` lists no ignore flags at all (only
-    /// `codex exec --help` does). `read_only_args()` above added both
-    /// unconditionally whenever `ignore_flags_supported()` (an `exec --help`
-    /// probe) said yes, which killed every `--mode read-only` dashboard pane
-    /// instantly with "pane exited with code 2", before it ever registered a
-    /// session. This override carries the profile supported on
-    /// BOTH surfaces -- never the exec-only pair, regardless of what the
-    /// exec probe reports, because it is never applicable to this launch
-    /// surface in the first place.
+    /// Interactive Codex rejects exec-only ignore flags; keep its read-only pin to flags accepted by the top-level command.
     fn interactive_read_only_args(&self) -> Vec<String> {
         self.read_only_sandbox_args()
     }
@@ -1573,21 +1273,10 @@ impl AgentAdapter for CodexAdapter {
         )
     }
 
-    /// Codex's supported model ladder, top to bottom: `gpt-5.6-sol` (the
-    /// default used when no `-m` is given), `gpt-5.6-terra`, and
-    /// `gpt-5.6-luna`. The historical model observation remains recorded in
-    /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md; the current
-    /// supported ladder lives in `catalogue` (issue #381).
-    /// Matched by substring on `seat`, lowercased first (same as claude's
-    /// own ladder) so a mixed-case seat still lands on the right rung
-    /// instead of falling through to the unknown arm. `gpt-5.6-luna` is
-    /// already the floor, so it maps to itself; an absent or unrecognised
-    /// seat (including one naming another adapter's model, e.g. a Claude
-    /// orchestrator's own `chat.model`) assumes the top tier -- the
-    /// deliberate consequence is that the computed default can then resolve
-    /// to a model *more expensive* than the seat actually in use (an
-    /// accepted spend-up default; the operator can override it with
-    /// `[review]` or by setting `chat.model`).
+    /// Resolve Codex model tiers through the catalogue, case-insensitively. An
+    /// absent or unrecognized seat resolves to the top tier: the safe direction
+    /// is over-reviewing at higher cost, never under-reviewing with a cheaper
+    /// model. (#381)
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
         catalogue::vendor(CATALOGUE_VENDOR)
             .map(|v| catalogue::rung_below(v, seat))
@@ -1815,44 +1504,11 @@ impl AgentAdapter for CodexAdapter {
         args
     }
 
-    /// The codex side of the shipped-default posture, split by launch mode
-    /// (2026-08-24, cross-harness permissions design).
-    ///
-    /// **Headless** is unchanged: `--sandbox workspace-write` paired with
-    /// `--ask-for-approval never`, both verified against the installed
-    /// `codex-cli 0.147.0`. Nobody is present to answer an escalation, so a
-    /// blocked action is reported straight back to the model.
-    ///
-    /// **Interactive** upgrades the approval mode to `on-request`: the
-    /// session works freely inside the workspace sandbox and escalates only
-    /// when it needs to leave it. When the installed CLI also advertises
-    /// `--approve-for-me`, its native security reviewer auto-clears lower-
-    /// risk boundary requests, denies critical ones, and leaves only high-
-    /// risk decisions to the operator. Both capabilities are probed
-    /// independently so older CLIs retain the last posture they support.
-    ///
-    /// Deliberately **not** `untrusted`, which was this design's first
-    /// answer: `untrusted` prompts for everything outside codex's own narrow
-    /// built-in trusted set, which is exactly the endless-prompting failure
-    /// the primary acceptance criterion exists to remove. Choosing the
-    /// approval mode by how much it interrupts -- not by how much it
-    /// gates -- is the whole point; the SANDBOX is what gates, and it is
-    /// unchanged between the two modes.
-    ///
-    /// Probed, never assumed (`on_request_approval_supported`): on any doubt
-    /// the launch keeps `never`, because an unrecognized argument breaks the
-    /// launch outright.
-    ///
-    /// Never `--dangerously-bypass-approvals-and-sandbox`: that removes
-    /// sandboxing entirely, which is the one thing this posture must not do.
-    ///
-    /// `sandbox.extra_allow`/`extra_deny` and `safety` are still ignored in
-    /// both modes: they are claude permission-rule strings, and no
-    /// trusted-command mechanism was verified on the installed codex CLI to
-    /// receive them. Rather than invent one, this projects nothing extra and
-    /// `policy_support` reports the gap as `Degraded` -- see that method's own
-    /// doc comment. Faking parity here would be exactly the over-claim
-    /// `policy.rs`'s honesty contract exists to prevent.
+    /// Headless uses workspace-write with approval `never`; interactive probes `on-request` and optional native review. On doubt retain `never`, and never disable the sandbox.
+    /// Approval mode is chosen by how much it interrupts, not by how much it
+    /// gates -- the sandbox is what gates, unchanged between modes. `sandbox.extra_allow`/
+    /// `extra_deny` and `[safety]` are not projected here: no verified codex mechanism
+    /// receives them, so `policy_support` reports this as `Degraded` rather than faking parity.
     fn default_sandbox_args(
         &self,
         sandbox: &crate::commands::ctx::config::SandboxConfig,
@@ -1884,33 +1540,11 @@ impl AgentAdapter for CodexAdapter {
         args
     }
 
-    /// Issue #119 (dash worktree panes) + the mail report-back gap
-    /// (2026-08-26, codex approval-posture round): see the trait method's own
-    /// doc comment for what this closes and why `cwd`/`mail_dir` are not
-    /// threaded through `default_sandbox_args` instead.
-    ///
-    /// One `-c sandbox_workspace_write.writable_roots=[...]` config override
-    /// carries every extra root this launch needs, never several separate
-    /// `-c` occurrences for the same key: codex's own config resolution is
-    /// last-value-wins (the same fact `approval_suppression_args`'s fallback
-    /// relies on for `approval_policy`), so a second `-c ...writable_roots=`
-    /// would silently replace the first rather than add to it. Verified to
-    /// work on both the interactive and `exec` command surfaces, the same
-    /// `-c/--config key=value` fact `approval_suppression_args`'s own doc
-    /// comment cites.
-    ///
-    /// `git_common_dir(cwd)` is ALWAYS added, whether it resolves inside or
-    /// outside `cwd` -- issue #252. codex's own sandbox (seatbelt/landlock)
-    /// keeps `<root>/.git` read-only inside every writable root it is handed,
-    /// including `cwd` itself under `--sandbox workspace-write`; only naming
-    /// the git dir explicitly lifts that. This is true for a main checkout's
-    /// `<cwd>/.git` exactly as much as for a linked worktree's external
-    /// common dir -- the earlier doc comment's claim that a main checkout's
-    /// `.git` was "already covered" by the cwd root was the bug. `mail_dir`
-    /// is always added too: it sits under the state root, always outside
-    /// `cwd`, regardless of worktree shape.
-    /// A linked worktree's own git dir is also named explicitly (#364),
-    /// since Codex can protect the directory its `.git` file points to.
+    /// Emit one config override for all extra writable roots; Codex config resolution may replace repeated keys. (#119)
+    /// `git_common_dir(cwd)` is always added explicitly: codex's sandbox keeps
+    /// `<root>/.git` read-only inside every writable root it is handed,
+    /// including `cwd` itself, unless the git dir is named directly. A linked
+    /// worktree's own git dir is added too. (#252, #364)
     fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
         let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut roots: Vec<PathBuf> = Vec::new();
@@ -2343,30 +1977,12 @@ impl AgentAdapter for CodexAdapter {
         true
     }
 
-    /// Issue #155 review finding C2: `parse_events` above never emits
-    /// `NormalizedEvent::ToolCall` -- deliberately, per its own doc comment,
-    /// since no verified rollout shape exists for a tool call at all -- so a
-    /// `--max-tool-calls` ceiling checked against this adapter's events
-    /// would never see a count above zero. `exec::run_with_clock` reads
-    /// this to refuse the flag outright rather than accept it and silently
-    /// never enforce it.
+    /// Codex emits no verified tool-call event, so refuse a max-tool-calls limit that could not be enforced. (#155)
     fn counts_tool_calls(&self) -> bool {
         false
     }
 
-    /// Issue #303: investigated alongside `headless_resume_cmd` above and
-    /// stays `None`. `codex exec --help`, `codex exec resume --help` and the
-    /// top-level `codex --help` document no compaction concept at all -- no
-    /// subcommand, no flag, no `-c` config key. The interactive slash-command
-    /// set remains unverified (`docs/superpowers/notes/
-    /// 2026-07-31-codex-cli-facts.md`: probing it non-interactively failed
-    /// with "stdin is not a terminal" before any slash command could be
-    /// observed, so the existing `/quit\r` placeholder below is unverified
-    /// too), but even a verified interactive `/compact` would not answer this
-    /// method -- see `qwen::QwenAdapter`'s own gap for the same reasoning:
-    /// an interactive-only slash command is not a headless directive. Never
-    /// claim a compaction step this binary has never been observed to
-    /// perform.
+    /// No verified Codex compaction command exists; report unsupported instead of guessing. (#303)
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -2389,12 +2005,7 @@ impl AgentAdapter for CodexAdapter {
             // The adapter supports this generally. `system_prompt_supported`
             // narrows the answer for Windows shell-shim launch shapes.
             system_prompt: true,
-            // Issue #86 (2026-08-23): `parse_events`/`structural_context`
-            // now derive real turn-boundary and token data from the rollout
-            // JSON (see their own doc comments for exactly what is and is
-            // not mapped), so this is honestly `true` -- rot scoring,
-            // `zirv ctx status`'s usage/rot cells, and the pacing gate all
-            // light up for a codex session.
+            // Turn and usage events come from verified rollout records; unverified event kinds remain unavailable. (#86)
             events: true,
             // Issue #118: verified against codex's own ratatui composer
             // (issue #114) -- a same-burst text+`\r` is read as a paste and
@@ -2404,9 +2015,7 @@ impl AgentAdapter for CodexAdapter {
             // one is worse than falling back to rot's absolute defaults,
             // which are at least a known quantity. Never fake parity.
             context_window_tokens: None,
-            // Issue #418: no verified native hooks surface for codex exists
-            // (see `docs/design/2026-09-01-hook-surface-gap-analysis.md`);
-            // this wave adds seams for copilot/droid/gemini only.
+            // Codex has no verified native hook surface for this adapter. (#418)
             pre_tool_hook: false,
             post_tool_hook: false,
         }
@@ -2433,11 +2042,7 @@ impl AgentAdapter for CodexAdapter {
         vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
     }
 
-    /// Review finding (#395 follow-up): the shared pinning `model_args`
-    /// above and `distiller_cmd` now both route every `--model` through,
-    /// and `review_roster_line` routes its advisory text through too, so
-    /// the roster's displayed review model can never name a model the
-    /// actual launch would replace.
+    /// Endpoint pinning applies to launch argv and roster guidance alike. (#395)
     fn pin_model_for_endpoint(&self, model: &str) -> String {
         match &self.endpoint {
             Some(ep) => ep.pin_model(Some(model)),

@@ -337,31 +337,11 @@ impl StdioTransport {
         }
     }
 
-    /// Waits, bounded by a single overall `budget`, for the child to exit and
-    /// then for the stderr-draining thread to finish, so the tail it
-    /// collected is complete before an error message is built from it.
-    ///
-    /// A write-side EPIPE or the stdout reader hitting EOF each mean the
-    /// corresponding pipe's other end is gone, which for a child process
-    /// almost always means the child itself has already exited or is about
-    /// to. Rather than sleeping a fixed, arbitrary duration and hoping the
-    /// background reader (`pump_stderr`) has been scheduled to observe and
-    /// buffer the child's stderr by then -- a real race under CI load that
-    /// used to surface as a bare "Broken pipe" with no diagnostic -- this
-    /// waits for the actual exit, which normally means the reader has also
-    /// already seen EOF on stderr (guaranteed once every handle to the write
-    /// end is closed) and finished.
-    ///
-    /// It is only "normally" because a grandchild (a wrapper or launcher
-    /// that forked its own server) can inherit the stderr handle and keep it
-    /// open after the direct child we spawned has exited; the reader would
-    /// then never see EOF. So this polls `is_finished` rather than blocking
-    /// on `join`, under the SAME deadline that bounds the exit wait, and
-    /// only joins once the thread has actually finished -- a transport error
-    /// path must never be able to hang forever. If the deadline passes
-    /// first, the (still-running) handle is put back so a later call can
-    /// still pick up its result, and the tail is used as-is, possibly
-    /// incomplete.
+    /// Wait for child exit and stderr drain under one deadline before building an
+    /// error; a grandchild may keep stderr open indefinitely. A transport error path
+    /// must never hang forever: this polls rather than blocking on `join`, and if the
+    /// deadline passes first, the still-running handle is put back so a later call can
+    /// still pick up its result; the tail is used as-is, possibly incomplete.
     fn drain_stderr_after_exit(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {

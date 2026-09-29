@@ -95,8 +95,7 @@ pub struct DelegateArgs {
     pub budget_tokens: Option<u64>,
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
-    /// Issue #541 chunk C, decision 2: the workflow agent manifest id this
-    /// worker is filling. Absent defers to `role`'s own default manifest.
+    /// Workflow manifest ID this worker fills; absent uses the role default. (#541)
     #[serde(default)]
     pub manifest: Option<String>,
     /// Bypass the "must match an unfilled team-plan seat" rule. Honoured
@@ -212,10 +211,7 @@ impl super::NativeToolClient {
         use crate::commands::ctx::team;
 
         let cfg = self.ctx_config()?;
-        // Issue #485 item 2: a route the MODEL named for a role has to clear
-        // operator policy and stay on the billing the operator seated that
-        // role on. The operator's own `--route` on a CLI delegation is the
-        // operator speaking and is untouched; this is the other case.
+        // Model-named routes must satisfy operator policy and role billing; explicit operator routes retain their authority. (#485)
         let target = args.target_or_default();
         if args.runtime == ToolRuntime::Native
             && target != crate::commands::ctx::runtime::RuntimeKind::Native.as_str()
@@ -264,12 +260,8 @@ impl super::NativeToolClient {
             ),
         };
         let identity = self.broker.identity().clone();
-        // Issue #485 (roadmap N16): the delegating seat's ROLE comes off the
-        // persisted seat record the broker is fenced on, and its remaining
-        // delegation DEPTH from the same envelope resolution `agent::run_with`
-        // performs for this session -- so the bounds this launch is judged
-        // against and the ones the launch itself later enforces are one
-        // answer, not two. Neither is reachable from model output.
+        // Read role and remaining depth from the persisted, fenced seat before delegating;
+        // neither is reachable from model output. (#485)
         let parent_envelope = crate::commands::ctx::agent::resolve_parent_envelope(&cfg, &|key| {
             self.launch_env.get(key).cloned()
         })
@@ -292,10 +284,7 @@ impl super::NativeToolClient {
                 short: &identity.short,
                 role: &identity.role,
                 depth,
-                // Issue #488: the generation the broker is already fenced on.
-                // A delegating session an automatic rollover superseded is
-                // refused here, before a durable launch receipt names work
-                // the live generation knows nothing about.
+                // Refuse a superseded generation before creating a durable launch receipt. (#488)
                 generation: Some(identity.generation),
                 generation_locked: true,
             },

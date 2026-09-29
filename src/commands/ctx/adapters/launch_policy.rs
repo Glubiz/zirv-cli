@@ -2,57 +2,7 @@
 //! rules, and the launch argv built from an `EffectivePolicy`.
 use super::*;
 
-/// Whether `flags` already pins one of the CLI-level policy flags
-/// `AgentAdapter::policy_args`/`default_sandbox_args` might otherwise
-/// prepend: claude's `--disallowedTools`/`--allowedTools`/`--permission-
-/// mode`, or codex's `-s/--sandbox` and `-a/--ask-for-approval`. Exact match
-/// or the `=`-joined form only (`--sandbox=read-only`) -- unlike `classify_
-/// model_flag`, this deliberately does not also recognise an attached short
-/// form (`-sread-only`): that spelling was never verified for these flags
-/// the way `-mvalue` was for `--model` (`-m`'s own attached form is a
-/// dedicated, tested case in this file), and a false positive here means
-/// silently *withholding* zirv's own restriction rather than merely
-/// mis-ordering a model flag, so precision matters more than coverage.
-///
-/// **Codex `-c`/`--config` overrides (2026-08-26, approval-posture round):**
-/// an operator may also pin codex's approval/sandbox posture via a raw
-/// config override -- `-c approval_policy=<value>`, `-c sandbox_mode=<value>`,
-/// or the long `--config` spelling of either -- rather than the dedicated
-/// `--ask-for-approval`/`--sandbox` flags above. Before this, that spelling
-/// was invisible to this function: `flags_pin_policy` returned `false`, so
-/// `policy_launch_args` still prepended zirv's own `-c approval_policy=...`
-/// (`CodexAdapter::approval_suppression_args`'s exec-probe fallback) *after*
-/// the operator's own override, and codex's config resolution is
-/// last-value-wins, so the operator's explicit choice was silently
-/// overridden by zirv's own. `CODEX_CONFIG_OVERRIDE_KEYS` below closes that
-/// gap for the split form (`-c`/`--config` followed by a `key=value` token,
-/// checked pairwise since the key lives in the *next* token, unlike every
-/// other flag this function recognises), the `=`-joined single-token form
-/// (`--config=approval_policy=...`), mirroring the existing `--sandbox=...`
-/// handling above, and (2026-08-26, correction round) codex's own attached
-/// short form -- `-cKEY=VALUE` with no space at all, verified accepted by
-/// codex-cli 0.149.1, mirroring the attached `-mvalue` form
-/// `classify_model_flag` already recognises for `--model`. All-or-nothing,
-/// same as every other flag this function recognises: pinning just one
-/// dimension (e.g. only `approval_policy`) withholds zirv's *entire*
-/// computed prefix, not only the approval half -- `policy_launch_args` has
-/// no partial-prefix concept, and this function's contract has always been
-/// "the operator's own flag pins policy outright".
-///
-/// Mirrors `agent.rs`'s own `flags_pin_model` in spirit: the operator's own
-/// explicit choice must demonstrably win over a zirv-computed default, not
-/// merely happen to survive because a CLI takes the last occurrence of a
-/// repeated flag. `policy_launch_args` is the sole caller that acts on this.
-///
-/// **`--dangerously-skip-permissions`/`--dangerously-bypass-approvals-and-
-/// sandbox` (issue #224 review round 2):** claude's and codex's own bare
-/// "remove every check" toggles pin the loosest possible posture outright,
-/// the same way a dedicated `--permission-mode`/`--sandbox` value does --
-/// leaving them out meant `policy_launch_args` still prepended zirv's own
-/// (functionally inert, since these toggles win regardless of position)
-/// prefix ahead of them, and `safety::reserved_zirv_auto_allow_rule` had no
-/// way to see that a `zirv agent`/`zirv chat` invocation's forwarded flags
-/// had asked the spawned harness to drop its own guardrails.
+/// Detect explicit policy flags, including Codex config overrides and bypass flags, so operator choice wins; reject unverified short forms that could suppress zirv restrictions. (#224)
 pub fn flags_pin_policy(flags: &[String]) -> bool {
     const POLICY_FLAG_NAMES: &[&str] = &[
         "--disallowedTools",
@@ -105,118 +55,7 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
     })
 }
 
-/// One family of in-repo-development or destructive actions zirv's own
-/// shipped-default "sandboxed, no prompts" posture takes a position on --
-/// the shared static source both `ClaudeAdapter::default_sandbox_args` (which
-/// projects every entry onto a concrete `Bash(...)`/`Read(...)`/`Edit(...)`
-/// permission rule) and codex's own `default_sandbox_args` (a coarse
-/// `--sandbox workspace-write --ask-for-approval never` pair, documented
-/// against this same list -- see that method's own doc comment) are
-/// expressions of, so the two harnesses' postures cannot independently
-/// drift into disagreement about what "sandboxed, no prompts" means. Zirv's
-/// case-insensitive reserved built-ins are the one generated family alongside
-/// this constant; `safety::reserved_zirv_command_patterns` derives them from
-/// the dispatch layer's `utils::RESERVED_COMMANDS` source of truth.
-///
-/// **Why `dontAsk` alone is not enough (2026-08-22, fix round 2):** a fresh
-/// install with no operator-configured `permissions.allow` denies every
-/// `Write`/`Edit`/`Bash` call outright -- safe, but inert, not the "session
-/// works and stays safe" posture the operator actually asked for. This list
-/// is what makes `--permission-mode dontAsk` *usable* out of the box.
-///
-/// **Verified live, not guessed**, against the installed `claude 2.1.240`:
-/// - `Edit(./**)` (not bare `Write`) is the rule that actually scopes a
-///   write to the workspace -- the CLI's own runtime error is explicit
-///   about this: `"Write(./**) is not matched by file permission checks --
-///   only Edit(path) rules are. ... Edit rules cover all file-editing
-///   tools."` A bare `Write` allow rule, tested live, let a write reach the
-///   *parent* directory of the workspace with no denial at all.
-/// - `Read(./**)` genuinely scopes reads to the workspace (a read outside
-///   it was denied); a bare `Read` rule, tested live, did not (it read a
-///   file one directory above the workspace).
-/// - A `disallowedTools` entry wins over a broader, unrelated `allowedTools`
-///   entry even when both could apply to the same command family (`Bash(git
-///   push --force *)` denied while a broader `Bash(git *)` allow was also
-///   configured) -- Claude Code's own settings.json schema documents `deny`
-///   winning over `allow` as the contract, and this was reproduced live, not
-///   assumed from the docs alone.
-/// - `Bash(<verb> *)` is prefix matching (Claude Code's own embedded schema
-///   docs: `"Prefix wildcard: \"Bash(git *)\" - matches git, git status, git
-///   commit, etc."`), reproduced live for both the space-separated form
-///   (`Bash(git status *)`, the documented spelling) and a colon-separated
-///   form that also happened to work; this list uses the documented
-///   spelling.
-///
-/// **What is deliberately NOT in this list, and why:** "writes outside the
-/// workspace" is not a separate deny rule -- `Edit(./**)`'s own scoping
-/// already denies it by omission (verified live above), and a second rule
-/// trying to express the same negative space would be redundant and harder
-/// to audit. General credential-file reads via `Bash(cat ...)` are denied
-/// the same way: no allow rule pre-approves `cat`/`Bash` in general, so
-/// `dontAsk` denies it by omission; `Bash(security *)` is still listed
-/// explicitly (the one credential-reading *command family* worth naming on
-/// its own, since zirv's own macOS keychain fallback already documents it
-/// as the concrete vector -- see `poll.rs`).
-///
-/// **Fix round 4 (2026-08-23, issue #104): whole toolchain families, harness
-/// dirs, scratchpad, `WebFetch`/`WebSearch`.** Round 2's list above still hit
-/// `dontAsk`'s own inert-by-omission failure one layer up: it only
-/// pre-approved a handful of subcommands per toolchain (`cargo build *`/
-/// `cargo test *`/`cargo check *`, not `cargo run *`/`cargo doc *`/...), so
-/// an otherwise-legitimate in-family command still hit a silent, final
-/// denial. The narrow per-subcommand entries are replaced with whole
-/// `Bash(<tool> *)` families (`git *`, `gh *`, `cargo *`, `npm *`, `npx *`,
-/// `node *`, `python *`, `python3 *`, `pip *`, `go *`, `dotnet *`, `make *`,
-/// `gradle *`, `mvn *`, `pytest *`) plus a set of read-only shell
-/// utilities -- the deny list, not per-verb narrowing, is what still keeps
-/// each family's destructive half blocked (`git clean *`, `git push
-/// --delete *`, `gh repo delete *`, `gh release delete *`, `gh auth *`,
-/// `cargo publish *`, `npm publish *`, added to `SHIPPED_POSTURE_DENY`
-/// alongside the pre-existing force-push/reset/rebase/curl/wget/sudo/su/
-/// security entries -- deny still wins, verified live in fix round 2).
-///
-/// Issue #224 replaces issue #98's former blanket `zirv *` family with rules
-/// derived from `utils::RESERVED_COMMANDS` in `safety::builtin_allow`.
-/// Zirv's own built-ins remain usable under `dontAsk`, while repo-defined
-/// `zirv <script>` invocations return to the unmatched-command gate.
-///
-/// Also added: `Read(~/.claude/**)`/`Edit(~/.claude/projects/**)` (inspect
-/// the harness's own settings/memory, and write Claude Code's own
-/// auto-memory, which lives under `~/.claude/projects/<slug>/memory/`);
-/// `Read(~/.zirv/**)` (inspect the operator layer -- `Edit(~/.zirv/**)` is
-/// denied below, since a session must never widen its own posture);
-/// `WebFetch`/`WebSearch` (bare tool rules, no `Bash(...)` wrapper); and two
-/// scratchpad rules computed at launch from the real `std::env::temp_dir()`
-/// rather than baked into this `&'static` list -- see [`scratchpad_rules`].
-///
-/// **Fix round 6 (2026-09-16, docs/superpowers/2026-09-16-builtin-safe-
-/// command-policy.md, Change 2): the worker capability list.** This list is
-/// also what a headless `zirv ctx agent`/`exec`/`loop` worker can do
-/// unattended -- unlike an interactive session, it has no unmatched-command
-/// fallback to lean on (`headless_default = ask`, unanswerable), so a
-/// command absent here silently blocks a worker even though the identical
-/// command is already `Allow` interactively. `glab *`, `gitlab-ci-local *`,
-/// `php *`; read-only `kubectl get/logs/describe/config *` (never a bare
-/// `kubectl *` -- `apply`/`delete` stay off); `docker exec *`/`kubectl exec
-/// *` (safe only because the inner command is now analysed -- see the two
-/// entries' own comments and the spec's Change 3); and the everyday-tool
-/// gap (`sed`, `awk`, `jq`, `mkdir`, `touch`, `cp`, `mv`, `stat`, `df`, `du`,
-/// `ps`, `printf`, `date`, `basename`, `dirname`, `xargs`, `tee`, `mktemp`,
-/// `realpath`), plus the fixed macOS SSH-agent environment lookup
-/// (`launchctl getenv` and `export SSH_AUTH_SOCK=...`).
-///
-/// **Fix round 7 (2026-09-20): the remaining harmless built-ins.** `Grep`,
-/// `Glob`, `AskUserQuestion`, `TodoWrite`, `NotebookRead` and `TaskOutput`
-/// are added as whole-tool allow entries alongside `WebFetch`/`WebSearch`
-/// above -- each is either read-only (`Grep`, `Glob`, `NotebookRead`,
-/// `TaskOutput`) or pure in-conversation UI state with no filesystem or
-/// process effect (`AskUserQuestion`, `TodoWrite`), so none of them can
-/// touch the machine, the repo or production. `Monitor`, `Skill` and
-/// `Agent`/`Task` are deliberately excluded even though they also showed up
-/// in `permission-prompts.jsonl`: `Monitor` can run and stream arbitrary
-/// shell commands, and `Skill`/`Agent` can themselves invoke
-/// `Bash`/`Write`/`Edit`, so all three must stay behind the same gate as
-/// `Bash` rather than being pre-approved as leaf tools.
+/// Shared default allow families make `dontAsk` usable for ordinary work; named destructive actions remain denied or ask-gated. (#104)
 pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Read(./**)", "read anything inside the workspace"),
     (
@@ -237,17 +76,9 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ),
     ("WebFetch", "fetch a URL's contents, read-only"),
     ("WebSearch", "search the web, read-only"),
-    // Fix round 7 (2026-09-20): whole-tool allow entries for the remaining
-    // built-ins that cannot touch the machine, the repo or production --
-    // each is either read-only or purely in-conversation UI state, so
-    // gating them behind a prompt bought nothing (permission-prompts.jsonl:
-    // Grep 14, Glob 1, AskUserQuestion 7 of the 345 logged prompts were
-    // exactly this). `Monitor`, `Skill` and `Agent`/`Task` are deliberately
-    // NOT here even though they also showed up in that log: `Monitor` can
-    // run and stream arbitrary shell commands, and `Skill`/`Agent` can
-    // themselves invoke `Bash`/`Write`/`Edit`, so all three stay gated by
-    // the same posture that gates `Bash` itself rather than being
-    // pre-approved as if they were leaf tools.
+    // Allow read-only and in-conversation tools without prompting; keep mutating tools gated.
+    // Monitor, Skill, and Agent/Task stay gated despite looking similar: they can run or
+    // themselves invoke Bash/Write/Edit.
     ("Grep", "search file contents, read-only"),
     ("Glob", "match file paths by pattern, read-only"),
     (
@@ -263,10 +94,7 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
         "read a Jupyter notebook's cells and outputs, read-only",
     ),
     ("TaskOutput", "read a delegated agent's output; read-only"),
-    // Whole toolchain families (2026-08-23, fix round 4, issue #104) -- see
-    // this constant's own doc comment for why the narrower per-subcommand
-    // entries these replace were still inert-by-omission on anything else
-    // in the same family.
+    // Allow whole toolchain families; the deny list catches named destructive subcommands. (#104)
     (
         "Bash(git *)",
         "the full git command family; force-push, hard reset, rebase, filter-branch and clean are denied below and win",
@@ -332,11 +160,7 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(uniq *)", "filter duplicate lines, read-only"),
     ("Bash(tr *)", "translate or delete characters, read-only"),
     ("Bash(cut *)", "extract fields from input, read-only"),
-    // Moved out of SHIPPED_POSTURE_DENY (2026-08-24, primary acceptance
-    // criterion): fetching a URL is everyday dev work -- checking an API,
-    // downloading a fixture -- and denying the tool wholesale is exactly the
-    // over-blocking this round exists to remove. The real danger, a download
-    // piped straight into a shell, is denied on its own below.
+    // URL fetches are ordinary work; executing a downloaded script is denied below.
     (
         "Bash(curl *)",
         "fetch a URL; piping into a shell is denied below",
@@ -345,9 +169,7 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
         "Bash(wget *)",
         "fetch a URL; piping into a shell is denied below",
     ),
-    // Fix round 6 (2026-09-16, issue tracked in docs/superpowers/2026-09-16-
-    // builtin-safe-command-policy.md, Change 2) -- see this constant's own
-    // doc comment for the "worker capability list" framing.
+    // These entries are worker capabilities, not an exhaustive command allowlist.
     (
         "Bash(glab *)",
         "the GitLab CLI; resolves a real asymmetry with `Bash(gh *)` above -- \
@@ -418,23 +240,7 @@ pub const SHIPPED_POSTURE_ALLOW: &[(&str, &str)] = &[
     ("Bash(realpath *)", "resolve a path, read-only"),
 ];
 
-/// Projects the operator's scratchpad temp directory into the two claude
-/// permission rules that make it usable under `dontAsk` -- computed at
-/// launch (2026-08-23, issue #104) inside `ClaudeAdapter::
-/// default_sandbox_args` rather than baked into [`SHIPPED_POSTURE_ALLOW`],
-/// since the path is per-machine and that constant has to stay `&'static`.
-///
-/// Claude Code's absolute-path rule form is a *doubled* leading slash
-/// (`//<path>`, the same convention `SHIPPED_POSTURE_ALLOW`'s own doc
-/// comment cites live findings against). `temp_dir` is normalized to
-/// forward slashes, any trailing slash is removed, then **one** leading
-/// slash (if the path already had one, e.g. a Unix absolute path) is
-/// stripped before the `//` prefix is added -- so the result always has
-/// exactly two leading slashes, never three. A Windows path with no leading
-/// slash of its own (a drive letter) is unaffected by the strip:
-/// `C:\Users\x\AppData\Local\Temp\` becomes
-/// `//C:/Users/x/AppData/Local/Temp/claude/**`; a Unix `/tmp` base with UID
-/// 501 becomes `//tmp/claude-501/**`, not `///tmp/claude-501/**`.
+/// Project the operator scratchpad at launch because its machine-specific path cannot be a static allow rule. (#104)
 pub(crate) fn scratchpad_rules(temp_dir: &Path) -> Vec<String> {
     scratchpad_rules_from_roots(&scratchpad_roots(temp_dir))
 }
@@ -537,45 +343,7 @@ pub(crate) fn scratchpad_roots_for(
     roots
 }
 
-/// The destructive families this posture denies regardless of anything on
-/// [`SHIPPED_POSTURE_ALLOW`] -- verified live to win over a broader,
-/// overlapping allow entry (see that constant's own doc comment).
-///
-/// **Fix round 4 additions (2026-08-23, issue #104):** `Edit(~/.zirv/**)`
-/// (a session must never widen its own posture -- `Read(~/.zirv/**)` is
-/// allowed above, editing it is not) and `Read(~/.claude/.credentials.json)`
-/// (the harness's own stored OAuth credentials, alongside the harness dirs
-/// newly allowed above) -- both non-`Bash` entries, declared first so the
-/// claude projection can prepend them the same way it prepends
-/// [`SHIPPED_POSTURE_ALLOW`]'s own non-`Bash` entries, see `ClaudeAdapter::
-/// default_sandbox_args`. Plus the destructive halves of the toolchain
-/// families [`SHIPPED_POSTURE_ALLOW`] widened to whole `Bash(<tool> *)`
-/// entries: `cargo publish *`/`npm publish *` (irreversible), `gh repo
-/// delete *`/`gh release delete *`/`gh auth *`, `git clean *`, `git push
-/// --delete *`. A trailing `" *"` denies the bare invocation too, not only
-/// one carrying flags (issue #106's `glob_match` fix -- a claude `Bash(<x>
-/// *)` rule is documented to match the bare `<x>` as well).
-///
-/// **Fix round 5 (2026-08-23, issue #111): argument-reordering and
-/// sibling-utility bypasses.** PR #107's review found the round-4 `git
-/// push`/`git reset` entries were flag-anchored (`Bash(git push --force *)`)
-/// and so matched only when the dangerous flag came first -- `git push
-/// origin --force` slipped through untouched, as did the short-flag
-/// spellings (`-f`, `-d`), an empty-src refspec delete (`git push origin
-/// :branch`), and a force-refspec push (`git push origin +branch`). Those
-/// entries are replaced with mid-string-wildcard patterns below (`glob_
-/// match` already supports `*` anywhere, not only as a suffix). `find`'s
-/// own `-delete`/`-exec`/`-ok` actions, and the credential-path reads
-/// `head`/`tail`/`diff` can perform just as well as the already-denied
-/// `cat`, are closed the same way, plus three `gh` escapes (`gh api -X
-/// DELETE`, `gh secret`, `gh codespace ssh`). **With arbitrary-code
-/// toolchains (`python *`, `node *`, ...) allowed by
-/// [`SHIPPED_POSTURE_ALLOW`], this list is a tripwire for named
-/// destructive/credential command families, not a security boundary** -- a
-/// session can always reach the same effect through an interpreter one-liner
-/// this list cannot enumerate in advance; the README already frames the
-/// shipped posture as an honest partial, and this round narrows the gap
-/// without pretending to close it.
+/// Deny named destructive commands and protected file access regardless of broader allows; interpreter access makes this a tripwire, not a complete boundary. (#104, #111)
 pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     (
         "Edit(~/.zirv/**)",
@@ -585,11 +353,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Read(~/.claude/.credentials.json)",
         "the harness's own stored OAuth credentials",
     ),
-    // Self-destructive (2026-08-24): this session itself runs under zirv, so
-    // killing a zirv process kills the supervisor that would have asked the
-    // question. `evaluate_single` walks the whole deny list before it looks
-    // at ask at all, so these beat the broad `taskkill *`/`rm -rf *` entries
-    // in SHIPPED_POSTURE_ASK with no ordering rule needed.
+    // Deny killing zirv before evaluating the broader ask rule: it would kill this supervisor.
     ("Bash(taskkill*zirv*)", "kills the supervising zirv session"),
     (
         "Bash(Stop-Process*zirv*)",
@@ -609,10 +373,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Bash(Remove-Item*zirv*)",
         "destroys zirv's own state or operator layer, PowerShell spelling",
     ),
-    // The actual danger `curl`/`wget` were denied wholesale for, now denied
-    // precisely instead: a remote download executed as a shell script. These
-    // are whole-string patterns, matched against the raw command -- which
-    // `evaluate` always checks as its first candidate.
+    // Deny downloads piped into a shell using whole-command patterns.
     (
         "Bash(* | sh)",
         "a remote download executed as a shell script",
@@ -640,12 +401,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Bash(security *)",
         "macOS keychain CLI; reads stored credentials",
     ),
-    // Credential-path reads (2026-08-22, fix round 3): the allow list never
-    // grants a broad `cat`/`Bash`, so these were already denied by
-    // omission -- explicit here so the guarantee does not rest on that
-    // remaining true as the allow list grows. A mid-string wildcard was
-    // verified live to be honored (`Bash(cat *.aws*)` denied `cat
-    // .aws/credentials`), not assumed from the prefix-only doc example.
+    // Explicitly deny protected path reads even if the allow list later grows; mid-string globs match reordered arguments.
     (
         "Bash(cat *credentials*)",
         "reads a file conventionally named for stored credentials",
@@ -653,9 +409,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(cat *.aws*)", "reads AWS credential files"),
     ("Bash(cat *.ssh*)", "reads SSH private keys"),
     ("Bash(cat *.netrc*)", "reads stored HTTP credentials"),
-    // Credential-path reads, head/tail/diff parity (2026-08-23, issue
-    // #111): `head`/`tail`/`diff` can read the same credential paths `cat`
-    // can, and were not covered by the `cat`-anchored entries above.
+    // Apply protected-path denies to head, tail, and diff as well as cat. (#111)
     (
         "Bash(head *credentials*)",
         "reads a file conventionally named for stored credentials",
@@ -691,7 +445,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "Bash(gh auth *)",
         "changes or reveals the operator's own GitHub authentication",
     ),
-    // gh escapes (2026-08-23, issue #111).
+    // Deny alternate gh paths to destructive effects. (#111)
     (
         "Bash(gh api*DELETE*)",
         "covers both -X DELETE and --method DELETE",
@@ -700,35 +454,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
     ("Bash(gh codespace ssh*)", "opens a shell into a codespace"),
 ];
 
-/// The short, closed list of families zirv's shipped posture wants a HUMAN to
-/// see before they run (2026-08-24, cross-harness permissions design).
-///
-/// **This list is deliberately narrow, and adding to it is a product
-/// decision, not a hardening reflex.** The primary acceptance criterion is
-/// that an everyday dev command -- and a command zirv has never seen -- never
-/// prompts. Every entry here is a prompt an operator will actually be
-/// interrupted by, so the bar for membership is "genuinely dangerous and
-/// hard to undo", not "mutates something". `cargo build`, `npm install`,
-/// `git commit`, `mkdir`, an in-repo file write, a plain `curl` and an
-/// unrecognised tool are all `Allow`, and must stay that way -- pinned by
-/// `the_product_requirement_no_everyday_or_novel_command_ever_prompts` in
-/// `safety.rs`.
-///
-/// **Split from [`SHIPPED_POSTURE_DENY`] by reversibility, not by danger.**
-/// `git push --force` is recoverable from a reflog and `rm -rf ./target`
-/// from a rebuild, so both ask. `cargo publish` is irreversible and
-/// `cat ~/.ssh/id_rsa` has already leaked by the time anyone sees the
-/// prompt, so both stay denied.
-///
-/// **Deny still wins**: `safety::evaluate_single` walks deny before ask, so
-/// the specific `Bash(taskkill*zirv*)` deny beats the broad
-/// `Bash(taskkill *)` ask here with no ordering rule of its own.
-///
-/// Projected differently per launch mode: claude's INTERACTIVE argv leaves
-/// these off `--allowedTools`, so the safety hook's `"ask"` decision is what
-/// prompts on them; claude's HEADLESS argv folds them into
-/// `--disallowedTools` alongside the deny set, since nobody is present to
-/// answer (see `ClaudeAdapter::default_sandbox_args`).
+/// Ask only for dangerous, recoverable actions; deny wins first, and unattended launches refuse asks. Ordinary and unknown commands stay prompt-free.
 pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
     ("Bash(rm -rf *)", "recursive force-delete"),
     (
@@ -771,17 +497,7 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
         "Bash(git reset*--hard*)",
         "destroys uncommitted work and can discard commits, any argument position",
     ),
-    // Issue #306: `rebase` and `clean` no longer have a blanket glob entry
-    // here -- unlike a bare glob, both need to inspect ARGUMENTS to tell a
-    // genuinely dangerous invocation from routine, local, agent-scoped work
-    // (a non-interactive `rebase`; a pathed `clean -f...` that names an
-    // explicit target and does not also remove gitignored files). That
-    // per-argument judgment is `safety::is_destructive_vcs_action`'s job,
-    // not a glob's -- it already owns the identical judgment for `checkout`/
-    // `restore`/`worktree remove`/`branch -D`/`stash drop`/`clear`/`reflog
-    // expire`/`delete`/`gc --prune`, none of which have a blanket entry
-    // here either. `filter-branch` keeps its own blanket entry: it rewrites
-    // history unconditionally, with no narrower form to allow.
+    // Inspect rebase and clean arguments before asking; routine local forms do not need a blanket prompt. (#306)
     ("Bash(git filter-branch *)", "rewrites commit history"),
     // These three glob entries name the most common shapes literally; the
     // general case -- ANY `find -exec`/`-ok`/`-execdir`/`-okdir` action that
@@ -835,34 +551,14 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
     ("Bash(reboot*)", "restarts the machine"),
 ];
 
-/// `AgentAdapter::read_only_args`/`interactive_read_only_args` for a
-/// registered adapter name, without requiring that adapter to be enabled or
-/// ready -- the same static-fact lookup through `ADAPTERS` that
-/// `provider_for_agent_name` does. `None` for an unknown name, so a caller
-/// that must not launch an unpinned child can refuse rather than guess an
-/// empty restriction.
-///
-/// `mode` picks which of the two floors applies: bug fix (2026-09-06),
-/// `dash::worker_pane_extra_args` used to call this with no mode at all and
-/// always got the `exec`-only floor, which carried codex's `--ignore-rules`/
-/// `--ignore-user-config` onto an interactive pane launch that rejects both
-/// -- see `AgentAdapter::interactive_read_only_args`'s own doc comment.
+/// Resolve a registered adapter's structural read-only flags without needing it installed; unknown names remain `None` so callers can refuse.
 pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec<String>> {
     ADAPTERS
         .iter()
         .find(|(adapter_name, _)| *adapter_name == name)
         .map(|(_, ctor)| {
             let adapter = ctor(None);
-            // Issue #89: the workflow reviewer's own choke point for
-            // resolving a read-only pin by name -- a sibling call site to
-            // the ones production callers make directly around `handoff::
-            // run_model` for the distiller role. `chrome.events` is not
-            // known at this call site (no `CtxConfig` in hand), so this
-            // defaults to enabled, matching this function's own pre-
-            // existing "no config, no repo" shape; `reviewer_args`'s own
-            // caller may still be running under `ZIRV_CTX_QUIET`, which
-            // `Announcer` itself does not re-check here -- see the
-            // documented residual on `announce_sandbox_residual_once`.
+            // Resolve the reviewer's structural read-only pin before launch; absent config uses the normal static default. (#89)
             announce_sandbox_residual_once(adapter.as_ref(), true);
             if mode.is_interactive() {
                 adapter.interactive_read_only_args()
@@ -977,43 +673,9 @@ pub fn policy_launch_args(
     policy_launch_args_for_surface(cfg, adapter, flags, mode, mode, role)
 }
 
-/// The general form of [`policy_launch_args`] above, for the one caller
-/// whose approval-permissiveness signal and actual CLI launch surface can
-/// diverge: a dashboard pane (`dash::worker_pane_extra_args`, review round,
-/// issue #326) always launches through [`AgentAdapter::interactive_cmd`] --
-/// `SpawnRequest::interactive` never gates that choice, only whether this
-/// pane gets the permissive interactive approval posture or the fail-closed
-/// headless one (issue #230 finding 10). Every OTHER real-launch seam this
-/// module's own doc comment above lists passes one `mode` that already
-/// equals its real launch surface (`agent.rs`/`exec.rs`/`run_loop.rs` are
-/// always headless-launched; `chat.rs`/`wrap.rs`/`handover.rs` always
-/// interactive-launched), so `policy_launch_args` above still passes the
-/// same `mode` to both halves for them -- this split only matters for the
-/// one caller where it doesn't hold.
-///
-/// `approval_mode` feeds `default_sandbox_args` (and nothing else): its own
-/// argv is safe under either `LaunchMode` value regardless of the REAL
-/// surface -- `--ask-for-approval`/`--approve-for-me`/`-c approval_policy=`
-/// are all verified present on both codex's top-level interactive launch
-/// and `codex exec` (see `CodexAdapter::approval_suppression_args`'s own
-/// doc comment) -- so it is safe, and correct, to keep it driven by
-/// `SpawnRequest::interactive`'s fail-closed signal.
-///
-/// `surface_mode` feeds `policy_args`, because THAT is where a genuinely
-/// surface-unsafe choice lives: `CodexAdapter::policy_args`'s Deny-stance
-/// branch picks between `read_only_args()` (exec-only `--ignore-rules
-/// --ignore-user-config`, safe only on `codex exec`) and
-/// `interactive_read_only_args()` (never those two, safe on codex's
-/// top-level interactive launch too) -- see `AgentAdapter::
-/// interactive_read_only_args`'s own doc comment. Passing a `Headless`
-/// approval-permissiveness signal in as `surface_mode` too, for a
-/// `SpawnRequest { interactive: false, .. }` that is nonetheless fulfilled
-/// as a real interactive pane (an ordinary `zirv ctx agent` dispatch, which
-/// never claims `interactive` since it cannot vouch a human is watching the
-/// dashboard that might pick the request up -- `agent.rs`'s own doc comment
-/// on that field), reproduced the exact "pane exited with code 2" crash
-/// this whole fix exists to close, just through the canonical `[policy]`
-/// `Deny` stance instead of `--mode read-only`'s own floor.
+/// Separate approval posture from the actual CLI surface for dashboard panes: an unattended interactive pane must use interactive-safe read-only flags. (#326)
+/// `approval_mode` feeds `default_sandbox_args`, safe under either value; `surface_mode`
+/// feeds `policy_args`, where a codex Deny-stance projection is genuinely surface-unsafe.
 pub fn policy_launch_args_for_surface(
     cfg: &CtxConfig,
     adapter: &(impl AgentAdapter + ?Sized),
