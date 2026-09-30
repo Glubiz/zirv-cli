@@ -758,10 +758,12 @@ pub(super) fn report_stalled_compaction(
         return;
     };
     let body = format!(
-        "pane {} ({}, {}) {reason}, no output for {quiet_mins} min; restart or resume it",
+        "pane {} ({}, {}) {}, with no status change for {quiet_mins} min (a long silent \
+         command looks the same); restart or resume it if it is wedged",
         pane.short(),
         pane.agent(),
-        pane.cwd().display()
+        pane.cwd().display(),
+        super::attention::reason(&status),
     );
     if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
         push_error(errors, format!("stalled report: {error}"));
@@ -2912,10 +2914,18 @@ mod tests {
         let messages = inbox(&state);
         assert_eq!(messages.len(), 1, "exactly one report, not one per tick");
         let body = &messages[0].1.body;
-        assert!(body.contains("stalled after compaction"), "got {body}");
+        assert!(!body.contains("stalled after compaction"), "got {body}");
         assert!(body.contains("compacting since"), "got {body}");
-        assert!(body.contains("no output for 18 min"), "got {body}");
-        assert!(body.contains("restart or resume it"), "got {body}");
+        assert!(
+            body.contains(
+                "with no status change for 18 min (a long silent command looks the same)"
+            ),
+            "got {body}"
+        );
+        assert!(
+            body.contains("restart or resume it if it is wedged"),
+            "got {body}"
+        );
         let status = super::super::attention::load(&state, pane.short());
         assert_eq!(
             status.attention,
