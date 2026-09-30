@@ -1102,7 +1102,7 @@ to the section that documents it in depth.
   value), and the endpoint and model in use, plus a per-site usage rollup
   (calls, cache-hit rate, p50/p95 latency, error count, and effect size —
   bytes removed / rows changed) over the last 7 days, folded read-only from
-  `jev-decisions.jsonl` and `jev-effects.jsonl`. See [Harness
+  `jev-decisions.jsonl` and `jev-effects.jsonl` (`jev-session-aliases.jsonl` maps a launch's pre-minted session to the persistent-runtime session it became, so a session-scoped rollup still counts its intake rows). See [Harness
   proxy](#harness-proxy).
 - **Configured capabilities** — `capabilities` reports every non-shell
   integration a native session can use — MCP servers, web search/fetch,

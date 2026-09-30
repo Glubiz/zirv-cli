@@ -1104,6 +1104,9 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
 
 const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
+/// `{ts, from, to}` rows naming a launch's pre-minted session (`from`) that became another
+/// session (`to`); a separate file so decision-log readers never see a non-decision row (#827).
+const JEV_ALIASES_FILE: &str = "jev-session-aliases.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` prices the spend row
 /// on -- see `catalogue.rs`'s `typesafe` vendor. Every `[jev]`-gated site
 /// spends through the same vendor as the harness proxy, regardless of which
@@ -1230,6 +1233,42 @@ pub(crate) fn record_decision_row(
         let _ = writeln!(file, "{line}");
     }
     (ts, session, principal)
+}
+
+/// Record that rows written under `from` belong to `to`, e.g. intake rows written under the id a
+/// launch minted before the persistent runtime chose its own. Best-effort like every recorder.
+pub(crate) fn record_session_alias(state: &StateDir, from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    let row = serde_json::json!({"ts": state::now_secs(), "from": from, "to": to});
+    if state::create_private_dir_all(state.root()).is_ok()
+        && let Ok(mut file) = state::open_private_append(&state.root().join(JEV_ALIASES_FILE))
+    {
+        let _ = writeln!(file, "{row}");
+    }
+}
+
+/// Every alias `from` whose `to` satisfies `is_target` (one hop). A missing file or torn line
+/// contributes nothing.
+pub(crate) fn alias_sources(state: &StateDir, is_target: impl Fn(&str) -> bool) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(state.root().join(JEV_ALIASES_FILE)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| match (row["from"].as_str(), row["to"].as_str()) {
+            (Some(from), Some(to)) if is_target(to) => Some(from.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `sessions` plus every alias `from` whose `to` is in it.
+fn with_aliases(state: &StateDir, sessions: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut expanded = sessions.clone();
+    expanded.extend(alias_sources(state, |to| sessions.contains(to)));
+    expanded
 }
 
 /// Record decision and spend together so usage remains attributable to the verdict.
@@ -1531,7 +1570,8 @@ pub(crate) fn usage_rollup(
 ) -> JevRollup {
     let now = state::now_secs();
     let cutoff = now.saturating_sub(window_secs);
-    let in_scope = |session: &str| sessions.is_none_or(|set| set.contains(session));
+    let scope = sessions.map(|set| with_aliases(state, set));
+    let in_scope = |session: &str| scope.as_ref().is_none_or(|set| set.contains(session));
     let mut builders: BTreeMap<String, JevSiteUsageBuilder> = BTreeMap::new();
     let mut last_call: Option<JevLastCall> = None;
     let mut recent_errors: Vec<JevErrorEntry> = Vec::new();
@@ -3785,5 +3825,51 @@ pub(crate) mod tests {
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p50"], 200);
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p95"], 300);
         assert!(value["gates"]["memory"].as_bool().unwrap());
+    }
+
+    /// #827: intake rows written under a launch's pre-minted session count for the runtime
+    /// session it became once an alias exists, and for nobody before.
+    #[test]
+    fn usage_rollup_counts_rows_under_an_aliased_session_only_once_aliased() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+        std::fs::write(
+            state.root().join("jev-decisions.jsonl"),
+            format!(
+                "{{\"site\":\"intake\",\"ts\":{now},\"wall_ms\":1,\"cached\":false,\"fallbacks\":[],\"session\":\"minted\"}}\n"
+            ),
+        )
+        .expect("write decisions");
+        let runtime: BTreeSet<String> = ["runtime".to_string()].into();
+        let calls = |state: &StateDir| {
+            usage_rollup(state, ROLLUP_WINDOW_SECS, Some(&runtime))
+                .sites
+                .get("intake")
+                .map_or(0, |usage| usage.calls)
+        };
+
+        assert_eq!(
+            calls(&state),
+            0,
+            "no alias: the minted session is not the runtime's"
+        );
+        record_session_alias(&state, "minted", "runtime");
+        assert_eq!(calls(&state), 1);
+    }
+
+    /// #827: the alias is written only when the runtime chose a different id.
+    #[test]
+    fn session_alias_is_written_only_when_the_ids_differ() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        record_session_alias(&state, "same", "same");
+        assert!(!dir.path().join("jev-session-aliases.jsonl").exists());
+        record_session_alias(&state, "minted", "runtime");
+        let text = std::fs::read_to_string(dir.path().join("jev-session-aliases.jsonl"))
+            .expect("alias row");
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("\"from\":\"minted\"") && text.contains("\"to\":\"runtime\""));
     }
 }

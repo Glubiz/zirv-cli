@@ -389,6 +389,7 @@ fn run_attach<W: Write>(args: &AttachArgs, state: &StateDir, w: &mut W) -> CtxRe
         !args.observer,
         args.takeover,
         w,
+        || {},
     )?;
     match outcome {
         client::AttachOutcome::Detached => writeln!(
@@ -576,6 +577,7 @@ const SERVICE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Every step is an ordinary protocol v1 call: `session.snapshot` to find an
 /// existing seat for this repository, `session.start` to open one, then the
 /// attachment surface. Nothing about this path is private to `zirv chat`.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_via_runtime<W: Write>(
     state: &StateDir,
     agent: &str,
@@ -584,6 +586,7 @@ pub fn chat_via_runtime<W: Write>(
     repo: &std::path::Path,
     w: &mut W,
     role: super::prompt::PromptRole,
+    on_attached: impl FnOnce(&str),
 ) -> CtxResult<i32> {
     let endpoint = endpoint_for(state);
     if !super::api::transport::probe(&endpoint) {
@@ -621,7 +624,9 @@ pub fn chat_via_runtime<W: Write>(
         }
     };
     let name = client::client_id("chat");
-    let outcome = client::attach_terminal(&mut client, &session_id, &name, true, false, w)?;
+    let outcome = client::attach_terminal(&mut client, &session_id, &name, true, false, w, || {
+        on_attached(&session_id)
+    })?;
     match outcome {
         client::AttachOutcome::Detached => writeln!(
             w,

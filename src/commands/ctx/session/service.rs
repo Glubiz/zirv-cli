@@ -1003,4 +1003,31 @@ mod tests {
 
         service.shutdown(false);
     }
+    /// #827: a refused attach never runs `on_attached`, so no Jev alias is recorded for a session
+    /// the chat did not end up in.
+    #[test]
+    fn a_refused_attach_never_runs_the_on_attached_callback() {
+        use super::super::super::api::client::Client;
+
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let cfg = config(tmp.path());
+        let service = RuntimeService::start(state, "default", &cfg).expect("start");
+        let mut client = Client::connect(service.endpoint()).expect("connect");
+        let mut called = false;
+        let outcome = super::super::client::attach_terminal(
+            &mut client,
+            "no-such-session",
+            "c1",
+            true,
+            false,
+            &mut Vec::new(),
+            || called = true,
+        );
+        assert!(outcome.is_err());
+        assert!(!called);
+        service.shutdown(true);
+    }
 }
