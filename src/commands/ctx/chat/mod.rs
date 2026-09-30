@@ -341,6 +341,14 @@ fn proxy_intake(
     }
 }
 
+/// Count intake rows written under `minted` toward the runtime session the chat attached to, when
+/// Jev is active at all (#827).
+fn alias_when_jev_active(cfg: &CtxConfig, state: &StateDir, minted: &str, attached: &str) {
+    if super::jev::any_gate_enabled(&cfg.jev) && super::jev::credential_present(cfg) {
+        super::jev::record_session_alias(state, minted, attached);
+    }
+}
+
 /// Purely apply the decided harness/model through shared launch fields so argv and disclosures agree.
 fn apply_proxy_decision(cfg: &mut CtxConfig, decision: &ProxyDecision) -> String {
     cfg.chat.model = Some(decision.orchestrator.model.clone());
@@ -823,6 +831,7 @@ pub fn run_with<W: Write, E: Write>(
             repo,
             w,
             launch.role,
+            |attached| alias_when_jev_active(&cfg, &state, session.as_str(), attached),
         ) {
             Ok(code) => return Ok(code),
             Err(error) => writeln!(
@@ -4123,5 +4132,14 @@ mod tests {
             "must name why and which workflow is already active: {}",
             announced[0]
         );
+    }
+    /// #827: with every `[jev]` gate off the runtime route must not create the alias file.
+    #[test]
+    fn gates_off_the_runtime_route_writes_no_session_alias() {
+        let cfg = CtxConfig::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        alias_when_jev_active(&cfg, &state, "minted", "runtime");
+        assert!(!dir.path().join("jev-session-aliases.jsonl").exists());
     }
 }

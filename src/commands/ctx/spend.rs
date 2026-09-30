@@ -382,9 +382,23 @@ pub fn run_with<W: Write>(
     // No cap: `zirv ctx spend` reads the whole ledger, unlike `status`'s own
     // bounded tail -- an aggregate over only the newest N rows would silently
     // under-report an operator's own total spend.
+    // Rows written under a launch's pre-minted session (Jev intake) belong to the runtime session
+    // it became, so `--session` also matches those (#827).
+    let aliased = args.session.as_ref().map_or_else(Vec::new, |target| {
+        super::jev::alias_sources(state, |to| {
+            to == target || sessions::short_id(to) == *target
+        })
+    });
+    let unscoped = SpendArgs {
+        session: None,
+        ..args.clone()
+    };
     let rows: Vec<DelegationRow> = super::log::read_delegations(state, usize::MAX)
         .into_iter()
-        .filter(|row| matches_filters(row, args, now))
+        .filter(|row| {
+            matches_filters(row, args, now)
+                || (aliased.contains(&row.session) && matches_filters(row, &unscoped, now))
+        })
         .collect();
 
     let table = price::resolve_table(cfg);
@@ -839,5 +853,59 @@ mod tests {
         assert_eq!(parse_since("999999999999999d"), None);
         assert_eq!(parse_since("18446744073709551615h"), None);
         assert_eq!(parse_since("24h"), Some(86_400));
+    }
+    /// #827: `--session <runtime id>` also counts spend rows written under the pre-minted session
+    /// that became it.
+    #[test]
+    fn session_filter_counts_rows_under_an_aliased_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        for session in ["minted", "other"] {
+            crate::commands::ctx::log::append_delegation(
+                &state,
+                &crate::commands::ctx::log::Delegation {
+                    ts: 1_700_000_000,
+                    session,
+                    parent_session: "",
+                    work_group_id: None,
+                    agent: "claude",
+                    model: Some("sonnet"),
+                    input_tokens: 1_000_000,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                    wall_ms: 1_000,
+                    exit_code: 0,
+                    outcome: "ok",
+                    mode: None,
+                    task_class: None,
+                    principal: "root",
+                    envelope_sha256: None,
+                },
+            )
+            .expect("append");
+        }
+        crate::commands::ctx::jev::record_session_alias(&state, "minted", "runtime");
+        let args = SpendArgs {
+            session: Some("runtime".to_string()),
+            group: None,
+            since: None,
+            by: SpendDimension::Harness,
+            json: false,
+        };
+        let mut out = Vec::new();
+        run_with(
+            &state,
+            &CtxConfig::default(),
+            &args,
+            &mut out,
+            1_700_000_100,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("$3.00"),
+            "only the aliased row counts: {text}"
+        );
     }
 }

@@ -193,6 +193,9 @@ pub enum AttachOutcome {
 /// The session is never touched on the way out: [`AttachOutcome::Detached`]
 /// calls `session.detach`, which by construction moves one entry in the
 /// runtime's attachment table and nothing else.
+///
+/// `on_attached` runs once the attachment is established (after the observer fallback too),
+/// right before the interactive loop; a refused attach never calls it.
 pub fn attach_terminal<W: Write>(
     client: &mut Client,
     session_id: &str,
@@ -200,6 +203,7 @@ pub fn attach_terminal<W: Write>(
     controller: bool,
     takeover: bool,
     notes: &mut W,
+    on_attached: impl FnOnce(),
 ) -> CtxResult<AttachOutcome> {
     let (cols, rows) = crossterm::terminal::size()
         .unwrap_or((super::host::DEFAULT_COLS, super::host::DEFAULT_ROWS));
@@ -253,6 +257,7 @@ pub fn attach_terminal<W: Write>(
         Err(error) => return Err(error),
     }
 
+    on_attached();
     let outcome = run_attached(client, session_id, client_name, controlling);
     // Detach on EVERY exit path, including an error one: a client that went
     // away without saying so would leave a ghost in the attachment table
