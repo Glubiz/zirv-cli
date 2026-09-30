@@ -1130,6 +1130,29 @@ fn directed_paths_for(
         .collect()
 }
 
+/// Issue #829: mail filed without a delivery envelope (a hand-written or
+/// supervisor-written file) sits in the mailbox root of the repo the session
+/// registered from, which the dashboard counts but a reader whose cwd slugs
+/// differently never scanned. Only files whose `To-session` names `short`
+/// are returned, so undirected mail of that mailbox stays out of this scope.
+fn registered_root_paths_for(state: &StateDir, short: &str, cwd_mailbox: &Path) -> Vec<PathBuf> {
+    let Some(record) = sessions::load_record(state, short) else {
+        return Vec::new();
+    };
+    let mailbox = state.mail().join(state::repo_slug_read_only(&record.repo));
+    if mailbox == cwd_mailbox {
+        return Vec::new();
+    }
+    scan_md_files(&mailbox)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|text| parse_markdown(&text).to_session.as_deref() == Some(short))
+        })
+        .collect()
+}
+
 /// A worker's directed report remains evidence after the recipient reads it.
 pub(super) fn sent_since(
     state: &StateDir,
@@ -1177,6 +1200,7 @@ pub fn list(
     };
     if let Some(short) = for_session {
         paths.extend(directed_paths_for(state, short, &envelopes));
+        paths.extend(registered_root_paths_for(state, short, &dir));
         // Still oldest first across mailboxes: what sorts chronologically is
         // the zero-padded seconds prefix `store_into` names a file with, not
         // the slug directory above it. The full path breaks a tie so the
@@ -5028,6 +5052,174 @@ This is part of the body too.\n";
             1,
             "the undirected message is untouched in its own mailbox"
         );
+    }
+
+    /// Issue #829 fixture: a session registered from `main_repo`, plus the
+    /// state dir and env an inbox read by that session needs.
+    struct RootMailFixture {
+        _tmp: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        _home_guard: crate::commands::ctx::testenv::HomeGuard,
+        _session_guard: sessions::SessionGuard,
+        state: StateDir,
+        main_repo: PathBuf,
+        other_cwd: PathBuf,
+        short: String,
+        mailbox: PathBuf,
+        env: std::collections::HashMap<String, String>,
+    }
+
+    impl RootMailFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tempfile::tempdir().expect("tempdir");
+            let home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+            let state_dir = tmp.path().join("state");
+            let state = StateDir::from_root(state_dir.clone());
+            let main_repo = tmp.path().join("main-repo");
+            let other_cwd = tmp.path().join("elsewhere");
+            let session = "abcdef12-3456-4789-8abc-def012345678";
+            let record = sessions::Record::new(session, "claude", &main_repo, sessions::Verb::Wrap);
+            let short = record.short.clone();
+            let session_guard = sessions::SessionGuard::register(&state, record);
+            let mailbox = state.mail().join(repo_slug(&main_repo));
+            std::fs::create_dir_all(&mailbox).expect("mailbox");
+            let mut env = env_map(&[(
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            )]);
+            env.insert(SESSION_ENV.to_string(), session.to_string());
+            env.insert(AGENT_ENV.to_string(), "claude".to_string());
+            Self {
+                _tmp: tmp,
+                _home: home,
+                _home_guard: home_guard,
+                _session_guard: session_guard,
+                state,
+                main_repo,
+                other_cwd,
+                short,
+                mailbox,
+                env,
+            }
+        }
+
+        /// A hand-written root-level file, no delivery envelope.
+        fn write_root_mail(&self, name: &str, to_session: Option<&str>, body: &str) {
+            let to_session = to_session
+                .map(|short| format!("- To-session: {short}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                self.mailbox.join(name),
+                format!(
+                    "## Message\n- From-session: 16caf931-f39b-4db3-a910-7443938b6987\n\
+                     - From-agent: codex\n- To: claude\n{to_session}- Sent: 1790758204\n\n{body}\n"
+                ),
+            )
+            .expect("write mail");
+        }
+
+        fn inbox_from(&self, cwd: &Path, peek: bool) -> String {
+            let mut out = Vec::new();
+            run_inbox_with(&inbox_args(peek), &mut out, cwd, &|k| {
+                self.env.get(k).cloned()
+            })
+            .expect("inbox");
+            String::from_utf8(out).expect("utf8")
+        }
+    }
+
+    /// Issue #829: a hand-written root-level file (no delivery envelope)
+    /// addressed `To-session: <short>` sits in the registered repo's mailbox.
+    /// The dashboard counts it; an inbox read from another cwd must return it.
+    #[test]
+    fn inbox_returns_every_root_file_the_unread_counter_counts() {
+        let fx = RootMailFixture::new();
+        fx.write_root_mail(
+            "1790758204-16caf931.md",
+            Some(&fx.short),
+            "root level reply",
+        );
+
+        assert_eq!(
+            unread_counts(&fx.state, &fx.main_repo, "claude", &fx.short, true),
+            Some((0, 1))
+        );
+        let printed = fx.inbox_from(&fx.other_cwd, false);
+        assert!(printed.contains("root level reply"), "{printed}");
+    }
+
+    /// Guard (passes without the fix too): another session's root file is
+    /// neither counted nor delivered, so the exact short-id match cannot leak.
+    #[test]
+    fn a_root_file_for_another_session_is_neither_counted_nor_delivered() {
+        let fx = RootMailFixture::new();
+        fx.write_root_mail(
+            "1790758204-16caf931.md",
+            Some("deadbeef"),
+            "someone elses mail",
+        );
+
+        assert_eq!(
+            unread_counts(&fx.state, &fx.main_repo, "claude", &fx.short, true),
+            Some((0, 0))
+        );
+        let printed = fx.inbox_from(&fx.other_cwd, false);
+        assert!(!printed.contains("someone elses mail"), "{printed}");
+        assert!(fx.mailbox.join("1790758204-16caf931.md").is_file());
+    }
+
+    /// Guard (passes without the fix too): undirected root mail of the
+    /// registered mailbox is not pulled into a reader with a different cwd.
+    #[test]
+    fn an_undirected_root_file_is_not_delivered_to_another_cwd() {
+        let fx = RootMailFixture::new();
+        fx.write_root_mail("1790758204-16caf931.md", None, "undirected note");
+
+        assert_eq!(
+            unread_counts(&fx.state, &fx.other_cwd, "claude", &fx.short, true),
+            Some((0, 0))
+        );
+        let printed = fx.inbox_from(&fx.other_cwd, false);
+        assert!(!printed.contains("undirected note"), "{printed}");
+    }
+
+    /// Guard (passes without the fix too): when the cwd mailbox IS the
+    /// registered mailbox, the root file is delivered exactly once, not twice.
+    #[test]
+    fn a_root_file_is_delivered_once_when_the_cwd_is_the_registered_repo() {
+        let fx = RootMailFixture::new();
+        fx.write_root_mail(
+            "1790758204-16caf931.md",
+            Some(&fx.short),
+            "same mailbox reply",
+        );
+
+        let printed = fx.inbox_from(&fx.main_repo, false);
+        assert_eq!(
+            printed.matches("same mailbox reply").count(),
+            1,
+            "{printed}"
+        );
+    }
+
+    /// Consuming a root file read from another cwd moves it into the
+    /// registered mailbox's own `read/`, not into the reader's.
+    #[test]
+    fn consuming_a_root_file_moves_it_into_its_own_mailboxs_read_dir() {
+        let fx = RootMailFixture::new();
+        fx.write_root_mail("1790758204-16caf931.md", Some(&fx.short), "consume me");
+
+        let printed = fx.inbox_from(&fx.other_cwd, false);
+        assert!(printed.contains("consume me"), "{printed}");
+        assert!(!fx.mailbox.join("1790758204-16caf931.md").exists());
+        assert!(
+            fx.mailbox
+                .join("read")
+                .join("1790758204-16caf931.md")
+                .is_file()
+        );
+        assert!(!fx.inbox_from(&fx.other_cwd, false).contains("consume me"));
     }
 
     /// Issue #219: a session registered from `main_repo` later reads its
