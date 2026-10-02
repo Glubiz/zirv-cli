@@ -519,21 +519,7 @@ fn run_with_clock_inner<W: Write>(
         }
         let stripped =
             super::sessions::secret_env::scrub_worker_env_cmd(command, &cfg, adapter.as_ref());
-        if !stripped.is_empty() {
-            let _ = log::append(
-                &state,
-                &log::Decision {
-                    ts: now_secs(),
-                    session: session.as_str(),
-                    verb: "exec",
-                    verdict: "n/a",
-                    score: 0,
-                    action: "scrub-env",
-                    detail: &format!("withheld from worker: {}", stripped.join(", ")),
-                    observed_at: None,
-                },
-            );
-        }
+        super::sessions::secret_env::log_withheld(&state, session.as_str(), "exec", &stripped);
     };
 
     // Windows cmd and PowerShell launchers reparse downstream argv; deliver

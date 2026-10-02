@@ -1123,24 +1123,8 @@ impl Pane {
         command.cwd(cwd);
 
         sessions::scrub_supervision_env(&mut command);
-        {
-            let stripped = scrub_worker_pane_env(&mut command, role, repo, &agent_name);
-            if !stripped.is_empty() {
-                let _ = super::super::log::append(
-                    state,
-                    &super::super::log::Decision {
-                        ts: super::super::state::now_secs(),
-                        session: &session_id,
-                        verb: "pane",
-                        verdict: "n/a",
-                        score: 0,
-                        action: "scrub-env",
-                        detail: &format!("withheld from worker: {}", stripped.join(", ")),
-                        observed_at: None,
-                    },
-                );
-            }
-        }
+        let stripped = scrub_worker_pane_env(&mut command, role, repo, &agent_name);
+        sessions::secret_env::log_withheld(state, &session_id, "pane", &stripped);
         // Derive launch mode from the same environment given to the child (#160).
         let launch_mode = if turn_env.iter().any(|(k, v)| {
             k == super::super::adapters::LAUNCH_MODE_ENV
@@ -2523,21 +2507,7 @@ impl Pane {
         sessions::scrub_supervision_env(&mut command);
         // A rolled-over worker must not get its secrets back.
         let stripped = scrub_worker_pane_env(&mut command, role, repo, &new_agent_name);
-        if !stripped.is_empty() {
-            let _ = super::super::log::append(
-                &self.state_dir,
-                &super::super::log::Decision {
-                    ts: super::super::state::now_secs(),
-                    session: &self.session_id,
-                    verb: "pane",
-                    verdict: "n/a",
-                    score: 0,
-                    action: "scrub-env",
-                    detail: &format!("withheld from worker: {}", stripped.join(", ")),
-                    observed_at: None,
-                },
-            );
-        }
+        sessions::secret_env::log_withheld(&self.state_dir, &self.session_id, "pane", &stripped);
         for (key, value) in &turn_env {
             command.env(key, value);
         }
