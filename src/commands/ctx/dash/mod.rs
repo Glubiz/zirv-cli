@@ -3631,7 +3631,7 @@ fn build_tree_facts<'a>(
                 short: short.clone(),
                 kind,
                 since: status.last_transition,
-                evidence: tree_view::capped_first_line(&status.evidence, 60),
+                evidence: tree_view::wait_evidence(&status.evidence),
             })
         })
         .collect();
