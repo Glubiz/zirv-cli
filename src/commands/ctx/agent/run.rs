@@ -662,6 +662,12 @@ pub fn run_with<W: Write>(
         route_applied = Some(route);
     }
 
+    // Re-check the rerouted adapter with its real args: availability is only a side-effect-free pre-check.
+    if !native && routed_args.mode == WorkerMode::ReadOnly {
+        let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
+        adapters::require_read_only_floor(adapter.as_ref(), adapters::LaunchMode::Headless)?;
+    }
+
     // Validate MCP requirements against the final routed adapter and materialize before either dispatch path can spawn.
     // Existing-checkout setup takes a writer permit; newly allocated worktrees are already exclusive.
     let _workspace_ready = if let Some(workspace) = selected_workspace {
