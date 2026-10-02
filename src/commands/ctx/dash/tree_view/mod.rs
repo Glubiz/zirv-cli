@@ -59,8 +59,6 @@ pub(super) use plan::Surface;
 
 /// Newest events kept from the merged log.
 const EVENTS_KEPT: usize = 50;
-/// A Jev call just before the seat registered still belongs to its first request.
-const JEV_SINCE_GRACE_SECS: u64 = 120;
 /// With no seat session the Jev box shows this much of the repository's recent past.
 const JEV_REPO_WINDOW_SECS: u64 = 12 * 3600;
 const ADVICE_CHARS: usize = 60;
@@ -297,7 +295,7 @@ pub(super) fn compute(
             })
         })
         .map_or(now_secs().saturating_sub(JEV_REPO_WINDOW_SECS), |start| {
-            start.saturating_sub(JEV_SINCE_GRACE_SECS)
+            start.saturating_sub(super::super::jev_feed::INTAKE_GRACE_SECS)
         });
     TreeData {
         loaded: true,
