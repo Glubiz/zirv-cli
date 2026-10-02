@@ -603,7 +603,6 @@ pub(super) struct TreeFacts<'a> {
     pub(super) seat_role: Option<&'a str>,
     pub(super) seat_session: Option<&'a str>,
     pub(super) rot: Option<u32>,
-    pub(super) spend_micros: Option<u64>,
     pub(super) jev: Option<&'a JevSectionFact>,
     /// The repository's active workflow, from the dashboard's cache.
     pub(super) workflow: Option<&'a ActiveWorkflowSummary>,
@@ -866,7 +865,6 @@ mod testkit {
                         text: "claude sonnet".into(),
                         confidence: 0.87,
                         sure: true,
-                        cost_usd: 0.0021,
                         cached: false,
                     },
                     content::JevRow {
@@ -876,7 +874,6 @@ mod testkit {
                         text: "seat decides".into(),
                         confidence: 0.12,
                         sure: false,
-                        cost_usd: 0.0,
                         cached: true,
                     },
                 ],
@@ -1021,7 +1018,6 @@ mod testkit {
             seat_role: Some("orchestrator"),
             seat_session: Some("seat-1"),
             rot: Some(18),
-            spend_micros: Some(3_100_000),
             jev,
             workflow: None,
             approvals: 0,

@@ -473,17 +473,15 @@ fn jev_box(
     }
     s.grid.text(tx, y, "\u{b7} decisions ", c::FAINT);
     let today = jev_today(ctx, feed);
-    let cost: f64 = today.iter().map(|j| j.cost_usd).sum();
     let sites = if feed.sites.is_empty() {
         "proxy on".to_string()
     } else {
         format!("{} sites on", feed.sites.len())
     };
-    // The seat's line meets the top border at `cx`: the summary gives up its cost, then its
-    // "today", before it would run over it.
+    // The seat's line meets the top border at `cx`: the summary gives up its "today" before it
+    // would run over it.
     let calls = today.len();
     let candidates = [
-        (cost > 0.0).then(|| format!(" {sites} \u{b7} {calls} calls today \u{b7} ${cost:.4} ")),
         Some(format!(" {sites} \u{b7} {calls} calls today ")),
         Some(format!(" {sites} \u{b7} {calls} calls ")),
     ];

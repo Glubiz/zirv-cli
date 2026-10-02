@@ -1177,7 +1177,6 @@ mod tests {
             "effort \u{25ae}\u{25ae}\u{25ae}\u{25af} high",
             "$15 / $75 per 1M",
             "rot 0.18",
-            "$3.10 session",
             "JEV \u{b7} decisions",
             "calls 214",
             "dispatch tier",
@@ -1198,6 +1197,10 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
         assert!(!text.contains('\u{1b}'), "control characters are stripped");
+        assert!(
+            !text.contains("spend") && !text.contains("3.10"),
+            "no spend in the tree view:\n{text}"
+        );
         // The seat is a card, not an agent box.
         assert_eq!(text.matches("orchestrator").count(), 1, "{text}");
     }
@@ -1557,10 +1560,7 @@ mod tests {
     #[test]
     fn the_footer_shows_an_approvals_count_only_while_something_is_pending() {
         let idle = content::footer_label(&TreeData::default(), &facts(None));
-        assert_eq!(
-            idle,
-            " agents [3/6]   supervisor [off]   jev [off]   spend [$3.10]"
-        );
+        assert_eq!(idle, " agents [3/6]   supervisor [off]   jev [off]");
         let mut f = facts(None);
         f.approvals = 2;
         let pending = content::footer_label(&TreeData::default(), &f);
