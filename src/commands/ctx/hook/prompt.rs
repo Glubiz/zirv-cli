@@ -228,6 +228,38 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     Ok(0)
 }
 
+/// Leading wrappers the harness itself puts in a UserPromptSubmit prompt
+/// (background-task and teammate notifications, slash-command echoes, `!`
+/// shell echoes). Matched at the start only: an operator may paste one of
+/// these tags inside a real prompt.
+const HARNESS_WRAPPERS: [&str; 15] = [
+    "<task-notification",
+    "<system-reminder",
+    "<teammate-message",
+    "<agent-message",
+    "<cross-session-message",
+    "<command-name",
+    "<command-message",
+    "<command-args",
+    "<local-command-caveat",
+    "<local-command-stdout",
+    "<local-command-stderr",
+    "<bash-input",
+    "<bash-stdout",
+    "<bash-stderr",
+    "[system notification",
+];
+
+/// Whether `prompt` is text the harness injected rather than something the
+/// user typed; such a prompt is never a work request or a stated scope.
+pub(super) fn is_harness_injected_prompt(prompt: &str) -> bool {
+    let head = prompt.trim_start();
+    HARNESS_WRAPPERS.iter().any(|wrapper| {
+        head.get(..wrapper.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(wrapper))
+    })
+}
+
 /// One-turn discipline note for a substantial first prompt, capped to
 /// avoid recurring context cost (#753).
 pub(crate) const INTAKE_DISCIPLINE_TEXT: &str = "[zirv intake] Substantial task. Plan ordered, verifiable steps before editing. Write or extend tests first for behaviour changes. Never modify or weaken existing or protected tests to make them pass. Run the full test suite before declaring done. Skills: zirv skill load plan / tdd / verify.";
@@ -286,7 +318,10 @@ fn intake_discipline_note(
     stdin: &str,
     env: EnvLookup<'_>,
 ) -> Option<String> {
-    if !cfg.prompt.intake_discipline || intake_skipped_for_launch(env) {
+    if !cfg.prompt.intake_discipline
+        || intake_skipped_for_launch(env)
+        || is_harness_injected_prompt(&prompt_text_from(stdin))
+    {
         return None;
     }
     let session = env(SESSION_ENV)
@@ -339,6 +374,9 @@ fn auto_start_workflow_note(
         .filter(|value| !value.is_empty())
         .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
     let prompt = prompt_text_from(stdin);
+    if is_harness_injected_prompt(&prompt) {
+        return None;
+    }
     let declined = decision::declines_workflow(&prompt);
     if !declined && !decision::auto_start_wanted(&prompt, policy) {
         return None;
@@ -1172,6 +1210,47 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
         }
         repo
+    }
+
+    const INJECTED_PROMPTS: [&str; 4] = [
+        "<task-notification>\n<task-id>b8f</task-id>\n<summary>Background command \"Run zirv verify\" completed</summary>\n</task-notification>",
+        "<teammate-message teammate_id=\"team-lead\">fix the crash in the dashboard</teammate-message>",
+        "  <command-name>/compact</command-name>\n<command-message>compact</command-message>",
+        "[SYSTEM NOTIFICATION] fix the failing build",
+    ];
+
+    #[test]
+    fn harness_injected_prompts_start_nothing_and_a_pasted_tag_mid_text_still_counts() {
+        let repo = git_repo_with_commit();
+        let state = tempfile::tempdir().expect("state");
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+        for injected in INJECTED_PROMPTS {
+            assert!(is_harness_injected_prompt(injected), "{injected}");
+            assert_eq!(
+                auto_start_workflow_note(&cfg, "s1", &intake_stdin(injected), repo.path(), &lookup),
+                None
+            );
+            assert_eq!(
+                intake_discipline_note(&cfg, "s1", &intake_stdin(injected), &lookup),
+                None
+            );
+        }
+        let store = StateDir::from_root(state.path().to_path_buf());
+        assert!(
+            engine::load_active(&store, repo.path())
+                .expect("readable")
+                .is_none()
+        );
+
+        let pasted = "fix the crash; the log said <task-notification> was dropped";
+        assert!(!is_harness_injected_prompt(pasted));
+        assert!(
+            auto_start_workflow_note(&cfg, "s1", &intake_stdin(pasted), repo.path(), &lookup)
+                .is_some(),
+            "an injected prompt must not have consumed the session's claim"
+        );
     }
 
     const CODING_PROMPT: &str = "fix the crash when the dashboard pane is clicked";
