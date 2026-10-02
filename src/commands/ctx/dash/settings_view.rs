@@ -416,7 +416,7 @@ impl SettingsState {
                     out.extend(wrap(&format!("session scope refused: {why}"), inner));
                 }
                 let applies = if *scope == Scope::Session {
-                    "live in this pane, never saved"
+                    "this pane's view only, never saved; delegations and turns: next session"
                 } else {
                     APPLIES
                 };
@@ -610,7 +610,7 @@ mod tests {
         let footer = state.lines(120, 20).join("\n");
         assert!(footer.contains("(o) session (this pane)"), "{footer}");
         assert!(
-            footer.contains("live in this pane, never saved"),
+            footer.contains("this pane's view only, never saved"),
             "{footer}"
         );
         assert_eq!(

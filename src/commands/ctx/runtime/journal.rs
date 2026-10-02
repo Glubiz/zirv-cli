@@ -1580,6 +1580,16 @@ impl Journal {
         read_events(&self.conn, session)
     }
 
+    /// Every event of one kind in sequence order, decoding only those payloads.
+    pub fn events_of_type(
+        &self,
+        session: &JournalSessionId,
+        event_type: &str,
+    ) -> JournalResult<Vec<StoredEvent>> {
+        let _ = self.session(session)?;
+        read_events_of_type(&self.conn, session, Some(event_type))
+    }
+
     /// Counts one event kind without reading or decoding its payloads.
     /// Reporting surfaces use this projection when they need an all-time
     /// count but not the full conversation history.
@@ -2350,12 +2360,22 @@ struct RawSession {
 }
 
 fn read_events(conn: &Connection, session: &JournalSessionId) -> JournalResult<Vec<StoredEvent>> {
+    read_events_of_type(conn, session, None)
+}
+
+/// [`read_events`], optionally narrowed in SQL to one event type so other payloads stay undecoded.
+fn read_events_of_type(
+    conn: &Connection,
+    session: &JournalSessionId,
+    event_type: Option<&str>,
+) -> JournalResult<Vec<StoredEvent>> {
     let mut stmt = conn.prepare(
         "SELECT sequence, generation, event_type, turn_id, attempt_id, task_id,
                 payload_json, committed_at
-         FROM native_events WHERE session_id = ?1 ORDER BY sequence",
+         FROM native_events WHERE session_id = ?1 AND (?2 IS NULL OR event_type = ?2)
+         ORDER BY sequence",
     )?;
-    let rows = stmt.query_map([session.as_str()], |row| {
+    let rows = stmt.query_map(params![session.as_str(), event_type], |row| {
         Ok(RawEvent {
             sequence: row.get(0)?,
             generation: row.get(1)?,

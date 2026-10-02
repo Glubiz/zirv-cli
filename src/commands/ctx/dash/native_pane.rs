@@ -2701,7 +2701,7 @@ fn restore_session_overrides(
     session: &JournalSessionId,
 ) -> super::super::config::settings::SessionOverrides {
     let mut out = super::super::config::settings::SessionOverrides::new();
-    let Ok(events) = journal.events(session) else {
+    let Ok(events) = journal.events_of_type(session, "settings_override") else {
         return out;
     };
     for stored in events {
@@ -3809,7 +3809,9 @@ impl NativePaneRuntime {
             None => self.session_overrides.remove(&key),
         };
         self.ux.refreshed_at = 0;
-        Ok(format!("{key}: {verb} for this session (live, not saved)"))
+        Ok(format!(
+            "{key}: {verb} for this session (this pane's view only, not saved; delegations and turns use it next session)"
+        ))
     }
 
     /// `/settings`, `/settings <query>` and the `get|set|reset` text forms (#536).
@@ -6600,6 +6602,18 @@ mod tests {
         pane.journal
             .create_session(&identity_for("sess-1", 1))
             .expect("create session");
+        pane.journal
+            .acknowledge_input(
+                &pane.session_id,
+                1,
+                &EventScope::default(),
+                crate::commands::ctx::runtime::journal::MessageId::new("m-1").unwrap(),
+                "earlier turn".to_string(),
+                false,
+                None,
+                1,
+            )
+            .expect("input event");
         let before = pane.journal.replay(&pane.session_id).expect("replay");
 
         submit_text(
@@ -6629,10 +6643,16 @@ mod tests {
                 if key == "fallback.unknown_headroom_pct" && value == "40"
         ));
 
+        crate::commands::ctx::runtime::journal::reset_decoded_payload_count();
         let resumed = restore_session_overrides(&pane.journal, &pane.session_id);
         assert_eq!(
             resumed, pane.session_overrides,
             "a resumed pane replays the override"
+        );
+        assert_eq!(
+            crate::commands::ctx::runtime::journal::decoded_payload_count(),
+            1,
+            "restore decodes only the settings_override payloads, not the conversation"
         );
 
         submit_text(

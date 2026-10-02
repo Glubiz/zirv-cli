@@ -3641,7 +3641,9 @@ control event (key and non-secret value, never a user turn), replayed from the
 journal when the pane resumes, and never written to a file. Only keys the pane
 re-reads on every record refresh (`fallback.enabled`, `fallback.health.enabled`,
 `fallback.unknown_headroom_pct`, which feed the pane's pool view) offer it and
-say `live in session, saved: next session`; every other key says `next session`
+say `pane view only; delegations and turns: next session`: the override changes
+what that pane displays, while delegations, turns and the run loop load their
+own config and pick the key up next session. Every other key says `next session`
 and a session edit of one is refused with that reason. A saved (user or project)
 write is never live, because the dashboard loads its config once.
 `zirv ctx config get <key> [--json]` prints the same effective value, default,

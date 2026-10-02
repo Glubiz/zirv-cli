@@ -16,7 +16,9 @@ pub const APPLIES: &str = "next session";
 /// Session overrides held by the native pane, key to value; they win over every other layer.
 pub type SessionOverrides = std::collections::BTreeMap<String, toml::Value>;
 
-/// A key the native pane re-reads on every record refresh, and how a session override reaches it.
+/// A key the native pane's own view re-reads on every record refresh, and how a session override
+/// reaches it. Only that view: delegations (`route_new_delegation`), turns (`CtxConfig::load` in
+/// the interactive session) and the run loop load their own config, so they see it next session.
 /// `refresh_records` runs `pool::build` with the pane's effective config every few seconds, and
 /// that reads exactly these (`pool.rs` `signal_quality_for(.., cfg.fallback.unknown_headroom_pct)`,
 /// `health_rows` and `fallback::capacity_snapshot` through `cfg.fallback.effective_health()`).
@@ -53,7 +55,8 @@ const LIVE_KEYS: &[LiveKey] = &[
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reload {
-    /// A session override reaches the running pane; a saved value still waits for the next session.
+    /// A session override reaches the running pane's view only; everything else, and every saved
+    /// value, waits for the next session.
     Live,
     NextSession,
 }
@@ -69,7 +72,7 @@ impl Reload {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Live => "live in session, saved: next session",
+            Self::Live => "pane view only; delegations and turns: next session",
             Self::NextSession => APPLIES,
         }
     }
@@ -92,6 +95,51 @@ pub fn apply_session(cfg: &CtxConfig, overrides: &SessionOverrides) -> CtxConfig
 fn default_text(path: &[&str]) -> String {
     static DUMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let dump = DUMP.get_or_init(|| format!("{:#?}", CtxConfig::default()));
+    let text = dump_value(dump, path);
+    let is_variant = text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.chars().all(|c| c.is_ascii_alphanumeric());
+    if is_variant {
+        return serde_spelling(path, &text).unwrap_or(text);
+    }
+    text
+}
+
+/// The configured spelling of an enum variant: the first candidate casing that the schema itself
+/// deserializes back into the same variant, so no parallel variant table exists.
+fn serde_spelling(path: &[&str], variant: &str) -> Option<String> {
+    let words: Vec<String> = variant.chars().fold(Vec::<String>::new(), |mut words, c| {
+        match words.last_mut() {
+            Some(last) if !c.is_ascii_uppercase() => last.push(c),
+            _ => words.push(c.to_string()),
+        }
+        words
+    });
+    let candidates = [
+        variant.to_ascii_lowercase(),
+        words.join("_").to_ascii_lowercase(),
+        words.join("-").to_ascii_lowercase(),
+        variant.to_string(),
+    ];
+    candidates.into_iter().find_map(|candidate| {
+        let mut table = toml::Table::new();
+        let value = toml::Value::String(candidate.clone());
+        // `[safety]` is lifted out of the config document and resolved by its own parser.
+        let dump = if path.first() == Some(&"safety") {
+            insert_path(&mut table, &path[1..], value);
+            let policy =
+                super::super::safety::resolve(Some(toml::Value::Table(table)), None, &|_| None)
+                    .ok()?;
+            dump_value(&format!("{policy:#?}"), &path[1..])
+        } else {
+            insert_path(&mut table, path, value);
+            let cfg: CtxConfig = toml::Value::Table(table).try_into().ok()?;
+            dump_value(&format!("{cfg:#?}"), path)
+        };
+        (dump == variant).then(|| format!("{candidate:?}"))
+    })
+}
+
+fn dump_value(dump: &str, path: &[&str]) -> String {
     let lines: Vec<&str> = dump.lines().collect();
     let (mut from, mut to) = (1, lines.len().saturating_sub(1));
     for (depth, name) in path.iter().enumerate() {
@@ -1339,6 +1387,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown setting"), "{error}");
+    }
+
+    #[test]
+    fn config_get_from_a_subdirectory_reads_the_repo_root_project_layer_like_settings_get() {
+        let fx = Fixture::new();
+        std::fs::create_dir(fx.repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(fx.repo.path().join(".zirv")).unwrap();
+        std::fs::write(fx.project_file(), "[worker]\nmax_depth = 1\n").unwrap();
+        let sub = fx.repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut out = Vec::new();
+        config_cmd::run_get(&sub, "worker.max_depth", true, &mut out).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            (json["source"].as_str(), json["value"].as_str()),
+            (Some("project"), Some("1"))
+        );
+        let notice = with_ctx(&fx, &no_env, |ctx| {
+            match slash(ctx, "get worker.max_depth") {
+                Slash::Notice(text) => text,
+                _ => panic!("get must only notify"),
+            }
+        });
+        let mut out = Vec::new();
+        config_cmd::run_get(&sub, "worker.max_depth", false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().trim_end(), notice);
+    }
+
+    #[test]
+    fn enum_defaults_show_the_serde_spelling_not_the_rust_variant() {
+        let fx = Fixture::new();
+        let default_of = |key: &str| row_of(&fx, &no_env, key).default;
+        assert_eq!(default_of("proxy.decider"), "\"typesafe\"");
+        assert_eq!(default_of("dash.motion"), "\"full\"");
+        for setting in registry() {
+            let text = default_text(setting.path);
+            assert!(
+                !text.starts_with(|c: char| c.is_ascii_uppercase())
+                    || text.contains(|c: char| !c.is_ascii_alphanumeric()),
+                "{} shows a bare Rust variant: {text}",
+                setting.key
+            );
+        }
     }
 
     #[test]

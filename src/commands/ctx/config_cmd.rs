@@ -396,16 +396,19 @@ pub(super) fn apply_operator_edit(key: &str, raw: &str, op: EditOp) -> CtxResult
     )
 }
 
-/// `/settings get`'s text for one key, with the project layer read from `repo`.
+/// `/settings get`'s text for one key, with the project layer read from the repository root
+/// that contains `from` (a `.git` ancestor, as the write guards resolve it), else `from` itself.
 pub(super) fn run_get(
-    repo: &std::path::Path,
+    from: &std::path::Path,
     key: &str,
     json: bool,
     w: &mut dyn Write,
 ) -> CtxResult<i32> {
     let env = config::env_from_process();
+    let repo = super::lifecycle::repo_root_for_target(&from.join(crate::utils::SCRIPT_DIR_NAME))
+        .unwrap_or_else(|| from.to_path_buf());
     let ctx = config::settings::SettingsCtx {
-        repo,
+        repo: &repo,
         env: &env,
         session: &config::settings::SessionOverrides::new(),
     };
