@@ -275,15 +275,9 @@ fn header(s: &mut Scene, ctx: &Ctx, w: i32, need_count: usize) {
     let usage = facts
         .usage_5h
         .map(|pct| ("usage 5h ".to_string(), format!("{pct:.0}%")));
-    let spend = facts.spend_micros.map(|m| {
-        (
-            "spend ".to_string(),
-            super::super::super::price::format_usd(m, false),
-        )
-    });
     // Drop the facts that matter least until what is left fits beside the badge.
     let sep = "  \u{b7}  ";
-    let mut parts: Vec<(String, String)> = [usage, spend].into_iter().flatten().collect();
+    let mut parts: Vec<(String, String)> = [usage].into_iter().flatten().collect();
     let parts_w = |parts: &[(String, String)]| -> i32 {
         parts
             .iter()
@@ -1093,20 +1087,6 @@ fn selected(s: &mut Scene, ctx: &Ctx, (x, y, w, h): (i32, i32, i32, i32)) {
         yy += 1;
         kv(s, x, yy, "agents", &flow::counts_line(ctx, iw - 9), iw);
         yy += 1;
-        if let Some(m) = model.facts.spend_micros {
-            kv(
-                s,
-                x,
-                yy,
-                "spend",
-                &format!(
-                    "{} this session",
-                    super::super::super::price::format_usd(m, false)
-                ),
-                iw,
-            );
-            yy += 1;
-        }
         yy += gap;
         s.grid.bold(x + 2, yy, "RECENT", c::FAINT);
         yy += 1;
@@ -1216,13 +1196,8 @@ fn jev_panel(s: &mut Scene, ctx: &Ctx, subj: &Subject, (x, y, w, h): (i32, i32, 
     s.grid.text(x + 4, yy, "TypeSafe decision model", c::DIM);
     yy += 2;
     let today = flow::jev_today(ctx, &feed);
-    let cost: f64 = today.iter().map(|j| j.cost_usd).sum();
     let unsure = today.iter().filter(|j| !j.sure).count();
-    let mut line = format!("{} calls", today.len());
-    if cost > 0.0 {
-        line.push_str(&format!(" \u{b7} ${cost:.4}"));
-    }
-    line.push_str(&format!(" \u{b7} {unsure} unsure"));
+    let line = format!("{} calls \u{b7} {unsure} unsure", today.len());
     kv(s, x, yy, "today", &line, iw);
     yy += 1;
     let sites = if feed.sites.is_empty() {
@@ -2569,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn the_header_carries_the_badge_the_cached_usage_and_spend_and_the_keys_chip() {
+    fn the_header_carries_the_badge_the_cached_usage_and_the_keys_chip_but_no_spend() {
         let (data, wf, jev) = busy();
         let f = orch_facts(&wf, &jev);
         let text = draw(160, 45, &view(data.clone()), &f);
@@ -2578,17 +2553,16 @@ mod tests {
             head.contains("zirv-cli  \u{b7}  seat claude fable \u{b7} orchestrator"),
             "{head}"
         );
-        for part in [
-            "\u{2691} 4 need you",
-            "usage 5h 34%",
-            "spend $3.10",
-            "? keys",
-        ] {
+        for part in ["\u{2691} 4 need you", "usage 5h 34%", "? keys"] {
             assert!(head.contains(part), "{part} in {head}");
         }
         assert!(
-            head.find("need you") < head.find("usage") && head.find("spend") < head.find("? keys"),
-            "badge, usage, spend, keys: {head}"
+            head.find("need you") < head.find("usage") && head.find("usage") < head.find("? keys"),
+            "badge, usage, keys: {head}"
+        );
+        assert!(
+            !head.contains("spend") && !head.contains('$'),
+            "no cost in the header: {head}"
         );
         // The badge breathes.
         let at_ms = |ms: u64| {
@@ -2601,7 +2575,6 @@ mod tests {
         assert_ne!(at_ms(0), at_ms(400), "the badge breathes on the clock");
         let mut quiet = orch_facts(&wf, &jev);
         quiet.usage_5h = None;
-        quiet.spend_micros = None;
         quiet.approval_items.clear();
         quiet.waits.clear();
         quiet.stalled.clear();
@@ -2611,7 +2584,7 @@ mod tests {
         let head = head.lines().next().expect("header").trim_end().to_string();
         assert!(head.contains("\u{2713} all clear"), "{head}");
         assert!(
-            !head.contains("usage") && !head.contains("spend") && !head.contains("need"),
+            !head.contains("usage") && !head.contains("need"),
             "an unknown reading is left out, not made up: {head}"
         );
         assert!(head.ends_with("? keys"), "{head}");
@@ -3987,7 +3960,6 @@ mod tests {
             text: "claude sonnet".into(),
             confidence: 0.93,
             sure: true,
-            cost_usd: 0.0,
             cached: false,
         });
         v.data = next;

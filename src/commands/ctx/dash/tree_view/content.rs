@@ -9,7 +9,6 @@ use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
 
 use super::super::super::graph::{Event, Node};
-use super::super::super::price;
 use super::super::super::sessions;
 use super::super::ui::JevSectionFact;
 use super::model::{Agent, Model, Sel};
@@ -280,7 +279,6 @@ pub(in super::super) struct JevRow {
     pub(in super::super) text: String,
     pub(in super::super) confidence: f64,
     pub(in super::super) sure: bool,
-    pub(in super::super) cost_usd: f64,
     pub(in super::super) cached: bool,
 }
 
@@ -320,7 +318,6 @@ pub(super) fn jev_feed_of(feed: super::super::super::jev_feed::JevFeed, proxy: b
             text: clean(&d.text),
             confidence: d.confidence,
             sure: d.sure,
-            cost_usd: d.cost_usd,
             cached: d.cached,
         })
         .collect();
@@ -391,10 +388,6 @@ pub(super) fn node_model_badged(data: &TreeData, node: &Node) -> String {
     }
 }
 
-fn usd(micros: u64) -> String {
-    price::format_usd(micros, false)
-}
-
 fn per_million((input, output): (u64, u64)) -> String {
     let dollars = |micros: u64| {
         if micros.is_multiple_of(1_000_000) {
@@ -444,7 +437,6 @@ pub(super) fn supervisor_status(data: &TreeData) -> String {
 /// The statusline's left side, in display order with the priority that keeps it.
 pub(super) fn footer_segments(data: &TreeData, facts: &TreeFacts) -> Vec<(u8, String)> {
     let jev = jev_calls(facts).map_or("off".to_string(), |c| c.to_string());
-    let spend = facts.spend_micros.map_or("-".to_string(), usd);
     let mut segments = vec![
         (
             1,
@@ -452,7 +444,6 @@ pub(super) fn footer_segments(data: &TreeData, facts: &TreeFacts) -> Vec<(u8, St
         ),
         (2, format!("supervisor [{}]", supervisor_status(data))),
         (3, format!("jev [{jev}]")),
-        (4, format!("spend [{spend}]")),
     ];
     if facts.approvals > 0 {
         segments.push((0, format!("\u{2691} approvals [{}]", facts.approvals)));
@@ -692,16 +683,8 @@ pub(super) fn seat_rows(model: &Model, count: usize, inner: usize) -> Vec<Row> {
         .rot
         .map(|r| ("rot ", format!("{:.2}", r as f64 / 100.0), ""));
     let tokens = tokens.map(|t| ("", t, ""));
-    let spend = facts.spend_micros.map(|m| ("", usd(m), " session"));
-    let spend_short = facts.spend_micros.map(|m| ("", usd(m), ""));
     // The widest wording that fits the card; the separator shrinks before a number is dropped.
-    let options = [
-        vec![rot.clone(), tokens, spend.clone()],
-        vec![rot.clone(), spend],
-        vec![rot.clone(), spend_short.clone()],
-        vec![rot],
-        vec![spend_short],
-    ];
+    let options = [vec![rot.clone(), tokens], vec![rot]];
     let mut usage: Vec<Span<'static>> = Vec::new();
     'fit: for sep in ["  \u{b7}  ", " \u{b7} "] {
         for option in &options {
