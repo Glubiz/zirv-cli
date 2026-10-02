@@ -15,6 +15,8 @@ pub mod decision;
 pub mod launch;
 pub mod llm;
 pub mod native;
+pub mod stats;
+pub mod store;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -26,6 +28,7 @@ use self::decision::{Answers, Decider, ProxyDecision, Question, SeatRole};
 use super::attribution::Attribution;
 use super::config::{self, CtxConfig, ProxyDecider};
 use super::{CtxResult, adapters, helper, jev, log, state};
+use crate::commands::workflow::profile::ValidationProfile;
 
 const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` key the proxy's own
@@ -52,8 +55,43 @@ pub(crate) const HEADLESS_CLARIFY_LINE: &str = "clarify: nobody can answer in th
                                                  the most reasonable reading and name the \
                                                  assumption in your final report";
 
+/// Operator overrides of the derived profile for one launch. Raising is always honoured; lowering stops at the hard floor. (#537)
+#[derive(Debug, Clone, Default, Args)]
+pub struct OverrideArgs {
+    /// Force the execution mode: direct, bounded or orchestrated.
+    #[arg(long, value_name = "MODE")]
+    pub execution: Option<String>,
+    /// Force the seat tier: cheap, standard, deep or frontier.
+    #[arg(long, value_name = "TIER")]
+    pub tier: Option<String>,
+    /// Force the validation gates on: a comma list of review, test, security (or none).
+    #[arg(long, value_name = "GATES")]
+    pub validation: Option<String>,
+}
+
+impl OverrideArgs {
+    pub fn parse(&self) -> Result<decision::ProxyOverride, String> {
+        decision::ProxyOverride::parse(
+            self.execution.as_deref(),
+            self.tier.as_deref(),
+            self.validation.as_deref(),
+        )
+    }
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ProxyCommand {
+    /// Per-task-class token cost and verified-pass rate of proxy-decided seats (read-only).
+    Stats(stats::StatsArgs),
+}
+
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ProxyArgs {
+    #[command(subcommand)]
+    pub command: Option<ProxyCommand>,
+    #[command(flatten)]
+    pub overrides: OverrideArgs,
     /// Print the full `ProxyDecision` as JSON instead of the human summary.
     #[arg(long)]
     pub json: bool,
@@ -413,6 +451,9 @@ pub fn decide(
     }
 
     decision::validate(&mut result, &baseline, &roster, cfg);
+    if !cfg.proxy.overrides.is_empty() {
+        decision::apply_override(&mut result, &cfg.proxy.overrides, cfg);
+    }
     result.decider = winner;
     result.fallbacks = fallbacks;
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -423,8 +464,33 @@ pub fn decide(
         decision::force_single_seat(&mut result);
     }
 
-    let _ = persist(state_dir, &result);
+    let _ = persist_with(
+        state_dir,
+        &result,
+        Some(&cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
+    );
     result
+}
+
+/// A single seat has no reviewer or tester seat, so the validation the profile asks for becomes its own self-check. (#537)
+fn single_seat_validation_line(validation: &ValidationProfile) -> Option<String> {
+    let mut duties = Vec::new();
+    if validation.independent_test {
+        duties.push("run the targeted tests and report the command and exit code");
+    }
+    if validation.independent_review {
+        duties.push("re-read your own diff for defects and say what you did not check");
+    }
+    if validation.security_review {
+        duties.push("state the security assumptions and flag the change for human review");
+    }
+    if duties.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "validate: no reviewer seat exists, so before reporting done {}",
+        duties.join("; ")
+    ))
 }
 
 /// Announce the actual seat role, resolved tier, workflow, and decider in one line. (#537)
@@ -535,6 +601,11 @@ pub fn prompt_layer(decision: &ProxyDecision, started_workflow_id: Option<&str>)
             INTERACTIVE_CLARIFY_LINE.to_string()
         });
     }
+    if decision.seat_role == SeatRole::Single
+        && let Some(line) = single_seat_validation_line(&decision.validation)
+    {
+        lines.push(line);
+    }
     if decision.seat_role == SeatRole::Single {
         lines.push(
             "You are the single seat for this request: do the work here yourself; do not \
@@ -570,14 +641,30 @@ struct ProxyDecisionWire<'a> {
     inner: &'a ProxyDecision,
     #[serde(default, skip_serializing_if = "Attribution::is_empty")]
     attribution: Attribution,
+    /// The seat session this decision was made for, when the process knows it (#537).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_override: Option<&'a decision::ProxyOverride>,
 }
 
-pub fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
+#[cfg(test)]
+pub(crate) fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
+    persist_with(state_dir, d, None)
+}
+
+fn persist_with(
+    state_dir: &Path,
+    d: &ProxyDecision,
+    operator_override: Option<&decision::ProxyOverride>,
+) -> CtxResult<()> {
     state::create_private_dir_all(state_dir)?;
     let mut file = state::open_private_append(&state_dir.join(PROXY_DECISIONS_FILE))?;
     let wire = ProxyDecisionWire {
         inner: d,
         attribution: Attribution::from_env(),
+        session: Some(jev::session_and_principal().0).filter(|session| session != "proxy"),
+        operator_override,
     };
     writeln!(file, "{}", serde_json::to_string(&wire)?)?;
 
@@ -716,6 +803,9 @@ fn human_fields(decision: &ProxyDecision, min_confidence: f32) -> Vec<(&'static 
 /// `zirv ctx proxy [--json] [--headless] [REQUEST]`: decides and prints,
 /// never launches.
 pub fn run<W: Write>(args: &ProxyArgs, w: &mut W) -> CtxResult<i32> {
+    if let Some(ProxyCommand::Stats(stats_args)) = &args.command {
+        return stats::run(stats_args, w);
+    }
     let env = config::env_from_process();
     let repo = std::env::current_dir()?;
     let cfg = CtxConfig::load(&repo, &env)?;
@@ -743,6 +833,17 @@ pub fn run_with<W: Write>(
     w: &mut W,
 ) -> CtxResult<i32> {
     let headless = headless_from(args, env);
+    let overridden;
+    let cfg = if args.overrides.parse()?.is_empty() {
+        cfg
+    } else {
+        overridden = {
+            let mut cfg = cfg.clone();
+            cfg.proxy.overrides = args.overrides.parse()?;
+            cfg
+        };
+        &overridden
+    };
     let request = match &args.request {
         Some(request) => request.clone(),
         None => {
@@ -786,7 +887,7 @@ pub fn run_with<W: Write>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::commands::ctx::catalogue::Tier;
     use crate::commands::workflow::classify::{Complexity, Intent, RiskBand};
@@ -794,7 +895,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    fn sample_decision() -> ProxyDecision {
+    pub(crate) fn sample_decision() -> ProxyDecision {
         ProxyDecision {
             request_sha256: "x".repeat(64),
             repo: PathBuf::from("/tmp/repo"),
@@ -1125,6 +1226,33 @@ mod tests {
     }
 
     #[test]
+    fn single_seat_layer_carries_validation_duties_within_eight_lines() {
+        let mut decision = sample_decision();
+        decision.seat_role = SeatRole::Single;
+        decision.validation = ValidationProfile {
+            independent_review: true,
+            independent_test: true,
+            security_review: true,
+        };
+        decision.domains = vec!["security".to_string()];
+        decision.needs_clarification = 0.9;
+        decision.needs_clarification_decisive = true;
+        let layer = prompt_layer(&decision, Some("wf1"));
+        assert!(
+            layer.contains("validate: no reviewer seat exists"),
+            "{layer}"
+        );
+        assert!(layer.contains("run the targeted tests"), "{layer}");
+        assert!(layer.lines().count() <= 8, "{layer}");
+
+        decision.validation = ValidationProfile::default();
+        assert!(!prompt_layer(&decision, None).contains("validate:"));
+        decision.seat_role = SeatRole::Orchestrator;
+        decision.validation.independent_test = true;
+        assert!(!prompt_layer(&decision, None).contains("validate:"));
+    }
+
+    #[test]
     fn prompt_layer_is_bounded_and_starts_with_the_header() {
         let layer = prompt_layer(&sample_decision(), None);
         let lines: Vec<&str> = layer.lines().collect();
@@ -1302,6 +1430,8 @@ mod tests {
     #[test]
     fn headless_from_honours_either_the_flag_or_the_env_marker() {
         let flagged = ProxyArgs {
+            command: None,
+            overrides: OverrideArgs::default(),
             json: false,
             request: None,
             headless: true,
@@ -1309,6 +1439,8 @@ mod tests {
         assert!(headless_from(&flagged, &|_| None));
 
         let unflagged = ProxyArgs {
+            command: None,
+            overrides: OverrideArgs::default(),
             json: false,
             request: None,
             headless: false,
@@ -1774,6 +1906,109 @@ mod tests {
             std::fs::write(&full, content).expect("write case file");
         }
         repo
+    }
+
+    fn override_cfg(ov: decision::ProxyOverride) -> CtxConfig {
+        CtxConfig {
+            proxy: crate::commands::ctx::config::ProxyConfig {
+                decider: ProxyDecider::Deterministic,
+                overrides: ov,
+                ..crate::commands::ctx::config::ProxyConfig::default()
+            },
+            ..CtxConfig::default()
+        }
+    }
+
+    /// Operator overrides raise freely, stop at the hard floor with a reason, and lose to headless. (#537)
+    #[test]
+    fn operator_override_raises_refuses_below_the_floor_and_yields_to_headless() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let repo = shaped_repo(&[BatteryFile {
+            path: "README.md".to_string(),
+            lines: 1,
+        }]);
+        let typo = "Fix the typo in the README's installation heading.";
+        let plain = decide(
+            &override_cfg(Default::default()),
+            state_dir.path(),
+            repo.path(),
+            typo,
+            false,
+        );
+        assert_eq!(plain.execution, ExecutionMode::Direct);
+
+        let raise =
+            decision::ProxyOverride::parse(Some("orchestrated"), Some("deep"), Some("review,test"))
+                .expect("parse");
+        let raised = decide(
+            &override_cfg(raise),
+            state_dir.path(),
+            repo.path(),
+            typo,
+            false,
+        );
+        assert_eq!(raised.execution, ExecutionMode::Orchestrated);
+        assert_eq!(raised.seat_role, SeatRole::Orchestrator);
+        assert!(raised.validation.independent_review && raised.validation.independent_test);
+        assert!(!raised.validation.security_review);
+
+        let headless = decide(
+            &override_cfg(raise),
+            state_dir.path(),
+            repo.path(),
+            typo,
+            true,
+        );
+        assert_eq!(headless.seat_role, SeatRole::Single);
+        assert_eq!(headless.execution, ExecutionMode::Bounded);
+
+        let risky = "One-line change: rotate the shared credential constant used by session auth.";
+        let lower = decision::ProxyOverride::parse(Some("direct"), Some("cheap"), Some("none"))
+            .expect("parse");
+        let floored = decide(
+            &override_cfg(lower),
+            state_dir.path(),
+            repo.path(),
+            risky,
+            false,
+        );
+        assert!(floored.risk >= RiskBand::High, "{:?}", floored.risk);
+        assert_eq!(floored.execution, ExecutionMode::Bounded);
+        assert!(floored.validation.independent_review && floored.validation.security_review);
+        for needle in [
+            "execution direct refused",
+            "validation review cannot be turned off",
+            "validation security cannot be turned off",
+        ] {
+            assert!(
+                floored.reasons.iter().any(|r| r.contains(needle)),
+                "{needle}: {:?}",
+                floored.reasons
+            );
+        }
+        // Direct + workflow never coexist after an override.
+        assert!(floored.execution != ExecutionMode::Direct || floored.workflow.is_none());
+
+        let rows =
+            std::fs::read_to_string(state_dir.path().join(PROXY_DECISIONS_FILE)).expect("rows");
+        let last: serde_json::Value =
+            serde_json::from_str(rows.lines().last().expect("row")).expect("json");
+        assert!(last.get("operator_override").is_some(), "{last}");
+        let first: serde_json::Value =
+            serde_json::from_str(rows.lines().next().expect("row")).expect("json");
+        assert!(first.get("operator_override").is_none(), "{first}");
+    }
+
+    #[test]
+    fn override_flags_reject_unknown_spellings() {
+        assert!(decision::ProxyOverride::parse(Some("huge"), None, None).is_err());
+        assert!(decision::ProxyOverride::parse(None, Some("max"), None).is_err());
+        assert!(decision::ProxyOverride::parse(None, None, Some("review,lint")).is_err());
+        assert!(
+            decision::ProxyOverride::parse(None, None, None)
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     /// Issue #537 seam: the deterministic decider's own floor, exercised

@@ -788,6 +788,39 @@ prints the full decision. `zirv ctx chat --proxy` / `--no-proxy` overrides
 `cfg.proxy.enabled` for one launch; `--resume` and `--simple` always skip the
 proxy.
 
+**Operator overrides.** `zirv ctx chat` and `zirv ctx proxy` accept
+`--execution direct|bounded|orchestrated`, `--tier cheap|standard|deep|frontier`
+and `--validation review,test,security` (or `none`) to override the derived
+profile for that one launch. They are flags only, never config keys, so a
+checkout cannot set them. Raising is always honoured; lowering stops at the hard
+floor (a high-risk or security request cannot go below `bounded`, cannot drop
+the review or security gate, and cannot lower the tier below its derived value),
+and each refusal is named in the decision's `reasons`. A headless launch still
+ends on a single seat. The applied override is recorded as `operator_override`
+on the `proxy-decisions.jsonl` row.
+
+**Single-seat validation.** A single seat has no reviewer or tester seat, so when
+its profile asks for review, test or security validation the `[zirv proxy]`
+layer carries one `validate:` line telling it to run the targeted tests, re-read
+its own diff and flag security assumptions before reporting done. This is
+advice only; no hook blocks completion. Bounded bug fixes and small features
+stay single-seat; `workflow.auto_start = detect` can still start a workflow for
+them.
+
+**Per-seat profile store.** The final decision (with its override and started
+workflow) is also written to `<state>/proxy-profile/<seat short id>.json`. A
+rollover or handover successor keeps the seat's short id, so the successor's
+handoff prompt re-renders the same `[zirv proxy]` layer from that file
+(unless its base prompt already carries one). A missing, corrupt or old-format
+file is skipped.
+
+**`zirv ctx proxy stats [--json]`** is read-only. It groups the stored
+profiles by `intent/complexity` and reports, in tokens only (no dollars), the
+median seat input, output and cache tokens from the seat transcript, the
+tokens of `zirv agent` delegations whose parent is that seat, and the
+verified-pass rate of the last attributable build/test run in the seat
+transcript. A class with no verification record prints quality as unavailable.
+
 **Headless single seat.** A headless launch works unattended — nobody is
 watching the seat, so it must never be told it is an orchestrator: zirv's own
 rule for a worker is "runs unattended and must not delegate further". Pass
@@ -1197,7 +1230,8 @@ to the section that documents it in depth.
   delegates one task to a supervised worker on another enabled harness
   (also `zirv agent`); `proxy` decides a request's intent, complexity, risk
   and workflow before a launch, so the seat, model and workflow fit the task
-  (opt-in, see [Harness proxy](#harness-proxy)). See [Verbs](#verbs) and
+  (opt-in; `proxy stats` reports per-class token cost and verified-pass rate, see
+  [Harness proxy](#harness-proxy)). See [Verbs](#verbs) and
   [Just Run `zirv`](#just-run-zirv).
 - **Experimental: `native`** — a thin, case-insensitive top-level alias
   (`zirv native`) for `zirv chat --runtime native`, reserved so a script or
@@ -3160,7 +3194,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
 | `zirv ctx agent <name> <prompt> [--name <label>] [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>] [--goal <text>]` | Delegates one task to a supervised worker on another enabled harness — a dashboard pane when one is live, otherwise inline in this terminal; workflow reviewers run inline because their caller must consume completed review evidence synchronously. A selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` resolves a YAML file's `brief`/`agent`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same launch instead of typing each one; `agent` contributes default skills and read-only/capability floors. Untrusted manifest input can only narrow: a field it shares with an explicit CLI flag is a hard error on disagreement, except narrowing-capable fields, where the stricter value wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior reuse allocation whose base commit and ordered `[[workspace]].setup` list digest the same is reset to that base and reused with its untracked build cache intact. A digest mismatch or proof refusal falls back to a cold worktree; matched setup receipts retain the same checkout identity and resume only unchanged successful steps. On release, eligible trees remain `Idle` up to `[worktree] idle_pool_max`; `[worktree] idle_ttl_secs` expires them through proof-required GC/reconcile. `--goal` forces an inline launch and first runs one bounded, depth-zero environment-preparation bootstrap in the selected checkout; it must exit zero and report explicit `Done` JSON before the main worker may start. The bootstrap uses the operator's configured Fast tier when present, otherwise leaves model selection to the harness. A read-only worker (`--mode read-only`, a read-only manifest, a workflow reviewer or a read-only dashboard spawn) fails closed: when the chosen harness has no enforced read-only floor for its launch mode, the launch is refused up front naming the harnesses that can enforce it, and automatic harness rerouting skips harnesses without a floor. |
-| `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
+| `zirv ctx proxy [--json] [--headless] [--execution MODE] [--tier TIER] [--validation GATES] [REQUEST]` / `zirv ctx proxy stats [--json]` | Runs the harness-proxy intake decision and prints it without launching anything (the override flags preview `zirv ctx chat`'s); `stats` reports per-task-class token cost and verified-pass rate; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |

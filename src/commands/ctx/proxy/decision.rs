@@ -1241,6 +1241,193 @@ pub fn force_single_seat(decision: &mut ProxyDecision) {
     }
 }
 
+/// Operator-set overrides of the derived profile. Raising is always honoured; lowering stops at the hard floor. (#537)
+/// Never read from config files: `zirv ctx chat` and `zirv ctx proxy` flags set it for one launch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyOverride {
+    pub execution: Option<ExecutionMode>,
+    pub seat_tier: Option<SeatTier>,
+    pub review: Option<bool>,
+    pub test: Option<bool>,
+    pub security: Option<bool>,
+}
+
+impl ProxyOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Parse the CLI spellings; `validation` is the comma list of gates that must be on, the rest are off.
+    pub fn parse(
+        execution: Option<&str>,
+        tier: Option<&str>,
+        validation: Option<&str>,
+    ) -> Result<Self, String> {
+        let execution = execution
+            .map(|value| match value {
+                "direct" => Ok(ExecutionMode::Direct),
+                "bounded" => Ok(ExecutionMode::Bounded),
+                "orchestrated" => Ok(ExecutionMode::Orchestrated),
+                other => Err(format!(
+                    "--execution: unknown mode '{other}' (direct, bounded, orchestrated)"
+                )),
+            })
+            .transpose()?;
+        let seat_tier = tier
+            .map(|value| match value {
+                "cheap" => Ok(SeatTier::Cheap),
+                "standard" => Ok(SeatTier::Standard),
+                "deep" => Ok(SeatTier::Deep),
+                "frontier" => Ok(SeatTier::Frontier),
+                other => Err(format!(
+                    "--tier: unknown tier '{other}' (cheap, standard, deep, frontier)"
+                )),
+            })
+            .transpose()?;
+        let mut parsed = Self {
+            execution,
+            seat_tier,
+            ..Self::default()
+        };
+        if let Some(list) = validation {
+            let (mut review, mut test, mut security) = (false, false, false);
+            for gate in list
+                .split(',')
+                .map(str::trim)
+                .filter(|g| !g.is_empty() && *g != "none")
+            {
+                match gate {
+                    "review" => review = true,
+                    "test" => test = true,
+                    "security" => security = true,
+                    other => {
+                        return Err(format!(
+                            "--validation: unknown gate '{other}' (review, test, security, none)"
+                        ));
+                    }
+                }
+            }
+            parsed.review = Some(review);
+            parsed.test = Some(test);
+            parsed.security = Some(security);
+        }
+        Ok(parsed)
+    }
+}
+
+fn seat_tier_rank(tier: SeatTier) -> u8 {
+    match tier {
+        SeatTier::Cheap => 0,
+        SeatTier::Standard => 1,
+        SeatTier::Deep => 2,
+        SeatTier::Frontier => 3,
+    }
+}
+
+/// Apply the operator override after every derived floor. Refused lowerings are named in `reasons`. (#537)
+pub fn apply_override(decision: &mut ProxyDecision, ov: &ProxyOverride, cfg: &CtxConfig) {
+    if let Some(requested) = ov.execution {
+        let floor = if decision.risk >= RiskBand::High || decision.workflow.is_some() {
+            ExecutionMode::Bounded
+        } else {
+            ExecutionMode::Direct
+        };
+        let applied = if execution_rank(requested) < execution_rank(floor) {
+            decision.reasons.push(format!(
+                "override: execution {} refused, floor is {} (risk or workflow)",
+                format!("{requested:?}").to_lowercase(),
+                format!("{floor:?}").to_lowercase()
+            ));
+            floor
+        } else {
+            requested
+        };
+        if applied != decision.execution {
+            decision.execution = applied;
+            decision.seat_role = SeatRole::from_execution(applied);
+            decision.worker_tier = worker_tier_from_execution(applied);
+            decision.seat_tier = SeatTier::from_execution_complexity_risk(
+                applied,
+                decision.complexity,
+                decision.risk,
+            );
+            decision.reasons.push(format!(
+                "override: execution set to {}",
+                format!("{applied:?}").to_lowercase()
+            ));
+        }
+        apply_direct_execution_workflow_rule(decision);
+    }
+    if let Some(requested) = ov.seat_tier {
+        let derived = SeatTier::from_execution_complexity_risk(
+            decision.execution,
+            decision.complexity,
+            decision.risk,
+        );
+        let mut applied = requested;
+        if decision.risk >= RiskBand::High && seat_tier_rank(applied) < seat_tier_rank(derived) {
+            decision.reasons.push(format!(
+                "override: tier {} refused, floor is {} (risk high)",
+                requested.label(),
+                derived.label()
+            ));
+            applied = derived;
+        }
+        if applied == SeatTier::Frontier && decision.execution != ExecutionMode::Orchestrated {
+            decision
+                .reasons
+                .push("override: tier frontier needs an orchestrated seat; used deep".to_string());
+            applied = SeatTier::Deep;
+        }
+        if applied != decision.seat_tier {
+            decision.seat_tier = applied;
+            decision
+                .reasons
+                .push(format!("override: tier set to {}", applied.label()));
+        }
+    }
+    if ov.execution.is_some() || ov.seat_tier.is_some() {
+        decision.orchestrator.model =
+            model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
+    }
+    let security_surface = decision.risk >= RiskBand::High
+        || decision.domains.iter().any(|domain| domain == "security");
+    for (name, requested, current, required) in [
+        (
+            "review",
+            ov.review,
+            &mut decision.validation.independent_review,
+            security_surface,
+        ),
+        (
+            "test",
+            ov.test,
+            &mut decision.validation.independent_test,
+            false,
+        ),
+        (
+            "security",
+            ov.security,
+            &mut decision.validation.security_review,
+            security_surface,
+        ),
+    ] {
+        let Some(requested) = requested else { continue };
+        if !requested && required {
+            decision.reasons.push(format!(
+                "override: validation {name} cannot be turned off (risk high or security surface)"
+            ));
+            continue;
+        }
+        if *current != requested {
+            *current = requested;
+            decision
+                .reasons
+                .push(format!("override: validation {name} set to {requested}"));
+        }
+    }
+}
+
 /// Build bounded, repository-neutral decider input from request text, workflow definitions, and native availability. (#537)
 pub fn build_intake(
     cfg: &CtxConfig,

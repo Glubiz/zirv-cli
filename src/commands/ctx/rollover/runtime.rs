@@ -793,8 +793,13 @@ fn native_successor_input(
     plan: &SuccessorPlan,
     note: &super::super::handoff::Handoff,
     cfg: &super::super::config::CtxConfig,
+    state: &StateDir,
 ) -> String {
     let mut text = super::super::wrap::restart_prompt(note, &cfg.screen.thresholds());
+    if let Some(layer) = super::super::proxy::store::layer_for_session(state.root(), &plan.short) {
+        text.push_str("\n\n");
+        text.push_str(&layer);
+    }
     if !plan.acknowledged_input.is_empty() {
         text.push_str(
             "\n\nAcknowledged input the previous session never answered. Treat each line as an \
@@ -856,7 +861,7 @@ pub fn launch_native_pane(
             writing: native.writing,
             provider: native.provider.clone(),
             seat: Some((plan.short.clone(), plan.generation)),
-            initial_input: Some(native_successor_input(plan, note, cfg)),
+            initial_input: Some(native_successor_input(plan, note, cfg, state)),
         },
     )
     .map_err(|error| SuccessorRefusal::LaunchFailed(error.to_string()))
