@@ -1169,7 +1169,8 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     current.calls += 1;
     push_capped(&mut current.triggers, ASK_TICKET.to_string(), TRIGGERS_KEEP);
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
-    push_capped(&mut current.reserved, ticket.clone(), TRIGGERS_KEEP);
+    // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
+    current.reserved.push(ticket.clone());
     save_state(&path, &current);
     Some(ticket)
 }
@@ -2185,6 +2186,27 @@ mod tests {
         settle_ask_call(&state, "operator", &other, false);
         settle_ask_call(&state, "operator", &other, true);
         assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn the_oldest_outstanding_reservation_stays_refundable_past_the_trigger_cap() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let mut env = ruling_env(state.root());
+        env.insert(
+            "ZIRV_CTX_SUPERVISOR_MAX_CALLS".to_string(),
+            "40".to_string(),
+        );
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let first = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        for _ in 0..TRIGGERS_KEEP + 1 {
+            reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        }
+        let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
+        assert_eq!(calls() as usize, TRIGGERS_KEEP + 2);
+        settle_ask_call(&state, "operator", &first, true);
+        assert_eq!(calls() as usize, TRIGGERS_KEEP + 1);
     }
 
     #[test]
