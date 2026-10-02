@@ -6444,6 +6444,36 @@ intake_discipline = true
         }
     }
 
+    #[test]
+    fn workflow_auto_start_defaults_to_detect_parses_env_and_is_repo_forbidden() {
+        use crate::commands::workflow::adoption::AutoStartPolicy;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("load");
+        assert_eq!(cfg.workflow.auto_start, AutoStartPolicy::Detect);
+        for (raw, expected) in [
+            ("off", AutoStartPolicy::Off),
+            ("detect", AutoStartPolicy::Detect),
+            ("always", AutoStartPolicy::Always),
+        ] {
+            let env = env_map(&[("ZIRV_CTX_WORKFLOW_AUTO_START", raw)]);
+            let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("env");
+            assert_eq!(cfg.workflow.auto_start, expected, "raw value {raw}");
+        }
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[workflow]\nauto_start = \"off\"\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set workflow.auto_start");
+        assert!(is_repo_forbidden(err.as_ref()), "{err}");
+    }
+
     /// SECURITY: `workflow.adoption` is operator-only -- a repo checkout must
     /// not be able to loosen its own adoption pressure to `off`, nor tighten
     /// it to `enforce` to hold an operator's own agent dispatches hostage.
@@ -7002,6 +7032,7 @@ intake_discipline = true
         ("workflow.deploy", "tier"),
         ("workflow.deploy", "minimum_tier"),
         ("workflow", "adoption"),
+        ("workflow", "auto_start"),
         ("workflow.maintain", "timeout_secs"),
         ("report", "repository"),
         ("search", "max_output_bytes"),

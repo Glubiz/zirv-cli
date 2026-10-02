@@ -2440,6 +2440,20 @@ running workflow's resolved tier only ever ratchets upward:
 | `staging` | Requires an explicit `zirv workflow approve` on the deploy step |
 | `production` | Requires approval, plus at least one fresh independent `reviewer`-seat run and fresh final `zirv verify` evidence; an open finding or stale evidence blocks it outright |
 
+### Workflow auto-start
+
+`[workflow] auto_start = "off" | "detect" | "always"` in `~/.zirv/ctx.toml`
+(`ZIRV_CTX_WORKFLOW_AUTO_START` for the final override; default `detect`) is
+operator-only. On a session's first prompt the `UserPromptSubmit` hook starts
+a workflow itself, bound to that session and running at its first step with
+no approval prompt: `detect` for programming or investigation work (a
+feature, bugfix, refactor, spike, performance or review request, judged from
+the prompt text alone, no network), `always` for every first prompt. Questions
+and chat start none, and "no workflow" in the prompt opts out. It is skipped
+for a session that already has a bound workflow and for delegated seats
+(worker, sub-orchestrator, single, or a `zirv agent` child), so a worker brief
+never inherits another session's workflow.
+
 ### Workflow adoption
 
 `[workflow] adoption = "off" | "advise" | "nudge" | "enforce"` in
@@ -5138,6 +5152,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `workflow.repo_workflows_enabled` | `ZIRV_CTX_WORKFLOW_REPO_WORKFLOWS` |
 | `workflow.deploy.tier` | `ZIRV_CTX_WORKFLOW_DEPLOY_TIER` |
 | `workflow.adoption` | `ZIRV_CTX_WORKFLOW_ADOPTION` |
+| `workflow.auto_start` | `ZIRV_CTX_WORKFLOW_AUTO_START` |
 | `workflow.maintain` | `~/.zirv/ctx.toml only` |
 | `report.repository` | `ZIRV_CTX_REPORT_REPOSITORY` |
 | `workflow.telemetry_enabled` | `ZIRV_CTX_WORKFLOW_TELEMETRY` |
@@ -5287,7 +5302,9 @@ pick which vendor account gets spent with that guard never in the way.
 `workflow.adoption` closes the same hole once more for the workflow-adoption
 nudge/enforce gate (issue #223): a repo checkout must not be able to turn its
 own adoption pressure down to `off`, or up to `enforce` to hold an operator's
-own agent dispatches hostage.
+own agent dispatches hostage. `workflow.auto_start` is operator-only for the
+same reason: a repo must not start workflows, with their approvals and spend,
+on the operator's behalf.
 `fallback.orchestrator_rollover_headroom_pct`/`fallback.rollover_cooldown_secs`/`fallback.reactive_force_after_secs`
 (issue #358) close the same hole for automatic orchestrator-seat rollover: the
 on/off switch (`fallback.auto_orchestrator_rollover`) stays repo-narrowable

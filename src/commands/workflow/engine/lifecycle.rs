@@ -29,6 +29,29 @@ fn sanitize_skill_body(body: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Move a just-started workflow from its first gate to running that step,
+/// for a start nobody is present to approve. A first step with an External
+/// effect keeps its gate.
+pub fn waive_first_gate(
+    state_dir: &StateDir,
+    mut state: WorkflowState,
+) -> CtxResult<WorkflowState> {
+    if state.status != WorkflowStatus::AwaitingApproval || !state.completed_steps.is_empty() {
+        return Ok(state);
+    }
+    let Some(step) = state.current() else {
+        return Ok(state);
+    };
+    if step.effect == crate::commands::workflow::definition::EffectClass::External {
+        return Ok(state);
+    }
+    state.current_step_approved = Some(step.id.clone());
+    state.status = WorkflowStatus::Running;
+    state.updated_at = now_secs();
+    save(state_dir, &state, true)?;
+    Ok(state)
+}
+
 pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<WorkflowState> {
     // Checked against the as-loaded status, before `refresh_deploy_tier`: see
     // `advance_with_evidence`'s identical guard for why.

@@ -489,6 +489,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKFLOW_AUTO_START",
+        &["workflow", "auto_start"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_REPORT_REPOSITORY",
         &["report", "repository"],
         EnvKind::Str,
@@ -1563,6 +1568,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     ),
     // Repos may neither evade adoption pressure nor force enforcement onto operator dispatches (#223).
     (&["workflow", "adoption"], "ZIRV_CTX_WORKFLOW_ADOPTION"),
+    // Repos must not start workflows (with their approvals and spend) on the operator's behalf.
+    (&["workflow", "auto_start"], "ZIRV_CTX_WORKFLOW_AUTO_START"),
     (&["workflow", "maintain"], "~/.zirv/ctx.toml only"),
     (&["report", "repository"], "ZIRV_CTX_REPORT_REPOSITORY"),
     (

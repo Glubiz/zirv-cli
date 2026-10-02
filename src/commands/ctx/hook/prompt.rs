@@ -190,7 +190,8 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
 
     let adoption_nudge = prompt_adoption_nudge(&repo, &cfg, env);
     let intake_note = intake_discipline_note(&cfg, &payload.session_id, stdin, env);
-    let extra = [intake_note, adoption_nudge]
+    let workflow_note = auto_start_workflow_note(&cfg, &payload.session_id, stdin, &repo, env);
+    let extra = [intake_note, workflow_note, adoption_nudge]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -310,6 +311,70 @@ fn intake_discipline_note(
         },
     );
     Some(note.to_string())
+}
+
+/// Start a workflow for a session whose prompt is programming or
+/// investigation work, once per session, and tell the agent. A prompt that is
+/// not such work leaves the session unclaimed so a later one can start it.
+/// Every failure leaves the prompt unchanged.
+fn auto_start_workflow_note(
+    cfg: &CtxConfig,
+    payload_session: &str,
+    stdin: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    use crate::commands::ctx::proxy::{decision, launch};
+    let policy = cfg.workflow.auto_start;
+    if policy == adoption::AutoStartPolicy::Off
+        || intake_skipped_for_launch(env)
+        || env(crate::commands::ctx::supervisor::CONSULT_ENV).is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let session = env(SESSION_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let prompt = prompt_text_from(stdin);
+    let declined = decision::declines_workflow(&prompt);
+    if !declined && !decision::auto_start_wanted(&prompt, policy) {
+        return None;
+    }
+    let state = StateDir::resolve(env).ok()?;
+    let short = crate::commands::ctx::sessions::short_id(&session);
+    if engine::load_active_for_session(&state, repo, &short)
+        .ok()?
+        .is_some()
+    {
+        return None;
+    }
+    if !claim_first_prompt(&state, &format!("{session}#workflow")) || declined {
+        return None;
+    }
+    let task = crate::utils::truncate_bytes(prompt, Some(4000));
+    let launch::WorkflowStart::Started { id } =
+        launch::start_named_workflow(None, None, state.root(), repo, &task, Some(&short)).ok()?
+    else {
+        return None;
+    };
+    let started = engine::load(&state, repo, &id).ok()?;
+    let _ = engine::waive_first_gate(&state, started);
+    let _ = log::append(
+        &state,
+        &log::Decision {
+            ts: now_secs(),
+            session: &session,
+            verb: "hook",
+            verdict: "n/a",
+            score: 0,
+            action: "workflow-auto-start",
+            detail: &id,
+            observed_at: None,
+        },
+    );
+    Some(format!(
+        "[zirv workflow] Started workflow {id} for this session. Follow `zirv workflow status` and its artifacts."
+    ))
 }
 
 /// Closed set of read-only administrative operations that need no model
@@ -1075,6 +1140,168 @@ mod tests {
 
     fn intake_stdin(prompt: &str) -> String {
         serde_json::json!({ "session_id": "s1", "prompt": prompt }).to_string()
+    }
+
+    fn git_repo_with_commit() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("repo");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        repo
+    }
+
+    const CODING_PROMPT: &str = "fix the crash when the dashboard pane is clicked";
+
+    #[test]
+    fn auto_start_starts_a_running_workflow_for_coding_work_once() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = git_repo_with_commit();
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+
+        let note = auto_start_workflow_note(
+            &cfg,
+            "s1",
+            &intake_stdin(CODING_PROMPT),
+            repo.path(),
+            &lookup,
+        )
+        .expect("a coding prompt starts a workflow");
+        assert!(
+            note.starts_with("[zirv workflow] Started workflow "),
+            "{note}"
+        );
+
+        let store = StateDir::from_root(state.path().to_path_buf());
+        let active = engine::load_active(&store, repo.path())
+            .expect("readable")
+            .expect("a workflow is active");
+        assert_eq!(active.status, engine::WorkflowStatus::Running);
+        assert_eq!(active.task, CODING_PROMPT);
+        assert_eq!(
+            auto_start_workflow_note(
+                &cfg,
+                "s1",
+                &intake_stdin(CODING_PROMPT),
+                repo.path(),
+                &lookup
+            ),
+            None,
+            "a session that has its workflow starts no second one"
+        );
+    }
+
+    #[test]
+    fn auto_start_ignores_questions_without_claiming_the_session() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = git_repo_with_commit();
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+
+        assert_eq!(
+            auto_start_workflow_note(
+                &cfg,
+                "s1",
+                &intake_stdin("how does the dashboard pane click handler work?"),
+                repo.path(),
+                &lookup
+            ),
+            None
+        );
+        assert!(
+            auto_start_workflow_note(
+                &cfg,
+                "s1",
+                &intake_stdin(CODING_PROMPT),
+                repo.path(),
+                &lookup
+            )
+            .is_some(),
+            "a later coding prompt still starts one"
+        );
+    }
+
+    #[test]
+    fn auto_start_skips_opt_outs_off_and_delegated_launches() {
+        let repo = git_repo_with_commit();
+        let off = {
+            let mut cfg = CtxConfig::default();
+            cfg.workflow.auto_start = adoption::AutoStartPolicy::Off;
+            cfg
+        };
+        let cases: Vec<_> = vec![
+            (
+                CtxConfig::default(),
+                "fix the crash, no workflow please",
+                vec![],
+            ),
+            (off, CODING_PROMPT, vec![]),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(adapters::SEAT_ROLE_ENV, "worker")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(adapters::SEAT_ROLE_ENV, "sub-orchestrator")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(crate::commands::ctx::agent::WORK_GROUP_ENV, "g")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(crate::commands::ctx::agent::PARENT_SESSION_ENV, "p")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(crate::commands::ctx::supervisor::CONSULT_ENV, "1")],
+            ),
+        ];
+        for (cfg, prompt, extra) in cases {
+            let state = tempfile::tempdir().expect("state");
+            let env = intake_env(state.path(), &extra);
+            assert_eq!(
+                auto_start_workflow_note(&cfg, "s1", &intake_stdin(prompt), repo.path(), &|k| {
+                    env.get(k).cloned()
+                }),
+                None,
+                "{prompt:?} {extra:?} must start nothing"
+            );
+            let store = StateDir::from_root(state.path().to_path_buf());
+            assert!(
+                engine::load_active(&store, repo.path())
+                    .expect("readable")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -129,6 +129,28 @@ pub enum AdoptionPolicy {
     Enforce,
 }
 
+/// Whether zirv starts a workflow itself on a session's first prompt.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoStartPolicy {
+    Off,
+    /// Programming or investigation work only; questions and chat start none.
+    #[default]
+    Detect,
+    /// Every first prompt, unless it opts out.
+    Always,
+}
+
 impl std::fmt::Display for AdoptionPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
