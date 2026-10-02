@@ -102,13 +102,8 @@ impl Setting {
                 || format!("{kind} setting (env {env})"),
                 |(_, text)| (*text).to_string(),
             );
-        let last = path.last().copied().unwrap_or_default();
         Self {
-            sensitive: last.contains("credential")
-                || last.ends_with("password")
-                || last.ends_with("secret")
-                || last.ends_with("api_key")
-                || last == "token",
+            sensitive: kind != "bool" && is_secret_name(&key),
             operator_only: REPO_FORBIDDEN
                 .iter()
                 .find(|(forbidden, _)| path.starts_with(forbidden))
@@ -409,13 +404,44 @@ fn embeds_credentials(raw: &str) -> bool {
         })
 }
 
+/// The one rule for "this name holds a secret", on whole segments split on `_`, `.` and `-`.
+/// A `*_env` key holds the NAME of a variable, but it is still treated as secret-shaped: it renders
+/// `(redacted)` and is refused, the conservative reading of "credential-like keys".
 fn is_secret_name(name: &str) -> bool {
+    const ANY_SEGMENT: [&str; 14] = [
+        "secret",
+        "secrets",
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "credentials",
+        "cred",
+        "creds",
+        "apikey",
+        "bearer",
+        "cookie",
+        "cookies",
+        "authorization",
+    ];
+    const LAST_SEGMENT: [&str; 5] = ["token", "key", "sig", "signature", "auth"];
     let name = name.to_ascii_lowercase();
-    [
-        "token", "key", "secret", "password", "passwd", "auth", "sig",
-    ]
-    .iter()
-    .any(|word| name.contains(word))
+    let segments: Vec<&str> = name.split(['_', '.', '-']).collect();
+    segments.iter().any(|segment| ANY_SEGMENT.contains(segment))
+        || segments
+            .last()
+            .is_some_and(|last| LAST_SEGMENT.contains(last))
+}
+
+/// True when a TOML table value, at any depth, has a secret-named string field.
+fn has_secret_field(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table
+            .iter()
+            .any(|(name, item)| (is_secret_name(name) && item.is_str()) || has_secret_field(item)),
+        toml::Value::Array(items) => items.iter().any(has_secret_field),
+        _ => false,
+    }
 }
 
 /// Mask URL userinfo and token-like query values inside a string.
@@ -484,15 +510,22 @@ pub fn change(
     scope: Scope,
 ) -> CtxResult<String> {
     let setting = find(key);
-    if setting.as_ref().is_some_and(|setting| setting.sensitive) {
+    let sensitive = setting
+        .as_ref()
+        .map_or_else(|| is_secret_name(key), |setting| setting.sensitive);
+    if sensitive {
         return Err(
             format!("{key} is a credential setting: it is never shown or edited here").into(),
         );
     }
     let (raw, op) = match change {
-        Change::Set(raw) if embeds_credentials(raw) => {
+        Change::Set(raw)
+            if embeds_credentials(raw)
+                || toml::from_str::<toml::Table>(&format!("v = {raw}"))
+                    .is_ok_and(|table| has_secret_field(&table["v"])) =>
+        {
             return Err(format!(
-                "{key}: the value embeds a credential (URL userinfo or a token-like query parameter); reference an environment variable instead"
+                "{key}: the value embeds a credential (URL userinfo, a token-like query parameter or a secret-named field); reference an environment variable instead"
             )
             .into());
         }
@@ -868,6 +901,50 @@ mod tests {
         }
         assert!(!embeds_credentials("https://api.example/v1?page=2"));
         assert!(!fx.project_file().exists());
+    }
+
+    #[test]
+    fn credential_named_fields_are_redacted_refused_and_innocuous_names_are_not() {
+        let fx = Fixture::new();
+        fx.user("[endpoint.x]\nsearch_credential = \"abc\"\nname = \"ok\"\n");
+        let row = row_of(&fx, &no_env, "endpoint");
+        assert!(
+            !row.value.contains("abc") && row.value.contains("ok"),
+            "{}",
+            row.value
+        );
+        for key in ["search_credential", "endpoint.search_credential"] {
+            for scope in [Scope::User, Scope::Project] {
+                let error = with_ctx(&fx, &no_env, |ctx| {
+                    change(ctx, key, Change::Set("\"abc\""), scope).unwrap_err()
+                });
+                assert!(error.to_string().contains("credential"), "{key}: {error}");
+            }
+        }
+        let table = with_ctx(&fx, &no_env, |ctx| {
+            change(
+                ctx,
+                "endpoint",
+                Change::Set("{ search_credential = \"abc\" }"),
+                Scope::User,
+            )
+            .unwrap_err()
+        });
+        assert!(table.to_string().contains("embeds a credential"), "{table}");
+        for name in [
+            "credential",
+            "api_key",
+            "access-key",
+            "session_token",
+            "x.Cookie",
+            "creds",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in ["credit_limit", "score.token_floor", "max_key_bytes"] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+        assert!(!find("sandbox.scrub_worker_secrets").unwrap().sensitive);
     }
 
     #[test]
