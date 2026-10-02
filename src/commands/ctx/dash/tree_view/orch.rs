@@ -145,6 +145,17 @@ fn needs(model: &Model) -> Vec<Need> {
             age: now.saturating_sub(*since),
         });
     }
+    if let Some(wf) = facts.workflow.filter(|wf| wf.awaiting_approval) {
+        out.push(Need {
+            kind: NeedKind::Wait {
+                kind: WaitKind::WorkflowGate,
+                evidence: format!("{} \u{b7} {}", wf.pack, wf.step),
+            },
+            sel: Some(Sel::Seat),
+            name: name_of(model, &Sel::Seat),
+            age: 0,
+        });
+    }
     for (short, since) in &facts.stalled {
         let (sel, name) = subject(short);
         out.push(Need {
@@ -2937,6 +2948,36 @@ mod tests {
             press(&mut v, &f, 160, 70, KeyCode::Char('a')),
             Outcome::Notice(_)
         ));
+    }
+
+    #[test]
+    fn a_workflow_awaiting_approval_is_a_gate_wait_on_the_seat() {
+        let (data, wf, jev) = busy();
+        let mut gated = wf.clone();
+        gated.awaiting_approval = true;
+        let f = orch_facts(&gated, &jev);
+        let model = model_of(&data, &f);
+        let gate = needs(&model)
+            .into_iter()
+            .find(|n| {
+                matches!(
+                    n.kind,
+                    NeedKind::Wait {
+                        kind: WaitKind::WorkflowGate,
+                        ..
+                    }
+                )
+            })
+            .expect("a gate wait");
+        assert_eq!(gate.sel, Some(Sel::Seat));
+        let calm = orch_facts(&wf, &jev);
+        assert!(!needs(&model_of(&data, &calm)).iter().any(|n| matches!(
+            n.kind,
+            NeedKind::Wait {
+                kind: WaitKind::WorkflowGate,
+                ..
+            }
+        )));
     }
 
     #[test]
