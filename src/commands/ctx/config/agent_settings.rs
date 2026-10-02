@@ -7,6 +7,8 @@ use super::*;
 pub struct WorkerConfig {
     pub claude: Option<String>,
     pub codex: Option<String>,
+    /// Codex worker reasoning effort, passed as `-c model_reasoning_effort=`; unset leaves Codex's own default.
+    pub codex_effort: Option<String>,
     /// Operator-only root delegation depth; repos cannot grant themselves more reach (#262).
     pub default_depth: u8,
     /// Operator-only root read-only default: no destructive access or write roots (#262).
@@ -24,6 +26,7 @@ impl Default for WorkerConfig {
         Self {
             claude: None,
             codex: None,
+            codex_effort: None,
             default_depth: 1,
             default_read_only: false,
             max_depth: u8::MAX,

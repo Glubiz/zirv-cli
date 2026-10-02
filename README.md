@@ -4980,7 +4980,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `mail.mid_turn`, any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `models.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
-`worker.codex`, `worker.default_depth`, `worker.default_read_only`,
+`worker.codex`, `worker.codex_effort`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
 `obfuscate.allow`, `obfuscate.literals_file`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
@@ -5140,6 +5140,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker.claude` | `ZIRV_CTX_WORKER_MODEL_CLAUDE` |
 | `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.codex_effort` | `ZIRV_CTX_WORKER_EFFORT_CODEX` (Codex worker reasoning effort, e.g. `low`/`medium`/`high`; passed as `-c model_reasoning_effort=`; an operator `-c model_reasoning_effort=...` passthrough wins; unset leaves Codex's own default) |
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `worker.bootstrap_timeout_secs` | `ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS` (whole goal-bootstrap run; default `600`, must be greater than zero) |

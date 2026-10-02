@@ -1540,6 +1540,9 @@ impl CtxConfig {
         if let Some(model) = cfg.worker.codex.as_deref() {
             validate_model_str("worker.codex", model)?;
         }
+        if let Some(effort) = cfg.worker.codex_effort.as_deref() {
+            validate_model_str("worker.codex_effort", effort)?;
+        }
         if cfg.worker.bootstrap_timeout_secs == 0 {
             return Err(add_config_error_prefix(
                 "worker.bootstrap_timeout_secs must be greater than 0, got 0".into(),

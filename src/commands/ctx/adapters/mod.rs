@@ -48,7 +48,7 @@ pub use launch_policy::{
 pub(crate) use launch_policy::{doubled_slash_rule_base, scratchpad_roots, scratchpad_rules};
 pub use model::{
     provider_for_agent_and_model, provider_for_agent_name, provider_for_usage_readout,
-    worker_model_args,
+    worker_effort_args, worker_model_args,
 };
 pub(crate) use model::{resolve_review_model, resolve_tiered_model};
 pub use probe::ProbeCache;

@@ -701,6 +701,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKER_EFFORT_CODEX",
+        &["worker", "codex_effort"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
         &["worker", "default_depth"],
         EnvKind::Int,
@@ -1772,6 +1777,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // Worker model selection spends operator accounts; forbid model leaves while allowing depth/network narrowing (#262).
     (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
     (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    (&["worker", "codex_effort"], "ZIRV_CTX_WORKER_EFFORT_CODEX"),
     (
         &["worker", "bootstrap_timeout_secs"],
         "ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS",
