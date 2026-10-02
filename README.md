@@ -376,9 +376,9 @@ colour when `COLORTERM` is `truecolor` or `24bit`, else the nearest of the 256
 colours, decided once) and never uses the terminal's dim attribute:
 
 - **Header**: `zirv <repo> · seat <model> · <role>`; on the right a breathing
-  `⚑ N need you` badge or `✓ all clear`, the seat harness's `usage 5h` reading and
-  the session `spend` (the sidebar's own cached facts, never computed again; an
-  unknown reading is left out), and `? keys`.
+  `⚑ N need you` badge or `✓ all clear`, the seat harness's `usage 5h` reading
+  (the sidebar's own cached fact, never computed again; an unknown reading is left
+  out), and `? keys`. No dashboard shows a USD figure.
 - **Workflow stepper**: `WORKFLOW <pack> · <task>`, each step `✓` done, a turning
   spinner on the current one or `○` to do, joined by `━━━` after a done step (a
   light runs along them) and `───` after the others, with `step i/n · <elapsed> ·
@@ -394,10 +394,14 @@ colours, decided once) and never uses the terminal's dim attribute:
   bus to working agents; a dispatch, mail, finish, ask or answer sends a glyph along
   it, the borders of working and waiting cards breathe, and a new Jev decision flashes
   Jev's border. Finished agents older than four minutes fold into clickable
-  `FINISHED` pills. The agent order and the scrolling of many rows are as before
+  `FINISHED` pills. A finished native subagent of a live session reads `idle`
+  (it can still be messaged); past four idle cards the rest fold into `IDLE` pills. The agent order and the scrolling of many rows are as before
   (wheel, `PgUp`/`PgDn`, arrows). Terminals that are too short shrink the cards, then
   Jev, before they drop anything.
-- **NEEDS YOU** (right column): the oldest pending approval as a card: who asks (the
+- **NEEDS YOU** (right column): every pending operator wait shows here (a Claude or
+  Codex approval naming its command, an `AskUserQuestion` until the next tool call, a
+  workflow awaiting approval); a wait only its harness can answer is a card with
+  `⏎ Open its pane`. The oldest pending approval is a card: who asks (the
   agent's job), where, how long ago, the whole command wrapped by column to four lines
   and coloured, why it needs you, and `y Allow once`, `a Always allow`, `d Deny`, `⏎
   Open its harness`. `y` and `d` are drawn faint and do nothing unless the whole
@@ -408,7 +412,7 @@ colours, decided once) and never uses the terminal's dim attribute:
   Nothing pending reads `✓ Nothing needs you right now`.
 - **SELECTED** (right column), `PREVIEW` while the pointer hovers another node: status,
   model, kind (`Codex pane`, `Claude subagent, inside seat`), where it runs, workflow
-  step, what it is doing now and its recent steps. For Jev: today's decisions, cost and
+  step, what it is doing now and its recent steps. For Jev: today's decisions and
   how many were unsure, the enabled sites and what it does. Chips `⏎ Open`, `m
   Message`, `n Nudge`, `x Stop`; one whose action does not apply (`n`, `x` need a pane)
   is faint and does nothing.
@@ -452,8 +456,10 @@ Keys (plain keys while the view shows; every `^A` chord keeps working):
 Mouse: one click on a card, the seat or a `FINISHED` pill opens that agent's own
 harness, never a custom view: a pane agent (Codex or Claude) opens its pane chat, and a
 native Claude subagent, which has no pane because it runs inside its root session's
-Claude Code, opens that session's pane chat, with the bar naming the subagent (when the
-host has no pane on this dashboard a notice names it). A click on Jev, a NEEDS YOU
+Claude Code, drives the host pane's own subagent list to that subagent when the host is
+idle with an empty prompt, and otherwise opens a read-only live view of its transcript
+(`Esc` or `^A t` closes it). The Jev box counts only this seat's session, its
+descendants and nothing from before it started. A click on Jev, a NEEDS YOU
 row or an activity row selects. A click on a chip does what its key does. Hovering
 previews a node in SELECTED; the terminal must report plain pointer motion for that (the
 dashboard asks for any-motion reports, `?1003`, only while the flow shows and never on
@@ -476,7 +482,9 @@ the dashboard's cached facts. The classic dashboard's rendering is untouched.
 
 **Approvals inbox** (issue #840, off by default). With `[approvals] inbox =
 true`, a Claude `PermissionRequest` from a pane of a live dashboard is held for
-that dashboard's operator instead of showing the pane's own dialog at once. A
+that dashboard's operator instead of showing the pane's own dialog at once, but only in
+the `default`, `plan` and `acceptEdits` permission modes (`auto`, `dontAsk` and
+`bypassPermissions` resolve without a dialog, so nothing is held). A
 strip appears across the bottom of the dashboard and of an open agent chat ONLY
 while something is pending (with nothing pending the screens are byte-identical
 to a build without the feature): the oldest request first, with the agent,
@@ -6050,7 +6058,7 @@ the output; `--json` prints the newest 100 events unless `--events` is given.
 writes nothing unless `[jev] retry` is on and the TypeSafe credential is set; then it
 counts consecutive failures of one tool call shape in `<state>/jev-retry/<session>.json`
 (a successful `PostToolUse` clears it) and asks Jev once at the third. `zirv setup apply` registers the hook only while `[jev] retry` is on (and removes it when off), so
-enabling the key requires re-running `zirv setup apply`; with the key off no process spawns on a tool failure. `[supervisor] enabled` (#835) installs the same hook and shares the streak file: at the third failure of a streak it also asks the supervisor for a retry-or-stop ruling, with or without `[jev] retry`.
+enabling the key requires re-running `zirv setup apply`; with the key off no process spawns on a tool failure. `[supervisor] enabled` (#835) installs the same hook and shares the streak file (a zirv-launched Claude session also gets the Stop and tool-failure hooks in its launch settings, without `zirv setup`; `zirv ctx status` prints a `supervisor:` line with the harness and model, or `off`): at the third failure of a streak it also asks the supervisor for a retry-or-stop ruling, with or without `[jev] retry`.
 
 #### Supervisor
 
@@ -6074,7 +6082,7 @@ bounds every kind per session; once it is spent the seat decides as it would wit
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook (once per distinct diffstat); while a `not_done` is open the Claude Stop hook blocks with the reason, at most 3 times per ruling, and the workflow's final step is refused. A later `done` resolves it. Codex has no Stop-hook block, so it gets the mail and the workflow gate only |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook (once per distinct diffstat); while a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, and the workflow's final step is refused. A later `done` resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 
