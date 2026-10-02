@@ -567,7 +567,7 @@ fn read_only_floor(adapter: &(impl AgentAdapter + ?Sized), mode: LaunchMode) -> 
 pub fn floorless_adapter_names(mode: LaunchMode) -> Vec<&'static str> {
     ADAPTERS
         .iter()
-        .filter(|(_, ctor)| read_only_floor(ctor(None).as_ref(), mode).is_empty())
+        .filter(|(_, ctor)| !ctor(None).read_only_floor_available(mode.is_interactive()))
         .map(|(name, _)| *name)
         .collect()
 }
@@ -1328,6 +1328,23 @@ mod tests {
                 assert!(!capable_list.contains(floorless), "{message}");
             }
         }
+    }
+
+    /// The refusal lists capable harnesses without launching any: building it must write no
+    /// policy or config file (gemini's lands in the temp dir when no state dir resolves).
+    #[test]
+    fn building_the_read_only_refusal_writes_no_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "TMPDIR",
+            Some(tmp.path().to_str().expect("utf8")),
+        )]);
+        let cursor = cursor::CursorAdapter::new(None);
+        for mode in [LaunchMode::Headless, LaunchMode::Interactive] {
+            assert!(require_read_only_floor(&cursor, mode).is_err());
+        }
+        let written: Vec<_> = std::fs::read_dir(tmp.path()).expect("read_dir").collect();
+        assert!(written.is_empty(), "{written:?}");
     }
 
     #[test]
