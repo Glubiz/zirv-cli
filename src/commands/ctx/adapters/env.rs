@@ -47,6 +47,10 @@ pub const LAUNCH_MODE_INTERACTIVE_VALUE: &str = "interactive";
 /// spawn topology and prompt-answerability are different questions.
 pub const HEADLESS_ENV: &str = "ZIRV_CTX_HEADLESS";
 
+/// Marks a model call or unattended loop zirv itself spawned (distiller, loop cycle), never a
+/// user's session; the prompt hook starts no workflow in it. Only `"1"` counts; nested launches scrub it.
+pub const INTERNAL_ENV: &str = "ZIRV_CTX_INTERNAL";
+
 /// The `(key, value)` pair a real interactive-launch seam pushes into its
 /// child's env vector -- `None` for [`LaunchMode::Headless`], so a headless
 /// launch adds nothing rather than a second, spoofable "not interactive"

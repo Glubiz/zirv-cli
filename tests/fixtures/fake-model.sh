@@ -55,6 +55,7 @@ esac
 
 prompt=$(cat)
 [ -z "${FAKE_MODEL_PROMPT_LOG:-}" ] || printf '%s' "$prompt" > "$FAKE_MODEL_PROMPT_LOG"
+[ -z "${FAKE_MODEL_ENV_LOG:-}" ] || printf '%s' "${ZIRV_CTX_INTERNAL:-unset}" > "$FAKE_MODEL_ENV_LOG"
 
 case "${FAKE_MODEL_MODE:-good}" in
   fail)

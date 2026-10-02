@@ -5,7 +5,7 @@ use super::*;
 /// Scrub inherited session, seat, headless, and parent identity before
 /// setting this child's own values; failed bind must mean unsupervised,
 /// never supervised by an outer session. (#249/#328/#334)
-pub const SUPERVISION_ENV: [&str; 11] = [
+pub const SUPERVISION_ENV: [&str; 12] = [
     super::adapters::SESSION_ENV,
     super::adapters::SOCKET_ENV,
     super::adapters::SEAT_MODEL_ENV,
@@ -15,6 +15,7 @@ pub const SUPERVISION_ENV: [&str; 11] = [
     super::adapters::LAUNCH_MODE_ENV,
     super::agent::PARENT_SESSION_ENV,
     super::adapters::HEADLESS_ENV,
+    super::adapters::INTERNAL_ENV,
     super::agent::RESULT_SCHEMA_ENV,
     super::agent::RESULT_WORKDIR_ENV,
 ];

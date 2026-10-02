@@ -2458,8 +2458,10 @@ no approval prompt: `detect` for programming or investigation work (a
 feature, bugfix, refactor, spike, performance or review request, judged from
 the prompt text alone, no network), `always` for every first prompt. Questions
 and chat start none, and "no workflow" in the prompt opts out. It is skipped
-for a session that already has a bound workflow and for delegated seats
-(worker, sub-orchestrator, single, or a `zirv agent` child), so a worker brief
+for a session that already has a bound workflow, for delegated seats
+(worker, sub-orchestrator, single, or a `zirv agent` child), and for unattended or
+zirv-spawned launches (`ZIRV_CTX_HEADLESS=1`, or `ZIRV_CTX_INTERNAL=1` on the
+distiller/handoff/memory model call and `zirv ctx loop` cycles), so a worker brief
 never inherits another session's workflow.
 
 ### Workflow adoption

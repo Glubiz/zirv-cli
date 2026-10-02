@@ -32,9 +32,9 @@ mod roster;
 
 pub(super) use dirs::{resolve_home_dir, resolve_state_dir};
 pub use env::{
-    AGENT_ENV, HEADLESS_ENV, LAUNCH_MODE_ENV, LAUNCH_MODE_INTERACTIVE_VALUE, LaunchMode,
-    PROXY_DECIDED_ENV, SEAT_MODEL_ENV, SEAT_ROLE_ENV, SESSION_ENV, SOCKET_ENV, TurnSignalSetup,
-    headless_marker_env, launch_mode_pin_env, seat_model_env, seat_role_env,
+    AGENT_ENV, HEADLESS_ENV, INTERNAL_ENV, LAUNCH_MODE_ENV, LAUNCH_MODE_INTERACTIVE_VALUE,
+    LaunchMode, PROXY_DECIDED_ENV, SEAT_MODEL_ENV, SEAT_ROLE_ENV, SESSION_ENV, SOCKET_ENV,
+    TurnSignalSetup, headless_marker_env, launch_mode_pin_env, seat_model_env, seat_role_env,
 };
 pub(crate) use env::{ModelFlagForm, classify_model_flag, last_model_flag, model_only_flags};
 pub(crate) use error::{
