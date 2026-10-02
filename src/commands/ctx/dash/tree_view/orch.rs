@@ -288,7 +288,7 @@ fn header(s: &mut Scene, ctx: &Ctx, w: i32, need_count: usize) {
         .map(|pct| ("usage 5h ".to_string(), format!("{pct:.0}%")));
     // Drop the facts that matter least until what is left fits beside the badge.
     let sep = "  \u{b7}  ";
-    let mut parts: Vec<(String, String)> = [usage].into_iter().flatten().collect();
+    let mut parts: Vec<(String, String)> = usage.into_iter().collect();
     let parts_w = |parts: &[(String, String)]| -> i32 {
         parts
             .iter()

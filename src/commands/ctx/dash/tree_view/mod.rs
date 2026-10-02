@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use chrono::FixedOffset;
 
+use super::super::attention::AUTHORITY_ORDER;
 use super::super::config::CtxConfig;
 use super::super::graph::{self, Event, Node};
 use super::super::mail;
@@ -125,17 +126,10 @@ pub(super) fn wait_evidence(status_evidence: &str) -> String {
         .rsplit("; ")
         .next()
         .unwrap_or(status_evidence);
-    let bare = [
-        "AdapterHook",
-        "Supervisor",
-        "Workflow",
-        "Transcript",
-        "ScreenManifest",
-        "QuietHeuristic",
-    ]
-    .iter()
-    .find_map(|label| clause.strip_prefix(label)?.strip_prefix(": "))
-    .unwrap_or(clause);
+    let bare = AUTHORITY_ORDER
+        .iter()
+        .find_map(|authority| clause.strip_prefix(&format!("{authority:?}: ")))
+        .unwrap_or(clause);
     capped_first_line(bare, 60)
 }
 
@@ -277,20 +271,20 @@ pub(super) fn compute(
     // row names no session). Without a seat the box falls back to the repository's last half day.
     let mut jev_children: Vec<String> = Vec::new();
     while let Some(seat) = seat_session {
-        let before = jev_children.len();
-        let kids = nodes.iter().filter(|n| {
-            n.parent
-                .as_deref()
-                .is_some_and(|p| p == seat || jev_children.iter().any(|c| c == p))
-        });
-        let fresh: Vec<String> = kids
+        let fresh: Vec<String> = nodes
+            .iter()
+            .filter(|n| !jev_children.contains(&n.id))
+            .filter(|n| {
+                n.parent
+                    .as_deref()
+                    .is_some_and(|p| p == seat || jev_children.iter().any(|c| c == p))
+            })
             .map(|n| n.id.clone())
-            .filter(|id| !jev_children.contains(id))
             .collect();
-        jev_children.extend(fresh);
-        if jev_children.len() == before {
+        if fresh.is_empty() {
             break;
         }
+        jev_children.extend(fresh);
     }
     let jev_since = seat_session
         .and_then(|seat| {
