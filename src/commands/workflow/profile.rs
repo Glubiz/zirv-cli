@@ -275,21 +275,7 @@ fn classify_jev_facts(task: &str, classification: &Classification) -> serde_json
         .split_whitespace()
         .filter(|word| proxy::is_path_like_token(word))
         .count() as u64;
-    let mut domain_hits: Vec<u64> = DOMAIN_SIGNALS
-        .iter()
-        .map(|(needles, _, _)| {
-            needles
-                .iter()
-                .filter(|needle| lower.contains(*needle))
-                .count() as u64
-        })
-        .collect();
-    domain_hits.push(
-        FRONTEND_TASK_TERMS
-            .iter()
-            .filter(|needle| lower.contains(*needle))
-            .count() as u64,
-    );
+    let domain_hits = domain_hit_counts(&lower);
     serde_json::json!({
         "_zirv_metadata_only": true,
         // [site=3, intent, complexity, risk, word-count bucket, path-like
@@ -314,6 +300,45 @@ fn classify_jev_facts(task: &str, classification: &Classification) -> serde_json
             domain_hits[5],
         ]],
     })
+}
+
+/// Per-domain keyword hit counts (security, data, docs, devops, architecture, frontend) in lowercased text.
+fn domain_hit_counts(lower: &str) -> [u64; 6] {
+    let mut hits = [0u64; 6];
+    for (slot, (needles, _, _)) in hits.iter_mut().zip(DOMAIN_SIGNALS.iter()) {
+        *slot = needles
+            .iter()
+            .filter(|needle| lower.contains(*needle))
+            .count() as u64;
+    }
+    hits[5] = FRONTEND_TASK_TERMS
+        .iter()
+        .filter(|needle| lower.contains(*needle))
+        .count() as u64;
+    hits
+}
+
+/// Metadata-only facts for the workflow gate reclassification (`[jev] gates`); must satisfy `jev::safe_metadata_request`.
+/// Keyword hit counts over the task and over the changed paths reuse [`domain_hit_counts`]; no task text or path is sent.
+pub(crate) fn gate_jev_facts(
+    task: &str,
+    changed_paths: &[String],
+    complexity: Complexity,
+    risk: RiskBand,
+    domain: WorkDomain,
+) -> serde_json::Value {
+    let task_hits = domain_hit_counts(&task.to_ascii_lowercase());
+    let path_hits = domain_hit_counts(&changed_paths.join(" ").to_ascii_lowercase());
+    let mut row = vec![
+        4,
+        complexity as u64,
+        risk as u64,
+        domain as u64,
+        changed_paths.len().min(200) as u64,
+    ];
+    row.extend(task_hits);
+    row.extend(path_hits);
+    serde_json::json!({ "_zirv_metadata_only": true, "facts": [row] })
 }
 
 /// The intent Choice alone (the same six options `proxy::decision::

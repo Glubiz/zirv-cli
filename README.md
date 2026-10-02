@@ -573,18 +573,16 @@ to `zirv chat`. It implements part of the execution-profile seam tracked in
 classifier, team compiler, workflow definitions and gates it sits in front of
 are unchanged.
 
-**Decider chain.** `decide()` computes the deterministic baseline first. The
-shared client's metadata-only boundary now refuses the legacy text-bearing
-Jev classification request locally, before cache or network; the existing
-helper-model chokepoint remains available, then the baseline. The
+**Decider chain.** `decide()` computes the deterministic baseline first. With
+`decider = "typesafe"` and a credential present, one metadata-only Jev call
+(coarse counts, classes and flags; never request text, repository names or
+paths) may advise clarification and its category; with no Jev credential the
+helper-model chokepoint runs, then the baseline. The
 baseline measures no diff at intake, so it floors complexity by the request's
 own size: 120+ words or 3+ enumerated items is at least bounded, 300+ words
 or 8+ items at least substantial (never architectural) -- without it every
-multi-part spec landed on the cheap seat. With
-`jev.intake_savings` enabled and a credential present, a separate
-metadata-only Jev call may advise clarification and its category. The
-eleven-question classification schema and live battery below describe the
-historical Jev path and the helper's merge behavior. The historical Jev path
+multi-part spec landed on the cheap seat. The eleven-question classification
+schema and live battery below describe the helper's merge behavior. The historical Jev path
 and current helper model answer eleven
 questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`,
 and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
@@ -4581,7 +4579,7 @@ dispatch = false    # model tier for an omitted Agent model, from brief metadata
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
-intake_savings = false # clarification category and optional planner; ZIRV_CTX_JEV_INTAKE_SAVINGS
+intake_savings = false # optional planner (clarification advice runs whenever decider=typesafe); ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
