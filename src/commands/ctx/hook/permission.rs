@@ -59,6 +59,8 @@ struct PermissionHookPayload {
     session_id: String,
     cwd: String,
     permission_mode: String,
+    /// Non-empty inside a native subagent.
+    agent_id: String,
     hook_event_name: Option<String>,
     reason: Option<String>,
     tool_name: String,
@@ -325,6 +327,12 @@ pub(super) fn run_permission<W: Write>(
     };
     let short = attention_short(env, &payload.session_id);
     let auto_allowed = permission_request_is_prompt_free(&payload, stdin, env);
+    let permission_id = crate::commands::ctx::approvals::request_id(
+        &short,
+        &payload.tool_name,
+        &payload.tool_input.command,
+        &payload.tool_input.preview_source(&payload.tool_name),
+    );
     if auto_allowed {
         let _ = writeln!(w, "{PERMISSION_ALLOW_DECISION}");
     }
@@ -337,6 +345,7 @@ pub(super) fn run_permission<W: Write>(
             &short,
             format!("permission denied: {}", payload.tool_name),
             now_secs(),
+            |open| open.id == permission_id && open.agent == payload.agent_id,
         );
         crate::commands::ctx::approvals::clear_for_tool(
             &state,
@@ -346,6 +355,15 @@ pub(super) fn run_permission<W: Write>(
             &payload.tool_input.preview_source(&payload.tool_name),
         );
     } else if !auto_allowed {
+        crate::commands::ctx::attention::open_prompt(
+            &state,
+            &short,
+            crate::commands::ctx::attention::OpenPrompt {
+                id: permission_id,
+                agent: payload.agent_id.clone(),
+                at: now_secs(),
+            },
+        );
         let _ = crate::commands::ctx::attention::record(
             &state,
             &short,
@@ -409,12 +427,22 @@ pub(super) fn run_permission<W: Write>(
     Ok(0)
 }
 
-/// Clear Approval or Question only when it is still the persisted attention state.
+/// Clear Approval or Question only when it is still the persisted attention state and `closes`
+/// leaves no other permission prompt of the session open (#854).
 /// Tool hooks and PermissionDenied prove the prompt ended; a locked
 /// conditional write preserves unrelated higher-priority latches. Read
 /// without the lock first to avoid common-path hot-hook latency (#456).
-pub(super) fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
+pub(super) fn clear_resolved_approval(
+    state: &StateDir,
+    short: &str,
+    evidence: String,
+    now: u64,
+    closes: impl Fn(&crate::commands::ctx::attention::OpenPrompt) -> bool,
+) {
     use crate::commands::ctx::attention::Attention;
+    if crate::commands::ctx::attention::close_prompts(state, short, closes) > 0 {
+        return;
+    }
     let waiting = |attention| matches!(attention, Attention::Approval | Attention::Question);
     if !waiting(crate::commands::ctx::attention::load(state, short).attention) {
         return;
@@ -826,6 +854,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn two_subagents_prompting_for_the_same_command_hold_approval_until_both_resolve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let with_agent = |stdin: String, agent: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&stdin).expect("json");
+            value["agent_id"] = serde_json::json!(agent);
+            value.to_string()
+        };
+        for agent in ["agent-a", "agent-b"] {
+            run_permission(
+                &mut Vec::new(),
+                &with_agent(
+                    permission_stdin(
+                        Some("PermissionRequest"),
+                        "Bash",
+                        serde_json::json!({"command": "rm -rf /tmp/x"}),
+                    ),
+                    agent,
+                ),
+                &lookup,
+            )
+            .expect("never errors");
+        }
+        let mut post: serde_json::Value = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/work/repo",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_response": {"stdout": "", "stderr": ""},
+            "agent_id": "agent-b",
+        });
+        super::super::posttool::run_posttool(&mut Vec::new(), &post.to_string(), &lookup)
+            .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::Approval,
+            "agent a's dialog is still open"
+        );
+        post["agent_id"] = serde_json::json!("agent-a");
+        super::super::posttool::run_posttool(&mut Vec::new(), &post.to_string(), &lookup)
+            .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::None
+        );
+    }
+
     /// A `PreToolUse` for a DIFFERENT tool than the one that prompted also
     /// clears `Approval`: a new tool call at all proves the prompt is gone.
     #[test]
@@ -853,6 +935,32 @@ mod tests {
             crate::commands::ctx::attention::Attention::Approval
         );
 
+        // A call parallel to the prompt starts within the same second and proves nothing about it (#854).
+        run_pretool(
+            &mut Vec::new(),
+            &pretool_stdin("Read", serde_json::json!({"file_path": "/work/repo/a.md"})),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::Approval
+        );
+        // The same agent calling on well after the prompt shows it ended, denied or answered.
+        crate::commands::ctx::attention::open_prompt(
+            &state,
+            &short,
+            crate::commands::ctx::attention::OpenPrompt {
+                id: crate::commands::ctx::approvals::request_id(
+                    &short,
+                    "Bash",
+                    "rm -rf /tmp/x",
+                    "rm -rf /tmp/x",
+                ),
+                agent: String::new(),
+                at: 1,
+            },
+        );
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,

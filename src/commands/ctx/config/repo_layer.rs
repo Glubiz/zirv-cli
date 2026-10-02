@@ -701,6 +701,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_WORKER_EFFORT_CODEX",
+        &["worker", "codex_effort"],
+        EnvKind::Str,
+    ),
+    (
         "ZIRV_CTX_WORKER_DEFAULT_DEPTH",
         &["worker", "default_depth"],
         EnvKind::Int,
@@ -875,6 +880,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     // Operator runtime override; also named in forbidden repo-config errors (#491).
     ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
+    (
+        "ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL",
+        &["runtime", "prompt_cache_ttl"],
+        EnvKind::Str,
+    ),
     // Operator proxy overrides; every corresponding config key is repo-forbidden (#537).
     (
         "ZIRV_CTX_PROXY_ENABLED",
@@ -1464,7 +1474,7 @@ fn parse_bool(raw: &str) -> CtxResult<bool> {
 }
 
 /// Repos cannot choose launched binaries, failure commands or spending models; operator config, env and flags may.
-const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
     // Configured agent selection bypasses the fallback loop's repo-disable guard; repos must not select the vendor account.
     (&["agent"], "ZIRV_CTX_AGENT"),
@@ -1772,6 +1782,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // Worker model selection spends operator accounts; forbid model leaves while allowing depth/network narrowing (#262).
     (&["worker", "claude"], "ZIRV_CTX_WORKER_MODEL_CLAUDE"),
     (&["worker", "codex"], "ZIRV_CTX_WORKER_MODEL_CODEX"),
+    (&["worker", "codex_effort"], "ZIRV_CTX_WORKER_EFFORT_CODEX"),
     (
         &["worker", "bootstrap_timeout_secs"],
         "ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS",

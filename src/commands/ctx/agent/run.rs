@@ -2427,6 +2427,59 @@ mod tests {
         drop(held);
     }
 
+    /// Issue #543: `run_with` fences its writer lease on this process's seat identity, so an
+    /// uncommitted successor generation is refused before any adapter is launched.
+    #[test]
+    fn run_with_refuses_a_writer_lease_for_an_uncommitted_seat_generation() {
+        use crate::commands::ctx::runtime::RuntimeKind;
+        use crate::commands::ctx::seat;
+
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+        let state = StateDir::from_root(state_path);
+
+        let session = "7b1a2c3d-9999-4000-8000-000000000543";
+        let short = crate::commands::ctx::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1,
+        )
+        .expect("register");
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::adapters::SESSION_ENV, Some(session)),
+            (seat::GENERATION_ENV, Some(&prepared.to_string())),
+        ]);
+
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a writer refusal is a structured exit, not an Err");
+        assert_eq!(code, exec::EXIT_WRITER_BUSY);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("uncommitted seat generation"), "got {text}");
+        assert_eq!(permit::live_writer_records(&state).len(), 0);
+    }
+
     /// Audit finding G4: the same refusal, one invariant deeper. `run_with`
     /// reserves this delegation's token ceiling against its PROVIDER before
     /// the writer permit is even asked for, promising (at the reservation

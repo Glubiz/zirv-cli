@@ -6,22 +6,19 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use serde::Serialize;
 
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::jev::{self, AnswerValue, Question};
 use crate::commands::ctx::state::{StateDir, now_secs};
-use crate::commands::workflow::classify::{self, Classification, Complexity, RiskBand, WorkDomain};
+use crate::commands::workflow::classify::{self, Classification, RiskBand, WorkDomain};
 use crate::commands::workflow::deploy::DeployTier;
 use crate::commands::workflow::skill::WorkflowPhase;
+
+use crate::commands::workflow::profile::gate_jev_facts;
 
 use super::cli::*;
 use super::definitions::*;
 use super::state::*;
-const MAX_JEV_GATE_TASK_BYTES: usize = 4 * 1024;
-
-const MAX_JEV_GATE_PATHS: usize = 200;
-
 /// Minimum sensitive-surface probability from the 2026-09-18 probe.
 const JEV_SENSITIVE_PROBABILITY: f64 = 0.7;
 
@@ -363,13 +360,11 @@ pub(super) fn enrich_transition_evidence(
     evidence
 }
 
-#[derive(Serialize)]
-pub(super) struct JevGateState {
-    task: String,
-    changed_paths: Vec<String>,
-    current_complexity: Complexity,
-    current_risk: RiskBand,
-    current_domain: WorkDomain,
+/// Shared facts description for every gate question (see `profile::gate_jev_facts`).
+macro_rules! gate_facts {
+    () => {
+        "From facts [site=4, complexity (0 trivial to 3 architectural), risk (0 low to 3 critical), work domain (0 general, 1 frontend), changed path count, then keyword hit counts over the task text (security, data, docs, devops, architecture, frontend) and the same six over the changed paths]"
+    };
 }
 
 /// [`apply_jev_gate_advice`]'s own full question set, factored out so `zirv
@@ -377,15 +372,21 @@ pub(super) struct JevGateState {
 /// state -- static, no per-call inputs.
 pub(crate) fn gate_reclass_questions() -> Vec<Question> {
     vec![
-        Question::noul(
+        Question::metadata_noul(
             "sensitive_surface",
-            "Do these paths or this task touch authentication, credentials, permissions, schema or data migration, deployment, or a public API contract?",
+            concat!(
+                gate_facts!(),
+                ", is a sensitive surface touched (authentication, credentials, permissions, schema or data migration, deployment, or a public API contract)? Answer false if the metadata is insufficient."
+            ),
             "a sensitive surface is touched",
-            "no sensitive surface is touched",
+            "no sensitive surface is touched or insufficient evidence",
         ),
-        Question::choice(
+        Question::metadata_choice(
             "work_domain",
-            "Which work domain best describes this change?",
+            concat!(
+                gate_facts!(),
+                ", which work domain best describes this change? Choose backend if the metadata is insufficient."
+            ),
             &[
                 ("frontend", "frontend user interface work"),
                 ("backend", "backend or service work"),
@@ -393,23 +394,48 @@ pub(crate) fn gate_reclass_questions() -> Vec<Question> {
                 ("docs", "documentation-only work"),
             ],
         ),
-        Question::noul(
+        Question::metadata_noul(
             "security",
-            "Is this security work?",
+            concat!(
+                gate_facts!(),
+                ", is this security work? Answer false if insufficient."
+            ),
             "security",
             "not security",
         ),
-        Question::noul("data", "Is this data work?", "data", "not data"),
-        Question::noul(
+        Question::metadata_noul(
+            "data",
+            concat!(
+                gate_facts!(),
+                ", is this data work? Answer false if insufficient."
+            ),
+            "data",
+            "not data",
+        ),
+        Question::metadata_noul(
             "docs_only",
-            "Is this documentation-only work?",
+            concat!(
+                gate_facts!(),
+                ", is this documentation-only work? Answer false if insufficient."
+            ),
             "documentation only",
             "not documentation only",
         ),
-        Question::noul("devops", "Is this DevOps work?", "DevOps", "not DevOps"),
-        Question::noul(
+        Question::metadata_noul(
+            "devops",
+            concat!(
+                gate_facts!(),
+                ", is this DevOps work? Answer false if insufficient."
+            ),
+            "DevOps",
+            "not DevOps",
+        ),
+        Question::metadata_noul(
             "architecture",
-            "Is this architecture work?",
+            concat!(
+                gate_facts!(),
+                ", is this architecture work? Answer false if insufficient."
+            ),
             "architecture",
             "not architecture",
         ),
@@ -496,18 +522,13 @@ pub(super) fn apply_jev_gate_advice(
     } else {
         measured.work_domain.domain
     };
-    let advice_state = JevGateState {
-        task: crate::utils::truncate_bytes(state.task.clone(), Some(MAX_JEV_GATE_TASK_BYTES)),
-        changed_paths: measured
-            .changed_paths
-            .iter()
-            .take(MAX_JEV_GATE_PATHS)
-            .cloned()
-            .collect(),
-        current_complexity: measured.complexity,
+    let advice_state = gate_jev_facts(
+        &state.task,
+        &measured.changed_paths,
+        measured.complexity,
         current_risk,
         current_domain,
-    };
+    );
     let questions = gate_reclass_questions();
     let Some(answers) = jev::advise(
         cfg,
@@ -2482,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_freeform_state_cannot_raise_risk_through_jev() {
+    fn gate_metadata_state_raises_risk_through_jev() {
         let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -2509,18 +2530,17 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
-        );
-        assert_eq!(measured.risk, RiskBand::Medium);
-        assert!(!state_dir.root().join("jev-decisions.jsonl").exists());
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("change credentials"), "{sent}");
+        assert_eq!(measured.risk, RiskBand::High);
+        assert!(state_dir.root().join("jev-decisions.jsonl").exists());
     }
 
     #[test]
-    fn gate_freeform_state_cannot_set_frontend_domain_through_jev() {
-        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+    fn gate_metadata_state_sets_frontend_domain_through_jev() {
+        let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.95,"backend":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -2545,16 +2565,15 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
-        );
-        assert_eq!(measured.work_domain.domain, WorkDomain::General);
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("update the view"), "{sent}");
+        assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
     }
 
     #[test]
-    fn gate_freeform_state_preserves_an_unset_frontend_domain() {
+    fn gate_metadata_state_keeps_general_domain_on_thin_margin() {
         let body = r#"{"model":"jev-latest","answers":{"work_domain":{"type":"choice","choice":"frontend","probabilities":{"frontend":0.51,"backend":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -2580,17 +2599,16 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
-        );
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("update the view"), "{sent}");
 
         assert_ne!(measured.work_domain.domain, WorkDomain::Frontend);
     }
 
     #[test]
-    fn gate_freeform_state_preserves_existing_high_risk_and_frontend() {
+    fn gate_metadata_state_preserves_existing_high_risk_and_frontend() {
         let body = r#"{"model":"jev-latest","answers":{"sensitive_surface":{"type":"noul","noul":0.05},"work_domain":{"type":"choice","choice":"backend","probabilities":{"backend":0.99,"other":0.01},"confidence":0.99},"security":{"type":"noul","noul":0.05},"data":{"type":"noul","noul":0.05},"docs_only":{"type":"noul","noul":0.05},"devops":{"type":"noul","noul":0.05},"architecture":{"type":"noul","noul":0.05}},"usage":{"input_tokens":20,"output_tokens":7}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -2619,11 +2637,10 @@ mod tests {
         let mut measured = classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
-        );
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("existing frontend change"), "{sent}");
 
         assert_eq!(measured.risk, RiskBand::High);
         assert_eq!(measured.work_domain.domain, WorkDomain::Frontend);
@@ -2631,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_freeform_state_cannot_add_jev_tags() {
+    fn gate_metadata_state_adds_jev_tags() {
         let body = r#"{"model":"jev-latest","answers":{"security":{"type":"noul","noul":0.95},"data":{"type":"noul","noul":0.95},"docs_only":{"type":"noul","noul":0.95},"devops":{"type":"noul","noul":0.95},"architecture":{"type":"noul","noul":0.95}},"usage":{"input_tokens":20,"output_tokens":5}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -2655,20 +2672,22 @@ mod tests {
         let mut measured = state.classification.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("cross-cutting change"), "{sent}");
+        assert_eq!(
+            state.jev_tags,
+            ["architecture", "data", "devops", "docs-only", "security"]
         );
-        assert!(state.jev_tags.is_empty());
         let mut output = Vec::new();
         write_state(&mut output, &state, false).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains("jev tags:"), "{output}");
+        assert!(output.contains("jev tags:"), "{output}");
     }
 
     #[test]
-    fn gate_freeform_state_matches_gate_off() {
+    fn gate_metadata_state_http_error_matches_gate_off() {
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             500,
             "{}",
@@ -2693,14 +2712,31 @@ mod tests {
         let expected_measured = measured.clone();
 
         apply_jev_gate_advice(&cfg, &state_dir, &mut state, &mut measured);
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
-        );
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
+        assert!(!sent.contains("small change"), "{sent}");
 
         assert_eq!(state, expected_state);
         assert_eq!(measured, expected_measured);
+    }
+
+    #[test]
+    fn gate_request_passes_the_metadata_only_guard_without_task_or_paths() {
+        let facts = gate_jev_facts(
+            "rotate the shared credential",
+            &["src/secret_store.rs".to_string()],
+            classify::Complexity::Bounded,
+            RiskBand::Medium,
+            WorkDomain::General,
+        );
+        assert!(crate::commands::ctx::jev::safe_metadata_request(
+            &facts,
+            &gate_reclass_questions(),
+            "jev-latest"
+        ));
+        let text = facts.to_string();
+        assert!(!text.contains("rotate") && !text.contains("secret_store"));
     }
 
     #[test]

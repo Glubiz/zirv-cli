@@ -169,6 +169,12 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .with_attention(crate::commands::ctx::attention::Attention::None),
             now_secs(),
         );
+        // A turn boundary ends every prompt the session had open.
+        crate::commands::ctx::attention::close_prompts(
+            &state,
+            &super::permission::attention_short(env, &payload.session_id),
+            |_| true,
+        );
         crate::commands::ctx::approvals::clear_released(
             &state,
             &super::permission::attention_short(env, &payload.session_id),
@@ -852,10 +858,16 @@ mod tests {
         let socket = dir.path().join("t.sock");
         let server = signal::SignalServer::bind(&socket).expect("bind");
 
-        let env: std::collections::HashMap<String, String> = [(
-            crate::commands::ctx::adapters::SOCKET_ENV.to_string(),
-            socket.display().to_string(),
-        )]
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::adapters::SOCKET_ENV.to_string(),
+                socket.display().to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                dir.path().join("state").display().to_string(),
+            ),
+        ]
         .into();
         let stdin = stop_payload(&transcript, dir.path());
 

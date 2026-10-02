@@ -895,8 +895,13 @@ mod tests {
 
     #[test]
     fn pre_compact_exits_zero_even_with_unusable_stdin() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let mut out = Vec::new();
-        let code = run_pre_compact(&mut out, "not json at all", &|_| None).expect("never errors");
+        let code = run_pre_compact(&mut out, "not json at all", &|key| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| state_dir.path().display().to_string())
+        })
+        .expect("never errors");
         assert_eq!(code, 0);
         assert!(
             String::from_utf8_lossy(&out).contains("systemMessage"),
@@ -1016,8 +1021,13 @@ mod tests {
 
     #[test]
     fn notify_survives_a_non_json_payload() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let mut out = Vec::new();
-        let code = run_notify(&mut out, "agent-turn-complete", &|_| None).expect("runs");
+        let code = run_notify(&mut out, "agent-turn-complete", &|key| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| state_dir.path().display().to_string())
+        })
+        .expect("runs");
         assert_eq!(code, 0);
         assert!(out.is_empty(), "no output and no panic: {out:?}");
     }

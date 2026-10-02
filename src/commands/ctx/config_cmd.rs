@@ -228,7 +228,39 @@ fn contains_native_runtime(value: &toml::Value) -> bool {
     }
 }
 
-fn edit(doc: &mut DocumentMut, key: &str, raw: &str, append: bool) -> CtxResult<bool> {
+/// What an edit does to the key: replace its value, append an array element or remove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditOp {
+    Set,
+    Add,
+    Unset,
+}
+
+fn unset(doc: &mut DocumentMut, key: &str) -> CtxResult<bool> {
+    let parts = key_parts(key)?;
+    let Some((last, parents)) = parts.split_last() else {
+        return Ok(false);
+    };
+    let mut item = doc.as_item_mut();
+    for part in parents {
+        let Some(next) = item
+            .as_table_like_mut()
+            .and_then(|table| table.get_mut(part.get()))
+        else {
+            return Ok(false);
+        };
+        item = next;
+    }
+    Ok(item
+        .as_table_like_mut()
+        .is_some_and(|table| table.remove(last.get()).is_some()))
+}
+
+fn edit(doc: &mut DocumentMut, key: &str, raw: &str, op: EditOp) -> CtxResult<bool> {
+    if op == EditOp::Unset {
+        return unset(doc, key);
+    }
+    let append = op == EditOp::Add;
     let mut value = raw.parse::<Value>().unwrap_or_else(|_| Value::from(raw));
     if key_parts(key)?
         .first()
@@ -286,27 +318,91 @@ fn edit(doc: &mut DocumentMut, key: &str, raw: &str, append: bool) -> CtxResult<
     Ok(true)
 }
 
-pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
-    let path = config::operator_path()?;
-    if let ConfigCommand::Migrate {
-        to,
-        downgrade,
-        dry_run,
-    } = &args.command
-    {
-        return migrate(&path, to, *downgrade, *dry_run, w);
-    }
-    let text = match std::fs::read_to_string(&path) {
+/// The document at `path` before and after the edit, plus whether it changed;
+/// the updated text has already passed `validate`, nothing is written.
+pub(super) fn preview_edit(
+    path: &std::path::Path,
+    key: &str,
+    raw: &str,
+    op: EditOp,
+    validate: &dyn Fn(&str) -> CtxResult<()>,
+) -> CtxResult<(String, String, bool)> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let (key, value, append) = match &args.command {
-        ConfigCommand::Show { key: None } => {
-            write!(w, "{text}")?;
-            return Ok(0);
-        }
-        ConfigCommand::Show { key: Some(key) } => {
+    let mut doc: DocumentMut = text.parse()?;
+    let changed = edit(&mut doc, key, raw, op)?;
+    let updated = doc.to_string();
+    validate(&updated).map_err(|e| format!("refusing to update {}: {e}", path.display()))?;
+    Ok((text, updated, changed))
+}
+
+/// The shared validated, comment-preserving edit of the file at `path`: the
+/// whole updated document must pass `validate` before an atomic private write,
+/// and the write is refused when the file changed since it was read. Returns
+/// whether the document changed. `zirv ctx config` and `/settings` both call this.
+pub(super) fn apply_edit(
+    path: &std::path::Path,
+    key: &str,
+    raw: &str,
+    op: EditOp,
+    validate: &dyn Fn(&str) -> CtxResult<()>,
+) -> CtxResult<bool> {
+    let (text, updated, changed) = preview_edit(path, key, raw, op, validate)?;
+    if !changed {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        state::create_private_dir_all(parent)?;
+    }
+    if state::write_atomic_bytes_if_unchanged(
+        path,
+        updated.as_bytes(),
+        true,
+        &state::hex_sha256(text.as_bytes()),
+    )?
+    .is_some()
+    {
+        return Err(format!(
+            "refusing to update {}: it changed while being edited; nothing was written",
+            path.display()
+        )
+        .into());
+    }
+    Ok(true)
+}
+
+/// `apply_edit` on `~/.zirv/ctx.toml`, validated as the operator document.
+pub(super) fn apply_operator_edit(key: &str, raw: &str, op: EditOp) -> CtxResult<bool> {
+    apply_edit(
+        &config::operator_path()?,
+        key,
+        raw,
+        op,
+        &config::validate_operator_document,
+    )
+}
+
+pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
+    let path = config::operator_path()?;
+    let (key, value, op) = match &args.command {
+        ConfigCommand::Migrate {
+            to,
+            downgrade,
+            dry_run,
+        } => return migrate(&path, to, *downgrade, *dry_run, w),
+        ConfigCommand::Show { key } => {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e.into()),
+            };
+            let Some(key) = key else {
+                write!(w, "{text}")?;
+                return Ok(0);
+            };
             let doc: DocumentMut = text.parse()?;
             let mut item = doc.as_item();
             for part in key_parts(key)? {
@@ -317,25 +413,18 @@ pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
             writeln!(w, "{item}")?;
             return Ok(0);
         }
-        ConfigCommand::Set { key, value } => (key, value, false),
-        ConfigCommand::Add { key, value } => (key, value, true),
-        // Handled above, before the document is even read.
-        ConfigCommand::Migrate { .. } => unreachable!(),
+        ConfigCommand::Set { key, value } => (key, value, EditOp::Set),
+        ConfigCommand::Add { key, value } => (key, value, EditOp::Add),
     };
-    let mut doc: DocumentMut = text.parse()?;
-    let changed = edit(&mut doc, key, value, append)?;
-    let updated = doc.to_string();
-    config::validate_operator_document(&updated)
-        .map_err(|e| format!("refusing to update {}: {e}", path.display()))?;
-    if !changed {
+    if !apply_operator_edit(key, value, op)? {
         writeln!(w, "{key}: element already present (unchanged)")?;
         return Ok(0);
     }
-    if let Some(parent) = path.parent() {
-        state::create_private_dir_all(parent)?;
-    }
-    state::write_private(&path, &updated)?;
-    writeln!(w, "{key}: {}", if append { "added" } else { "set" })?;
+    writeln!(
+        w,
+        "{key}: {}",
+        if op == EditOp::Add { "added" } else { "set" }
+    )?;
     Ok(0)
 }
 
@@ -580,5 +669,62 @@ mod tests {
         std::fs::write(&path, "[broken").unwrap();
         assert!(invoke(set("worker.codex", "new")).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[broken");
+    }
+
+    #[test]
+    fn a_concurrent_change_between_read_and_write_leaves_the_other_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let path = config::operator_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[score]\nwindow = 3\n").unwrap();
+        let racer = path.clone();
+        let _hook = state::set_pre_rename_hook(move || {
+            std::fs::write(&racer, "[score]\nwindow = 4\n").unwrap();
+        });
+        let error = apply_operator_edit("score.window", "5", EditOp::Set).unwrap_err();
+        assert!(
+            error.to_string().contains("changed while being edited"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[score]\nwindow = 4\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_the_original_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let path = config::operator_path().unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[score]\nwindow = 3\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = std::fs::write(dir.join("probe"), "").is_ok();
+        let result = apply_operator_edit("score.window", "5", EditOp::Set);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if writable {
+            return;
+        }
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[score]\nwindow = 3\n"
+        );
+    }
+
+    #[test]
+    fn unset_removes_only_the_named_key_and_reports_a_missing_one() {
+        let mut doc: DocumentMut = "# c\n[score]\nwindow = 3 # w\nmin_turns = 2\n"
+            .parse()
+            .unwrap();
+        assert!(edit(&mut doc, "score.window", "", EditOp::Unset).unwrap());
+        assert_eq!(doc.to_string(), "# c\n[score]\nmin_turns = 2\n");
+        assert!(!edit(&mut doc, "score.window", "", EditOp::Unset).unwrap());
+        assert!(!edit(&mut doc, "nope.nothing", "", EditOp::Unset).unwrap());
     }
 }

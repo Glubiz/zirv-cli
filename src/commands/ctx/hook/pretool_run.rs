@@ -343,12 +343,16 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
 
     // A new PreToolUse call proves any previous permission prompt ended;
     // clear its attention latch before guard-specific early returns (#456).
+    // Only this agent's earlier prompts: a sibling subagent's call proves nothing about them, and
+    // parallel calls of one agent start together, before any of its prompts exist (#854).
     if let Ok(state) = StateDir::resolve(env) {
+        let now = now_secs();
         clear_resolved_approval(
             &state,
             &attention_short(env, &payload.session_id),
             format!("permission resolved: {}", payload.tool_name),
-            now_secs(),
+            now,
+            |open| open.agent == payload.agent_id && now >= open.at + 2,
         );
     }
 
@@ -552,6 +556,15 @@ mod tests {
     };
     use super::*;
 
+    /// Env lookup that routes the state dir to a tempdir so a test never
+    /// appends to the operator's real logs (#844).
+    fn pinned(state_dir: &tempfile::TempDir, key: &str, value: Option<String>) -> Option<String> {
+        if key == crate::commands::ctx::state::STATE_ENV {
+            return Some(state_dir.path().display().to_string());
+        }
+        value
+    }
+
     #[test]
     fn the_deny_output_matches_the_documented_pretooluse_shape() {
         let out = pretool_output("because");
@@ -572,6 +585,7 @@ mod tests {
 
     #[test]
     fn run_pretool_denies_a_fork_end_to_end_and_still_exits_zero() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
             "fable".to_string(),
@@ -584,7 +598,7 @@ mod tests {
                 "Agent",
                 serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0, "exit 2 would block on stderr text instead of json");
@@ -601,6 +615,7 @@ mod tests {
 
     #[test]
     fn run_pretool_allows_a_cheap_dispatch_with_the_skill_pointer_appended() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> = [
             (
                 crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
@@ -616,7 +631,7 @@ mod tests {
                 "Agent",
                 serde_json::json!({"subagent_type": "general-purpose", "model": "sonnet", "prompt": "do the thing"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -664,6 +679,7 @@ mod tests {
     /// must not fire for it either.
     #[test]
     fn run_pretool_never_fires_the_pointer_when_the_dispatch_has_no_prompt() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> =
             [(SESSION_ENV.to_string(), "zirv-sess-no-prompt".to_string())].into();
         let mut out = Vec::new();
@@ -673,7 +689,7 @@ mod tests {
                 "Agent",
                 serde_json::json!({"subagent_type": "general-purpose"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -685,6 +701,7 @@ mod tests {
     /// even though this dispatch is otherwise allowed outright.
     #[test]
     fn run_pretool_never_doubles_the_pointer_when_the_prompt_already_mentions_it() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> = [(
             SESSION_ENV.to_string(),
             "zirv-sess-already-briefed".to_string(),
@@ -701,7 +718,7 @@ mod tests {
                     "prompt": "before starting, run zirv skill list --match \"...\""
                 }),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -715,6 +732,7 @@ mod tests {
     /// unconditionally on `pretool_decision` never even running.
     #[test]
     fn run_pretool_appends_the_pointer_for_a_single_or_worker_seat_with_no_seat_model_env() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> =
             [(SESSION_ENV.to_string(), "zirv-sess-single".to_string())].into();
         let mut out = Vec::new();
@@ -724,7 +742,7 @@ mod tests {
                 "Task",
                 serde_json::json!({"subagent_type": "general-purpose", "prompt": "review the diff"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -744,11 +762,12 @@ mod tests {
     /// the pointer's own gate (`SESSION_ENV`) never fires on an absent value.
     #[test]
     fn run_pretool_exits_zero_and_silent_without_the_seat_env() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,
             &pretool_stdin("Agent", serde_json::json!({"subagent_type": "fork"})),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -759,6 +778,7 @@ mod tests {
     /// `skill_pointer_override`'s own filter, not just `Option::is_some()`.
     #[test]
     fn run_pretool_treats_an_empty_session_env_as_absent() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> =
             [(SESSION_ENV.to_string(), String::new())].into();
         let mut out = Vec::new();
@@ -768,7 +788,7 @@ mod tests {
                 "Agent",
                 serde_json::json!({"subagent_type": "general-purpose", "prompt": "do the thing"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -810,6 +830,7 @@ mod tests {
     /// for the actual default-posture behaviour.
     #[test]
     fn run_pretool_denies_an_orchestrator_edit_with_no_seat_model_env_at_all() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let env: std::collections::HashMap<String, String> = [
             (
@@ -831,7 +852,7 @@ mod tests {
                 "Edit",
                 serde_json::json!({"file_path": repo.path().join("src/x.rs").display().to_string()}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0, "exit 2 would block on stderr text instead of json");
@@ -1280,12 +1301,13 @@ mod tests {
     /// `updatedInput`, and the reason names the rewrite.
     #[test]
     fn run_pretool_rewrites_a_bare_git_log_with_a_cap() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,
             &bash_pretool_stdin(&repo.path().display().to_string(), "git log"),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1327,6 +1349,7 @@ mod tests {
     /// sibling test below).
     #[test]
     fn run_pretool_bash_names_an_explicit_allow_headlessly_when_the_operator_default_is_allow() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let env: std::collections::HashMap<String, String> = [
             (
@@ -1348,7 +1371,10 @@ mod tests {
         })
         .to_string();
         let mut out = Vec::new();
-        let code = run_pretool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        let code = run_pretool(&mut out, &stdin, &|k| {
+            pinned(&state_dir, k, env.get(k).cloned())
+        })
+        .expect("never errors");
         assert_eq!(code, 0);
 
         let printed = String::from_utf8(out).expect("utf8");
@@ -1374,6 +1400,7 @@ mod tests {
     /// denies anything not explicitly allowed.
     #[test]
     fn run_pretool_bash_headless_allow_never_bypasses_a_pinned_stricter_snapshot() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let snapshot_dir = tempfile::tempdir().expect("tempdir");
         let snapshot_path = snapshot_dir.path().join("policy.json");
@@ -1419,7 +1446,10 @@ mod tests {
         })
         .to_string();
         let mut out = Vec::new();
-        let code = run_pretool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("never errors");
+        let code = run_pretool(&mut out, &stdin, &|k| {
+            pinned(&state_dir, k, env.get(k).cloned())
+        })
+        .expect("never errors");
         assert_eq!(code, 0);
 
         let printed = String::from_utf8(out).expect("utf8");
@@ -1441,6 +1471,7 @@ mod tests {
     /// F7 path, which independently stays silent here exactly as before.
     #[test]
     fn run_pretool_bash_names_an_explicit_allow_interactively_too_via_the_safety_check() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let env: std::collections::HashMap<String, String> =
             [("ZIRV_CTX_SAFETY_DEFAULT".to_string(), "allow".to_string())].into();
@@ -1451,7 +1482,7 @@ mod tests {
                 &repo.path().display().to_string(),
                 "cat > f.py <<'EOF'\nprint(1)\nEOF",
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1477,6 +1508,7 @@ mod tests {
     /// carry `updatedInput` alongside a real `ask`/`deny`.
     #[test]
     fn run_pretool_bash_never_allows_a_denied_command_even_headlessly() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let env: std::collections::HashMap<String, String> = [
             (
@@ -1490,7 +1522,7 @@ mod tests {
         let code = run_pretool(
             &mut out,
             &bash_pretool_stdin(&repo.path().display().to_string(), "rm -rf /"),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1521,6 +1553,7 @@ mod tests {
     /// command every `git log` rewrite test above already relies on.
     #[test]
     fn run_pretool_now_evaluates_powershell_directly_where_it_used_to_stay_silent() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let mut out = Vec::new();
         let code = run_pretool(
@@ -1531,7 +1564,7 @@ mod tests {
                 "PowerShell",
                 serde_json::json!({"command": "git log"}),
             ),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1580,13 +1613,14 @@ mod tests {
     /// #769), the same as any other allowed `Bash` command now.
     #[test]
     fn run_pretool_leaves_an_already_limited_git_log_alone() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         for command in ["git log -n 5", "git log --max-count=3", "git log -3"] {
             let mut out = Vec::new();
             let code = run_pretool(
                 &mut out,
                 &bash_pretool_stdin(&repo.path().display().to_string(), command),
-                &|_| None,
+                &|k| pinned(&state_dir, k, None),
             )
             .expect("never errors");
             assert_eq!(code, 0);
@@ -1600,12 +1634,13 @@ mod tests {
     /// `git log` part; no `updatedInput` ever appears for it.
     #[test]
     fn run_pretool_leaves_a_piped_git_log_alone() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,
             &bash_pretool_stdin(&repo.path().display().to_string(), "git log | head"),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1622,12 +1657,13 @@ mod tests {
     /// chain.
     #[test]
     fn run_pretool_leaves_a_compound_git_log_alone() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let mut out = Vec::new();
         let code = run_pretool(
             &mut out,
             &bash_pretool_stdin(&repo.path().display().to_string(), "git log && ls"),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1644,6 +1680,7 @@ mod tests {
     /// exactly as unbounded as before the "fix".
     #[test]
     fn run_pretool_leaves_a_commented_git_log_alone() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let repo = orchestrator_repo();
         let mut out = Vec::new();
         let code = run_pretool(
@@ -1652,7 +1689,7 @@ mod tests {
                 &repo.path().display().to_string(),
                 "git log # include all history",
             ),
-            &|_| None,
+            &|k| pinned(&state_dir, k, None),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1665,6 +1702,7 @@ mod tests {
     /// alongside its deny envelope.
     #[test]
     fn run_pretool_never_attaches_updated_input_to_a_denied_command() {
+        let state_dir = tempfile::tempdir().expect("state dir");
         let env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
             "fable".to_string(),
@@ -1677,7 +1715,7 @@ mod tests {
                 "Agent",
                 serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
             ),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);
@@ -1705,7 +1743,7 @@ mod tests {
         let code = run_pretool(
             &mut out,
             &edit_payload_stdin(repo.path(), "src/x.rs"),
-            &|k| env.get(k).cloned(),
+            &|k| pinned(&state_dir, k, env.get(k).cloned()),
         )
         .expect("never errors");
         assert_eq!(code, 0);

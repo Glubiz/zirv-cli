@@ -381,6 +381,8 @@ pub fn capacity_snapshot(
             // declares no offer, so nothing about harness placement or
             // eligibility changes.
             identity: super::route::RouteIdentity::harness(name, &provider),
+            // No offer on purpose: forward validation for harness targets needs a per-harness billing
+            // posture zirv cannot know without credential probing, and a guessed one would refuse rollovers that work today.
             offer: None,
         };
         let (state, reason) = allocator::classify(&harness, provider_capacity, cfg);

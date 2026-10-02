@@ -15,7 +15,6 @@ pub mod decision;
 pub mod launch;
 pub mod llm;
 pub mod native;
-pub mod typesafe;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
@@ -295,16 +294,15 @@ pub fn decide(
     let classification = decision::classify_request(request);
     let roster = decision::Roster::gather(cfg, repo);
     let baseline = decision::baseline(cfg, repo, request, &classification, &roster);
-    let safe_intake = cfg.jev.intake_savings
-        && matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
-        && jev::available(&cfg.proxy.typesafe);
+    let safe_intake =
+        matches!(cfg.proxy.decider, ProxyDecider::Typesafe) && jev::available(&cfg.proxy.typesafe);
     let safe_input = safe_intake.then(|| {
         (
             safe_intake_metadata(request, &baseline),
             safe_intake_questions(),
         )
     });
-    let model_input = (!safe_intake && !matches!(cfg.proxy.decider, ProxyDecider::Deterministic))
+    let model_input = matches!(cfg.proxy.decider, ProxyDecider::Helper)
         .then(|| protected_model_intake(cfg, state_dir, repo, request, &roster));
 
     let mut fallbacks = Vec::new();
@@ -313,32 +311,26 @@ pub fn decide(
     let mut result = baseline.clone();
     let mut ran_model = false;
 
+    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) && !safe_intake {
+        fallbacks.push(format!(
+            "typesafe: {}",
+            jev::JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone())
+        ));
+    }
     if let Some(Err(error)) = &model_input {
         fallbacks.push(format!("sensitive-data masking: {error}"));
     }
 
     let model_call_started = Instant::now();
-    let typesafe_result = if let Some((input, questions)) = &safe_input {
-        Some(jev::ask(
+    let typesafe_result = safe_input.as_ref().map(|(input, questions)| {
+        jev::ask(
             &cfg.proxy.typesafe,
             state_dir,
             cfg.jev.cache_ttl_secs,
             input,
             questions,
-        ))
-    } else if matches!(cfg.proxy.decider, ProxyDecider::Typesafe)
-        && let Some(Ok((intake, questions))) = &model_input
-    {
-        Some(typesafe::decide(
-            &cfg.proxy.typesafe,
-            state_dir,
-            cfg.jev.cache_ttl_secs,
-            intake,
-            questions,
-        ))
-    } else {
-        None
-    };
+        )
+    });
     // Every live Jev request leaves a decision row, like the other Jev sites; a success's spend row is `persist`'s.
     if let Some(call) = &typesafe_result {
         let wall_ms = model_call_started
@@ -403,14 +395,7 @@ pub fn decide(
         }
     }
 
-    if !ran_model
-        && !safe_intake
-        && matches!(
-            cfg.proxy.decider,
-            ProxyDecider::Typesafe | ProxyDecider::Helper
-        )
-        && let Some(Ok((_, questions))) = &model_input
-    {
+    if !ran_model && let Some(Ok((_, questions))) = &model_input {
         match try_helper(cfg, questions) {
             Ok(answers) => {
                 result = decision::merge(
@@ -839,6 +824,56 @@ mod tests {
             created_at: 0,
             headless: false,
         }
+    }
+
+    /// #787: with the default `intake_savings = false`, a Typesafe decider still reaches Jev with the metadata-only intake.
+    #[test]
+    fn default_config_typesafe_intake_reaches_jev_with_metadata_only() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        assert!(!cfg.jev.intake_savings);
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_DEFAULT".to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.02},"clarification_category":{"type":"choice","choice":"other","probabilities":{"target":0.1,"behavior":0.1,"constraint":0.1,"other":0.7},"confidence":0.7}},"usage":{"input_tokens":5,"output_tokens":1}}"#;
+        let (base_url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
+            200,
+            body,
+            "application/json",
+        );
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_DEFAULT", "test-key") };
+        let decision = decide(
+            &cfg,
+            state_tmp.path(),
+            repo.path(),
+            "change PRIVATE_CUSTOMER_SERVICE",
+            false,
+        );
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_DEFAULT") };
+        let sent = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the default path reaches Jev");
+        assert!(!sent.contains("PRIVATE_CUSTOMER_SERVICE"), "{sent}");
+        assert_eq!(decision.decider, Decider::Typesafe);
+        assert!(
+            !decision
+                .fallbacks
+                .iter()
+                .any(|reason| reason.contains("unsafe"))
+        );
+    }
+
+    #[test]
+    fn safe_intake_request_passes_the_metadata_only_guard() {
+        let baseline = sample_decision();
+        let metadata = safe_intake_metadata("change src/private.rs", &baseline);
+        assert!(jev::safe_metadata_request(
+            &metadata,
+            &safe_intake_questions(),
+            "jev-latest"
+        ));
     }
 
     #[test]
@@ -1539,6 +1574,12 @@ mod tests {
             "{:?}",
             decision.fallbacks
         );
+        assert_eq!(
+            decision.fallbacks.len(),
+            1,
+            "no credential means the baseline only, never a helper attempt: {:?}",
+            decision.fallbacks
+        );
         if let Some(value) = had {
             unsafe {
                 std::env::set_var("TYPESAFE_API_KEY", value);
@@ -1596,7 +1637,7 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let state_dir = repo.path().join("state");
         let mut cfg = CtxConfig::default();
-        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.decider = ProxyDecider::Helper;
         cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
         cfg.obfuscate.literals_file = Some("missing-sensitive-literals.txt".to_string());
 

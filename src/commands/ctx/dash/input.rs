@@ -338,6 +338,7 @@ pub(super) fn enrich_sidebar(rows: &mut [ui::SidebarRow], disk: &DiskFacts, now:
         // throttled per-session reads `FactsCache::refresh_if_due` already
         // did this tick -- never a fallback to the repo-wide pointer.
         row.workflow = disk.workflow_by_session.get(&row.short).cloned();
+        row.name = disk.names.get(&row.short).cloned();
         row.unread_mail = disk
             .mail_by_session
             .get(&row.short)

@@ -18,6 +18,7 @@ use super::interactive::InteractiveProgress;
 use super::turn::{NativeLoop, TurnDriver};
 use super::types::{
     CompactionSettings, NativeFinalStatus, NativeLimits, NativeSessionConfig, RecompileContext,
+    prompt_cache_for,
 };
 
 /// Apply the proxy decision on the first turn; an existing transport is never rebuilt, and any route mismatch or workflow skip is announced rather than silently claimed. (#537)
@@ -242,6 +243,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
         super::super::super::state::now_secs(),
         &[],
     )?;
+    let prompt_cache = prompt_cache_for(&cfg, route.provider.as_ref());
     let mut journal = Journal::open(&state)?;
     let mut driver = NativeLoop::new_driver(
         NativeSessionConfig {
@@ -259,6 +261,7 @@ pub fn run_hosted_turns<W: std::io::Write>(
             workflow_repo: brokered.then(|| turn.repo.to_path_buf()),
             system,
             preamble,
+            prompt_cache,
         },
         &provider,
         tools.as_mut(),

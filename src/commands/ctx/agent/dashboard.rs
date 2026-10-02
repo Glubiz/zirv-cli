@@ -249,6 +249,7 @@ pub(super) fn try_join_dashboard<W: Write>(
         .unwrap_or_else(|| "unknown".to_string());
     let req = spawnreq::SpawnRequest {
         kill: None,
+        name: args.label.clone(),
         agent: args.name.clone(),
         prompt: prompt.to_string(),
         cwd: repo.to_path_buf(),

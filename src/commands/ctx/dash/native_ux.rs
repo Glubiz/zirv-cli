@@ -1712,6 +1712,7 @@ pub enum Focus {
     Overview,
     Inspection,
     Approval,
+    Settings,
 }
 
 impl Focus {
@@ -1722,6 +1723,7 @@ impl Focus {
             Self::Overview => "agents",
             Self::Inspection => "worker",
             Self::Approval => "approval",
+            Self::Settings => "settings",
         }
     }
 }
@@ -1967,6 +1969,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/help", "show the shortcut list"),
     ("/instructions", "alias for /context"),
+    ("/settings", "search and change settings by scope"),
     ("/skill", "show one resolved skill's digest and body"),
     ("/skills", "list the repository's resolved skills"),
     ("/status", "show the authoritative session status"),
@@ -2311,6 +2314,8 @@ pub struct UxState {
     pub notices: NoticeLog,
     pub approval: Option<ApprovalDialog>,
     pub inspection: Option<Inspection>,
+    /// The `/settings` modal (#536); a pure reducer the pane feeds keys.
+    pub settings: Option<super::settings_view::SettingsState>,
     pub deferred: DeferredDelivery,
     pub focus: Focus,
     pub help: bool,
@@ -2345,6 +2350,7 @@ impl Default for UxState {
             notices: NoticeLog::new(NOTICE_LOG_CAP),
             approval: None,
             inspection: None,
+            settings: None,
             deferred: DeferredDelivery::default(),
             focus: Focus::Composer,
             help: false,
@@ -2386,7 +2392,7 @@ impl UxState {
 
     /// Close an open modal on Esc before forwarding a later Esc to interrupt the turn.
     pub fn modal_open(&self) -> bool {
-        self.approval.is_some() || self.inspection.is_some() || self.help
+        self.approval.is_some() || self.inspection.is_some() || self.help || self.settings.is_some()
     }
 
     /// Re-derives the overview and the usage strip from records, keeping the
@@ -3637,6 +3643,7 @@ mod tests {
                 "/context",
                 "/help",
                 "/instructions",
+                "/settings",
                 "/skill",
                 "/skills",
                 "/status",

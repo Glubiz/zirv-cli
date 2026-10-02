@@ -834,6 +834,89 @@ worker='opus'
         );
     }
 
+    /// Issue #543: a writing native worker fences its writer lease on this process's seat
+    /// identity, so an uncommitted successor generation is refused before the session starts.
+    #[test]
+    fn a_writing_native_worker_is_refused_a_writer_lease_for_an_uncommitted_seat_generation() {
+        use crate::commands::ctx::{runtime::RuntimeKind, seat};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let native_toml = home.join(crate::utils::SCRIPT_DIR_NAME).join("native.toml");
+        std::fs::create_dir_all(native_toml.parent().expect("parent")).expect("mkdir .zirv");
+        std::fs::write(
+            &native_toml,
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n\
+             [route.opus]\naccount='work'\nmodel='claude-opus-5'\n[roles]\nworker='opus'\n",
+        )
+        .expect("write native.toml");
+
+        let session = "7b1a2c3d-9999-4000-8000-000000000544";
+        let short = crate::commands::ctx::sessions::short_id(session);
+        seat::register(
+            &state,
+            &short,
+            session,
+            "native",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1,
+        )
+        .expect("register");
+        let prepared = seat::prepare_onto(
+            &state,
+            &short,
+            "claude",
+            None,
+            RuntimeKind::Harness,
+            seat::Cause::Manual,
+            2,
+        )
+        .expect("prepare");
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (crate::commands::ctx::adapters::SESSION_ENV, Some(session)),
+            (seat::GENERATION_ENV, Some(&prepared.to_string())),
+        ]);
+
+        let mut args = args_for("opus");
+        args.mode = WorkerMode::Writing;
+        let cfg = CtxConfig::default();
+        let parent = envelope::WorkerEnvelope::locked();
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.root().to_str().expect("utf8").to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let mut out = Vec::new();
+        let code = run(
+            Request {
+                args: &args,
+                prompt: "do the thing".to_string(),
+                repo: &repo,
+                launch_repo: repo.clone(),
+                state: &state,
+                cfg: &cfg,
+                parent_envelope: &parent,
+                result_schema: None,
+                provider_override: None,
+            },
+            &mut out,
+            &lookup,
+        )
+        .expect("a writer refusal is a structured exit, not an Err");
+        assert_eq!(code, super::super::exec::EXIT_WRITER_BUSY);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("uncommitted seat generation"), "got {text}");
+        assert_eq!(permit::live_writer_records(&state).len(), 0);
+    }
+
     #[test]
     fn harness_only_arguments_are_refused_rather_than_silently_dropped() {
         let mut restarts = args_for("native");

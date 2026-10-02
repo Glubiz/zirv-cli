@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use super::super::super::CtxResult;
 use super::super::super::config::OrchestratorWrites;
-use super::super::super::provider::adapter::{FinishReason, ProviderUsage};
+use super::super::super::provider::adapter::{CacheMode, FinishReason, ProviderUsage};
 use super::super::compaction::{
     CompactionDecision, CompactionPolicy, CompactionRecord, DistillBudget, NativeBudget,
     RETAIN_RECENT_MESSAGES,
@@ -491,6 +491,21 @@ pub struct NativeSessionConfig {
     pub system: Vec<String>,
     /// Repository context is untrusted data delivered as a user message, never as system instructions. (#484)
     pub preamble: Vec<String>,
+    /// Prompt-cache mode for the provider request's stable prefix; `Disabled` unless opted in.
+    pub prompt_cache: CacheMode,
+}
+
+/// Opt-in `[runtime].prompt_cache_ttl` for native routes whose API supports prompt-cache TTLs
+/// (Anthropic only); every other provider and the unset default stay `Disabled` (#766).
+pub fn prompt_cache_for(cfg: &super::super::super::config::CtxConfig, provider: &str) -> CacheMode {
+    if provider != "anthropic" {
+        return CacheMode::Disabled;
+    }
+    match cfg.runtime.prompt_cache_ttl.as_deref() {
+        Some("1h") => CacheMode::Ephemeral1h,
+        Some("5m") => CacheMode::Ephemeral5m,
+        _ => CacheMode::Disabled,
+    }
 }
 
 /// Everything one session's compaction needs that is not a live borrow.
@@ -546,6 +561,29 @@ pub struct RecompileContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_cache_is_opt_in_and_anthropic_only() {
+        let mut cfg = super::super::super::super::config::CtxConfig::default();
+        assert_eq!(
+            super::prompt_cache_for(&cfg, "anthropic"),
+            super::CacheMode::Disabled
+        );
+        cfg.runtime.prompt_cache_ttl = Some("1h".to_string());
+        assert_eq!(
+            super::prompt_cache_for(&cfg, "anthropic"),
+            super::CacheMode::Ephemeral1h
+        );
+        assert_eq!(
+            super::prompt_cache_for(&cfg, "bedrock"),
+            super::CacheMode::Disabled
+        );
+        cfg.runtime.prompt_cache_ttl = Some("5m".to_string());
+        assert_eq!(
+            super::prompt_cache_for(&cfg, "anthropic"),
+            super::CacheMode::Ephemeral5m
+        );
+    }
+
     use super::super::super::super::provider::Protocol;
     use super::super::turn::run_fixture;
     use super::*;

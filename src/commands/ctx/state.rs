@@ -911,7 +911,7 @@ fn call_pre_rename_hook() {
 #[cfg(not(test))]
 fn call_pre_rename_hook() {}
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))

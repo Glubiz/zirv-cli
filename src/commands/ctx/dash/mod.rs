@@ -29,6 +29,7 @@ mod overlays;
 mod pane_rollover;
 mod reap;
 mod selection_clipboard;
+pub mod settings_view;
 mod sidebar_facts;
 mod spawn_policy;
 mod subagent_focus;
@@ -887,6 +888,19 @@ fn run_dashboard_inner(
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
             // Run the one-shot report reminder on the mail sweep cadence (#115).
             report_back_reminder_sweep(&mut panes, state, &mut errors);
+            let slug = super::state::repo_slug(repo);
+            for pane in &mut panes {
+                report_idle_unread_mail(
+                    pane,
+                    state,
+                    cfg,
+                    &slug,
+                    &mut errors,
+                    &mut notices,
+                    super::state::now_secs(),
+                    facts_cache.disk.mail_by_session.get(pane.short()).copied(),
+                );
+            }
         }
         // Dash refresh PR2: the JEV sidebar section, on its own coarser
         // cadence -- never the render path, never `FACTS_THROTTLE` either
@@ -1409,6 +1423,7 @@ fn run_dashboard_inner(
                                             Some(SpawnEffect::Submit { agent, prompt }) => {
                                                 let req = spawnreq::SpawnRequest {
                                                     kill: None,
+                                                    name: None,
                                                     agent,
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
@@ -3223,6 +3238,7 @@ fn run_dashboard_inner(
         });
         // Draw focused pane identity and workflow in its pane header; draw nothing without focus.
         let pane_header_facts = focused_row.map(|row| ui::PaneHeaderFacts {
+            name: row.name.clone(),
             harness: row.harness.clone(),
             role: row.role.clone(),
             model: row.model.clone(),
@@ -3370,7 +3386,7 @@ fn run_dashboard_inner(
         {
             hub.mark_drawn(None);
         }
-        // The orchestrator dashboard animates, so it draws about 15 times a second while it shows
+        // The orchestrator dashboard animates, so it draws about 30 times a second while it shows
         // and straight away after input; the classic dashboard's tick is untouched.
         let skip_draw = tree_view.frame_interval().is_some_and(|every| {
             drained == moved_only
@@ -4170,6 +4186,7 @@ mod tests {
     pub(super) fn spawn_request(prompt: &str, cwd: &Path) -> spawnreq::SpawnRequest {
         spawnreq::SpawnRequest {
             kill: None,
+            name: None,
             agent: "claude".to_string(),
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),

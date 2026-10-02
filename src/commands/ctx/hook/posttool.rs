@@ -359,11 +359,18 @@ pub fn run_posttool_with<W: Write>(
     // inbox record before every later early return, the masked branch included (#456).
     if let (Some(payload), Ok(state)) = (&parsed, StateDir::resolve(env)) {
         let short = attention_short(env, &payload.session_id);
+        let permission_id = crate::commands::ctx::approvals::request_id(
+            &short,
+            &payload.tool_name,
+            &payload.tool_input.command,
+            &payload.tool_input.preview_source(&payload.tool_name),
+        );
         clear_resolved_approval(
             &state,
             &short,
             format!("permission resolved: {}", payload.tool_name),
             now_secs(),
+            |open| open.id == permission_id && open.agent == payload.agent_id,
         );
         crate::commands::ctx::approvals::clear_for_tool(
             &state,
@@ -625,6 +632,47 @@ mod tests {
             "explain-status must name what cleared it: {}",
             crate::commands::ctx::attention::reason(&status)
         );
+    }
+
+    /// Two parallel subagents each hold a prompt (#854): an unrelated call finishing, or one prompt
+    /// resolving, leaves the session `Approval` until the last one resolves.
+    #[test]
+    fn concurrent_permission_prompts_keep_approval_until_the_last_resolves() {
+        use crate::commands::ctx::attention::{Attention, load};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let post = |tool: &str, command: &str| {
+            let stdin = serde_json::json!({
+                "session_id": "abc123", "tool_name": tool, "tool_input": {"command": command},
+                "tool_response": {"stdout": "", "stderr": "", "interrupted": false, "isImage": false},
+                "cwd": "/work/repo", "tool_use_id": "toolu_x",
+            })
+            .to_string();
+            run_posttool(&mut Vec::new(), &stdin, &lookup).expect("never errors");
+        };
+        for command in ["echo a", "echo b"] {
+            run_permission(
+                &mut Vec::new(),
+                &permission_stdin(
+                    Some("PermissionRequest"),
+                    "Bash",
+                    serde_json::json!({ "command": command }),
+                ),
+                &lookup,
+            )
+            .expect("never errors");
+        }
+
+        post("Read", "");
+        assert_eq!(load(&state, &short).attention, Attention::Approval);
+        post("Bash", "echo a");
+        assert_eq!(load(&state, &short).attention, Attention::Approval);
+        post("Bash", "echo b");
+        assert_eq!(load(&state, &short).attention, Attention::None);
     }
 
     /// A guard, not an unconditional clear: a `PostToolUse` firing while the

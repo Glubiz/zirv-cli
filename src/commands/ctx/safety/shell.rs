@@ -22,6 +22,145 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
     out
 }
 
+/// Reads up to `max` digits of `radix` at `*i`, advancing past them.
+fn take_digits(chars: &[char], i: &mut usize, max: usize, radix: u32) -> Option<u32> {
+    let count = chars[*i..]
+        .iter()
+        .take(max)
+        .take_while(|c| c.is_digit(radix))
+        .count();
+    let text: String = chars[*i..*i + count].iter().collect();
+    *i += count;
+    u32::from_str_radix(&text, radix).ok()
+}
+
+/// Decodes the body of an ANSI-C `$'...'` word starting after the opening
+/// quote; returns the decoded text and the index just past the closing quote,
+/// or `None` when the quote never closes.
+fn decode_ansi_c_quoted(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut truncated = false;
+    let mut i = start;
+    loop {
+        let c = *chars.get(i)?;
+        i += 1;
+        if c == '\'' {
+            return Some((out, i));
+        }
+        let decoded = if c != '\\' {
+            Some(c)
+        } else {
+            let escape = *chars.get(i)?;
+            i += 1;
+            match escape {
+                'a' => Some('\x07'),
+                'b' => Some('\x08'),
+                'e' | 'E' => Some('\x1b'),
+                'f' => Some('\x0c'),
+                'n' => Some('\n'),
+                'r' => Some('\r'),
+                't' => Some('\t'),
+                'v' => Some('\x0b'),
+                '\\' | '\'' | '"' | '?' => Some(escape),
+                '0'..='7' => {
+                    i -= 1;
+                    take_digits(chars, &mut i, 3, 8).and_then(char::from_u32)
+                }
+                'x' | 'u' | 'U' => {
+                    let max = match escape {
+                        'x' => 2,
+                        'u' => 4,
+                        _ => 8,
+                    };
+                    match take_digits(chars, &mut i, max, 16) {
+                        Some(value) => Some(char::from_u32(value).unwrap_or('?')),
+                        None => {
+                            out.push('\\');
+                            Some(escape)
+                        }
+                    }
+                }
+                'c' => {
+                    let target = *chars.get(i)?;
+                    i += 1;
+                    char::from_u32(u32::from(target) & 0x1f)
+                }
+                other => {
+                    out.push('\\');
+                    Some(other)
+                }
+            }
+        };
+        match decoded {
+            // bash truncates an ANSI-C string at the first NUL.
+            Some('\0') => truncated = true,
+            Some(c) if !truncated => out.push(c),
+            _ => {}
+        }
+    }
+}
+
+/// Rewrites shell syntax the quote-aware scanners cannot model into text they
+/// can: a bare `$'...'` word becomes the equivalent single-quoted word and an
+/// unquoted word-initial `#` comment is dropped to the end of its line. A
+/// scanner that treated `$'\''` or `#'` as an open quote would otherwise hide
+/// a live redirect or command from every verdict (#847). `None` means the
+/// text is ambiguous (unterminated `$'`, `#` glued to a redirect operator) and
+/// the caller must fail closed.
+pub(crate) fn canonical_shell_syntax(command: &str) -> Option<String> {
+    if !command.contains("$'") && !command.contains('#') {
+        return Some(command.to_string());
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut word_start = true;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped && c == '\n' {
+            // bash deletes backslash-newline before any other parsing, so it must not split a word or hide a `#`.
+            out.pop();
+            escaped = false;
+            i += 1;
+            continue;
+        } else if escaped {
+            escaped = false;
+            word_start = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+        } else if c == '$' && chars.get(i + 1) == Some(&'\'') {
+            let (decoded, end) = decode_ansi_c_quoted(&chars, i + 2)?;
+            out.push('\'');
+            out.push_str(&decoded.replace('\'', "'\\''"));
+            out.push('\'');
+            word_start = false;
+            i = end;
+            continue;
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            word_start = false;
+        } else if c == '#' && word_start {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        } else if c == '#' && matches!(out.chars().next_back(), Some('<' | '>')) {
+            return None;
+        } else {
+            word_start = c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')');
+        }
+        out.push(c);
+        i += 1;
+    }
+    Some(out)
+}
+
 /// Split shell separators while preserving quoted data and marking pipe
 /// joins. Recognize multi-character operators before their prefixes (#334).
 pub(super) fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
@@ -550,7 +689,8 @@ fn find_heredoc_terminator(
 /// rather than risking excessive redaction (#136).
 pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
-    redact_heredocs_scan(&chars, 0)
+    let redacted = redact_heredocs_scan(&chars, 0);
+    canonical_shell_syntax(&redacted).unwrap_or(redacted)
 }
 
 /// Recurse into live `$(...)` even inside double quotes to find heredocs;
@@ -3013,5 +3153,81 @@ mod tests {
             None,
             "an unrelated program's -am flag must not be treated as a redactable message"
         );
+    }
+
+    #[test]
+    fn an_ansi_c_quoted_quote_cannot_hide_a_write_to_the_operator_config() {
+        let policy = SafetyPolicy::default();
+        let command = "zirv ctx status $'\\'' >~/.zirv/ctx.toml #'";
+        assert_eq!(
+            evaluate(&policy, command, LaunchMode::Interactive).verdict,
+            Verdict::Deny,
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn a_comment_quote_cannot_hide_a_write_to_the_operator_config_on_the_next_line() {
+        let policy = SafetyPolicy::default();
+        let command = "zirv ctx status #'\nzirv ctx status >~/.zirv/ctx.toml #'";
+        assert_eq!(
+            evaluate(&policy, command, LaunchMode::Interactive).verdict,
+            Verdict::Deny,
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn a_line_continuation_cannot_hide_a_comment_quote_from_the_next_line() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "zirv ctx status \\\n#' comment\nzirv ctx status >~/.zirv/ctx.toml #'",
+            "zirv ctx status \"x\\\ny\" \\\n#' c\nzirv ctx status >~/.zirv/ctx.toml #'",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{command}"
+            );
+        }
+        assert_eq!(canonical_shell_syntax("a\\\n#b").as_deref(), Some("a#b"));
+        assert_eq!(
+            canonical_shell_syntax("echo $'a\\\nb' #c").as_deref(),
+            Some("echo 'a\\\nb' ")
+        );
+    }
+
+    #[test]
+    fn canonical_shell_syntax_decodes_ansi_c_words_and_drops_only_real_comments() {
+        let canon = |text: &str| canonical_shell_syntax(text);
+        assert_eq!(
+            canon(r"echo $'a\tb\x41\101'").as_deref(),
+            Some("echo 'a\tbAA'")
+        );
+        assert_eq!(canon(r"echo $'it\'s'").as_deref(), Some(r"echo 'it'\''s'"));
+        assert_eq!(canon("ls # note\npwd").as_deref(), Some("ls \npwd"));
+        for untouched in [
+            "echo a#b",
+            "echo $# ${#x}",
+            "echo '# x'",
+            "echo \"$'x' # y\"",
+            r"echo \#x",
+        ] {
+            assert_eq!(canon(untouched).as_deref(), Some(untouched));
+        }
+        assert_eq!(canon("echo $'unterminated"), None);
+        assert_eq!(canon("echo hi >#x; rm -rf ~"), None);
+    }
+
+    #[test]
+    fn unparseable_quoting_never_allows() {
+        let policy = SafetyPolicy::default();
+        for command in ["zirv ctx status $'open", "zirv ctx status >#x; echo done"] {
+            assert_ne!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command}"
+            );
+        }
     }
 }

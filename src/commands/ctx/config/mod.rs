@@ -33,6 +33,7 @@ mod jev_settings;
 mod pace_settings;
 mod prompt_settings;
 mod repo_layer;
+pub mod settings;
 mod supervisor_settings;
 mod validate;
 
@@ -43,10 +44,10 @@ pub use pace_settings::*;
 pub use prompt_settings::*;
 pub use repo_layer::is_repo_forbidden;
 use repo_layer::{
-    ENV_MAP, add_config_error_prefix, bool_at, combine_additive_array, deploy_tier_at, env_value,
-    fallback_harness_map_at, float_at, insert_path, integer_at, merge, narrow_fallback_harness,
-    narrow_fallback_order, narrow_max, narrow_max_f64, narrow_min, narrow_min_f64,
-    narrow_objective_gates, narrow_orchestrator_writes, orchestrator_writes_at,
+    ENV_MAP, REPO_FORBIDDEN, add_config_error_prefix, bool_at, combine_additive_array,
+    deploy_tier_at, env_value, fallback_harness_map_at, float_at, insert_path, integer_at, merge,
+    narrow_fallback_harness, narrow_fallback_order, narrow_max, narrow_max_f64, narrow_min,
+    narrow_min_f64, narrow_objective_gates, narrow_orchestrator_writes, orchestrator_writes_at,
     reject_untrusted_keys, reject_untrusted_workspace_execution, string_array, string_array_at,
     take_nested, take_nested3, value_at,
 };
@@ -1504,6 +1505,13 @@ impl CtxConfig {
                 format!("headless.prompt_cache_ttl must be \"5m\" or \"1h\", got \"{ttl}\"").into(),
             ));
         }
+        if let Some(ttl) = cfg.runtime.prompt_cache_ttl.as_deref()
+            && !matches!(ttl, "5m" | "1h")
+        {
+            return Err(add_config_error_prefix(
+                format!("runtime.prompt_cache_ttl must be \"5m\" or \"1h\", got \"{ttl}\"").into(),
+            ));
+        }
         for (key, effort) in [
             ("headless.effort.trivial", &cfg.headless.effort.trivial),
             ("headless.effort.bounded", &cfg.headless.effort.bounded),
@@ -1539,6 +1547,9 @@ impl CtxConfig {
         }
         if let Some(model) = cfg.worker.codex.as_deref() {
             validate_model_str("worker.codex", model)?;
+        }
+        if let Some(effort) = cfg.worker.codex_effort.as_deref() {
+            validate_model_str("worker.codex_effort", effort)?;
         }
         if cfg.worker.bootstrap_timeout_secs == 0 {
             return Err(add_config_error_prefix(
@@ -5773,6 +5784,7 @@ intake_discipline = true
         for (case, toml) in [
             ("default", "[runtime]\ndefault = \"native\"\n"),
             ("roles", "[runtime.roles]\nworker = \"native\"\n"),
+            ("prompt_cache_ttl", "[runtime]\nprompt_cache_ttl = \"1h\"\n"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -5795,6 +5807,22 @@ intake_discipline = true
     /// The other half of the same rule: the operator's own layer still sets
     /// it, which is the whole point of the key -- only the checkout is
     /// refused.
+    #[test]
+    fn the_operator_may_set_the_native_prompt_cache_ttl_from_env_and_bad_values_fail() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = env_map(&[("ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL", "1h")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.runtime.prompt_cache_ttl.as_deref(), Some("1h"));
+        let env = env_map(&[("ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL", "30m")]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect_err("bad ttl");
+        assert!(
+            err.to_string().contains("runtime.prompt_cache_ttl"),
+            "got {err}"
+        );
+    }
+
     #[test]
     fn the_operator_may_set_a_native_runtime_default_from_home_config() {
         let home = tempfile::tempdir().expect("tempdir");

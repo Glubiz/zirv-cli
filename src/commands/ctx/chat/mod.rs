@@ -571,6 +571,7 @@ fn run_native_chat<E: Write>(
     // Known before intake so its Jev call is attributed to the session this launch will use.
     let session = uuid::Uuid::new_v4().to_string();
     super::jev::adopt_session_id(&session);
+    // No `[zirv proxy]` prompt layer here (#749): native compiles its own role methodology and loads the active workflow per turn (`runtime::context`), and the layer's `zirv workflow status` instruction targets harness shells.
     let intake = proxy_intake(cfg, &state, repo, args, stdin_is_tty, vt_ok)?;
     if let ProxyIntakeOutcome::Refuse { message } = &intake {
         writeln!(stderr, "{message}")?;

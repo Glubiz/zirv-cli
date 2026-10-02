@@ -573,18 +573,16 @@ to `zirv chat`. It implements part of the execution-profile seam tracked in
 classifier, team compiler, workflow definitions and gates it sits in front of
 are unchanged.
 
-**Decider chain.** `decide()` computes the deterministic baseline first. The
-shared client's metadata-only boundary now refuses the legacy text-bearing
-Jev classification request locally, before cache or network; the existing
-helper-model chokepoint remains available, then the baseline. The
+**Decider chain.** `decide()` computes the deterministic baseline first. With
+`decider = "typesafe"` and a credential present, one metadata-only Jev call
+(coarse counts, classes and flags; never request text, repository names or
+paths) may advise clarification and its category; with no Jev credential the
+helper-model chokepoint runs, then the baseline. The
 baseline measures no diff at intake, so it floors complexity by the request's
 own size: 120+ words or 3+ enumerated items is at least bounded, 300+ words
 or 8+ items at least substantial (never architectural) -- without it every
-multi-part spec landed on the cheap seat. With
-`jev.intake_savings` enabled and a credential present, a separate
-metadata-only Jev call may advise clarification and its category. The
-eleven-question classification schema and live battery below describe the
-historical Jev path and the helper's merge behavior. The historical Jev path
+multi-part spec landed on the cheap seat. The eleven-question classification
+schema and live battery below describe the helper's merge behavior. The historical Jev path
 and current helper model answer eleven
 questions — `intent`, `complexity`, `risk`, `workflow`, `needs_clarification`,
 and six additive domain tags (`security`, `data`, `docs_only`, `devops`,
@@ -3161,7 +3159,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
-| `zirv ctx agent <name> <prompt> [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>] [--goal <text>]` | Delegates one task to a supervised worker on another enabled harness — a dashboard pane when one is live, otherwise inline in this terminal; workflow reviewers run inline because their caller must consume completed review evidence synchronously. A selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` resolves a YAML file's `brief`/`agent`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same launch instead of typing each one; `agent` contributes default skills and read-only/capability floors. Untrusted manifest input can only narrow: a field it shares with an explicit CLI flag is a hard error on disagreement, except narrowing-capable fields, where the stricter value wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior reuse allocation whose base commit and ordered `[[workspace]].setup` list digest the same is reset to that base and reused with its untracked build cache intact. A digest mismatch or proof refusal falls back to a cold worktree; matched setup receipts retain the same checkout identity and resume only unchanged successful steps. On release, eligible trees remain `Idle` up to `[worktree] idle_pool_max`; `[worktree] idle_ttl_secs` expires them through proof-required GC/reconcile. `--goal` forces an inline launch and first runs one bounded, depth-zero environment-preparation bootstrap in the selected checkout; it must exit zero and report explicit `Done` JSON before the main worker may start. The bootstrap uses the operator's configured Fast tier when present, otherwise leaves model selection to the harness. A read-only worker (`--mode read-only`, a read-only manifest, a workflow reviewer or a read-only dashboard spawn) fails closed: when the chosen harness has no enforced read-only floor for its launch mode, the launch is refused up front naming the harnesses that can enforce it, and automatic harness rerouting skips harnesses without a floor. |
+| `zirv ctx agent <name> <prompt> [--name <label>] [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>] [--goal <text>]` | Delegates one task to a supervised worker on another enabled harness — a dashboard pane when one is live, otherwise inline in this terminal; workflow reviewers run inline because their caller must consume completed review evidence synchronously. A selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` resolves a YAML file's `brief`/`agent`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same launch instead of typing each one; `agent` contributes default skills and read-only/capability floors. Untrusted manifest input can only narrow: a field it shares with an explicit CLI flag is a hard error on disagreement, except narrowing-capable fields, where the stricter value wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior reuse allocation whose base commit and ordered `[[workspace]].setup` list digest the same is reset to that base and reused with its untracked build cache intact. A digest mismatch or proof refusal falls back to a cold worktree; matched setup receipts retain the same checkout identity and resume only unchanged successful steps. On release, eligible trees remain `Idle` up to `[worktree] idle_pool_max`; `[worktree] idle_ttl_secs` expires them through proof-required GC/reconcile. `--goal` forces an inline launch and first runs one bounded, depth-zero environment-preparation bootstrap in the selected checkout; it must exit zero and report explicit `Done` JSON before the main worker may start. The bootstrap uses the operator's configured Fast tier when present, otherwise leaves model selection to the harness. A read-only worker (`--mode read-only`, a read-only manifest, a workflow reviewer or a read-only dashboard spawn) fails closed: when the chosen harness has no enforced read-only floor for its launch mode, the launch is refused up front naming the harnesses that can enforce it, and automatic harness rerouting skips harnesses without a floor. |
 | `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
@@ -3585,7 +3583,22 @@ trailing text as a task, starts it) and `/workflow status [id]` shows a
 running workflow's status -- all three rendered through the exact same
 `workflow::engine` writer functions the headless `--json`/text CLI uses
 (issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
-can never disagree about the same state. `@` file references and a
+can never disagree about the same state. `/settings` opens a searchable,
+keyboard-only list of every configuration key (name, effective value, winning
+layer, scopes `U`ser/`P`roject, reload timing) with a one-line
+detail footer; type to filter, `Up`/`Down` move, `Enter` edits the focused
+row, `Tab` cycles its scope, `Ctrl+R` resets it to the inherited value,
+`Esc` cancels and then closes. `/settings <query>` opens the list filtered,
+`/settings get <key>`, `/settings set <key> <value> [--scope user|project]`
+and `/settings reset <key> [--scope ...]` print one notice instead. It is
+zirv control input: never journaled, never sent to the model. User-scope
+writes go through the exact validated, comment-preserving, atomic edit
+`zirv ctx config set` uses (and are refused when the file changed since it was
+read); project scope writes `<repo>/.zirv/ctx.toml` only for keys a repository
+may set and only when the value narrows, refusing before anything is written;
+there is no session scope yet. Credential-like keys render as
+`(redacted)` and are never accepted. No key is known to reload live, so every
+row says `next session` and a write never claims otherwise. `@` file references and a
 `!`-prefixed shell line are not wired into this loop yet.
 
 `--runtime native` is **not** a separate dashboard any more: the native
@@ -4581,7 +4594,7 @@ dispatch = false    # model tier for an omitted Agent model, from brief metadata
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
-intake_savings = false # clarification category and optional planner; ZIRV_CTX_JEV_INTAKE_SAVINGS
+intake_savings = false # optional planner (clarification advice runs whenever decider=typesafe); ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH
@@ -4807,7 +4820,8 @@ bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
 substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also what an Architectural-complexity request reads; see below
 ```
 
-`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
+`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child; it
+does not affect native sessions (see `[runtime] prompt_cache_ttl`). The
 `effort` table classifies the prompt text with the SAME deterministic
 classifier the intake hook uses (`proxy::decision::try_classify_request`,
 text-only by default -- see `jev.launch_effort` below for the opt-in
@@ -4953,6 +4967,7 @@ keep only your own.
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
@@ -4977,7 +4992,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
 `mail.max_delivered_bytes`, `mail.mid_turn`, any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `models.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
-`worker.codex`, `worker.default_depth`, `worker.default_read_only`,
+`worker.codex`, `worker.codex_effort`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
 `obfuscate.allow`, `obfuscate.literals_file`, any `session.*` key, any `runtime.*` key, or any of the five keys that feed the token gate (`score.token_floor`,
@@ -5137,6 +5152,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `review` (`review.claude`, `review.codex`) | `ZIRV_CTX_REVIEW_MODEL_CLAUDE` / `ZIRV_CTX_REVIEW_MODEL_CODEX` |
 | `worker.claude` | `ZIRV_CTX_WORKER_MODEL_CLAUDE` |
 | `worker.codex` | `ZIRV_CTX_WORKER_MODEL_CODEX` |
+| `worker.codex_effort` | `ZIRV_CTX_WORKER_EFFORT_CODEX` (Codex worker reasoning effort, e.g. `low`/`medium`/`high`; passed as `-c model_reasoning_effort=`; an operator `-c model_reasoning_effort=...` passthrough wins; unset leaves Codex's own default) |
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `worker.bootstrap_timeout_secs` | `ZIRV_CTX_WORKER_BOOTSTRAP_TIMEOUT_SECS` (whole goal-bootstrap run; default `600`, must be greater than zero) |
@@ -5631,6 +5647,13 @@ harness with a one-line note rather than failing the command — `zirv ctx
 doctor` is where it is reported. The whole `[runtime]` table is
 `REPO_FORBIDDEN` (see [Trust boundary](#trust-boundary)).
 
+`[runtime] prompt_cache_ttl = "1h"` (or `"5m"`; `ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL`)
+opts native Anthropic sessions into prompt caching: `"1h"` puts a one-hour
+`cache_control` breakpoint on the stable prefix (system prompt, else last tool
+definition) and never on the moving tail, `"5m"` uses the default cache TTL.
+Unset (the default) leaves native requests uncached; Bedrock, Google and OpenAI
+routes are unchanged. It is independent of `[headless].prompt_cache_ttl`.
+
 **Migration and rollback.** `zirv ctx config migrate [--to harness|native]
 [--dry-run]` brings `~/.zirv/ctx.toml` to schema 2 — the `[runtime]` table
 above — backing the previous document up to
@@ -6091,7 +6114,9 @@ bounds every kind per session; once it is spent the seat decides as it would wit
 `zirv ctx supervisor ask "<question>" --option "<a>" --option "<b>" [--context-file F] [--timeout-secs 180]`
 is synchronous and never runs from a hook: it prints the chosen option and its reason and records
 the ruling. With the supervisor on, the seat's injected instructions carry one line telling it to
-route real design or approach choices through `ask` and follow the ruling. `zirv ctx supervisor
+route real design or approach choices through `ask` and follow the ruling. Claude Code lifts the sandbox for an excluded command only when every command in the call is
+excluded, so `ask` must be its own Bash call; on a sandbox denial it says to run it with the sandbox
+disabled. `zirv ctx supervisor
 override <id> [--reason ...]` marks a ruling overridden and is operator-only: it is refused inside an
 agent session (a session, socket or seat-role variable present, even if empty) and unless stdin and
 stdout are terminals, and it is never auto-allowed, so an agent's attempt surfaces as a permission
@@ -6266,6 +6291,15 @@ counter) and trailing `-- <flags>` beyond a `--model` pin (they would become
 argv on the pane's own harness child, and a spawn request is untrusted data);
 both are announced on stderr rather than dropped silently. `--timeout-secs`
 and `--max-restarts` are honoured either way.
+
+A dashboard pane gets a short kebab-case name (at most 24 characters), shown in
+the pane bar and sidebar, the agent tree and its SELECTED panel, NEEDS YOU
+cards, the activity log, `zirv ctx status` and the `From-session` line of the
+mail it sends. `--name <label>` sets it; without it one is derived from the
+first words of the prompt, never `worker`. A clash with an existing worker gets
+a numeric suffix. `zirv ctx send --to-session` and `nudge` accept the name as
+well as the short id; a name two sessions share is an ambiguity error. The role
+is a separate field and is still shown. Inline (non-pane) runs are unnamed.
 
 ```bash
 zirv ctx exec --prompt "$PROMPT" -- claude -p "$PROMPT" --session-id "$SID"

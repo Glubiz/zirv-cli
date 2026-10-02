@@ -29,6 +29,11 @@ pub struct AgentArgs {
     /// live dashboard fulfilled the review as a pane.
     #[arg(long)]
     pub system_prompt: Option<String>,
+    /// A short display name for this worker, shown wherever a native subagent's name is shown and
+    /// accepted by `zirv ctx send --to` / `nudge`. Unstated, one is derived from the prompt.
+    /// Pane workers only; kebab-cased, at most 24 characters, made unique per dashboard.
+    #[arg(long = "name")]
+    pub label: Option<String>,
     /// Restart budget before giving up.
     #[arg(long)]
     pub max_restarts: Option<u32>,
@@ -297,6 +302,7 @@ impl Default for AgentArgs {
             name: String::new(),
             prompt: String::new(),
             flags: Vec::new(),
+            label: None,
             system_prompt: None,
             max_restarts: None,
             timeout_secs: None,

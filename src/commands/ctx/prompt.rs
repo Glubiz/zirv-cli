@@ -1197,7 +1197,8 @@ pub fn with_objective_layer(
 
 const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
 choices through `zirv ctx supervisor ask \"<question>\" --option \"<a>\" --option \"<b>\"`, and follow \
-its ruling unless the operator overrides it.";
+its ruling unless the operator overrides it. Run it as its own command (no `;`, `&&`, pipe, `cd` or \
+file redirect around it); if it reports a sandbox denial, run it again with the sandbox disabled.";
 
 /// The one-line supervisor instruction; absent when the supervisor is off (the default).
 pub fn with_supervisor_layer(
@@ -7003,6 +7004,7 @@ mod tests {
         let on = with_supervisor_layer(base(), true).expect("composed");
         assert!(on.text.contains("zirv ctx supervisor ask"), "{}", on.text);
         assert!(on.text.contains("unless the operator overrides it"));
+        assert!(on.text.contains("as its own command"), "{}", on.text);
         assert_eq!(
             on.sources,
             vec![PromptSource::Default, PromptSource::Supervisor]

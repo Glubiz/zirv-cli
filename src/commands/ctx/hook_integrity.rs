@@ -888,6 +888,8 @@ mod tests {
         let state = state_at(repo.path());
 
         let _guard = config_dirs_at(home.path());
+        // The PostToolUseFailure slot appears when the operator's ctx.toml enables jev retry/supervisor; pin HOME empty.
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let rows = report_with_legacy(&state, home.path(), &[]).expect("report");
 
         let expected = setup::HARNESS_HOOKS.len() * 2 + setup::CLAUDE_ONLY_HOOKS.len();

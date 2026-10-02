@@ -1,6 +1,6 @@
 //! [`WorkflowState`] and its durable, on-disk persistence (issue #542-split).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,6 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
 const WORKFLOW_SCHEMA_VERSION_V4: u32 = 4;
 
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
-
-const MAX_JEV_ARTIFACT_BYTES: usize = 16 * 1024;
 
 /// Minimum artifact-substance confidence from the 2026-09-18 probe.
 const JEV_ARTIFACT_CONFIDENCE: f32 = 0.9;
@@ -456,19 +454,67 @@ pub(super) fn rfc3339_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-#[derive(Serialize)]
-pub(super) struct JevArtifactState {
-    artifact_kind: ArtifactStage,
-    artifact_text: String,
+/// Metadata-only facts for the artifact substance advisory; must satisfy `jev::safe_metadata_request`. No artifact text is sent.
+/// Row: [site=5, stage, size bucket, template size bucket, lines, lines absent from the template, headings, bullets,
+/// checkboxes, code fences, placeholder hits, prose lines].
+pub(crate) fn artifact_jev_facts(stage: ArtifactStage, body: &str) -> serde_json::Value {
+    let template = stage.template();
+    let template_lines: BTreeSet<&str> = template.lines().map(str::trim).collect();
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    let count = |predicate: &dyn Fn(&str) -> bool| {
+        lines.iter().filter(|line| predicate(line)).count() as u64
+    };
+    let headings = count(&|line| line.starts_with('#'));
+    let bullets = count(&|line| line.starts_with("- ") || line.starts_with("* "));
+    let checkboxes = count(&|line| line.starts_with("- [") || line.starts_with("* ["));
+    let fences = count(&|line| line.starts_with("```"));
+    let lower = body.to_ascii_lowercase();
+    let placeholders = ["todo", "tbd", "fixme", "<describe", "lorem"]
+        .iter()
+        .map(|needle| lower.matches(needle).count() as u64)
+        .sum::<u64>();
+    let prose = count(&|line| {
+        !line.is_empty()
+            && !line.starts_with('#')
+            && !line.starts_with("- ")
+            && !line.starts_with("* ")
+    });
+    let new_lines = count(&|line| !line.is_empty() && !template_lines.contains(line));
+    serde_json::json!({
+        "_zirv_metadata_only": true,
+        "facts": [[
+            5,
+            stage as u64,
+            (body.len() as u64 / 256).min(1000),
+            (template.len() as u64 / 256).min(1000),
+            (lines.len() as u64).min(10_000),
+            new_lines.min(10_000),
+            headings.min(1000),
+            bullets.min(1000),
+            checkboxes.min(1000),
+            fences.min(1000),
+            placeholders.min(1000),
+            prose.min(10_000),
+        ]],
+    })
+}
+
+macro_rules! artifact_facts {
+    () => {
+        "From facts [site=5, artifact stage (0 intent, 1 spec, 2 plan), size and template size in 256-byte units, line count, lines absent from the template, heading count, bullet count, checkbox count, code fence count, placeholder hits (todo/tbd/fixme), prose line count]"
+    };
 }
 
 /// [`pin_current_artifact_with_config`]'s own single Choice question,
 /// factored out so `zirv ctx jev probe` can ask the exact same question from
 /// a fixture's own state.
 pub(crate) fn artifact_substance_questions() -> [Question; 1] {
-    [Question::choice(
+    [Question::metadata_choice(
         "substance",
-        "Assess whether this artifact has substantive content for its section headings.",
+        concat!(
+            artifact_facts!(),
+            ", assess whether this artifact has substantive content for its section headings. Choose substantive if the metadata is insufficient."
+        ),
         &[
             ("template_copy", "the template with only trivial edits"),
             (
@@ -531,10 +577,7 @@ pub(super) fn pin_current_artifact_with_config(
     }
     let mut warning = None;
     if let Some(cfg) = cfg {
-        let advice_state = JevArtifactState {
-            artifact_kind: stage,
-            artifact_text: crate::utils::truncate_bytes(body.clone(), Some(MAX_JEV_ARTIFACT_BYTES)),
-        };
+        let advice_state = artifact_jev_facts(stage, &body);
         let questions = artifact_substance_questions();
         if let Some(answers) = jev::advise(
             cfg,
@@ -1528,8 +1571,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_freeform_state_falls_back_without_sending_content_to_jev() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+    fn artifact_metadata_state_refuses_a_decisive_template_copy() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95,"substantive":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -1548,21 +1591,22 @@ mod tests {
         let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
         std::fs::write(&path, "# Intent\n\n## Problem\nChanged wording\n").unwrap();
 
-        let (stage, warning) =
-            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("template_copy advisory"), "{error}");
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
         assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
+            !sent.contains("Changed wording") && !sent.contains("A sentence"),
+            "{sent}"
         );
-        assert_eq!(stage, ArtifactStage::Intent);
-        assert!(warning.is_none());
-        assert!(state.artifacts["intent"].accepted_hash.is_some());
-        assert!(!state_dir.root().join("jev-decisions.jsonl").exists());
+        assert!(state.artifacts["intent"].accepted_hash.is_none());
     }
 
     #[test]
-    fn artifact_freeform_state_pins_under_the_privacy_guard() {
+    fn artifact_metadata_state_pins_on_a_thin_margin() {
         let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.51,"substantive":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
@@ -1585,10 +1629,12 @@ mod tests {
 
         let (stage, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
         assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
+            !sent.contains("Changed wording") && !sent.contains("A sentence"),
+            "{sent}"
         );
 
         assert_eq!(stage, ArtifactStage::Intent);
@@ -1600,8 +1646,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_freeform_thin_content_does_not_leave_the_process() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95,"other":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+    fn artifact_metadata_state_warns_on_decisive_thin_content() {
+        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95,"substantive":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
             body,
@@ -1622,12 +1668,14 @@ mod tests {
 
         let (_, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
         assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
+            !sent.contains("Changed wording") && !sent.contains("A sentence"),
+            "{sent}"
         );
-        assert!(warning.is_none());
+        assert!(warning.expect("thin advisory").contains("thin"));
         assert!(state.artifacts["intent"].accepted_hash.is_some());
     }
 
@@ -1664,7 +1712,21 @@ mod tests {
     }
 
     #[test]
-    fn artifact_freeform_state_pins_without_network_access() {
+    fn artifact_request_passes_the_metadata_only_guard_without_text() {
+        let facts = artifact_jev_facts(
+            ArtifactStage::Intent,
+            "# Intent\n\n## Problem\nSECRET_TOKEN_TEXT\n",
+        );
+        assert!(crate::commands::ctx::jev::safe_metadata_request(
+            &facts,
+            &artifact_substance_questions(),
+            "jev-latest"
+        ));
+        assert!(!facts.to_string().contains("SECRET_TOKEN_TEXT"));
+    }
+
+    #[test]
+    fn artifact_metadata_state_http_error_still_pins() {
         let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             500,
             "{}",
@@ -1686,10 +1748,12 @@ mod tests {
 
         let (stage, warning) =
             pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
+        let sent = request
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the metadata state reaches Jev");
         assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err()
+            !sent.contains("Changed wording") && !sent.contains("A sentence"),
+            "{sent}"
         );
 
         assert_eq!(stage, ArtifactStage::Intent);

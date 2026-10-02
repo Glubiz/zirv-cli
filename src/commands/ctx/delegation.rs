@@ -442,6 +442,7 @@ pub fn record_launch(
                 .objective
                 .as_deref()
                 .or(record.handle.task.as_deref()),
+            name: None,
             workdir: Some(&record.handle.workdir),
         },
         now,

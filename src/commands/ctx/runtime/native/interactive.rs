@@ -554,6 +554,7 @@ pub fn spawn_interactive(
         state: Some(state.clone()),
     };
 
+    let prompt_cache = super::types::prompt_cache_for(&cfg, route.provider.as_ref());
     let config = NativeSessionConfig {
         session: session.clone(),
         generation: handle.generation,
@@ -568,6 +569,7 @@ pub fn spawn_interactive(
         workflow_repo: brokered.then(|| request.repo.clone()),
         system,
         preamble,
+        prompt_cache,
     };
 
     let (submit_tx, submit_rx) = mpsc::channel::<String>();

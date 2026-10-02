@@ -4782,6 +4782,7 @@ mod tests {
                 crate::commands::ctx::dash::spawnreq::DASH_REQUESTS_ENV,
                 requests.to_str(),
             ),
+            (crate::commands::ctx::adapters::SEAT_ROLE_ENV, None),
             ("ZIRV_CTX_PACE", Some("true")),
             ("ZIRV_CTX_PACE_POLL", Some("false")),
             ("ZIRV_CTX_PACE_BLIND_DELAY_SECS", Some("0")),

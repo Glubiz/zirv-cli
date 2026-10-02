@@ -168,6 +168,8 @@ struct SessionState {
     seen: Vec<String>,
     /// One-shot permits `fire` writes and `consult` consumes, so only a fired consult runs.
     tickets: Vec<String>,
+    /// Ask reservations their parent has not settled yet; a refund needs its id here, so it is idempotent.
+    reserved: Vec<String>,
 }
 
 /// One session's consult state as the agent tree shows it.
@@ -964,6 +966,22 @@ fn take_ticket(state: &StateDir, session: &str, ticket: &str) -> bool {
 
 const ASK_TICKET: &str = "ask";
 
+/// Carries the exact ticket an `ask` reserved to the consult child that must consume it.
+const ASK_TICKET_ENV: &str = "ZIRV_SUPERVISOR_ASK_TICKET";
+
+/// Exit code of an `--ask` consult whose helper failed or answered unparseably.
+const ASK_FAILED_EXIT: i32 = 3;
+
+/// How much of the consult child's stderr an error message carries.
+const ASK_STDERR_TAIL_BYTES: usize = 400;
+
+/// Only the `--ask` child honours the ticket its parent reserved; a direct consult consumes its own.
+fn ask_ticket_for(ask: bool, env: EnvLookup<'_>) -> String {
+    ask.then(|| env(ASK_TICKET_ENV))
+        .flatten()
+        .unwrap_or_else(|| ASK_TICKET.to_string())
+}
+
 fn run_consult(
     session: &str,
     trigger: Option<Trigger>,
@@ -983,8 +1001,9 @@ fn run_consult(
             return Ok(0);
         }
     };
-    let ticket = trigger.map_or(ASK_TICKET, Trigger::as_str);
-    if (trigger.is_none() && !ask) || !take_ticket(&state, session, ticket) {
+    let ask_ticket = ask_ticket_for(ask, &env);
+    let ticket = trigger.map_or(ask_ticket, |fired| fired.as_str().to_string());
+    if (trigger.is_none() && !ask) || !take_ticket(&state, session, &ticket) {
         log_fallback(
             &state,
             session,
@@ -1010,12 +1029,18 @@ fn run_consult(
             &mut tokens,
             &|prompt| delegated_report(&cfg, &repo, RulingKind::Choice, timeout_secs, prompt),
         );
-        match outcome {
-            Ok(Some(ruling)) => println!("{}", serde_json::to_string(&ruling)?),
-            Ok(None) => {}
-            Err(error) => log_fallback(&state, session, &error.to_string()),
-        }
-        return Ok(0);
+        let failure = match outcome {
+            Ok(Some(ruling)) => {
+                println!("{}", serde_json::to_string(&ruling)?);
+                return Ok(0);
+            }
+            Ok(None) => "the helper's reply did not parse".to_string(),
+            Err(error) => error.to_string(),
+        };
+        log_fallback(&state, session, &failure);
+        // A non-zero exit tells `ask` this was an infrastructure failure, so it can refund the call.
+        eprintln!("{failure}");
+        return Ok(ASK_FAILED_EXIT);
     }
     let Some(trigger) = trigger else {
         return Ok(0);
@@ -1038,7 +1063,7 @@ fn run_consult(
 }
 
 /// What `ask` needs from the consult: the one seam its tests stub.
-type AskConsult<'a> = &'a dyn Fn(&str, &[String], &str, u64) -> CtxResult<Option<Ruling>>;
+type AskConsult<'a> = &'a dyn Fn(&str, &[String], &str, u64, &str) -> CtxResult<Option<Ruling>>;
 
 /// The real consult for `ask`: the same detached-consult child, but waited on, with the options
 /// on its command line and the evidence on its stdin. The child carries `CONSULT_ENV`, so the
@@ -1048,6 +1073,7 @@ fn spawn_ask_consult(
     options: &[String],
     evidence: &str,
     timeout_secs: u64,
+    ticket: &str,
 ) -> CtxResult<Option<Ruling>> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
@@ -1066,13 +1092,22 @@ fn spawn_ask_consult(
         )
         .args(["--timeout-secs", &timeout_secs.to_string()])
         .env(CONSULT_ENV, "1")
+        .env(ASK_TICKET_ENV, ticket)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(evidence.as_bytes());
     }
+    // Drained on a thread so a chatty child can never fill the pipe and stall the wait below.
+    let stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    });
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + ASK_GRACE_SECS);
     while child.try_wait()?.is_none() {
@@ -1083,30 +1118,87 @@ fn spawn_ask_consult(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let status = child.wait()?;
     let mut out = String::new();
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout.read_to_string(&mut out);
     }
-    Ok(serde_json::from_str(out.trim()).ok())
+    let ruling = serde_json::from_str(out.trim()).ok();
+    if status.success() && ruling.is_some() {
+        return Ok(ruling);
+    }
+    let stderr = stderr
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let tail = super::run_loop::tail_of_bytes(stderr.trim().as_bytes(), ASK_STDERR_TAIL_BYTES);
+    Err(format!("the supervisor child {status}: {tail}").into())
 }
 
-/// Reserve one call of the session's `max_calls` budget and write the one-shot ticket.
-fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> bool {
-    let Some(path) = state_path(state, session) else {
-        return false;
-    };
-    let Some(_lock) = lock_beside(&path) else {
-        return false;
-    };
+/// How to run the ask outside Claude Code's sandbox; shared by both hint strengths (#856).
+const SANDBOX_REMEDY: &str = "run `zirv ctx supervisor ask` as its own Bash command with the sandbox \
+disabled (dangerouslyDisableSandbox); Claude Code only lifts the sandbox when every command in the call is \
+excluded, so no `;`, `&&`, pipe, `cd` or file redirect around it";
+
+/// The hint for a failed consult, from the child's stderr: firm for the kernel's own denial, conditional for transport text a proxy can also produce.
+fn sandbox_hint(failure: &str) -> Option<String> {
+    let lower = failure.to_lowercase();
+    if lower.contains("operation not permitted") {
+        return Some(format!(
+            "this looks like a sandbox denial: {SANDBOX_REMEDY}"
+        ));
+    }
+    ["tunnel failed", "sandbox"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then(|| format!("if this seat runs in Claude Code's sandbox, {SANDBOX_REMEDY}"))
+}
+
+/// Reserve one call of the session's `max_calls` budget and write a one-shot ticket unique to this
+/// reservation, returned so only its own consult consumes it and only its own refund removes it.
+fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<String> {
+    let path = state_path(state, session)?;
+    let _lock = lock_beside(&path)?;
     let mut current = load_state(&path);
     if current.calls >= cfg.supervisor.max_calls {
-        return false;
+        return None;
     }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let ticket = format!("{ASK_TICKET}:{}-{nanos}", std::process::id());
     current.calls += 1;
     push_capped(&mut current.triggers, ASK_TICKET.to_string(), TRIGGERS_KEEP);
-    push_capped(&mut current.tickets, ASK_TICKET.to_string(), TRIGGERS_KEEP);
+    push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
+    // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
+    current.reserved.push(ticket.clone());
     save_state(&path, &current);
-    true
+    Some(ticket)
+}
+
+/// Settle the reservation `id`; on an infrastructure failure also give its call back. A child
+/// consuming its ticket does not settle it, and an unknown or already settled id is a no-op.
+fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
+    let Some(path) = state_path(state, session) else {
+        return;
+    };
+    let Some(_lock) = lock_beside(&path) else {
+        return;
+    };
+    let mut current = load_state(&path);
+    let Some(at) = current.reserved.iter().position(|held| held == id) else {
+        return;
+    };
+    current.reserved.remove(at);
+    if refund {
+        current.calls = current.calls.saturating_sub(1);
+        if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
+            current.triggers.remove(at);
+        }
+        if let Some(at) = current.tickets.iter().position(|held| held == id) {
+            current.tickets.remove(at);
+        }
+    }
+    save_state(&path, &current);
 }
 
 /// `zirv ctx supervisor ask`: one synchronous consult, never from a hook. Prints the chosen
@@ -1135,7 +1227,7 @@ fn run_ask_with<W: Write>(
     if options.len() < 2 {
         return Err("ask needs at least two --option values".into());
     }
-    if !reserve_ask_call(&state, &cfg, &session) {
+    let Some(ticket) = reserve_ask_call(&state, &cfg, &session) else {
         log_fallback(
             &state,
             &session,
@@ -1146,14 +1238,15 @@ fn run_ask_with<W: Write>(
             "the supervisor's call budget is spent; decide yourself or ask the operator"
         )?;
         return Ok(1);
-    }
+    };
     let evidence = format!(
         "Question: {question}\n\nContext:\n{}",
         crate::utils::truncate_bytes(super::snapshot::redact_text(context), Some(PLAN_CAP))
     );
-    let ruling = match consult(&session, options, &evidence, timeout_secs) {
+    let ruling = match consult(&session, options, &evidence, timeout_secs, &ticket) {
         Ok(Some(ruling)) => ruling,
         Ok(None) => {
+            settle_ask_call(&state, &session, &ticket, true);
             writeln!(
                 w,
                 "the supervisor gave no usable ruling; decide yourself or ask the operator"
@@ -1161,14 +1254,19 @@ fn run_ask_with<W: Write>(
             return Ok(1);
         }
         Err(error) => {
+            settle_ask_call(&state, &session, &ticket, true);
             log_fallback(&state, &session, &error.to_string());
             writeln!(
                 w,
                 "the supervisor could not rule ({error}); decide yourself or ask the operator"
             )?;
+            if let Some(hint) = sandbox_hint(&error.to_string()) {
+                writeln!(w, "{hint}")?;
+            }
             return Ok(1);
         }
     };
+    settle_ask_call(&state, &session, &ticket, false);
     writeln!(
         w,
         "ruling {}: {}\nreason: {}\nBinding unless the operator overrides it.",
@@ -1946,28 +2044,29 @@ mod tests {
         let env = ruling_env(state.root());
         let lookup = |k: &str| env.get(k).cloned();
         let options = vec!["a queue".to_string(), "a table".to_string()];
-        let consult = |session: &str, options: &[String], evidence: &str, _timeout: u64| {
-            assert!(evidence.contains("Question: which store?"), "{evidence}");
-            let mut tokens = 0;
-            rule_with(
-                &state,
-                &enabled_cfg(),
-                RulingKind::Choice,
-                session,
-                Path::new("."),
-                None,
-                evidence,
-                options,
-                &mut tokens,
-                &|prompt| {
-                    assert!(
-                        prompt.contains("1. a queue") && prompt.contains("2. a table"),
-                        "{prompt}"
-                    );
-                    Ok("CHOICE: 2\nREASON: simpler to operate".to_string())
-                },
-            )
-        };
+        let consult =
+            |session: &str, options: &[String], evidence: &str, _timeout: u64, _ticket: &str| {
+                assert!(evidence.contains("Question: which store?"), "{evidence}");
+                let mut tokens = 0;
+                rule_with(
+                    &state,
+                    &enabled_cfg(),
+                    RulingKind::Choice,
+                    session,
+                    Path::new("."),
+                    None,
+                    evidence,
+                    options,
+                    &mut tokens,
+                    &|prompt| {
+                        assert!(
+                            prompt.contains("1. a queue") && prompt.contains("2. a table"),
+                            "{prompt}"
+                        );
+                        Ok("CHOICE: 2\nREASON: simpler to operate".to_string())
+                    },
+                )
+            };
         let mut out = Vec::new();
         let code = run_ask_with(
             "which store?",
@@ -1994,8 +2093,9 @@ mod tests {
         assert_eq!(row.calls, 1, "ask spends the shared budget");
 
         // An out-of-range choice is no ruling: the seat decides as it would without a supervisor.
-        let bad =
-            |_: &str, _: &[String], _: &str, _: u64| -> CtxResult<Option<Ruling>> { Ok(None) };
+        let bad = |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+            Ok(None)
+        };
         let mut out = Vec::new();
         let code = run_ask_with("q", &options, "", 5, &lookup, &bad, &mut out).expect("ask");
         assert_eq!(code, 1);
@@ -2003,6 +2103,168 @@ mod tests {
             String::from_utf8(out)
                 .expect("utf8")
                 .contains("decide yourself")
+        );
+    }
+
+    /// Issue #856: a consult that failed for infrastructure reasons names its cause and costs no call.
+    #[test]
+    fn an_infrastructure_failure_names_the_cause_and_refunds_the_call() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let failing =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                Err("the supervisor child exit status: 3: network denied".into())
+            };
+        let mut out = Vec::new();
+        let code = run_ask_with("q", &options, "", 5, &lookup, &failing, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 1);
+        assert!(text.contains("network denied"), "{text}");
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!((row.calls, row.tickets.len()), (0, 0));
+
+        let unparseable =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                Ok(None)
+            };
+        let mut out = Vec::new();
+        run_ask_with("q", &options, "", 5, &lookup, &unparseable, &mut out).expect("ask");
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!(row.calls, 0, "an unusable reply costs nothing either");
+    }
+
+    /// Issue #856: a sandbox denial in the child's stderr tells the seat how to run the ask.
+    #[test]
+    fn a_sandbox_denial_in_the_child_stderr_names_the_unsandboxed_run() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let denied =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                Err(
+                    "the supervisor child exit status: 1: CONNECT tunnel failed, response 403"
+                        .into(),
+                )
+            };
+        let mut out = Vec::new();
+        run_ask_with("q", &options, "", 5, &lookup, &denied, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("dangerouslyDisableSandbox"), "{text}");
+        assert!(
+            text.contains("if this seat runs in Claude Code's sandbox"),
+            "transport text alone must not assert a sandbox denial: {text}"
+        );
+        assert!(!text.contains("this looks like a sandbox denial"), "{text}");
+        let hint = sandbox_hint("child exit status: 1: connect: Operation not permitted");
+        assert!(
+            hint.is_some_and(|hint| hint.starts_with("this looks like a sandbox denial")),
+            "the kernel denial is the stronger signal"
+        );
+    }
+
+    #[test]
+    fn a_consumed_ask_ticket_is_still_refunded_exactly_once() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        assert!(take_ticket(&state, "operator", &id));
+        settle_ask_call(&state, "operator", &id, true);
+        let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
+        assert_eq!(calls(), 0, "the child consumed it and failed: refunded");
+        let other = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        settle_ask_call(&state, "operator", &id, true);
+        settle_ask_call(&state, "operator", "ask:never-reserved", true);
+        assert_eq!(calls(), 1, "a repeat, foreign or unknown refund is a no-op");
+        settle_ask_call(&state, "operator", &other, false);
+        settle_ask_call(&state, "operator", &other, true);
+        assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn the_oldest_outstanding_reservation_stays_refundable_past_the_trigger_cap() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let mut env = ruling_env(state.root());
+        env.insert(
+            "ZIRV_CTX_SUPERVISOR_MAX_CALLS".to_string(),
+            "40".to_string(),
+        );
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let first = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        for _ in 0..TRIGGERS_KEEP + 1 {
+            reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        }
+        let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
+        assert_eq!(calls() as usize, TRIGGERS_KEEP + 2);
+        settle_ask_call(&state, "operator", &first, true);
+        assert_eq!(calls() as usize, TRIGGERS_KEEP + 1);
+    }
+
+    #[test]
+    fn a_direct_consult_ignores_a_foreign_ask_ticket() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let foreign = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let ticket = ask_ticket_for(false, &|key| {
+            (key == ASK_TICKET_ENV).then(|| foreign.clone())
+        });
+        assert_eq!(ticket, ASK_TICKET);
+        assert!(!take_ticket(&state, "operator", &ticket));
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!((row.calls, row.tickets), (1, vec![foreign.clone()]));
+        assert_eq!(
+            ask_ticket_for(true, &|key| (key == ASK_TICKET_ENV)
+                .then(|| foreign.clone())),
+            foreign
+        );
+    }
+
+    /// Two overlapping asks: the first one's failed consult never refunds the second one's ticket.
+    #[test]
+    fn a_failed_ask_refunds_its_own_ticket_not_a_sibling_asks() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let options = vec!["a".to_string(), "b".to_string()];
+        let sibling = std::cell::RefCell::new(None);
+        let failing = |session: &str, _: &[String], _: &str, _: u64, ticket: &str| {
+            // B reserves while A's consult is in flight, then A's child consumes its ticket and fails.
+            *sibling.borrow_mut() = reserve_ask_call(&state, &cfg, session);
+            assert!(take_ticket(&state, session, ticket));
+            Err::<Option<Ruling>, _>("the supervisor child exit status: 3: boom".into())
+        };
+        let mut out = Vec::new();
+        run_ask_with("q", &options, "", 5, &lookup, &failing, &mut out).expect("ask");
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        let sibling = sibling.borrow().clone().expect("sibling reserved");
+        assert_eq!(row.tickets, vec![sibling], "B's ticket survives A's refund");
+        assert_eq!(row.calls, 1, "only A's call is given back");
+    }
+
+    /// Issue #856: `supervisor ask` spawns a harness child that needs network and `~/.claude`,
+    /// so a sandboxed seat must run it outside the sandbox.
+    #[test]
+    fn supervisor_ask_is_excluded_from_the_seat_sandbox() {
+        let exclusions = crate::commands::ctx::safety::reserved_zirv_sandbox_exclusion_patterns();
+        assert!(
+            exclusions
+                .iter()
+                .any(|pattern| pattern == "zirv ctx supervisor ask *"),
+            "{exclusions:?}"
         );
     }
 
@@ -2014,9 +2276,10 @@ mod tests {
     fn ask_falls_back_when_the_supervisor_is_off_or_the_budget_is_spent() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
-        let never = |_: &str, _: &[String], _: &str, _: u64| -> CtxResult<Option<Ruling>> {
-            panic!("must not consult")
-        };
+        let never =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                panic!("must not consult")
+            };
         let options = vec!["a".to_string(), "b".to_string()];
         let off = std::collections::HashMap::from([(
             crate::commands::ctx::state::STATE_ENV.to_string(),

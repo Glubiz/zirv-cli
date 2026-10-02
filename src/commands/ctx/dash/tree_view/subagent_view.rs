@@ -16,7 +16,6 @@ use super::content::pal;
 const TAIL_BYTES: u64 = 1024 * 1024;
 const REFRESH: Duration = Duration::from_millis(500);
 const ENTRY_LINES: usize = 12;
-const PREVIEW_CHARS: usize = 600;
 
 /// A file's modified time and length.
 type Stamp = (SystemTime, u64);
@@ -48,14 +47,53 @@ pub(super) struct SubagentView {
     back: usize,
 }
 
-fn preview(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = flat.chars().take(PREVIEW_CHARS).collect();
-    if flat.chars().count() > PREVIEW_CHARS {
-        format!("{cut}\u{2026}")
+/// The first non-empty line, with `…` when anything else follows it.
+fn first_line(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first}\u{2026}")
     } else {
-        cut
+        first.to_string()
     }
+}
+
+/// The first non-empty output line, plus how many more lines there are.
+fn result_summary(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    match lines.count() {
+        0 => first.to_string(),
+        more => format!("{first} (+{more} lines)"),
+    }
+}
+
+/// `Name(primary arg)` for a tool call; never the raw input JSON.
+fn tool_summary(name: &str, input: &Value) -> String {
+    let field = |key: &str| input.get(key).and_then(Value::as_str);
+    let primary = match name {
+        "Bash" => field("command"),
+        "Read" | "Edit" | "Write" | "NotebookEdit" => field("file_path"),
+        "Grep" | "Glob" => field("pattern"),
+        "Agent" | "Task" => field("description"),
+        "WebFetch" => field("url"),
+        _ => None,
+    }
+    .or_else(|| {
+        input
+            .as_object()?
+            .values()
+            .filter_map(Value::as_str)
+            .find(|v| !v.trim().is_empty() && v.chars().count() <= 80)
+    })
+    .map(|v| {
+        v.lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+    })
+    .unwrap_or("");
+    format!("{name}({primary})")
 }
 
 fn block_text(value: &Value) -> String {
@@ -77,6 +115,11 @@ fn parse(text: &str) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut push = |kind: Kind, text: String| {
         let text = crate::commands::ctx::snapshot::redact_text(&text);
+        let text = match kind {
+            Kind::User => first_line(&text),
+            Kind::Result => result_summary(&text),
+            Kind::Assistant | Kind::Tool => text,
+        };
         if !text.trim().is_empty() {
             entries.push(Entry { kind, text });
         }
@@ -89,17 +132,21 @@ fn parse(text: &str) -> Vec<Entry> {
             continue;
         };
         match (row.get("type").and_then(Value::as_str), content) {
-            (Some("user"), Value::String(text)) => push(Kind::User, preview(text)),
+            (Some("user"), Value::String(text)) => push(Kind::User, text.clone()),
             (Some("user"), Value::Array(blocks)) => {
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("tool_result") => {
                             let body = block.get("content").map(block_text).unwrap_or_default();
-                            push(Kind::Result, preview(&body));
+                            push(Kind::Result, body);
                         }
                         Some("text") => push(
                             Kind::User,
-                            preview(block.get("text").and_then(Value::as_str).unwrap_or("")),
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                         ),
                         _ => {}
                     }
@@ -110,13 +157,16 @@ fn parse(text: &str) -> Vec<Entry> {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => push(
                             Kind::Assistant,
-                            preview(block.get("text").and_then(Value::as_str).unwrap_or("")),
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                         ),
                         Some("tool_use") => {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            let input =
-                                block.get("input").map(Value::to_string).unwrap_or_default();
-                            push(Kind::Tool, preview(&format!("{name} {input}")));
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
+                            push(Kind::Tool, tool_summary(name, &input));
                         }
                         _ => {}
                     }
@@ -128,14 +178,55 @@ fn parse(text: &str) -> Vec<Entry> {
     entries
 }
 
+/// Word-wraps each line of `text` (blank lines and indentation survive); an over-long word is
+/// the only thing cut mid-word. At most ENTRY_LINES lines, the last ending in `…` when cut.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(width)
-        .take(ENTRY_LINES)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let raw = raw.trim_end();
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let indent: String = raw.chars().take_while(|c| *c == ' ').collect();
+        let mut line = indent.clone();
+        for word in raw.split_whitespace() {
+            let mut word = word.to_string();
+            while word.chars().count() > width {
+                if line.trim().is_empty() {
+                    let head: String = word.chars().take(width).collect();
+                    out.push(head);
+                } else {
+                    out.push(std::mem::take(&mut line));
+                    continue;
+                }
+                word = word.chars().skip(width).collect();
+            }
+            let sep = usize::from(!line.trim().is_empty());
+            if line.chars().count() + sep + word.chars().count() > width && !line.trim().is_empty()
+            {
+                out.push(std::mem::replace(&mut line, indent.clone()));
+            }
+            if !line.trim().is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&word);
+        }
+        out.push(line);
+    }
+    if out.len() > ENTRY_LINES {
+        out.truncate(ENTRY_LINES);
+        if let Some(last) = out.last_mut() {
+            last.push('\u{2026}');
+        }
+    }
+    out
+}
+
+/// One line cut to `width` with `…`.
+fn clip(text: &str, width: usize) -> Vec<String> {
+    vec![super::content::fit(text, width.max(8))]
 }
 
 impl SubagentView {
@@ -223,10 +314,12 @@ impl SubagentView {
                 Kind::Tool => ("\u{25b8} ", pal::fg(pal::SEAT)),
                 Kind::Result => ("  \u{21b3} ", pal::dim()),
             };
-            for (i, line) in wrap(&entry.text, width.saturating_sub(mark.chars().count()))
-                .into_iter()
-                .enumerate()
-            {
+            let room = width.saturating_sub(mark.chars().count());
+            let shown = match entry.kind {
+                Kind::Assistant => wrap(&entry.text, room),
+                _ => clip(&entry.text, room),
+            };
+            for (i, line) in shown.into_iter().enumerate() {
                 let lead = if i == 0 {
                     mark.to_string()
                 } else {
@@ -318,7 +411,7 @@ mod tests {
             kinds,
             [
                 (Kind::User, "Map the call sites".to_string()),
-                (Kind::Tool, r#"Grep {"pattern":"foo"}"#.to_string()),
+                (Kind::Tool, "Grep(foo)".to_string()),
                 (Kind::Result, "src/a.rs:1".to_string()),
                 (Kind::Assistant, "4 call sites".to_string()),
             ]
@@ -365,5 +458,62 @@ mod tests {
         // A missing file says so instead of drawing nothing.
         let gone = SubagentView::open("t".into(), dir.path().join("none.jsonl"));
         assert!(gone.error.is_some());
+    }
+
+    #[test]
+    fn a_realistic_transcript_renders_compactly_at_width_60() {
+        let brief = "Investigate the retry loop in the exporter.\n\nContext: the nightly job fails \
+            intermittently and we suspect the backoff helper.\n\nReport back with file and line references.";
+        let reply = "Found three problems:\n- the backoff never resets after a success\n- the jitter \
+            uses a shared global generator\n- the retry limit is read once at startup";
+        let output: String = (1..=40).map(|i| format!("line {i} of output\n")).collect();
+        let rows = [
+            serde_json::json!({"type":"user","message":{"content":brief}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":reply}]}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test retry\nsecond","description":"x"}}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":output}]}}),
+        ];
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("agent-y.jsonl");
+        std::fs::write(&path, text).expect("write");
+        let view = SubagentView::open("t".into(), path);
+        let lines: Vec<String> = view.lines(58).into_iter().map(|(_, l)| l).collect();
+        let joined = lines.join("\n");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("asked")).count(), 1);
+        assert!(
+            !joined.contains("Context:"),
+            "only the first brief line: {joined}"
+        );
+        assert!(lines[0].ends_with('\u{2026}'), "{joined}");
+        for item in [
+            "- the backoff never resets",
+            "- the jitter",
+            "- the retry limit",
+        ] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.trim_start().starts_with(item) || l.contains(item)),
+                "{item} in {joined}"
+            );
+        }
+        assert_eq!(lines.iter().filter(|l| l.contains("Bash(")).count(), 1);
+        assert!(joined.contains("Bash(cargo test retry)"), "{joined}");
+        assert!(!joined.contains('{'), "no raw JSON: {joined}");
+        assert!(joined.contains("line 1 of output (+39 lines)"), "{joined}");
+        assert!(!joined.contains("line 2 of output"), "{joined}");
+        // No word is split: every rendered word is a whole word of the source.
+        let source = format!("{brief} {reply} cargo test retry output lines of");
+        for word in joined
+            .split_whitespace()
+            .filter(|w| w.chars().all(char::is_alphabetic))
+        {
+            assert!(
+                source.contains(word) || ["asked", "says"].contains(&word),
+                "{word}"
+            );
+        }
+        assert!(lines.iter().all(|l| l.chars().count() <= 58), "{joined}");
     }
 }

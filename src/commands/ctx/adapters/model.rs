@@ -143,6 +143,29 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
     }
 }
 
+/// Codex `-c model_reasoning_effort=...` for a worker when `[worker].codex_effort` is set and
+/// the operator's own flags do not already set it, so the cost ceiling is argv, not prompt text (#765).
+pub fn worker_effort_args(cfg: &CtxConfig, name: &str, flags: &[String]) -> Vec<String> {
+    let Some(effort) = cfg
+        .worker
+        .codex_effort
+        .as_deref()
+        .filter(|_| name == "codex")
+    else {
+        return Vec::new();
+    };
+    if flags
+        .iter()
+        .any(|f| f.starts_with("model_reasoning_effort"))
+    {
+        return Vec::new();
+    }
+    vec![
+        "-c".to_string(),
+        format!("model_reasoning_effort=\"{effort}\""),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +561,26 @@ mod tests {
             worker_model_args(&cfg, "codex", &adapter),
             vec!["--model".to_string(), "gpt-5.6-terra".to_string()],
         );
+    }
+
+    #[test]
+    fn worker_effort_args_are_codex_only_and_yield_to_an_operator_passthrough() {
+        let mut cfg = super::super::tests::permissive_cfg();
+        assert!(
+            worker_effort_args(&cfg, "codex", &[]).is_empty(),
+            "unset adds nothing"
+        );
+        cfg.worker.codex_effort = Some("low".to_string());
+        assert_eq!(
+            worker_effort_args(&cfg, "codex", &[]),
+            vec![
+                "-c".to_string(),
+                "model_reasoning_effort=\"low\"".to_string()
+            ]
+        );
+        assert!(worker_effort_args(&cfg, "claude", &[]).is_empty());
+        let operator = vec!["-c".to_string(), "model_reasoning_effort=high".to_string()];
+        assert!(worker_effort_args(&cfg, "codex", &operator).is_empty());
     }
 
     // FIX A: `last_model_flag` recognises codex's `-m` short alias in every

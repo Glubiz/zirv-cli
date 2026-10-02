@@ -922,7 +922,7 @@ fn zirv_invocation(env: EnvLookup<'_>) -> CtxResult<Vec<String>> {
 
 /// The last `max_bytes` of `bytes`, lossily decoded -- shared by a gate's
 /// stdout+stderr tail and the judge prompt's transcript tail.
-fn tail_of_bytes(bytes: &[u8], max_bytes: usize) -> String {
+pub(super) fn tail_of_bytes(bytes: &[u8], max_bytes: usize) -> String {
     let start = bytes.len().saturating_sub(max_bytes);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }

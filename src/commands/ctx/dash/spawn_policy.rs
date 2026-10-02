@@ -240,6 +240,7 @@ pub(super) fn worker_pane_extra_args(
     // approval posture, so surface mode must match the real launch (#326).
     let surface_mode = adapters::LaunchMode::Interactive;
     let mut extra = pane_model_args(req, cfg, adapter);
+    extra.extend(adapters::worker_effort_args(cfg, &req.agent, &req.flags));
     // Workers skip the native skill plugin's listing cost; sub-orchestrators
     // retain it because they can dispatch workers.
     extra.extend(adapters::policy_launch_args_for_surface(
@@ -725,10 +726,18 @@ fn record_pane_launch(
         .parent_session
         .as_deref()
         .filter(|id| prompt::is_addressable_short(id)));
+    use super::super::graph::{clean_agent_name, derive_agent_name, unique_agent_name};
+    let wanted = req
+        .name
+        .as_deref()
+        .map(clean_agent_name)
+        .unwrap_or_else(|| derive_agent_name(&req.prompt));
+    let agent_name = unique_agent_name(state, &wanted);
     super::super::graph::record_worker_launch(
         state,
         repo,
         &super::super::graph::Launch {
+            name: Some(&agent_name),
             session,
             origin: "pane",
             parent_session: parent,

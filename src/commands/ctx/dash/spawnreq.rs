@@ -132,6 +132,10 @@ pub struct SpawnRequest {
     /// Fence a spawn with the requester's seat generation, not the dashboard process's seat. A forged generation can only narrow permission (#543).
     #[serde(default)]
     pub parent_seat_generation: Option<u64>,
+    /// The worker's display name (`zirv agent --name`); kebab-cased and made unique on launch,
+    /// and derived from the prompt when absent. Display and addressing only, never authority.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -343,6 +347,7 @@ mod tests {
     fn sample_request() -> SpawnRequest {
         SpawnRequest {
             kill: None,
+            name: None,
             agent: "claude".to_string(),
             prompt: "fix the failing tests".to_string(),
             cwd: PathBuf::from("/repo"),

@@ -183,6 +183,7 @@ fn sessions_lines(
         .map(|(record, _)| record.short.clone())
         .collect();
 
+    let names = super::graph::agent_names(state);
     let mut lines: Vec<String> = records
         .iter()
         .map(|(record, liveness)| {
@@ -216,7 +217,14 @@ fn sessions_lines(
             let mut line = format!(
                 "  {} {}  {}  {}  pid {}  {}  {}  {}",
                 bullet,
-                style::paint(&record.short, Tone::Accent, colour),
+                style::paint(
+                    &names.get(&record.short).map_or_else(
+                        || record.short.clone(),
+                        |name| format!("{} ({name})", record.short)
+                    ),
+                    Tone::Accent,
+                    colour
+                ),
                 style::paint(&record.agent, Tone::Accent, colour),
                 style::paint(&record.verb.to_string(), Tone::Accent, colour),
                 style::paint(&record.pid.to_string(), Tone::Muted, colour),

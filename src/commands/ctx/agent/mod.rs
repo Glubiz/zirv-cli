@@ -861,7 +861,7 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
 fn flags_pin_model(flags: &[String]) -> bool {
     flags
         .iter()
-        .any(|f| adapters::classify_model_flag(f).is_some())
+        .any(|f| adapters::classify_model_flag(f).is_some() || f.trim_start().starts_with("model="))
 }
 
 /// Vendor flags are not portable: only empty or model-only passthrough may be automatically rerouted.
@@ -916,12 +916,13 @@ fn worker_launch_flags(
         adapters::LaunchMode::Headless,
         super::prompt::PromptRole::Worker,
     );
+    let mut out = adapters::worker_effort_args(cfg, name, flags);
     if flags_pin_model(flags) {
-        let mut out = policy_extra;
+        out.extend(policy_extra);
         out.extend_from_slice(flags);
         return out;
     }
-    let mut out = adapters::worker_model_args(cfg, name, adapter);
+    out.extend(adapters::worker_model_args(cfg, name, adapter));
     out.extend(policy_extra);
     out.extend_from_slice(flags);
     out
@@ -2748,6 +2749,42 @@ mod tests {
         assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
     }
 
+    /// #765: the configured Codex worker model and effort reach argv; an operator
+    /// `-c model=` / `-c model_reasoning_effort=` passthrough suppresses zirv's value.
+    #[test]
+    fn codex_worker_model_and_effort_are_enforced_unless_the_operator_passes_them() {
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_exec_ask_for_approval_forced(true);
+        let mut cfg = CtxConfig::default();
+        cfg.worker.codex = Some("gpt-5.6-terra".to_string());
+        cfg.worker.codex_effort = Some("low".to_string());
+        let out = worker_launch_flags(&cfg, "codex", &adapter, &[]);
+        assert!(
+            out.contains(&"model_reasoning_effort=\"low\"".to_string()),
+            "{out:?}"
+        );
+        assert!(out.contains(&"gpt-5.6-terra".to_string()), "{out:?}");
+        let operator: Vec<String> = [
+            "-c",
+            "model=gpt-5.6-sol",
+            "-c",
+            "model_reasoning_effort=high",
+        ]
+        .map(String::from)
+        .to_vec();
+        let out = worker_launch_flags(&cfg, "codex", &adapter, &operator);
+        assert!(
+            !out.iter().any(|f| f.contains("low") || f == "--model"),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|f| f.starts_with("model_reasoning_effort"))
+                .count(),
+            1
+        );
+    }
+
     /// No model flag (codex has no adapter-owned worker-model default), but
     /// the shipped-default sandbox posture still applies.
     #[test]
@@ -3358,6 +3395,7 @@ mod tests {
     pub(super) fn args_for(name: &str, prompt: &str) -> AgentArgs {
         AgentArgs {
             name: name.to_string(),
+            label: None,
             prompt: prompt.to_string(),
             flags: Vec::new(),
             system_prompt: None,

@@ -196,6 +196,7 @@ pub(super) fn assemble_sidebar(
     let (live_panes, ended_panes): (Vec<&PaneRowMeta>, Vec<&PaneRowMeta>) =
         panes.iter().partition(|p| p.ended.is_none());
     let row_of = |p: &PaneRowMeta| ui::SidebarRow {
+        name: None,
         role: display_role(&p.role).into(),
         model: p.model.clone(),
         group: p.group_id.as_ref().map(|id| ui::GroupRef {
@@ -254,6 +255,7 @@ pub(super) fn assemble_sidebar(
             continue;
         }
         rows.push(ui::SidebarRow {
+            name: None,
             role: record
                 .role
                 .as_deref()
@@ -1593,6 +1595,7 @@ mod tests {
 
     fn focused_alive_row_supervised(score: Option<u32>, supervised: bool) -> ui::SidebarRow {
         ui::SidebarRow {
+            name: None,
             role: "worker".into(),
             model: None,
             group: None,
