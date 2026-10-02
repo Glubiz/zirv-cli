@@ -504,24 +504,13 @@ pub(super) fn derive_agent_name(brief: &str) -> String {
 
 /// An operator-typed or derived name reduced to kebab-case, at most 24 characters.
 pub(super) fn clean_agent_name(raw: &str) -> String {
-    let kebab: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let name: String = kebab
-        .split('-')
+    let kebab = raw
+        .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
-        .chars()
-        .take(24)
-        .collect();
+        .to_ascii_lowercase();
+    let name: String = kebab.chars().take(24).collect();
     let name = name.trim_matches('-');
     if name.is_empty() || name == "worker" {
         return "agent".to_string();

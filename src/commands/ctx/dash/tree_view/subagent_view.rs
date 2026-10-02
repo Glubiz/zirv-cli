@@ -226,12 +226,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// One line cut to `width` with `…`.
 fn clip(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(8);
-    if text.chars().count() <= width {
-        return vec![text.to_string()];
-    }
-    let cut: String = text.chars().take(width - 1).collect();
-    vec![format!("{cut}\u{2026}")]
+    vec![super::content::fit(text, width.max(8))]
 }
 
 impl SubagentView {

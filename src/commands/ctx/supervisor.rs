@@ -1115,12 +1115,7 @@ fn spawn_ask_consult(
     let stderr = stderr
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let tail: String = {
-        let chars: Vec<char> = stderr.trim().chars().collect();
-        chars[chars.len().saturating_sub(ASK_STDERR_TAIL_BYTES)..]
-            .iter()
-            .collect()
-    };
+    let tail = super::run_loop::tail_of_bytes(stderr.trim().as_bytes(), ASK_STDERR_TAIL_BYTES);
     Err(format!("the supervisor child {status}: {tail}").into())
 }
 
