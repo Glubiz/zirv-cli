@@ -283,7 +283,7 @@ fn show(setting: &Setting, value: &toml::Value) -> String {
     if setting.sensitive {
         return "(redacted)".to_string();
     }
-    match value {
+    match redact_value(value) {
         toml::Value::String(text) => format!("{text:?}"),
         other => other.to_string(),
     }
@@ -341,11 +341,30 @@ pub enum Change<'a> {
     Reset,
 }
 
-fn project_effect_check(ctx: &SettingsCtx<'_>, key: &str, updated: &str) -> CtxResult<()> {
+/// Why a project write is refused: the effective config must never get looser.
+fn project_effect_check(
+    ctx: &SettingsCtx<'_>,
+    setting: &Setting,
+    updated: &str,
+    op: EditOp,
+) -> CtxResult<()> {
     let path = project_path(ctx.repo);
+    let key = &setting.key;
     let table: toml::Table = toml::from_str(updated)?;
-    reject_untrusted_keys(&table, &path)?;
-    reject_untrusted_workspace_execution(&table, &path)?;
+    if op == EditOp::Set {
+        reject_untrusted_keys(&table, &path)?;
+        reject_untrusted_workspace_execution(&table, &path)?;
+        // No generic "narrower than" order exists, so replacing a repo value is never proven safe.
+        if let Some(old) = value_at(&read_table(&path)?, setting.path)
+            && Some(old) != value_at(&table, setting.path)
+        {
+            return Err(format!(
+                "{key}: the project already sets a value and a replacement could loosen it; edit {} by hand if you mean it",
+                path.display()
+            )
+            .into());
+        }
+    }
     let before = CtxConfig::load(ctx.repo, ctx.env)?;
     let scratch = std::env::temp_dir().join(format!("zirv-settings-{}", uuid::Uuid::new_v4()));
     let candidate = scratch
@@ -356,13 +375,104 @@ fn project_effect_check(ctx: &SettingsCtx<'_>, key: &str, updated: &str) -> CtxR
         .map_err(Into::into)
         .and_then(|()| CtxConfig::load(&scratch, ctx.env));
     let _ = std::fs::remove_dir_all(&scratch);
-    if before == after? {
+    let unchanged = before == after?;
+    if op == EditOp::Unset && !unchanged {
+        return Err(format!(
+            "{key}: resetting it would remove a restriction; edit {} by hand if you mean it",
+            path.display()
+        )
+        .into());
+    }
+    if op == EditOp::Set && unchanged {
         return Err(format!(
             "{key}: a project value can only narrow, and this would change nothing (a user, environment or built-in value already is at least as strict)"
         )
         .into());
     }
     Ok(())
+}
+
+/// True when `raw` embeds a credential: URL userinfo or a token-like query parameter.
+fn embeds_credentials(raw: &str) -> bool {
+    raw.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}'))
+        .filter_map(|word| word.split_once("://"))
+        .any(|(_, rest)| {
+            let (authority, tail) = rest
+                .split_once(['/', '?'])
+                .map_or((rest, ""), |(a, _)| (a, &rest[a.len()..]));
+            authority.contains('@')
+                || tail.split_once('?').is_some_and(|(_, query)| {
+                    query
+                        .split('&')
+                        .any(|pair| is_secret_name(pair.split('=').next().unwrap_or("")))
+                })
+        })
+}
+
+fn is_secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "token", "key", "secret", "password", "passwd", "auth", "sig",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+/// Mask URL userinfo and token-like query values inside a string.
+fn redact_text(text: &str) -> String {
+    if !text.contains("://") {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for (index, word) in text.split(' ').enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let Some((scheme, rest)) = word.split_once("://") else {
+            out.push_str(word);
+            continue;
+        };
+        let (authority, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority.to_string(), |(_, host)| format!("***@{host}"));
+        let tail = match tail.split_once('?') {
+            Some((path, query)) => {
+                let query: Vec<String> = query
+                    .split('&')
+                    .map(|pair| match pair.split_once('=') {
+                        Some((name, _)) if is_secret_name(name) => format!("{name}=***"),
+                        _ => pair.to_string(),
+                    })
+                    .collect();
+                format!("{path}?{}", query.join("&"))
+            }
+            None => tail.to_string(),
+        };
+        out.push_str(&format!("{scheme}://{authority}{tail}"));
+    }
+    out
+}
+
+fn redact_value(value: &toml::Value) -> toml::Value {
+    match value {
+        toml::Value::String(text) => toml::Value::String(redact_text(text)),
+        toml::Value::Array(items) => toml::Value::Array(items.iter().map(redact_value).collect()),
+        toml::Value::Table(table) => toml::Value::Table(
+            table
+                .iter()
+                .map(|(name, item)| {
+                    let item = if is_secret_name(name) && item.is_str() {
+                        toml::Value::String("(redacted)".to_string())
+                    } else {
+                        redact_value(item)
+                    };
+                    (name.clone(), item)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Write one change at one scope. `zirv ctx config` validation applies byte for byte: user and
@@ -380,6 +490,12 @@ pub fn change(
         );
     }
     let (raw, op) = match change {
+        Change::Set(raw) if embeds_credentials(raw) => {
+            return Err(format!(
+                "{key}: the value embeds a credential (URL userinfo or a token-like query parameter); reference an environment variable instead"
+            )
+            .into());
+        }
         Change::Set(raw) => (raw, EditOp::Set),
         Change::Reset => ("", EditOp::Unset),
     };
@@ -399,12 +515,7 @@ pub fn change(
                 return Err("the project is the home directory: use the user scope".into());
             }
             let path = project_path(ctx.repo);
-            let check = |updated: &str| {
-                if op == EditOp::Unset {
-                    return Ok(());
-                }
-                project_effect_check(ctx, &setting.key, updated)
-            };
+            let check = |updated: &str| project_effect_check(ctx, &setting, updated, op);
             let changed = config_cmd::apply_edit(&path, key, raw, op, &check)?;
             Ok(format!(
                 "{key}: {} in {} ({APPLIES})",
@@ -667,6 +778,96 @@ mod tests {
         );
         let row = row_of(&fx, &no_env, "prompt.skill_index");
         assert_eq!((row.value.as_str(), row.source), ("false", "project"));
+    }
+
+    #[test]
+    fn project_set_never_replaces_an_existing_narrowing_with_a_wider_value() {
+        let fx = Fixture::new();
+        let path = fx.project_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[prompt]\nskill_index = false\n").unwrap();
+        let error = with_ctx(&fx, &no_env, |ctx| {
+            change(
+                ctx,
+                "prompt.skill_index",
+                Change::Set("true"),
+                Scope::Project,
+            )
+            .unwrap_err()
+        });
+        assert!(error.to_string().contains("by hand"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[prompt]\nskill_index = false\n"
+        );
+    }
+
+    #[test]
+    fn project_reset_is_refused_when_it_removes_a_narrowing_and_allowed_otherwise() {
+        let fx = Fixture::new();
+        let path = fx.project_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[prompt]\nskill_index = false\n").unwrap();
+        let error = with_ctx(&fx, &no_env, |ctx| {
+            change(ctx, "prompt.skill_index", Change::Reset, Scope::Project).unwrap_err()
+        });
+        assert!(error.to_string().contains("by hand"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[prompt]\nskill_index = false\n"
+        );
+        // A key the project never set, and a project value the user layer already matches, change nothing.
+        let absent = with_ctx(&fx, &no_env, |ctx| {
+            change(ctx, "score.window", Change::Reset, Scope::Project).unwrap()
+        });
+        assert!(absent.contains("unchanged"), "{absent}");
+        fx.user("[prompt]\nskill_index = false\n");
+        with_ctx(&fx, &no_env, |ctx| {
+            change(ctx, "prompt.skill_index", Change::Reset, Scope::Project).unwrap()
+        });
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("skill_index")
+        );
+    }
+
+    #[test]
+    fn endpoint_tables_render_redacted_and_embedded_credentials_are_refused_everywhere() {
+        let fx = Fixture::new();
+        fx.user(
+            "[endpoint.claude]\nbase_url = \"https://bob:hunter2@api.example/v1?token=abc123&x=1\"\nauthorization = \"Bearer zzz\"\n",
+        );
+        let row = row_of(&fx, &no_env, "endpoint");
+        for leaked in ["bob", "hunter2", "abc123", "zzz"] {
+            assert!(
+                !row.value.contains(leaked),
+                "{leaked} leaked: {}",
+                row.value
+            );
+        }
+        assert!(
+            row.value.contains("api.example") && row.value.contains("x=1"),
+            "{}",
+            row.value
+        );
+        for raw in [
+            "https://bob:hunter2@api.example/v1",
+            "https://api.example/v1?api_key=abc",
+            "\"https://api.example/?x=1&password=p\"",
+        ] {
+            for scope in [Scope::User, Scope::Project] {
+                let error = with_ctx(&fx, &no_env, |ctx| {
+                    change(ctx, "proxy.typesafe.base_url", Change::Set(raw), scope).unwrap_err()
+                });
+                assert!(
+                    error.to_string().contains("embeds a credential"),
+                    "{raw}: {error}"
+                );
+            }
+        }
+        assert!(!embeds_credentials("https://api.example/v1?page=2"));
+        assert!(!fx.project_file().exists());
     }
 
     #[test]
