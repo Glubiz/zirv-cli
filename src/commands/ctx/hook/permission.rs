@@ -298,6 +298,17 @@ fn permission_request_is_prompt_free(
     )
 }
 
+/// The latch evidence NEEDS YOU shows: the tool and a redacted preview of what it asks to run.
+fn permission_evidence(payload: &PermissionHookPayload) -> String {
+    let preview = crate::commands::ctx::approvals::redacted_preview(
+        &payload.tool_input.preview_source(&payload.tool_name),
+    );
+    if preview.is_empty() {
+        return format!("permission requested for {}", payload.tool_name);
+    }
+    format!("{}: {preview}", payload.tool_name)
+}
+
 /// Records one privacy-preserving permission-prompt row. Prints the allow
 /// decision only for a command [`permission_request_is_prompt_free`]
 /// proves; every error is swallowed and otherwise stdout stays empty.
@@ -340,7 +351,7 @@ pub(super) fn run_permission<W: Write>(
             &short,
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
-                format!("permission requested for {}", payload.tool_name),
+                permission_evidence(&payload),
                 100,
                 now_secs(),
             )
@@ -588,6 +599,26 @@ mod tests {
         .expect("payload");
         let requested = serde_json::to_value(permission_prompt_row(&requested, 46)).expect("row");
         assert!(requested.get("reason").is_none());
+    }
+
+    #[test]
+    fn the_approval_latch_evidence_names_the_tool_and_a_redacted_preview() {
+        let payload = |command: &str| {
+            PermissionHookPayload::parse(&permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": command}),
+            ))
+            .expect("payload")
+        };
+        assert_eq!(
+            permission_evidence(&payload("cargo test")),
+            "Bash: cargo test"
+        );
+        assert_eq!(
+            permission_evidence(&payload("")),
+            "permission requested for Bash"
+        );
     }
 
     #[test]

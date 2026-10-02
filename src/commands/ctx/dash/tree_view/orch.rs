@@ -623,6 +623,81 @@ fn color_command(g: &mut theme::Grid, x: i32, y: i32, line: &str, first: bool) {
     }
 }
 
+/// One wait that only its harness can answer, as a card: who, what it waits on, where, and a way in.
+/// Returns its height.
+fn wait_card(
+    s: &mut Scene,
+    ctx: &Ctx,
+    (kind, evidence, need): (WaitKind, &str, &Need),
+    count: usize,
+    (x, y, w): (i32, i32, i32),
+) -> i32 {
+    let model = ctx.model;
+    let inbox_hint =
+        matches!(kind, WaitKind::Permission | WaitKind::Approval) && !model.facts.approvals_inbox;
+    let h = if inbox_hint { 7 } else { 5 };
+    s.grid.boxed(
+        x,
+        y,
+        w,
+        h,
+        mix(c::WARN_DIM, c::WARN, breathe(ctx.now, 1.6)),
+        Some(c::WARN_BG),
+    );
+    s.grid.bold(x + 2, y, " \u{2691} NEEDS YOU ", c::WARN);
+    let tag = format!(
+        " {}{} ",
+        if count > 1 {
+            format!("1 of {count} \u{b7} ")
+        } else {
+            String::new()
+        },
+        content::elapsed_label(need.age)
+    );
+    s.grid.text(x + w - 2 - theme::width(&tag), y, &tag, c::DIM);
+    s.grid
+        .put(x + 2, y + 1, '\u{25cf}', Some(c::AGENT), None, true);
+    let name = cut(&need.name, 20);
+    let after = s.grid.bold(x + 4, y + 1, &name, c::HI);
+    let place = need
+        .sel
+        .as_ref()
+        .and_then(|sel| model.node(sel))
+        .map(|node| where_line(model, node))
+        .unwrap_or_default();
+    let line = if place.is_empty() {
+        format!("\u{b7} {}", wait_verb(kind))
+    } else {
+        format!("\u{b7} {} \u{b7} {place}", wait_verb(kind))
+    };
+    s.grid
+        .text(after + 1, y + 1, &cut(&line, x + w - 3 - after), c::DIM);
+    s.grid.text(x + 2, y + 2, &cut(evidence, w - 4), c::FG);
+    let mut yy = y + 3;
+    if inbox_hint {
+        for note in [
+            "Answer it in its pane.",
+            "To answer here: [approvals] inbox = true",
+        ] {
+            s.grid.text(x + 2, yy, &cut(note, w - 4), c::FAINT);
+            yy += 1;
+        }
+    }
+    s.chip(
+        ctx,
+        x + 2,
+        yy,
+        Chip::new(
+            "\u{23ce}",
+            "Open its pane",
+            Some(Act::Open(need.sel.clone().unwrap_or(Sel::Seat))),
+        )
+        .id("wait-e")
+        .node(need.sel.clone()),
+    );
+    h
+}
+
 /// One open supervisor ruling as a card: whose it is, its kind, why, and the two answers. Returns
 /// its height.
 fn ruling_card(
@@ -763,6 +838,21 @@ fn right_col(s: &mut Scene, ctx: &Ctx, items: &[Need], (rx, rw): (i32, i32), fh:
         let max_h = (fh - 1 - SELECTED_MIN).max(10);
         y += approval_card(s, ctx, fact, approvals, (rx, y, rw), max_h) + 1;
     }
+    let waits = items
+        .iter()
+        .filter(|n| matches!(n.kind, NeedKind::Wait { .. }))
+        .count();
+    let mut drawn_wait = None;
+    if first.is_none()
+        && let Some(i) = items
+            .iter()
+            .position(|n| matches!(n.kind, NeedKind::Wait { .. }))
+        && let NeedKind::Wait { kind, evidence } = &items[i].kind
+        && fh - 1 - SELECTED_MIN >= 8
+    {
+        y += wait_card(s, ctx, (*kind, evidence, &items[i]), waits, (rx, y, rw)) + 1;
+        drawn_wait = Some(i);
+    }
     let rulings = items
         .iter()
         .filter(|n| matches!(n.kind, NeedKind::Ruling(_)))
@@ -791,13 +881,14 @@ fn right_col(s: &mut Scene, ctx: &Ctx, items: &[Need], (rx, rw): (i32, i32), fh:
     let rest: Vec<&Need> = items
         .iter()
         .enumerate()
-        .filter(|(i, _)| Some(*i) != first && Some(*i) != drawn_ruling)
+        .filter(|(i, _)| Some(*i) != first && Some(*i) != drawn_ruling && Some(*i) != drawn_wait)
         .map(|(_, n)| n)
         .collect();
     let gate = gate_line(model);
     let used = y - TOP;
     let room = fh - used - 1 - SELECTED_MIN;
-    if rest.is_empty() && first.is_none() && drawn_ruling.is_none() {
+    let carded = first.is_some() || drawn_ruling.is_some() || drawn_wait.is_some();
+    if rest.is_empty() && !carded {
         let h = if gate.is_some() { 4 } else { 3 };
         s.grid.boxed(rx, y, rw, h, c::RULE, Some(c::BG));
         s.grid.bold(rx + 2, y, " NEEDS YOU ", c::DIM);
@@ -817,16 +908,12 @@ fn right_col(s: &mut Scene, ctx: &Ctx, items: &[Need], (rx, rw): (i32, i32), fh:
             rows
         });
         let h = 2 + shown as i32 + i32::from(rest.len() > shown) + i32::from(gate.is_some());
-        let title = if first.is_some() || drawn_ruling.is_some() {
+        let title = if carded {
             " ALSO NEEDS YOU "
         } else {
             " \u{2691} NEEDS YOU "
         };
-        let col = if first.is_some() || drawn_ruling.is_some() {
-            c::DIM
-        } else {
-            c::WARN
-        };
+        let col = if carded { c::DIM } else { c::WARN };
         s.grid.boxed(rx, y, rw, h, c::RULE, Some(c::BG));
         s.grid.bold(rx + 2, y, title, col);
         s.grid.text(
@@ -2877,6 +2964,40 @@ mod tests {
             press(&mut v, &f, 160, 70, KeyCode::Char('a')),
             Outcome::Notice(_)
         ));
+    }
+
+    #[test]
+    fn a_wait_with_no_approval_card_draws_its_own_card_that_opens_its_pane() {
+        let (data, wf, jev) = busy();
+        let mut f = orch_facts(&wf, &jev);
+        f.approval_items.clear();
+        f.approval_shorts.clear();
+        f.approvals = 0;
+        f.stalled.clear();
+        f.waits = vec![WaitFact {
+            short: "a1".into(),
+            kind: WaitKind::Permission,
+            since: f.now - 70,
+            evidence: "Bash: cargo test".into(),
+        }];
+        let text = draw(160, 45, &view(data), &f);
+        let right: String = text
+            .lines()
+            .map(|l| l.chars().skip(110).collect::<String>() + "\n")
+            .collect();
+        for part in [
+            "\u{2691} NEEDS YOU",
+            "needs permission",
+            "Bash: cargo test",
+            "Open its pane",
+            "[approvals] inbox = true",
+        ] {
+            assert!(right.contains(part), "{part} in:\n{right}");
+        }
+        f.approvals_inbox = true;
+        let (data, ..) = busy();
+        let text = draw(160, 45, &view(data), &f);
+        assert!(!text.contains("[approvals] inbox = true"), "{text}");
     }
 
     #[test]

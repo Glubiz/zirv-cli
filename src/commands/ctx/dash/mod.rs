@@ -3714,6 +3714,7 @@ fn build_tree_facts<'a>(
         jev: facts_cache.disk.jev.as_ref(),
         workflow: facts_cache.disk.workflow.as_ref(),
         approvals: approvals_hub.map_or(0, super::approvals::Hub::count),
+        approvals_inbox: approvals_hub.is_some(),
         approval_shorts: approvals_hub.map_or_else(Vec::new, |hub| {
             hub.shorts().into_iter().map(str::to_string).collect()
         }),
