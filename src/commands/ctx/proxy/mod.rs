@@ -302,7 +302,7 @@ pub fn decide(
             safe_intake_questions(),
         )
     });
-    let model_input = (!safe_intake && !matches!(cfg.proxy.decider, ProxyDecider::Deterministic))
+    let model_input = matches!(cfg.proxy.decider, ProxyDecider::Helper)
         .then(|| protected_model_intake(cfg, state_dir, repo, request, &roster));
 
     let mut fallbacks = Vec::new();
@@ -395,14 +395,7 @@ pub fn decide(
         }
     }
 
-    if !ran_model
-        && !safe_intake
-        && matches!(
-            cfg.proxy.decider,
-            ProxyDecider::Typesafe | ProxyDecider::Helper
-        )
-        && let Some(Ok((_, questions))) = &model_input
-    {
+    if !ran_model && let Some(Ok((_, questions))) = &model_input {
         match try_helper(cfg, questions) {
             Ok(answers) => {
                 result = decision::merge(
@@ -1581,6 +1574,12 @@ mod tests {
             "{:?}",
             decision.fallbacks
         );
+        assert_eq!(
+            decision.fallbacks.len(),
+            1,
+            "no credential means the baseline only, never a helper attempt: {:?}",
+            decision.fallbacks
+        );
         if let Some(value) = had {
             unsafe {
                 std::env::set_var("TYPESAFE_API_KEY", value);
@@ -1638,8 +1637,7 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let state_dir = repo.path().join("state");
         let mut cfg = CtxConfig::default();
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "PROXY_TEST_NEVER_SET_MASKING".to_string();
+        cfg.proxy.decider = ProxyDecider::Helper;
         cfg.obfuscate.mode = super::super::config::ObfuscateMode::Obfuscate;
         cfg.obfuscate.literals_file = Some("missing-sensitive-literals.txt".to_string());
 
