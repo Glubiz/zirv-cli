@@ -427,6 +427,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
         // child cannot report turns to an outer supervisor.
         let apply_session_env = |command: &mut std::process::Command| {
             super::sessions::scrub_supervision_env_cmd(command);
+            command.env(super::adapters::INTERNAL_ENV, "1");
             // Export this cycle's harness for nested command defaults.
             command.env(super::adapters::AGENT_ENV, adapter.name());
             super::sessions::secret_env::scrub_worker_env_cmd(command, &cfg, adapter.as_ref());

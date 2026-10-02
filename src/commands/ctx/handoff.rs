@@ -1202,6 +1202,8 @@ pub fn run_model(
     // Covers `memory::harvest_from_handoff` too, which spawns its harvest
     // model through this same function rather than building its own command.
     super::sessions::scrub_supervision_env_cmd(&mut command);
+    // Not a user's session: its prompt hook must never start a workflow.
+    command.env(super::adapters::INTERNAL_ENV, "1");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2812,6 +2814,18 @@ mod tests {
 
         let seen = std::fs::read_to_string(log.path()).expect("log");
         assert!(seen.contains("ship the webhook"), "got: {seen}");
+    }
+
+    #[test]
+    fn the_distiller_child_is_marked_zirv_internal() {
+        let log = tempfile::NamedTempFile::new().expect("tempfile");
+        let _env_log = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "FAKE_MODEL_ENV_LOG",
+            log.path().to_str(),
+        )]);
+        run_model(&fake_model_adapter(), "haiku", "anything", TEST_TIMEOUT).expect("answers");
+
+        assert_eq!(std::fs::read_to_string(log.path()).expect("log"), "1");
     }
 
     /// Issue #280: `files_read`/`files_modified` on a distilled `Handoff` are

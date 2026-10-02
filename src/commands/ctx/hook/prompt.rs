@@ -326,8 +326,11 @@ fn auto_start_workflow_note(
 ) -> Option<String> {
     use crate::commands::ctx::proxy::{decision, launch};
     let policy = cfg.workflow.auto_start;
+    let flagged = |key: &str| env(key).as_deref() == Some("1");
     if policy == adoption::AutoStartPolicy::Off
         || intake_skipped_for_launch(env)
+        || flagged(adapters::INTERNAL_ENV)
+        || flagged(adapters::HEADLESS_ENV)
         || env(crate::commands::ctx::supervisor::CONSULT_ENV).is_some_and(|v| !v.is_empty())
     {
         return None;
@@ -1283,6 +1286,16 @@ mod tests {
                 CtxConfig::default(),
                 CODING_PROMPT,
                 vec![(crate::commands::ctx::supervisor::CONSULT_ENV, "1")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(adapters::INTERNAL_ENV, "1")],
+            ),
+            (
+                CtxConfig::default(),
+                CODING_PROMPT,
+                vec![(adapters::HEADLESS_ENV, "1")],
             ),
         ];
         for (cfg, prompt, extra) in cases {
