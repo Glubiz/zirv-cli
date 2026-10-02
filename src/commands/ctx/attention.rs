@@ -1098,6 +1098,61 @@ fn lock_status(state: &super::state::StateDir, short: &str) -> Option<super::sta
     super::state::acquire_lock(&lock_path(state, short)).ok()
 }
 
+/// One permission prompt a session has open. Parallel subagents open several at once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenPrompt {
+    pub id: String,
+    pub agent: String,
+    pub at: u64,
+}
+
+fn prompts_path(state: &super::state::StateDir, short: &str) -> PathBuf {
+    state.attention().join(format!("{short}.prompts"))
+}
+
+fn read_prompts(state: &super::state::StateDir, short: &str) -> Vec<OpenPrompt> {
+    std::fs::read_to_string(prompts_path(state, short))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_prompts(state: &super::state::StateDir, short: &str, prompts: &[OpenPrompt]) {
+    if let Ok(json) = serde_json::to_string(prompts) {
+        let _ = super::state::write_private(&prompts_path(state, short), &json);
+    }
+}
+
+/// Notes one more open prompt for `short`, so a sibling call finishing cannot clear its latch (#854).
+pub fn open_prompt(state: &super::state::StateDir, short: &str, prompt: OpenPrompt) {
+    let _ = super::state::create_private_dir_all(&state.attention());
+    let _guard = lock_status(state, short);
+    let mut prompts = read_prompts(state, short);
+    prompts.retain(|open| open.id != prompt.id);
+    prompts.push(prompt);
+    write_prompts(state, short, &prompts);
+}
+
+/// Closes the prompts `closes` selects and returns how many are still open. A session that never
+/// opened one costs a single failed stat and no lock.
+pub fn close_prompts(
+    state: &super::state::StateDir,
+    short: &str,
+    closes: impl Fn(&OpenPrompt) -> bool,
+) -> usize {
+    if !prompts_path(state, short).exists() {
+        return 0;
+    }
+    let _guard = lock_status(state, short);
+    let mut prompts = read_prompts(state, short);
+    let before = prompts.len();
+    prompts.retain(|open| !closes(open));
+    if prompts.len() != before {
+        write_prompts(state, short, &prompts);
+    }
+    prompts.len()
+}
+
 /// Reads the persisted status for `short`, or a fresh default when the file
 /// is missing or fails to parse.
 pub fn load(state: &super::state::StateDir, short: &str) -> SessionStatus {

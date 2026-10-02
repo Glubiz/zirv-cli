@@ -343,12 +343,16 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
 
     // A new PreToolUse call proves any previous permission prompt ended;
     // clear its attention latch before guard-specific early returns (#456).
+    // Only this agent's earlier prompts: a sibling subagent's call proves nothing about them, and
+    // parallel calls of one agent start together, before any of its prompts exist (#854).
     if let Ok(state) = StateDir::resolve(env) {
+        let now = now_secs();
         clear_resolved_approval(
             &state,
             &attention_short(env, &payload.session_id),
             format!("permission resolved: {}", payload.tool_name),
-            now_secs(),
+            now,
+            |open| open.agent == payload.agent_id && now >= open.at + 2,
         );
     }
 

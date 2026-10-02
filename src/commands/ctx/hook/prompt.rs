@@ -219,6 +219,12 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
             .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Working),
             now_secs(),
         );
+        // A turn boundary ends every prompt the session had open.
+        crate::commands::ctx::attention::close_prompts(
+            &state,
+            &attention_short(env, &session_id),
+            |_| true,
+        );
         crate::commands::ctx::approvals::clear_released(
             &state,
             &attention_short(env, &session_id),
