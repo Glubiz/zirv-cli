@@ -899,6 +899,24 @@ fn describe_chat_with_presence(
 /// most recently persisted decision for this repo rendered the same way a
 /// launch would announce it (`proxy::announce_line`), or a note that none
 /// has been recorded yet.
+fn describe_supervisor(cfg: &CtxConfig, colour: bool) -> String {
+    let supervisor = &cfg.supervisor;
+    if !supervisor.enabled {
+        return format!(
+            "{} {}",
+            label(colour, "supervisor:"),
+            style::paint("off", Tone::Muted, colour)
+        );
+    }
+    format!(
+        "{} on, {} {}, {} consults per session",
+        label(colour, "supervisor:"),
+        supervisor.harness,
+        supervisor.model,
+        supervisor.max_calls
+    )
+}
+
 fn describe_proxy(cfg: &CtxConfig, state_dir: &Path, repo: &Path, colour: bool) -> String {
     if !cfg.proxy.enabled {
         return format!(
@@ -1385,6 +1403,7 @@ fn render_report<W: Write>(
         Ok(cfg) => {
             writeln!(w, "\n{}", describe_chat(cfg, colour))?;
             writeln!(w, "{}", describe_proxy(cfg, state.root(), repo, colour))?;
+            writeln!(w, "{}", describe_supervisor(cfg, colour))?;
             if let Some(summary) = super::obfuscate_store::summary(state.root(), repo) {
                 let misses = log::read_recent_decisions(&state)
                     .iter()
@@ -4133,6 +4152,19 @@ mod tests {
 
     /// `describe_proxy` is `off` while `[proxy] enabled` is false, regardless
     /// of any other configuration.
+    #[test]
+    fn status_supervisor_line_names_the_harness_and_model_only_while_enabled() {
+        let mut cfg = CtxConfig::default();
+        assert_eq!(describe_supervisor(&cfg, false), "supervisor: off");
+        cfg.supervisor.enabled = true;
+        cfg.supervisor.harness = "claude".to_string();
+        cfg.supervisor.model = "claude-fable-5-1".to_string();
+        assert_eq!(
+            describe_supervisor(&cfg, false),
+            "supervisor: on, claude claude-fable-5-1, 3 consults per session"
+        );
+    }
+
     #[test]
     fn status_proxy_line_is_off_when_disabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
