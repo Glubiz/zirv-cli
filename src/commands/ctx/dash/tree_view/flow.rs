@@ -15,6 +15,8 @@ const MAX_W: i32 = 30;
 const GAP: i32 = 2;
 /// A finished agent stays a card for this long, then folds into the FINISHED strip.
 const FOLD_SECS: u64 = 240;
+/// Idle agents past this many (newest first) fold into the strip instead of taking a card each.
+const IDLE_CARDS: usize = 4;
 const FULL_CARD: i32 = 11;
 const MIN_CARD: i32 = 7;
 
@@ -39,6 +41,11 @@ pub(super) fn status(model: &Model, node: &Node) -> St {
     }
 }
 
+/// A finished agent whose host session is still live: idle, as opposed to not started.
+fn parked(node: &Node) -> bool {
+    Mark::of(&node.status) == Mark::Idle
+}
+
 pub(super) fn glyph(st: St, now: u64) -> (char, Rgb) {
     match st {
         St::Running => (spin(now), c::AGENT),
@@ -55,6 +62,7 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
     match st {
         St::Done => format!("done {} ago", since(node.ended_at)),
         St::Failed => format!("failed {} ago", since(node.ended_at)),
+        St::Idle if parked(node) => format!("idle {}", since(node.ended_at)),
         St::Idle => "not started".to_string(),
         _ => content::node_elapsed(node, wall).unwrap_or_default(),
     }
@@ -66,6 +74,7 @@ pub(super) fn now_line(node: &Node, st: St) -> (String, Rgb) {
         St::Waiting => ("waiting for you".into(), c::WARN),
         St::Done => ("finished".into(), c::OK),
         St::Failed => ("failed".into(), c::ERR),
+        St::Idle if parked(node) => ("idle".into(), c::DIM),
         St::Idle => ("not started".into(), c::DIM),
         St::Running => {
             let text = match node_steps(node).last() {
@@ -99,12 +108,19 @@ pub(super) fn recent(node: &Node, st: St, wall: u64, n: usize) -> Vec<(u64, Stri
 pub(super) fn split(ctx: &Ctx) -> (Vec<usize>, Vec<usize>) {
     let mut cards = Vec::new();
     let mut folded = Vec::new();
+    let mut idle_cards = 0;
     for (i, agent) in ctx.model.agents.iter().enumerate() {
         let node = agent.node;
-        let old = status(ctx.model, node) == St::Done
-            && node
+        let old = match status(ctx.model, node) {
+            St::Done => node
                 .ended_at
-                .is_none_or(|end| ctx.wall.saturating_sub(end) >= FOLD_SECS);
+                .is_none_or(|end| ctx.wall.saturating_sub(end) >= FOLD_SECS),
+            St::Idle if parked(node) => {
+                idle_cards += 1;
+                idle_cards > IDLE_CARDS
+            }
+            _ => false,
+        };
         if old {
             folded.push(i);
         } else {
@@ -114,15 +130,16 @@ pub(super) fn split(ctx: &Ctx) -> (Vec<usize>, Vec<usize>) {
     (cards, folded)
 }
 
-/// `(working, waiting, finished, failed)` over every top-level agent.
-pub(super) fn counts(ctx: &Ctx) -> (usize, usize, usize, usize) {
-    let mut n = (0, 0, 0, 0);
+/// `(working, waiting, finished, failed, idle)` over every top-level agent.
+pub(super) fn counts(ctx: &Ctx) -> (usize, usize, usize, usize, usize) {
+    let mut n = (0, 0, 0, 0, 0);
     for agent in &ctx.model.agents {
         match status(ctx.model, agent.node) {
             St::Running => n.0 += 1,
             St::Waiting => n.1 += 1,
             St::Done => n.2 += 1,
             St::Failed => n.3 += 1,
+            St::Idle if parked(agent.node) => n.4 += 1,
             St::Idle => {}
         }
     }
@@ -132,12 +149,13 @@ pub(super) fn counts(ctx: &Ctx) -> (usize, usize, usize, usize) {
 /// `1 working · 1 waiting for you · 1 failed · 3 finished`, in the longest wording that fits
 /// `room` columns (`waiting for you` shortens to `waiting`, then `failed` goes, then it is cut).
 pub(super) fn counts_line(ctx: &Ctx, room: i32) -> String {
-    let (working, waiting, done, failed) = counts(ctx);
+    let (working, waiting, done, failed, idle) = counts(ctx);
     let line = |wait: &str, with_failed: bool| {
         [
             Some(format!("{working} working")),
             (waiting > 0).then(|| format!("{waiting} {wait}")),
             (with_failed && failed > 0).then(|| format!("{failed} failed")),
+            (idle > 0).then(|| format!("{idle} idle")),
             Some(format!("{done} finished")),
         ]
         .into_iter()
@@ -260,7 +278,7 @@ pub(super) fn draw(s: &mut Scene, ctx: &Ctx, r: (i32, i32, i32, i32)) {
         .map(|&i| model.agents[i].node.id.clone())
         .collect();
     s.grid.boxed(fx, fy, fw, fh, c::RULE, Some(c::BG));
-    let (working, waiting, done, failed) = counts(ctx);
+    let (working, waiting, done, failed, idle) = counts(ctx);
     let mut tx = s.grid.bold(fx + 2, fy, " FLOW ", c::DIM);
     tx = s.grid.text(
         tx,
@@ -272,6 +290,7 @@ pub(super) fn draw(s: &mut Scene, ctx: &Ctx, r: (i32, i32, i32, i32)) {
         Some(format!("{working} working")),
         (waiting > 0).then(|| format!("{waiting} waiting")),
         (failed > 0).then(|| format!("{failed} failed")),
+        (idle > 0).then(|| format!("{idle} idle")),
         Some(format!("{done} finished")),
     ]
     .into_iter()
@@ -696,13 +715,27 @@ fn finished(s: &mut Scene, ctx: &Ctx, (fx, fy, fw, fh): (i32, i32, i32, i32), fo
         return;
     }
     let y = fy + fh - 2;
-    let mut x = s.grid.bold(fx + 3, y, "FINISHED  ", c::FAINT);
+    let idle = |idx: usize| parked(ctx.model.agents[idx].node);
+    let title = match (
+        folded.iter().any(|&i| idle(i)),
+        folded.iter().any(|&i| !idle(i)),
+    ) {
+        (true, true) => "IDLE \u{b7} FINISHED  ",
+        (true, false) => "IDLE  ",
+        _ => "FINISHED  ",
+    };
+    let mut x = s.grid.bold(fx + 3, y, title, c::FAINT);
     for (shown, &idx) in folded.iter().enumerate() {
         let node = ctx.model.agents[idx].node;
         let job = ctx.model.job_of(node);
         let ago =
             content::elapsed_label(ctx.wall.saturating_sub(node.ended_at.unwrap_or(ctx.wall)));
-        let label = format!(" \u{2713} {}  {ago} ago ", short_name(&job, 30));
+        let (glyph, glyph_color) = if parked(node) {
+            ('\u{25cc}', c::DIM)
+        } else {
+            ('\u{2713}', c::OK)
+        };
+        let label = format!(" {glyph} {}  {ago} ago ", short_name(&job, 30));
         let lw = label.chars().count() as i32;
         if x + lw > fx + fw - 3 {
             let more = format!("+{} more", folded.len() - shown);
@@ -717,7 +750,7 @@ fn finished(s: &mut Scene, ctx: &Ctx, (fx, fy, fw, fh): (i32, i32, i32, i32), fo
             (c::DIM, c::PANEL)
         };
         let end = s.grid.text_on(x, y, &label, fg, Some(bg), false);
-        s.grid.put(x + 1, y, '✓', Some(c::OK), None, true);
+        s.grid.put(x + 1, y, glyph, Some(glyph_color), None, true);
         let reg = s.reg(x, y, end - x, 1, Some(Act::Open(sel.clone())));
         reg.node = Some(sel);
         x = end + 1;
@@ -881,6 +914,46 @@ mod tests {
     }
 
     #[test]
+    fn idle_agents_stay_cards_newest_first_and_only_the_overflow_folds_labelled_idle() {
+        let mut data = fixture();
+        data.nodes.retain(|n| n.id == "seat-1");
+        for i in 0..6u64 {
+            let mut n = node(&format!("i{i}"), Some("seat-1"), "subagent", "sol", "idle");
+            n.ended_at = Some(100 + i);
+            data.nodes.push(n);
+        }
+        let mut old = node("d", Some("seat-1"), "subagent", "sol", "completed");
+        old.ended_at = Some(1);
+        data.nodes.push(old);
+        let f = facts(None);
+        let v = view(data);
+        let model = Model::build(&v.data, &f, v.scope);
+        let sel = Sel::default();
+        let ctx = Ctx {
+            model: &model,
+            view: &v,
+            now: 0,
+            wall: 100_000,
+            sel: &sel,
+            hover: None,
+            hover_key: None,
+        };
+        let id = |i: &usize| model.agents[*i].node.id.clone();
+        let (cards, folded) = split(&ctx);
+        assert_eq!(
+            cards.iter().map(id).collect::<Vec<_>>(),
+            ["i5", "i4", "i3", "i2"]
+        );
+        assert_eq!(folded.iter().map(id).collect::<Vec<_>>(), ["i1", "i0", "d"]);
+        let by = |id: &str| v.data.nodes.iter().find(|n| n.id == id).expect("node");
+        assert_eq!(status(&model, by("i5")), St::Idle);
+        assert_eq!(now_line(by("i5"), St::Idle).0, "idle");
+        assert_eq!(age_word(by("i5"), St::Idle, 160), "idle 55s");
+        assert_eq!(counts(&ctx).4, 6);
+        assert!(counts_line(&ctx, 80).contains("6 idle"));
+    }
+
+    #[test]
     fn the_counts_line_shortens_its_wording_to_the_room_it_has() {
         let mut f = facts(None);
         f.approval_shorts = vec!["w1".into()];
@@ -901,7 +974,7 @@ mod tests {
             hover: None,
             hover_key: None,
         };
-        assert_eq!(counts(&ctx), (1, 1, 1, 1));
+        assert_eq!(counts(&ctx), (1, 1, 1, 1, 0));
         assert_eq!(
             counts_line(&ctx, 60),
             "1 working \u{b7} 1 waiting for you \u{b7} 1 failed \u{b7} 1 finished"

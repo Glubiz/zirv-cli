@@ -1365,8 +1365,19 @@ fn place_subagents(
 
     let mut dispatches: BTreeMap<String, BTreeMap<String, DispatchLine>> = BTreeMap::new();
     let ids: BTreeSet<String> = agents.keys().cloned().collect();
+    let live: BTreeSet<&str> = session_records
+        .iter()
+        .filter(|(_, alive)| *alive)
+        .map(|(record, _)| record.session.as_str())
+        .collect();
     for record in agents.into_values() {
         let session = resolve(&record.session);
+        // A finished subagent of a live session can still be sent a message: it is idle, not gone.
+        let status = if record.status == "completed" && live.contains(session.as_str()) {
+            "idle".to_string()
+        } else {
+            record.status.clone()
+        };
         let line = record.tool_use_id.as_deref().and_then(|tool| {
             dispatches
                 .entry(session.clone())
@@ -1396,7 +1407,7 @@ fn place_subagents(
                 model: record.model.clone().or(record.requested_model.clone()),
                 effort: None,
                 role: Some(record.agent_type.clone()).filter(|t| !t.is_empty()),
-                status: record.status.clone(),
+                status,
                 started_at: Some(record.started_at),
                 ended_at: record.ended_at,
                 tokens: record
@@ -2311,7 +2322,7 @@ mod tests {
         );
         let nodes = snapshot_in(&state, &repo, None, Some(&home), now_secs());
         let node = nodes.iter().find(|n| n.id == "gone1").expect("node");
-        assert_eq!(node.status, "completed");
+        assert_eq!(node.status, "idle");
         assert!(node.ended_at.is_some());
         let label = node.label.as_deref().unwrap_or_default();
         assert!(!label.contains("AKIAIOSFODNN7"), "{label}");
@@ -2430,7 +2441,7 @@ mod tests {
         let node = |id: &str| nodes.iter().find(|n| n.id == id).expect(id);
         let done = node("done1");
         assert_eq!(done.kind, "subagent");
-        assert_eq!(done.status, "completed");
+        assert_eq!(done.status, "idle");
         assert_eq!(done.parent.as_deref(), Some(session));
         assert_eq!(done.session.as_deref(), Some(session));
         assert_eq!(done.job.as_deref(), Some("Map the call sites"));
@@ -2447,8 +2458,47 @@ mod tests {
         assert_eq!(busy.job.as_deref(), Some("Still working on it"));
         let hooked = node("hook3");
         assert_eq!(hooked.job.as_deref(), Some("from hook"));
-        assert_eq!(hooked.status, "completed");
+        assert_eq!(hooked.status, "idle");
         assert_eq!(hooked.started_at, Some(7));
+    }
+
+    #[test]
+    fn a_finished_native_agent_is_idle_under_a_live_session_and_completed_under_a_dead_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let live = "aaaa1111-0000-4000-8000-000000000001";
+        let dead = "bbbb2222-0000-4000-8000-000000000002";
+        register_session(&state, live, "claude", &repo);
+        register_session(&state, dead, "claude", &repo);
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        gone.wait().expect("wait");
+        let path = state.sessions().join(format!("{}.json", &dead[..8]));
+        let mut record: sessions::Record =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        record.pid = gone.id();
+        std::fs::write(&path, serde_json::to_string(&record).expect("json")).expect("write");
+        for (session, id) in [(live, "live1"), (dead, "dead1")] {
+            let subagents = home
+                .join(".claude/projects")
+                .join(super::super::adapters::claude::project_slug(&repo))
+                .join(session)
+                .join("subagents");
+            write_native(
+                &subagents,
+                id,
+                r#"{"agentType":"Explore","description":"d"}"#,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-01T10:00:00.000Z","message":{"content":"go"}}"#,
+                    r#"{"type":"user","timestamp":"2026-10-01T10:01:00.000Z","toolEndsTurn":true}"#,
+                ],
+            );
+        }
+        let nodes = snapshot_in(&state, &repo, None, Some(&home), now_secs());
+        let status = |id: &str| nodes.iter().find(|n| n.id == id).expect(id).status.clone();
+        assert_eq!(status("live1"), "idle");
+        assert_eq!(status("dead1"), "completed");
     }
 
     #[test]

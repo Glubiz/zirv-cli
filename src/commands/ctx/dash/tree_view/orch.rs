@@ -1111,7 +1111,7 @@ fn selected(s: &mut Scene, ctx: &Ctx, (x, y, w, h): (i32, i32, i32, i32)) {
             flow::age_word(node, st, ctx.wall),
             if st == St::Done { c::OK } else { c::ERR },
         ),
-        St::Idle => ("not started".to_string(), c::DIM),
+        St::Idle => (flow::age_word(node, st, ctx.wall), c::DIM),
     };
     s.grid.text(x + 4, yy, &word, wc);
     yy += 1 + gap;

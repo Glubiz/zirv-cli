@@ -90,6 +90,7 @@ pub(super) enum Mark {
     Failed,
     Waiting,
     Queued,
+    Idle,
     Unknown,
 }
 
@@ -97,7 +98,9 @@ impl Mark {
     pub(super) fn of(status: &str) -> Self {
         let s = status.to_ascii_lowercase();
         let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
-        if has(&["fail", "error", "block", "crash", "abort", "cancel"]) {
+        if s == "idle" {
+            Self::Idle
+        } else if has(&["fail", "error", "block", "crash", "abort", "cancel"]) {
             Self::Failed
         } else if has(&["queue", "pend", "wait"]) {
             Self::Queued
@@ -116,7 +119,7 @@ impl Mark {
             Self::Done => "\u{2713}",
             Self::Failed => "\u{2717}",
             Self::Waiting => "\u{2691}",
-            Self::Queued => "\u{25cc}",
+            Self::Queued | Self::Idle => "\u{25cc}",
             Self::Unknown => "\u{25cb}",
         }
     }
@@ -127,7 +130,7 @@ impl Mark {
             Self::Done => ok(),
             Self::Failed => pal::fail(),
             Self::Waiting => pal::warn(),
-            Self::Queued | Self::Unknown => dim(),
+            Self::Queued | Self::Idle | Self::Unknown => dim(),
         }
     }
 }
