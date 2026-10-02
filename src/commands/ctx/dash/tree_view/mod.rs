@@ -570,6 +570,8 @@ pub(super) struct TreeFacts<'a> {
     pub(super) approvals: usize,
     /// Short ids of the sessions whose request the approvals inbox holds.
     pub(super) approval_shorts: Vec<String>,
+    /// The approvals inbox is bound, so a permission request can be answered here instead of in its pane.
+    pub(super) approvals_inbox: bool,
     /// Short ids of this dashboard's panes.
     pub(super) pane_shorts: Vec<String>,
     /// The focused pane: `(short id, title, agent)`; the chat bar names it.
@@ -983,6 +985,7 @@ mod testkit {
             workflow: None,
             approvals: 0,
             approval_shorts: Vec::new(),
+            approvals_inbox: false,
             pane_shorts: ["seat1", "w1", "w2"].map(String::from).to_vec(),
             focused: None,
             panes_used: 3,
