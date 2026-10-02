@@ -47,24 +47,18 @@ pub(crate) fn is_secret_env_name(name: &str) -> bool {
         || upper.split('_').any(|word| SECRET_WORDS.contains(&word))
 }
 
-/// Remove secret-shaped names from a worker's `Command`, except the harness's own
-/// credentials (`keep`, `None` = the adapter declares none, so nothing is touched) and
-/// anything the launch set explicitly. Returns the stripped NAMES, never values.
-pub(crate) fn scrub_worker_secrets_cmd(
-    command: &mut Command,
+/// Names to strip: secret-shaped ambient names that are neither the harness's own credentials
+/// (`keep`, `None` = the adapter declares none, so nothing is touched) nor set explicitly.
+fn names_to_strip(
     enabled: bool,
     keep: Option<&[String]>,
+    explicit: BTreeSet<String>,
     ambient: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
     let Some(keep) = keep.filter(|_| enabled) else {
         return Vec::new();
     };
     let keep: BTreeSet<String> = keep.iter().map(|k| k.to_ascii_uppercase()).collect();
-    let explicit: BTreeSet<String> = command
-        .get_envs()
-        .filter(|(_, value)| value.is_some())
-        .map(|(key, _)| key.to_string_lossy().to_ascii_uppercase())
-        .collect();
     let mut stripped: Vec<String> = ambient
         .into_iter()
         .filter(|name| is_secret_env_name(name))
@@ -75,8 +69,39 @@ pub(crate) fn scrub_worker_secrets_cmd(
         .collect();
     stripped.sort();
     stripped.dedup();
+    stripped
+}
+
+/// Remove secret-shaped names from a worker's `Command`. Returns the stripped NAMES, never values.
+pub(crate) fn scrub_worker_secrets_cmd(
+    command: &mut Command,
+    enabled: bool,
+    keep: Option<&[String]>,
+    ambient: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let explicit = command
+        .get_envs()
+        .filter(|(_, value)| value.is_some())
+        .map(|(key, _)| key.to_string_lossy().to_ascii_uppercase())
+        .collect();
+    let stripped = names_to_strip(enabled, keep, explicit, ambient);
     for name in &stripped {
         command.env_remove(name);
+    }
+    stripped
+}
+
+/// The `portable_pty` twin of [`scrub_worker_secrets_cmd`]; call it before the launch's own env is
+/// applied, since a `CommandBuilder` cannot tell inherited from explicit values.
+pub(crate) fn scrub_worker_secrets_pty(
+    builder: &mut portable_pty::CommandBuilder,
+    enabled: bool,
+    keep: Option<&[String]>,
+    ambient: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let stripped = names_to_strip(enabled, keep, BTreeSet::new(), ambient);
+    for name in &stripped {
+        builder.env_remove(name);
     }
     stripped
 }
@@ -173,6 +198,22 @@ mod tests {
         let mut undeclared = Command::new("agent");
         assert!(scrub_worker_secrets_cmd(&mut undeclared, true, None, parent_env()).is_empty());
         assert!(removed(&undeclared).is_empty());
+    }
+
+    #[test]
+    fn pty_builder_loses_secrets_but_keeps_the_harness_credential() {
+        let mut builder = portable_pty::CommandBuilder::new("agent");
+        builder.env("MY_SERVICE_PASSWORD", "x");
+        builder.env("ANTHROPIC_API_KEY", "k");
+        let keep = vec!["ANTHROPIC_API_KEY".to_string()];
+        let env = vec![
+            "MY_SERVICE_PASSWORD".to_string(),
+            "ANTHROPIC_API_KEY".to_string(),
+        ];
+        let stripped = scrub_worker_secrets_pty(&mut builder, true, Some(&keep), env);
+        assert_eq!(stripped, vec!["MY_SERVICE_PASSWORD".to_string()]);
+        assert!(builder.get_env("MY_SERVICE_PASSWORD").is_none());
+        assert!(builder.get_env("ANTHROPIC_API_KEY").is_some());
     }
 
     #[test]

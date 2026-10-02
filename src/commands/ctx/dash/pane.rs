@@ -1123,6 +1123,24 @@ impl Pane {
         command.cwd(cwd);
 
         sessions::scrub_supervision_env(&mut command);
+        {
+            let stripped = scrub_worker_pane_env(&mut command, role, repo, &agent_name);
+            if !stripped.is_empty() {
+                let _ = super::super::log::append(
+                    state,
+                    &super::super::log::Decision {
+                        ts: super::super::state::now_secs(),
+                        session: &session_id,
+                        verb: "pane",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "scrub-env",
+                        detail: &format!("withheld from worker: {}", stripped.join(", ")),
+                        observed_at: None,
+                    },
+                );
+            }
+        }
         // Derive launch mode from the same environment given to the child (#160).
         let launch_mode = if turn_env.iter().any(|(k, v)| {
             k == super::super::adapters::LAUNCH_MODE_ENV
@@ -2885,9 +2903,77 @@ impl Pane {
     }
 }
 
+/// Strip secret-shaped env from a Worker pane's child; an orchestrator or operator pane is untouched.
+/// A config or adapter that cannot be loaded leaves the env as it was rather than blocking the spawn.
+fn scrub_worker_pane_env(
+    command: &mut CommandBuilder,
+    role: PromptRole,
+    repo: &Path,
+    agent_name: &str,
+) -> Vec<String> {
+    if role != PromptRole::Worker {
+        return Vec::new();
+    }
+    let env = super::super::config::env_from_process();
+    let Ok(cfg) = super::super::config::CtxConfig::load(repo, &env) else {
+        return Vec::new();
+    };
+    let Ok(adapter) = super::super::adapters::select(Some(agent_name), &[], &cfg) else {
+        return Vec::new();
+    };
+    scrub_pane_env_with(
+        command,
+        role,
+        cfg.sandbox.scrub_worker_secrets,
+        adapter.credential_env(&env).as_deref(),
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    )
+}
+
+fn scrub_pane_env_with(
+    command: &mut CommandBuilder,
+    role: PromptRole,
+    enabled: bool,
+    keep: Option<&[String]>,
+    ambient: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    if role != PromptRole::Worker {
+        return Vec::new();
+    }
+    sessions::secret_env::scrub_worker_secrets_pty(command, enabled, keep, ambient)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_worker_pane_loses_secret_env() {
+        let keep = vec!["ANTHROPIC_API_KEY".to_string()];
+        let env = || {
+            vec![
+                "MY_SERVICE_PASSWORD".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+            ]
+        };
+        let builder = || {
+            let mut b = CommandBuilder::new("agent");
+            b.env("MY_SERVICE_PASSWORD", "x");
+            b.env("ANTHROPIC_API_KEY", "k");
+            b
+        };
+        let mut worker = builder();
+        let stripped =
+            scrub_pane_env_with(&mut worker, PromptRole::Worker, true, Some(&keep), env());
+        assert_eq!(stripped, vec!["MY_SERVICE_PASSWORD".to_string()]);
+        assert!(worker.get_env("MY_SERVICE_PASSWORD").is_none());
+        assert!(worker.get_env("ANTHROPIC_API_KEY").is_some());
+        for role in [PromptRole::Orchestrator, PromptRole::Single] {
+            let mut seat = builder();
+            assert!(scrub_pane_env_with(&mut seat, role, true, Some(&keep), env()).is_empty());
+            assert!(seat.get_env("MY_SERVICE_PASSWORD").is_some());
+        }
+    }
 
     /// #681: a lifecycle hook files a session's conversation marker under its
     /// socket's file stem. The staged successor's socket must therefore carry
