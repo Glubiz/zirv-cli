@@ -887,6 +887,18 @@ fn run_dashboard_inner(
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
             // Run the one-shot report reminder on the mail sweep cadence (#115).
             report_back_reminder_sweep(&mut panes, state, &mut errors);
+            let slug = super::state::repo_slug(repo);
+            for pane in &mut panes {
+                report_idle_unread_mail(
+                    pane,
+                    state,
+                    cfg,
+                    &slug,
+                    &mut errors,
+                    &mut notices,
+                    super::state::now_secs(),
+                );
+            }
         }
         // Dash refresh PR2: the JEV sidebar section, on its own coarser
         // cadence -- never the render path, never `FACTS_THROTTLE` either

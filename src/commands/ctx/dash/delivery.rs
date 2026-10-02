@@ -770,6 +770,31 @@ pub(super) fn report_stalled_compaction(
     errors: &mut ErrorLog,
     now: u64,
 ) {
+    report_stalled_compaction_with(pane, state, cfg, errors, now, |pane| {
+        let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
+        let path = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(pane.session_id()),
+            cwd: pane.cwd().to_path_buf(),
+        });
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        Some(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs(),
+        )
+    });
+}
+
+/// `transcript_mtime` is the pane's transcript last-write time in unix seconds, a seam for tests (#829).
+pub(super) fn report_stalled_compaction_with(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    now: u64,
+    transcript_mtime: impl FnOnce(&Pane) -> Option<u64>,
+) {
     if pane.stalled_mail_sent || matches!(pane.state(), PaneState::Ended(_)) {
         return;
     }
@@ -779,6 +804,10 @@ pub(super) fn report_stalled_compaction(
         || super::attention::project_at(&status, now, threshold)
             != super::attention::Projection::Blocked(super::attention::Attention::Stalled)
     {
+        return;
+    }
+    // A transcript written within the fuse means the session is working through a silent command.
+    if transcript_mtime(pane).is_some_and(|mtime| now.saturating_sub(mtime) < threshold) {
         return;
     }
     let reason = super::attention::reason_at(&status, now, threshold);
@@ -810,6 +839,55 @@ pub(super) fn report_stalled_compaction(
     );
     if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
         push_error(errors, format!("stalled report: {error}"));
+    }
+}
+
+/// Seconds an idle pane may hold unread mail before the operator is told (#829).
+const UNREAD_MAIL_IDLE_SECS: u64 = 600;
+
+/// Raise one notice (and mail the supervisor) when an idle pane has left mail unread past [`UNREAD_MAIL_IDLE_SECS`] (#829).
+pub(super) fn report_idle_unread_mail(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    slug: &str,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: u64,
+) {
+    if !cfg.mail.enabled || matches!(pane.state(), PaneState::Ended(_)) {
+        return;
+    }
+    let idle = matches!(
+        super::attention::project(&super::attention::load(state, pane.short())),
+        super::attention::Projection::IdleSeen | super::attention::Projection::DoneUnread
+    );
+    let oldest = idle
+        .then(|| mail::list(state, slug, Some(pane.agent()), Some(pane.short())).ok())
+        .flatten()
+        .and_then(|found| found.iter().map(|(_, msg)| msg.sent).min());
+    let Some(sent) = oldest else {
+        pane.unread_mail_notice_sent = false;
+        return;
+    };
+    let waiting_secs = now.saturating_sub(sent);
+    if pane.unread_mail_notice_sent || waiting_secs < UNREAD_MAIL_IDLE_SECS {
+        return;
+    }
+    pane.unread_mail_notice_sent = true;
+    let body = format!(
+        "pane {} ({}, {}) is idle with mail unread for {} min",
+        pane.short(),
+        pane.agent(),
+        pane.cwd().display(),
+        waiting_secs / 60,
+    );
+    push_notice(notices, Instant::now(), format!("zirv \u{25b8} {body}"));
+    let Some(recipient) = pane.report_to().map(str::to_string) else {
+        return;
+    };
+    if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
+        push_error(errors, format!("unread mail report: {error}"));
     }
 }
 
@@ -3009,6 +3087,128 @@ mod tests {
             "got {}",
             super::super::attention::reason(&status)
         );
+        assert!(errors.entries.is_empty(), "{:?}", errors.entries);
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #829: a compaction past the fuse is a stall only when the session's transcript has also gone quiet.
+    #[test]
+    fn a_growing_transcript_suppresses_the_stalled_compaction_notice_a_static_one_does_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-666666666666",
+        );
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        let started = 100_000_u64;
+        super::super::attention::record(
+            &state,
+            pane.short(),
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "compaction started",
+                100,
+                started,
+            )
+            .with_attention(super::super::attention::Attention::Compacting),
+            started,
+        );
+        let now = started + cfg.supervise.compact_stall_secs + 480;
+        let mut errors = ErrorLog::default();
+
+        let written_a_minute_ago = |_: &Pane| Some(now - 60);
+        report_stalled_compaction_with(
+            &mut pane,
+            &state,
+            &cfg,
+            &mut errors,
+            now,
+            written_a_minute_ago,
+        );
+        assert!(!pane.stalled_mail_sent, "a working session is not stalled");
+
+        let static_for_an_hour = |_: &Pane| Some(now - 3600);
+        report_stalled_compaction_with(
+            &mut pane,
+            &state,
+            &cfg,
+            &mut errors,
+            now,
+            static_for_an_hour,
+        );
+        assert!(pane.stalled_mail_sent);
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #829: an idle pane holding old unread mail raises exactly one notice, not one per sweep.
+    #[test]
+    fn an_idle_pane_with_old_unread_mail_raises_one_notice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-777777777777",
+        );
+        let slug = super::super::state::repo_slug(tmp.path());
+        let sent = 100_000_u64;
+        super::super::attention::record(
+            &state,
+            pane.short(),
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "turn settled",
+                100,
+                sent,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Settled),
+            sent,
+        );
+        mail::store_to(
+            &state,
+            &slug,
+            &slug,
+            &mail::Message {
+                from_session: "aaaa1111".to_string(),
+                from_agent: "claude".to_string(),
+                to: "any".to_string(),
+                to_session: Some(pane.short().to_string()),
+                sent,
+                body: "ping".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+        let mut errors = ErrorLog::default();
+        let mut notices = Vec::new();
+
+        report_idle_unread_mail(
+            &mut pane,
+            &state,
+            &cfg,
+            &slug,
+            &mut errors,
+            &mut notices,
+            sent + UNREAD_MAIL_IDLE_SECS - 1,
+        );
+        assert!(notices.is_empty(), "mail younger than the fuse is normal");
+        for _ in 0..3 {
+            report_idle_unread_mail(
+                &mut pane,
+                &state,
+                &cfg,
+                &slug,
+                &mut errors,
+                &mut notices,
+                sent + UNREAD_MAIL_IDLE_SECS + 60,
+            );
+        }
+        assert_eq!(notices.len(), 1, "one notice, not one per sweep");
+        assert!(notices[0].text.contains("idle with mail unread for 11 min"));
         assert!(errors.entries.is_empty(), "{:?}", errors.entries);
         pane.finish_shutdown().expect("shutdown");
     }

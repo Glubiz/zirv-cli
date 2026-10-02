@@ -727,6 +727,8 @@ pub struct Pane {
     pub(crate) settled_mail_sent: bool,
     /// Send at most one stalled-compaction mail per logical pane (#379).
     pub(crate) stalled_mail_sent: bool,
+    /// Send one idle-with-unread-mail notice per unread episode (#829).
+    pub(crate) unread_mail_notice_sent: bool,
     /// Pair attention-blocked mail with its specific message ID for later delivery logging (#468).
     pub(crate) mail_block_log: Option<(&'static str, String)>,
     pub(crate) result_schema: Option<String>,
@@ -1032,6 +1034,7 @@ impl Pane {
             report_reminder_sent: false,
             settled_mail_sent: false,
             stalled_mail_sent: false,
+            unread_mail_notice_sent: false,
             mail_block_log: None,
             result_schema: None,
             pending_submit: None,
@@ -1292,6 +1295,7 @@ impl Pane {
             report_reminder_sent: false,
             settled_mail_sent: false,
             stalled_mail_sent: false,
+            unread_mail_notice_sent: false,
             mail_block_log: None,
             result_schema: turn_env
                 .iter()
