@@ -185,13 +185,14 @@ impl<'a> Model<'a> {
             (true, _) => 1,
             (_, Mark::Running) => 0,
             (_, Mark::Failed) => 2,
-            (_, Mark::Done) => 4,
+            (_, Mark::Idle) => 4,
+            (_, Mark::Done) => 5,
             _ => 3,
         };
         let mut agents = std::mem::take(&mut model.agents);
         agents.sort_by_key(|a| {
             let rank = rank(&model, a.node);
-            let newest = if rank == 4 {
+            let newest = if rank >= 4 {
                 a.node.ended_at.or(a.node.started_at).unwrap_or(0)
             } else {
                 0

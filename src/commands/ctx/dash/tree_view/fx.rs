@@ -139,7 +139,7 @@ impl Motion {
         let mut flash = false;
         if rev != self.seen_rev || !seeded {
             for node in data.nodes.iter().filter(|n| n.kind != "group") {
-                let done = Mark::of(&node.status) == Mark::Done;
+                let done = matches!(Mark::of(&node.status), Mark::Done | Mark::Idle);
                 match seen.nodes.insert(node.id.clone(), done) {
                     None if seeded && !done => dispatched.push(node.id.clone()),
                     Some(false) if done && seeded => finished.push(node.id.clone()),
