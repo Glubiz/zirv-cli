@@ -1655,12 +1655,17 @@ mod tests {
             // `testenv::scrub_supervision_env_for_test_cmd`'s own doc comment
             // for why this is a test-side scrub, not an extended production one.
             crate::commands::ctx::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
+            // Same as the unix harness: the sandbox posture's `Read(./**)`-style rules carry
+            // cmd.exe metacharacters, which `guard_cmd_shim_reparse` refuses behind `cmd /c`.
+            cmd.env("ZIRV_CTX_PACE", "false");
+            cmd.env("ZIRV_CTX_SANDBOX", "false");
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::null());
             // A file, not a pipe: like NUL it is not a console, and it cannot fill and block the wrapper.
+            std::fs::create_dir_all(state).expect("state dir");
             let log = std::fs::File::create(stderr_log(state)).expect("stderr log");
             cmd.stderr(log);
             // Keep the developer's real ~/.zirv/ctx.toml out of the run.
@@ -1727,7 +1732,9 @@ mod tests {
                 // Long enough to still be running when the assertion below
                 // looks for the socket entry, short enough to reap itself if
                 // the kill somehow misses.
-                &["cmd", "/c", "ping -n 20 127.0.0.1"],
+                // `--agent claude` makes wrap append adapter flags after this
+                // command, which `ping` would reject and exit; `rem` swallows them.
+                &["cmd", "/c", "ping -n 20 127.0.0.1 >nul & rem"],
             );
 
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1756,13 +1763,26 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            let early_exit = child.try_wait().ok().flatten();
             let _ = child.kill();
             let _ = child.wait();
 
+            fn listing(dir: &std::path::Path, out: &mut Vec<String>) {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    out.push(entry.path().display().to_string());
+                    if entry.path().is_dir() {
+                        listing(&entry.path(), out);
+                    }
+                }
+            }
+            let mut tree = Vec::new();
+            listing(&state, &mut tree);
             assert_eq!(
                 sockets.len(),
                 1,
-                "a supervised wrap publishes exactly one turn-signal endpoint"
+                "a supervised wrap publishes exactly one turn-signal endpoint; \
+                 wrap exited early: {early_exit:?}; state dir: {tree:#?}; wrap stderr: {}",
+                wrap_stderr(&state)
             );
             let published = std::fs::read_to_string(&sockets[0]).expect("read");
             assert!(

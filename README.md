@@ -788,6 +788,39 @@ prints the full decision. `zirv ctx chat --proxy` / `--no-proxy` overrides
 `cfg.proxy.enabled` for one launch; `--resume` and `--simple` always skip the
 proxy.
 
+**Operator overrides.** `zirv ctx chat` and `zirv ctx proxy` accept
+`--execution direct|bounded|orchestrated`, `--tier cheap|standard|deep|frontier`
+and `--validation review,test,security` (or `none`) to override the derived
+profile for that one launch. They are flags only, never config keys, so a
+checkout cannot set them. Raising is always honoured; lowering stops at the hard
+floor (a high-risk or security request cannot go below `bounded`, cannot drop
+the review or security gate, and cannot lower the tier below its derived value),
+and each refusal is named in the decision's `reasons`. A headless launch still
+ends on a single seat. The applied override is recorded as `operator_override`
+on the `proxy-decisions.jsonl` row.
+
+**Single-seat validation.** A single seat has no reviewer or tester seat, so when
+its profile asks for review, test or security validation the `[zirv proxy]`
+layer carries one `validate:` line telling it to run the targeted tests, re-read
+its own diff and flag security assumptions before reporting done. This is
+advice only; no hook blocks completion. Bounded bug fixes and small features
+stay single-seat; `workflow.auto_start = detect` can still start a workflow for
+them.
+
+**Per-seat profile store.** The final decision (with its override and started
+workflow) is also written to `<state>/proxy-profile/<seat short id>.json`. A
+rollover or handover successor keeps the seat's short id, so the successor's
+handoff prompt re-renders the same `[zirv proxy]` layer from that file
+(unless its base prompt already carries one). A missing, corrupt or old-format
+file is skipped.
+
+**`zirv ctx proxy stats [--json]`** is read-only. It groups the stored
+profiles by `intent/complexity` and reports, in tokens only (no dollars), the
+median seat input, output and cache tokens from the seat transcript, the
+tokens of `zirv agent` delegations whose parent is that seat, and the
+verified-pass rate of the last attributable build/test run in the seat
+transcript. A class with no verification record prints quality as unavailable.
+
 **Headless single seat.** A headless launch works unattended — nobody is
 watching the seat, so it must never be told it is an orchestrator: zirv's own
 rule for a worker is "runs unattended and must not delegate further". Pass
@@ -1197,7 +1230,8 @@ to the section that documents it in depth.
   delegates one task to a supervised worker on another enabled harness
   (also `zirv agent`); `proxy` decides a request's intent, complexity, risk
   and workflow before a launch, so the seat, model and workflow fit the task
-  (opt-in, see [Harness proxy](#harness-proxy)). See [Verbs](#verbs) and
+  (opt-in; `proxy stats` reports per-class token cost and verified-pass rate, see
+  [Harness proxy](#harness-proxy)). See [Verbs](#verbs) and
   [Just Run `zirv`](#just-run-zirv).
 - **Experimental: `native`** — a thin, case-insensitive top-level alias
   (`zirv native`) for `zirv chat --runtime native`, reserved so a script or
@@ -3160,7 +3194,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx provider init\|list\|check\|credential set` | Coming soon; native provider setup is unavailable in this release |
 | `zirv ctx chat [--pin-harness] [--proxy\|--no-proxy]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat. `--proxy`/`--no-proxy` overrides `cfg.proxy.enabled` for this launch — see [Harness proxy](#harness-proxy); skipped with `--resume` or `--simple`. `--runtime native` reports coming soon and refuses to start — see [The native conversation pane](#the-native-conversation-pane) |
 | `zirv ctx agent <name> <prompt> [--name <label>] [--manifest <path>] [--worktree] [--worktree-reuse] [--workspace <name>] [--goal <text>]` | Delegates one task to a supervised worker on another enabled harness — a dashboard pane when one is live, otherwise inline in this terminal; workflow reviewers run inline because their caller must consume completed review evidence synchronously. A selected declarative workspace is fully prepared before either path launches; `--runtime native` reports coming soon and refuses to start (also `zirv agent`). `--manifest` resolves a YAML file's `brief`/`agent`/`task`/`group`/`workdir`/`mode`/`budget_tokens`/`max_tool_calls`/`path_scope`/`no_network`/`result` into the same launch instead of typing each one; `agent` contributes default skills and read-only/capability floors. Untrusted manifest input can only narrow: a field it shares with an explicit CLI flag is a hard error on disagreement, except narrowing-capable fields, where the stricter value wins. `--worktree --worktree-reuse` (issue #718, opt-in, default off) tries the warm pool first: an `Idle` tree from a prior reuse allocation whose base commit and ordered `[[workspace]].setup` list digest the same is reset to that base and reused with its untracked build cache intact. A digest mismatch or proof refusal falls back to a cold worktree; matched setup receipts retain the same checkout identity and resume only unchanged successful steps. On release, eligible trees remain `Idle` up to `[worktree] idle_pool_max`; `[worktree] idle_ttl_secs` expires them through proof-required GC/reconcile. `--goal` forces an inline launch and first runs one bounded, depth-zero environment-preparation bootstrap in the selected checkout; it must exit zero and report explicit `Done` JSON before the main worker may start. The bootstrap uses the operator's configured Fast tier when present, otherwise leaves model selection to the harness. A read-only worker (`--mode read-only`, a read-only manifest, a workflow reviewer or a read-only dashboard spawn) fails closed: when the chosen harness has no enforced read-only floor for its launch mode, the launch is refused up front naming the harnesses that can enforce it, and automatic harness rerouting skips harnesses without a floor. |
-| `zirv ctx proxy [--json] [REQUEST]` | Runs the harness-proxy intake decision and prints it without launching anything; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
+| `zirv ctx proxy [--json] [--headless] [--execution MODE] [--tier TIER] [--validation GATES] [REQUEST]` / `zirv ctx proxy stats [--json]` | Runs the harness-proxy intake decision and prints it without launching anything (the override flags preview `zirv ctx chat`'s); `stats` reports per-task-class token cost and verified-pass rate; reads `REQUEST` from stdin when omitted and stdin is not a tty; `--json` prints the full decision — see [Harness proxy](#harness-proxy) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
@@ -3171,6 +3205,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo <dir>]` | Measurement only: asks one Jev site's real production question(s) for a fixture input `K` times (1..=20) with the cache disabled, applies that site's production floor and answer-to-action rule, and prints what production would have DONE on each rep — spends real Jev calls and writes the normal decision/spend log rows, never any other side effect — see [Measuring floor determinism](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
 
@@ -3585,20 +3620,36 @@ running workflow's status -- all three rendered through the exact same
 (issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
 can never disagree about the same state. `/settings` opens a searchable,
 keyboard-only list of every configuration key (name, effective value, winning
-layer, scopes `U`ser/`P`roject, reload timing) with a one-line
-detail footer; type to filter, `Up`/`Down` move, `Enter` edits the focused
-row, `Tab` cycles its scope, `Ctrl+R` resets it to the inherited value,
-`Esc` cancels and then closes. `/settings <query>` opens the list filtered,
-`/settings get <key>`, `/settings set <key> <value> [--scope user|project]`
-and `/settings reset <key> [--scope ...]` print one notice instead. It is
+layer, scopes `U`ser/`P`roject/`S`ession, reload timing) with a detail footer
+that also shows the built-in default (`(unset)` for a key with no default,
+`false` and `0` shown as such); type to filter, `Up`/`Down` move,
+`Tab`/`Shift+Tab` (or `PageDown`/`PageUp`) jump to the next/previous top-level
+section, `Enter` edits the focused row, `Tab` inside the editor cycles its
+scope, `Ctrl+R` resets it to the inherited value (or removes a session
+override), `Esc` cancels and then closes. `/settings <query>` opens the list
+filtered, `/settings get <key>`,
+`/settings set <key> <value> [--scope session|user|project]` and
+`/settings reset <key> [--scope ...]` print one notice instead. It is
 zirv control input: never journaled, never sent to the model. User-scope
 writes go through the exact validated, comment-preserving, atomic edit
 `zirv ctx config set` uses (and are refused when the file changed since it was
 read); project scope writes `<repo>/.zirv/ctx.toml` only for keys a repository
 may set and only when the value narrows, refusing before anything is written;
-there is no session scope yet. Credential-like keys render as
-`(redacted)` and are never accepted. No key is known to reload live, so every
-row says `next session` and a write never claims otherwise. `@` file references and a
+Credential-like keys render as `(redacted)` and are never accepted.
+Session scope is an in-memory override held by that pane: it is journaled as a
+control event (key and non-secret value, never a user turn), replayed from the
+journal when the pane resumes, and never written to a file. Only keys the pane
+re-reads on every record refresh (`fallback.enabled`, `fallback.health.enabled`,
+`fallback.unknown_headroom_pct`, which feed the pane's pool view) offer it and
+say `pane view only; delegations and turns: next session`: the override changes
+what that pane displays, while delegations, turns and the run loop load their
+own config and pick the key up next session. Every other key says `next session`
+and a session edit of one is refused with that reason. A saved (user or project)
+write is never live, because the dashboard loads its config once.
+`zirv ctx config get <key> [--json]` prints the same effective value, default,
+source and reload timing as `/settings get` for the same key (project layer from the
+current directory), and `zirv ctx config show [key] --json` prints the stored
+operator file as JSON; there is no session scope on the command line. `@` file references and a
 `!`-prefixed shell line are not wired into this loop yet.
 
 `--runtime native` is **not** a separate dashboard any more: the native
@@ -4967,7 +5018,7 @@ keep only your own.
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
-| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
+| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |

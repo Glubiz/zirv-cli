@@ -312,6 +312,26 @@ jobs:
               || { echo "filter $filter matched no tests" >&2; exit 1; }
           done
 
+      # Issues #641 and #635: neither failure has ever run on a Windows
+      # runner, so run both here with --nocapture and the in-test
+      # diagnostics. Same stale-filter guard as the steps above, and
+      # !cancelled() so a failure earlier in the job does not hide them.
+      - name: Verify Windows Wrap And MCP Cancellation
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: bash
+        run: |
+          set +e -uo pipefail
+          for name in $(env | grep -o '^ZIRV_[A-Za-z0-9_]*' || true); do unset "$name"; done
+          status=0
+          for filter in \
+            commands::ctx::wrap::tests::win:: \
+            a_mid_flight_cancellation_of_a_stdio_call_is_observed_promptly_and_still_notifies_the_server; do
+            cargo test --bin zirv "$filter" -- --test-threads=1 --nocapture 2>&1 | tee result.txt
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+              || { echo "filter $filter failed or matched no tests" >&2; status=1; }
+          done
+          exit "$status"
+
       # The parity matrix is a release gate, so it is checked where the
       # release is built, on every OS: ZCHK-NATIVE-PARITY reads
       # docs/design/native-parity.md against the runtime inventory and the

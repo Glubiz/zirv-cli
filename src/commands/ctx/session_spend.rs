@@ -119,7 +119,11 @@ pub fn resolve_transcript(state: &StateDir, session_short: &str) -> Option<PathB
         id: SessionId::parse(&record.session),
         cwd: record.repo,
     };
-    Some(claude.transcript_path(&session_ref))
+    Some(adapters::claude::session_transcript(
+        &claude,
+        state,
+        &session_ref,
+    ))
 }
 
 /// Reads `transcript`'s own assistant rows plus every native subagent

@@ -141,6 +141,32 @@ impl SettingsState {
             .copied()
     }
 
+    /// Jump to the first row of the next (or, from inside a section, the current/previous) top-level
+    /// section of the filtered list, the first key segment being the section.
+    fn jump_section(&mut self, forward: bool) {
+        let rows = self.filtered();
+        let section = |index: usize| rows[index].key.split('.').next().unwrap_or("");
+        let selected = self.selected.min(rows.len().saturating_sub(1));
+        if rows.is_empty() {
+            return;
+        }
+        let first_of = |mut index: usize| {
+            while index > 0 && section(index - 1) == section(index) {
+                index -= 1;
+            }
+            index
+        };
+        self.selected = if forward {
+            (selected + 1..rows.len())
+                .find(|&index| section(index) != section(selected))
+                .unwrap_or(selected)
+        } else if first_of(selected) < selected {
+            first_of(selected)
+        } else {
+            first_of(selected.saturating_sub(1))
+        };
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let count = self.filtered().len();
         self.selected = self
@@ -163,6 +189,8 @@ impl SettingsState {
             KeyCode::Esc => return SettingsAction::Close,
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
+            KeyCode::Tab | KeyCode::PageDown => self.jump_section(true),
+            KeyCode::BackTab | KeyCode::PageUp => self.jump_section(false),
             KeyCode::Enter => {
                 let Some(row) = self.selected_row() else {
                     return SettingsAction::None;
@@ -184,9 +212,14 @@ impl SettingsState {
                     self.message = Some(format!("{} cannot be edited here", row.key));
                     return SettingsAction::None;
                 }
+                let scope = if row.source == "session" {
+                    Scope::Session
+                } else {
+                    Scope::User
+                };
                 return SettingsAction::Reset {
                     key: row.key.clone(),
-                    scope: Scope::User,
+                    scope,
                 };
             }
             KeyCode::Char(ch) if !ctrl => {
@@ -324,7 +357,9 @@ impl SettingsState {
         out.extend(detail.iter().map(|line| boxed(line)));
         out.push(rule);
         let hint = match self.mode {
-            Mode::List => "type to filter  Up/Down move  Enter edit  Ctrl+R reset  Esc close",
+            Mode::List => {
+                "type to filter  Up/Down move  Tab/Shift+Tab section  Enter edit  Ctrl+R reset  Esc close"
+            }
             Mode::Edit { .. } => "Enter save  Tab scope  Ctrl+R reset to inherited  Esc cancel",
         };
         out.extend(wrap(hint, inner).iter().map(|line| boxed(line)));
@@ -336,7 +371,10 @@ impl SettingsState {
         let Some(row) = rows.get(selected) else {
             return vec![String::new()];
         };
-        let mut out = vec![format!("{}  ({}, default: built-in)", row.key, row.kind)];
+        let mut out = vec![format!(
+            "{}  ({}, default: {})",
+            row.key, row.kind, row.default
+        )];
         match &self.mode {
             Mode::List => {
                 out.extend(wrap(&row.description, inner));
@@ -362,13 +400,27 @@ impl SettingsState {
                 };
                 out.extend(wrap(
                     &format!(
-                        "scope:  {}   {}",
+                        "scope:  {}   {}   {}",
                         radio(Scope::User, "user ~/.zirv/ctx.toml"),
                         radio(Scope::Project, "project (narrows only)"),
+                        radio(Scope::Session, "session (this pane)"),
                     ),
                     inner,
                 ));
-                out.extend(wrap(&format!("applies: {APPLIES}"), inner));
+                if !row.scopes.contains(&Scope::Session) {
+                    let why = if row.sensitive {
+                        "a credential"
+                    } else {
+                        "applies next session"
+                    };
+                    out.extend(wrap(&format!("session scope refused: {why}"), inner));
+                }
+                let applies = if *scope == Scope::Session {
+                    "this pane's view only, never saved; delegations and turns: next session"
+                } else {
+                    APPLIES
+                };
+                out.extend(wrap(&format!("applies: {applies}"), inner));
             }
         }
         if let Some(locked) = &row.locked {
@@ -390,6 +442,7 @@ mod tests {
             key: key.to_string(),
             kind,
             value: value.to_string(),
+            default: if kind == "bool" { "false" } else { "600" }.to_string(),
             source,
             scopes: vec![Scope::User, Scope::Project],
             applies: APPLIES,
@@ -509,6 +562,82 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("cannot be edited")
+        );
+    }
+
+    #[test]
+    fn tab_and_shift_tab_jump_between_top_level_sections() {
+        let mut state = SettingsState::new(rows(), "");
+        let key = |state: &SettingsState| state.selected_row().unwrap().key.clone();
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(
+            key(&state),
+            "pace.enabled",
+            "back from inside a section goes to its start"
+        );
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(key(&state), "memory.enabled");
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(
+            key(&state),
+            "memory.enabled",
+            "no section after the last one"
+        );
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(key(&state), "pace.enabled");
+        press(&mut state, KeyCode::PageDown);
+        assert_eq!(key(&state), "memory.enabled");
+        press(&mut state, KeyCode::PageUp);
+        assert_eq!(key(&state), "pace.enabled");
+    }
+
+    #[test]
+    fn session_scope_is_selectable_only_where_offered_and_resets_a_session_override() {
+        let mut live = row("fallback.enabled", "bool", "false", "session");
+        live.scopes = vec![Scope::User, Scope::Project, Scope::Session];
+        let mut state = SettingsState::new(vec![live.clone()], "");
+        assert_eq!(
+            ctrl(&mut state, 'r'),
+            SettingsAction::Reset {
+                key: "fallback.enabled".into(),
+                scope: Scope::Session
+            }
+        );
+        press(&mut state, KeyCode::Enter);
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Tab);
+        let footer = state.lines(120, 20).join("\n");
+        assert!(footer.contains("(o) session (this pane)"), "{footer}");
+        assert!(
+            footer.contains("this pane's view only, never saved"),
+            "{footer}"
+        );
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            SettingsAction::Save {
+                key: "fallback.enabled".into(),
+                raw: "true".into(),
+                scope: Scope::Session
+            }
+        );
+        let mut state = SettingsState::new(rows(), "pace.enabled");
+        press(&mut state, KeyCode::Enter);
+        let footer = state.lines(120, 20).join("\n");
+        assert!(footer.contains("[n/a] session (this pane)"), "{footer}");
+        assert!(
+            footer.contains("session scope refused: applies next session"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn the_footer_shows_the_built_in_default_not_a_placeholder() {
+        let state = SettingsState::new(rows(), "pace.enabled");
+        let footer = state.lines(120, 20).join("\n");
+        assert!(
+            footer.contains("pace.enabled  (bool, default: false)"),
+            "{footer}"
         );
     }
 

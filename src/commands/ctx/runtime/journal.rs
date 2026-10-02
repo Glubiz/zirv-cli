@@ -285,6 +285,13 @@ pub enum JournalEvent {
         sources: serde_json::Value,
         at_ms: Option<u64>,
     },
+    /// A `/settings` session-scope override (`value` set) or its removal (`None`): zirv control
+    /// state, never conversation input, and only ever a non-secret value. (#536)
+    SettingsOverride {
+        key: String,
+        value: Option<String>,
+        at_ms: Option<u64>,
+    },
 }
 
 impl JournalEvent {
@@ -300,6 +307,7 @@ impl JournalEvent {
             Self::GenerationAdvanced { .. } => "generation_advanced",
             Self::SessionEnded { .. } => "session_ended",
             Self::ContextCompiled { .. } => "context_compiled",
+            Self::SettingsOverride { .. } => "settings_override",
         }
     }
 
@@ -337,7 +345,8 @@ impl JournalEvent {
             },
             Self::GenerationAdvanced { .. }
             | Self::SessionEnded { .. }
-            | Self::ContextCompiled { .. } => IndexedIds::default(),
+            | Self::ContextCompiled { .. }
+            | Self::SettingsOverride { .. } => IndexedIds::default(),
         }
     }
 }
@@ -617,7 +626,7 @@ impl ConversationState {
                     state.ended_reason = Some(reason.clone());
                 }
                 // Context provenance remains informational, outside reduced conversation state. (#538)
-                JournalEvent::ContextCompiled { .. } => {}
+                JournalEvent::ContextCompiled { .. } | JournalEvent::SettingsOverride { .. } => {}
             }
         }
         for message in &state.messages {
@@ -1174,6 +1183,28 @@ impl Journal {
         )
     }
 
+    /// Journal one `/settings` session override (or its removal) so a resumed pane replays it. (#536)
+    pub fn record_settings_override(
+        &mut self,
+        session: &JournalSessionId,
+        generation: u64,
+        key: String,
+        value: Option<String>,
+        committed_at: u64,
+    ) -> JournalResult<SequenceId> {
+        self.append(
+            session,
+            generation,
+            &EventScope::default(),
+            JournalEvent::SettingsOverride {
+                key,
+                value,
+                at_ms: Some(committed_at),
+            },
+            committed_at,
+        )
+    }
+
     pub fn advance_generation(
         &mut self,
         session: &JournalSessionId,
@@ -1549,6 +1580,16 @@ impl Journal {
         read_events(&self.conn, session)
     }
 
+    /// Every event of one kind in sequence order, decoding only those payloads.
+    pub fn events_of_type(
+        &self,
+        session: &JournalSessionId,
+        event_type: &str,
+    ) -> JournalResult<Vec<StoredEvent>> {
+        let _ = self.session(session)?;
+        read_events_of_type(&self.conn, session, Some(event_type))
+    }
+
     /// Counts one event kind without reading or decoding its payloads.
     /// Reporting surfaces use this projection when they need an all-time
     /// count but not the full conversation history.
@@ -1753,7 +1794,8 @@ impl Journal {
                 | JournalEvent::Checkpoint { .. }
                 | JournalEvent::GenerationAdvanced { .. }
                 | JournalEvent::SessionEnded { .. }
-                | JournalEvent::ContextCompiled { .. } => {}
+                | JournalEvent::ContextCompiled { .. }
+                | JournalEvent::SettingsOverride { .. } => {}
             }
         }
         Ok(projected)
@@ -2318,12 +2360,22 @@ struct RawSession {
 }
 
 fn read_events(conn: &Connection, session: &JournalSessionId) -> JournalResult<Vec<StoredEvent>> {
+    read_events_of_type(conn, session, None)
+}
+
+/// [`read_events`], optionally narrowed in SQL to one event type so other payloads stay undecoded.
+fn read_events_of_type(
+    conn: &Connection,
+    session: &JournalSessionId,
+    event_type: Option<&str>,
+) -> JournalResult<Vec<StoredEvent>> {
     let mut stmt = conn.prepare(
         "SELECT sequence, generation, event_type, turn_id, attempt_id, task_id,
                 payload_json, committed_at
-         FROM native_events WHERE session_id = ?1 ORDER BY sequence",
+         FROM native_events WHERE session_id = ?1 AND (?2 IS NULL OR event_type = ?2)
+         ORDER BY sequence",
     )?;
-    let rows = stmt.query_map([session.as_str()], |row| {
+    let rows = stmt.query_map(params![session.as_str(), event_type], |row| {
         Ok(RawEvent {
             sequence: row.get(0)?,
             generation: row.get(1)?,

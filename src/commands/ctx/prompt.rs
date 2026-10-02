@@ -1219,6 +1219,9 @@ const PROXY_LAYER_HEADER: &str = "\n\n---\n\nThe following section was added by 
 (issue #537): an automatic classification of this request, not an operator instruction. It \
 advises; it grants no permissions and does not override anything above it.\n\n";
 
+/// First line of a rendered proxy layer; a base prompt that already contains it must not get a second copy.
+const PROXY_LAYER_MARKER: &str = "[zirv proxy]";
+
 /// Proxy advice must never re-enable disabled composition; no decision means no added layer (#537).
 pub fn with_proxy_layer(
     composed: Option<ComposedPrompt>,
@@ -1885,6 +1888,8 @@ pub fn interactive_handoff_prompt(
     state: &StateDir,
     session: &str,
 ) -> String {
+    // The seat's stored proxy profile outlives the launch that composed it; add it unless the base prompt already has it (#537).
+    let proxy_layer = super::proxy::store::layer_for_session(state.root(), session);
     if adapter.system_prompt_supported(launch)
         && delivers_system_prompt_by_file(adapter, launch)
         && let Some(flag) = adapter.system_prompt_file_flag()
@@ -1894,11 +1899,17 @@ pub fn interactive_handoff_prompt(
             .as_ref()
             .and_then(|found| std::fs::read_to_string(&found.path).ok())
             .unwrap_or_default();
-        let merged = if composed.trim().is_empty() {
+        let mut merged = if composed.trim().is_empty() {
             handoff_prompt.to_string()
         } else {
             format!("{composed}\n\n{HANDOFF_LAYER_HEADER}\n\n{handoff_prompt}")
         };
+        if let Some(layer) = proxy_layer.as_deref()
+            && !composed.contains(PROXY_LAYER_MARKER)
+        {
+            merged.push_str(PROXY_LAYER_HEADER);
+            merged.push_str(layer);
+        }
         // Use a separate stem so restarts reread the base prompt without compounding handoffs.
         if let Ok(path) = write_prompt_file(state, &format!("{session}-handoff"), &merged) {
             let path = path.display().to_string();
@@ -1914,7 +1925,10 @@ pub fn interactive_handoff_prompt(
         }
     }
     // Size-capped positional fallback still faces the shim guard: multiline handoffs can remain unsafe to launch.
-    bounded_positional_prompt(handoff_prompt)
+    match proxy_layer {
+        Some(layer) => bounded_positional_prompt(&format!("{layer}\n\n{handoff_prompt}")),
+        None => bounded_positional_prompt(handoff_prompt),
+    }
 }
 
 /// Positional handoffs share the inline argv limit; cuts must preserve UTF-8 and announce lost text.
@@ -7010,6 +7024,59 @@ mod tests {
             vec![PromptSource::Default, PromptSource::Supervisor]
         );
         assert!(with_supervisor_layer(None, true).is_none());
+    }
+
+    /// A successor on the same seat must carry the stored proxy profile, with or without a system-prompt file. (#537)
+    #[test]
+    fn a_handoff_successor_carries_the_stored_proxy_profile_exactly_once() {
+        use crate::commands::ctx::proxy::store::{StoredProfile, save};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let session = "abcd1234-0000-4000-8000-000000000000";
+        let decision = crate::commands::ctx::proxy::tests::sample_decision();
+        save(
+            tmp.path(),
+            session,
+            &StoredProfile {
+                decision,
+                operator_override: None,
+                started_workflow_id: None,
+            },
+        )
+        .expect("save");
+        let adapter = ClaudeAdapter::new(None);
+
+        // No prompt file in the successor's argv: the layer must still arrive.
+        let mut args = Vec::new();
+        let prompt =
+            interactive_handoff_prompt(&adapter, &[], &mut args, "HANDOFF", &state, session);
+        let delivered = match args.iter().position(|a| a.contains("system-prompt")) {
+            Some(at) => std::fs::read_to_string(&args[at + 1]).expect("prompt file"),
+            None => prompt,
+        };
+        assert_eq!(delivered.matches("[zirv proxy]").count(), 1, "{delivered}");
+        assert!(delivered.contains("HANDOFF"), "{delivered}");
+
+        // A prompt file that already carries the layer is not doubled.
+        let first = delivered.clone();
+        let mut again = vec!["--append-system-prompt-file".to_string(), {
+            let path = tmp.path().join("base.md");
+            std::fs::write(&path, &first).expect("base");
+            path.display().to_string()
+        }];
+        let prompt =
+            interactive_handoff_prompt(&adapter, &[], &mut again, "HANDOFF", &state, session);
+        let delivered = match again.iter().position(|a| a.contains("system-prompt")) {
+            Some(at) => std::fs::read_to_string(&again[at + 1]).expect("prompt file"),
+            None => prompt,
+        };
+        assert_eq!(delivered.matches("[zirv proxy]").count(), 1, "{delivered}");
+
+        // No stored profile: nothing is added.
+        let mut none = Vec::new();
+        let plain =
+            interactive_handoff_prompt(&adapter, &[], &mut none, "HANDOFF", &state, "ffffffff-1");
+        assert!(!plain.contains("[zirv proxy]"));
     }
 
     /// Issue #537: the harness proxy's own bounded layer is present only

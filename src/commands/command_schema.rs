@@ -119,6 +119,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx score",
     "zirv ctx ask",
     "zirv ctx config show",
+    "zirv ctx config get",
     "zirv ctx status",
     "zirv ctx models",
     "zirv ctx mcp serve",
@@ -147,6 +148,8 @@ const READ_ONLY: &[&str] = &[
     // same "internal record, not a repo/process mutation" class `zirv ctx
     // optimize`'s own report above already sits in.
     "zirv ctx proxy",
+    // Per-class token and verified-pass report over stored profiles, delegations and transcripts; writes nothing.
+    "zirv ctx proxy stats",
     "zirv ctx savings",
     "zirv ctx snapshot",
     "zirv ctx search",

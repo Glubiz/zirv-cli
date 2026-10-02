@@ -165,6 +165,13 @@ pub fn run_session_start<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     // A fresh, resumed or post-compaction prompt proves work resumed;
     // replace stale attention with Working (#349).
     if let Ok(state) = StateDir::resolve(env) {
+        if let Some(zirv_session) = env(SESSION_ENV) {
+            crate::commands::ctx::adapters::claude::pin_hook_transcript(
+                &state,
+                &zirv_session,
+                &payload.transcript_path,
+            );
+        }
         let _ = crate::commands::ctx::attention::record(
             &state,
             &attention_short(env, &payload.session_id),
@@ -584,6 +591,47 @@ mod tests {
             agent_id: String::new(),
             agent_transcript_path: String::new(),
         }
+    }
+
+    /// A resumed claude session reports the transcript it resumed; the hook pins it for the
+    /// zirv session, and a transcript named after the zirv session pins nothing.
+    #[test]
+    fn session_start_pins_a_transcript_that_is_not_named_after_the_zirv_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let projects = dir.path().join(".claude/projects/-repo");
+        let zirv = "c391fd4f-84e7-4a6c-81fe-5738d28be57c";
+        let env = |key: &str| match key {
+            k if k == crate::commands::ctx::state::STATE_ENV => {
+                Some(dir.path().display().to_string())
+            }
+            SESSION_ENV => Some(zirv.to_string()),
+            _ => None,
+        };
+        let pin = state.rollouts().join("c391fd4f.claude.path");
+        let start = |transcript: &str| {
+            let mut payload = session_start_payload(repo.path(), "resume");
+            payload.transcript_path = transcript.to_string();
+            run_session_start(
+                &mut Vec::new(),
+                &serde_json::to_string(&payload).unwrap(),
+                &env,
+            )
+            .unwrap();
+        };
+
+        std::fs::create_dir_all(&projects).expect("projects");
+        let resumed = projects.join("bff6a2d4-bf99-498d-8c9e-5efc2d84bdb9.jsonl");
+        std::fs::write(&resumed, "").expect("resumed transcript");
+        start(&projects.join(format!("{zirv}.jsonl")).display().to_string());
+        assert!(!pin.exists());
+        start(&resumed.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&pin).unwrap(),
+            format!("{zirv}\n{}", resumed.display())
+        );
     }
 
     /// `source` gates everything: `resume`/`clear` inject a stored handoff,

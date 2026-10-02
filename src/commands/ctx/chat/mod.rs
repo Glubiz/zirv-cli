@@ -85,6 +85,8 @@ pub struct ChatArgs {
     /// intake view, even when `[proxy] enabled = true`.
     #[arg(long, default_value_t = false)]
     pub no_proxy: bool,
+    #[command(flatten)]
+    pub overrides: proxy::OverrideArgs,
     /// Extra arguments passed through to the agent, after `--`.
     #[arg(allow_hyphen_values = true, last = true)]
     pub extra: Vec<String>,
@@ -655,6 +657,7 @@ pub fn run_with<W: Write, E: Write>(
     } else if args.no_proxy {
         cfg.proxy.enabled = false;
     }
+    cfg.proxy.overrides = args.overrides.parse()?;
     // Retain the VT guard until the session ends; early Drop would disable VT before raw mode uses it.
     let (stdout_is_tty, stdin_is_tty, vt_ok, size, _vt_guard) = probe_terminal();
 
@@ -772,6 +775,18 @@ pub fn run_with<W: Write, E: Write>(
     }
     // Share one bounded proxy layer across every launch shape (#537).
     let proxy_layer = proxy_layer_text(&intake, started_workflow_id.as_deref());
+    // A successor of this seat re-renders its layer from the stored profile (#537).
+    if let ProxyIntakeOutcome::Decided { decision, .. } = &intake {
+        let _ = proxy::store::save(
+            state.root(),
+            session.as_str(),
+            &proxy::store::StoredProfile {
+                decision: (**decision).clone(),
+                operator_override: Some(cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
+                started_workflow_id: started_workflow_id.clone(),
+            },
+        );
+    }
     // Resolve the role once so all prompt, env and launch consumers agree (#537).
     let seat_role = proxy_prompt_role(&intake);
     let initial_prompt = orchestrator_initial_prompt(
@@ -2516,6 +2531,7 @@ mod tests {
             runtime: None,
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2565,6 +2581,7 @@ mod tests {
             runtime: None,
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2603,6 +2620,7 @@ mod tests {
             runtime: Some("bogus".to_string()),
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2662,6 +2680,7 @@ mod tests {
             runtime: Some("harness".to_string()),
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2710,6 +2729,7 @@ mod tests {
             runtime: Some("native".to_string()),
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut err_out = Vec::new();
@@ -2753,6 +2773,7 @@ mod tests {
             runtime: Some("native".to_string()),
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut err_out = Vec::new();
@@ -2806,6 +2827,7 @@ mod tests {
             runtime: Some("native".to_string()),
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let real_env = env_from_process();
@@ -2892,6 +2914,7 @@ mod tests {
             runtime: None,
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         };
         let mut out = Vec::new();
@@ -2949,6 +2972,7 @@ mod tests {
             runtime: None,
             proxy: false,
             no_proxy: false,
+            overrides: Default::default(),
             extra: Vec::new(),
         }
     }

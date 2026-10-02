@@ -14,8 +14,19 @@ pub struct ConfigArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ConfigCommand {
-    /// Print operator ~/.zirv/ctx.toml, or one dotted key, as TOML.
-    Show { key: Option<String> },
+    /// Print operator ~/.zirv/ctx.toml, or one dotted key, as TOML (or JSON with --json).
+    Show {
+        key: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one key's effective value, default, winning source and reload timing, exactly as
+    /// `/settings get` shows it. The project layer is read from the current directory.
+    Get {
+        key: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Set a dotted key; parse VALUE as TOML, otherwise as a string. Asks for approval.
     Set {
         key: String,
@@ -385,6 +396,26 @@ pub(super) fn apply_operator_edit(key: &str, raw: &str, op: EditOp) -> CtxResult
     )
 }
 
+/// `/settings get`'s text for one key, with the project layer read from the repository root
+/// that contains `from` (a `.git` ancestor, as the write guards resolve it), else `from` itself.
+pub(super) fn run_get(
+    from: &std::path::Path,
+    key: &str,
+    json: bool,
+    w: &mut dyn Write,
+) -> CtxResult<i32> {
+    let env = config::env_from_process();
+    let repo = super::lifecycle::repo_root_for_target(&from.join(crate::utils::SCRIPT_DIR_NAME))
+        .unwrap_or_else(|| from.to_path_buf());
+    let ctx = config::settings::SettingsCtx {
+        repo: &repo,
+        env: &env,
+        session: &config::settings::SessionOverrides::new(),
+    };
+    writeln!(w, "{}", config::settings::get(&ctx, key, json)?)?;
+    Ok(0)
+}
+
 pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
     let path = config::operator_path()?;
     let (key, value, op) = match &args.command {
@@ -393,12 +424,25 @@ pub fn run(args: &ConfigArgs, w: &mut dyn Write) -> CtxResult<i32> {
             downgrade,
             dry_run,
         } => return migrate(&path, to, *downgrade, *dry_run, w),
-        ConfigCommand::Show { key } => {
+        ConfigCommand::Get { key, json } => {
+            return run_get(&std::env::current_dir()?, key, *json, w);
+        }
+        ConfigCommand::Show { key, json } => {
             let text = match std::fs::read_to_string(&path) {
                 Ok(text) => text,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e.into()),
             };
+            if *json {
+                let mut value = toml::Value::Table(toml::from_str(&text)?);
+                for part in key.iter().flat_map(|key| key.split('.')) {
+                    value = value.get(part).cloned().ok_or_else(|| {
+                        format!("config key {} is not set", key.as_deref().unwrap_or(""))
+                    })?;
+                }
+                writeln!(w, "{}", serde_json::to_string(&value)?)?;
+                return Ok(0);
+            }
             let Some(key) = key else {
                 write!(w, "{text}")?;
                 return Ok(0);
@@ -568,7 +612,11 @@ mod tests {
         invoke(set("memory.enabled", "true")).unwrap();
         invoke(set("score.window", "3")).unwrap();
         invoke(set("dash.workdir_roots", r#"["/tmp/a", "/tmp/b"]"#)).unwrap();
-        let text = invoke(ConfigCommand::Show { key: None }).unwrap();
+        let text = invoke(ConfigCommand::Show {
+            key: None,
+            json: false,
+        })
+        .unwrap();
         let table: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(table["worker"]["codex"].as_str(), Some("gpt-5"));
         assert_eq!(table["memory"]["enabled"].as_bool(), Some(true));
@@ -576,7 +624,8 @@ mod tests {
         assert_eq!(table["dash"]["workdir_roots"].as_array().unwrap().len(), 2);
         assert_eq!(
             invoke(ConfigCommand::Show {
-                key: Some("score.window".into())
+                key: Some("score.window".into()),
+                json: false
             })
             .unwrap()
             .trim(),
@@ -643,10 +692,18 @@ mod tests {
     fn missing_show_and_invalid_new_config_create_nothing() {
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
-        assert_eq!(invoke(ConfigCommand::Show { key: None }).unwrap(), "");
+        assert_eq!(
+            invoke(ConfigCommand::Show {
+                key: None,
+                json: false
+            })
+            .unwrap(),
+            ""
+        );
         assert!(
             invoke(ConfigCommand::Show {
-                key: Some("worker.codex".into())
+                key: Some("worker.codex".into()),
+                json: false
             })
             .is_err()
         );

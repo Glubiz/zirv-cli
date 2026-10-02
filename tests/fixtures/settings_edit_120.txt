@@ -4,9 +4,10 @@
 |   KEY                            VALUE        SOURCE     SCOPES  APPLIES                                             |
 | > pace.max_wait_secs             900          project    U P     next session                                        |
 |----------------------------------------------------------------------------------------------------------------------|
-| pace.max_wait_secs  (integer, default: built-in)                                                                     |
+| pace.max_wait_secs  (integer, default: 600)                                                                          |
 | new value: 900_                                                                                                      |
-| scope: (o) user ~/.zirv/ctx.toml ( ) project (narrows only)                                                          |
+| scope: (o) user ~/.zirv/ctx.toml ( ) project (narrows only) [n/a] session (this pane)                                |
+| session scope refused: applies next session                                                                          |
 | applies: next session                                                                                                |
 | pace.max_wait_secs: expected an integer                                                                              |
 |----------------------------------------------------------------------------------------------------------------------|

@@ -1,0 +1,49 @@
+{
+  "expected_layer": "[zirv proxy]\nexecution: bounded (complexity substantial, risk high)\nseat: claude/fable (frontier)\nworkflow: none\nvalidate: no reviewer seat exists, so before reporting done run the targeted tests and report the command and exit code; re-read your own diff for defects and say what you did not check; state the security assumptions and flag the change for human review\nYou are the single seat for this request: do the work here yourself; do not delegate.",
+  "profile": {
+    "decision": {
+      "complexity": "substantial",
+      "confidence": {
+        "seat_tier": 0.8100000023841858
+      },
+      "created_at": 0,
+      "decider": "typesafe",
+      "domains": [],
+      "elapsed_ms": 12,
+      "execution": "bounded",
+      "fallbacks": [],
+      "headless": false,
+      "intent": "feature",
+      "needs_clarification": 0.0,
+      "needs_clarification_decisive": false,
+      "orchestrator": {
+        "harness": "claude",
+        "model": "fable"
+      },
+      "reasons": [
+        "override: execution direct refused, floor is bounded (risk or workflow)"
+      ],
+      "repo": "/tmp/repo",
+      "request_sha256": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "risk": "high",
+      "seat_role": "single",
+      "seat_tier": "frontier",
+      "usage": null,
+      "validation": {
+        "independent_review": true,
+        "independent_test": true,
+        "security_review": true
+      },
+      "worker_tier": "standard",
+      "workflow": null
+    },
+    "operator_override": {
+      "execution": "direct",
+      "review": null,
+      "seat_tier": null,
+      "security": null,
+      "test": null
+    },
+    "started_workflow_id": null
+  }
+}

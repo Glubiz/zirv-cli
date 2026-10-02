@@ -98,7 +98,7 @@ criterion).
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
-| `ctx proxy` | shared | decide-and-print CRUD (`--json` prints the `ProxyDecision`, never launches) is runtime-neutral; its two model-calling deciders (TypeSafe HTTP, the helper-model chokepoint) are tracked as entry points below |
+| `ctx proxy` | shared | decide-and-print CRUD (`--json` prints the `ProxyDecision`, never launches; `stats` is a read-only fold over stored profiles, delegations and transcripts) is runtime-neutral; its two model-calling deciders (TypeSafe HTTP, the helper-model chokepoint) are tracked as entry points below |
 | `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
 | `ctx reconcile` | shared | zero-model state-reconcile pass composing the existing dead-owner sweeps; runtime-neutral |
 | `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |

@@ -8,9 +8,186 @@ use super::super::config_cmd::{self, EditOp};
 use super::repo_layer::EnvKind;
 use super::*;
 
-/// When a saved value takes effect. No key has a proven live reload yet, so every key says the
-/// conservative thing instead of guessing.
+/// When a SAVED value (user or project file) takes effect: the dashboard loads its `CtxConfig`
+/// once and hands the same reference to every pane for the life of the process, so no file write
+/// is ever picked up live.
 pub const APPLIES: &str = "next session";
+
+/// Session overrides held by the native pane, key to value; they win over every other layer.
+pub type SessionOverrides = std::collections::BTreeMap<String, toml::Value>;
+
+/// A key the native pane's own view re-reads on every record refresh, and how a session override
+/// reaches it. Only that view: delegations (`route_new_delegation`), turns (`CtxConfig::load` in
+/// the interactive session) and the run loop load their own config, so they see it next session.
+/// `refresh_records` runs `pool::build` with the pane's effective config every few seconds, and
+/// that reads exactly these (`pool.rs` `signal_quality_for(.., cfg.fallback.unknown_headroom_pct)`,
+/// `health_rows` and `fallback::capacity_snapshot` through `cfg.fallback.effective_health()`).
+struct LiveKey {
+    key: &'static str,
+    apply: fn(&mut CtxConfig, &toml::Value) -> bool,
+}
+
+const LIVE_KEYS: &[LiveKey] = &[
+    LiveKey {
+        key: "fallback.enabled",
+        apply: |cfg, value| value.as_bool().map(|v| cfg.fallback.enabled = v).is_some(),
+    },
+    LiveKey {
+        key: "fallback.health.enabled",
+        apply: |cfg, value| {
+            value
+                .as_bool()
+                .map(|v| cfg.fallback.health.enabled = v)
+                .is_some()
+        },
+    },
+    LiveKey {
+        key: "fallback.unknown_headroom_pct",
+        apply: |cfg, value| {
+            value
+                .as_float()
+                .or_else(|| value.as_integer().map(|v| v as f64))
+                .map(|v| cfg.fallback.unknown_headroom_pct = v)
+                .is_some()
+        },
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reload {
+    /// A session override reaches the running pane's view only; everything else, and every saved
+    /// value, waits for the next session.
+    Live,
+    NextSession,
+}
+
+impl Reload {
+    pub fn of(key: &str) -> Self {
+        if LIVE_KEYS.iter().any(|live| live.key == key) {
+            Self::Live
+        } else {
+            Self::NextSession
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "pane view only; delegations and turns: next session",
+            Self::NextSession => APPLIES,
+        }
+    }
+}
+
+/// The pane's config with its session overrides applied; the input is never mutated.
+pub fn apply_session(cfg: &CtxConfig, overrides: &SessionOverrides) -> CtxConfig {
+    let mut out = cfg.clone();
+    for live in LIVE_KEYS {
+        if let Some(value) = overrides.get(live.key) {
+            (live.apply)(&mut out, value);
+        }
+    }
+    out
+}
+
+/// Built-in default of a key, read off `CtxConfig::default()` so no parallel table exists. The
+/// config types derive `Debug` but not `Serialize`; walking the pretty dump by field path is the
+/// smallest way to reach a value of any type without deriving `Serialize` across the schema.
+fn default_text(path: &[&str]) -> String {
+    static DUMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let dump = DUMP.get_or_init(|| format!("{:#?}", CtxConfig::default()));
+    let text = dump_value(dump, path);
+    let is_variant = text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.chars().all(|c| c.is_ascii_alphanumeric());
+    if is_variant {
+        return serde_spelling(path, &text).unwrap_or(text);
+    }
+    text
+}
+
+/// The configured spelling of an enum variant: the first candidate casing that the schema itself
+/// deserializes back into the same variant, so no parallel variant table exists.
+fn serde_spelling(path: &[&str], variant: &str) -> Option<String> {
+    let words: Vec<String> = variant.chars().fold(Vec::<String>::new(), |mut words, c| {
+        match words.last_mut() {
+            Some(last) if !c.is_ascii_uppercase() => last.push(c),
+            _ => words.push(c.to_string()),
+        }
+        words
+    });
+    let candidates = [
+        variant.to_ascii_lowercase(),
+        words.join("_").to_ascii_lowercase(),
+        words.join("-").to_ascii_lowercase(),
+        variant.to_string(),
+    ];
+    candidates.into_iter().find_map(|candidate| {
+        let mut table = toml::Table::new();
+        let value = toml::Value::String(candidate.clone());
+        // `[safety]` is lifted out of the config document and resolved by its own parser.
+        let dump = if path.first() == Some(&"safety") {
+            insert_path(&mut table, &path[1..], value);
+            let policy =
+                super::super::safety::resolve(Some(toml::Value::Table(table)), None, &|_| None)
+                    .ok()?;
+            dump_value(&format!("{policy:#?}"), &path[1..])
+        } else {
+            insert_path(&mut table, path, value);
+            let cfg: CtxConfig = toml::Value::Table(table).try_into().ok()?;
+            dump_value(&format!("{cfg:#?}"), path)
+        };
+        (dump == variant).then(|| format!("{candidate:?}"))
+    })
+}
+
+fn dump_value(dump: &str, path: &[&str]) -> String {
+    let lines: Vec<&str> = dump.lines().collect();
+    let (mut from, mut to) = (1, lines.len().saturating_sub(1));
+    for (depth, name) in path.iter().enumerate() {
+        let indent = " ".repeat(4 * (depth + 1));
+        let head = format!("{indent}{name}: ");
+        let Some(at) = (from..to).find(|&i| lines[i].starts_with(&head)) else {
+            return "(unknown)".to_string();
+        };
+        let rest = &lines[at][head.len()..];
+        let block = rest.chars().last().and_then(|open| {
+            let shut = match open {
+                '{' => '}',
+                '[' => ']',
+                '(' => ')',
+                _ => return None,
+            };
+            let end = format!("{indent}{shut},");
+            Some((
+                open,
+                shut,
+                (at + 1..to).find(|&i| lines[i] == end).unwrap_or(to),
+            ))
+        });
+        if depth + 1 < path.len() {
+            let Some((_, _, end)) = block else {
+                return "(unknown)".to_string();
+            };
+            (from, to) = (at + 1, end);
+            continue;
+        }
+        let Some((open, shut, end)) = block else {
+            return match rest.trim_end_matches(',') {
+                "None" => "(unset)".to_string(),
+                other => other.to_string(),
+            };
+        };
+        let inner: Vec<&str> = lines[at + 1..end].iter().map(|l| l.trim()).collect();
+        if rest.starts_with("Some(") && inner.len() == 1 {
+            return inner[0].trim_end_matches(',').to_string();
+        }
+        let prefix = &rest[..rest.len() - 1];
+        return format!(
+            "{prefix}{open}{}{shut}",
+            inner.join(" ").trim_end_matches(',')
+        );
+    }
+    "(unknown)".to_string()
+}
 
 /// Curated descriptions; every other key falls back to its type and environment variable.
 const DESCRIPTIONS: &[(&str, &str)] = &[
@@ -61,6 +238,7 @@ const DESCRIPTIONS: &[(&str, &str)] = &[
 pub enum Scope {
     User,
     Project,
+    Session,
 }
 
 impl Scope {
@@ -68,7 +246,10 @@ impl Scope {
         match raw {
             "user" => Ok(Self::User),
             "project" => Ok(Self::Project),
-            other => Err(format!("unknown scope '{other}': expected user or project").into()),
+            "session" => Ok(Self::Session),
+            other => {
+                Err(format!("unknown scope '{other}': expected session, user or project").into())
+            }
         }
     }
 
@@ -76,6 +257,7 @@ impl Scope {
         match self {
             Self::User => 'U',
             Self::Project => 'P',
+            Self::Session => 'S',
         }
     }
 }
@@ -116,7 +298,8 @@ impl Setting {
         }
     }
 
-    /// Scopes a value may be written at; sensitive keys are never edited in ordinary fields.
+    /// Scopes a value may be written at; sensitive keys are never edited in ordinary fields and
+    /// session scope exists only for keys the pane re-reads live.
     pub fn scopes(&self) -> Vec<Scope> {
         if self.sensitive {
             return Vec::new();
@@ -124,6 +307,9 @@ impl Setting {
         let mut scopes = vec![Scope::User];
         if self.operator_only.is_none() {
             scopes.push(Scope::Project);
+        }
+        if Reload::of(&self.key) == Reload::Live {
+            scopes.push(Scope::Session);
         }
         scopes
     }
@@ -161,6 +347,7 @@ pub fn find(key: &str) -> Option<Setting> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
+    Session,
     Env,
     Project,
     User,
@@ -170,6 +357,7 @@ pub enum Layer {
 impl Layer {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Session => "session",
             Self::Env => "env",
             Self::Project => "project",
             Self::User => "user",
@@ -181,6 +369,7 @@ impl Layer {
 /// Raw per-layer tables, so shadowing is data: `false`, zero and missing stay distinct.
 #[derive(Debug, Default)]
 pub struct LayerTables {
+    session: toml::Table,
     user: toml::Table,
     project: toml::Table,
     env: toml::Table,
@@ -189,14 +378,16 @@ pub struct LayerTables {
 /// The value each layer holds for one key, highest precedence first.
 #[derive(Debug)]
 pub struct Layers<'a> {
+    pub session: Option<&'a toml::Value>,
     pub env: Option<&'a toml::Value>,
     pub project: Option<&'a toml::Value>,
     pub user: Option<&'a toml::Value>,
 }
 
 impl<'a> Layers<'a> {
-    pub fn stack(&self) -> [(Layer, Option<&'a toml::Value>); 3] {
+    pub fn stack(&self) -> [(Layer, Option<&'a toml::Value>); 4] {
         [
+            (Layer::Session, self.session),
             (Layer::Env, self.env),
             (Layer::Project, self.project),
             (Layer::User, self.user),
@@ -213,6 +404,7 @@ impl<'a> Layers<'a> {
 impl LayerTables {
     pub fn layers(&self, setting: &Setting) -> Layers<'_> {
         Layers {
+            session: value_at(&self.session, setting.path),
             env: value_at(&self.env, setting.path),
             project: value_at(&self.project, setting.path),
             user: value_at(&self.user, setting.path),
@@ -234,7 +426,11 @@ fn project_path(repo: &Path) -> PathBuf {
         .join(CTX_CONFIG_FILE)
 }
 
-pub fn resolve_layers(repo: &Path, env: EnvLookup<'_>) -> CtxResult<LayerTables> {
+pub fn resolve_layers(
+    repo: &Path,
+    env: EnvLookup<'_>,
+    session: &SessionOverrides,
+) -> CtxResult<LayerTables> {
     let mut env_table = toml::Table::new();
     for (var, path, kind) in ENV_MAP {
         if let Some(raw) = env(var)
@@ -248,7 +444,14 @@ pub fn resolve_layers(repo: &Path, env: EnvLookup<'_>) -> CtxResult<LayerTables>
     } else {
         read_table(&project_path(repo))?
     };
+    let mut session_table = toml::Table::new();
+    for (key, value) in session {
+        if let Some(setting) = find(key) {
+            insert_path(&mut session_table, setting.path, value.clone());
+        }
+    }
     Ok(LayerTables {
+        session: session_table,
         user: read_table(&operator_path()?)?,
         project,
         env: env_table,
@@ -258,6 +461,7 @@ pub fn resolve_layers(repo: &Path, env: EnvLookup<'_>) -> CtxResult<LayerTables>
 pub struct SettingsCtx<'a> {
     pub repo: &'a Path,
     pub env: EnvLookup<'a>,
+    pub session: &'a SessionOverrides,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +469,7 @@ pub struct SettingRow {
     pub key: String,
     pub kind: &'static str,
     pub value: String,
+    pub default: String,
     pub source: &'static str,
     pub scopes: Vec<Scope>,
     pub applies: &'static str,
@@ -311,8 +516,13 @@ fn row(setting: &Setting, tables: &LayerTables) -> SettingRow {
         ),
         source: winner.map_or(Layer::Default, |(layer, _)| layer).name(),
         scopes: setting.scopes(),
-        applies: APPLIES,
+        applies: Reload::of(&setting.key).label(),
         description: setting.description.clone(),
+        default: if setting.sensitive {
+            "(redacted)".to_string()
+        } else {
+            default_text(setting.path)
+        },
         shadowed: if shadowed.is_empty() {
             "none".to_string()
         } else {
@@ -324,7 +534,7 @@ fn row(setting: &Setting, tables: &LayerTables) -> SettingRow {
 }
 
 pub fn rows(ctx: &SettingsCtx<'_>) -> CtxResult<Vec<SettingRow>> {
-    let tables = resolve_layers(ctx.repo, ctx.env)?;
+    let tables = resolve_layers(ctx.repo, ctx.env, ctx.session)?;
     Ok(registry()
         .iter()
         .map(|setting| row(setting, &tables))
@@ -501,6 +711,72 @@ fn redact_value(value: &toml::Value) -> toml::Value {
     }
 }
 
+fn refuse_embedded_credentials(key: &str, raw: &str) -> CtxResult<()> {
+    if embeds_credentials(raw)
+        || toml::from_str::<toml::Table>(&format!("v = {raw}"))
+            .is_ok_and(|table| has_secret_field(&table["v"]))
+    {
+        return Err(format!(
+            "{key}: the value embeds a credential (URL userinfo, a token-like query parameter or a secret-named field); reference an environment variable instead"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A validated session-scope edit; `value` is `None` for a reset. The pane holds and journals it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionEdit {
+    pub key: String,
+    pub value: Option<toml::Value>,
+}
+
+/// Validate a session-scope change with the same document check `zirv ctx config set` runs, and
+/// refuse what a session override could not honestly do.
+pub fn session_edit(key: &str, change: Change<'_>) -> CtxResult<SessionEdit> {
+    let setting = find(key).ok_or_else(|| format!("unknown setting '{key}'"))?;
+    if setting.sensitive {
+        return Err(
+            format!("{key} is a credential setting: it is never shown or edited here").into(),
+        );
+    }
+    if Reload::of(key) != Reload::Live {
+        return Err(format!(
+            "{key}: applies next session, so a session override would do nothing; use --scope user or project"
+        )
+        .into());
+    }
+    let Change::Set(raw) = change else {
+        return Ok(SessionEdit {
+            key: key.to_string(),
+            value: None,
+        });
+    };
+    refuse_embedded_credentials(key, raw)?;
+    let (_, updated, _) = config_cmd::preview_edit(
+        &operator_path()?,
+        key,
+        raw,
+        EditOp::Set,
+        &validate_operator_document,
+    )?;
+    let table: toml::Table = toml::from_str(&updated)?;
+    let value = value_at(&table, setting.path)
+        .cloned()
+        .ok_or_else(|| format!("{key}: no value to apply"))?;
+    let mut probe = CtxConfig::default();
+    if !LIVE_KEYS
+        .iter()
+        .any(|live| live.key == key && (live.apply)(&mut probe, &value))
+    {
+        return Err(format!("{key}: expected a {}, got {value}", setting.kind).into());
+    }
+    Ok(SessionEdit {
+        key: key.to_string(),
+        value: Some(value),
+    })
+}
+
 /// Write one change at one scope. `zirv ctx config` validation applies byte for byte: user and
 /// session go through the operator-document check, project through the narrowing-only rules first.
 pub fn change(
@@ -519,21 +795,18 @@ pub fn change(
         );
     }
     let (raw, op) = match change {
-        Change::Set(raw)
-            if embeds_credentials(raw)
-                || toml::from_str::<toml::Table>(&format!("v = {raw}"))
-                    .is_ok_and(|table| has_secret_field(&table["v"])) =>
-        {
-            return Err(format!(
-                "{key}: the value embeds a credential (URL userinfo, a token-like query parameter or a secret-named field); reference an environment variable instead"
-            )
-            .into());
+        Change::Set(raw) => {
+            refuse_embedded_credentials(key, raw)?;
+            (raw, EditOp::Set)
         }
-        Change::Set(raw) => (raw, EditOp::Set),
         Change::Reset => ("", EditOp::Unset),
     };
     let verb = if op == EditOp::Unset { "reset" } else { "set" };
     match scope {
+        Scope::Session => Err(format!(
+            "{key}: session scope is held by the running pane, not written from here"
+        )
+        .into()),
         Scope::User => {
             let changed = config_cmd::apply_operator_edit(key, raw, op)?;
             Ok(format!(
@@ -563,18 +836,36 @@ pub fn change(
 pub enum Slash {
     Open(String),
     Notice(String),
+    Session(SessionEdit),
 }
 
-fn detail(ctx: &SettingsCtx<'_>, key: &str) -> CtxResult<String> {
+/// One key's effective value, default, source and shadowed layers: the text `/settings get` shows
+/// and `zirv ctx config get` prints, or the same facts as JSON.
+pub fn get(ctx: &SettingsCtx<'_>, key: &str, json: bool) -> CtxResult<String> {
     let setting = find(key).ok_or_else(|| format!("unknown setting '{key}'"))?;
-    let tables = resolve_layers(ctx.repo, ctx.env)?;
+    let tables = resolve_layers(ctx.repo, ctx.env, ctx.session)?;
     let row = row(&setting, &tables);
     let scopes: String = row.scopes.iter().map(|scope| scope.letter()).collect();
+    if json {
+        return Ok(serde_json::json!({
+            "key": row.key,
+            "type": row.kind,
+            "value": row.value,
+            "default": row.default,
+            "source": row.source,
+            "scopes": scopes,
+            "applies": row.applies,
+            "shadowed": row.shadowed,
+            "sensitive": row.sensitive,
+        })
+        .to_string());
+    }
     Ok(format!(
-        "{} = {} ({}; source: {}; scopes: {}; applies {})\nshadowed: {}",
+        "{} = {} ({}; default: {}; source: {}; scopes: {}; applies {})\nshadowed: {}",
         row.key,
         row.value,
         row.kind,
+        row.default,
         row.source,
         if scopes.is_empty() { "-" } else { &scopes },
         row.applies,
@@ -590,7 +881,7 @@ pub fn slash(ctx: &SettingsCtx<'_>, args: &str) -> Slash {
     if let Some(at) = words.iter().position(|word| *word == "--scope") {
         let parsed = words
             .get(at + 1)
-            .ok_or_else(|| "--scope needs user or project".into())
+            .ok_or_else(|| "--scope needs session, user or project".into())
             .and_then(|raw| Scope::parse(raw));
         match parsed {
             Ok(parsed) => scope = parsed,
@@ -598,19 +889,28 @@ pub fn slash(ctx: &SettingsCtx<'_>, args: &str) -> Slash {
         }
         words.drain(at..(at + 2).min(words.len()));
     }
-    let result = match words.as_slice() {
-        ["get", key] => detail(ctx, key),
-        ["set", key, value @ ..] if !value.is_empty() => {
-            change(ctx, key, Change::Set(&value.join(" ")), scope)
+    let (key, requested) = match words.as_slice() {
+        ["get", key] => {
+            return Slash::Notice(get(ctx, key, false).unwrap_or_else(|e| e.to_string()));
         }
-        ["reset", key] => change(ctx, key, Change::Reset, scope),
-        ["get" | "set" | "reset", ..] => Err(
-            "usage: /settings get <key> | set <key> <value> [--scope s] | reset <key> [--scope s]"
-                .into(),
-        ),
+        ["set", key, value @ ..] if !value.is_empty() => (*key, Some(value.join(" "))),
+        ["reset", key] => (*key, None),
+        ["get" | "set" | "reset", ..] => {
+            return Slash::Notice(
+                "usage: /settings get <key> | set <key> <value> [--scope s] | reset <key> [--scope s]"
+                    .to_string(),
+            );
+        }
         _ => return Slash::Open(words.join(" ")),
     };
-    Slash::Notice(result.unwrap_or_else(|error| error.to_string()))
+    let change_kind = requested.as_deref().map_or(Change::Reset, Change::Set);
+    if scope == Scope::Session {
+        return match session_edit(key, change_kind) {
+            Ok(edit) => Slash::Session(edit),
+            Err(error) => Slash::Notice(error.to_string()),
+        };
+    }
+    Slash::Notice(change(ctx, key, change_kind, scope).unwrap_or_else(|error| error.to_string()))
 }
 
 #[cfg(test)]
@@ -654,6 +954,7 @@ mod tests {
         f(&SettingsCtx {
             repo: fx.repo.path(),
             env,
+            session: &SessionOverrides::new(),
         })
     }
 
@@ -969,10 +1270,166 @@ mod tests {
         let notice = with_ctx(&fx, &no_env, |ctx| {
             match slash(ctx, "get proxy.typesafe.credential_env") {
                 Slash::Notice(text) => text,
-                Slash::Open(_) => panic!("get must not open the menu"),
+                Slash::Open(_) | Slash::Session(_) => panic!("get must only notify"),
             }
         });
         assert!(!notice.contains("MY_SECRET_ENV"), "{notice}");
+    }
+
+    #[test]
+    fn defaults_come_from_the_built_in_config_and_keep_false_zero_and_unset_distinct() {
+        let fx = Fixture::new();
+        let default_of = |key: &str| row_of(&fx, &no_env, key).default;
+        assert_eq!(default_of("pace.use_credits.claude"), "false");
+        assert_eq!(default_of("pace.five_hour_budget_tokens"), "0");
+        assert_eq!(default_of("agent"), "(unset)");
+        assert_eq!(
+            default_of("score.window"),
+            CtxConfig::default().score.window.to_string()
+        );
+        assert_eq!(default_of("proxy.typesafe.credential_env"), "(redacted)");
+        let unresolved: Vec<_> = registry()
+            .into_iter()
+            .filter(|setting| default_text(setting.path) == "(unknown)")
+            .map(|setting| setting.key)
+            .collect();
+        assert_eq!(
+            unresolved,
+            ["supervise.max_heavy_workers"],
+            "deprecated alias only"
+        );
+    }
+
+    #[test]
+    fn only_keys_the_pane_rereads_are_live_and_only_they_offer_session_scope() {
+        for setting in registry() {
+            let live = LIVE_KEYS.iter().any(|live| live.key == setting.key);
+            assert_eq!(
+                setting.scopes().contains(&Scope::Session),
+                live && !setting.sensitive,
+                "{}",
+                setting.key
+            );
+            assert_eq!(
+                Reload::of(&setting.key) == Reload::Live,
+                live,
+                "{}",
+                setting.key
+            );
+        }
+        for live in LIVE_KEYS {
+            assert!(
+                find(live.key).is_some(),
+                "{} is not a registry key",
+                live.key
+            );
+        }
+    }
+
+    #[test]
+    fn session_edit_validates_applies_and_refuses_what_it_could_not_honour() {
+        let fx = Fixture::new();
+        let edit = session_edit("fallback.unknown_headroom_pct", Change::Set("40")).unwrap();
+        assert_eq!(edit.value, Some(toml::Value::Integer(40)));
+        let mut overrides = SessionOverrides::new();
+        overrides.insert(edit.key, edit.value.unwrap());
+        let base = CtxConfig::default();
+        let live = apply_session(&base, &overrides);
+        assert_eq!(live.fallback.unknown_headroom_pct, 40.0);
+        assert_eq!(
+            base.fallback.unknown_headroom_pct, 25.0,
+            "input is never mutated"
+        );
+        let tables = resolve_layers(fx.repo.path(), &no_env, &overrides).unwrap();
+        let row = row(&find("fallback.unknown_headroom_pct").unwrap(), &tables);
+        assert_eq!((row.source, row.value.as_str()), ("session", "40"));
+
+        let reset = session_edit("fallback.enabled", Change::Reset).unwrap();
+        assert_eq!(reset.value, None);
+        for (key, raw, needle) in [
+            ("score.window", "4", "applies next session"),
+            ("proxy.typesafe.credential_env", "X", "credential"),
+            ("fallback.enabled", "maybe", "refusing to update"),
+            ("nope.nope", "1", "unknown setting"),
+        ] {
+            let error = session_edit(key, Change::Set(raw)).unwrap_err().to_string();
+            assert!(error.contains(needle), "{key}: {error}");
+        }
+        assert!(
+            !operator_path().unwrap().exists(),
+            "session scope never writes a file"
+        );
+    }
+
+    #[test]
+    fn config_get_and_settings_get_report_the_same_value_default_and_source() {
+        let fx = Fixture::new();
+        fx.user("[score]\nwindow = 4\n");
+        let notice = with_ctx(&fx, &no_env, |ctx| match slash(ctx, "get score.window") {
+            Slash::Notice(text) => text,
+            _ => panic!("get must only notify"),
+        });
+        let mut out = Vec::new();
+        config_cmd::run_get(fx.repo.path(), "score.window", false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().trim_end(), notice);
+        let mut out = Vec::new();
+        config_cmd::run_get(fx.repo.path(), "score.window", true, &mut out).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["value"], "4");
+        assert_eq!(json["source"], "user");
+        assert_eq!(
+            json["default"],
+            CtxConfig::default().score.window.to_string()
+        );
+        assert!(notice.contains("default: "), "{notice}");
+        let mut out = Vec::new();
+        let error = config_cmd::run_get(fx.repo.path(), "nope.nope", false, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown setting"), "{error}");
+    }
+
+    #[test]
+    fn config_get_from_a_subdirectory_reads_the_repo_root_project_layer_like_settings_get() {
+        let fx = Fixture::new();
+        std::fs::create_dir(fx.repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(fx.repo.path().join(".zirv")).unwrap();
+        std::fs::write(fx.project_file(), "[worker]\nmax_depth = 1\n").unwrap();
+        let sub = fx.repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut out = Vec::new();
+        config_cmd::run_get(&sub, "worker.max_depth", true, &mut out).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            (json["source"].as_str(), json["value"].as_str()),
+            (Some("project"), Some("1"))
+        );
+        let notice = with_ctx(&fx, &no_env, |ctx| {
+            match slash(ctx, "get worker.max_depth") {
+                Slash::Notice(text) => text,
+                _ => panic!("get must only notify"),
+            }
+        });
+        let mut out = Vec::new();
+        config_cmd::run_get(&sub, "worker.max_depth", false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().trim_end(), notice);
+    }
+
+    #[test]
+    fn enum_defaults_show_the_serde_spelling_not_the_rust_variant() {
+        let fx = Fixture::new();
+        let default_of = |key: &str| row_of(&fx, &no_env, key).default;
+        assert_eq!(default_of("proxy.decider"), "\"typesafe\"");
+        assert_eq!(default_of("dash.motion"), "\"full\"");
+        for setting in registry() {
+            let text = default_text(setting.path);
+            assert!(
+                !text.starts_with(|c: char| c.is_ascii_uppercase())
+                    || text.contains(|c: char| !c.is_ascii_alphanumeric()),
+                "{} shows a bare Rust variant: {text}",
+                setting.key
+            );
+        }
     }
 
     #[test]
@@ -982,13 +1439,17 @@ mod tests {
             with_ctx(&fx, &no_env, |ctx| match slash(ctx, args) {
                 Slash::Notice(text) => format!("notice:{text}"),
                 Slash::Open(query) => format!("open:{query}"),
+                Slash::Session(edit) => format!("session:{}", edit.key),
             })
         };
         assert_eq!(run(""), "open:");
         assert_eq!(run("pace wait"), "open:pace wait");
         assert!(run("set score.window 4").contains("set"));
-        assert!(run("get score.window").contains("score.window = 4 (integer; source: user"));
-        assert!(run("set score.window 6 --scope session").contains("unknown scope"));
+        assert!(
+            run("get score.window")
+                .contains("score.window = 4 (integer; default: 10; source: user")
+        );
+        assert!(run("set score.window 6 --scope session").contains("applies next session"));
         assert!(run("reset score.window").contains("reset"));
         assert!(run("set score.window 1 --scope galaxy").contains("unknown scope"));
         assert!(run("set score.window").contains("usage"));

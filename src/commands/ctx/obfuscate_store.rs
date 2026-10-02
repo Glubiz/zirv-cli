@@ -433,10 +433,14 @@ fn scan_input(
             return Err("native session scanning is not available from the transcript audit; scan an exported journal file instead".into());
         }
         let adapter = super::adapters::select(Some(&record.agent), &[], cfg)?;
-        let path = adapter.transcript_path(&super::event::SessionRef {
-            id: super::event::SessionId::parse(&record.session),
-            cwd: record.repo,
-        });
+        let path = super::adapters::claude::session_transcript(
+            adapter.as_ref(),
+            state,
+            &super::event::SessionRef {
+                id: super::event::SessionId::parse(&record.session),
+                cwd: record.repo,
+            },
+        );
         return std::fs::read_to_string(&path)
             .map(|input| (input, format!("session:{prefix}")))
             .map_err(|error| {

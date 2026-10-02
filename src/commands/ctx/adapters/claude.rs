@@ -699,6 +699,71 @@ pub(crate) fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
     Some(transcript.parent()?.join(stem).join("subagents"))
 }
 
+/// `<state>/rollouts/<short>.claude.path`: the transcript claude reported for a zirv session.
+fn transcript_pin(state: &super::super::state::StateDir, zirv_session: &str) -> PathBuf {
+    let short = super::super::sessions::short_id(zirv_session);
+    state.rollouts().join(format!("{short}.claude.path"))
+}
+
+/// A resumed claude conversation keeps writing the transcript of the session it resumed, not
+/// the zirv session id it was launched under; a hook pins the path claude reports so readers
+/// follow it. Nothing is pinned while the two agree.
+pub(crate) fn pin_hook_transcript(
+    state: &super::super::state::StateDir,
+    zirv_session: &str,
+    transcript_path: &str,
+) {
+    let stem = Path::new(transcript_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str());
+    if zirv_session.is_empty()
+        || !is_projects_transcript(Path::new(transcript_path))
+        || stem.is_none_or(|stem| stem.is_empty() || stem == zirv_session)
+    {
+        return;
+    }
+    let pin = transcript_pin(state, zirv_session);
+    let contents = format!("{zirv_session}\n{transcript_path}");
+    if std::fs::read_to_string(&pin).is_ok_and(|current| current == contents) {
+        return;
+    }
+    if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
+        let _ = super::super::state::write_private(&pin, &contents);
+    }
+}
+
+/// An absolute `.jsonl` file that, symlinks resolved, lies under the Claude projects root.
+fn is_projects_transcript(path: &Path) -> bool {
+    let projects = ClaudeAdapter::new(None)
+        .home_dir()
+        .join(".claude")
+        .join("projects");
+    if !path.is_absolute() || path.extension().is_none_or(|ext| ext != "jsonl") {
+        return false;
+    }
+    match (path.canonicalize(), projects.canonicalize()) {
+        (Ok(real), Ok(root)) => real.starts_with(root),
+        _ => false,
+    }
+}
+
+/// The transcript a claude session really writes: the hook-pinned path when it exists, else
+/// the one derived from the session id.
+pub(crate) fn session_transcript(
+    adapter: &dyn AgentAdapter,
+    state: &super::super::state::StateDir,
+    session: &SessionRef,
+) -> PathBuf {
+    std::fs::read_to_string(transcript_pin(state, session.id.as_str()))
+        .ok()
+        .and_then(|recorded| {
+            let (owner, path) = recorded.split_once('\n')?;
+            (owner == session.id.as_str()).then(|| PathBuf::from(path.trim()))
+        })
+        .filter(|pinned| is_projects_transcript(pinned))
+        .unwrap_or_else(|| adapter.transcript_path(session))
+}
+
 /// The first parseable row `timestamp` in `jsonl`, in unix milliseconds.
 fn first_timestamp_ms(jsonl: &str) -> Option<u64> {
     jsonl.lines().find_map(|line| {
@@ -3716,6 +3781,70 @@ mod tests {
     /// keep passing `&adapter` unchanged.
     fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
         super::super::built_args(&adapter.program, cmd)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_hook_transcript_ignores_paths_outside_the_projects_root() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = crate::commands::ctx::state::StateDir::from_root(home.path().join("state"));
+        let zirv = "c391fd4f-84e7-4a6c-81fe-5738d28be57c";
+        let projects = home.path().join(".claude/projects/-repo");
+        let pin = transcript_pin(&state, zirv);
+        std::fs::create_dir_all(&projects).expect("projects");
+        std::fs::create_dir_all(home.path().join("elsewhere")).expect("elsewhere");
+        for existing in [
+            projects.join("other.jsonl"),
+            projects.join("other.txt"),
+            home.path().join("elsewhere/other.jsonl"),
+        ] {
+            std::fs::write(existing, "").expect("file");
+        }
+        let traversal = format!("{}/../../x/other.jsonl", projects.display());
+        let outside = home.path().join("elsewhere/other.jsonl");
+        let wrong_ext = projects.join("other.txt");
+        for rejected in [
+            "relative/other.jsonl".to_string(),
+            "/etc/other.jsonl".to_string(),
+            outside.display().to_string(),
+            wrong_ext.display().to_string(),
+            traversal,
+            String::new(),
+        ] {
+            pin_hook_transcript(&state, zirv, &rejected);
+            assert!(!pin.exists(), "pinned {rejected:?}");
+        }
+        let secret = home.path().join("elsewhere/secret.jsonl");
+        std::fs::write(&secret, "").expect("secret");
+        std::os::unix::fs::symlink(&secret, projects.join("link.jsonl")).expect("symlink");
+        pin_hook_transcript(
+            &state,
+            zirv,
+            &projects.join("link.jsonl").display().to_string(),
+        );
+        assert!(!pin.exists(), "pinned a symlink leaving the root");
+        let accepted = projects.join("other.jsonl");
+        pin_hook_transcript(&state, zirv, &accepted.display().to_string());
+        let session = SessionRef {
+            id: SessionId::parse(zirv),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(session_transcript(&adapter, &state, &session), accepted);
+
+        // Same short id, different session: the pin is not theirs.
+        let colliding = SessionRef {
+            id: SessionId::parse("c391fd4f-0000-4000-8000-000000000000"),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        assert_ne!(session_transcript(&adapter, &state, &colliding), accepted);
+
+        // A pin swapped for a symlink leaving the root is ignored on read.
+        std::fs::remove_file(&accepted).expect("rm");
+        std::os::unix::fs::symlink(home.path().join("elsewhere/secret.jsonl"), &accepted)
+            .expect("swap");
+        assert_ne!(session_transcript(&adapter, &state, &session), accepted);
     }
 
     #[test]
