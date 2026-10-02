@@ -2208,6 +2208,15 @@ mod tests {
     /// Runs one Bash PreToolUse payload with the process cwd inside a repo whose
     /// `.zirv/ctx.toml` is `repo_toml`, and returns what the hook printed.
     fn bash_pretool_with_repo_config(repo_toml: &str, command: &str, mode: &str) -> String {
+        bash_pretool_with_repo_config_env(repo_toml, command, mode, &|_| None)
+    }
+
+    fn bash_pretool_with_repo_config_env(
+        repo_toml: &str,
+        command: &str,
+        mode: &str,
+        env: EnvLookup<'_>,
+    ) -> String {
         let home = tempfile::tempdir().expect("home");
         let repo = tempfile::tempdir().expect("repo");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
@@ -2223,7 +2232,7 @@ mod tests {
         })
         .to_string();
         let mut out = Vec::new();
-        let code = run_pretool(&mut out, &stdin, &|_| None).expect("never errors");
+        let code = run_pretool(&mut out, &stdin, env).expect("never errors");
         assert_eq!(code, 0);
         String::from_utf8(out).expect("utf8")
     }
@@ -2267,6 +2276,29 @@ mod tests {
         assert!(
             !printed.contains("\"deny\""),
             "a safe command must not be denied: {printed}"
+        );
+    }
+
+    /// A refused repo config whose trusted fallback also fails to load (here an invalid numeric
+    /// override) must still not go silent: the hook asks, naming both failures.
+    #[test]
+    fn run_pretool_bash_asks_when_the_trusted_config_cannot_load_either() {
+        let printed = bash_pretool_with_repo_config_env(
+            "[safety]\ndefault = \"allow\"\n",
+            "git status",
+            "default",
+            &|key| (key == "ZIRV_CTX_WINDOW").then(|| "not-a-number".to_string()),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim())
+            .unwrap_or_else(|_| panic!("the ask went silent: {printed:?}"));
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "ask");
+        let reason = parsed["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("forbidden keys")
+                && reason.contains("trusted config could not be loaded"),
+            "{reason}"
         );
     }
 

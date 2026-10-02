@@ -102,14 +102,7 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
     // Config failure must not block a prompt or lose unrelated adoption and
     // attention signals; optional masking degrades to passthrough (#466).
     // A repo-forbidden config is a refusal, not a failure: keep the operator's own masking settings.
-    let cfg = match crate::commands::ctx::config::CtxConfig::load(&repo, env) {
-        Ok(cfg) => cfg,
-        Err(err) if crate::commands::ctx::config::is_repo_forbidden(err.as_ref()) => {
-            crate::commands::ctx::config::CtxConfig::load_trusted_only(&repo, env)
-                .unwrap_or_default()
-        }
-        Err(_) => crate::commands::ctx::config::CtxConfig::default(),
-    };
+    let cfg = crate::commands::ctx::config::CtxConfig::load_refusal_safe(&repo, env);
 
     // Scope-creep guard: records this prompt's own preservation/limitation
     // language (if any) for the `PreToolUse` checkpoint and `Stop` backstop

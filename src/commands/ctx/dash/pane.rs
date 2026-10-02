@@ -2891,7 +2891,7 @@ impl Pane {
 }
 
 /// Strip secret-shaped env from a Worker pane's child; an orchestrator or operator pane is untouched.
-/// A config or adapter that cannot be loaded leaves the env as it was rather than blocking the spawn.
+/// A refused or broken config scrubs with the trusted layers or defaults; only an unselectable adapter leaves the env as it was.
 fn scrub_worker_pane_env(
     command: &mut CommandBuilder,
     role: PromptRole,
@@ -2902,18 +2902,32 @@ fn scrub_worker_pane_env(
         return Vec::new();
     }
     let env = super::super::config::env_from_process();
-    let Ok(cfg) = super::super::config::CtxConfig::load(repo, &env) else {
-        return Vec::new();
-    };
+    scrub_worker_pane_env_in(
+        command,
+        repo,
+        agent_name,
+        &env,
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    )
+}
+
+fn scrub_worker_pane_env_in(
+    command: &mut CommandBuilder,
+    repo: &Path,
+    agent_name: &str,
+    env: super::super::config::EnvLookup<'_>,
+    ambient: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let cfg = super::super::config::CtxConfig::load_refusal_safe(repo, env);
     let Ok(adapter) = super::super::adapters::select(Some(agent_name), &[], &cfg) else {
         return Vec::new();
     };
     scrub_pane_env_with(
         command,
-        role,
+        PromptRole::Worker,
         cfg.sandbox.scrub_worker_secrets,
-        adapter.credential_env(&env).as_deref(),
-        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+        adapter.credential_env(env).as_deref(),
+        ambient,
     )
 }
 
@@ -2960,6 +2974,37 @@ pub(crate) mod tests {
             assert!(scrub_pane_env_with(&mut seat, role, true, Some(&keep), env()).is_empty());
             assert!(seat.get_env("MY_SERVICE_PASSWORD").is_some());
         }
+    }
+
+    /// A repo config the loader refuses (here, switching the scrub off itself) must not
+    /// switch the scrub off: the secret goes, the harness credential stays.
+    #[test]
+    fn a_refused_repo_config_still_scrubs_a_worker_pane() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nscrub_worker_secrets = false\n",
+        )
+        .expect("write");
+        let mut worker = CommandBuilder::new("agent");
+        worker.env("MY_SERVICE_PASSWORD", "x");
+        worker.env("ANTHROPIC_API_KEY", "k");
+        let stripped = scrub_worker_pane_env_in(
+            &mut worker,
+            repo.path(),
+            "claude",
+            &|_| None,
+            [
+                "MY_SERVICE_PASSWORD".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+            ],
+        );
+        assert_eq!(stripped, vec!["MY_SERVICE_PASSWORD".to_string()]);
+        assert!(worker.get_env("MY_SERVICE_PASSWORD").is_none());
+        assert!(worker.get_env("ANTHROPIC_API_KEY").is_some());
     }
 
     /// #681: a lifecycle hook files a session's conversation marker under its

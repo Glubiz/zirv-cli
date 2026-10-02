@@ -1995,18 +1995,45 @@ impl AgentAdapter for ClaudeAdapter {
         &self.program
     }
 
-    /// Native/API-key login names always; cloud-provider credentials only once a `CLAUDE_CODE_USE_*` switch selects them.
+    /// Native/API-key login names always; a cloud provider's credentials only once its `CLAUDE_CODE_USE_*` switch selects it.
+    /// Names that fit no provider (proxy and CA settings) are kept when any switch is on.
     fn credential_env(&self, env: super::super::config::EnvLookup<'_>) -> Option<Vec<String>> {
-        let cloud = super::super::runtime::execution::AUTH_ENV
+        const PROVIDERS: &[(&str, &[&str])] = &[
+            ("CLAUDE_CODE_USE_BEDROCK", &["AWS_"]),
+            ("CLAUDE_CODE_USE_MANTLE", &["AWS_"]),
+            ("CLAUDE_CODE_USE_ANTHROPIC_AWS", &["AWS_"]),
+            (
+                "CLAUDE_CODE_USE_VERTEX",
+                &["GOOGLE_", "CLOUDSDK_", "CLOUD_ML_"],
+            ),
+            ("CLAUDE_CODE_USE_FOUNDRY", &["AZURE_"]),
+        ];
+        let on = |switch: &str| env(switch).is_some_and(|v| !v.is_empty());
+        let active: Vec<&str> = PROVIDERS
             .iter()
-            .any(|name| {
-                name.starts_with("CLAUDE_CODE_USE_") && env(name).is_some_and(|v| !v.is_empty())
-            });
+            .filter(|(switch, _)| on(switch))
+            .flat_map(|(_, prefixes)| prefixes.iter().copied())
+            .collect();
+        let any_switch = super::super::runtime::execution::AUTH_ENV
+            .iter()
+            .any(|name| name.starts_with("CLAUDE_CODE_USE_") && on(name));
+        let is_provider_name = |name: &str| {
+            PROVIDERS
+                .iter()
+                .flat_map(|(_, prefixes)| prefixes.iter())
+                .any(|prefix| name.starts_with(prefix))
+        };
         Some(
             super::super::runtime::execution::AUTH_ENV
                 .iter()
                 .filter(|name| {
-                    cloud || name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_")
+                    if name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_") {
+                        return true;
+                    }
+                    if is_provider_name(name) {
+                        return active.iter().any(|prefix| name.starts_with(prefix));
+                    }
+                    any_switch
                 })
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -2861,6 +2888,56 @@ mod tests {
     use super::super::super::config::OrchestratorWrites;
     use super::*;
     use crate::commands::ctx::event::{NormalizedEvent, input_hash};
+
+    fn credential_names(env: &[(&str, &str)]) -> Vec<String> {
+        let map: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        ClaudeAdapter::new(None)
+            .credential_env(&|k| map.get(k).cloned())
+            .expect("claude declares its credentials")
+    }
+
+    #[test]
+    fn credential_env_keeps_anthropic_and_claude_entries() {
+        let names = credential_names(&[]);
+        for keep in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            assert!(names.iter().any(|n| n == keep), "{keep}");
+        }
+    }
+
+    #[test]
+    fn credential_env_keeps_only_the_selected_providers_cloud_credentials() {
+        let has = |names: &[String], name: &str| names.iter().any(|n| n == name);
+        let none = credential_names(&[]);
+        let empty_switch = credential_names(&[("CLAUDE_CODE_USE_BEDROCK", "")]);
+        let bedrock = credential_names(&[("CLAUDE_CODE_USE_BEDROCK", "1")]);
+        let vertex = credential_names(&[("CLAUDE_CODE_USE_VERTEX", "1")]);
+        let foundry = credential_names(&[("CLAUDE_CODE_USE_FOUNDRY", "1")]);
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AZURE_CLIENT_SECRET",
+            "HTTPS_PROXY",
+        ] {
+            assert!(!has(&none, name), "{name} without a switch");
+            assert!(!has(&empty_switch, name), "{name} with an empty switch");
+        }
+        assert!(has(&bedrock, "AWS_SECRET_ACCESS_KEY") && has(&bedrock, "HTTPS_PROXY"));
+        assert!(!has(&bedrock, "GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(!has(&bedrock, "AZURE_CLIENT_SECRET"));
+        assert!(has(&vertex, "GOOGLE_APPLICATION_CREDENTIALS") && has(&vertex, "CLOUDSDK_CONFIG"));
+        assert!(!has(&vertex, "AWS_SECRET_ACCESS_KEY"));
+        assert!(!has(&vertex, "AZURE_CLIENT_SECRET"));
+        assert!(has(&foundry, "AZURE_CLIENT_SECRET"));
+        assert!(!has(&foundry, "AWS_SECRET_ACCESS_KEY"));
+        assert!(!has(&foundry, "GOOGLE_APPLICATION_CREDENTIALS"));
+    }
 
     fn test_launch_settings() -> Value {
         launch_settings_value(

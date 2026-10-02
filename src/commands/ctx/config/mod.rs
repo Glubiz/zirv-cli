@@ -331,6 +331,18 @@ impl CtxConfig {
         Self::load_layers(repo, env, false)
     }
 
+    /// `load`, but never an error: a repo-forbidden layer falls back to the trusted layers, any other failure to defaults.
+    /// For callers that must still apply operator policy (e.g. secret scrubbing) when the repo config is refused.
+    pub(crate) fn load_refusal_safe(repo: &Path, env: EnvLookup<'_>) -> Self {
+        match Self::load(repo, env) {
+            Ok(cfg) => cfg,
+            Err(err) if repo_layer::is_repo_forbidden(err.as_ref()) => {
+                Self::load_trusted_only(repo, env).unwrap_or_default()
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
     fn load_layers(repo: &Path, env: EnvLookup<'_>, read_repo_layer: bool) -> CtxResult<Self> {
         let mut merged = toml::Table::new();
         let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();

@@ -283,6 +283,17 @@ pub trait AgentAdapter: std::fmt::Debug {
         self.read_only_args()
     }
 
+    /// Whether a read-only floor can be enforced for this surface, answered without the side effects
+    /// (policy or config files) some adapters' `read_only_args` materialize; refusal and routing use this.
+    fn read_only_floor_available(&self, interactive: bool) -> bool {
+        let floor = if interactive {
+            self.interactive_read_only_args()
+        } else {
+            self.read_only_args()
+        };
+        !floor.is_empty()
+    }
+
     /// Build a provider-neutral workflow-seat launch. Agent manifests describe
     /// required capabilities and methodology but never grant authority: this
     /// default re-loads the effective canonical policy, applies the normal

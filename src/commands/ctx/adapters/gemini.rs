@@ -651,6 +651,11 @@ impl AgentAdapter for GeminiAdapter {
         vec!["--admin-policy".to_string(), path.display().to_string()]
     }
 
+    /// The deny policy is always written at launch, so the floor is always available; nothing is written here.
+    fn read_only_floor_available(&self, _interactive: bool) -> bool {
+        true
+    }
+
     /// `GEMINI_SYSTEM_MD` is an environment variable that fully replaces the
     /// system prompt -- there is no per-run argv mechanism to inject or
     /// append one (this module's own doc comment). Empty, the same "no

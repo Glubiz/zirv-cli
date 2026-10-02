@@ -713,6 +713,11 @@ impl AgentAdapter for OpenCodeAdapter {
         vec!["--agent".to_string(), READ_ONLY_AGENT.to_string()]
     }
 
+    /// The floor needs a resolvable state dir to materialize into; checking that writes nothing.
+    fn read_only_floor_available(&self, _interactive: bool) -> bool {
+        self.state_dir().is_some()
+    }
+
     /// Content-fingerprints `prompt` into a dedicated agent name (see
     /// [`OpenCodeAdapter::system_prompt_agent_name`]) and materializes an
     /// `agent.<name>.prompt` config entry for it -- the one verified
