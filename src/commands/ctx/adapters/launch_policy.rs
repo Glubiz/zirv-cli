@@ -673,6 +673,22 @@ pub fn policy_launch_args(
     policy_launch_args_for_surface(cfg, adapter, flags, mode, mode, role)
 }
 
+/// Append the adapter's writable roots (git dirs and zirv state subdirectories)
+/// to a non-empty policy baseline, so a supervised seat's own `zirv` calls do
+/// not escalate (#845). Empty `extra` (operator-pinned policy or sandbox off)
+/// stays empty: the operator's posture is never widened.
+pub fn with_workload_writable_roots(
+    mut extra: Vec<String>,
+    adapter: &(impl AgentAdapter + ?Sized),
+    cwd: &Path,
+    state: &super::super::state::StateDir,
+) -> Vec<String> {
+    if !extra.is_empty() {
+        extra.extend(adapter.extra_writable_root_args(cwd, state));
+    }
+    extra
+}
+
 /// Separate approval posture from the actual CLI surface for dashboard panes: an unattended interactive pane must use interactive-safe read-only flags. (#326)
 /// `approval_mode` feeds `default_sandbox_args`, safe under either value; `surface_mode`
 /// feeds `policy_args`, where a codex Deny-stance projection is genuinely surface-unsafe.
@@ -709,6 +725,32 @@ pub fn policy_launch_args_for_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_roots_follow_a_non_empty_baseline_and_never_widen_an_empty_one() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
+        let codex = super::super::codex::CodexAdapter::new(None);
+        let empty = with_workload_writable_roots(Vec::new(), &codex, repo.path(), &state);
+        assert!(
+            empty.is_empty(),
+            "operator-pinned launch must stay empty: {empty:?}"
+        );
+        let out = with_workload_writable_roots(
+            vec!["--sandbox".to_string(), "workspace-write".to_string()],
+            &codex,
+            repo.path(),
+            &state,
+        );
+        assert_eq!(&out[..2], ["--sandbox", "workspace-write"]);
+        assert!(
+            out.iter()
+                .any(|a| a.starts_with("sandbox_workspace_write.writable_roots=[")),
+            "{out:?}"
+        );
+    }
 
     /// Fix round 7 (2026-09-20): the six read-only/UI built-ins that cannot
     /// touch the machine, the repo or production must be whole-tool allow

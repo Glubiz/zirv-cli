@@ -1545,7 +1545,11 @@ impl AgentAdapter for CodexAdapter {
     /// `<root>/.git` read-only inside every writable root it is handed,
     /// including `cwd` itself, unless the git dir is named directly. A linked
     /// worktree's own git dir is added too. (#252, #364)
-    fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
+    fn extra_writable_root_args(
+        &self,
+        cwd: &Path,
+        state: &super::super::state::StateDir,
+    ) -> Vec<String> {
         let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut roots: Vec<PathBuf> = Vec::new();
         if let Some((git_dir, common_dir)) = super::git_dirs(&cwd) {
@@ -1554,9 +1558,13 @@ impl AgentAdapter for CodexAdapter {
                 roots.push(git_dir);
             }
         }
-        let mail_dir = mail_dir.to_path_buf();
-        if !roots.contains(&mail_dir) {
-            roots.push(mail_dir);
+        // Zirv creates its own state subdirectories so a first-ever `zirv`
+        // call from the sandbox does not escalate (#845).
+        for dir in state.workload_writable_dirs() {
+            let _ = std::fs::create_dir_all(&dir);
+            if dir.is_dir() && !roots.contains(&dir) {
+                roots.push(dir);
+            }
         }
 
         let quoted: Vec<String> = roots
@@ -4029,10 +4037,12 @@ mod tests {
             .status()
             .expect("git init");
         let state_root = tempfile::tempdir().expect("tempdir");
-        let mail_dir = state_root.path().join("mail");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
+        let mail_dir = state.mail();
 
         let adapter = CodexAdapter::new(None);
-        let args = adapter.extra_writable_root_args(repo.path(), &mail_dir);
+        let args = adapter.extra_writable_root_args(repo.path(), &state);
 
         let joined = args.join(" ");
         // Checked as a QUOTED, closed TOML string element (`"<path>"`), not a
@@ -4106,9 +4116,11 @@ mod tests {
             super::super::git_common_dir(main_repo.path()).expect("main repo has a git common dir");
 
         let state_root = tempfile::tempdir().expect("tempdir");
-        let mail_dir = state_root.path().join("mail");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
+        let mail_dir = state.mail();
         let adapter = CodexAdapter::new(None);
-        let args = adapter.extra_writable_root_args(&linked_path, &mail_dir);
+        let args = adapter.extra_writable_root_args(&linked_path, &state);
 
         let joined = args.join(" ");
         // Same fix as `extra_writable_root_args_always_includes_the_mail_
@@ -4154,20 +4166,71 @@ mod tests {
 
         let common_dir = std::fs::canonicalize(main_repo.path().join(".git")).expect("common dir");
         let git_dir = std::fs::canonicalize(common_dir.join("worktrees/worktree")).expect("gitdir");
-        let mail_dir = linked.path().join("mail");
-        let args = CodexAdapter::new(None).extra_writable_root_args(&linked_path, &mail_dir);
+        let state = crate::commands::ctx::state::StateDir::from_path(linked.path().to_path_buf());
+        let args = CodexAdapter::new(None).extra_writable_root_args(&linked_path, &state);
+        let mut roots = vec![
+            toml_quoted_string(&common_dir.display().to_string()),
+            toml_quoted_string(&git_dir.display().to_string()),
+        ];
+        roots.extend(
+            state
+                .workload_writable_dirs()
+                .iter()
+                .map(|dir| toml_quoted_string(&dir.display().to_string())),
+        );
         assert_eq!(
             args,
             vec![
                 "-c".to_string(),
                 format!(
-                    "sandbox_workspace_write.writable_roots=[{},{},{}]",
-                    toml_quoted_string(&common_dir.display().to_string()),
-                    toml_quoted_string(&git_dir.display().to_string()),
-                    toml_quoted_string(&mail_dir.display().to_string()),
+                    "sandbox_workspace_write.writable_roots=[{}]",
+                    roots.join(",")
                 ),
             ],
         );
+    }
+
+    /// Issue #845: a sandboxed seat's own `zirv workflow/ctx/artifact` calls
+    /// persist under these state subdirectories; none of the roots may be the
+    /// bare state root or the operator's `~/.zirv` config layer.
+    #[test]
+    fn extra_writable_root_args_cover_the_zirv_state_dirs_but_never_operator_config() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_path(state_root.path().join("ctx"));
+        let args = CodexAdapter::new(None).extra_writable_root_args(repo.path(), &state);
+        let joined = args.join(" ");
+        for dir in [
+            state.mail(),
+            state.memory(),
+            state.sessions(),
+            state.logs(),
+            state.tasks(),
+            state.workflows(),
+            state.verification(),
+            state.artifacts(),
+            state.workflow_telemetry(),
+        ] {
+            assert!(
+                joined.contains(&toml_quoted_string(&dir.display().to_string())),
+                "missing {dir:?}: {args:?}"
+            );
+            assert!(dir.is_dir(), "zirv must create {dir:?}");
+        }
+        for forbidden in [
+            state.root().to_path_buf(),
+            state.root().join("proxy-decisions.jsonl"),
+            state.approvals(),
+            std::path::PathBuf::from(".zirv"),
+            std::path::PathBuf::from(".codex"),
+            std::path::PathBuf::from(".claude"),
+        ] {
+            assert!(
+                !joined.contains(&toml_quoted_string(&forbidden.display().to_string())),
+                "must not name {forbidden:?}: {args:?}"
+            );
+        }
+        assert!(!joined.contains("ctx.toml"), "{args:?}");
     }
 
     /// The regression this round fixes, exercised end to end through the
@@ -4186,11 +4249,12 @@ mod tests {
         let linked_path = linked.path().join("worktree");
         init_linked_worktree(repo.path(), &linked_path);
         let state_root = tempfile::tempdir().expect("tempdir");
-        let mail_dir = state_root.path().join("mail");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
 
         let adapter = CodexAdapter::new(None);
         for cwd in [repo.path(), linked_path.as_path()] {
-            let extra = adapter.extra_writable_root_args(cwd, &mail_dir);
+            let extra = adapter.extra_writable_root_args(cwd, &state);
             assert!(!extra.is_empty(), "the mail root alone must still add args");
 
             let mut shim_args = vec!["/c".to_string(), "codex.cmd".to_string()];

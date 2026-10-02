@@ -343,8 +343,7 @@ pub(super) fn is_git_read_only(tokens: &[String]) -> bool {
 
 /// Zirv ctx verbs safe outside the sandbox because they spawn no
 /// caller-controlled subprocess. Unknown or newly added verbs remain
-/// ineligible until reviewed; base auto-allow uses a narrower subset
-/// (#168, #224).
+/// ineligible until reviewed (#168, #224).
 pub(super) const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "score",
     "handoff",
@@ -365,16 +364,6 @@ pub(super) const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     // argv, so it meets this list's escape-safe contract.
     "kill",
 ];
-
-/// Escape-safe ctx verbs eligible for base auto-allow, excluding `usage`:
-/// a static `usage *` glob cannot distinguish `usage tee -- <command>`
-/// from read-only usage, while the retry path checks subcommands (#224).
-pub(super) fn ctx_base_allow_verbs() -> impl Iterator<Item = &'static str> {
-    ZIRV_CTX_ESCAPE_SAFE_VERBS
-        .iter()
-        .copied()
-        .filter(|verb| *verb != "usage")
-}
 
 /// Require every segment of a reserved zirv command to be retry-safe.
 /// Reserved names alone do not prove sandbox safety: ctx launchers and

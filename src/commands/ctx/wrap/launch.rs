@@ -194,12 +194,17 @@ pub fn run_with(
     let policy_extra = if policy_skip {
         Vec::new()
     } else {
-        adapters::policy_launch_args(
-            &cfg,
+        adapters::with_workload_writable_roots(
+            adapters::policy_launch_args(
+                &cfg,
+                adapter.as_ref(),
+                rest,
+                launch_mode_from_interactive(interactive_launch),
+                role,
+            ),
             adapter.as_ref(),
-            rest,
-            launch_mode_from_interactive(interactive_launch),
-            role,
+            repo,
+            &state_dir,
         )
     };
     // Announce the effective policy once per session.

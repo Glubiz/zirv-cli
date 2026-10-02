@@ -331,12 +331,17 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             session.as_str(),
         )?;
         // Resolve policy every cycle; explicit operator flags win.
-        let policy_extra = adapters::policy_launch_args(
-            &cfg,
+        let policy_extra = adapters::with_workload_writable_roots(
+            adapters::policy_launch_args(
+                &cfg,
+                adapter.as_ref(),
+                &user_extra,
+                adapters::LaunchMode::Headless,
+                super::prompt::PromptRole::Worker,
+            ),
             adapter.as_ref(),
-            &user_extra,
-            adapters::LaunchMode::Headless,
-            super::prompt::PromptRole::Worker,
+            repo,
+            &state,
         );
         // Announce policy for each new session.
         announcer.emit(&super::announce::Event::SandboxPosture {

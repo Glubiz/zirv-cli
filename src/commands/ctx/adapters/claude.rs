@@ -4422,6 +4422,12 @@ mod tests {
         }
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx status *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx inbox *)")));
+        // Schema-derived (#845): verbs outside the old hand list are allowed
+        // while config writes and hook installs stay out.
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx wait *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx config show *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx config set *)")));
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx hook install *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx wrap *)")));
         // `usage`'s own `tee` subcommand launches an arbitrary trailing

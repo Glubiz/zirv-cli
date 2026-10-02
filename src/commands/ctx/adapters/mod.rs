@@ -43,7 +43,7 @@ pub(crate) use error::{
 pub use launch_policy::{
     SHIPPED_POSTURE_ALLOW, SHIPPED_POSTURE_ASK, SHIPPED_POSTURE_DENY, extend_read_only_args,
     flags_pin_policy, policy_launch_args, policy_launch_args_for_surface,
-    read_only_args_for_agent_name,
+    read_only_args_for_agent_name, with_workload_writable_roots,
 };
 pub(crate) use launch_policy::{doubled_slash_rule_base, scratchpad_roots, scratchpad_rules};
 pub use model::{
@@ -313,6 +313,9 @@ pub trait AgentAdapter: std::fmt::Debug {
             LaunchMode::Headless,
             super::prompt::PromptRole::Worker,
         );
+        if let Ok(state) = super::state::StateDir::resolve(&|key| std::env::var(key).ok()) {
+            extra = with_workload_writable_roots(extra, self, &task.repo, &state);
+        }
         // Resolution order (issue #699): an explicit per-invocation pin always
         // wins; otherwise consult the operator's tier map for this adapter,
         // never a guess of zirv's own. Neither branch ever narrows or widens
@@ -779,13 +782,13 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
-    /// Add only launch-specific worktree and mail roots, using the adapter's verified CLI mechanism at the actual spawn seam.
+    /// Add only launch-specific worktree and zirv state roots, using the adapter's verified CLI mechanism at the actual spawn seam.
     /// Caller contract: only call for a launch that is actually happening, never
-    /// speculatively. `mail_dir` is deliberately the mail subtree alone, never the
-    /// whole state root -- policy snapshots and the decision log must stay
-    /// unwritable by the workload.
-    fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
-        let _ = (cwd, mail_dir);
+    /// speculatively. The state roots are `StateDir::workload_writable_dirs`,
+    /// never the whole state root -- policy snapshots and the decision log must
+    /// stay unwritable by the workload.
+    fn extra_writable_root_args(&self, cwd: &Path, state: &super::state::StateDir) -> Vec<String> {
+        let _ = (cwd, state);
         Vec::new()
     }
 

@@ -27,31 +27,15 @@ pub fn builtin_deny() -> Vec<Rule> {
         .collect()
 }
 
-/// Generate native allow patterns only for unshadowable zirv built-ins.
-/// `ctx` uses safe verbs rather than `zirv ctx *`, which would grant
-/// caller-controlled subprocesses base Allow and sandbox exclusion.
+/// Native allow patterns for the unshadowable zirv built-ins, derived from
+/// the command schema: every built-in is prompt-free except the subtrees in
+/// [`PROMPT_FREE_EXCLUSIONS`] (#845). `ctx` needs per-verb rules because a
+/// blanket `zirv ctx *` would cover caller-controlled subprocesses.
 /// `agent`/`chat` need native globs for safe delegation, but posture-weakening
 /// flags receive an explicit hook Deny: silent Ask under `dontAsk` would
 /// leave those same native globs in force (#224).
 pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
-    crate::utils::RESERVED_COMMANDS
-        .iter()
-        .flat_map(|name| {
-            if *name == "ctx" {
-                ctx_base_allow_verbs()
-                    .map(|verb| format!("zirv ctx {verb} *"))
-                    .chain([
-                        "zirv ctx config show".into(),
-                        "zirv ctx config show *".into(),
-                    ])
-                    .collect::<Vec<_>>()
-            } else if BASE_GATED_RESERVED_BUILTINS.contains(name) {
-                Vec::new()
-            } else {
-                vec![format!("zirv {name} *")]
-            }
-        })
-        .collect()
+    schema_allow_patterns()
 }
 
 /// The base/native allow set and the OS-sandbox exclusion set deliberately
@@ -245,22 +229,13 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
             origin: Origin::BuiltIn,
         });
     }
-    let verb = tokens.get(2)?.to_ascii_lowercase();
-    if verb == "config" && tokens.get(3).is_some_and(|s| s == "show") {
-        return Some(Rule {
-            pattern: "zirv ctx config show *".to_string(),
-            origin: Origin::BuiltIn,
-        });
-    }
     if is_permissions_compile_write(&tokens) {
         return None;
     }
-    ctx_base_allow_verbs()
-        .any(|safe| safe == verb)
-        .then(|| Rule {
-            pattern: format!("zirv ctx {verb} *"),
-            origin: Origin::BuiltIn,
-        })
+    prompt_free_path(&tokens[1..]).map(|path| Rule {
+        pattern: format!("zirv {} *", path.join(" ")),
+        origin: Origin::BuiltIn,
+    })
 }
 
 /// Hard-deny writing `permissions compile`: it mutates the operator's home

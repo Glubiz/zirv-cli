@@ -471,6 +471,26 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     stdin: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<Option<Verdict>> {
+    run_check_hook_inner(cfg, w, stdin, env, true)
+}
+
+/// The deterministic verdict only: no audit rows and no Jev call, for a
+/// second look at a command the `PreToolUse` hook already judged (#845).
+pub(crate) fn evaluate_check_hook_verdict(
+    cfg: &CtxConfig,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> CtxResult<Option<Verdict>> {
+    run_check_hook_inner(cfg, &mut std::io::sink(), stdin, env, false)
+}
+
+fn run_check_hook_inner<W: Write>(
+    cfg: &CtxConfig,
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    record: bool,
+) -> CtxResult<Option<Verdict>> {
     let Some(payload) = HookToolPayload::parse(stdin) else {
         return Ok(None);
     };
@@ -777,7 +797,8 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     // Run Jev after deterministic adjustments so it sees the final local
     // verdict and any escalation clears stale Allow context. Skip `dontAsk`,
     // where its answer cannot change the decision (#781).
-    if payload.permission_mode != "dontAsk"
+    if record
+        && payload.permission_mode != "dontAsk"
         && let Ok(state) = super::state::StateDir::resolve(env)
     {
         outcome = apply_jev_approve_outcome(
@@ -798,7 +819,7 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
 
     // Audit the final repo-write disposition; a later guard may have changed
     // an advised or allowed write into Deny (#358).
-    if let Some((session, _target)) = orchestrator_block_pending {
+    if let Some((session, _target)) = orchestrator_block_pending.filter(|_| record) {
         let outcome_label = if outcome.verdict == Verdict::Deny {
             "denied"
         } else {
@@ -839,7 +860,9 @@ pub(crate) fn run_check_hook_with_verdict<W: Write>(
     ) {
         writeln!(w, "{output}")?;
     }
-    audit_hook_decision(&payload, command, mode, &outcome, &evidence, env);
+    if record {
+        audit_hook_decision(&payload, command, mode, &outcome, &evidence, env);
+    }
     Ok(Some(outcome.verdict))
 }
 

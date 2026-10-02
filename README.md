@@ -6600,6 +6600,8 @@ or the explicit opt-out below do.
   command.
 - **Codex headless:** `--sandbox workspace-write --ask-for-approval never`.
 
+Zirv-launched Codex `workspace-write` sessions also get zirv's own state subdirectories (mail, memory, sessions, logs, tasks, groups, workflows, verification, artifacts, workflow telemetry, adoption, intake, frontend, status snapshots) as writable roots so zirv commands do not escalate; the bare state root, policy snapshots, the decision log and `~/.zirv` operator config stay unwritable.
+
 `adapters::SHIPPED_POSTURE_ALLOW`/`_ASK`/`_DENY` are the shared source for the
 built-in classifier and Claude projection. Plain `curl`/`wget`, dependency
 installation, builds, commits, in-repo writes, read utilities, and commands
@@ -6686,6 +6688,24 @@ silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
 
 With the default `interactive_default = "allow"`, the hook answers "allow" for commands no rule matches and suppresses the harness's own permission prompt, so enabling the hook widens what runs without a prompt; set `[safety] interactive_default = "ask"` in `~/.zirv/ctx.toml` to keep the harness's prompt for unmatched commands.
+
+**Zirv's own commands never prompt (issue #845).** The launch layer's native
+`Bash(zirv ...)` allow rules are derived from the clap command schema
+(`zirv commands`): every built-in is allowed except a short exclusion list --
+commands that run a caller-supplied command or start a nested harness session
+(`ctx exec`/`wrap`/`run`/`loop`/`chat`/`agent`/`resume`/`handover`,
+`ctx usage tee`) and commands that write operator or harness configuration
+(`setup`, the mutating `ctx config` verbs, `ctx hook install`, `ctx provider
+login`/`credential`). Repo-authored `zirv <script>` is never covered. Because
+Claude Code matches every compound segment on its own and never matches a
+path-qualified binary, an env-prefixed command or a command substitution, the
+`PermissionRequest` hook (`zirv ctx hook permission`) additionally prints an
+`allow` decision when it is about to prompt for a Bash command that zirv's own
+safety verdict allows and whose every segment is a prompt-free built-in zirv
+invocation (`zirv` or the running binary's own path; only `ZIRV_*` env prefixes,
+and only on `ctx`), a literal `cd`, or a read-only filter, with each
+`$(...)`/backtick body held to the same rule. It never prints deny or ask, so
+every refusal and a matching deny rule still win.
 
 Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry. A variable must have a single literal assignment in a simple command list; functions, traps, shell-variable mutations and ambiguous expansions disable resolution. Unresolved targets still require approval on a retry. A `CLAUDE_CODE_TMPDIR` already ending in `claude-<uid>` is used as-is; on macOS, scratchpad roots include both `/tmp/...` and `/private/tmp/...` spellings.
 Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`) are read-only for the network classifier and retry screen when every request URL matches a query route and any body is inline. File/stdin uploads, dynamic bodies, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.

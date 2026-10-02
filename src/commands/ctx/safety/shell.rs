@@ -282,7 +282,7 @@ const OPAQUE_MESSAGE_PLACEHOLDER: &str = "<opaque:message>";
 /// Stable placeholder [`redact_single_quoted_heredocs`] substitutes for a
 /// heredoc body's lines. See [`OPAQUE_MESSAGE_PLACEHOLDER`]'s own doc
 /// comment for why this is non-empty and metacharacter-free.
-const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
+pub(super) const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
 
 /// Quote-aware token with a character span in source text; keep quote
 /// characters so replacements preserve the original syntax.

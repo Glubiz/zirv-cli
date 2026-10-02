@@ -952,15 +952,15 @@ fn effective_delegation_model<'a>(
     route.map(|route| route.model.as_str()).or(requested_model)
 }
 
-/// Add Codex writable roots only at real launch, after routing determines repo and mail paths (#252).
+/// Add Codex writable roots only at real launch, after routing determines repo and state paths (#252).
 /// Other adapters use the empty trait default.
 fn with_headless_extra_writable_roots(
     mut command: Vec<String>,
     adapter: &dyn AgentAdapter,
     launch_repo: &Path,
-    mail_dir: &Path,
+    state: &super::state::StateDir,
 ) -> Vec<String> {
-    command.extend(adapter.extra_writable_root_args(launch_repo, mail_dir));
+    command.extend(adapter.extra_writable_root_args(launch_repo, state));
     command
 }
 
@@ -3160,12 +3160,14 @@ mod tests {
             .status()
             .expect("git init");
         let state_root = tempfile::tempdir().expect("tempdir");
-        let mail_dir = state_root.path().join("mail");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
+        let mail_dir = state.mail();
         let expected_git_dir =
             super::super::adapters::git_common_dir(repo.path()).expect("repo has a git common dir");
 
         let codex = super::super::adapters::codex::CodexAdapter::new(None);
-        let out = with_headless_extra_writable_roots(Vec::new(), &codex, repo.path(), &mail_dir);
+        let out = with_headless_extra_writable_roots(Vec::new(), &codex, repo.path(), &state);
         let joined = out.join(" ");
         assert!(
             joined.contains(&expected_git_dir.display().to_string()),
@@ -3183,11 +3185,13 @@ mod tests {
     #[test]
     fn headless_claude_launch_flags_are_unchanged_by_the_extra_writable_root_seam() {
         let repo = crate::commands::ctx::testenv::repo();
-        let mail_dir = tempfile::tempdir().expect("tempdir").path().join("mail");
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let state =
+            crate::commands::ctx::state::StateDir::from_path(state_root.path().to_path_buf());
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
 
         let base = vec!["--model".to_string(), "sonnet".to_string()];
-        let out = with_headless_extra_writable_roots(base.clone(), &claude, repo.path(), &mail_dir);
+        let out = with_headless_extra_writable_roots(base.clone(), &claude, repo.path(), &state);
         assert_eq!(
             out, base,
             "claude has no verified writable-root mechanism, so this seam must add nothing"
@@ -3341,7 +3345,7 @@ mod tests {
             headless_worker_flags(&cfg, &args, &adapter),
             &adapter,
             tmp.path(),
-            &tmp.path().join("mail"),
+            &crate::commands::ctx::state::StateDir::from_path(tmp.path().to_path_buf()),
         );
         let sandbox: Vec<_> = flags
             .windows(2)
