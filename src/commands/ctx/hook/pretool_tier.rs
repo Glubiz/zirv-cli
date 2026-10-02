@@ -72,6 +72,14 @@ pub struct PreToolInput {
     pub edits: Vec<PreToolEdit>,
     /// Bash command text for the bounded bare-`git log` rewrite (#419).
     pub command: String,
+    /// `AskUserQuestion`'s questions; the dashboard shows the first while the operator is asked.
+    pub questions: Vec<AskedQuestion>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AskedQuestion {
+    pub question: String,
 }
 
 /// Optional MultiEdit entry; payload drift must not break the hook.

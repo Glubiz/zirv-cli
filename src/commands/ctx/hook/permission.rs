@@ -409,14 +409,14 @@ pub(super) fn run_permission<W: Write>(
     Ok(0)
 }
 
-/// Clear Approval only when it is still the persisted attention state.
+/// Clear Approval or Question only when it is still the persisted attention state.
 /// Tool hooks and PermissionDenied prove the prompt ended; a locked
 /// conditional write preserves unrelated higher-priority latches. Read
 /// without the lock first to avoid common-path hot-hook latency (#456).
 pub(super) fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
-    if crate::commands::ctx::attention::load(state, short).attention
-        != crate::commands::ctx::attention::Attention::Approval
-    {
+    use crate::commands::ctx::attention::Attention;
+    let waiting = |attention| matches!(attention, Attention::Approval | Attention::Question);
+    if !waiting(crate::commands::ctx::attention::load(state, short).attention) {
         return;
     }
     let _ = crate::commands::ctx::attention::record_if(
@@ -430,7 +430,7 @@ pub(super) fn clear_resolved_approval(state: &StateDir, short: &str, evidence: S
         )
         .with_attention(crate::commands::ctx::attention::Attention::None),
         now,
-        |prev| prev.attention == crate::commands::ctx::attention::Attention::Approval,
+        |prev| waiting(prev.attention),
     );
 }
 
@@ -763,6 +763,42 @@ mod tests {
         )
         .expect("never errors");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ask_user_question_latches_a_question_until_the_next_tool_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        run_pretool(
+            &mut Vec::new(),
+            &pretool_stdin(
+                "AskUserQuestion",
+                serde_json::json!({"questions": [{"question": "Which layout?"}]}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let status = crate::commands::ctx::attention::load(&state, &short);
+        assert_eq!(
+            status.attention,
+            crate::commands::ctx::attention::Attention::Question
+        );
+        assert!(status.evidence.contains("AskUserQuestion: Which layout?"));
+        run_pretool(
+            &mut Vec::new(),
+            &pretool_stdin("Read", serde_json::json!({"file_path": "/work/repo/a.rs"})),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::None
+        );
     }
 
     #[test]
