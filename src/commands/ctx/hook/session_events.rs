@@ -622,13 +622,15 @@ mod tests {
             .unwrap();
         };
 
+        std::fs::create_dir_all(&projects).expect("projects");
         let resumed = projects.join("bff6a2d4-bf99-498d-8c9e-5efc2d84bdb9.jsonl");
+        std::fs::write(&resumed, "").expect("resumed transcript");
         start(&projects.join(format!("{zirv}.jsonl")).display().to_string());
         assert!(!pin.exists());
         start(&resumed.display().to_string());
         assert_eq!(
             std::fs::read_to_string(&pin).unwrap(),
-            resumed.display().to_string()
+            format!("{zirv}\n{}", resumed.display())
         );
     }
 

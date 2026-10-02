@@ -713,30 +713,37 @@ pub(crate) fn pin_hook_transcript(
     zirv_session: &str,
     transcript_path: &str,
 ) {
-    let path = Path::new(transcript_path);
-    let projects = ClaudeAdapter::new(None)
-        .home_dir()
-        .join(".claude")
-        .join("projects");
-    let stem = path.file_stem().and_then(|stem| stem.to_str());
-    let trusted = path.is_absolute()
-        && path.extension().is_some_and(|ext| ext == "jsonl")
-        && path.starts_with(&projects)
-        && !path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir));
+    let stem = Path::new(transcript_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str());
     if zirv_session.is_empty()
-        || !trusted
+        || !is_projects_transcript(Path::new(transcript_path))
         || stem.is_none_or(|stem| stem.is_empty() || stem == zirv_session)
     {
         return;
     }
     let pin = transcript_pin(state, zirv_session);
-    if std::fs::read_to_string(&pin).is_ok_and(|current| current.trim() == transcript_path) {
+    let contents = format!("{zirv_session}\n{transcript_path}");
+    if std::fs::read_to_string(&pin).is_ok_and(|current| current == contents) {
         return;
     }
     if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
-        let _ = super::super::state::write_private(&pin, transcript_path);
+        let _ = super::super::state::write_private(&pin, &contents);
+    }
+}
+
+/// An absolute `.jsonl` file that, symlinks resolved, lies under the Claude projects root.
+fn is_projects_transcript(path: &Path) -> bool {
+    let projects = ClaudeAdapter::new(None)
+        .home_dir()
+        .join(".claude")
+        .join("projects");
+    if !path.is_absolute() || path.extension().is_none_or(|ext| ext != "jsonl") {
+        return false;
+    }
+    match (path.canonicalize(), projects.canonicalize()) {
+        (Ok(real), Ok(root)) => real.starts_with(root),
+        _ => false,
     }
 }
 
@@ -748,9 +755,12 @@ pub(crate) fn session_transcript(
     session: &SessionRef,
 ) -> PathBuf {
     std::fs::read_to_string(transcript_pin(state, session.id.as_str()))
-        .map(|recorded| PathBuf::from(recorded.trim()))
         .ok()
-        .filter(|pinned| pinned.is_file())
+        .and_then(|recorded| {
+            let (owner, path) = recorded.split_once('\n')?;
+            (owner == session.id.as_str()).then(|| PathBuf::from(path.trim()))
+        })
+        .filter(|pinned| is_projects_transcript(pinned))
         .unwrap_or_else(|| adapter.transcript_path(session))
 }
 
@@ -3773,6 +3783,7 @@ mod tests {
         super::super::built_args(&adapter.program, cmd)
     }
 
+    #[cfg(unix)]
     #[test]
     fn pin_hook_transcript_ignores_paths_outside_the_projects_root() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -3781,6 +3792,15 @@ mod tests {
         let zirv = "c391fd4f-84e7-4a6c-81fe-5738d28be57c";
         let projects = home.path().join(".claude/projects/-repo");
         let pin = transcript_pin(&state, zirv);
+        std::fs::create_dir_all(&projects).expect("projects");
+        std::fs::create_dir_all(home.path().join("elsewhere")).expect("elsewhere");
+        for existing in [
+            projects.join("other.jsonl"),
+            projects.join("other.txt"),
+            home.path().join("elsewhere/other.jsonl"),
+        ] {
+            std::fs::write(existing, "").expect("file");
+        }
         let traversal = format!("{}/../../x/other.jsonl", projects.display());
         let outside = home.path().join("elsewhere/other.jsonl");
         let wrong_ext = projects.join("other.txt");
@@ -3795,9 +3815,36 @@ mod tests {
             pin_hook_transcript(&state, zirv, &rejected);
             assert!(!pin.exists(), "pinned {rejected:?}");
         }
-        let accepted = projects.join("other.jsonl").display().to_string();
-        pin_hook_transcript(&state, zirv, &accepted);
-        assert_eq!(std::fs::read_to_string(&pin).unwrap(), accepted);
+        let secret = home.path().join("elsewhere/secret.jsonl");
+        std::fs::write(&secret, "").expect("secret");
+        std::os::unix::fs::symlink(&secret, projects.join("link.jsonl")).expect("symlink");
+        pin_hook_transcript(
+            &state,
+            zirv,
+            &projects.join("link.jsonl").display().to_string(),
+        );
+        assert!(!pin.exists(), "pinned a symlink leaving the root");
+        let accepted = projects.join("other.jsonl");
+        pin_hook_transcript(&state, zirv, &accepted.display().to_string());
+        let session = SessionRef {
+            id: SessionId::parse(zirv),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        let adapter = ClaudeAdapter::new(None);
+        assert_eq!(session_transcript(&adapter, &state, &session), accepted);
+
+        // Same short id, different session: the pin is not theirs.
+        let colliding = SessionRef {
+            id: SessionId::parse("c391fd4f-0000-4000-8000-000000000000"),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        assert_ne!(session_transcript(&adapter, &state, &colliding), accepted);
+
+        // A pin swapped for a symlink leaving the root is ignored on read.
+        std::fs::remove_file(&accepted).expect("rm");
+        std::os::unix::fs::symlink(home.path().join("elsewhere/secret.jsonl"), &accepted)
+            .expect("swap");
+        assert_ne!(session_transcript(&adapter, &state, &session), accepted);
     }
 
     #[test]
