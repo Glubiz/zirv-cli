@@ -642,28 +642,32 @@ pub fn resolve_prefix(state: &StateDir, prefix: &str) -> Result<Record, ResolveE
         .map(|(record, _)| record)
         .collect();
 
-    // A worker's name (`zirv agent --name`) addresses it too, and wins over a prefix match.
+    // An exact short or session id always wins over a worker name.
+    if let Some(exact) = live
+        .iter()
+        .find(|r| r.short == prefix || r.session == prefix)
+    {
+        return Ok(exact.clone());
+    }
+
+    // A worker's name (`zirv agent --name`) addresses it too; a name and a prefix of
+    // different sessions together are ambiguous.
     let names = if prefix.is_empty() {
         Default::default()
     } else {
         super::graph::agent_names(state)
     };
-    let mut matches: Vec<Record> = live
+    let matches: Vec<Record> = live
         .iter()
         .filter(|r| {
             names
                 .get(&r.short)
                 .is_some_and(|n| n.eq_ignore_ascii_case(prefix))
+                || r.short.starts_with(prefix)
+                || r.session.starts_with(prefix)
         })
         .cloned()
         .collect();
-    if matches.is_empty() {
-        matches = live
-            .iter()
-            .filter(|r| r.short.starts_with(prefix) || r.session.starts_with(prefix))
-            .cloned()
-            .collect();
-    }
 
     match matches.len() {
         0 => Err(ResolveError::NotFound {
@@ -1496,6 +1500,45 @@ mod tests {
             resolve_prefix(&state, "fix-tests"),
             Err(ResolveError::Ambiguous(shorts)) if shorts.len() == 2
         ));
+    }
+
+    #[test]
+    fn a_hex_looking_worker_name_never_shadows_another_sessions_short_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let launch = |session: &str, name: Option<&str>| {
+            let mut record = record_for(session, &repo, Verb::Wrap);
+            record.pid = std::process::id();
+            write_record(&state, &record);
+            super::super::graph::record_worker_launch(
+                &state,
+                &repo,
+                &super::super::graph::Launch {
+                    session,
+                    origin: "pane",
+                    parent_session: None,
+                    harness: Some("codex"),
+                    model: None,
+                    task: None,
+                    name,
+                    workdir: None,
+                },
+                1,
+            );
+        };
+        launch("aaaaaaaa-1111-4222-8333-444444444444", Some("cafe"));
+        launch("cafe12ab-1111-4222-8333-444444444444", None);
+        assert!(matches!(
+            resolve_prefix(&state, "cafe"),
+            Err(ResolveError::Ambiguous(shorts)) if shorts.len() == 2
+        ));
+        assert_eq!(
+            resolve_prefix(&state, "cafe12ab")
+                .expect("full short id")
+                .short,
+            "cafe12ab"
+        );
     }
 
     #[test]
