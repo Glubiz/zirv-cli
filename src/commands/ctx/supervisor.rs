@@ -656,10 +656,11 @@ pub(crate) fn record_for_test(state: &StateDir, session: &str, reason: &str) {
     rulings::record(state, session, None, RulingKind::Done, "not_done", reason);
 }
 
-/// The Stop hook's block: Claude only. Codex has no Stop-hook block, so it relies on the mailed
-/// ruling and the workflow gate alone. Never errors; any failure means no block.
+/// The Stop hook's block, for Claude and Codex alike: Codex continues the turn on a Stop hook's
+/// `decision: "block"` with the reason as the next prompt (https://learn.chatgpt.com/docs/hooks).
+/// Never errors; any failure means no block.
 pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Option<String> {
-    if env(AGENT_ENV).as_deref() == Some("codex") || env(CONSULT_ENV).is_some() {
+    if env(CONSULT_ENV).is_some() {
         return None;
     }
     // A repo config the loader refuses must not silence a binding ruling.
@@ -1857,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_hook_blocks_at_most_three_times_per_ruling_and_claude_only() {
+    fn the_stop_hook_blocks_at_most_three_times_per_ruling_for_claude_and_codex() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
         let mut env = ruling_env(state.root());
@@ -1870,8 +1871,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         env.insert(AGENT_ENV.to_string(), "codex".to_string());
-        assert!(blocks(&env).is_empty(), "codex has no Stop-hook block");
-        env.remove(AGENT_ENV);
         let reasons = blocks(&env);
         assert_eq!(reasons.len(), 3, "{reasons:?}");
         assert!(reasons[0].contains("no tests yet") && reasons[0].contains(&ruling.id));
