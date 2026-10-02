@@ -391,17 +391,6 @@ pub(super) fn node_model_badged(data: &TreeData, node: &Node) -> String {
     }
 }
 
-fn per_million((input, output): (u64, u64)) -> String {
-    let dollars = |micros: u64| {
-        if micros.is_multiple_of(1_000_000) {
-            format!("${}", micros / 1_000_000)
-        } else {
-            format!("${:.2}", micros as f64 / 1_000_000.0)
-        }
-    };
-    format!("{} / {} per 1M", dollars(input), dollars(output))
-}
-
 pub(super) fn seat_title(facts: &TreeFacts) -> String {
     [facts.seat_harness, facts.seat_model]
         .into_iter()
@@ -662,7 +651,6 @@ impl Row {
 }
 
 pub(super) fn seat_rows(model: &Model, count: usize, inner: usize) -> Vec<Row> {
-    let data = model.data;
     let facts = model.facts;
     let role = facts.seat_role.unwrap_or("seat");
     let title = vec![
@@ -674,12 +662,6 @@ pub(super) fn seat_rows(model: &Model, count: usize, inner: usize) -> Vec<Row> {
     let mut priced: Vec<Span<'static>> = Vec::new();
     if effort.is_some() {
         priced.extend(effort_spans(effort, pal::SEAT));
-    }
-    if let Some(price) = data.seat_price.map(per_million) {
-        if !priced.is_empty() {
-            priced.push(span("   ", dim()));
-        }
-        priced.push(span(price, dim()));
     }
     let tokens = model.seat.and_then(|n| n.tokens).map(tokens_label);
     let rot = facts

@@ -1179,7 +1179,6 @@ mod tests {
             "off",
             "claude fable \u{b7} orchestrator",
             "effort \u{25ae}\u{25ae}\u{25ae}\u{25af} high",
-            "$15 / $75 per 1M",
             "rot 0.18",
             "JEV \u{b7} decisions",
             "calls 214",
@@ -1361,7 +1360,6 @@ mod tests {
         // A seat with no known effort has no effort row at all.
         let mut bare = data;
         bare.nodes[0].effort = None;
-        bare.seat_price = None;
         let text = draw(160, 45, &view(bare), &f);
         let seat_rows: Vec<&str> = text.lines().filter(|l| l.contains("effort")).collect();
         assert!(

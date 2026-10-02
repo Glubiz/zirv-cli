@@ -43,7 +43,6 @@ use chrono::FixedOffset;
 use super::super::config::CtxConfig;
 use super::super::graph::{self, Event, Node};
 use super::super::mail;
-use super::super::price;
 use super::super::sessions;
 use super::super::state::{StateDir, now_secs, repo_slug_read_only};
 use super::super::supervisor;
@@ -105,8 +104,6 @@ pub(super) struct TreeData {
     pub(super) loaded: bool,
     pub(super) nodes: Vec<Node>,
     pub(super) events: Vec<Event>,
-    /// The seat model's `(input, output)` micro-USD per 1M tokens, when priced.
-    pub(super) seat_price: Option<(u64, u64)>,
     /// Newest Jev decision per site: `(margin, sharp)`.
     pub(super) jev_verdicts: BTreeMap<String, (f64, bool)>,
     /// Lowercased model ids the operator or the scorecard avoids; empty unless opted in.
@@ -265,7 +262,6 @@ pub(super) fn compute(
     state: &StateDir,
     repo: &Path,
     codex_root: Option<&Path>,
-    seat_model: Option<&str>,
     seat_session: Option<&str>,
     cfg: &CtxConfig,
 ) -> TreeData {
@@ -276,11 +272,6 @@ pub(super) fn compute(
     let mut all = graph::merged_events_with_mail(state, &edges);
     all.extend(dispatch_events(&nodes, &all));
     let events = connection_events(all);
-    let seat_price = seat_model.and_then(|model| {
-        let table = price::resolve_table(cfg);
-        let p = table.models.get(model)?;
-        Some((p.input_micros, p.output_micros))
-    });
     let slug = repo_slug_read_only(repo);
     // The Jev box shows this seat's work: its descendants, and nothing from before it started (a proxy
     // row names no session). Without a seat the box falls back to the repository's last half day.
@@ -318,7 +309,6 @@ pub(super) fn compute(
         loaded: true,
         nodes,
         events,
-        seat_price,
         jev_verdicts: graph::jev_site_verdicts(state),
         avoided: super::super::models::avoid_for_state(cfg, state),
         supervisor: supervisor_fact(state, cfg, seat_short),
@@ -780,7 +770,6 @@ mod testkit {
                     None,
                 ),
             ],
-            seat_price: Some((15_000_000, 75_000_000)),
             jev_verdicts: [("dispatch tier".to_string(), (0.87, true))].into(),
             ..TreeData::default()
         }
@@ -914,7 +903,6 @@ mod testkit {
                 mail_to,
                 event(1_235, "seat-1", "decision", "allow cargo", None),
             ],
-            seat_price: Some((15_000_000, 75_000_000)),
             jev_verdicts: [
                 ("dispatch tier".to_string(), (0.87, true)),
                 ("review triage".to_string(), (0.97, true)),

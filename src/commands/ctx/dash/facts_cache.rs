@@ -66,9 +66,6 @@ pub(super) struct DiskFacts {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AggregateSpendFacts {
     pub(super) failed: u64,
-    pub(super) cost_micros: u64,
-    /// Count unknown-priced messages so a displayed cost of zero does not imply no work occurred (#457).
-    pub(super) skipped_messages: u64,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -384,10 +381,8 @@ impl FactsCache {
             &table,
         );
         // Display unknown spend only when neither transcript nor delegation source exists (#457).
-        self.disk.spend = spend.cost_micros.map(|cost_micros| AggregateSpendFacts {
+        self.disk.spend = spend.cost_micros.map(|_| AggregateSpendFacts {
             failed: spend.delegation_failed,
-            cost_micros,
-            skipped_messages: spend.skipped_messages,
         });
     }
 
@@ -1085,10 +1080,6 @@ mod tests {
         );
 
         let spend = cache.disk.spend.expect("the owner's own row is not empty");
-        assert_eq!(
-            spend.cost_micros, 10_000_000,
-            "only the owner's own 1M sonnet output tokens ($10) may be counted"
-        );
         assert_eq!(
             spend.failed, 0,
             "another session's failed delegation is not this footer's failure"
