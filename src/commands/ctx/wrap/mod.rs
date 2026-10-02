@@ -1660,8 +1660,22 @@ mod tests {
             // terminal to send.
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
+            // A file, not a pipe: like NUL it is not a console, and it cannot fill and block the wrapper.
+            let log = std::fs::File::create(stderr_log(state)).expect("stderr log");
+            cmd.stderr(log);
+            // Keep the developer's real ~/.zirv/ctx.toml out of the run.
+            for home in ["HOME", "USERPROFILE"] {
+                cmd.env(home, state);
+            }
             cmd.spawn().expect("spawn zirv ctx wrap")
+        }
+
+        fn stderr_log(state: &std::path::Path) -> std::path::PathBuf {
+            state.join("wrap-stderr.log")
+        }
+
+        fn wrap_stderr(state: &std::path::Path) -> String {
+            std::fs::read_to_string(stderr_log(state)).unwrap_or_default()
         }
 
         /// The regression that shipped: portable-pty's pseudoconsole asks for a
@@ -1674,7 +1688,12 @@ mod tests {
                 spawn_wrap(tmp.path(), &["--no-supervise"], &["cmd", "/c", "exit", "0"]);
             let status = wait_bounded(&mut child, Duration::from_secs(30))
                 .expect("wrap must exit, not deadlock on the console host's cursor probe");
-            assert_eq!(status.code(), Some(0), "the child's own exit code");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "the child's own exit code; wrap stderr: {}",
+                wrap_stderr(tmp.path())
+            );
         }
 
         /// The wrapped command's exit code is the wrapper's, so a
@@ -1686,7 +1705,12 @@ mod tests {
                 spawn_wrap(tmp.path(), &["--no-supervise"], &["cmd", "/c", "exit", "3"]);
             let status = wait_bounded(&mut child, Duration::from_secs(30))
                 .expect("wrap must exit rather than deadlock");
-            assert_eq!(status.code(), Some(3));
+            assert_eq!(
+                status.code(),
+                Some(3),
+                "wrap stderr: {}",
+                wrap_stderr(tmp.path())
+            );
         }
 
         /// Supervision used to be off for the entire run on Windows: the turn

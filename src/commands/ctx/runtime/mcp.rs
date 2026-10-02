@@ -2209,6 +2209,13 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
         let mut environment = BTreeMap::new();
+        // Hypothesis (#635): cmd.exe may not start reliably under env_clear() without these.
+        #[cfg(windows)]
+        for key in ["SystemRoot", "PATH", "COMSPEC"] {
+            if let Ok(value) = std::env::var(key) {
+                environment.insert(key.to_string(), value);
+            }
+        }
         environment.insert(
             "MCP_HANG_MARKER".to_string(),
             marker.to_string_lossy().into_owned(),
@@ -2240,7 +2247,7 @@ mod tests {
             .expect_err("a request stuck on a non-responding server must be cancellable");
         let elapsed = started.elapsed();
 
-        assert_eq!(error, McpError::Cancelled);
+        assert_eq!(error, McpError::Cancelled, "got {error:?}");
         assert!(
             elapsed < Duration::from_secs(5),
             "a mid-flight cancellation must be observed within a poll tick, \
