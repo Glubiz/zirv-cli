@@ -3282,9 +3282,25 @@ mod tests {
         let mut v = view(data);
         let text = draw(160, 45, &v, &f);
         let (x, y) = at_flow(&text, "reads the code");
+        let opened = click(&mut v, &f, (160, 45), (x + 3, y));
+        let Outcome::OpenSubagent {
+            id,
+            session,
+            host,
+            title,
+            ..
+        } = opened
+        else {
+            panic!("a native subagent opens itself, not its host: {opened:?}");
+        };
         assert_eq!(
-            click(&mut v, &f, (160, 45), (x + 3, y)),
-            Outcome::OpenPane("seat1".into())
+            (
+                id.as_str(),
+                session.as_deref(),
+                host.as_deref(),
+                title.as_str()
+            ),
+            ("a1", Some("seat-1"), Some("seat1"), "reads the code")
         );
         assert_eq!(v.opened, Some(Sel::Agent("a1".into())));
         // The host's chat is showing: the bar names the subagent and where it runs.
@@ -3336,7 +3352,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_whose_host_has_no_pane_here_gets_a_notice_naming_the_host() {
+    fn a_subagent_whose_host_has_no_pane_here_still_opens_its_transcript_and_a_key_closes_it() {
         let (mut data, wf, jev) = busy();
         data.nodes
             .iter_mut()
@@ -3349,16 +3365,36 @@ mod tests {
         let text = draw(160, 45, &v, &f);
         let (x, y) = at_flow(&text, "reads the code");
         let out = click(&mut v, &f, (160, 45), (x + 3, y));
-        assert_eq!(
-            out,
-            Outcome::Notice(
-                "reads the code runs inside seat, which has no pane on this dashboard".into()
-            )
-        );
-        assert_eq!(v.opened, None);
         assert!(
-            draw(160, 45, &v, &f).contains("runs inside seat, which has no pane"),
-            "the toast shows it"
+            matches!(&out, Outcome::OpenSubagent { host: None, .. }),
+            "{out:?}"
+        );
+        // The loop opens the read-only view; Esc and ^A t come back to the flow.
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("agent-a1.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"mapped 4 call sites\"}]}}\n",
+        )
+        .expect("write");
+        v.open_subagent_view("reads the code".into(), path);
+        let shown = draw(160, 45, &v, &f);
+        assert!(
+            shown.contains("subagent \u{b7} reads the code")
+                && shown.contains("mapped 4 call sites"),
+            "{shown}"
+        );
+        press(&mut v, &f, 160, 45, KeyCode::Esc);
+        assert!(
+            draw(160, 45, &v, &f).contains("FLOW"),
+            "Esc returns to the flow"
+        );
+        let path = dir.path().join("agent-a1.jsonl");
+        v.open_subagent_view("reads the code".into(), path);
+        v.chord_toggle();
+        assert!(
+            v.sub.is_none() && v.is_visible(),
+            "^A t closes the view first"
         );
     }
 

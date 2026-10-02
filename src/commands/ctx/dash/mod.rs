@@ -31,6 +31,7 @@ mod reap;
 mod selection_clipboard;
 mod sidebar_facts;
 mod spawn_policy;
+mod subagent_focus;
 mod terminal_turn;
 mod tree_view;
 
@@ -982,6 +983,9 @@ fn run_dashboard_inner(
             || facts_refresher.take_latest(facts_now),
         );
         tree_view.poll();
+        if let Some(why) = tree_view.drive_focus(&mut panes, Instant::now()) {
+            push_notice(&mut notices, Instant::now(), why);
+        }
         if tree_view.due(facts_now) {
             let (tree_state, tree_repo, tree_cfg) =
                 (state.clone(), repo.to_path_buf(), cfg.clone());
@@ -3791,6 +3795,50 @@ fn apply_tree_outcome(
                 select_row(&short, rows, *dash.selected, *dash.focused);
             // The chat opens inside the tree, under its bar, with the pane taking every key.
             tree_view.open_chat();
+        }
+        Outcome::OpenSubagent {
+            id,
+            session,
+            host,
+            agent_type,
+            description,
+            title,
+        } => {
+            let path = session
+                .as_deref()
+                .and_then(|session| super::graph::native_subagent_path(state, session, &id));
+            let fallback = path.map(|path| (title, path));
+            let target = subagent_focus::Target {
+                agent_type,
+                description,
+            };
+            let host_short = host.filter(|short| {
+                dash.panes
+                    .iter()
+                    .any(|p| p.short() == short && subagent_focus::drivable(p, &target))
+            });
+            let Some(short) = host_short else {
+                match fallback {
+                    Some((title, path)) => tree_view.open_subagent_view(title, path),
+                    None => notice(dash, "no transcript was found for this subagent".into()),
+                }
+                return;
+            };
+            apply_tree_outcome(
+                Outcome::OpenPane(short.clone()),
+                tree_view,
+                None,
+                state,
+                repo,
+                rows,
+                dash,
+            );
+            if tree_view.in_chat() {
+                let focus = subagent_focus::Focus::new(short, target, Instant::now());
+                tree_view.start_focus(focus, fallback);
+            } else if let Some((title, path)) = fallback {
+                tree_view.open_subagent_view(title, path);
+            }
         }
         Outcome::Mail { to } => {
             let mut view = build_mail_view(state, repo);

@@ -43,6 +43,16 @@ pub(in super::super) enum Outcome {
         body: String,
     },
     Notice(String),
+    /// Land on this pane-less native Claude subagent: drive its host pane's own subagent list when
+    /// that is safe, else show its transcript read-only.
+    OpenSubagent {
+        id: String,
+        session: Option<String>,
+        host: Option<String>,
+        agent_type: Option<String>,
+        description: String,
+        title: String,
+    },
     /// Answer the approval the orchestrator dashboard showed in full: only a request that was
     /// drawn with its answer keys is ever answered.
     AnswerShown {
@@ -246,6 +256,19 @@ impl TreeView {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
+            return Outcome::None;
+        }
+        if let Some(sub) = self.sub.as_mut() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.sub = None,
+                KeyCode::Up | KeyCode::Char('k') => sub.scroll(1),
+                KeyCode::Down | KeyCode::Char('j') => sub.scroll(-1),
+                KeyCode::PageUp => sub.scroll(10),
+                KeyCode::PageDown => sub.scroll(-10),
+                KeyCode::Home => sub.scroll(isize::MAX / 2),
+                KeyCode::End => sub.scroll(isize::MIN / 2),
+                _ => {}
+            }
             return Outcome::None;
         }
         let in_orch = !surf.panel && orch::fits(surf.area.width, surf.area.height);
@@ -495,6 +518,14 @@ impl TreeView {
         facts: &TreeFacts,
         now: Instant,
     ) -> Outcome {
+        if let Some(sub) = self.sub.as_mut() {
+            match event.kind {
+                MouseEventKind::ScrollUp => sub.scroll(3),
+                MouseEventKind::ScrollDown => sub.scroll(-3),
+                _ => {}
+            }
+            return Outcome::None;
+        }
         let (x, y) = (event.column, event.row);
         let in_orch = !surf.panel && orch::fits(surf.area.width, surf.area.height);
         match event.kind {
@@ -763,6 +794,24 @@ fn open_sel(model: &Model, sel: &Sel) -> (Outcome, Option<Option<Sel>>) {
         let notice = Outcome::Notice(format!("{} has no pane to open", name_of(model, sel)));
         return (notice, None);
     };
+    if node.kind == "subagent" && node.harness.as_deref() == Some("claude") {
+        let open = Outcome::OpenSubagent {
+            id: node.id.clone(),
+            session: node.session.clone(),
+            host: model
+                .host(node)
+                .filter(|host| host.pane)
+                .map(|host| host.short),
+            agent_type: node.role.clone(),
+            description: node
+                .label
+                .clone()
+                .or_else(|| node.job.clone())
+                .unwrap_or_default(),
+            title: model.job_of(node),
+        };
+        return (open, Some(Some(sel.clone())));
+    }
     match model.host(node) {
         Some(host) if host.pane => (Outcome::OpenPane(host.short), Some(Some(sel.clone()))),
         Some(host) => (
