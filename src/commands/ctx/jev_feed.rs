@@ -58,7 +58,12 @@ pub struct JevFeed {
 /// scope takes its Jev rows by session and its proxy rows by the session's repository, and a
 /// repository scope takes Jev rows of the registered sessions that run there.
 pub enum JevScope<'a> {
-    Session { session: &'a str, repo: &'a Path },
+    /// The seat's session and its delegated children, whose Jev rows count as the seat's own.
+    Session {
+        session: &'a str,
+        children: &'a [String],
+        repo: &'a Path,
+    },
     Repo(&'a Path),
 }
 
@@ -293,12 +298,18 @@ pub fn enabled_sites(jev: &JevConfig) -> Vec<&'static str> {
     .collect()
 }
 
-/// The newest 40 decisions in `scope`, plus the enabled `[jev]` sites.
-pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>) -> JevFeed {
+/// The newest 40 decisions in `scope` at or after `since` (epoch seconds), plus the enabled `[jev]`
+/// sites. A proxy row names no session, so `since` is all that keeps an old repository row out.
+pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>, since: u64) -> JevFeed {
     let (session_ids, repo): (Vec<String>, &Path) = match scope {
-        JevScope::Session { session, repo } => {
+        JevScope::Session {
+            session,
+            children,
+            repo,
+        } => {
             let mut ids = vec![session.to_string()];
             ids.extend(jev::alias_sources(state, |to| to == session));
+            ids.extend(children.iter().cloned());
             (ids, repo)
         }
         JevScope::Repo(repo) => (
@@ -322,6 +333,7 @@ pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>) -> JevFe
         .filter(|row| row.get("decider").and_then(Value::as_str) == Some("typesafe"))
         .filter(|row| row.get("repo").and_then(Value::as_str).map(Path::new) == Some(repo))
         .filter_map(|row| proxy_decision(row, cfg))
+        .filter(|decision| decision.ts >= since)
         .collect();
     let mut decisions: Vec<JevDecision> = rows(&state.root().join(jev::JEV_DECISIONS_FILE))
         .iter()
@@ -333,6 +345,7 @@ pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>) -> JevFe
             )
         })
         .filter_map(|row| jev_decision(row, cfg))
+        .filter(|decision| decision.ts >= since)
         // The proxy row of an intake call says more than the Jev row it also left.
         .filter(|decision| {
             decision.site != "intake"
@@ -367,7 +380,7 @@ mod tests {
     }
 
     fn feed(state: &StateDir, scope: JevScope<'_>) -> JevFeed {
-        jev_feed(state, &CtxConfig::default(), scope)
+        jev_feed(state, &CtxConfig::default(), scope, 0)
     }
 
     fn by_site<'a>(feed: &'a JevFeed, site: &str) -> &'a JevDecision {
@@ -384,6 +397,7 @@ mod tests {
             &state,
             JevScope::Session {
                 session: SESSION,
+                children: &[],
                 repo: Path::new("/work/repo"),
             },
         );
@@ -426,6 +440,7 @@ mod tests {
             &state,
             JevScope::Session {
                 session: SESSION,
+                children: &[],
                 repo: Path::new("/elsewhere"),
             },
         );
@@ -439,6 +454,7 @@ mod tests {
             &state,
             JevScope::Session {
                 session: "bbbb2222-0000-4000-8000-000000000002",
+                children: &[],
                 repo: Path::new("/work/other"),
             },
         );
@@ -448,6 +464,7 @@ mod tests {
             &state,
             JevScope::Session {
                 session: "cccc3333-0000-4000-8000-000000000003",
+                children: &[],
                 repo: Path::new("/nowhere"),
             },
         );
@@ -478,6 +495,35 @@ mod tests {
     }
 
     #[test]
+    fn since_drops_older_rows_and_a_childs_rows_count_as_the_seats() {
+        let (_tmp, state) = fixture();
+        let child = ["bbbb2222-0000-4000-8000-000000000002".to_string()];
+        let scope = |children| JevScope::Session {
+            session: SESSION,
+            children,
+            repo: Path::new("/work/repo"),
+        };
+        let cfg = CtxConfig::default();
+        let all = jev_feed(&state, &cfg, scope(&[]), 0);
+        assert!(all.decisions.iter().any(|d| d.ts == 1050), "{all:?}");
+        assert!(
+            !all.decisions
+                .iter()
+                .any(|d| d.text == "ranked 1 notes, top 0.40")
+        );
+        let recent = jev_feed(&state, &cfg, scope(&[]), 1051);
+        assert!(recent.decisions.iter().all(|d| d.ts >= 1051), "{recent:?}");
+        let with_child = jev_feed(&state, &cfg, scope(&child), 0);
+        assert!(
+            with_child
+                .decisions
+                .iter()
+                .any(|d| d.text == "ranked 1 notes, top 0.40"),
+            "{with_child:?}"
+        );
+    }
+
+    #[test]
     fn the_feed_is_capped_at_forty_and_lists_the_enabled_sites() {
         let tmp = tempfile::tempdir().expect("tmp");
         let state = StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
@@ -496,8 +542,10 @@ mod tests {
             &cfg,
             JevScope::Session {
                 session: SESSION,
+                children: &[],
                 repo: Path::new("/x"),
             },
+            0,
         );
         assert_eq!(feed.decisions.len(), KEEP);
         assert_eq!(feed.decisions[0].ts, 60);
