@@ -151,7 +151,7 @@ pub enum Authority {
 /// Highest-ranked first. [`authority_rank`] is the only thing that reads
 /// this order; every suppression decision in [`compose`] goes through it, so
 /// the order is declared exactly once.
-const AUTHORITY_ORDER: [Authority; 6] = [
+pub(super) const AUTHORITY_ORDER: [Authority; 6] = [
     Authority::AdapterHook,
     Authority::Supervisor,
     Authority::Workflow,
