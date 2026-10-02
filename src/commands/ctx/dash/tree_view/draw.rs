@@ -189,6 +189,10 @@ fn paint_with(
     if area.width < 4 || area.height < 1 || (area.height < 2 && !view.in_chat()) {
         return;
     }
+    if let Some(sub) = &view.sub {
+        sub.paint(f.buffer_mut(), area);
+        return;
+    }
     let model = Model::build(&view.data, facts, view.scope);
     if view.in_chat() {
         if let Some(scene) = orch::build_chat(area, &model, view) {

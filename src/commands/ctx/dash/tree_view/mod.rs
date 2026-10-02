@@ -30,6 +30,7 @@ mod model;
 mod orch;
 mod plan;
 mod scene;
+mod subagent_view;
 mod theme;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -376,6 +377,13 @@ pub(super) struct TreeView {
     /// The agent whose harness the operator opened, when it has no pane of its own and the chat
     /// showing is its host's: the bar names it.
     opened: Option<Sel>,
+    /// A subagent's own transcript shows in place of the page.
+    sub: Option<subagent_view::SubagentView>,
+    /// The drive of a host pane's subagent list in progress, with the transcript it falls back to.
+    focus: Option<(
+        super::subagent_focus::Focus,
+        Option<(String, std::path::PathBuf)>,
+    )>,
     /// Pulses, flashes, fades and the toast.
     motion: fx::Motion,
     /// Bumped each time a gather lands, so `observe` compares only new data.
@@ -467,8 +475,59 @@ impl TreeView {
         self.chat = false;
     }
 
+    /// Show a subagent's transcript, read-only, in place of the page.
+    pub(super) fn open_subagent_view(&mut self, title: String, path: std::path::PathBuf) {
+        if self.visible {
+            self.sub = Some(subagent_view::SubagentView::open(title, path));
+            self.chat = false;
+            self.help = false;
+        }
+    }
+
+    /// Start driving a host pane's subagent list; the transcript is where a failed drive lands.
+    pub(super) fn start_focus(
+        &mut self,
+        focus: super::subagent_focus::Focus,
+        fallback: Option<(String, std::path::PathBuf)>,
+    ) {
+        self.focus = Some((focus, fallback));
+    }
+
+    /// One step of the drive in progress. A drive that cannot finish lands on the transcript, and
+    /// the returned text says why.
+    pub(super) fn drive_focus(
+        &mut self,
+        panes: &mut [super::pane::Pane],
+        now: Instant,
+    ) -> Option<String> {
+        use super::subagent_focus::Tick;
+        let (focus, _) = self.focus.as_mut()?;
+        let tick = match panes.iter_mut().find(|p| p.short() == focus.short) {
+            Some(pane) => focus.tick(pane, now),
+            None => Tick::Failed("the host pane is gone"),
+        };
+        match tick {
+            Tick::Pending => None,
+            Tick::Done => {
+                self.focus = None;
+                None
+            }
+            Tick::Failed(why) => {
+                let (_, fallback) = self.focus.take()?;
+                let Some((title, path)) = fallback else {
+                    return Some(format!("could not open the subagent: {why}"));
+                };
+                self.open_subagent_view(title, path);
+                Some(format!("{why}; showing the subagent's transcript"))
+            }
+        }
+    }
+
     /// `^A t`: from a chat back to the flow, from the flow back to the dashboard.
     pub(super) fn chord_toggle(&mut self) {
+        if self.sub.take().is_some() {
+            return;
+        }
         if self.in_chat() {
             self.chat = false;
         } else {
@@ -537,6 +596,9 @@ impl TreeView {
 
     /// Take a finished gather, if any. Never blocks.
     pub(super) fn poll(&mut self) {
+        if let Some(sub) = self.sub.as_mut() {
+            sub.refresh(Instant::now());
+        }
         let Some(rx) = self.inflight.as_ref() else {
             return;
         };

@@ -1315,6 +1315,25 @@ fn snapshot_in(
     ordered
 }
 
+/// Where claude keeps one native subagent's transcript, for the session that ran it.
+pub(super) fn native_subagent_path(
+    state: &StateDir,
+    session: &str,
+    agent_id: &str,
+) -> Option<PathBuf> {
+    let (record, _) = read_session_records(state)
+        .into_iter()
+        .find(|(record, _)| record.session == session)?;
+    let transcript = super::adapters::claude::ClaudeAdapter::new(None).transcript_path(
+        &super::event::SessionRef {
+            id: super::event::SessionId::parse(&record.session),
+            cwd: record.repo.clone(),
+        },
+    );
+    let dir = super::adapters::claude::subagents_dir(&transcript)?;
+    Some(dir.join(format!("agent-{}.jsonl", file_safe(agent_id))))
+}
+
 /// Native subagents: claude's own `subagents/` files merged with the hook records (the hook
 /// record wins), each parented on the caller of its dispatching `Agent` call, else the session.
 fn place_subagents(
