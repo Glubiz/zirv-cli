@@ -1373,12 +1373,7 @@ pub fn apply_override(decision: &mut ProxyDecision, ov: &ProxyOverride, cfg: &Ct
             ));
             applied = derived;
         }
-        if applied == SeatTier::Frontier && decision.execution != ExecutionMode::Orchestrated {
-            decision
-                .reasons
-                .push("override: tier frontier needs an orchestrated seat; used deep".to_string());
-            applied = SeatTier::Deep;
-        }
+        // No invariant forbids a single seat on `Frontier` (only the derivation avoids it; `validate` and headless `force_single_seat` keep it), so a raise is honoured.
         if applied != decision.seat_tier {
             decision.seat_tier = applied;
             decision

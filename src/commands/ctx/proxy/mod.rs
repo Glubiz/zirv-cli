@@ -1952,6 +1952,26 @@ pub(crate) mod tests {
         assert!(raised.validation.independent_review && raised.validation.independent_test);
         assert!(!raised.validation.security_review);
 
+        // A raise to frontier on a single seat is honoured and recorded, not silently lowered.
+        let frontier = decision::ProxyOverride::parse(None, Some("frontier"), None).expect("parse");
+        let single = decide(
+            &override_cfg(frontier),
+            state_dir.path(),
+            repo.path(),
+            typo,
+            false,
+        );
+        assert_eq!(single.execution, ExecutionMode::Direct);
+        assert_eq!(single.seat_tier, decision::SeatTier::Frontier);
+        assert!(
+            single
+                .reasons
+                .iter()
+                .any(|r| r.contains("override: tier set to frontier")),
+            "{:?}",
+            single.reasons
+        );
+
         let headless = decide(
             &override_cfg(raise),
             state_dir.path(),

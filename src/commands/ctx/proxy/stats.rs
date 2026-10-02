@@ -30,10 +30,13 @@ pub struct StatsArgs {
 pub struct SeatRow {
     pub class: String,
     pub seat_tokens: Option<[u64; 4]>,
-    pub delegation_tokens: u64,
-    pub delegations: u64,
+    pub delegation_tokens: Option<u64>,
+    pub delegations: Option<u64>,
     pub verification: Option<VerificationStatus>,
 }
+
+/// Why delegation figures are `None`: the ledger is a source, and an absent source is not zero.
+const DELEGATIONS_UNAVAILABLE: &str = "unavailable: delegations.jsonl is missing or unreadable";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClassStats {
@@ -43,8 +46,10 @@ pub struct ClassStats {
     pub median_input_tokens: Option<u64>,
     pub median_output_tokens: Option<u64>,
     pub median_cache_tokens: Option<u64>,
-    pub delegation_tokens: u64,
-    pub delegations: u64,
+    pub delegation_tokens: Option<u64>,
+    pub delegations: Option<u64>,
+    /// The reason `delegation_tokens` and `delegations` are null, when they are.
+    pub delegations_note: Option<String>,
     pub verified_seats: u64,
     pub verified_passed: u64,
     pub verified_pass_rate: Option<f64>,
@@ -91,6 +96,10 @@ pub fn compute(rows: &[SeatRow]) -> Vec<ClassStats> {
                 ),
                 delegation_tokens: seats.iter().map(|row| row.delegation_tokens).sum(),
                 delegations: seats.iter().map(|row| row.delegations).sum(),
+                delegations_note: seats
+                    .iter()
+                    .any(|row| row.delegations.is_none())
+                    .then(|| DELEGATIONS_UNAVAILABLE.to_string()),
                 verified_seats: decided,
                 verified_passed: passed,
                 verified_pass_rate: rate,
@@ -107,7 +116,13 @@ pub fn compute(rows: &[SeatRow]) -> Vec<ClassStats> {
 
 /// Reads every stored profile and joins it with token and verification sources.
 pub fn collect(state: &StateDir) -> Vec<SeatRow> {
-    let delegations = log::read_delegations(state, DELEGATION_ROW_CAP);
+    // A missing or unreadable ledger is `None`, which `tail_delegations` alone would report as an empty list.
+    let delegations = state
+        .logs()
+        .join(log::DELEGATION_FILE)
+        .exists()
+        .then(|| log::read_delegations(state, DELEGATION_ROW_CAP))
+        .filter(|_| log::tail_delegations(state, 0).is_ok());
     store::load_all(state.root())
         .into_iter()
         .map(|(short, profile)| {
@@ -120,14 +135,18 @@ pub fn collect(state: &StateDir) -> Vec<SeatRow> {
                 ),
                 ..SeatRow::default()
             };
-            for delegation in delegations.iter().filter(|r| r.parent_session == short) {
-                row.delegations += 1;
-                row.delegation_tokens = row
-                    .delegation_tokens
-                    .saturating_add(delegation.input_tokens)
-                    .saturating_add(delegation.cache_creation_input_tokens)
-                    .saturating_add(delegation.cache_read_input_tokens)
-                    .saturating_add(delegation.output_tokens);
+            if let Some(ledger) = &delegations {
+                let (mut runs, mut tokens) = (0u64, 0u64);
+                for delegation in ledger.iter().filter(|r| r.parent_session == short) {
+                    runs += 1;
+                    tokens = tokens
+                        .saturating_add(delegation.input_tokens)
+                        .saturating_add(delegation.cache_creation_input_tokens)
+                        .saturating_add(delegation.cache_read_input_tokens)
+                        .saturating_add(delegation.output_tokens);
+                }
+                row.delegations = Some(runs);
+                row.delegation_tokens = Some(tokens);
             }
             if let Some(path) = session_spend::resolve_transcript(state, &short) {
                 let fold = session_spend::session_transcript_usage(Some(&path), None);
@@ -158,8 +177,11 @@ fn cell(value: Option<u64>) -> String {
 
 pub fn run<W: Write>(args: &StatsArgs, w: &mut W) -> CtxResult<i32> {
     let env = config::env_from_process();
-    let state = StateDir::resolve(&env)?;
-    let stats = compute(&collect(&state));
+    run_in(&StateDir::resolve(&env)?, args, w)
+}
+
+fn run_in<W: Write>(state: &StateDir, args: &StatsArgs, w: &mut W) -> CtxResult<i32> {
+    let stats = compute(&collect(state));
     if args.json {
         writeln!(w, "{}", serde_json::to_string_pretty(&stats)?)?;
         return Ok(0);
@@ -173,8 +195,17 @@ pub fn run<W: Write>(args: &StatsArgs, w: &mut W) -> CtxResult<i32> {
         "class (intent/complexity): seats, median tokens in/out/cache, delegation tokens, quality"
     )?;
     for s in &stats {
+        let delegation = match (s.delegation_tokens, s.delegations) {
+            (Some(tokens), Some(runs)) => format!("{tokens} delegation tokens in {runs} runs"),
+            _ => format!(
+                "delegation tokens {}",
+                s.delegations_note
+                    .as_deref()
+                    .unwrap_or(DELEGATIONS_UNAVAILABLE)
+            ),
+        };
         let quality = s.verified_pass_rate.map_or_else(
-            || "quality unavailable".to_string(),
+            || format!("quality {}", s.quality),
             |rate| {
                 format!(
                     "{}/{} verified pass ({:.0}%)",
@@ -186,15 +217,14 @@ pub fn run<W: Write>(args: &StatsArgs, w: &mut W) -> CtxResult<i32> {
         );
         writeln!(
             w,
-            "{}: {} seats ({} with tokens), {}/{}/{}, {} delegation tokens in {} runs, {}",
+            "{}: {} seats ({} with tokens), {}/{}/{}, {}, {}",
             s.class,
             s.seats,
             s.seats_with_tokens,
             cell(s.median_input_tokens),
             cell(s.median_output_tokens),
             cell(s.median_cache_tokens),
-            s.delegation_tokens,
-            s.delegations,
+            delegation,
             quality
         )?;
     }
@@ -286,8 +316,57 @@ mod tests {
         let stats = compute(&collect(&state));
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].class, "feature/substantial");
-        assert_eq!((stats[0].delegations, stats[0].delegation_tokens), (1, 160));
+        assert_eq!(
+            (stats[0].delegations, stats[0].delegation_tokens),
+            (Some(1), Some(160))
+        );
+        assert_eq!(stats[0].delegations_note, None);
         assert_eq!(stats[0].seats_with_tokens, 0);
         assert_eq!(stats[0].median_input_tokens, None);
+    }
+
+    /// An absent ledger is unavailable with its reason in text and JSON, and quality prints its reason too.
+    #[test]
+    fn a_missing_delegation_ledger_is_unavailable_not_zero_and_quality_prints_its_reason() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        store::save(
+            tmp.path(),
+            "abcd1234-1",
+            &store::StoredProfile {
+                decision: super::super::tests::sample_decision(),
+                operator_override: None,
+                started_workflow_id: None,
+            },
+        )
+        .expect("save");
+        assert!(!state.logs().join(log::DELEGATION_FILE).exists());
+
+        let stats = compute(&collect(&state));
+        assert_eq!(
+            (stats[0].delegations, stats[0].delegation_tokens),
+            (None, None)
+        );
+        assert_eq!(
+            stats[0].delegations_note.as_deref(),
+            Some(DELEGATIONS_UNAVAILABLE)
+        );
+
+        let mut json = Vec::new();
+        run_in(&state, &StatsArgs { json: true }, &mut json).expect("json");
+        let json: serde_json::Value = serde_json::from_slice(&json).expect("parse");
+        assert!(json[0]["delegation_tokens"].is_null(), "{json}");
+        assert!(json[0]["delegations"].is_null(), "{json}");
+        assert_eq!(json[0]["delegations_note"], DELEGATIONS_UNAVAILABLE);
+
+        let mut text = Vec::new();
+        run_in(&state, &StatsArgs { json: false }, &mut text).expect("text");
+        let text = String::from_utf8(text).expect("utf8");
+        assert!(text.contains(DELEGATIONS_UNAVAILABLE), "{text}");
+        assert!(!text.contains("0 delegation tokens"), "{text}");
+        assert!(
+            text.contains("quality unavailable: no attributable verification record"),
+            "{text}"
+        );
     }
 }
