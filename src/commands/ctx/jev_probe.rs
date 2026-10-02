@@ -32,17 +32,8 @@
 //!
 //! Six more sites complete the probe contract: `missing-tests`,
 //! `stop-verify`, `review-disposition`, `review-dedup`, `artifact-substance`,
-//! `gate-reclass`. `artifact-substance` sends a TEXT-bearing state (an
-//! artifact's own body) that `jev::safe_metadata_request` -- the same
-//! metadata-only egress boundary every other site's state must also clear --
-//! permanently refuses today (see `engine.rs`'s own `artifact_freeform_state_*`
-//! tests): production's own call for this site never leaves the process
-//! either. This probe applies that exact same boundary (never bypasses it),
-//! so every rep reports its fallback action with a `"unsafe Jev metadata
-//! projection"` error. Because that refusal is certain in advance,
-//! [`Site::metadata_only`] skips the probe's OWN upfront exit-2 pre-check for
-//! just this site; the boundary itself still runs, once per rep, exactly
-//! where production runs it. `gate-reclass` sends the metadata-only facts of
+//! `gate-reclass`. Every site's state is metadata-only: `artifact-substance`
+//! sends `state::artifact_jev_facts` and `gate-reclass` sends
 //! `profile::gate_jev_facts`.
 //! `gate-reclass` additionally has PER-QUESTION floors (`work_domain` uses
 //! a different default than its other six items) -- the output's optional
@@ -283,19 +274,6 @@ impl Site {
             Self::GateReclass => engine::GATE_RECLASS_NOUL_DEFAULT_FLOOR,
             _ => self.default_floor(),
         }
-    }
-
-    /// Whether this site's state must clear `jev::safe_metadata_request` --
-    /// `false` only for [`Site::ArtifactSubstance`],
-    /// whose production state is text-bearing and so can never clear that
-    /// boundary (see this module's own doc comment). `true` for every other
-    /// site skips the probe's own redundant upfront copy of that check for
-    /// that one -- the boundary itself still runs inside `jev::
-    /// advise_detailed` for every site, every rep, exactly where production
-    /// runs it; this only decides whether the probe ALSO fails fast before
-    /// the loop starts.
-    fn metadata_only(self) -> bool {
-        !matches!(self, Self::ArtifactSubstance)
     }
 
     /// Whether `case.json` must set `"n"` (the per-candidate item count) for
@@ -804,15 +782,8 @@ pub(crate) fn run_probe(
         }
     };
 
-    // Skipped for `ArtifactSubstance`: its production state
-    // is text-bearing and can never clear this boundary, so refusing here
-    // would misreport a normal, well-formed case as a probe-input error --
-    // see [`Site::metadata_only`] and this module's own doc comment. The
-    // boundary itself still runs, every rep, inside `jev::advise_detailed`
-    // below -- never bypassed, only not ALSO pre-checked here.
-    if site.metadata_only()
-        && !jev::safe_metadata_request(&case.state, &questions, &cfg.proxy.typesafe.model)
-    {
+    // The same egress boundary production's `jev::advise_detailed` applies, checked once up front to fail fast on a malformed case.
+    if !jev::safe_metadata_request(&case.state, &questions, &cfg.proxy.typesafe.model) {
         writeln!(
             writer,
             "jev probe: case \"state\"/question set refused by the metadata-only egress boundary"
@@ -1789,22 +1760,13 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    /// `artifact-substance`'s production state (`{artifact_kind,
-    /// artifact_text}`) is text-bearing, not metadata-only, so `jev::
-    /// safe_metadata_request` -- the exact same boundary production's own
-    /// `pin_current_artifact_with_config` clears through `ask()` -- refuses
-    /// it every time (see `engine.rs`'s own `artifact_freeform_state_*`
-    /// tests: production never reaches the network for this site either).
-    /// No fake server is spun up at all: `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL`
-    /// points at a closed port, so a regression that started actually
-    /// dialing out would fail loudly instead of silently passing.
+    /// A failed `artifact-substance` call (closed port) reports the `"pass"` fallback and a counted error.
     #[test]
-    fn artifact_substance_always_falls_back_because_its_freeform_state_never_clears_the_metadata_only_boundary()
-     {
+    fn artifact_substance_failed_call_falls_back_to_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
         let case_state = serde_json::json!({
             "id": "c1",
-            "state": {"artifact_kind": "intent", "artifact_text": "# Intent\n\nSome text.\n"},
+            "state": {"_zirv_metadata_only": true, "facts": [[5, 0, 1, 1, 4, 1, 1, 0, 0, 0, 0, 1]]},
         });
         let case = write_case(dir.path(), "case.json", &case_state);
         with_env(
@@ -1819,7 +1781,6 @@ mod tests {
                 assert_eq!(value["errors"], 2);
                 for rep in value["reps"].as_array().expect("reps") {
                     assert_eq!(rep["actions"]["substance"], "pass");
-                    assert_eq!(rep["error"], "unsafe Jev metadata projection");
                 }
             },
         );
