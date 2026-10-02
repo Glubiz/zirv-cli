@@ -1199,7 +1199,20 @@ impl ClaudeAdapter {
             Some(timeout) => path.with_extension(format!("ap{timeout}.json")),
             None => path,
         };
+        let supervisor = super::super::config::CtxConfig::load_refusal_safe(
+            &std::env::current_dir().unwrap_or_default(),
+            &super::super::config::env_from_process(),
+        )
+        .supervisor
+        .enabled;
+        // The supervisor's extra hooks make a different settings file, for the same reason.
+        let path = if supervisor {
+            path.with_extension("sup.json")
+        } else {
+            path
+        };
         let mut launch_environment = LaunchEnvironment::resolve();
+        launch_environment.supervisor = supervisor;
         launch_environment.approvals_hook_timeout = self.approvals_hook_timeout;
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
         launch_environment.lean = lean;
@@ -1349,6 +1362,8 @@ struct LaunchEnvironment {
     lean: bool,
     /// `[approvals]` hold plus margin (#840): the `PermissionRequest` hook's `timeout`, present only with the inbox on.
     approvals_hook_timeout: Option<u64>,
+    /// `[supervisor] enabled`: the Stop and tool-failure hooks its done gate and retry rulings need, wired here so a session does not depend on `zirv setup` having written them globally.
+    supervisor: bool,
 }
 
 impl LaunchEnvironment {
@@ -1398,6 +1413,7 @@ impl LaunchEnvironment {
             scrub_subprocess_env: false,
             lean: false,
             approvals_hook_timeout: None,
+            supervisor: false,
         }
     }
 }
@@ -1631,6 +1647,16 @@ fn launch_settings_value(
     if let Some(timeout) = launch_environment.approvals_hook_timeout {
         settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] =
             serde_json::json!(timeout);
+    }
+    if launch_environment.supervisor {
+        for (event, command) in [
+            ("Stop", "zirv ctx hook stop"),
+            ("PostToolUseFailure", "zirv ctx hook tool-failure"),
+        ] {
+            settings["hooks"][event] = serde_json::json!([{
+                "hooks": [{ "type": "command", "command": command }]
+            }]);
+        }
     }
     if launch_environment.lean {
         settings["autoMemoryEnabled"] = serde_json::json!(false);
@@ -4115,6 +4141,33 @@ mod tests {
 
     /// Issue #840: the `PermissionRequest` hook carries a `timeout` only with the approvals inbox on, and it
     /// lands in its own settings file; with the inbox off the output is untouched.
+    #[test]
+    fn launch_settings_wire_the_supervisor_hooks_only_while_the_supervisor_is_on() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let off = test_launch_settings();
+        assert!(off["hooks"]["Stop"].is_null());
+        assert!(off["hooks"]["PostToolUseFailure"].is_null());
+        let on = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                supervisor: true,
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(
+            on["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "zirv ctx hook stop"
+        );
+        assert_eq!(
+            on["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"],
+            "zirv ctx hook tool-failure"
+        );
+        assert_eq!(on["hooks"]["PreToolUse"], off["hooks"]["PreToolUse"]);
+    }
+
     #[test]
     fn launch_settings_time_the_permission_hook_only_with_the_approvals_inbox_on() {
         let policy = super::super::super::safety::SafetyPolicy::default();
