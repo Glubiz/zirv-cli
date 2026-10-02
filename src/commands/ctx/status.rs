@@ -274,6 +274,7 @@ fn sessions_lines(
                 ));
             }
             if let Some(change) = super::score::model_change_for_session(
+                state,
                 &record.agent,
                 &record.session,
                 &record.repo,

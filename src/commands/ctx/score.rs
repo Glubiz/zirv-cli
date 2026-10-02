@@ -402,6 +402,7 @@ pub fn score_transcript(
 /// consumer: transcript resolution and reading stay at this I/O layer rather
 /// than leaking into the pure rot fold or the renderer.
 pub fn model_change_for_session(
+    state: &StateDir,
     agent: &str,
     session_id: &str,
     repo: &Path,
@@ -409,10 +410,14 @@ pub fn model_change_for_session(
 ) -> Option<ModelChange> {
     let cfg = CtxConfig::load(repo, env).ok()?;
     let adapter = adapters::select(Some(agent), &[], &cfg).ok()?;
-    let transcript = adapter.transcript_path(&SessionRef {
-        id: SessionId::parse(session_id),
-        cwd: repo.to_path_buf(),
-    });
+    let transcript = super::adapters::claude::session_transcript(
+        adapter.as_ref(),
+        state,
+        &SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: repo.to_path_buf(),
+        },
+    );
     full_score(adapter.as_ref(), &transcript, &cfg.score)
         .ok()?
         .model_change
@@ -442,10 +447,14 @@ pub fn breakdown_for_session(
         .find(|record| record.session == session || record.short == session)
         .ok_or_else(|| format!("no registered session matches `{session}`"))?;
     let adapter = adapters::select(Some(record.agent.as_str()), &[], &cfg)?;
-    let transcript = adapter.transcript_path(&SessionRef {
-        id: SessionId::parse(&record.session),
-        cwd: record.repo.clone(),
-    });
+    let transcript = super::adapters::claude::session_transcript(
+        adapter.as_ref(),
+        &state,
+        &SessionRef {
+            id: SessionId::parse(&record.session),
+            cwd: record.repo.clone(),
+        },
+    );
     let jsonl = std::fs::read_to_string(&transcript)
         .map_err(|e| format!("{}: {e}", transcript.display()))?;
     Ok(window_breakdown_core(
@@ -1389,10 +1398,14 @@ fn cached_score_with(
         return None;
     }
 
-    let transcript = adapter.transcript_path(&SessionRef {
-        id: SessionId::parse(session_id),
-        cwd: repo.to_path_buf(),
-    });
+    let transcript = super::adapters::claude::session_transcript(
+        adapter.as_ref(),
+        state,
+        &SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: repo.to_path_buf(),
+        },
+    );
     // Stamped before the parse, so a line appended while it runs invalidates
     // this entry on the next poll instead of being missed forever.
     let scored = match stamp_of(&transcript) {
@@ -2811,6 +2824,42 @@ mod tests {
                 .score,
             "and still agrees with a full parse of the new bytes"
         );
+    }
+
+    /// A resumed claude seat writes the transcript of the session it resumed; the
+    /// dashboard's rot score must follow the hook-pinned path, not the zirv id's.
+    #[test]
+    fn the_cached_score_follows_the_pinned_transcript_of_a_resumed_seat() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(home.path().join("state"));
+        let env: HashMap<String, String> = HashMap::new();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "5c0d0002-1111-4222-8333-444444444444";
+        let resumed = claude_transcript(
+            home.path(),
+            repo.path(),
+            "bff6a2d4-bf99-498d-8c9e-5efc2d84bdb9",
+        );
+        let body = std::fs::read_to_string(write_transcript(repo.path(), 12, false, 170_000))
+            .expect("read");
+        std::fs::write(&resumed, body).expect("write");
+
+        assert_eq!(
+            cached_score_with(&state, repo.path(), session, "claude", &lookup),
+            None,
+            "without a pin the zirv id's own transcript does not exist"
+        );
+        super::super::adapters::claude::pin_hook_transcript(
+            &state,
+            session,
+            &resumed.display().to_string(),
+        );
+        // The unknown answer above is cached for a few polls; a fresh id avoids that.
+        let scored = (0..10)
+            .find_map(|_| cached_score_with(&state, repo.path(), session, "claude", &lookup));
+        assert!(scored.is_some());
     }
 
     /// The committed two-turn codex rollout, read the same way `codex.rs`'s

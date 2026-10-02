@@ -699,6 +699,61 @@ pub(crate) fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
     Some(transcript.parent()?.join(stem).join("subagents"))
 }
 
+/// `<state>/rollouts/<short>.claude.path`: the transcript claude reported for a zirv session.
+fn transcript_pin(state: &super::super::state::StateDir, zirv_session: &str) -> PathBuf {
+    let short = super::super::sessions::short_id(zirv_session);
+    state.rollouts().join(format!("{short}.claude.path"))
+}
+
+/// A resumed claude conversation keeps writing the transcript of the session it resumed, not
+/// the zirv session id it was launched under; a hook pins the path claude reports so readers
+/// follow it. Nothing is pinned while the two agree.
+pub(crate) fn pin_hook_transcript(
+    state: &super::super::state::StateDir,
+    zirv_session: &str,
+    transcript_path: &str,
+) {
+    let path = Path::new(transcript_path);
+    let projects = ClaudeAdapter::new(None)
+        .home_dir()
+        .join(".claude")
+        .join("projects");
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    let trusted = path.is_absolute()
+        && path.extension().is_some_and(|ext| ext == "jsonl")
+        && path.starts_with(&projects)
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir));
+    if zirv_session.is_empty()
+        || !trusted
+        || stem.is_none_or(|stem| stem.is_empty() || stem == zirv_session)
+    {
+        return;
+    }
+    let pin = transcript_pin(state, zirv_session);
+    if std::fs::read_to_string(&pin).is_ok_and(|current| current.trim() == transcript_path) {
+        return;
+    }
+    if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
+        let _ = super::super::state::write_private(&pin, transcript_path);
+    }
+}
+
+/// The transcript a claude session really writes: the hook-pinned path when it exists, else
+/// the one derived from the session id.
+pub(crate) fn session_transcript(
+    adapter: &dyn AgentAdapter,
+    state: &super::super::state::StateDir,
+    session: &SessionRef,
+) -> PathBuf {
+    std::fs::read_to_string(transcript_pin(state, session.id.as_str()))
+        .map(|recorded| PathBuf::from(recorded.trim()))
+        .ok()
+        .filter(|pinned| pinned.is_file())
+        .unwrap_or_else(|| adapter.transcript_path(session))
+}
+
 /// The first parseable row `timestamp` in `jsonl`, in unix milliseconds.
 fn first_timestamp_ms(jsonl: &str) -> Option<u64> {
     jsonl.lines().find_map(|line| {
@@ -3716,6 +3771,33 @@ mod tests {
     /// keep passing `&adapter` unchanged.
     fn built_args(adapter: &ClaudeAdapter, cmd: &Command) -> Vec<String> {
         super::super::built_args(&adapter.program, cmd)
+    }
+
+    #[test]
+    fn pin_hook_transcript_ignores_paths_outside_the_projects_root() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = crate::commands::ctx::state::StateDir::from_root(home.path().join("state"));
+        let zirv = "c391fd4f-84e7-4a6c-81fe-5738d28be57c";
+        let projects = home.path().join(".claude/projects/-repo");
+        let pin = transcript_pin(&state, zirv);
+        let traversal = format!("{}/../../x/other.jsonl", projects.display());
+        let outside = home.path().join("elsewhere/other.jsonl");
+        let wrong_ext = projects.join("other.txt");
+        for rejected in [
+            "relative/other.jsonl".to_string(),
+            "/etc/other.jsonl".to_string(),
+            outside.display().to_string(),
+            wrong_ext.display().to_string(),
+            traversal,
+            String::new(),
+        ] {
+            pin_hook_transcript(&state, zirv, &rejected);
+            assert!(!pin.exists(), "pinned {rejected:?}");
+        }
+        let accepted = projects.join("other.jsonl").display().to_string();
+        pin_hook_transcript(&state, zirv, &accepted);
+        assert_eq!(std::fs::read_to_string(&pin).unwrap(), accepted);
     }
 
     #[test]

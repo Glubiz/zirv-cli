@@ -637,10 +637,14 @@ pub(super) fn report_settled_pane(
 ) {
     report_settled_pane_with(pane, state, cfg, errors, |pane| {
         let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
-        let path = adapter.transcript_path(&SessionRef {
-            id: SessionId::parse(pane.session_id()),
-            cwd: pane.cwd().to_path_buf(),
-        });
+        let path = super::super::adapters::claude::session_transcript(
+            adapter.as_ref(),
+            state,
+            &SessionRef {
+                id: SessionId::parse(pane.session_id()),
+                cwd: pane.cwd().to_path_buf(),
+            },
+        );
         adapter.final_assistant_message(&std::fs::read_to_string(path).ok()?)
     });
 }
@@ -772,10 +776,14 @@ pub(super) fn report_stalled_compaction(
 ) {
     report_stalled_compaction_with(pane, state, cfg, errors, now, |pane| {
         let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
-        let path = adapter.transcript_path(&SessionRef {
-            id: SessionId::parse(pane.session_id()),
-            cwd: pane.cwd().to_path_buf(),
-        });
+        let path = super::super::adapters::claude::session_transcript(
+            adapter.as_ref(),
+            state,
+            &SessionRef {
+                id: SessionId::parse(pane.session_id()),
+                cwd: pane.cwd().to_path_buf(),
+            },
+        );
         let modified = std::fs::metadata(path).ok()?.modified().ok()?;
         Some(
             modified

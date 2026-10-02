@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::CtxResult;
-use super::adapters::{AgentAdapter, SESSION_ENV};
+use super::adapters::SESSION_ENV;
 use super::config::{EnvLookup, env_from_process};
 pub use super::graph_steps::Step;
 use super::sessions;
@@ -268,6 +268,7 @@ pub fn run_subagent_start(stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
         return Ok(0);
     }
     let now = now_secs();
+    super::adapters::claude::pin_hook_transcript(&state, &session, &fields.transcript_path);
     prune_if_due(&state, now);
     let mut record = SubagentRecord {
         session,
@@ -1388,7 +1389,9 @@ pub(super) fn native_subagent_path(
     let (record, _) = read_session_records(state)
         .into_iter()
         .find(|(record, _)| record.session == session)?;
-    let transcript = super::adapters::claude::ClaudeAdapter::new(None).transcript_path(
+    let transcript = super::adapters::claude::session_transcript(
+        &super::adapters::claude::ClaudeAdapter::new(None),
+        state,
         &super::event::SessionRef {
             id: super::event::SessionId::parse(&record.session),
             cwd: record.repo.clone(),
@@ -1418,10 +1421,14 @@ fn place_subagents(
         if record.agent != "claude" || (!alive && record.started_at < cutoff) {
             continue;
         }
-        let transcript = adapter.transcript_path(&super::event::SessionRef {
-            id: super::event::SessionId::parse(&record.session),
-            cwd: record.repo.clone(),
-        });
+        let transcript = super::adapters::claude::session_transcript(
+            &adapter,
+            state,
+            &super::event::SessionRef {
+                id: super::event::SessionId::parse(&record.session),
+                cwd: record.repo.clone(),
+            },
+        );
         let Some(dir) = super::adapters::claude::subagents_dir(&transcript) else {
             continue;
         };
@@ -1524,10 +1531,14 @@ fn place_session_steps(
     }
     for (record, _) in session_records.iter().filter(|(_, alive)| *alive) {
         let path = match record.agent.as_str() {
-            "claude" => Some(adapter.transcript_path(&super::event::SessionRef {
-                id: super::event::SessionId::parse(&record.session),
-                cwd: record.repo.clone(),
-            })),
+            "claude" => Some(super::adapters::claude::session_transcript(
+                &adapter,
+                state,
+                &super::event::SessionRef {
+                    id: super::event::SessionId::parse(&record.session),
+                    cwd: record.repo.clone(),
+                },
+            )),
             "codex" => {
                 std::fs::read_to_string(state.rollouts().join(format!("{}.path", record.short)))
                     .ok()
@@ -2472,6 +2483,46 @@ mod tests {
                 .collect::<String>(),
         )
         .expect("transcript");
+    }
+
+    /// A resumed conversation writes the transcript of the session it resumed, so the
+    /// subagent dir lives under that id; the hook-pinned path must lead the lookup there.
+    #[test]
+    fn a_resumed_seat_shows_the_subagents_under_the_transcript_claude_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let home = dir.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let repo = dir.path().join("repo");
+        let session = "c391fd4f-84e7-4a6c-81fe-5738d28be57c";
+        let resumed = "bff6a2d4-bf99-498d-8c9e-5efc2d84bdb9";
+        register_session(&state, session, "claude", &repo);
+        let project = home
+            .join(".claude/projects")
+            .join(super::super::adapters::claude::project_slug(&repo));
+        write_native(
+            &project.join(resumed).join("subagents"),
+            "res1",
+            r#"{"agentType":"Explore","description":"Resumed work","toolUseId":"toolu_1"}"#,
+            &[
+                r#"{"type":"user","timestamp":"2026-10-01T10:00:00.000Z","message":{"content":"go"}}"#,
+            ],
+        );
+        let has_agent = || {
+            snapshot_in(&state, &repo, None, Some(&home), now_secs())
+                .iter()
+                .any(|n| n.id == "res1")
+        };
+        assert!(!has_agent(), "no pin yet: nothing to follow");
+
+        let transcript = project.join(format!("{resumed}.jsonl"));
+        std::fs::write(&transcript, "").expect("transcript");
+        super::super::adapters::claude::pin_hook_transcript(
+            &state,
+            session,
+            &transcript.display().to_string(),
+        );
+        assert!(has_agent());
     }
 
     #[test]

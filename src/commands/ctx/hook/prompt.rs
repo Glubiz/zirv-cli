@@ -99,6 +99,13 @@ fn mail_note_deferred(
 pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let payload = HookPayload::parse(stdin).unwrap_or_default();
     let repo = payload.repo();
+    if let (Some(zirv_session), Ok(state)) = (env(SESSION_ENV), StateDir::resolve(env)) {
+        crate::commands::ctx::adapters::claude::pin_hook_transcript(
+            &state,
+            &zirv_session,
+            &payload.transcript_path,
+        );
+    }
     // Config failure must not block a prompt or lose unrelated adoption and
     // attention signals; optional masking degrades to passthrough (#466).
     // A repo-forbidden config is a refusal, not a failure: keep the operator's own masking settings.
