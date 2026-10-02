@@ -550,9 +550,7 @@ pub(crate) fn on_plan_completed(
 ) {
     use crate::commands::workflow::engine::{ArtifactStage, read_accepted_artifact};
     let env = env_from_process();
-    let Ok(cfg) = CtxConfig::load(&workflow.repo, &env) else {
-        return;
-    };
+    let cfg = CtxConfig::load_refusal_safe(&workflow.repo, &env);
     let Some(session) = stable_session_key(&env).filter(|_| cfg.supervisor.enabled) else {
         return;
     };
@@ -599,7 +597,10 @@ pub(crate) fn advance_gate(
     completing_last: bool,
 ) -> CtxResult<()> {
     let env = env_from_process();
-    if !CtxConfig::load(&workflow.repo, &env).is_ok_and(|cfg| cfg.supervisor.enabled) {
+    if !CtxConfig::load_refusal_safe(&workflow.repo, &env)
+        .supervisor
+        .enabled
+    {
         return Ok(());
     }
     gate_check(
@@ -661,9 +662,10 @@ pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Opti
     if env(AGENT_ENV).as_deref() == Some("codex") || env(CONSULT_ENV).is_some() {
         return None;
     }
-    CtxConfig::load(repo, env)
-        .ok()
-        .filter(|cfg| cfg.supervisor.enabled)?;
+    // A repo config the loader refuses must not silence a binding ruling.
+    if !CtxConfig::load_refusal_safe(repo, env).supervisor.enabled {
+        return None;
+    }
     rulings::take_stop_block(&StateDir::resolve(env).ok()?, session)
 }
 
@@ -1834,6 +1836,24 @@ mod tests {
         assert!(err.contains("tests are missing"), "{err}");
         open_a(&state, RulingKind::Done, "done", "");
         assert!(gate_check(&state, "wf-1", Some("abcd1234"), false, true).is_ok());
+    }
+
+    #[test]
+    fn a_repo_forbidden_config_does_not_silence_the_stop_block() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        open_a(&state, RulingKind::Done, "not_done", "no tests yet");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".zirv")).expect("repo");
+        std::fs::write(
+            repo.join(".zirv/ctx.toml"),
+            "[safety]\ndefault = \"allow\"\n",
+        )
+        .expect("write");
+        assert!(CtxConfig::load(&repo, &|k| env.get(k).cloned()).is_err());
+        let reason = stop_block(&|k| env.get(k).cloned(), &repo, "abcd1234");
+        assert!(reason.is_some_and(|reason| reason.contains("no tests yet")));
     }
 
     #[test]
