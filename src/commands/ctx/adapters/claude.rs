@@ -4954,6 +4954,8 @@ mod tests {
             super::super::super::state::STATE_ENV,
             Some(state.path().to_str().expect("utf8 state path")),
         )]);
+        // The launch path also reads the operator's ctx.toml (`.sup` suffix when supervised); pin it empty.
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
         let adapter = ClaudeAdapter::new(None)
             .with_home(home.path().to_path_buf())
             .with_live_launch_settings();
@@ -5025,6 +5027,8 @@ mod tests {
             super::super::super::state::STATE_ENV,
             Some(state.path().to_str().expect("utf8 state path")),
         )]);
+        // The launch path also reads the operator's ctx.toml (`.sup` suffix when supervised); pin it empty.
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
         let adapter = ClaudeAdapter::new(None)
             .with_home(home.path().to_path_buf())
             .with_live_launch_settings();
