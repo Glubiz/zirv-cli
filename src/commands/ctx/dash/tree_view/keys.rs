@@ -52,6 +52,9 @@ pub(in super::super) enum Outcome {
         agent_type: Option<String>,
         description: String,
         title: String,
+        /// The descriptions of the host's other native subagents, so a row is only taken when
+        /// no other subagent could be it.
+        siblings: Vec<String>,
     },
     /// Answer the approval the orchestrator dashboard showed in full: only a request that was
     /// drawn with its answer keys is ever answered.
@@ -809,6 +812,13 @@ fn open_sel(model: &Model, sel: &Sel) -> (Outcome, Option<Option<Sel>>) {
                 .or_else(|| node.job.clone())
                 .unwrap_or_default(),
             title: model.job_of(node),
+            siblings: model
+                .data
+                .nodes
+                .iter()
+                .filter(|n| n.kind == "subagent" && n.id != node.id && n.session == node.session)
+                .filter_map(|n| n.label.clone().or_else(|| n.job.clone()))
+                .collect(),
         };
         return (open, Some(Some(sel.clone())));
     }

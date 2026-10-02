@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use super::pane::Pane;
 
 const RULE_MIN: usize = 20;
-const NEEDLE_CHARS: usize = 24;
 const STEP_TIMEOUT: Duration = Duration::from_millis(2500);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PRESSES: usize = 24;
@@ -24,6 +23,8 @@ const ESC: &[u8] = b"\x1b";
 pub(super) struct Target {
     pub(super) agent_type: Option<String>,
     pub(super) description: String,
+    /// The descriptions of the host's other known subagents.
+    pub(super) siblings: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -99,29 +100,40 @@ fn read_panel(rows: &[String]) -> Option<Panel> {
     })
 }
 
-/// The one row naming the target; none or several is a mismatch.
-fn find_target(panel: &Panel, target: &Target) -> Option<usize> {
-    let needle: String = target
-        .description
-        .trim()
-        .chars()
-        .take(NEEDLE_CHARS)
-        .collect::<String>()
-        .to_lowercase();
-    if needle.is_empty() {
+/// The description Claude shows in a row: what follows the agent type, up to the stats column, with
+/// a truncation ellipsis dropped. `None` when the row is not of the target's type.
+fn row_description(row: &str, agent_type: &str) -> Option<String> {
+    let rest = row.to_lowercase();
+    let rest = rest.strip_prefix(&agent_type.to_lowercase())?;
+    if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let mut hits: Vec<usize> = (0..panel.rows.len())
-        .filter(|&i| panel.rows[i].text.to_lowercase().contains(&needle))
-        .collect();
-    if hits.len() > 1 {
-        let kind = target.agent_type.as_deref()?.to_lowercase();
-        hits.retain(|&i| panel.rows[i].text.to_lowercase().starts_with(&kind));
+    let shown = rest.trim_start().split("  ").next()?;
+    let shown = shown.trim_end_matches(['\u{2026}', '.']).trim();
+    (!shown.is_empty()).then(|| shown.to_string())
+}
+
+/// The one row that can only be the target: of its agent type, showing a prefix of its full
+/// description, which no other subagent of the same host shares. Anything less is a mismatch.
+fn find_target(panel: &Panel, target: &Target) -> Option<usize> {
+    let kind = target
+        .agent_type
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())?;
+    let full = target.description.trim().to_lowercase();
+    let mut hits = (0..panel.rows.len()).filter(|&i| {
+        row_description(&panel.rows[i].text, kind).is_some_and(|shown| full.starts_with(&shown))
+    });
+    let (row, extra) = (hits.next()?, hits.next());
+    if extra.is_some() {
+        return None;
     }
-    match hits[..] {
-        [only] => Some(only),
-        _ => None,
-    }
+    let shown = row_description(&panel.rows[row].text, kind)?;
+    let shared = target
+        .siblings
+        .iter()
+        .any(|other| other.trim().to_lowercase().starts_with(&shown));
+    (!shared).then_some(row)
 }
 
 fn next_step(panel: &Panel, target: usize) -> Step {
@@ -242,6 +254,7 @@ mod tests {
         Target {
             agent_type: Some("general-purpose".into()),
             description: "sleepy probe".into(),
+            siblings: Vec::new(),
         }
     }
 
@@ -308,41 +321,68 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_ambiguous_row_is_a_mismatch_never_a_guess() {
-        let panel = read_panel(&rows(LAUNCHED)).expect("panel");
-        let other = Target {
-            agent_type: None,
-            description: "something else".into(),
-        };
-        assert_eq!(find_target(&panel, &other), None);
-        let empty = Target {
-            agent_type: None,
-            description: "  ".into(),
-        };
-        assert_eq!(find_target(&panel, &empty), None);
-        let twin = Panel {
-            rows: vec![
-                PanelRow {
-                    text: "Explore  map it".into(),
+    fn a_row_is_only_accepted_when_it_can_only_be_that_subagent() {
+        let panel = |rows: &[&str]| Panel {
+            rows: rows
+                .iter()
+                .map(|text| PanelRow {
+                    text: text.to_string(),
                     selected: false,
-                },
-                PanelRow {
-                    text: "Plan  map it".into(),
-                    selected: false,
-                },
-            ],
+                })
+                .collect(),
             enter_hint: false,
         };
-        let by_description = Target {
-            agent_type: None,
-            description: "map it".into(),
+        let target = |kind: Option<&str>, description: &str, siblings: &[&str]| Target {
+            agent_type: kind.map(str::to_string),
+            description: description.into(),
+            siblings: siblings.iter().map(|s| s.to_string()).collect(),
         };
-        assert_eq!(find_target(&twin, &by_description), None);
-        let by_type = Target {
-            agent_type: Some("Plan".into()),
-            description: "map it".into(),
-        };
-        assert_eq!(find_target(&twin, &by_type), Some(1));
+        let real = read_panel(&rows(LAUNCHED)).expect("panel");
+        assert_eq!(
+            find_target(&real, &target(Some("general-purpose"), "sleepy probe", &[])),
+            Some(1)
+        );
+        assert_eq!(
+            find_target(
+                &real,
+                &target(Some("general-purpose"), "something else", &[])
+            ),
+            None
+        );
+        assert_eq!(
+            find_target(&real, &target(None, "sleepy probe", &[])),
+            None,
+            "the type is required"
+        );
+        // The target is gone; a lone listed sibling of another type shares its first 24 characters.
+        let lone = panel(&["main", "Plan  map the call sites of the focus drive  5s"]);
+        let gone = target(
+            Some("Explore"),
+            "map the call sites of the focus drive and report",
+            &[],
+        );
+        assert_eq!(find_target(&lone, &gone), None);
+        // A listed row of the right type is still not enough when another subagent of the host
+        // shares the prefix it shows (here a truncated row).
+        let same_type = panel(&["main", "Explore  map the call sites of\u{2026}  5s"]);
+        let twin = target(
+            Some("Explore"),
+            "map the call sites of the focus drive and report",
+            &["map the call sites of the sink"],
+        );
+        assert_eq!(find_target(&same_type, &twin), None);
+        let alone = target(
+            Some("Explore"),
+            "map the call sites of the focus drive and report",
+            &[],
+        );
+        assert_eq!(find_target(&same_type, &alone), Some(1));
+        // The type must end at a word boundary, and a different description is no match.
+        let longer = panel(&["main", "Planner  map it  5s"]);
+        assert_eq!(
+            find_target(&longer, &target(Some("Plan"), "map it", &[])),
+            None
+        );
     }
 
     #[test]
