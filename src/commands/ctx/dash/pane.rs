@@ -2521,6 +2521,23 @@ impl Pane {
         }
         command.cwd(repo);
         sessions::scrub_supervision_env(&mut command);
+        // A rolled-over worker must not get its secrets back.
+        let stripped = scrub_worker_pane_env(&mut command, role, repo, &new_agent_name);
+        if !stripped.is_empty() {
+            let _ = super::super::log::append(
+                &self.state_dir,
+                &super::super::log::Decision {
+                    ts: super::super::state::now_secs(),
+                    session: &self.session_id,
+                    verb: "pane",
+                    verdict: "n/a",
+                    score: 0,
+                    action: "scrub-env",
+                    detail: &format!("withheld from worker: {}", stripped.join(", ")),
+                    observed_at: None,
+                },
+            );
+        }
         for (key, value) in &turn_env {
             command.env(key, value);
         }
