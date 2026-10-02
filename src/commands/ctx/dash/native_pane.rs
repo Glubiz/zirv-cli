@@ -868,8 +868,8 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
             Some(String::new())
         }
         "/help" => Some(
-            "commands: /clear /compact /context /status /settings /agents /agent /team \
-             /workflows /workflow /skills /skill \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C \
+            "commands: /clear /compact /context /status /settings [query|get|set|reset] /agents /agent /team \
+             /workflows /workflow /skills /skill \u{b7} settings scopes: --scope session|user|project \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C \
              quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
@@ -2571,6 +2571,9 @@ pub struct NativePaneRuntime {
     /// two-supervisors failure `link::RUNTIME_OWNS_IT` exists to prevent.
     session: Option<InteractiveSession>,
     journal: Journal,
+    /// `/settings` session-scope overrides (#536): applied to this pane's effective config only,
+    /// journaled as control events and replayed from the journal on resume; never written to a file.
+    session_overrides: super::super::config::settings::SessionOverrides,
     presentation: NativePresentation,
     conversation: ConversationState,
     /// Aggregate usage retained separately because the conversation body is
@@ -2691,6 +2694,31 @@ fn resolve_native_route(candidate: Option<&str>, role: &str, repo: &Path) -> Opt
     Some(chosen.to_string())
 }
 
+/// The `/settings` session overrides a session journaled, replayed in order so a resumed pane
+/// keeps them (#536). An unreadable journal restores none: an override is never invented.
+fn restore_session_overrides(
+    journal: &Journal,
+    session: &JournalSessionId,
+) -> super::super::config::settings::SessionOverrides {
+    let mut out = super::super::config::settings::SessionOverrides::new();
+    let Ok(events) = journal.events(session) else {
+        return out;
+    };
+    for stored in events {
+        let JournalEvent::SettingsOverride { key, value, .. } = stored.event else {
+            continue;
+        };
+        let parsed = value
+            .and_then(|text| toml::from_str::<toml::Table>(&format!("v = {text}")).ok())
+            .and_then(|mut table| table.remove("v"));
+        match parsed {
+            Some(value) => out.insert(key, value),
+            None => out.remove(&key),
+        };
+    }
+    out
+}
+
 impl NativePaneRuntime {
     pub fn spawn(
         cfg: &CtxConfig,
@@ -2719,6 +2747,7 @@ impl NativePaneRuntime {
             cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
         let recorded_usage = conversation_usage(&conversation);
         compact_retained_conversation(&mut conversation);
+        let session_overrides = restore_session_overrides(&journal, &session.session);
         let billing = resolve_billing(&session.route, &spec.repo);
         let git_branch = git_branch(&spec.repo);
 
@@ -2756,6 +2785,7 @@ impl NativePaneRuntime {
             live_approval: None,
             #[cfg(test)]
             journal_payload_reads: 1,
+            session_overrides,
             session: Some(session),
             journal,
             presentation,
@@ -2797,6 +2827,7 @@ impl NativePaneRuntime {
             cap_transcript_items(build_transcript(&conversation), MAX_TRANSCRIPT_ITEMS);
         let recorded_usage = conversation_usage(&conversation);
         compact_retained_conversation(&mut conversation);
+        let session_overrides = restore_session_overrides(&journal, &session_id);
         let git_branch = git_branch(&repo);
 
         let mut presentation = NativePresentation {
@@ -2848,6 +2879,7 @@ impl NativePaneRuntime {
             live_approval: None,
             #[cfg(test)]
             journal_payload_reads: 1,
+            session_overrides,
             session: None,
             journal,
             presentation,
@@ -3068,6 +3100,15 @@ impl NativePaneRuntime {
     /// touches the filesystem for anything other than this session's journal.
     pub fn refresh_records(&mut self, cfg: &CtxConfig, env: EnvLookup<'_>, now: u64) {
         use super::super::{coordinator, delegation, pool, seat};
+
+        let overridden;
+        let cfg = if self.session_overrides.is_empty() {
+            cfg
+        } else {
+            overridden =
+                super::super::config::settings::apply_session(cfg, &self.session_overrides);
+            &overridden
+        };
 
         let graph = coordinator::load(&self.state, &self.repo);
         let records = delegation::list(&self.state, &self.repo);
@@ -3741,7 +3782,34 @@ impl NativePaneRuntime {
         f(&super::super::config::settings::SettingsCtx {
             repo: &self.repo,
             env: &env,
+            session: &self.session_overrides,
         })
+    }
+
+    /// Hold, journal and apply one validated session override; nothing is written to any file.
+    fn session_change(
+        &mut self,
+        edit: super::super::config::settings::SessionEdit,
+    ) -> CtxResult<String> {
+        let key = edit.key;
+        if self.session_overrides.get(&key) == edit.value.as_ref() {
+            return Ok(format!("{key}: unchanged for this session"));
+        }
+        let text = edit.value.as_ref().map(ToString::to_string);
+        self.journal.record_settings_override(
+            &self.session_id,
+            self.generation,
+            key.clone(),
+            text,
+            super::super::state::now_secs(),
+        )?;
+        let verb = if edit.value.is_some() { "set" } else { "reset" };
+        match edit.value {
+            Some(value) => self.session_overrides.insert(key.clone(), value),
+            None => self.session_overrides.remove(&key),
+        };
+        self.ux.refreshed_at = 0;
+        Ok(format!("{key}: {verb} for this session (live, not saved)"))
     }
 
     /// `/settings`, `/settings <query>` and the `get|set|reset` text forms (#536).
@@ -3749,6 +3817,12 @@ impl NativePaneRuntime {
         use super::super::config::settings::{self, Slash};
         match self.with_settings_ctx(|ctx| settings::slash(ctx, args)) {
             Slash::Notice(text) => self.notice = Some(text),
+            Slash::Session(edit) => {
+                self.notice = Some(
+                    self.session_change(edit)
+                        .unwrap_or_else(|error| error.to_string()),
+                );
+            }
             Slash::Open(query) => match self.with_settings_ctx(settings::rows) {
                 Ok(rows) => {
                     self.ux.settings = Some(super::settings_view::SettingsState::new(rows, &query));
@@ -3761,7 +3835,7 @@ impl NativePaneRuntime {
 
     /// Feed one key to the open settings modal and perform the write it asks for.
     pub fn settings_key(&mut self, key: KeyEvent) {
-        use super::super::config::settings::{self, Change};
+        use super::super::config::settings::{self, Change, Scope};
         use super::settings_view::SettingsAction;
         let Some(state) = self.ux.settings.as_mut() else {
             return;
@@ -3773,6 +3847,14 @@ impl NativePaneRuntime {
                 self.ux.settings = None;
                 self.ux.focus = super::native_ux::Focus::Composer;
                 return;
+            }
+            SettingsAction::Save { key, raw, scope } if *scope == Scope::Session => {
+                settings::session_edit(key, Change::Set(raw))
+                    .and_then(|edit| self.session_change(edit))
+            }
+            SettingsAction::Reset { key, scope } if *scope == Scope::Session => {
+                settings::session_edit(key, Change::Reset)
+                    .and_then(|edit| self.session_change(edit))
             }
             SettingsAction::Save { key, raw, scope } => {
                 self.with_settings_ctx(|ctx| settings::change(ctx, key, Change::Set(raw), *scope))
@@ -6438,6 +6520,7 @@ mod tests {
             idempotency_seq: 0,
             live_approval: None,
             journal_payload_reads: 0,
+            session_overrides: Default::default(),
             session: None,
             journal,
             presentation: NativePresentation::default(),
@@ -6501,6 +6584,81 @@ mod tests {
         assert!(pane.ux.settings.is_some(), "the last form opens the modal");
         assert_eq!(pane.ux.focus, super::super::native_ux::Focus::Settings);
         assert!(pane.ux.modal_open());
+    }
+
+    /// Issue #536: a session override is applied to the pane's config, journaled as a control event
+    /// (no user turn), replayed on resume, and never written to a file; a next-session key refuses.
+    #[test]
+    fn session_overrides_apply_journal_replay_on_resume_and_never_touch_a_file() {
+        use super::super::config::settings::{SessionOverrides, apply_session};
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        pane.repo = tempfile::tempdir().expect("repo").keep();
+        pane.journal
+            .create_session(&identity_for("sess-1", 1))
+            .expect("create session");
+        let before = pane.journal.replay(&pane.session_id).expect("replay");
+
+        submit_text(
+            &mut pane,
+            "/settings set fallback.unknown_headroom_pct 40 --scope session",
+        );
+        let notice = pane.notice.clone().expect("notice");
+        assert!(notice.contains("for this session"), "{notice}");
+        let live = apply_session(&CtxConfig::default(), &pane.session_overrides);
+        assert_eq!(live.fallback.unknown_headroom_pct, 40.0);
+        assert!(
+            !super::super::config::operator_path()
+                .expect("operator path")
+                .exists(),
+            "session scope never writes the user file"
+        );
+        let after = pane.journal.replay(&pane.session_id).expect("replay");
+        assert_eq!(after.messages.len(), before.messages.len(), "no user turn");
+        let stored = pane
+            .journal
+            .latest_event_of_type(&pane.session_id, "settings_override")
+            .expect("read")
+            .expect("journaled");
+        assert!(matches!(
+            stored.event,
+            JournalEvent::SettingsOverride { ref key, value: Some(ref value), .. }
+                if key == "fallback.unknown_headroom_pct" && value == "40"
+        ));
+
+        let resumed = restore_session_overrides(&pane.journal, &pane.session_id);
+        assert_eq!(
+            resumed, pane.session_overrides,
+            "a resumed pane replays the override"
+        );
+
+        submit_text(
+            &mut pane,
+            "/settings reset fallback.unknown_headroom_pct --scope session",
+        );
+        assert!(pane.session_overrides.is_empty());
+        assert_eq!(
+            restore_session_overrides(&pane.journal, &pane.session_id),
+            SessionOverrides::new(),
+            "a replayed reset removes the override"
+        );
+
+        submit_text(&mut pane, "/settings set score.window 3 --scope session");
+        let notice = pane.notice.clone().expect("notice");
+        assert!(notice.contains("applies next session"), "{notice}");
+        assert!(pane.session_overrides.is_empty());
+        let events = pane.journal.events(&pane.session_id).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, JournalEvent::SettingsOverride { .. }))
+                .count(),
+            2,
+            "the refused edit journaled nothing"
+        );
     }
 
     #[test]

@@ -285,6 +285,13 @@ pub enum JournalEvent {
         sources: serde_json::Value,
         at_ms: Option<u64>,
     },
+    /// A `/settings` session-scope override (`value` set) or its removal (`None`): zirv control
+    /// state, never conversation input, and only ever a non-secret value. (#536)
+    SettingsOverride {
+        key: String,
+        value: Option<String>,
+        at_ms: Option<u64>,
+    },
 }
 
 impl JournalEvent {
@@ -300,6 +307,7 @@ impl JournalEvent {
             Self::GenerationAdvanced { .. } => "generation_advanced",
             Self::SessionEnded { .. } => "session_ended",
             Self::ContextCompiled { .. } => "context_compiled",
+            Self::SettingsOverride { .. } => "settings_override",
         }
     }
 
@@ -337,7 +345,8 @@ impl JournalEvent {
             },
             Self::GenerationAdvanced { .. }
             | Self::SessionEnded { .. }
-            | Self::ContextCompiled { .. } => IndexedIds::default(),
+            | Self::ContextCompiled { .. }
+            | Self::SettingsOverride { .. } => IndexedIds::default(),
         }
     }
 }
@@ -617,7 +626,7 @@ impl ConversationState {
                     state.ended_reason = Some(reason.clone());
                 }
                 // Context provenance remains informational, outside reduced conversation state. (#538)
-                JournalEvent::ContextCompiled { .. } => {}
+                JournalEvent::ContextCompiled { .. } | JournalEvent::SettingsOverride { .. } => {}
             }
         }
         for message in &state.messages {
@@ -1168,6 +1177,28 @@ impl Journal {
             JournalEvent::ContextCompiled {
                 context_version,
                 sources,
+                at_ms: Some(committed_at),
+            },
+            committed_at,
+        )
+    }
+
+    /// Journal one `/settings` session override (or its removal) so a resumed pane replays it. (#536)
+    pub fn record_settings_override(
+        &mut self,
+        session: &JournalSessionId,
+        generation: u64,
+        key: String,
+        value: Option<String>,
+        committed_at: u64,
+    ) -> JournalResult<SequenceId> {
+        self.append(
+            session,
+            generation,
+            &EventScope::default(),
+            JournalEvent::SettingsOverride {
+                key,
+                value,
                 at_ms: Some(committed_at),
             },
             committed_at,
@@ -1753,7 +1784,8 @@ impl Journal {
                 | JournalEvent::Checkpoint { .. }
                 | JournalEvent::GenerationAdvanced { .. }
                 | JournalEvent::SessionEnded { .. }
-                | JournalEvent::ContextCompiled { .. } => {}
+                | JournalEvent::ContextCompiled { .. }
+                | JournalEvent::SettingsOverride { .. } => {}
             }
         }
         Ok(projected)

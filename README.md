@@ -3171,6 +3171,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo <dir>]` | Measurement only: asks one Jev site's real production question(s) for a fixture input `K` times (1..=20) with the cache disabled, applies that site's production floor and answer-to-action rule, and prints what production would have DONE on each rep — spends real Jev calls and writes the normal decision/spend log rows, never any other side effect — see [Measuring floor determinism](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
 
@@ -3585,20 +3586,34 @@ running workflow's status -- all three rendered through the exact same
 (issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
 can never disagree about the same state. `/settings` opens a searchable,
 keyboard-only list of every configuration key (name, effective value, winning
-layer, scopes `U`ser/`P`roject, reload timing) with a one-line
-detail footer; type to filter, `Up`/`Down` move, `Enter` edits the focused
-row, `Tab` cycles its scope, `Ctrl+R` resets it to the inherited value,
-`Esc` cancels and then closes. `/settings <query>` opens the list filtered,
-`/settings get <key>`, `/settings set <key> <value> [--scope user|project]`
-and `/settings reset <key> [--scope ...]` print one notice instead. It is
+layer, scopes `U`ser/`P`roject/`S`ession, reload timing) with a detail footer
+that also shows the built-in default (`(unset)` for a key with no default,
+`false` and `0` shown as such); type to filter, `Up`/`Down` move,
+`Tab`/`Shift+Tab` (or `PageDown`/`PageUp`) jump to the next/previous top-level
+section, `Enter` edits the focused row, `Tab` inside the editor cycles its
+scope, `Ctrl+R` resets it to the inherited value (or removes a session
+override), `Esc` cancels and then closes. `/settings <query>` opens the list
+filtered, `/settings get <key>`,
+`/settings set <key> <value> [--scope session|user|project]` and
+`/settings reset <key> [--scope ...]` print one notice instead. It is
 zirv control input: never journaled, never sent to the model. User-scope
 writes go through the exact validated, comment-preserving, atomic edit
 `zirv ctx config set` uses (and are refused when the file changed since it was
 read); project scope writes `<repo>/.zirv/ctx.toml` only for keys a repository
 may set and only when the value narrows, refusing before anything is written;
-there is no session scope yet. Credential-like keys render as
-`(redacted)` and are never accepted. No key is known to reload live, so every
-row says `next session` and a write never claims otherwise. `@` file references and a
+Credential-like keys render as `(redacted)` and are never accepted.
+Session scope is an in-memory override held by that pane: it is journaled as a
+control event (key and non-secret value, never a user turn), replayed from the
+journal when the pane resumes, and never written to a file. Only keys the pane
+re-reads on every record refresh (`fallback.enabled`, `fallback.health.enabled`,
+`fallback.unknown_headroom_pct`, which feed the pane's pool view) offer it and
+say `live in session, saved: next session`; every other key says `next session`
+and a session edit of one is refused with that reason. A saved (user or project)
+write is never live, because the dashboard loads its config once.
+`zirv ctx config get <key> [--json]` prints the same effective value, default,
+source and reload timing as `/settings get` for the same key (project layer from the
+current directory), and `zirv ctx config show [key] --json` prints the stored
+operator file as JSON; there is no session scope on the command line. `@` file references and a
 `!`-prefixed shell line are not wired into this loop yet.
 
 `--runtime native` is **not** a separate dashboard any more: the native
@@ -4967,7 +4982,7 @@ keep only your own.
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
-| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
+| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
