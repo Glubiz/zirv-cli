@@ -561,6 +561,7 @@ pub fn run_session<W: std::io::Write>(
     };
 
     let status = {
+        let prompt_cache = super::types::prompt_cache_for(&cfg, route.provider.as_ref());
         let journal = backend
             .journal_mut()
             .ok_or("native runtime: the journal was not attached")?;
@@ -581,6 +582,7 @@ pub fn run_session<W: std::io::Write>(
                 workflow_repo: brokered.then(|| request.repo.to_path_buf()),
                 system,
                 preamble,
+                prompt_cache,
             },
             &provider,
             tools.as_mut(),

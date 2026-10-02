@@ -641,7 +641,7 @@ impl<'a> NativeLoop<'a> {
             stop_sequences: Vec::new(),
             thinking: Default::default(),
             effort: None,
-            cache: Default::default(),
+            cache: self.config.prompt_cache,
         };
         let context = self.obfuscation_context()?;
         #[cfg(not(test))]

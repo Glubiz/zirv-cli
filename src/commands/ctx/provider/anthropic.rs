@@ -235,11 +235,25 @@ impl AnthropicMessagesAdapter {
             CacheMode::Ephemeral5m => {
                 body.insert("cache_control".into(), json!({"type":"ephemeral"}));
             }
+            // One breakpoint at the end of the stable prefix (tools, then system); the moving tail is never cached.
             CacheMode::Ephemeral1h => {
-                body.insert(
-                    "cache_control".into(),
-                    json!({"type":"ephemeral", "ttl":"1h"}),
-                );
+                let marker = json!({"type":"ephemeral", "ttl":"1h"});
+                let last_system = body
+                    .get_mut("system")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|blocks| blocks.last_mut());
+                match last_system {
+                    Some(block) => block["cache_control"] = marker,
+                    None => {
+                        if let Some(tool) = body
+                            .get_mut("tools")
+                            .and_then(Value::as_array_mut)
+                            .and_then(|tools| tools.last_mut())
+                        {
+                            tool["cache_control"] = marker;
+                        }
+                    }
+                }
             }
         }
         match request.thinking {
@@ -1868,6 +1882,34 @@ mod tests {
         let idle = timeout_failure(true, &target);
         assert_eq!(idle.class, FailureClass::IdleTimeout);
         assert_eq!(idle.scope.kind, FailureScopeKind::Endpoint);
+    }
+
+    #[test]
+    fn one_hour_cache_marks_only_the_stable_prefix() {
+        let adapter = AnthropicMessagesAdapter::new(
+            target("http://127.0.0.1:9".into()),
+            credential(),
+            AnthropicTimeouts::default(),
+        )
+        .unwrap();
+        let mut req = request();
+        req.system = vec!["stable".into()];
+        req.cache = CacheMode::Ephemeral1h;
+        let body = adapter.encode_request(&req).unwrap().body;
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type":"ephemeral", "ttl":"1h"})
+        );
+        assert!(
+            body.get("cache_control").is_none(),
+            "no top-level breakpoint"
+        );
+        assert!(!body["messages"].to_string().contains("cache_control"));
+        assert!(!body["tools"].to_string().contains("cache_control"));
+        req.cache = CacheMode::Ephemeral5m;
+        let body = adapter.encode_request(&req).unwrap().body;
+        assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
+        assert!(body["system"][0].get("cache_control").is_none());
     }
 
     #[test]

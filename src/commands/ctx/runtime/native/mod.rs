@@ -169,6 +169,7 @@ mod tests {
             workflow_repo: None,
             system: Vec::new(),
             preamble: Vec::new(),
+            prompt_cache: Default::default(),
         }
     }
 

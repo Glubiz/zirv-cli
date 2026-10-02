@@ -4806,6 +4806,11 @@ substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also 
 ```
 
 `prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
+same key also opts a native Anthropic route into prompt caching: `"1h"` puts a
+one-hour `cache_control` breakpoint on the stable prefix (system prompt, else
+last tool definition) and never on the moving tail, `"5m"` uses the default
+cache TTL; unset leaves native requests uncached, and every other native
+provider (Bedrock, Google, OpenAI) is unchanged. The
 `effort` table classifies the prompt text with the SAME deterministic
 classifier the intake hook uses (`proxy::decision::try_classify_request`,
 text-only by default -- see `jev.launch_effort` below for the opt-in
