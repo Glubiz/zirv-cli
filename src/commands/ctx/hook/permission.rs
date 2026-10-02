@@ -362,7 +362,13 @@ pub(super) fn run_permission<W: Write>(
         // Any other outcome prints nothing, so the native dialog shows exactly as it always has.
         let inbox = crate::commands::ctx::config::ApprovalsConfig::load_operator_only(env)
             .unwrap_or_default();
-        if inbox.inbox {
+        // Only a mode that shows the operator a dialog is worth holding; auto, dontAsk and bypassPermissions resolve without one.
+        if inbox.inbox
+            && matches!(
+                payload.permission_mode.as_str(),
+                "default" | "plan" | "acceptEdits"
+            )
+        {
             let rule =
                 crate::commands::ctx::approvals::always_rule(&payload.permission_suggestions);
             let details = crate::commands::ctx::approvals::RequestDetails {
@@ -986,6 +992,7 @@ mod tests {
         let stdin = serde_json::json!({
             "session_id": "abc123",
             "cwd": "/work/repo",
+            "permission_mode": "default",
             "hook_event_name": "PermissionRequest",
             "tool_name": "Bash",
             "tool_input": {
@@ -1040,6 +1047,40 @@ mod tests {
             value["hookSpecificOutput"]["decision"],
             serde_json::json!({"behavior": "allow", "updatedPermissions": [suggestion]})
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_where_claude_resolves_without_the_user_is_never_held() {
+        for mode in ["auto", "dontAsk", "bypassPermissions"] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let lookup = inbox_env(tmp.path(), true);
+            let state = StateDir::resolve(&lookup).expect("state");
+            let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+                &state,
+                crate::commands::ctx::sessions::Record::new(
+                    "abc123",
+                    "claude",
+                    Path::new("/work/repo"),
+                    crate::commands::ctx::sessions::Verb::Dash,
+                ),
+            );
+            let _hub = crate::commands::ctx::approvals::Hub::bind(&state).expect("hub");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&permission_request()).expect("json");
+            payload["permission_mode"] = mode.into();
+            let mut out = Vec::new();
+            run_permission(&mut out, &payload.to_string(), &lookup).expect("never errors");
+            assert!(out.is_empty(), "{mode}: {}", String::from_utf8_lossy(&out));
+            let held = std::fs::read_dir(crate::commands::ctx::approvals::approvals_dir(&state))
+                .map(|dir| {
+                    dir.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(held, 0, "{mode} must not leave a held request");
+        }
     }
 
     #[cfg(unix)]
