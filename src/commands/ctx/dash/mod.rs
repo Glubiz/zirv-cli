@@ -3797,6 +3797,7 @@ fn apply_tree_outcome(
             agent_type,
             description,
             title,
+            siblings,
         } => {
             let path = session
                 .as_deref()
@@ -3805,6 +3806,7 @@ fn apply_tree_outcome(
             let target = subagent_focus::Target {
                 agent_type,
                 description,
+                siblings,
             };
             let host_short = host.filter(|short| {
                 dash.panes
