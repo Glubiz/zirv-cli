@@ -422,6 +422,10 @@ pub(super) fn record_scope_guard_request(
     if !cfg.scope_guard.enabled && !cfg.missing_tests_gate.enabled {
         return;
     }
+    // A harness notification is not the user's request and must not replace it.
+    if super::prompt::is_harness_injected_prompt(prompt) {
+        return;
+    }
     let session = env(SESSION_ENV).unwrap_or_else(|| payload_session_id.to_string());
     if session.is_empty() {
         return;
@@ -863,6 +867,37 @@ mod tests {
             "a file created and staged this turn must not be reported as an existing-tracked \
              edit: {modified:?}"
         );
+    }
+
+    /// A harness notification arriving as a prompt must not replace the
+    /// user's recorded request.
+    #[test]
+    fn a_harness_notification_never_replaces_the_users_scope_record() {
+        let repo = git_repo();
+        let state = tempfile::tempdir().expect("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let mut cfg = CtxConfig::default();
+        cfg.scope_guard.enabled = true;
+        let store = StateDir::from_root(state.path().to_path_buf());
+        let path = scope_guard_record_path(&store, "s1");
+
+        record_scope_guard_request(&cfg, "s1", SCOPE_GUARD_T24_PROMPT, repo.path(), &lookup);
+        let genuine = load_scope_guard_record(&path).expect("the user's request is recorded");
+
+        record_scope_guard_request(
+            &cfg,
+            "s1",
+            "<task-notification>\n<task-id>b8f</task-id>\n</task-notification>",
+            repo.path(),
+            &lookup,
+        );
+        let after = load_scope_guard_record(&path).expect("still recorded");
+        assert_eq!(after.prompt_hash, genuine.prompt_hash);
     }
 
     /// Constraint extraction picks the two sentences that actually restrict
