@@ -1728,7 +1728,9 @@ mod tests {
                 // Long enough to still be running when the assertion below
                 // looks for the socket entry, short enough to reap itself if
                 // the kill somehow misses.
-                &["cmd", "/c", "ping -n 20 127.0.0.1"],
+                // `--agent claude` makes wrap append adapter flags after this
+                // command, which `ping` would reject and exit; `rem` swallows them.
+                &["cmd", "/c", "ping -n 20 127.0.0.1 >nul & rem"],
             );
 
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1757,13 +1759,26 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            let early_exit = child.try_wait().ok().flatten();
             let _ = child.kill();
             let _ = child.wait();
 
+            fn listing(dir: &std::path::Path, out: &mut Vec<String>) {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    out.push(entry.path().display().to_string());
+                    if entry.path().is_dir() {
+                        listing(&entry.path(), out);
+                    }
+                }
+            }
+            let mut tree = Vec::new();
+            listing(&state, &mut tree);
             assert_eq!(
                 sockets.len(),
                 1,
-                "a supervised wrap publishes exactly one turn-signal endpoint"
+                "a supervised wrap publishes exactly one turn-signal endpoint; \
+                 wrap exited early: {early_exit:?}; state dir: {tree:#?}; wrap stderr: {}",
+                wrap_stderr(&state)
             );
             let published = std::fs::read_to_string(&sockets[0]).expect("read");
             assert!(
