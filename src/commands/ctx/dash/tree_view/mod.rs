@@ -58,6 +58,10 @@ pub(super) use plan::Surface;
 
 /// Newest events kept from the merged log.
 const EVENTS_KEPT: usize = 50;
+/// A Jev call just before the seat registered still belongs to its first request.
+const JEV_SINCE_GRACE_SECS: u64 = 120;
+/// With no seat session the Jev box shows this much of the repository's recent past.
+const JEV_REPO_WINDOW_SECS: u64 = 12 * 3600;
 const ADVICE_CHARS: usize = 60;
 
 /// One of the supervisor's three moments.
@@ -256,6 +260,38 @@ pub(super) fn compute(
         Some((p.input_micros, p.output_micros))
     });
     let slug = repo_slug_read_only(repo);
+    // The Jev box shows this seat's work: its descendants, and nothing from before it started (a proxy
+    // row names no session). Without a seat the box falls back to the repository's last half day.
+    let mut jev_children: Vec<String> = Vec::new();
+    while let Some(seat) = seat_session {
+        let before = jev_children.len();
+        let kids = nodes.iter().filter(|n| {
+            n.parent
+                .as_deref()
+                .is_some_and(|p| p == seat || jev_children.iter().any(|c| c == p))
+        });
+        let fresh: Vec<String> = kids
+            .map(|n| n.id.clone())
+            .filter(|id| !jev_children.contains(id))
+            .collect();
+        jev_children.extend(fresh);
+        if jev_children.len() == before {
+            break;
+        }
+    }
+    let jev_since = seat_session
+        .and_then(|seat| {
+            let node = nodes.iter().find(|n| n.id == seat)?.started_at;
+            node.or_else(|| {
+                graph::read_session_records(state)
+                    .into_iter()
+                    .find(|(record, _)| record.session == seat)
+                    .map(|(record, _)| record.started_at)
+            })
+        })
+        .map_or(now_secs().saturating_sub(JEV_REPO_WINDOW_SECS), |start| {
+            start.saturating_sub(JEV_SINCE_GRACE_SECS)
+        });
     TreeData {
         loaded: true,
         nodes,
@@ -275,8 +311,13 @@ pub(super) fn compute(
                 state,
                 cfg,
                 seat_session.map_or(super::super::jev_feed::JevScope::Repo(repo), |session| {
-                    super::super::jev_feed::JevScope::Session { session, repo }
+                    super::super::jev_feed::JevScope::Session {
+                        session,
+                        children: &jev_children,
+                        repo,
+                    }
                 }),
+                jev_since,
             ),
             cfg.proxy.enabled && cfg.proxy.decider == super::super::config::ProxyDecider::Typesafe,
         ),
