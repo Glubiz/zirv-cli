@@ -6095,7 +6095,9 @@ bounds every kind per session; once it is spent the seat decides as it would wit
 `zirv ctx supervisor ask "<question>" --option "<a>" --option "<b>" [--context-file F] [--timeout-secs 180]`
 is synchronous and never runs from a hook: it prints the chosen option and its reason and records
 the ruling. With the supervisor on, the seat's injected instructions carry one line telling it to
-route real design or approach choices through `ask` and follow the ruling. `zirv ctx supervisor
+route real design or approach choices through `ask` and follow the ruling. Claude Code lifts the sandbox for an excluded command only when every command in the call is
+excluded, so `ask` must be its own Bash call; on a sandbox denial it says to run it with the sandbox
+disabled. `zirv ctx supervisor
 override <id> [--reason ...]` marks a ruling overridden and is operator-only: it is refused inside an
 agent session (a session, socket or seat-role variable present, even if empty) and unless stdin and
 stdout are terminals, and it is never auto-allowed, so an agent's attempt surfaces as a permission

@@ -1119,6 +1119,18 @@ fn spawn_ask_consult(
     Err(format!("the supervisor child {status}: {tail}").into())
 }
 
+/// Said when the consult child's stderr shows the harness sandbox blocked it (#856).
+const SANDBOX_HINT: &str = "this looks like a sandbox denial: run `zirv ctx supervisor ask` as its own \
+Bash command with the sandbox disabled (dangerouslyDisableSandbox); Claude Code only lifts the sandbox when \
+every command in the call is excluded, so no `;`, `&&`, pipe, `cd` or file redirect around it";
+
+fn looks_sandbox_denied(failure: &str) -> bool {
+    let lower = failure.to_lowercase();
+    ["operation not permitted", "tunnel failed", "sandbox"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// Reserve one call of the session's `max_calls` budget and write the one-shot ticket.
 fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> bool {
     let Some(path) = state_path(state, session) else {
@@ -1215,6 +1227,9 @@ fn run_ask_with<W: Write>(
                 w,
                 "the supervisor could not rule ({error}); decide yourself or ask the operator"
             )?;
+            if looks_sandbox_denied(&error.to_string()) {
+                writeln!(w, "{SANDBOX_HINT}")?;
+            }
             return Ok(1);
         }
     };
@@ -2080,6 +2095,23 @@ mod tests {
         run_ask_with("q", &options, "", 5, &lookup, &unparseable, &mut out).expect("ask");
         let row = load_state(&state_path(&state, "operator").expect("path"));
         assert_eq!(row.calls, 0, "an unusable reply costs nothing either");
+    }
+
+    /// Issue #856: a sandbox denial in the child's stderr tells the seat how to run the ask.
+    #[test]
+    fn a_sandbox_denial_in_the_child_stderr_names_the_unsandboxed_run() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let denied = |_: &str, _: &[String], _: &str, _: u64| -> CtxResult<Option<Ruling>> {
+            Err("the supervisor child exit status: 1: CONNECT tunnel failed, response 403".into())
+        };
+        let mut out = Vec::new();
+        run_ask_with("q", &options, "", 5, &lookup, &denied, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("dangerouslyDisableSandbox"), "{text}");
     }
 
     /// Issue #856: `supervisor ask` spawns a harness child that needs network and `~/.claude`,
