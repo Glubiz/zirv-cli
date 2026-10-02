@@ -27,6 +27,7 @@ use crate::commands::ctx::handover;
 pub use crate::commands::ctx::jev::{
     Answer, AnswerValue, Answers, Criteria, MAX_CHOICE_OPTIONS, Question, QuestionKind, Usage,
 };
+use crate::commands::workflow::adoption::AutoStartPolicy;
 use crate::commands::workflow::classify::{self, Classification, Complexity, Intent, RiskBand};
 use crate::commands::workflow::engine;
 use crate::commands::workflow::profile::{ExecutionMode, ExecutionProfile, ValidationProfile};
@@ -383,6 +384,69 @@ pub fn try_classify_request(request: &str) -> Option<Classification> {
     }
     classification.reasons.sort();
     Some(classification)
+}
+
+/// Whether the prompt tells zirv not to run this work in a workflow.
+pub fn declines_workflow(request: &str) -> bool {
+    const PHRASES: [&str; 8] = [
+        "no workflow",
+        "without a workflow",
+        "without workflow",
+        "skip the workflow",
+        "skip workflow",
+        "don't use a workflow",
+        "don't start a workflow",
+        "do not start a workflow",
+    ];
+    let lower = request.to_ascii_lowercase().replace('\u{2019}', "'");
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Text-only: whether a session's prompt is work zirv should run in a
+/// workflow under `policy` -- a programming or investigation request for
+/// `Detect`, any non-empty prompt for `Always`. A question or chat is not.
+pub fn auto_start_wanted(request: &str, policy: AutoStartPolicy) -> bool {
+    match policy {
+        AutoStartPolicy::Off => false,
+        AutoStartPolicy::Always => !request.trim().is_empty(),
+        AutoStartPolicy::Detect => {
+            !is_question(request)
+                && try_classify_request(request)
+                    .is_some_and(|classification| classification.intent != Intent::Other)
+        }
+    }
+}
+
+/// A leading interrogative, or a trailing `?` that is not a polite request
+/// ("can you fix ...?"), asks for an answer rather than a change.
+fn is_question(request: &str) -> bool {
+    let lower = request.trim().to_ascii_lowercase();
+    let first = lower
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if matches!(
+        first,
+        "how"
+            | "what"
+            | "whats"
+            | "why"
+            | "when"
+            | "where"
+            | "who"
+            | "which"
+            | "explain"
+            | "describe"
+            | "is"
+            | "are"
+            | "does"
+            | "do"
+            | "did"
+    ) {
+        return true;
+    }
+    lower.ends_with('?') && !matches!(first, "can" | "could" | "would" | "will" | "please")
 }
 
 /// A long or enumerated request describes several requirements; never
@@ -2623,6 +2687,21 @@ mod tests {
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
         assert_eq!(merged.seat_role, SeatRole::Orchestrator);
         assert!(merged.validation.independent_test);
+    }
+
+    #[test]
+    fn auto_start_detects_programming_and_investigation_but_not_questions() {
+        let wanted = |text: &str| auto_start_wanted(text, AutoStartPolicy::Detect);
+        assert!(wanted("fix the crash in the dashboard pane click handler"));
+        assert!(wanted("Investigate why the scheduler crashes on startup"));
+        assert!(wanted("Can you refactor the adapters module?"));
+        assert!(!wanted("How do I add a flag to the log formatter?"));
+        assert!(!wanted("hi"));
+        assert!(!wanted("what does zirv ctx status print?"));
+        assert!(!auto_start_wanted("fix the crash", AutoStartPolicy::Off));
+        assert!(auto_start_wanted("hi", AutoStartPolicy::Always));
+        assert!(declines_workflow("fix the typo, no workflow please"));
+        assert!(!declines_workflow("fix the workflow status command"));
     }
 
     #[test]

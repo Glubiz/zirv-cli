@@ -17,7 +17,7 @@ pub use definitions::{
 };
 pub use lifecycle::{
     SKILL_HEADER_SENTINEL, active_skill_context, apply_recommended_dispositions, approve, close,
-    close_unstarted, native_completion_gate, render_current_context,
+    close_unstarted, native_completion_gate, render_current_context, waive_first_gate,
 };
 pub(crate) use state::{
     ARTIFACT_SUBSTANCE_DEFAULT_FLOOR, ARTIFACT_SUBSTANCE_LABEL, artifact_substance_action,

@@ -376,6 +376,8 @@ pub struct WorkflowConfig {
     pub telemetry_retention_days: u64,
     /// Operator-only adoption pressure; neither loosening nor tightening is safe for repos to choose (#223).
     pub adoption: crate::commands::workflow::adoption::AdoptionPolicy,
+    /// Operator-only: whether zirv starts a workflow on a session's first prompt; a repo must not start workflows (and their approvals and spend) for itself.
+    pub auto_start: crate::commands::workflow::adoption::AutoStartPolicy,
     /// Operator-only check-child env additions; never replace built-ins or let untrusted checks widen env access (#233).
     pub check_env_passthrough: Vec<String>,
     /// Operator-only reviewer budget limit.
@@ -405,6 +407,7 @@ impl Default for WorkflowConfig {
             telemetry_max_events: 1000,
             telemetry_retention_days: 30,
             adoption: crate::commands::workflow::adoption::AdoptionPolicy::default(),
+            auto_start: crate::commands::workflow::adoption::AutoStartPolicy::default(),
             check_env_passthrough: Vec::new(),
             review_worker_budget_tokens: None,
             review_worker_max_tool_calls: None,

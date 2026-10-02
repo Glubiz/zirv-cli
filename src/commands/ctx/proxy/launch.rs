@@ -9,6 +9,8 @@ use std::path::Path;
 use crate::commands::ctx::state::StateDir;
 use crate::commands::workflow::engine::{self, StartArgs};
 
+use crate::commands::workflow::classify::{Complexity, RiskBand};
+
 use super::decision::ProxyDecision;
 
 /// Whether `start_workflow_for` actually started a workflow for this launch.
@@ -40,6 +42,27 @@ pub fn start_workflow_for(
             reason: "no workflow named by this decision".to_string(),
         });
     };
+    start_named_workflow(
+        Some(kind),
+        Some((decision.complexity, decision.risk)),
+        state_dir,
+        repo,
+        request,
+        session,
+    )
+}
+
+/// The start behind [`start_workflow_for`]: `kind` `None` lets the engine
+/// classify and select the pack from `request`, and `class` `None` leaves
+/// complexity and risk to that classification.
+pub fn start_named_workflow(
+    kind: Option<String>,
+    class: Option<(Complexity, RiskBand)>,
+    state_dir: &Path,
+    repo: &Path,
+    request: &str,
+    session: Option<&str>,
+) -> Result<WorkflowStart, String> {
     let state = StateDir::from_path(state_dir.to_path_buf());
     if let Some(short) = session
         && let Some(active) = engine::load_active_for_session(&state, repo, short)
@@ -50,7 +73,7 @@ pub fn start_workflow_for(
         });
     }
     let args = StartArgs {
-        id: Some(kind),
+        id: kind,
         task: request.to_string(),
         agent: None,
         built_in_only: false,
@@ -58,8 +81,8 @@ pub fn start_workflow_for(
         paths: Vec::new(),
         changed_lines: None,
         tests_changed: false,
-        complexity: Some(decision.complexity),
-        risk: Some(decision.risk),
+        complexity: class.map(|(complexity, _)| complexity),
+        risk: class.map(|(_, risk)| risk),
         branch: None,
         frontend_root: None,
         brainstorm: false,
@@ -270,6 +293,34 @@ mod tests {
         let fresh = start_workflow_for(&decision, state_dir.path(), repo.path(), "do more", None)
             .expect("never errors");
         assert!(matches!(fresh, WorkflowStart::Started { .. }), "{fresh:?}");
+    }
+
+    #[test]
+    fn waiving_the_first_gate_starts_a_gated_workflow_running() {
+        let repo = tempdir().unwrap();
+        git_init_with_commit(repo.path());
+        let state_dir = tempdir().unwrap();
+        let state = CtxStateDir::from_path(state_dir.path().to_path_buf());
+        let started = start_named_workflow(
+            Some("feature".to_string()),
+            Some((Complexity::Bounded, RiskBand::Medium)),
+            state_dir.path(),
+            repo.path(),
+            "add a flag",
+            None,
+        )
+        .expect("starts");
+        let WorkflowStart::Started { id } = started else {
+            panic!("expected Started, got {started:?}");
+        };
+        let gated = engine::load(&state, repo.path(), &id).unwrap();
+        assert_eq!(gated.status, engine::WorkflowStatus::AwaitingApproval);
+
+        let running = engine::waive_first_gate(&state, gated).unwrap();
+        assert_eq!(running.status, engine::WorkflowStatus::Running);
+        let reloaded = engine::load_active(&state, repo.path()).unwrap().unwrap();
+        assert_eq!(reloaded.status, engine::WorkflowStatus::Running);
+        assert_eq!(reloaded.current_step, 0);
     }
 
     #[test]
