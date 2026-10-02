@@ -206,6 +206,7 @@ mod hook_core;
 mod interface;
 mod jev_approve;
 mod policy;
+mod prompt_free;
 mod readonly;
 mod retry;
 mod rules;
@@ -221,9 +222,9 @@ pub(crate) use evaluation::{evaluate_with_scratchpad_roots, parse_envelope_env, 
 pub use hook_core::run_check;
 #[cfg(test)]
 use hook_core::run_check_hook_mode;
-pub(crate) use hook_core::run_check_hook_with_verdict;
 #[cfg(test)]
 pub(crate) use hook_core::safety_family;
+pub(crate) use hook_core::{evaluate_check_hook_verdict, run_check_hook_with_verdict};
 pub use interface::{CheckArgs, SafetyArgs, run};
 pub(crate) use jev_approve::{
     APPROVE_ALLOW_MIN_CONFIDENCE, APPROVE_ALLOW_MIN_MARGIN, APPROVE_ESCALATE_MIN_CONFIDENCE,
@@ -231,6 +232,7 @@ pub(crate) use jev_approve::{
     approve_lower_question, jev_approve_is_read_only_local,
 };
 pub use policy::{glob_match, resolve};
+pub(crate) use prompt_free::permission_request_command_is_prompt_free;
 pub(crate) use readonly::is_read_only_escape_safe;
 pub(crate) use retry::{
     SANDBOX_DENY_READ_HOME_PATHS, command_fails_escape_screen, is_reserved_zirv_escape_safe,
@@ -254,6 +256,7 @@ use evaluation::*;
 use hook_core::*;
 use interface::*;
 use jev_approve::*;
+use prompt_free::*;
 use readonly::*;
 use retry::*;
 use rules::*;

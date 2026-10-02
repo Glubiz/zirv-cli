@@ -107,12 +107,17 @@ fn run_goal_bootstrap(
         .ok_or_else(|| GoalBootstrapError::before_launch("goal bootstrap called without --goal"))?;
     let adapter =
         adapters::select(Some(&args.name), &[], cfg).map_err(GoalBootstrapError::before_launch)?;
-    let mut command = adapters::policy_launch_args(
-        cfg,
+    let mut command = adapters::with_workload_writable_roots(
+        adapters::policy_launch_args(
+            cfg,
+            adapter.as_ref(),
+            &[],
+            adapters::LaunchMode::Headless,
+            super::super::prompt::PromptRole::Worker,
+        ),
         adapter.as_ref(),
-        &[],
-        adapters::LaunchMode::Headless,
-        super::super::prompt::PromptRole::Worker,
+        repo,
+        state,
     );
     if let Some(model) = adapters::resolve_tiered_model(
         cfg,
@@ -883,7 +888,7 @@ pub fn run_with<W: Write>(
         headless_worker_flags(&cfg, args, adapter.as_ref()),
         adapter.as_ref(),
         &launch_repo,
-        &state.mail(),
+        &state,
     );
     // Read the effective argv so the winning explicit or default model is recorded accurately.
     let model = adapters::last_model_flag(&command).map(str::to_string);

@@ -218,10 +218,52 @@ fn permission_prompt_row(payload: &PermissionHookPayload, ts: u64) -> Permission
     }
 }
 
-/// Records one privacy-preserving permission-prompt row without affecting
-/// Claude's permission flow. Every error is swallowed and stdout stays empty.
+/// The one `PermissionRequest` response this hook ever prints: approve.
+const PERMISSION_ALLOW_DECISION: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+
+/// Whether zirv's own safety verdict allows the command and every segment of
+/// it is a prompt-free built-in zirv invocation (#845). Never a deny or ask:
+/// anything uncertain simply leaves Claude's prompt in place.
+fn permission_request_is_prompt_free(
+    payload: &PermissionHookPayload,
+    stdin: &str,
+    env: EnvLookup<'_>,
+) -> bool {
+    if payload.tool_name != "Bash" || payload.hook_event_name.as_deref() == Some("PermissionDenied")
+    {
+        return false;
+    }
+    let Ok(current_exe) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    if !crate::commands::ctx::safety::permission_request_command_is_prompt_free(
+        &payload.tool_input.command,
+        &current_exe,
+    ) {
+        return false;
+    }
+    // The side-effect-free recheck cannot see a Jev escalation of the Allow.
+    let Ok(cfg) = CtxConfig::load(Path::new("."), env).and_then(|cfg| {
+        if cfg.jev.approve {
+            Err("jev approve is enabled".into())
+        } else {
+            Ok(cfg)
+        }
+    }) else {
+        return false;
+    };
+    let verdict = crate::commands::ctx::safety::evaluate_check_hook_verdict(&cfg, stdin, env);
+    matches!(
+        verdict,
+        Ok(Some(crate::commands::ctx::safety::Verdict::Allow))
+    )
+}
+
+/// Records one privacy-preserving permission-prompt row. Prints the allow
+/// decision only for a command [`permission_request_is_prompt_free`]
+/// proves; every error is swallowed and otherwise stdout stays empty.
 pub(super) fn run_permission<W: Write>(
-    _w: &mut W,
+    w: &mut W,
     stdin: &str,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
@@ -232,8 +274,13 @@ pub(super) fn run_permission<W: Write>(
         return Ok(0);
     };
     let short = attention_short(env, &payload.session_id);
-    // Observe live permission prompts without altering their flow. A denial
-    // also clears the prompt latch because the decision is resolved (#349, #456).
+    let auto_allowed = permission_request_is_prompt_free(&payload, stdin, env);
+    if auto_allowed {
+        let _ = writeln!(w, "{PERMISSION_ALLOW_DECISION}");
+    }
+    // Observe live permission prompts. A denial also clears the prompt latch
+    // because the decision is resolved (#349, #456); an auto-allowed prompt
+    // never waits on the operator, so it sets no latch.
     if payload.hook_event_name.as_deref() == Some("PermissionDenied") {
         clear_resolved_approval(
             &state,
@@ -241,7 +288,7 @@ pub(super) fn run_permission<W: Write>(
             format!("permission denied: {}", payload.tool_name),
             now_secs(),
         );
-    } else {
+    } else if !auto_allowed {
         let _ = crate::commands::ctx::attention::record(
             &state,
             &short,
@@ -507,6 +554,129 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(lines[0]).expect("json row");
         assert_eq!(row["session"], "abc123");
         assert_eq!(row["family"], "/work/repo/src");
+    }
+
+    fn permission_output(command: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = permission_env(&dir.path().join("state"));
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": command}),
+            ),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("never errors");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn the_allow_decision_has_the_documented_shape() {
+        let value: serde_json::Value =
+            serde_json::from_str(PERMISSION_ALLOW_DECISION).expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"}
+            }})
+        );
+    }
+
+    #[test]
+    fn a_prompt_free_zirv_command_is_approved_on_stdout() {
+        let out = permission_output("cd /some/dir && zirv ctx send abc \"hello\"");
+        assert_eq!(out.trim(), PERMISSION_ALLOW_DECISION);
+    }
+
+    #[test]
+    fn excluded_or_refused_zirv_commands_print_nothing() {
+        for command in [
+            "zirv ctx exec -- rm -rf x",
+            "zirv ctx config set foo bar",
+            "zirv ctx config show > ~/.zirv/ctx.toml",
+            "./target/debug/zirv ctx send a b",
+        ] {
+            assert_eq!(permission_output(command), "", "{command}");
+        }
+    }
+
+    #[test]
+    fn the_permission_request_path_appends_no_safety_audit_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = dir.path().join("state");
+        let env = permission_env(&state);
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "zirv ctx status"}),
+            ),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("never errors");
+        assert!(!out.is_empty(), "the command must have been approved");
+        assert!(
+            !state
+                .join("logs")
+                .join(crate::commands::ctx::log::SAFETY_LOG_DIR)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn jev_approve_enabled_leaves_the_prompt_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let mut env = permission_env(&dir.path().join("state"));
+        env.insert("ZIRV_CTX_JEV_APPROVE".into(), "true".into());
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "zirv ctx status"}),
+            ),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("never errors");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_auto_approved_prompt_raises_no_approval_latch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        run_permission(
+            &mut Vec::new(),
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "zirv ctx status"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        assert_ne!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::Approval
+        );
     }
 
     /// A `PreToolUse` for a DIFFERENT tool than the one that prompted also

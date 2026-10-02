@@ -257,7 +257,7 @@ pub(super) fn worker_pane_extra_args(
     if req.mode == super::permit::WorkerMode::ReadOnly {
         adapters::extend_read_only_args(adapter, &mut extra, surface_mode);
     }
-    extra.extend(adapter.extra_writable_root_args(&req.cwd, &state.mail()));
+    extra.extend(adapter.extra_writable_root_args(&req.cwd, state));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
     extra
 }

@@ -1090,6 +1090,30 @@ impl StateDir {
         self.0.join("mail")
     }
 
+    /// The state subdirectories a sandboxed worker's own `zirv` calls persist
+    /// to (#845): mail, memory, sessions, logs, tasks/groups, workflow,
+    /// verification, artifact and telemetry state. Deliberately NOT the bare
+    /// root: policy snapshots, the decision log, approvals and hook baselines
+    /// must stay unwritable by the workload.
+    pub fn workload_writable_dirs(&self) -> Vec<PathBuf> {
+        vec![
+            self.mail(),
+            self.memory(),
+            self.sessions(),
+            self.logs(),
+            self.tasks(),
+            self.groups(),
+            self.workflows(),
+            self.verification(),
+            self.artifacts(),
+            self.workflow_telemetry(),
+            self.adoption(),
+            self.intake(),
+            self.frontend(),
+            self.status_snapshots(),
+        ]
+    }
+
     /// Cross-session memory banks: `<state>/memory/<repo_slug>/...` and the
     /// machine-wide `<state>/memory/_global/...`. See `super::memory` for the
     /// storage layout and entry format.

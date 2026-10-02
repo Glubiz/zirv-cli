@@ -262,6 +262,12 @@ pub(super) fn perform_handover_swap(
     // must fail without tearing down the current session.
     let (new_adapter, new_extra_flags) =
         super::handover::resolve_swap_launch(cfg, req, true, role)?;
+    let new_extra_flags = adapters::with_workload_writable_roots(
+        new_extra_flags,
+        new_adapter.as_ref(),
+        repo,
+        state_dir,
+    );
     // Automatic swaps use the prepared fencing generation; manual swaps
     // retain the seat generation on disk. (#358)
     let successor_generation = req

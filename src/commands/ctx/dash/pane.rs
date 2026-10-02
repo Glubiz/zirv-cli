@@ -2081,6 +2081,14 @@ impl Pane {
         let carries_handoff = !same_harness;
         let (new_adapter, mut extra) =
             super::super::handover::resolve_swap_launch(cfg, req, carries_handoff, role)?;
+        if let Ok(state) = StateDir::resolve(&|key| std::env::var(key).ok()) {
+            extra = super::super::adapters::with_workload_writable_roots(
+                extra,
+                new_adapter.as_ref(),
+                repo,
+                &state,
+            );
+        }
         // Whether `resolve_swap_launch` above actually appended this
         // adapter's resume flags -- the same shared answer, so the argv and
         // the prompt decision below cannot disagree.

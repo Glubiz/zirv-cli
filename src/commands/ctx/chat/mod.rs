@@ -1045,12 +1045,17 @@ fn dash_orchestrator_pane_with_task(
     );
     // Apply the shared sandbox/policy posture while honoring explicit operator flags.
     // Use the resolved role so Single seats skip the orchestrator-only skill plugin.
-    let sandbox_extra = adapters::policy_launch_args(
-        cfg,
+    let sandbox_extra = adapters::with_workload_writable_roots(
+        adapters::policy_launch_args(
+            cfg,
+            adapter,
+            &argv,
+            adapters::LaunchMode::Interactive,
+            launch.role,
+        ),
         adapter,
-        &argv,
-        adapters::LaunchMode::Interactive,
-        launch.role,
+        repo,
+        state,
     );
     // Announce policy degradation on the same operator-controlled channel as other launches.
     let announcer =

@@ -318,12 +318,17 @@ fn run_with_clock_inner<W: Write>(
     let mut policy_extra = if policy_skip {
         Vec::new()
     } else {
-        adapters::policy_launch_args(
-            &cfg,
+        adapters::with_workload_writable_roots(
+            adapters::policy_launch_args(
+                &cfg,
+                adapter.as_ref(),
+                &user_extra,
+                adapters::LaunchMode::Headless,
+                super::prompt::PromptRole::Worker,
+            ),
             adapter.as_ref(),
-            &user_extra,
-            adapters::LaunchMode::Headless,
-            super::prompt::PromptRole::Worker,
+            repo,
+            &state,
         )
     };
     // Announce effective policy once at session start.
