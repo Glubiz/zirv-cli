@@ -337,12 +337,16 @@ pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>, since: u
         .iter()
         .filter(|row| row.get("decider").and_then(Value::as_str) == Some("typesafe"))
         .filter(|row| row.get("repo").and_then(Value::as_str).map(Path::new) == Some(repo))
-        .filter(|row| match row.get("session").and_then(Value::as_str) {
-            Some(session) if !session.is_empty() => in_scope(session),
-            _ => true,
+        .filter(|row| {
+            let created = row.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+            match row.get("session").and_then(Value::as_str) {
+                Some(session) if !session.is_empty() => in_scope(session),
+                // Sessionless: only the intake window around the seat's start is this seat's.
+                _ => proxy_until.is_none_or(|end| created <= end),
+            }
         })
         .filter_map(|row| proxy_decision(row, cfg))
-        .filter(|decision| decision.ts >= since && proxy_until.is_none_or(|end| decision.ts <= end))
+        .filter(|decision| decision.ts >= since)
         .collect();
     let mut decisions: Vec<JevDecision> = rows(&state.root().join(jev::JEV_DECISIONS_FILE))
         .iter()
@@ -524,7 +528,13 @@ mod tests {
             .expect("proxy rows");
         proxy.push_str("{\"repo\": \"/work/repo\", \"intent\": \"feature\", \"complexity\": \"bounded\", \"risk\": \"low\", \"decider\": \"typesafe\", \"confidence\": {}, \"usage\": {}, \"created_at\": 1650}\n");
         std::fs::write(state.root().join("proxy-decisions.jsonl"), proxy).expect("write");
+        // A session-tagged row of this seat is never cut by the launch window.
+        let mut proxy = std::fs::read_to_string(state.root().join("proxy-decisions.jsonl"))
+            .expect("proxy rows");
+        proxy.push_str(&format!("{{\"repo\": \"/work/repo\", \"session\": \"{SESSION}\", \"intent\": \"feature\", \"complexity\": \"bounded\", \"risk\": \"low\", \"decider\": \"typesafe\", \"confidence\": {{}}, \"usage\": {{}}, \"created_at\": 1655}}\n"));
+        std::fs::write(state.root().join("proxy-decisions.jsonl"), proxy).expect("write");
         let all = jev_feed(&state, &cfg, scope(&[]), 900);
+        assert!(all.decisions.iter().any(|d| d.ts == 1655), "{all:?}");
         assert!(all.decisions.iter().any(|d| d.ts == 1050), "{all:?}");
         assert!(!all.decisions.iter().any(|d| d.ts == 1650), "{all:?}");
         let repo_wide = jev_feed(&state, &cfg, JevScope::Repo(Path::new("/work/repo")), 900);
