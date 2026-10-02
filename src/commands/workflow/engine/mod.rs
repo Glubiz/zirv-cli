@@ -24,7 +24,7 @@ pub(crate) use state::{
     artifact_substance_questions, hash_bytes, load_active_read_only, read_accepted_artifact, save,
     save_preserving_active,
 };
-pub use state::{WorkflowState, load, load_active, state_mtime_secs};
+pub use state::{WorkflowState, load, load_active, load_active_for_session, state_mtime_secs};
 pub(crate) use transition::{
     GATE_RECLASS_LABEL, GATE_RECLASS_NOUL_DEFAULT_FLOOR, GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR,
     gate_reclass_questions, gate_sensitive_surface_action, gate_tag_action,

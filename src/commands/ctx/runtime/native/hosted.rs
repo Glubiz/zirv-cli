@@ -42,6 +42,7 @@ pub(super) fn apply_proxy_first_turn(
         state.root(),
         repo,
         request,
+        None,
     ) {
         Ok(super::super::super::proxy::launch::WorkflowStart::Skipped { reason }) => {
             let _ = progress_tx.send(InteractiveProgress::Notice(format!("proxy: {reason}")));
