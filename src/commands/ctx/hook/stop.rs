@@ -852,10 +852,16 @@ mod tests {
         let socket = dir.path().join("t.sock");
         let server = signal::SignalServer::bind(&socket).expect("bind");
 
-        let env: std::collections::HashMap<String, String> = [(
-            crate::commands::ctx::adapters::SOCKET_ENV.to_string(),
-            socket.display().to_string(),
-        )]
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::adapters::SOCKET_ENV.to_string(),
+                socket.display().to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                dir.path().join("state").display().to_string(),
+            ),
+        ]
         .into();
         let stdin = stop_payload(&transcript, dir.path());
 
