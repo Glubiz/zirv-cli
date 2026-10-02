@@ -168,6 +168,8 @@ struct SessionState {
     seen: Vec<String>,
     /// One-shot permits `fire` writes and `consult` consumes, so only a fired consult runs.
     tickets: Vec<String>,
+    /// Ask reservations their parent has not settled yet; a refund needs its id here, so it is idempotent.
+    reserved: Vec<String>,
 }
 
 /// One session's consult state as the agent tree shows it.
@@ -973,6 +975,13 @@ const ASK_FAILED_EXIT: i32 = 3;
 /// How much of the consult child's stderr an error message carries.
 const ASK_STDERR_TAIL_BYTES: usize = 400;
 
+/// Only the `--ask` child honours the ticket its parent reserved; a direct consult consumes its own.
+fn ask_ticket_for(ask: bool, env: EnvLookup<'_>) -> String {
+    ask.then(|| env(ASK_TICKET_ENV))
+        .flatten()
+        .unwrap_or_else(|| ASK_TICKET.to_string())
+}
+
 fn run_consult(
     session: &str,
     trigger: Option<Trigger>,
@@ -992,7 +1001,7 @@ fn run_consult(
             return Ok(0);
         }
     };
-    let ask_ticket = env(ASK_TICKET_ENV).unwrap_or_else(|| ASK_TICKET.to_string());
+    let ask_ticket = ask_ticket_for(ask, &env);
     let ticket = trigger.map_or(ask_ticket, |fired| fired.as_str().to_string());
     if (trigger.is_none() && !ask) || !take_ticket(&state, session, &ticket) {
         log_fallback(
@@ -1160,12 +1169,14 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     current.calls += 1;
     push_capped(&mut current.triggers, ASK_TICKET.to_string(), TRIGGERS_KEEP);
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
+    push_capped(&mut current.reserved, ticket.clone(), TRIGGERS_KEEP);
     save_state(&path, &current);
     Some(ticket)
 }
 
-/// Give back the call `reserve_ask_call` took when the consult failed for infrastructure reasons.
-fn refund_ask_call(state: &StateDir, session: &str, ticket: &str) {
+/// Settle the reservation `id`; on an infrastructure failure also give its call back. A child
+/// consuming its ticket does not settle it, and an unknown or already settled id is a no-op.
+fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
     let Some(path) = state_path(state, session) else {
         return;
     };
@@ -1173,13 +1184,18 @@ fn refund_ask_call(state: &StateDir, session: &str, ticket: &str) {
         return;
     };
     let mut current = load_state(&path);
-    current.calls = current.calls.saturating_sub(1);
-    if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
-        current.triggers.remove(at);
-    }
-    // The child may already have consumed its ticket; never take a sibling ask's.
-    if let Some(at) = current.tickets.iter().position(|held| held == ticket) {
-        current.tickets.remove(at);
+    let Some(at) = current.reserved.iter().position(|held| held == id) else {
+        return;
+    };
+    current.reserved.remove(at);
+    if refund {
+        current.calls = current.calls.saturating_sub(1);
+        if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
+            current.triggers.remove(at);
+        }
+        if let Some(at) = current.tickets.iter().position(|held| held == id) {
+            current.tickets.remove(at);
+        }
     }
     save_state(&path, &current);
 }
@@ -1229,7 +1245,7 @@ fn run_ask_with<W: Write>(
     let ruling = match consult(&session, options, &evidence, timeout_secs, &ticket) {
         Ok(Some(ruling)) => ruling,
         Ok(None) => {
-            refund_ask_call(&state, &session, &ticket);
+            settle_ask_call(&state, &session, &ticket, true);
             writeln!(
                 w,
                 "the supervisor gave no usable ruling; decide yourself or ask the operator"
@@ -1237,7 +1253,7 @@ fn run_ask_with<W: Write>(
             return Ok(1);
         }
         Err(error) => {
-            refund_ask_call(&state, &session, &ticket);
+            settle_ask_call(&state, &session, &ticket, true);
             log_fallback(&state, &session, &error.to_string());
             writeln!(
                 w,
@@ -1249,6 +1265,7 @@ fn run_ask_with<W: Write>(
             return Ok(1);
         }
     };
+    settle_ask_call(&state, &session, &ticket, false);
     writeln!(
         w,
         "ruling {}: {}\nreason: {}\nBinding unless the operator overrides it.",
@@ -2149,6 +2166,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_consumed_ask_ticket_is_still_refunded_exactly_once() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        assert!(take_ticket(&state, "operator", &id));
+        settle_ask_call(&state, "operator", &id, true);
+        let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
+        assert_eq!(calls(), 0, "the child consumed it and failed: refunded");
+        let other = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        settle_ask_call(&state, "operator", &id, true);
+        settle_ask_call(&state, "operator", "ask:never-reserved", true);
+        assert_eq!(calls(), 1, "a repeat, foreign or unknown refund is a no-op");
+        settle_ask_call(&state, "operator", &other, false);
+        settle_ask_call(&state, "operator", &other, true);
+        assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn a_direct_consult_ignores_a_foreign_ask_ticket() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let foreign = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let ticket = ask_ticket_for(false, &|key| {
+            (key == ASK_TICKET_ENV).then(|| foreign.clone())
+        });
+        assert_eq!(ticket, ASK_TICKET);
+        assert!(!take_ticket(&state, "operator", &ticket));
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!((row.calls, row.tickets), (1, vec![foreign.clone()]));
+        assert_eq!(
+            ask_ticket_for(true, &|key| (key == ASK_TICKET_ENV)
+                .then(|| foreign.clone())),
+            foreign
+        );
+    }
+
     /// Two overlapping asks: the first one's failed consult never refunds the second one's ticket.
     #[test]
     fn a_failed_ask_refunds_its_own_ticket_not_a_sibling_asks() {
@@ -2160,7 +2220,7 @@ mod tests {
         let options = vec!["a".to_string(), "b".to_string()];
         let sibling = std::cell::RefCell::new(None);
         let failing = |session: &str, _: &[String], _: &str, _: u64, ticket: &str| {
-            // B reserves while A's consult is in flight, then A's child consumes its own ticket and fails.
+            // B reserves while A's consult is in flight, then A's child consumes its ticket and fails.
             *sibling.borrow_mut() = reserve_ask_call(&state, &cfg, session);
             assert!(take_ticket(&state, session, ticket));
             Err::<Option<Ruling>, _>("the supervisor child exit status: 3: boom".into())
