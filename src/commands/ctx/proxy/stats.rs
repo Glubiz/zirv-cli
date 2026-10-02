@@ -116,13 +116,17 @@ pub fn compute(rows: &[SeatRow]) -> Vec<ClassStats> {
 
 /// Reads every stored profile and joins it with token and verification sources.
 pub fn collect(state: &StateDir) -> Vec<SeatRow> {
-    // A missing or unreadable ledger is `None`, which `tail_delegations` alone would report as an empty list.
-    let delegations = state
-        .logs()
-        .join(log::DELEGATION_FILE)
-        .exists()
-        .then(|| log::read_delegations(state, DELEGATION_ROW_CAP))
-        .filter(|_| log::tail_delegations(state, 0).is_ok());
+    // One read: any error (NotFound included) is `None`; a present empty file is `Some(vec![])`.
+    let delegations: Option<Vec<log::DelegationRow>> =
+        std::fs::read_to_string(state.logs().join(log::DELEGATION_FILE))
+            .ok()
+            .map(|text| {
+                let lines: Vec<&str> = text.lines().collect();
+                lines[lines.len().saturating_sub(DELEGATION_ROW_CAP)..]
+                    .iter()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            });
     store::load_all(state.root())
         .into_iter()
         .map(|(short, profile)| {
@@ -323,6 +327,44 @@ mod tests {
         assert_eq!(stats[0].delegations_note, None);
         assert_eq!(stats[0].seats_with_tokens, 0);
         assert_eq!(stats[0].median_input_tokens, None);
+    }
+
+    /// A ledger path that exists but cannot be read is unavailable; a present empty file is a real zero.
+    #[test]
+    fn an_existing_but_unreadable_ledger_is_unavailable_and_an_empty_one_is_zero() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        store::save(
+            tmp.path(),
+            "abcd1234-1",
+            &store::StoredProfile {
+                decision: super::super::tests::sample_decision(),
+                operator_override: None,
+                started_workflow_id: None,
+            },
+        )
+        .expect("save");
+        let ledger = state.logs().join(log::DELEGATION_FILE);
+        std::fs::create_dir_all(&ledger).expect("a directory where the file should be");
+        assert!(ledger.exists());
+        let stats = compute(&collect(&state));
+        assert_eq!(
+            (stats[0].delegations, stats[0].delegation_tokens),
+            (None, None)
+        );
+        assert_eq!(
+            stats[0].delegations_note.as_deref(),
+            Some(DELEGATIONS_UNAVAILABLE)
+        );
+
+        std::fs::remove_dir(&ledger).expect("remove dir");
+        std::fs::write(&ledger, "").expect("empty ledger");
+        let stats = compute(&collect(&state));
+        assert_eq!(
+            (stats[0].delegations, stats[0].delegation_tokens),
+            (Some(0), Some(0))
+        );
+        assert_eq!(stats[0].delegations_note, None);
     }
 
     /// An absent ledger is unavailable with its reason in text and JSON, and quality prints its reason too.
