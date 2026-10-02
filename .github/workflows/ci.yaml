@@ -320,7 +320,7 @@ jobs:
         if: ${{ runner.os == 'Windows' && !cancelled() }}
         shell: bash
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           for name in $(env | grep -o '^ZIRV_[A-Za-z0-9_]*' || true); do unset "$name"; done
           status=0
           for filter in \

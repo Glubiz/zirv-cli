@@ -1661,6 +1661,7 @@ mod tests {
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::null());
             // A file, not a pipe: like NUL it is not a console, and it cannot fill and block the wrapper.
+            std::fs::create_dir_all(state).expect("state dir");
             let log = std::fs::File::create(stderr_log(state)).expect("stderr log");
             cmd.stderr(log);
             // Keep the developer's real ~/.zirv/ctx.toml out of the run.
