@@ -189,7 +189,17 @@ fn hook_output_with_extras(
 /// standalone registration when the consolidated Bash hook is installed,
 /// avoiding two evaluations of one tool call (#769).
 pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
-    let cfg = CtxConfig::load(&args.repo, env)?;
+    let cfg = match CtxConfig::load(&args.repo, env) {
+        Ok(cfg) => cfg,
+        // Hook mode must not go silent on a refused repo config; the trusted layers still decide.
+        Err(err)
+            if args.command.is_empty()
+                && crate::commands::ctx::config::is_repo_forbidden(err.as_ref()) =>
+        {
+            CtxConfig::load_trusted_only(&args.repo, env)?
+        }
+        Err(err) => return Err(err),
+    };
 
     if !args.command.is_empty() {
         let command = args.command.join(" ");

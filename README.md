@@ -4919,6 +4919,7 @@ keep only your own.
 | Native release availability | fixed in the binary | no flag, configuration, environment variable or Cargo feature can enable native execution |
 | `~/.zirv/ZIRV.md`, `~/CLAUDE.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (operator-global) | operator | n/a — operator-authored |
 | `<repo>/ZIRV.md`, `<repo>/.zirv/ZIRV.md`, nested `ZIRV.md`, `AGENTS.md`, `CLAUDE.md`, singular `AGENT.md` (repo-owned, any scope) | repo-owned, untrusted | narrows only — read as prose context, never as authority |
+| `.zirv/ctx.toml` with a repo-forbidden key, seen by a PreToolUse Bash/PowerShell hook or the `zirv ctx safety check` hook | repo-owned and untrusted | the refusal never silences the safety check: the hook evaluates with built-in, operator (`~/.zirv/ctx.toml`) and `ZIRV_CTX_*` layers only, names the unapplied repo config in its reason, and asks if even that cannot load; `zirv ctx status` still reports the refusal and exits nonzero, and a launch still refuses; any other config error still fails open |
 | `[[workspace]]` in `.zirv/ctx.toml` | repo-owned and untrusted | additive-only inert `name`/`mcp_servers`/`skills`; `git` and `setup` are rejected because selecting a name is not operator authorization |
 | `[[workspace]]` in `~/.zirv/ctx.toml` | operator | may additionally declare bounded, environment-scrubbed `git` clones and `setup` commands; every materialization finishes before worker launch |
 | `ZIRV_CTX_OBFUSCATE_MODE` | operator environment | selects `off`, `flag` or `obfuscate`; no repository equivalent |
