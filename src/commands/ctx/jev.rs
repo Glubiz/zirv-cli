@@ -1100,9 +1100,10 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
         || cfg.inject
         || cfg.stop_verify
         || cfg.missing_tests
+        || cfg.retry
 }
 
-const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
+pub(crate) const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
 /// `{ts, from, to}` rows naming a launch's pre-minted session (`from`) that became another
 /// session (`to`); a separate file so decision-log readers never see a non-decision row (#827).
@@ -1776,7 +1777,7 @@ pub fn credential_present(cfg: &CtxConfig) -> bool {
 /// dashboard's JEV sidebar section, dash refresh PR2: hidden entirely with
 /// every gate off, via the existing [`any_gate_enabled`]) does not hand-
 /// maintain its own copy that could drift from theirs.
-fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 17] {
+fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 18] {
     [
         ("memory", cfg.jev.memory),
         ("supervisor", cfg.jev.supervisor),
@@ -1795,6 +1796,7 @@ fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 17] {
         ("inject_screen", cfg.jev.inject_screen),
         ("inject", cfg.jev.inject),
         ("stop_verify", cfg.jev.stop_verify),
+        ("retry", cfg.jev.retry),
     ]
 }
 

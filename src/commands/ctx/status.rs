@@ -1414,6 +1414,10 @@ fn render_report<W: Write>(
             if let Some(line) = describe_injection_fallback(cfg) {
                 writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
             }
+            let model_registry = super::models::load_registry(&state);
+            for line in super::models::retirement_warnings(cfg, &model_registry, now_secs()) {
+                writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
+            }
             // Issue #395: one line per configured `[endpoint.<agent>]`
             // override, naming the vendor, the base URL and the credential
             // environment variable's own NAME -- never its value, which
@@ -2697,7 +2701,12 @@ pub fn run_with<W: Write>(
 pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     let repo = std::env::current_dir()?;
     let env = env_from_process();
-    run_with(args, w, &repo, &env, console::colors_enabled())
+    let code = run_with(args, w, &repo, &env, console::colors_enabled())?;
+    // Only the CLI run starts the refresher; `run_with` also serves the prompt hook.
+    if let (Ok(state), Ok(cfg)) = (StateDir::resolve(&env), CtxConfig::load(&repo, &env)) {
+        super::models::spawn_refresh_if_due_detached(&cfg, &state);
+    }
+    Ok(code)
 }
 
 #[cfg(test)]
@@ -4952,8 +4961,8 @@ mod tests {
             let text = String::from_utf8(out).expect("utf8");
             assert!(text.contains("spend:"), "brief={brief}: got {text}");
             assert!(
-                text.contains("$3.00 this session"),
-                "1M input tokens @ $3/M (sonnet), attributed to this session: {text}"
+                text.contains("$2.00 this session"),
+                "1M input tokens @ $2/M (sonnet), attributed to this session: {text}"
             );
             assert!(text.contains("this 5h window"), "brief={brief}: got {text}");
             assert!(text.contains("prices as of"), "brief={brief}: got {text}");
@@ -7728,6 +7737,66 @@ mod tests {
         assert!(
             !state.status_snapshots().exists(),
             "no snapshot directory must be created when there is no session identity"
+        );
+    }
+
+    #[test]
+    fn status_shows_a_configured_models_nearby_retirement_and_upgrade() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        std::fs::create_dir_all(&state_root).expect("state");
+        let now = now_secs();
+        let model = crate::commands::ctx::models::RegistryModel {
+            vendor: "openai".into(),
+            id: "gpt-5.5".into(),
+            available: true,
+            first_seen: now,
+            last_seen: now,
+            retirement_at: Some(now + 10 * 86_400),
+            upgrade: Some("gpt-6.1-sol".into()),
+            sources: vec!["codex-cache".into()],
+            ..crate::commands::ctx::models::RegistryModel::default()
+        };
+        let registry = crate::commands::ctx::models::Registry {
+            updated_at: now,
+            models: std::collections::BTreeMap::from([("openai:gpt-5.5".into(), model)]),
+        };
+        std::fs::write(
+            state_root.join("models.json"),
+            serde_json::to_string(&registry).expect("json"),
+        )
+        .expect("registry");
+
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("home");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            "[worker]\ncodex = \"gpt-5.5\"\n",
+        )
+        .expect("config");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = env_for(&state_root);
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 0,
+                brief: true,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+                agents: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|key| env.get(key).cloned(),
+            false,
+        )
+        .expect("status");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("model gpt-5.5 retires within 14 days; upgrade to gpt-6.1-sol"),
+            "{text}"
         );
     }
 }

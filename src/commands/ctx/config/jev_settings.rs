@@ -104,6 +104,8 @@ pub struct JevConfig {
     /// Refine configured first-turn headless effort from numeric metadata; unavailable or indecisive answers use the classifier.
     /// Persist the choice per session so resume never re-asks or changes effort mid-conversation.
     pub launch_effort: bool,
+    /// After repeated identical tool failures, asks one retry/stop/change-approach question per streak; a decisive stop or change adds one advisory line, retry or any error adds nothing (#836).
+    pub retry: bool,
     /// Shared exact-request cache lifetime; zero disables reads and writes, and the model is part of the key.
     /// Caching stabilizes decisions near confidence floors because uncached Jev confidence varies between calls.
     pub cache_ttl_secs: u64,
@@ -133,6 +135,7 @@ impl Default for JevConfig {
             stop_verify: false,
             missing_tests: false,
             launch_effort: false,
+            retry: false,
             cache_ttl_secs: 604_800,
             floors: JevFloorsConfig::default(),
         }

@@ -1,0 +1,7 @@
+{"type": "assistant", "timestamp": "2026-10-01T10:00:01Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "Bash", "input": {"command": "ls"}}]}}
+{"type": "user", "timestamp": "2026-10-01T10:00:02Z", "message": {"content": [{"type": "tool_result", "content": "ok"}]}}
+{"type": "assistant", "timestamp": "2026-10-01T10:00:03Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "Read", "input": {"file_path": "/work/demo/src/lib.rs"}}]}}
+{"type": "assistant", "timestamp": "2026-10-01T10:00:04Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "Edit", "input": {"file_path": "/work/demo/src/lib.rs"}}]}}
+{"type": "assistant", "timestamp": "2026-10-01T10:00:05Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "Grep", "input": {"pattern": "fn main"}}]}}
+{"type": "assistant", "timestamp": "2026-10-01T10:00:06Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "Glob", "input": {"pattern": "src/**/*.rs"}}]}}
+{"type": "assistant", "timestamp": "2026-10-01T10:00:07Z", "message": {"content": [{"type": "text", "text": "working"}, {"type": "tool_use", "id": "toolu_x", "name": "SubagentHandback", "input": {"message": "done"}}]}}

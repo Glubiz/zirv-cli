@@ -53,6 +53,10 @@ pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
     ),
     ("ctx usage tee", "runs a caller-supplied statusline command"),
     (
+        "ctx supervisor override",
+        "lifts a binding supervisor ruling and is operator-only",
+    ),
+    (
         "ctx hook install",
         "writes another agent's hook configuration",
     ),
@@ -418,7 +422,11 @@ fn segment_is_prompt_free(
             .all(|t| is_zirv_env_assignment(t));
         // An env override is only trusted for the ctx supervisor verbs.
         let env_scope_ok = env_count == 0 || path.first().is_some_and(|root| root == "ctx");
-        return env_ok && env_scope_ok && !is_permissions_compile_write(&tokens[env_count..]);
+        // Token-matched in every spelling, like the retry path (`supervisor ask override` also prompts).
+        return env_ok
+            && env_scope_ok
+            && !is_permissions_compile_write(&tokens[env_count..])
+            && !is_supervisor_override(&[&["zirv".to_string()][..], args].concat());
     }
     if env_count > 0 {
         return false;
@@ -582,6 +590,39 @@ mod tests {
         ] {
             assert!(!free(command), "{command}");
         }
+    }
+
+    #[test]
+    fn supervisor_override_still_prompts_but_ask_and_status_do_not() {
+        for command in [
+            "zirv ctx supervisor override x",
+            "zirv ctx supervisor OVERRIDE x",
+            "zirv  ctx   supervisor   override",
+            "zirv ctx supervisor ask override",
+            "ZIRV_CTX_FALLBACK=false zirv ctx supervisor override x",
+            "cd /x && zirv ctx supervisor override x",
+            "zirv ctx status; zirv ctx supervisor override x",
+        ] {
+            assert!(!free(command), "{command}");
+        }
+        for command in [
+            "zirv ctx supervisor ask why",
+            "zirv ctx supervisor status",
+            "zirv ctx graph",
+            "zirv ctx statusline",
+            "zirv ctx models",
+        ] {
+            assert!(free(command), "{command}");
+        }
+        let patterns = schema_allow_patterns();
+        for command in ["zirv ctx supervisor ask x", "zirv ctx supervisor status"] {
+            assert!(patterns.iter().any(|p| glob_match(p, command)), "{command}");
+        }
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| glob_match(p, "zirv ctx supervisor override x"))
+        );
     }
 
     #[test]

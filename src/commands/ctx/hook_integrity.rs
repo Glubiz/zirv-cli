@@ -199,7 +199,7 @@ struct Target {
 
 fn targets_for(home: &Path) -> Vec<Target> {
     let mut claude_shapes: Vec<HookShape> = setup::HARNESS_HOOKS.to_vec();
-    claude_shapes.extend(setup::CLAUDE_ONLY_HOOKS);
+    claude_shapes.extend(setup::claude_only_hooks(setup::tool_failure_hook_enabled()));
     vec![
         Target {
             provider: "claude",

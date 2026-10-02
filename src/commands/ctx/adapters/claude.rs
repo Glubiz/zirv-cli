@@ -1019,6 +1019,8 @@ pub struct ClaudeAdapter {
     claude_permission_mode: Option<String>,
     /// Operator-only headless cost policy; absent configuration preserves the default launch. (#788)
     headless: super::super::config::HeadlessConfig,
+    /// Operator-only approvals inbox hold (#840): the `PermissionRequest` hook's installed timeout, set only when the inbox is on.
+    approvals_hook_timeout: Option<u64>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
     #[cfg(test)]
@@ -1046,6 +1048,7 @@ impl ClaudeAdapter {
             endpoint: None,
             claude_permission_mode: None,
             headless: super::super::config::HeadlessConfig::default(),
+            approvals_hook_timeout: None,
             #[cfg(test)]
             forced_file_support: None,
             #[cfg(test)]
@@ -1090,8 +1093,7 @@ impl ClaudeAdapter {
         self
     }
 
-    /// Test seam: pins the home directory the transcript path is built from.
-    #[cfg(test)]
+    /// Pins the home directory the transcript path is built from.
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
         self
@@ -1192,7 +1194,13 @@ impl ClaudeAdapter {
         } else {
             dir.join(format!("claude-launch-settings-{fingerprint}.json"))
         };
+        // A different hook timeout is a different settings file, so concurrent launches never share one.
+        let path = match self.approvals_hook_timeout {
+            Some(timeout) => path.with_extension(format!("ap{timeout}.json")),
+            None => path,
+        };
         let mut launch_environment = LaunchEnvironment::resolve();
+        launch_environment.approvals_hook_timeout = self.approvals_hook_timeout;
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
         launch_environment.lean = lean;
         let result = (|| -> std::io::Result<()> {
@@ -1339,6 +1347,8 @@ struct LaunchEnvironment {
     /// Adds `autoMemoryEnabled: false`/`disableBundledSkills: true` to the
     /// settings layer `launch_settings_value` builds.
     lean: bool,
+    /// `[approvals]` hold plus margin (#840): the `PermissionRequest` hook's `timeout`, present only with the inbox on.
+    approvals_hook_timeout: Option<u64>,
 }
 
 impl LaunchEnvironment {
@@ -1387,6 +1397,7 @@ impl LaunchEnvironment {
             workspace_write_roots,
             scrub_subprocess_env: false,
             lean: false,
+            approvals_hook_timeout: None,
         }
     }
 }
@@ -1617,6 +1628,10 @@ fn launch_settings_value(
     // Issue #788: operator opt-in only (`[headless] lean`), already narrowed
     // to a headless launch by the caller -- see `LaunchEnvironment::lean`'s
     // own doc comment.
+    if let Some(timeout) = launch_environment.approvals_hook_timeout {
+        settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] =
+            serde_json::json!(timeout);
+    }
     if launch_environment.lean {
         settings["autoMemoryEnabled"] = serde_json::json!(false);
         settings["disableBundledSkills"] = serde_json::json!(true);
@@ -2042,6 +2057,10 @@ impl AgentAdapter for ClaudeAdapter {
     /// `apply_chat_config` immediately above.
     fn apply_headless_config(&mut self, headless: &super::super::config::HeadlessConfig) {
         self.headless = headless.clone();
+    }
+
+    fn apply_approvals_config(&mut self, approvals: &super::super::config::ApprovalsConfig) {
+        self.approvals_hook_timeout = approvals.inbox.then(|| approvals.hook_timeout_secs());
     }
 
     fn endpoint_vendor(&self) -> Option<&str> {
@@ -3988,6 +4007,34 @@ mod tests {
             .expect("settings");
         assert!(settings["autoMemoryEnabled"].is_null());
         assert!(settings["disableBundledSkills"].is_null());
+    }
+
+    /// Issue #840: the `PermissionRequest` hook carries a `timeout` only with the approvals inbox on, and it
+    /// lands in its own settings file; with the inbox off the output is untouched.
+    #[test]
+    fn launch_settings_time_the_permission_hook_only_with_the_approvals_inbox_on() {
+        let policy = super::super::super::safety::SafetyPolicy::default();
+        let policy_path = Path::new("zirv-test-safety-policy.json");
+        let off = launch_settings_value(&policy, policy_path, &LaunchEnvironment::default())
+            .expect("settings");
+        assert!(off["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"].is_null());
+        let on = launch_settings_value(
+            &policy,
+            policy_path,
+            &LaunchEnvironment {
+                approvals_hook_timeout: Some(330),
+                ..LaunchEnvironment::default()
+            },
+        )
+        .expect("settings");
+        assert_eq!(
+            on["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            330
+        );
+        assert_eq!(
+            on["hooks"]["PermissionDenied"],
+            off["hooks"]["PermissionDenied"]
+        );
     }
 
     /// Writes the mutual link git keeps between `<repo>/.git/worktrees/

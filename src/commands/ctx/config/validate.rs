@@ -233,7 +233,8 @@ pub(super) fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> Ct
 
     match target.model.as_deref() {
         Some(model) => {
-            if !vendor.rungs.is_empty() && super::super::catalogue::rung_of(vendor, model).is_none()
+            if !vendor.rungs.is_empty()
+                && super::super::catalogue::rung_of_known(vendor, model).is_none()
             {
                 return Err(format!(
                     "{key}: model \"{model}\" does not resolve (by alias or id) on vendor \

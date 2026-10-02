@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-01T08:00:00.000Z","type":"session_meta","payload":{"session_id":"0aaaaaaa-0000-7000-8000-000000000001","id":"0aaaaaaa-0000-7000-8000-000000000002","parent_thread_id":"0aaaaaaa-0000-7000-8000-000000000001","timestamp":"2026-10-01T08:00:00.000Z","source":{"subagent":{"thread_spawn":{"depth":1,"agent_path":"/root/builder","agent_nickname":"Ada","agent_role":"builder"}}}}}
+{"timestamp":"2026-10-01T08:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/synthetic</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-10-01T08:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add the synthetic retry flag\nand cover it with a test"}]}}
+{"timestamp":"2026-10-01T08:00:03.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}

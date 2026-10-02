@@ -55,6 +55,10 @@ pub enum DashAction {
     /// Let the operator override automatic narrow-terminal sidebar hiding.
     ToggleSidebar,
     Quit,
+    /// `Ctrl+A t` switches between the dashboard and the agent tree (#833).
+    ToggleTree,
+    /// `Ctrl+A y/d/]/g/a`: answer or browse the approvals inbox; inert while nothing is pending (#840).
+    Approvals(ApprovalKey),
     /// `Ctrl+A ?` or `Ctrl+A h`/`H` -- opens the help overlay listing every
     /// binding below.
     Help,
@@ -71,6 +75,23 @@ pub enum DashAction {
     /// The prefix key pressed again while armed: the operator meant to send
     /// the child a literal `Ctrl+A`, not invoke a dashboard command.
     LiteralPrefix,
+}
+
+/// The five approvals-inbox chords behind the prefix (#840).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKey {
+    /// `y`: allow the shown request once.
+    Allow,
+    /// `Y`: allow it and apply the always-allow rule the harness offered, when it offered one.
+    AllowAlways,
+    /// `d`: deny it (`n` is already Nudge).
+    Deny,
+    /// `]`: show the next pending request.
+    Next,
+    /// `g`: release it to its pane and go there.
+    Goto,
+    /// `a`: the list across all dashboards.
+    List,
 }
 
 /// Resolve pointer actions from the last drawn frame; only Grid routes reach the child (#354).
@@ -438,6 +459,13 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         // Toggle the session sidebar even below its automatic width threshold.
         KeyCode::Char('b') => Some(DashAction::ToggleSidebar),
         KeyCode::Char('q') => Some(DashAction::Quit),
+        KeyCode::Char('t') => Some(DashAction::ToggleTree),
+        KeyCode::Char('y') => Some(DashAction::Approvals(ApprovalKey::Allow)),
+        KeyCode::Char('Y') => Some(DashAction::Approvals(ApprovalKey::AllowAlways)),
+        KeyCode::Char('d') => Some(DashAction::Approvals(ApprovalKey::Deny)),
+        KeyCode::Char(']') => Some(DashAction::Approvals(ApprovalKey::Next)),
+        KeyCode::Char('g') => Some(DashAction::Approvals(ApprovalKey::Goto)),
+        KeyCode::Char('a') => Some(DashAction::Approvals(ApprovalKey::List)),
         KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => Some(DashAction::Help),
         _ => None,
     };
@@ -616,6 +644,7 @@ pub(super) fn overlay_name(overlay: &ui::Overlay) -> &'static str {
         ui::Overlay::Palette(view) => view.mode.title(),
         ui::Overlay::Errors(_) => "errors",
         ui::Overlay::JevErrors(_) => "jev errors",
+        ui::Overlay::Approvals(_) => "approvals",
         ui::Overlay::Menu(_) => "actions",
         ui::Overlay::Inspector(_) => "inspect",
     }
@@ -893,6 +922,34 @@ impl KeyLog {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #840: the five approvals chords sit behind the prefix and do not shadow Nudge (`n`).
+    #[test]
+    fn the_approvals_chords_are_prefixed_and_leave_nudge_alone() {
+        for (code, expected) in [
+            ('y', ApprovalKey::Allow),
+            ('Y', ApprovalKey::AllowAlways),
+            ('d', ApprovalKey::Deny),
+            (']', ApprovalKey::Next),
+            ('g', ApprovalKey::Goto),
+            ('a', ApprovalKey::List),
+        ] {
+            assert_eq!(
+                filter_key(true, key(KeyCode::Char(code), KeyModifiers::NONE)).1,
+                InputVerdict::Dash(DashAction::Approvals(expected)),
+                "^A {code}"
+            );
+            assert_eq!(
+                filter_key(false, key(KeyCode::Char(code), KeyModifiers::NONE)).1,
+                InputVerdict::ToChild(encode_key(key(KeyCode::Char(code), KeyModifiers::NONE))),
+                "unprefixed {code} still belongs to the pane"
+            );
+        }
+        assert_eq!(
+            filter_key(true, key(KeyCode::Char('n'), KeyModifiers::NONE)).1,
+            InputVerdict::Dash(DashAction::Nudge)
+        );
+    }
     use super::super::tests::*;
     use super::*;
 

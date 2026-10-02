@@ -8,6 +8,9 @@ pub(super) enum EnvKind {
     /// Invert parsed booleans so quiet=true disables chrome events.
     NegatedBool,
     Str,
+    StringMap,
+    /// Comma-separated list.
+    StringList,
 }
 
 pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
@@ -446,6 +449,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     ("ZIRV_CTX_MAIL_KEEP", &["mail", "keep"], EnvKind::Int),
     (
+        "ZIRV_CTX_MAIL_MID_TURN",
+        &["mail", "mid_turn"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_REPO_CHECKS",
         &["workflow", "repo_checks_enabled"],
         EnvKind::Bool,
@@ -789,6 +797,31 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Str,
     ),
     (
+        "ZIRV_CTX_MODELS_DISCOVERY",
+        &["models", "discovery"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MODELS_PRICE_FETCH",
+        &["models", "price_fetch"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_MODELS_PIN",
+        &["models", "pin"],
+        EnvKind::StringMap,
+    ),
+    (
+        "ZIRV_CTX_MODELS_AVOID",
+        &["models", "avoid"],
+        EnvKind::StringList,
+    ),
+    (
+        "ZIRV_CTX_MODELS_AUTO_AVOID",
+        &["models", "auto_avoid"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS",
         &["compact_advisory", "min_reclaim_tokens"],
         EnvKind::Int,
@@ -942,6 +975,32 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["jev", "missing_tests"],
         EnvKind::Bool,
     ),
+    ("ZIRV_CTX_JEV_RETRY", &["jev", "retry"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_SUPERVISOR_ENABLED",
+        &["supervisor", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISOR_HARNESS",
+        &["supervisor", "harness"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISOR_MODEL",
+        &["supervisor", "model"],
+        EnvKind::Str,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISOR_MAX_CALLS",
+        &["supervisor", "max_calls"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES",
+        &["supervisor", "max_advice_bytes"],
+        EnvKind::Int,
+    ),
     (
         "ZIRV_CTX_JEV_LAUNCH_EFFORT",
         &["jev", "launch_effort"],
@@ -1068,6 +1127,16 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         "ZIRV_CTX_HEADLESS_LEAN",
         &["headless", "lean"],
         EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_APPROVALS_INBOX",
+        &["approvals", "inbox"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_APPROVALS_HOLD_SECS",
+        &["approvals", "hold_secs"],
+        EnvKind::Int,
     ),
     (
         "ZIRV_CTX_SCOPE_GUARD_ENABLED",
@@ -1344,6 +1413,34 @@ pub(super) fn env_value(raw: &str, kind: EnvKind) -> CtxResult<toml::Value> {
             .map_err(|_| format!("expected a number, got '{raw}'").into()),
         EnvKind::Bool => parse_bool(raw).map(toml::Value::Boolean),
         EnvKind::NegatedBool => parse_bool(raw).map(|b| toml::Value::Boolean(!b)),
+        EnvKind::StringList => Ok(toml::Value::Array(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| toml::Value::String(entry.to_string()))
+                .collect(),
+        )),
+        EnvKind::StringMap => {
+            let mut values = toml::Table::new();
+            for entry in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+            {
+                let Some((key, value)) = entry.split_once('=') else {
+                    return Err(
+                        format!("expected comma-separated key=value pairs, got '{entry}'").into(),
+                    );
+                };
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() || value.is_empty() {
+                    return Err(format!("expected non-empty key=value pair, got '{entry}'").into());
+                }
+                values.insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
+            Ok(toml::Value::Table(values))
+        }
     }
 }
 
@@ -1426,6 +1523,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["mail", "max_delivered_bytes"],
         "ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES",
     ),
+    // Repos cannot turn on mid-turn mail injection into the operator's agent context.
+    (&["mail", "mid_turn"], "ZIRV_CTX_MAIL_MID_TURN"),
     // Repos cannot re-enable mail the operator disabled.
     (&["mail", "enabled"], "ZIRV_CTX_MAIL"),
     // Repos must not silence announcements, including notices that supervision degraded.
@@ -1712,6 +1811,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         "ZIRV_CTX_PRICE_STALE_AFTER_DAYS",
     ),
     (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
+    // Discovery and fetched pricing choose operator accounts and network egress; repos cannot steer either or pin a spending model.
+    (&["models"], "ZIRV_CTX_MODELS_*"),
     // Repos cannot raise their history-search output cap (#315).
     (
         &["search", "max_output_bytes"],
@@ -1856,6 +1957,19 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["jev", "stop_verify"], "ZIRV_CTX_JEV_STOP_VERIFY"),
     (&["jev", "missing_tests"], "ZIRV_CTX_JEV_MISSING_TESTS"),
     (&["jev", "launch_effort"], "ZIRV_CTX_JEV_LAUNCH_EFFORT"),
+    (&["jev", "retry"], "ZIRV_CTX_JEV_RETRY"),
+    // Repos cannot enable or retarget the supervisor: it spends the operator's model budget (#835).
+    (&["supervisor", "enabled"], "ZIRV_CTX_SUPERVISOR_ENABLED"),
+    (&["supervisor", "harness"], "ZIRV_CTX_SUPERVISOR_HARNESS"),
+    (&["supervisor", "model"], "ZIRV_CTX_SUPERVISOR_MODEL"),
+    (
+        &["supervisor", "max_calls"],
+        "ZIRV_CTX_SUPERVISOR_MAX_CALLS",
+    ),
+    (
+        &["supervisor", "max_advice_bytes"],
+        "ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES",
+    ),
     (&["jev", "cache_ttl_secs"], "ZIRV_CTX_JEV_CACHE_TTL_SECS"),
     // Every advisory-floor field changes which answers are acted on; forbid the whole table (#803).
     (
@@ -1879,6 +1993,8 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["headless", "effort", "substantial"],
         "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL",
     ),
+    (&["approvals", "inbox"], "ZIRV_CTX_APPROVALS_INBOX"),
+    (&["approvals", "hold_secs"], "ZIRV_CTX_APPROVALS_HOLD_SECS"),
     (&["headless", "lean"], "ZIRV_CTX_HEADLESS_LEAN"),
     (
         &["headless", "disallowed_tools"],

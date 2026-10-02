@@ -26,19 +26,15 @@ use crate::commands::ctx::{CtxResult, log};
 #[serde(default)]
 pub struct PostToolPayload {
     pub tool_name: String,
-    pub tool_input: PostToolInput,
+    pub tool_input: super::permission::PermissionToolInput,
     pub tool_response: BashToolOutput,
     pub cwd: String,
     /// Claude session ID recorded in the compaction ledger (#422).
     pub session_id: String,
     /// Claude tool-call ID for correlating this compaction row (#422).
     pub tool_use_id: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct PostToolInput {
-    pub command: String,
+    /// Non-empty inside a native subagent, whose tool calls must not receive the lead's mail.
+    pub agent_id: String,
 }
 
 /// The documented shape of claude's `Bash` tool result -- and therefore the
@@ -139,6 +135,21 @@ fn posttool_finish<W: Write>(w: &mut W, note: Option<&str>) -> CtxResult<i32> {
     Ok(0)
 }
 
+/// Append mid-turn mail (#834) to the additionalContext note. The cheap gates live in
+/// `mail::mid_turn_context`; an unparsable payload or a missing cwd delivers nothing.
+fn with_mid_turn_mail(
+    note: Option<String>,
+    shared: Option<(&PathBuf, &crate::commands::ctx::config::CtxConfig)>,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    let mail =
+        shared.and_then(|(cwd, cfg)| crate::commands::ctx::mail::mid_turn_context(cwd, cfg, env));
+    match (note, mail) {
+        (Some(note), Some(mail)) => Some(format!("{note}\n\n{mail}")),
+        (note, mail) => note.or(mail),
+    }
+}
+
 fn withhold_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
@@ -196,7 +207,11 @@ fn label_sensitive_json(value: &mut serde_json::Value, kinds: &str) {
     }
 }
 
-fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde_json::Value> {
+fn obfuscated_posttool_response(
+    stdin: &str,
+    env: EnvLookup<'_>,
+    shared: Option<&crate::commands::ctx::config::CtxConfig>,
+) -> Option<serde_json::Value> {
     let mut raw = serde_json::from_str::<serde_json::Value>(stdin).ok()?;
     let original = raw.get("tool_response")?.clone();
     let cwd = raw
@@ -205,11 +220,18 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
         .filter(|cwd| !cwd.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())?;
-    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let loaded;
+    let cfg = match shared {
+        Some(cfg) => cfg,
+        None => {
+            loaded = cfg_or_operator_only_gate(&cwd, env);
+            &loaded
+        }
+    };
     if cfg.obfuscate.mode == crate::commands::ctx::config::ObfuscateMode::Off {
         return None;
     }
-    let options = match hook_obfuscation_options(&cfg) {
+    let options = match hook_obfuscation_options(cfg) {
         Ok(options) => options,
         Err(_) => {
             let mut response = original;
@@ -276,31 +298,85 @@ fn obfuscated_posttool_response(stdin: &str, env: EnvLookup<'_>) -> Option<serde
 /// `expect` or return `Err`: the release profile is `panic = "abort"`, and
 /// a hook that aborts takes the tool result with it.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    run_posttool_with(w, stdin, env, true)
+}
+
+/// [`run_posttool`]; `mid_turn_mail` is false for an agent whose envelope cannot carry `additionalContext`.
+pub fn run_posttool_with<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    mid_turn_mail: bool,
+) -> CtxResult<i32> {
+    // Load config once and share it with every stage below; each used to load its own.
+    let parsed = serde_json::from_str::<PostToolPayload>(stdin).ok();
+    let shared = parsed.as_ref().and_then(|payload| {
+        let cwd = if payload.cwd.is_empty() {
+            std::env::current_dir().ok()?
+        } else {
+            PathBuf::from(&payload.cwd)
+        };
+        let cfg = cfg_or_operator_only_gate(&cwd, env);
+        Some((cwd, cfg))
+    });
+
+    // A successful tool call ends any `[jev] retry` failure streak (#836).
+    if let (Some(payload), Some((_, cfg))) = (&parsed, &shared) {
+        super::tool_failure::reset_streak(cfg, env, &payload.session_id);
+    }
+
     // Compute the shell checkpoint before replacement paths branch so its
     // note joins their sole JSON envelope; PostToolUse accepts one object.
-    let shell_checkpoint = serde_json::from_str::<PostToolPayload>(stdin)
-        .ok()
+    let shell_checkpoint = parsed
+        .as_ref()
         .filter(|payload| matches!(payload.tool_name.as_str(), "Bash" | "PowerShell"))
         .and_then(|payload| {
-            let cwd = if payload.cwd.is_empty() {
-                std::env::current_dir().ok()?
-            } else {
-                PathBuf::from(&payload.cwd)
-            };
-            let cfg = cfg_or_operator_only_gate(&cwd, env);
+            let (cwd, cfg) = shared.as_ref()?;
             scope_guard_shell_checkpoint_note(
                 &payload.tool_name,
-                &cwd,
-                &cfg,
+                cwd,
+                cfg,
                 &payload.session_id,
                 &payload.tool_input.command,
                 env,
             )
         });
 
+    // A subagent's PostToolUse carries `agent_id`: nothing is delivered to it and nothing consumed.
+    let lead_turn = mid_turn_mail && parsed.as_ref().is_some_and(|p| p.agent_id.is_empty());
+    let shell_checkpoint = with_mid_turn_mail(
+        shell_checkpoint,
+        shared
+            .as_ref()
+            .filter(|_| lead_turn)
+            .map(|(cwd, cfg)| (cwd, cfg)),
+        env,
+    );
+
+    // A tool call proves any pending permission prompt has resolved; clear attention and the
+    // inbox record before every later early return, the masked branch included (#456).
+    if let (Some(payload), Ok(state)) = (&parsed, StateDir::resolve(env)) {
+        let short = attention_short(env, &payload.session_id);
+        clear_resolved_approval(
+            &state,
+            &short,
+            format!("permission resolved: {}", payload.tool_name),
+            now_secs(),
+        );
+        crate::commands::ctx::approvals::clear_for_tool(
+            &state,
+            &short,
+            &payload.tool_name,
+            &payload.tool_input.command,
+            &payload.tool_input.preview_source(&payload.tool_name),
+        );
+    }
+
     // Mask non-Bash results before Bash-only parsing; their response schemas
     // differ but may still carry sensitive strings.
-    if let Some(masked) = obfuscated_posttool_response(stdin, env) {
+    if let Some(masked) =
+        obfuscated_posttool_response(stdin, env, shared.as_ref().map(|(_, cfg)| cfg))
+    {
         let _ = writeln!(
             w,
             "{}",
@@ -314,17 +390,6 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
         return Ok(0);
     };
-
-    // A tool call proves any pending permission prompt has resolved; clear
-    // attention before Bash-only early returns (#456).
-    if let Ok(state) = StateDir::resolve(env) {
-        clear_resolved_approval(
-            &state,
-            &attention_short(env, &payload.session_id),
-            format!("permission resolved: {}", payload.tool_name),
-            now_secs(),
-        );
-    }
 
     if payload.tool_name != "Bash" || payload.tool_response.is_image {
         return posttool_finish(w, shell_checkpoint.as_deref());
@@ -387,7 +452,14 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         );
         return posttool_finish(w, shell_checkpoint.as_deref());
     }
-    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let loaded;
+    let cfg = match shared.as_ref() {
+        Some((_, cfg)) => cfg,
+        None => {
+            loaded = cfg_or_operator_only_gate(&cwd, env);
+            &loaded
+        }
+    };
     if !cfg.output.compact {
         record(
             crate::commands::ctx::ledger::Outcome::Disabled,
@@ -648,6 +720,35 @@ mod tests {
             !state.attention().join(format!("{short}.json")).exists(),
             "nothing to clear must never write a status file either"
         );
+    }
+
+    /// Issue #840: a finished tool call ends its pending approval record, and only that call's.
+    #[test]
+    fn posttool_clears_the_approval_record_of_the_finished_call_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let finished =
+            crate::commands::ctx::approvals::Request::new(&short, "Bash", "echo hi", "echo hi", 1);
+        let other = crate::commands::ctx::approvals::Request::new(&short, "Bash", "ls", "ls", 1);
+        let finished_path =
+            crate::commands::ctx::approvals::write_record(&state, &finished).expect("record");
+        let other_path =
+            crate::commands::ctx::approvals::write_record(&state, &other).expect("record");
+        let stdin = serde_json::json!({
+            "session_id": "abc123",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {"stdout": "hi", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo",
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        run_posttool(&mut Vec::new(), &stdin, &lookup).expect("never errors");
+        assert!(!finished_path.exists());
+        assert!(other_path.exists());
     }
 
     #[test]
@@ -1939,5 +2040,49 @@ mod tests {
                 .is_some_and(|note| note.contains("Scope checkpoint")),
             "the same envelope must also carry the checkpoint: {out}"
         );
+    }
+
+    /// #834: with the key on and nothing addressed to the session, the hook output is
+    /// byte-identical to the key-off output.
+    #[test]
+    fn mid_turn_mail_leaves_an_empty_inbox_output_byte_identical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(state.join("mail")).expect("mail dir");
+        let stdin = serde_json::json!({
+            "session_id": "abcdef12-3456-4789-8abc-def012345678",
+            "cwd": tmp.path().display().to_string(),
+            "tool_name": "Read",
+            "tool_input": {},
+            "tool_response": {},
+        })
+        .to_string();
+        let run = |mid_turn: &str| {
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            );
+            env.insert(
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "abcdef12-3456-4789-8abc-def012345678".to_string(),
+            );
+            env.insert("ZIRV_CTX_MAIL_MID_TURN".to_string(), mid_turn.to_string());
+            let mut out = Vec::new();
+            run_posttool(&mut out, &stdin, &|k| env.get(k).cloned()).expect("posttool");
+            out
+        };
+        assert_eq!(run("true"), run("false"));
+    }
+
+    #[test]
+    fn a_subagent_payload_is_recognised_by_its_agent_id() {
+        let lead: PostToolPayload = serde_json::from_str(r#"{"tool_name":"Read"}"#).expect("lead");
+        let sub: PostToolPayload =
+            serde_json::from_str(r#"{"tool_name":"Read","agent_id":"a1b2"}"#).expect("sub");
+        assert!(lead.agent_id.is_empty());
+        assert_eq!(sub.agent_id, "a1b2");
     }
 }

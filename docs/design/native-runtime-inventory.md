@@ -67,6 +67,7 @@ criterion).
 | `ctx` | shared | command-group umbrella; each subcommand owned individually below |
 | `ctx agent` | N10 (#479) | same surface as `agent`; `--runtime native` forks to `ctx::native_worker` after everything both runtimes share has already happened |
 | `ctx api` | N20 (#489) | the versioned local runtime protocol (issue #353): `schema`/`serve`/`call`. Backend-neutral by construction -- it publishes redacted session facts and a narrow method set over whichever `RuntimeBackend` is attached -- but the persistent runtime it exists to front is N20's, so the verb is owned there rather than marked `shared` |
+| `ctx supervisor` | shared | off-by-default supervisor: binding rulings that only narrow, from one read-only consult through `agent::run_with`; mail delivery; runtime-neutral |
 | `ctx ask` | N15 (#484) |  |
 | `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
 | `ctx chat` | N11 (#480) |  |
@@ -77,6 +78,7 @@ criterion).
 | `ctx exec` | N09 (#478) |  |
 | `ctx explain-status` | shared |  |
 | `ctx forget` | N06 (#475) | native `memory_forget` reuses the same locked store and journal semantics |
+| `ctx graph` | shared | read-only merge of the session registry, delegations, groups, subagent nodes and Codex child rollouts; runtime-neutral |
 | `ctx group` | N10 (#479) | group ids are shared: a native worker's delegation record carries the same `group` a legacy worker's does |
 | `ctx handoff` | N17 (#486) |  |
 | `ctx handover` | N16 (#485) |  |
@@ -88,6 +90,7 @@ criterion).
 | `ctx loop` | N09 (#478) |  |
 | `ctx mcp` | shared | scoped read-only MCP bridge for wrapped hosts; does not start a native session |
 | `ctx measure` | N18 (#487) | transcript-derived proportionality/health metrics with a committed baseline |
+| `ctx models` | shared | account-local discovery and public price caches are runtime-neutral; refresh never calls a model |
 | `ctx nudge` | N10 (#479) | pane-typing surface; the runtime-neutral equivalent for a native worker is `delegation::send`, which queues rather than types at an open dialog |
 | `ctx obfuscate` | shared | reads/audits the per-repository placeholder vault (`list`/`reveal`/`scan`/`purge`); both runtimes mask through the same `obfuscate`/`obfuscate_store` functions, `runtime::native` and `provider::adapter` included |
 | `ctx objective` | N09 (#478) |  |
@@ -109,6 +112,7 @@ criterion).
 | `ctx snapshot` | N14 (#483) | redacted diagnostic-state summary |
 | `ctx spend` | N18 (#487) |  |
 | `ctx status` | N17 (#486) |  |
+| `ctx statusline` | shared | local read of the session registry and Jev log; runtime-neutral |
 | `ctx swarm` | N10 (#479) | mints shared task cards; a native worker claims one through the same `task::claim_locked` |
 | `ctx task` | N10 (#479) | the one exclusive-ownership store for work, shared by both runtimes |
 | `ctx usage` | N18 (#487) |  |
@@ -250,6 +254,9 @@ installed binary during self-update; never spawns it).
 | Cross-harness review launch | `src/commands/workflow/review.rs` | `launch_reviewer` | N15 (#484) | `reviewer_argv` + self-recursion into `current_exe`; `--runtime native` emits a `zirv agent --runtime native --mode read-only` argv with no adapter flags |
 | Frontend visual reviewer launch | `src/commands/workflow/frontend_render.rs` | `launch_visual_reviewer` | N15 (#484) | reuses `review::reviewer_argv`; self-recursion into `current_exe` |
 | Auto-spawn on workflow gate transition | `src/commands/workflow/engine/cli.rs` | `spawn_auto_worker` | N15 (#484) | issue #242: detached self-recursion into `zirv workflow review run` / `test` / `verify` |
+| `ctx supervisor` consult spawn | `src/commands/ctx/supervisor.rs` | `spawn_consult` | shared | issue #835: detached self-recursion into `zirv ctx supervisor consult`, which runs ONE read-only `agent::run_with` delegation (the N10 dispatch above) and records a ruling; off by default |
+| `ctx supervisor ask` consult spawn | `src/commands/ctx/supervisor.rs` | `spawn_ask_consult` | shared | issue #835: the same consult child, waited on with a timeout, for a design-choice ruling; off by default |
+| `ctx models` background refresh | `src/commands/ctx/models/mod.rs` | `spawn_refresh_if_due_detached` | shared | issues #837/#838: detached self-recursion into `zirv ctx models refresh --quiet`, which reads local caches and public price lists; never calls a model |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
 | `ctx optimize` judgment call | `src/commands/ctx/surface_collect.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/typesafe.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |

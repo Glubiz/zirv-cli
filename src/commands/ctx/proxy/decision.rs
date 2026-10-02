@@ -419,10 +419,10 @@ fn model_for_tier(cfg: &CtxConfig, harness: &str, tier: SeatTier) -> String {
             .model
             .clone()
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| top_rung_alias(harness)),
+            .unwrap_or_else(|| top_rung_alias(cfg, harness)),
         SeatTier::Cheap | SeatTier::Standard | SeatTier::Deep => {
             handover::resolve_model(harness, tier.label(), cfg)
-                .unwrap_or_else(|_| top_rung_alias(harness))
+                .unwrap_or_else(|_| top_rung_alias(cfg, harness))
         }
     }
 }
@@ -498,14 +498,19 @@ pub(crate) fn worker_model(cfg: &CtxConfig, harness: &str, tier: Tier) -> String
         Tier::Standard => "standard",
         Tier::Deep => "deep",
     };
-    handover::resolve_model(harness, label, cfg).unwrap_or_else(|_| top_rung_alias(harness))
+    handover::resolve_model(harness, label, cfg).unwrap_or_else(|_| top_rung_alias(cfg, harness))
 }
 
-fn top_rung_alias(harness: &str) -> String {
+fn top_rung_alias(cfg: &CtxConfig, harness: &str) -> String {
     let vendor_slug = adapters::provider_for_agent_name(Some(harness));
-    catalogue::vendor(vendor_slug)
-        .and_then(|vendor| vendor.rungs.first())
-        .map(|rung| rung.alias.to_string())
+    let Some(vendor) = catalogue::vendor(vendor_slug) else {
+        return String::new();
+    };
+    let ladder = super::super::models::ladder_for(cfg, vendor);
+    ladder
+        .first()
+        .map(|rung| rung.alias.clone())
+        .or_else(|| vendor.rungs.first().map(|rung| rung.alias.to_string()))
         .unwrap_or_default()
 }
 

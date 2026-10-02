@@ -469,6 +469,7 @@ fn run_dash_branch(
                 env(key)
             }
         };
+        super::models::spawn_refresh_if_due_detached(cfg, state);
         dash::run_dashboard(
             cfg,
             repo,
@@ -581,6 +582,7 @@ fn run_native_chat<E: Write>(
     // Carry the decided model as a route candidate alongside its role; spawn must still validate it (#703).
     let model = proxy_decided_model(&intake);
     let (pane_spec, native_spec) = native_pane_spec(repo, session, seat_role, model);
+    super::models::spawn_refresh_if_due_detached(cfg, &state);
     dash::run_dashboard(
         cfg,
         repo,

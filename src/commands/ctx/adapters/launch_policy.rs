@@ -456,6 +456,10 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
 
 /// Ask only for dangerous, recoverable actions; deny wins first, and unattended launches refuse asks. Ordinary and unknown commands stay prompt-free.
 pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
+    (
+        "Bash(zirv ctx supervisor override*)",
+        "lifts a binding supervisor ruling; operator-only",
+    ),
     ("Bash(rm -rf *)", "recursive force-delete"),
     (
         "Bash(rm -fr *)",

@@ -44,6 +44,24 @@ pub struct ActiveWorkflowSummary {
     pub kind: &'static str,
     pub step: String,
     pub awaiting_approval: bool,
+    /// The pinned pack id, else the kind; shown by the agent tree's "back to seat" box.
+    pub pack: String,
+    /// Every step in order with how far the run is.
+    pub steps: Vec<(String, StepMark)>,
+    /// The task the workflow was started for, first line; shown beside the pack in the orchestrator dashboard's stepper.
+    pub title: String,
+    /// When the run started (unix seconds).
+    pub started_at: u64,
+    /// The first step after the current one that needs a person or a check: an approval, an external effect, a test, review or verify phase.
+    pub next_gate: Option<String>,
+}
+
+/// How far a workflow run is past one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMark {
+    Done,
+    Current,
+    Pending,
 }
 
 /// The same read `zirv workflow status` uses when no explicit `--id` is
@@ -62,12 +80,72 @@ pub fn active_workflow_summary(
     repo: &std::path::Path,
 ) -> Option<ActiveWorkflowSummary> {
     let wf = engine::load_active(state, repo).ok().flatten()?;
-    let step = wf.current().map(|s| s.id.clone()).unwrap_or_default();
+    let (pack, step) = pack_and_step(&wf);
+    let next_gate = wf
+        .steps
+        .iter()
+        .skip(wf.current_step + 1)
+        .find(|s| {
+            s.approval
+                || s.effect == definition::EffectClass::External
+                || matches!(
+                    s.phase,
+                    skill::WorkflowPhase::Test
+                        | skill::WorkflowPhase::Review
+                        | skill::WorkflowPhase::Verify
+                )
+        })
+        .map(|s| s.id.clone());
     Some(ActiveWorkflowSummary {
         kind: wf.kind.as_str(),
         step,
         awaiting_approval: wf.status == engine::WorkflowStatus::AwaitingApproval,
+        pack,
+        steps: wf
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                let mark = if wf.completed_steps.contains(&s.id) {
+                    StepMark::Done
+                } else if index == wf.current_step {
+                    StepMark::Current
+                } else {
+                    StepMark::Pending
+                };
+                (s.id.clone(), mark)
+            })
+            .collect(),
+        title: wf
+            .task
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        started_at: wf.created_at,
+        next_gate,
     })
+}
+
+/// The pinned pack id (else the kind) and the current step id of a workflow run.
+fn pack_and_step(wf: &engine::WorkflowState) -> (String, String) {
+    let pack = wf
+        .definition
+        .as_ref()
+        .map_or_else(|| wf.kind.as_str().to_string(), |d| d.id.clone());
+    (pack, wf.current().map(|s| s.id.clone()).unwrap_or_default())
+}
+
+/// `(workflow id, pack, step)` of the repo's active workflow, read as [`active_workflow_summary`]
+/// reads it; `None` when there is none.
+pub fn active_workflow_stamp(
+    state: &crate::commands::ctx::state::StateDir,
+    repo: &std::path::Path,
+) -> Option<(String, String, String)> {
+    let wf = engine::load_active(state, repo).ok().flatten()?;
+    let (pack, step) = pack_and_step(&wf);
+    Some((wf.id.clone(), pack, step))
 }
 
 /// Reserve the full command surface so repository scripts cannot claim a name between releases.
@@ -379,6 +457,65 @@ mod tests {
             .expect("an active workflow was just saved");
         assert_eq!(summary.kind, "feature");
         assert_eq!(summary.step, wf.current().unwrap().id);
+    }
+
+    #[test]
+    fn active_workflow_stamp_names_the_run_its_pack_and_its_current_step() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        assert_eq!(active_workflow_stamp(&state_dir, repo.path()), None);
+        let wf = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            test_classification(),
+        );
+        engine::save(&state_dir, &wf, true).expect("save active workflow");
+
+        let (id, pack, step) = active_workflow_stamp(&state_dir, repo.path()).expect("active");
+        let summary = active_workflow_summary(&state_dir, repo.path()).expect("active");
+        assert_eq!(
+            (id, pack, step),
+            (wf.id.clone(), summary.pack, summary.step)
+        );
+    }
+
+    #[test]
+    fn active_workflow_summary_lists_every_step_with_how_far_the_run_is() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(root.path().to_path_buf());
+        let mut wf = engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "small feature".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            test_classification(),
+        );
+        let first = wf.steps[0].id.clone();
+        wf.completed_steps.push(first.clone());
+        wf.current_step = 1;
+        engine::save(&state_dir, &wf, true).expect("save active workflow");
+
+        let summary = active_workflow_summary(&state_dir, repo.path()).expect("active");
+        assert_eq!(summary.steps.len(), wf.steps.len());
+        assert_eq!(summary.steps[0], (first, StepMark::Done));
+        assert_eq!(
+            summary.steps[1],
+            (wf.steps[1].id.clone(), StepMark::Current)
+        );
+        assert!(
+            summary.steps[2..]
+                .iter()
+                .all(|(_, mark)| *mark == StepMark::Pending),
+            "{:?}",
+            summary.steps
+        );
+        assert!(!summary.pack.is_empty(), "a pack id, or the kind");
     }
 
     #[test]

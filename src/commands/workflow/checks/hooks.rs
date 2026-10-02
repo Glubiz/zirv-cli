@@ -38,6 +38,7 @@ pub fn run(_repo: &Path) -> BuiltinCheckResult {
             .iter()
             .map(|(_, _, command)| *command),
     );
+    commands.push(crate::commands::setup::CLAUDE_TOOL_FAILURE_HOOK.2);
     evaluate(&commands)
 }
 

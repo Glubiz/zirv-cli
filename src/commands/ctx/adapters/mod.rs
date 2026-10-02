@@ -179,6 +179,11 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = headless;
     }
 
+    /// Issue #840: attaches `cfg.approvals`; only the Claude adapter has a `PermissionRequest` hook to time.
+    fn apply_approvals_config(&mut self, approvals: &super::config::ApprovalsConfig) {
+        let _ = approvals;
+    }
+
     /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
     /// attached endpoint override, or `None` when it has none -- what
     /// `harness_prompt_lines`'s roster line and `zirv ctx status` render as
@@ -1012,6 +1017,7 @@ fn apply_endpoint_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig)
 /// config` reads the one shared config directly.
 fn apply_chat_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
     adapter.apply_chat_config(&cfg.chat);
+    adapter.apply_approvals_config(&cfg.approvals);
 }
 
 /// Issue #788: attaches `cfg.headless` (via [`AgentAdapter::

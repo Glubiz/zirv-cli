@@ -12,6 +12,7 @@ mod scope_guard;
 mod session_events;
 mod stop;
 mod stop_verify;
+mod tool_failure;
 
 use std::io::{Read, Write};
 #[cfg(test)]
@@ -107,6 +108,12 @@ pub enum HookEvent {
     /// contract checks against the SUBAGENT's own transcript before its
     /// report reaches the lead. See [`run_subagent_stop`]'s own doc comment.
     SubagentStop,
+    /// Issue #832: claude's `SubagentStart` hook. A local append of one agent
+    /// graph node; prints nothing and always exits 0.
+    SubagentStart,
+    /// Issue #836: claude's `PostToolUseFailure` hook. Off by default; with `[jev] retry` on, asks
+    /// Jev once per failure streak and may add one advisory line.
+    ToolFailure,
     /// Codex notify program: same role as Stop.
     Notify {
         /// Payload, when the agent passes it as an argument instead of stdin.
@@ -209,6 +216,8 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         HookEvent::Permission => run_permission(w, &read_stdin(), &env),
         HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
         HookEvent::SubagentStop => run_subagent_stop(w, &read_stdin(), &env),
+        HookEvent::SubagentStart => super::graph::run_subagent_start(&read_stdin(), &env),
+        HookEvent::ToolFailure => tool_failure::run_tool_failure(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
             let raw = match payload {
                 Some(text) => text.clone(),

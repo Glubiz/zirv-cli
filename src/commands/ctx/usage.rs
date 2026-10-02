@@ -100,7 +100,7 @@ pub fn run_tee<W: Write>(
 }
 
 /// `None` when there is no command, it could not start, or it failed.
-fn run_chained(stdin_text: &str, command: &[String]) -> Option<String> {
+pub(super) fn run_chained(stdin_text: &str, command: &[String]) -> Option<String> {
     let (program, rest) = command.split_first()?;
     let mut child = Command::new(program)
         .args(rest)

@@ -1,0 +1,6 @@
+{"timestamp": "2026-10-01T10:00:00Z", "type": "session_meta", "payload": {"id": "demo"}}
+{"timestamp": "2026-10-01T10:00:01Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\": \"git status --short\"}", "call_id": "c1"}}
+{"timestamp": "2026-10-01T10:00:02Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "output": "x"}}
+{"timestamp": "2026-10-01T10:00:03Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "input": "text(await tools.exec_command({cmd:\"sed -n '1,40p' src/lib.rs\", yield_time_ms: 1000}))", "call_id": "c2"}}
+{"timestamp": "2026-10-01T10:00:04Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch", "call_id": "c3"}}
+{"timestamp": "2026-10-01T10:00:05Z", "type": "response_item", "payload": {"type": "function_call", "name": "wait_agent", "arguments": "{\"timeout_ms\":60000}", "call_id": "c4"}}

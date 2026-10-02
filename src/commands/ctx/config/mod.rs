@@ -28,13 +28,16 @@ pub fn env_from_process() -> impl Fn(&str) -> Option<String> {
 }
 
 mod agent_settings;
+mod approvals_settings;
 mod jev_settings;
 mod pace_settings;
 mod prompt_settings;
 mod repo_layer;
+mod supervisor_settings;
 mod validate;
 
 pub use agent_settings::*;
+pub use approvals_settings::*;
 pub use jev_settings::*;
 pub use pace_settings::*;
 pub use prompt_settings::*;
@@ -48,6 +51,7 @@ use repo_layer::{
     take_nested, take_nested3, value_at,
 };
 pub(crate) use repo_layer::{split_csv_list, toml_path_for_env};
+pub use supervisor_settings::*;
 use validate::validate_endpoint_target;
 pub(crate) use validate::{
     validate_endpoint_base_url, validate_model_str, validate_output_filter_rules,
@@ -68,6 +72,7 @@ pub struct CtxConfig {
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub price: PriceConfig,
+    pub models: ModelsConfig,
     pub compact_advisory: CompactAdvisoryConfig,
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
@@ -104,8 +109,12 @@ pub struct CtxConfig {
     pub proxy: ProxyConfig,
     /// Operator-only shared Jev advisory gates; see [`JevConfig`] (#537).
     pub jev: JevConfig,
+    /// Operator-only on-call supervisor consult; see [`SupervisorConfig`] (#835).
+    pub supervisor: SupervisorConfig,
     /// Operator-only opt-in headless Claude controls; see [`HeadlessConfig`] (#788).
     pub headless: HeadlessConfig,
+    /// Operator-only approvals inbox; see [`ApprovalsConfig`] (#840).
+    pub approvals: ApprovalsConfig,
     /// Operator-only experimental runtime persistence; see [`SessionConfig`] (#352).
     pub session: SessionConfig,
     /// Operator-only MCP/web/browser integrations; see [`CapabilitiesConfig`] (#483).
@@ -239,6 +248,34 @@ pub(super) fn operator_path() -> CtxResult<std::path::PathBuf> {
     Ok(crate::utils::home_dir()?
         .join(crate::utils::SCRIPT_DIR_NAME)
         .join(CTX_CONFIG_FILE))
+}
+
+/// One table of the operator file plus its `ZIRV_CTX_<SECTION>_*` env overrides, no repo layer.
+fn load_operator_section<T: Default + serde::de::DeserializeOwned>(
+    env: EnvLookup<'_>,
+    section: &str,
+) -> CtxResult<T> {
+    let text = match std::fs::read_to_string(operator_path()?) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut operator: toml::Table = toml::from_str(&text)?;
+    let mut merged = toml::Table::new();
+    if let Some(value) = operator.remove(section) {
+        merged.insert(section.into(), value);
+    }
+    for (var, path, kind) in ENV_MAP {
+        if path.first() == Some(&section)
+            && let Some(raw) = env(var)
+        {
+            insert_path(&mut merged, path, env_value(&raw, *kind)?);
+        }
+    }
+    match merged.remove(section) {
+        Some(value) => Ok(value.try_into()?),
+        None => Ok(T::default()),
+    }
 }
 
 /// Validate just the operator document, without repo or environment overrides.
@@ -1434,6 +1471,8 @@ impl CtxConfig {
             ));
         }
 
+        cfg.approvals.validate().map_err(add_config_error_prefix)?;
+
         // TTL reaches Claude's environment verbatim; reject unsupported values at load time (#788).
         if let Some(ttl) = cfg.headless.prompt_cache_ttl.as_deref()
             && !matches!(ttl, "5m" | "1h")
@@ -1523,6 +1562,26 @@ impl CtxConfig {
         if let Some(model) = cfg.model_tiers.codex.deep.as_deref() {
             validate_model_str("model_tiers.codex.deep", model)?;
         }
+        for (family_key, model) in &cfg.models.pin {
+            validate_model_str(&format!("models.pin.{family_key}"), model)?;
+            let Some((vendor, family)) = family_key.split_once('.') else {
+                return Err(add_config_error_prefix(
+                    format!("models.pin key '{family_key}' must be vendor.family").into(),
+                ));
+            };
+            if super::catalogue::model_family(vendor, model) != Some(family) {
+                return Err(add_config_error_prefix(
+                    format!(
+                        "models.pin.{family_key} model '{model}' is not a known {vendor}.{family} family id"
+                    )
+                    .into(),
+                ));
+            }
+        }
+
+        for model in &cfg.models.avoid {
+            validate_model_str("models.avoid", model)?;
+        }
 
         // Validate operator endpoints once so downstream launch code can trust catalogue membership (#395).
         if let Some(target) = cfg.endpoint.claude.as_ref() {
@@ -1551,6 +1610,9 @@ impl CtxConfig {
                 .into(),
             ));
         }
+        cfg.supervisor
+            .validate()
+            .map_err(|message| add_config_error_prefix(message.into()))?;
         // Reject out-of-range advisory floors at load time (#803).
         for (site, floor) in [
             ("memory", &cfg.jev.floors.memory),
@@ -2600,6 +2662,7 @@ mod tests {
             ("[jev]\nstop_verify = true\n", "stop_verify"),
             ("[jev]\nmissing_tests = true\n", "missing_tests"),
             ("[jev]\nlaunch_effort = true\n", "launch_effort"),
+            ("[jev]\nretry = true\n", "retry"),
             ("[jev]\ncache_ttl_secs = 1\n", "cache_ttl_secs"),
         ] {
             let repo = tempfile::tempdir().expect("tempdir");
@@ -2642,6 +2705,7 @@ mod tests {
             ("ZIRV_CTX_JEV_STOP_VERIFY", "true"),
             ("ZIRV_CTX_JEV_MISSING_TESTS", "true"),
             ("ZIRV_CTX_JEV_LAUNCH_EFFORT", "true"),
+            ("ZIRV_CTX_JEV_RETRY", "true"),
             ("ZIRV_CTX_JEV_CACHE_TTL_SECS", "3600"),
         ]);
         let home = tempfile::tempdir().expect("tempdir");
@@ -2669,6 +2733,7 @@ mod tests {
         assert!(cfg.jev.stop_verify);
         assert!(cfg.jev.missing_tests);
         assert!(cfg.jev.launch_effort);
+        assert!(cfg.jev.retry);
         assert_eq!(cfg.jev.cache_ttl_secs, 3600);
     }
 
@@ -2777,6 +2842,35 @@ mod tests {
                 "headless.{offending_key} must be rejected as REPO_FORBIDDEN: {err}"
             );
         }
+    }
+
+    /// Issue #840: a repository can neither switch the approvals inbox on nor stretch a hold, but the environment can.
+    #[test]
+    fn approvals_keys_are_repo_forbidden_and_env_settable() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        for (toml, key) in [
+            ("[approvals]\ninbox = true\n", "inbox"),
+            ("[approvals]\nhold_secs = 10\n", "hold_secs"),
+        ] {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), toml).expect("write");
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("a repository must not set approvals.{key}"));
+            assert!(is_repo_forbidden(err.as_ref()), "approvals.{key}: {err}");
+        }
+        let env = env_map(&[
+            ("ZIRV_CTX_APPROVALS_INBOX", "true"),
+            ("ZIRV_CTX_APPROVALS_HOLD_SECS", "60"),
+        ]);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.approvals.inbox);
+        assert_eq!(cfg.approvals.hold_secs, 60);
+        let bad = env_map(&[("ZIRV_CTX_APPROVALS_HOLD_SECS", "9999")]);
+        assert!(CtxConfig::load(repo.path(), &|k| bad.get(k).cloned()).is_err());
     }
 
     /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
@@ -6741,6 +6835,11 @@ intake_discipline = true
         ("pace.use_credits", "codex"),
         ("price", "stale_after_days"),
         ("price", "table_path"),
+        ("models", "discovery"),
+        ("models", "price_fetch"),
+        ("models", "pin"),
+        ("models", "avoid"),
+        ("models", "auto_avoid"),
         ("compact_advisory", "min_reclaim_tokens"),
         ("compact_advisory", "window_fraction"),
         ("optimize", "enabled"),
@@ -6768,6 +6867,12 @@ intake_discipline = true
         ("mail", "max_message_bytes"),
         ("mail", "max_delivered_bytes"),
         ("mail", "keep"),
+        ("mail", "mid_turn"),
+        ("supervisor", "enabled"),
+        ("supervisor", "harness"),
+        ("supervisor", "model"),
+        ("supervisor", "max_calls"),
+        ("supervisor", "max_advice_bytes"),
         ("memory", "enabled"),
         ("memory", "harvest"),
         ("memory", "max_entries"),
@@ -7661,6 +7766,48 @@ intake_discipline = true
                 "the refusal must name model_tiers: {err}"
             );
         }
+    }
+
+    #[test]
+    fn models_table_is_repo_forbidden_but_operator_environment_is_applied() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        for repo_toml in [
+            "[models]\ndiscovery = false\n",
+            "[models]\navoid = [\"gpt-5.6-sol\"]\n",
+            "[models]\nauto_avoid = true\n",
+        ] {
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write repo");
+            let err = CtxConfig::load(repo.path(), &|_| None).expect_err("repo models must fail");
+            assert!(is_repo_forbidden(err.as_ref()), "{err}");
+        }
+
+        std::fs::remove_file(repo.path().join(".zirv/ctx.toml")).expect("remove repo config");
+        let env = env_map(&[
+            ("ZIRV_CTX_MODELS_DISCOVERY", "false"),
+            ("ZIRV_CTX_MODELS_PRICE_FETCH", "false"),
+            (
+                "ZIRV_CTX_MODELS_PIN",
+                "anthropic.opus=claude-opus-5-5,openai.sol=gpt-6.1-sol",
+            ),
+            ("ZIRV_CTX_MODELS_AVOID", "gpt-5.6-sol, claude-opus-5"),
+            ("ZIRV_CTX_MODELS_AUTO_AVOID", "true"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load env");
+        assert!(!cfg.models.discovery);
+        assert!(!cfg.models.price_fetch);
+        assert_eq!(cfg.models.avoid, ["gpt-5.6-sol", "claude-opus-5"]);
+        assert!(cfg.models.auto_avoid);
+        assert_eq!(
+            cfg.models.pin.get("anthropic.opus").map(String::as_str),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            cfg.models.pin.get("openai.sol").map(String::as_str),
+            Some("gpt-6.1-sol")
+        );
     }
 
     /// The operator's own home layer is unaffected: `[model_tiers.<agent>]`

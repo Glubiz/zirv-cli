@@ -3178,6 +3178,25 @@ mod tests {
         );
     }
 
+    /// With nothing discovered the review default is the static ladder's, and a
+    /// discovered newer sol keeps the review default on terra (no family flip).
+    #[test]
+    fn review_model_below_is_unchanged_without_discovery_and_never_flips_family() {
+        crate::commands::ctx::models::set_test_discovered(Vec::new());
+        let adapter = CodexAdapter::new(None);
+        assert_eq!(adapter.review_model_below(None), "gpt-5.6-terra");
+        crate::commands::ctx::models::set_test_discovered(vec![catalogue::DiscoveredModel::new(
+            "openai",
+            "gpt-6.1-sol",
+            true,
+        )]);
+        assert_eq!(adapter.review_model_below(None), "gpt-5.6-terra");
+        assert_eq!(
+            adapter.review_model_below(Some("gpt-6.1-sol")),
+            "gpt-5.6-terra"
+        );
+    }
+
     /// Seat matching must be case-insensitive: a mixed-case seat must land
     /// on the same ladder rung as its lowercase form, not fall through to
     /// the unknown arm and assume the top tier.

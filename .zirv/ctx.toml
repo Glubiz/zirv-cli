@@ -159,6 +159,13 @@ model = "claude-opus-5-5"
 # stale_after_days = 90              # REPO-FORBIDDEN (ZIRV_CTX_PRICE_STALE_AFTER_DAYS): a price table older than this renders every cost line as "~$x (prices as of ...)" rather than a plain figure. Default: 90.
 # table_path = "~/.zirv/prices.toml" # REPO-FORBIDDEN (ZIRV_CTX_PRICE_TABLE_PATH): operator override path for the price table. Default: unset (built-in table, merged with ~/.zirv/prices.toml when present).
 
+# [models]                           # whole table is REPO-FORBIDDEN
+# discovery = true                  # ZIRV_CTX_MODELS_DISCOVERY: read account-local Codex model cache and Claude transcript observations. Default: true.
+# price_fetch = true                # ZIRV_CTX_MODELS_PRICE_FETCH: allow `zirv ctx models refresh` to fetch models.dev and LiteLLM prices. Default: true.
+# pin = { "anthropic.opus" = "claude-opus-5", "openai.sol" = "gpt-6-sol" } # ZIRV_CTX_MODELS_PIN uses comma-separated vendor.family=model pairs. Default: empty.
+# avoid = []                        # ZIRV_CTX_MODELS_AVOID (comma-separated): model ids never resolved from a tier or rung; an explicit pin still wins. Default: empty.
+# auto_avoid = false                # ZIRV_CTX_MODELS_AUTO_AVOID: also avoid models whose recorded task success is significantly worse than a same-tier peer's. Default: false.
+
 # [compact_advisory]
 # min_reclaim_tokens = 4096           # stale tool-result tokens must exceed this before the reclaim-gated /compact advisory even considers firing (ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS). Default: 4096.
 # window_fraction = 0.6               # AND the window must exceed this fraction of the model's context window (ZIRV_CTX_COMPACT_ADVISORY_WINDOW_FRACTION). Default: 0.6.
@@ -195,6 +202,14 @@ model = "claude-opus-5-5"
 # max_message_bytes = 4096           # cap on a single stored message body
 # max_delivered_bytes = 4096         # REPO-FORBIDDEN (ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES): cap on mail surfaced to a session at once. Default: 4096.
 # keep = 50                          # unread messages kept before the oldest are pruned
+# mid_turn = false                   # REPO-FORBIDDEN (ZIRV_CTX_MAIL_MID_TURN): deliver session-addressed mail from the Claude PostToolUse hook, 4 KiB per call. Default: false.
+
+# [supervisor]                       # every key below is REPO-FORBIDDEN (ZIRV_CTX_SUPERVISOR_*): the supervisor, a strong model whose binding rulings only narrow, at plan, done, retry and design choices (#835)
+# enabled = false                    # master switch; off means no spawns, no state files, unchanged hook output. Default: false.
+# harness = "codex"                  # claude or codex. Default: codex.
+# model = ""                         # explicit consult model, required while enabled (a config error otherwise).
+# max_calls = 3                      # consults per session. Default: 3.
+# max_advice_bytes = 2048            # cap on a ruling's reason. Default: 2048.
 
 # [memory]                           # every key below is REPO-FORBIDDEN
 # enabled = true                     # REPO-FORBIDDEN (ZIRV_CTX_MEMORY): MASTER switch -- false disables both the private and shared bank, regardless of shared_enabled. Default: true.

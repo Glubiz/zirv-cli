@@ -169,6 +169,7 @@ pub fn policy_fingerprint(cfg: &CtxConfig) -> String {
             "stop_verify": jev.stop_verify,
             "missing_tests": jev.missing_tests,
             "launch_effort": jev.launch_effort,
+            "retry": jev.retry,
             "cache_ttl_secs": jev.cache_ttl_secs,
             "floors": {
                 "memory": floor(&jev.floors.memory),

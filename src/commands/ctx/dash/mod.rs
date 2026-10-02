@@ -21,6 +21,7 @@ pub mod roster;
 pub mod spawnreq;
 pub mod ui;
 
+mod approvals_view;
 mod delivery;
 mod facts_cache;
 mod input;
@@ -31,6 +32,7 @@ mod selection_clipboard;
 mod sidebar_facts;
 mod spawn_policy;
 mod terminal_turn;
+mod tree_view;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
@@ -380,6 +382,18 @@ fn run_dashboard_inner(
     // future spawn seam -- Tasks 10/11 -- must push a matching
     // `VecDeque::new()` here too whenever it pushes a new pane).
     let mut nudge_queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
+    // Approvals inbox (#840): off unless the operator turned it on; then this dashboard serves its hooks' held requests.
+    let mut approvals_hub = if cfg.approvals.inbox {
+        match super::approvals::Hub::bind(state) {
+            Ok(hub) => Some(hub),
+            Err(e) => {
+                push_error(&mut errors, format!("approvals inbox: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let previous_panic_hook = install_panic_hook();
     // F4(c): an external kill (`taskkill`, a Ctrl-Break, a closed window)
@@ -518,6 +532,12 @@ fn run_dashboard_inner(
         ui::Overlay::Restore(build_restore_view(&restore_candidates))
     };
     let mut facts_cache = FactsCache::new(Instant::now());
+    // The agent-tree view (#833): hidden by default, and then it computes nothing.
+    let mut tree_view = tree_view::TreeView::default();
+    // When the tree last drew: while it shows it redraws at its own cadence, not on every tick.
+    let mut last_tree_draw: Option<Instant> = None;
+    // Whether any-motion tracking is on: only while the orchestrator FLOW shows (never on Windows).
+    let mut hover_on = false;
     // Refresh machine-wide facts off the UI thread because registry and provider scans can block.
     let facts_refresher = FactsRefresher::spawn(
         state,
@@ -781,13 +801,36 @@ fn run_dashboard_inner(
             push_notice(&mut notices, Instant::now(), line);
         }
 
+        // Approvals inbox (#840): drain requests, then give the strip its rows (none while nothing is pending).
+        if let Some(hub) = approvals_hub.as_mut() {
+            hub.poll(&|short| panes.iter().any(|pane| pane.short() == short));
+            hub.drop_released_unless(&|short| {
+                super::attention::load(state, short).attention
+                    == super::attention::Attention::Approval
+            });
+        }
+        let tick_term = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+        // The orchestrator dashboard answers approvals in NEEDS YOU, so it takes no strip.
+        let approvals_strip_h = if tree_view.hides_approvals_strip(tick_term) {
+            0
+        } else {
+            approvals_view::current_strip_rows(approvals_hub.as_ref())
+        };
         // Use current terminal and zoom geometry for panes spawned during this tick.
         let pane_size = {
-            let now_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+            let now_size = tick_term;
+            let now_size = (
+                now_size.0,
+                now_size.1.saturating_sub(
+                    approvals_strip_h
+                        + tree_view.chat_rows(tick_term, approvals_strip_h)
+                        + tree_view.chat_bottom_rows(tick_term, approvals_strip_h),
+                ),
+            );
             let m = effective_main(
                 Rect::new(0, 0, now_size.0, now_size.1),
                 sidebar_cols,
-                zoomed,
+                zoomed || tree_view.in_chat(),
             );
             (m.width.max(1), m.height.max(1))
         };
@@ -838,6 +881,7 @@ fn run_dashboard_inner(
         let sweep_now = Instant::now();
         if due(last_mail_sweep, sweep_now, FACTS_THROTTLE) {
             last_mail_sweep = sweep_now;
+            latch_codex_approval(&mut panes, state);
             mail_sweep(&mut panes, cfg, state, repo, &mut advised_mail, &mut errors);
             claim_pane_nudges(&panes, state, &mut notices, sweep_now);
             // Run the one-shot report reminder on the mail sweep cadence (#115).
@@ -937,6 +981,33 @@ fn run_dashboard_inner(
             facts_now,
             || facts_refresher.take_latest(facts_now),
         );
+        tree_view.poll();
+        if tree_view.due(facts_now) {
+            let (tree_state, tree_repo, tree_cfg) =
+                (state.clone(), repo.to_path_buf(), cfg.clone());
+            let codex_root =
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex/sessions"));
+            let seat_model = facts_cache
+                .disk
+                .seat_full
+                .as_ref()
+                .and_then(|s| s.model.clone());
+            let seat_session = facts_cache
+                .disk
+                .seat_full
+                .as_ref()
+                .map(|s| s.session.clone());
+            tree_view.start(facts_now, move || {
+                tree_view::compute(
+                    &tree_state,
+                    &tree_repo,
+                    codex_root.as_deref(),
+                    seat_model.as_deref(),
+                    seat_session.as_deref(),
+                    &tree_cfg,
+                )
+            });
+        }
         if facts_refreshed {
             // What the refresher's next cycle should load groups for: this
             // tick's live panes, deduped. One lock per throttled tick, held
@@ -1059,9 +1130,17 @@ fn run_dashboard_inner(
 
         // Drain a bounded batch of queued input after the first poll, then run maintenance and redraw.
         let mut drained = 0usize;
+        // Pointer motion is coalesced: only the last position of a burst is looked at, and a
+        // frame is drawn for it only if the hover target changed.
+        let mut moved_only = 0usize;
+        let mut pending_move: Option<crossterm::event::MouseEvent> = None;
         while drained < MAX_INPUT_DRAIN_PER_TICK {
             let wait = if drained == 0 {
-                input_poll_wait(last_activity.elapsed())
+                frame_poll_wait(
+                    input_poll_wait(last_activity.elapsed()),
+                    tree_view.frame_interval(),
+                    last_tree_draw.map(|at| at.elapsed()),
+                )
             } else {
                 Duration::ZERO
             };
@@ -1087,6 +1166,15 @@ fn run_dashboard_inner(
                     if let Some(log) = keylog.as_mut() {
                         log.observe(&read, prefix_armed, &overlay);
                     }
+                    if let Ok(Event::Mouse(mouse)) = read.as_ref()
+                        && matches!(mouse.kind, MouseEventKind::Moved)
+                        && matches!(overlay, ui::Overlay::None)
+                        && (tree_view.captures_plain_keys() || tree_view.in_chat())
+                    {
+                        pending_move = Some(*mouse);
+                        moved_only += 1;
+                        read = Ok(Event::FocusGained);
+                    }
                     // Route each pointer event against the frame geometry that was drawn (#354).
                     if let Ok(Event::Mouse(mouse)) = read.as_ref() {
                         let mouse = *mouse;
@@ -1104,6 +1192,65 @@ fn run_dashboard_inner(
                             !matches!(overlay, ui::Overlay::None),
                             selection.is_some() || pending_press.is_some(),
                         );
+                        // The tree view owns the pointer: clicks select and open boxes, the wheel scrolls.
+                        // An open chat keeps the pane's pointer except on its own chrome.
+                        let tree_owns = matches!(overlay, ui::Overlay::None)
+                            && (tree_view.captures_plain_keys() || tree_view.in_chat());
+                        let tree_outcome = if tree_owns {
+                            let tree_facts = build_tree_facts(
+                                &facts_cache,
+                                approvals_hub.as_ref(),
+                                &panes,
+                                focused,
+                                cfg,
+                                &rows,
+                                &retained_ended,
+                                &kept_requests,
+                                repo,
+                            );
+                            if tree_view.in_chat() {
+                                tree_view.chat_mouse(mouse, &tree_facts)
+                            } else {
+                                Some(tree_view.mouse(
+                                    mouse,
+                                    tree_view::Surface::page(Rect::new(0, 0, term_cols, term_rows)),
+                                    &tree_facts,
+                                    Instant::now(),
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+                        let route = match tree_outcome {
+                            Some(outcome) => {
+                                apply_tree_outcome(
+                                    outcome,
+                                    &mut tree_view,
+                                    approvals_hub.as_mut(),
+                                    state,
+                                    repo,
+                                    &rows,
+                                    &mut TreeDash {
+                                        selected: &mut selected,
+                                        focused: &mut focused,
+                                        chrome_selection: &mut chrome_selection,
+                                        reveal_sidebar: &mut reveal_sidebar,
+                                        overlay: &mut overlay,
+                                        notices: &mut notices,
+                                        errors: &mut errors,
+                                        panes: &mut panes,
+                                        nudge_queues: &mut nudge_queues,
+                                        retained: &mut retained_ended,
+                                        kept: &mut kept_requests,
+                                        cfg,
+                                        pane_size,
+                                        requests_dir: &requests_dir,
+                                    },
+                                );
+                                MouseRoute::Consume
+                            }
+                            None => route,
+                        };
                         // Reject overlay routes from a frame whose dialog identity is no longer current (#354).
                         let route = if overlay_route_is_current(
                             &route,
@@ -1629,6 +1776,13 @@ fn run_dashboard_inner(
                                             None => ui::Overlay::None,
                                         };
                                     }
+                                    // Approvals list (#840): the same read-only browse-and-close shape.
+                                    ui::Overlay::Approvals(view) => {
+                                        overlay = match jev_errors_overlay_reduce(view, key) {
+                                            Some(v) => ui::Overlay::Approvals(v),
+                                            None => ui::Overlay::None,
+                                        };
+                                    }
                                     ui::Overlay::Menu(view) => {
                                         let (next, effect) = menu_overlay_reduce(view, key);
                                         overlay = match next {
@@ -1742,20 +1896,9 @@ fn run_dashboard_inner(
                                                 reveal_sidebar = true;
                                             }
                                             ui::MenuAction::Nudge => {
-                                                let attached =
-                                                    panes.iter().any(|p| p.short() == target);
-                                                overlay = ui::Overlay::Nudge(ui::NudgeDraft {
-                                                    target: if attached {
-                                                        ui::NudgeTarget::AttachedPane(
-                                                            target.clone(),
-                                                        )
-                                                    } else {
-                                                        ui::NudgeTarget::ViewOnlySession(
-                                                            target.clone(),
-                                                        )
-                                                    },
-                                                    input: String::new(),
-                                                });
+                                                overlay = ui::Overlay::Nudge(nudge_draft(
+                                                    &target, &panes,
+                                                ));
                                             }
                                             ui::MenuAction::Mail => {
                                                 overlay =
@@ -1785,55 +1928,15 @@ fn run_dashboard_inner(
                                                         target_short: target.clone(),
                                                     });
                                             }
-                                            // Exactly the quit path's own first
-                                            // half (`shutdown_all`): ask the
-                                            // harness to quit and let this tick's
-                                            // `reap_ended_panes` do the rest, so
-                                            // the row is retained, the spend
-                                            // accounted and the group closed by
-                                            // the one code path that knows how.
                                             ui::MenuAction::Stop => {
-                                                match panes.iter_mut().find(|p| p.short() == target)
-                                                {
-                                                    Some(pane) => {
-                                                        if pane.is_native() {
-                                                            match pane.stop_now(0) {
-                                                                Ok(()) => push_notice(
-                                                                    &mut notices,
-                                                                    now,
-                                                                    format!(
-                                                                        "asked {target} to stop"
-                                                                    ),
-                                                                ),
-                                                                Err(error) => push_error(
-                                                                    &mut errors,
-                                                                    format!(
-                                                                        "could not stop {target}: {error}"
-                                                                    ),
-                                                                ),
-                                                            }
-                                                        } else {
-                                                            let quit_sequence = adapters::select(
-                                                                Some(pane.agent()),
-                                                                &[],
-                                                                cfg,
-                                                            )
-                                                            .map(|adapter| adapter.quit_sequence())
-                                                            .unwrap_or("");
-                                                            pane.request_quit(quit_sequence);
-                                                            push_notice(
-                                                                &mut notices,
-                                                                now,
-                                                                format!("asked {target} to quit"),
-                                                            );
-                                                        }
-                                                    }
-                                                    None => push_notice(
-                                                        &mut notices,
-                                                        now,
-                                                        format!("{target} is no longer running"),
-                                                    ),
-                                                }
+                                                stop_pane(
+                                                    &target,
+                                                    &mut panes,
+                                                    cfg,
+                                                    &mut errors,
+                                                    &mut notices,
+                                                    now,
+                                                );
                                             }
                                             ui::MenuAction::Restore | ui::MenuAction::Retry => {
                                                 restore_ended_row(
@@ -2034,6 +2137,53 @@ fn run_dashboard_inner(
                                             ),
                                         }
                                     }
+                                    // In an open chat the arrows step to the previous or next agent's chat.
+                                    InputVerdict::Dash(
+                                        action @ (DashAction::CollapseGroup
+                                        | DashAction::ExpandGroup),
+                                    ) if tree_view.in_chat() => {
+                                        let tree_facts = build_tree_facts(
+                                            &facts_cache,
+                                            approvals_hub.as_ref(),
+                                            &panes,
+                                            focused,
+                                            cfg,
+                                            &rows,
+                                            &retained_ended,
+                                            &kept_requests,
+                                            repo,
+                                        );
+                                        let delta = if action == DashAction::CollapseGroup {
+                                            -1
+                                        } else {
+                                            1
+                                        };
+                                        let outcome = tree_view.chat_step(&tree_facts, delta);
+                                        apply_tree_outcome(
+                                            outcome,
+                                            &mut tree_view,
+                                            approvals_hub.as_mut(),
+                                            state,
+                                            repo,
+                                            &rows,
+                                            &mut TreeDash {
+                                                selected: &mut selected,
+                                                focused: &mut focused,
+                                                chrome_selection: &mut chrome_selection,
+                                                reveal_sidebar: &mut reveal_sidebar,
+                                                overlay: &mut overlay,
+                                                notices: &mut notices,
+                                                errors: &mut errors,
+                                                panes: &mut panes,
+                                                nudge_queues: &mut nudge_queues,
+                                                retained: &mut retained_ended,
+                                                kept: &mut kept_requests,
+                                                cfg,
+                                                pane_size,
+                                                requests_dir: &requests_dir,
+                                            },
+                                        );
+                                    }
                                     InputVerdict::Dash(
                                         action @ (DashAction::CollapseGroup
                                         | DashAction::ExpandGroup),
@@ -2065,6 +2215,53 @@ fn run_dashboard_inner(
                                         }
                                     }
                                     InputVerdict::Pending => {}
+                                    // Keys never reach a pane the operator cannot see; a plain key is the tree's own.
+                                    InputVerdict::ToChild(_) if tree_view.captures_plain_keys() => {
+                                        if !armed_before {
+                                            let tree_facts = build_tree_facts(
+                                                &facts_cache,
+                                                approvals_hub.as_ref(),
+                                                &panes,
+                                                focused,
+                                                cfg,
+                                                &rows,
+                                                &retained_ended,
+                                                &kept_requests,
+                                                repo,
+                                            );
+                                            let outcome = tree_view.key(
+                                                key,
+                                                tree_view::Surface::page(Rect::new(
+                                                    0, 0, term_cols, term_rows,
+                                                )),
+                                                &tree_facts,
+                                            );
+                                            apply_tree_outcome(
+                                                outcome,
+                                                &mut tree_view,
+                                                approvals_hub.as_mut(),
+                                                state,
+                                                repo,
+                                                &rows,
+                                                &mut TreeDash {
+                                                    selected: &mut selected,
+                                                    focused: &mut focused,
+                                                    chrome_selection: &mut chrome_selection,
+                                                    reveal_sidebar: &mut reveal_sidebar,
+                                                    overlay: &mut overlay,
+                                                    notices: &mut notices,
+                                                    errors: &mut errors,
+                                                    panes: &mut panes,
+                                                    nudge_queues: &mut nudge_queues,
+                                                    retained: &mut retained_ended,
+                                                    kept: &mut kept_requests,
+                                                    cfg,
+                                                    pane_size,
+                                                    requests_dir: &requests_dir,
+                                                },
+                                            );
+                                        }
+                                    }
                                     // Send unprefixed input only to the focused pane, and mark operator typing so idle-gated injection waits for the next turn.
                                     InputVerdict::ToChild(bytes) => {
                                         // Route wrapped input as PTY bytes and native input through its composer contract (#490).
@@ -2196,7 +2393,11 @@ fn run_dashboard_inner(
                                     }
                                     InputVerdict::Dash(DashAction::Zoom) => {
                                         zoomed = !zoomed;
-                                        let m = effective_main(full, sidebar_cols, zoomed);
+                                        let m = effective_main(
+                                            full,
+                                            sidebar_cols,
+                                            zoomed || tree_view.in_chat(),
+                                        );
                                         let new_size = (m.height.max(1), m.width.max(1));
                                         // Cancel a selection before resizing changes its grid coordinates.
                                         cancel_selection_on_resize(
@@ -2221,6 +2422,9 @@ fn run_dashboard_inner(
                                         // change exactly as it does on a real
                                         // terminal resize.
                                         sidebar_forced_visible = !sidebar_forced_visible;
+                                    }
+                                    InputVerdict::Dash(DashAction::ToggleTree) => {
+                                        tree_view.chord_toggle()
                                     }
                                     InputVerdict::Dash(DashAction::Quit) => {
                                         let working: Vec<String> = panes
@@ -2320,6 +2524,27 @@ fn run_dashboard_inner(
                                             Instant::now(),
                                         ));
                                     }
+                                    InputVerdict::Dash(DashAction::Approvals(approval_key)) => {
+                                        let outcome = approvals_view::handle_key(
+                                            approvals_hub.as_mut(),
+                                            approval_key,
+                                            state,
+                                        );
+                                        if let Some(text) = outcome.notice {
+                                            push_notice(&mut notices, Instant::now(), text);
+                                        }
+                                        if let Some(next) = outcome.overlay {
+                                            overlay = next;
+                                        }
+                                        if let Some(short) = outcome.goto {
+                                            reveal_sidebar = true;
+                                            chrome_selection = None;
+                                            (selected, focused) =
+                                                select_row(&short, &rows, selected, focused);
+                                            // From the tree the pane opens as a chat, not as the dashboard.
+                                            tree_view.open_chat();
+                                        }
+                                    }
                                     InputVerdict::Dash(DashAction::ShowJevErrors) => {
                                         overlay = ui::Overlay::JevErrors(build_jev_errors_view(
                                             &facts_cache.disk.jev,
@@ -2354,9 +2579,14 @@ fn run_dashboard_inner(
                                 effective_sidebar_cols(cfg, cols, sidebar_forced_visible);
                             apply_terminal_resize(
                                 cols,
-                                term_h,
+                                term_h.saturating_sub(
+                                    approvals_strip_h
+                                        + tree_view.chat_rows((cols, term_h), approvals_strip_h)
+                                        + tree_view
+                                            .chat_bottom_rows((cols, term_h), approvals_strip_h),
+                                ),
                                 sidebar_cols,
-                                zoomed,
+                                zoomed || tree_view.in_chat(),
                                 &mut term_cols,
                                 &mut term_rows,
                                 &mut full,
@@ -2375,7 +2605,11 @@ fn run_dashboard_inner(
                             {
                                 match mouse.kind {
                                     MouseEventKind::Down(_) => {
-                                        let main = effective_main(full, sidebar_cols, zoomed);
+                                        let main = effective_main(
+                                            full,
+                                            sidebar_cols,
+                                            zoomed || tree_view.in_chat(),
+                                        );
                                         native_pane::click_overview_row(
                                             native,
                                             main,
@@ -2409,7 +2643,11 @@ fn run_dashboard_inner(
                                 // Pane-local and 1-based: the child believes
                                 // its own top-left is the terminal's, and the
                                 // sidebar means `main.x` is genuinely not 0.
-                                let main = effective_main(full, sidebar_cols, zoomed);
+                                let main = effective_main(
+                                    full,
+                                    sidebar_cols,
+                                    zoomed || tree_view.in_chat(),
+                                );
                                 let (col, row) = pane_local_mouse(main, mouse.column, mouse.row);
                                 match pane.scroll_wheel(delta, col, row) {
                                     Ok(outcome) => {
@@ -2450,7 +2688,11 @@ fn run_dashboard_inner(
                                 _ => None,
                             };
                             if let Some((code, press)) = button {
-                                let main = effective_main(full, sidebar_cols, zoomed);
+                                let main = effective_main(
+                                    full,
+                                    sidebar_cols,
+                                    zoomed || tree_view.in_chat(),
+                                );
                                 if main.contains(Position::new(mouse.column, mouse.row))
                                     && let Some(pane) = panes.get_mut(focused)
                                 {
@@ -2469,7 +2711,11 @@ fn run_dashboard_inner(
                                     // Clear stale selection and pending press on every fresh left press.
                                     selection = None;
                                     pending_press = None;
-                                    let main = effective_main(full, sidebar_cols, zoomed);
+                                    let main = effective_main(
+                                        full,
+                                        sidebar_cols,
+                                        zoomed || tree_view.in_chat(),
+                                    );
                                     if let Some(pane) = panes.get(focused)
                                         && press_starts_selection(main, mouse.column, mouse.row)
                                     {
@@ -2491,7 +2737,11 @@ fn run_dashboard_inner(
                                     }
                                 }
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    let main = effective_main(full, sidebar_cols, zoomed);
+                                    let main = effective_main(
+                                        full,
+                                        sidebar_cols,
+                                        zoomed || tree_view.in_chat(),
+                                    );
                                     if selection.is_some() {
                                         // Already past the threshold: extend
                                         // the drag. Also covers the pointer
@@ -2579,7 +2829,11 @@ fn run_dashboard_inner(
                                         if let Some(pane) = panes.get_mut(focused)
                                             && pane.short() == pending.pane_short
                                         {
-                                            let main = effective_main(full, sidebar_cols, zoomed);
+                                            let main = effective_main(
+                                                full,
+                                                sidebar_cols,
+                                                zoomed || tree_view.in_chat(),
+                                            );
                                             let code = mouse_button_code(MouseButton::Left);
                                             let (press_coords, release_coords) =
                                                 deferred_click_coords(
@@ -2659,6 +2913,37 @@ fn run_dashboard_inner(
             drained += 1;
         }
 
+        let mut hover_changed = false;
+        if let Some(mouse) = pending_move.take() {
+            let tree_facts = build_tree_facts(
+                &facts_cache,
+                approvals_hub.as_ref(),
+                &panes,
+                focused,
+                cfg,
+                &rows,
+                &retained_ended,
+                &kept_requests,
+                repo,
+            );
+            let before = tree_view.hover_signature();
+            if tree_view.in_chat() {
+                let _ = tree_view.chat_mouse(mouse, &tree_facts);
+            } else {
+                let page = tree_view::Surface::page(Rect::new(0, 0, term_cols, term_rows));
+                let _ = tree_view.mouse(mouse, page, &tree_facts, Instant::now());
+            }
+            hover_changed = tree_view.hover_signature() != before;
+        }
+        let want_hover = cfg.dash.mouse && tree_view.wants_hover(tick_term);
+        if want_hover != hover_on {
+            hover_on = want_hover;
+            let mut stdout = io::stdout();
+            let _ = stdout
+                .write_all(term::dash_hover_bytes(hover_on))
+                .and_then(|()| stdout.flush());
+        }
+
         // After persistent console-read errors, quit through normal roster and terminal cleanup instead of spinning.
         if input_stream_is_dead(input_errors) {
             push_error(
@@ -2680,6 +2965,24 @@ fn run_dashboard_inner(
         }
 
         let term_size = crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+        let full_term = term_size;
+        // The strip's rows belong to the inbox, not to the panes: every geometry read below sees the shorter terminal.
+        let approvals_strip_h = if tree_view.hides_approvals_strip(full_term) {
+            0
+        } else {
+            approvals_view::current_strip_rows(approvals_hub.as_ref())
+        };
+        // An open chat keeps the dashboard's header above its pane and the others strip below it;
+        // its pane is the zoomed single pane between them.
+        let chat_top = tree_view.chat_rows(full_term, approvals_strip_h);
+        let chat_bottom = tree_view.chat_bottom_rows(full_term, approvals_strip_h);
+        let zoomed_now = zoomed || chat_top > 0;
+        let term_size = (
+            term_size.0,
+            term_size
+                .1
+                .saturating_sub(approvals_strip_h + chat_top + chat_bottom),
+        );
         // Compute sidebar width from this frame's terminal size.
         let next_sidebar_cols = effective_sidebar_cols(cfg, term_size.0, sidebar_forced_visible);
         // Reconcile terminal size every frame because resize events may be coalesced or missed.
@@ -2689,7 +2992,7 @@ fn run_dashboard_inner(
                 term_size.0,
                 term_size.1,
                 sidebar_cols,
-                zoomed,
+                zoomed_now,
                 &mut term_cols,
                 &mut term_rows,
                 &mut full,
@@ -2700,10 +3003,12 @@ fn run_dashboard_inner(
         } else {
             sidebar_cols = next_sidebar_cols;
         }
-        let frame_area = Rect::new(0, 0, term_size.0, term_size.1);
+        // Mouse mapping reads `full`: below the chat bar when one is open.
+        full.y = chat_top;
+        let frame_area = Rect::new(0, chat_top, term_size.0, term_size.1);
         let layout = ui::layout(frame_area, sidebar_cols);
         // Draw the grid and overlay in the effective main rect so zoomed PTY and display geometry agree.
-        let main_area = effective_main(frame_area, sidebar_cols, zoomed);
+        let main_area = effective_main(frame_area, sidebar_cols, zoomed_now);
 
         // Rebuild sidebar rows after input changes selection so its highlight is current.
         let rows = assemble_sidebar(
@@ -2717,6 +3022,12 @@ fn run_dashboard_inner(
         );
         let mut rows = rows;
         enrich_sidebar(&mut rows, &facts_cache.disk, super::state::now_secs());
+        if let Some(hub) = approvals_hub.as_ref() {
+            let waiting = hub.shorts();
+            for row in rows.iter_mut() {
+                row.approval_pending = waiting.contains(row.short.as_str());
+            }
+        }
         // Dash refresh PR2: clock-driven, not per-drawn-frame -- see this
         // variable's own doc comment above the loop.
         render_tick = if motion.is_full() {
@@ -2786,6 +3097,9 @@ fn run_dashboard_inner(
             errors.sticky_line(),
             live_notice(&notices, Instant::now()).map(str::to_string),
         );
+        facts.approvals = approvals_hub
+            .as_ref()
+            .map_or(0, super::approvals::Hub::count);
         // Build the focused pane's footer from this tick's cached sidebar row (#209).
         facts.tip = first_run_tip.then(|| ui::FIRST_RUN_TIP.as_str());
         facts.hints.alive = rows
@@ -2887,7 +3201,7 @@ fn run_dashboard_inner(
         let mut next_snapshot = ui::frame_snapshot(
             frame_area,
             &layout,
-            zoomed,
+            zoomed_now,
             &roster,
             &facts,
             &overlay,
@@ -3033,148 +3347,216 @@ fn run_dashboard_inner(
             layout.sidebar.width
         };
         let mut native_approval_rendered = false;
-        let draw = terminal.draw(|f| {
-            if !zoomed {
-                if sidebar_hidden_now {
-                    ui::render_header_tabs(f, layout.header, &facts, &rows, render_tick);
-                } else {
-                    ui::render_header(f, layout.header, &facts);
+        let tree_facts = tree_view.is_visible().then(|| {
+            build_tree_facts(
+                &facts_cache,
+                approvals_hub.as_ref(),
+                &panes,
+                focused,
+                cfg,
+                &rows,
+                &retained_ended,
+                &kept_requests,
+                repo,
+            )
+        });
+        let strip_facts = (approvals_strip_h > 0)
+            .then(|| {
+                approvals_hub
+                    .as_ref()
+                    .and_then(|hub| approvals_view::strip_facts(hub, &rows, frame_area.width))
+            })
+            .flatten();
+        if approvals_strip_h == 0
+            && let Some(hub) = approvals_hub.as_ref()
+        {
+            hub.mark_drawn(None);
+        }
+        // The orchestrator dashboard animates, so it draws about 15 times a second while it shows
+        // and straight away after input; the classic dashboard's tick is untouched.
+        let skip_draw = tree_view.frame_interval().is_some_and(|every| {
+            drained == moved_only
+                && !hover_changed
+                && matches!(overlay, ui::Overlay::None)
+                && last_tree_draw.is_some_and(|at| at.elapsed() < every)
+        });
+        if let Some(tree_facts) = &tree_facts {
+            if !skip_draw {
+                tree_view.observe(tree_facts, Instant::now());
+                last_tree_draw = Some(Instant::now());
+            }
+        } else {
+            last_tree_draw = None;
+        }
+        let draw = (!skip_draw).then(|| {
+            terminal.draw(|f| {
+                if let Some(tree_facts) = &tree_facts {
+                    let area = if tree_view.in_chat() {
+                        Rect::new(
+                            0,
+                            0,
+                            frame_area.width,
+                            chat_top + frame_area.height + chat_bottom,
+                        )
+                    } else {
+                        frame_area
+                    };
+                    tree_view::render(f, area, &tree_view, tree_facts);
                 }
-                ui::render_rule(f, layout.rule_top, rule_divider_col, true);
-                if !sidebar_hidden_now {
-                    ui::render_sidebar_title(f, layout.sidebar_title, rows.len());
-                }
-                if let Some(pane_header_facts) = &pane_header_facts {
-                    ui::render_pane_header(
-                        f,
-                        layout.pane_header,
-                        pane_header_facts,
-                        render_tick,
-                        dash_start.elapsed().as_millis() as u64,
-                        motion,
-                    );
-                }
-                ui::render_mid_rule(f, layout.mid_rule, rule_divider_col);
-                if !sidebar_hidden_now {
-                    ui::render_roster(f, layout.sidebar, &roster);
-                    if jev_height > 0
-                        && let Some(fact) = &jev_eased_fact
-                    {
-                        ui::render_jev(f, jev_area, fact, jev_shown_sites, jev_last_flash);
+                if !zoomed_now && tree_facts.is_none() {
+                    if sidebar_hidden_now {
+                        ui::render_header_tabs(f, layout.header, &facts, &rows, render_tick);
+                    } else {
+                        ui::render_header(f, layout.header, &facts);
                     }
-                    if limits_height > 0 {
-                        ui::render_limits(
+                    ui::render_rule(f, layout.rule_top, rule_divider_col, true);
+                    if !sidebar_hidden_now {
+                        ui::render_sidebar_title(f, layout.sidebar_title, rows.len());
+                    }
+                    if let Some(pane_header_facts) = &pane_header_facts {
+                        ui::render_pane_header(
                             f,
-                            limits_area,
-                            &limits_blocks[..limits_shown],
+                            layout.pane_header,
+                            pane_header_facts,
+                            render_tick,
+                            dash_start.elapsed().as_millis() as u64,
+                            motion,
+                        );
+                    }
+                    ui::render_mid_rule(f, layout.mid_rule, rule_divider_col);
+                    if !sidebar_hidden_now {
+                        ui::render_roster(f, layout.sidebar, &roster);
+                        if jev_height > 0
+                            && let Some(fact) = &jev_eased_fact
+                        {
+                            ui::render_jev(f, jev_area, fact, jev_shown_sites, jev_last_flash);
+                        }
+                        if limits_height > 0 {
+                            ui::render_limits(
+                                f,
+                                limits_area,
+                                &limits_blocks[..limits_shown],
+                                super::state::now_secs(),
+                                local_offset,
+                            );
+                        }
+                        // Straight from the snapshot the click will be tested
+                        // against, so the drawn divider and `Hit::Divider` can
+                        // never describe different columns.
+                        ui::render_sidebar_divider(
+                            f,
+                            Rect {
+                                y: layout.sidebar_title.y,
+                                height: 1,
+                                ..next_snapshot.divider
+                            },
+                        );
+                        ui::render_sidebar_divider(f, next_snapshot.divider);
+                    }
+                    ui::render_rule(f, layout.rule_bottom, rule_divider_col, false);
+                    if sidebar_hidden_now {
+                        let focused_usage = focused_row.and_then(|row| {
+                            facts_cache
+                                .disk
+                                .usage
+                                .iter()
+                                .find(|u| u.name == row.harness)
+                        });
+                        ui::render_footer_narrow_usage(
+                            f,
+                            layout.footer,
+                            focused_usage,
                             super::state::now_secs(),
                             local_offset,
                         );
-                    }
-                    // Straight from the snapshot the click will be tested
-                    // against, so the drawn divider and `Hit::Divider` can
-                    // never describe different columns.
-                    ui::render_sidebar_divider(
-                        f,
-                        Rect {
-                            y: layout.sidebar_title.y,
-                            height: 1,
-                            ..next_snapshot.divider
-                        },
-                    );
-                    ui::render_sidebar_divider(f, next_snapshot.divider);
-                }
-                ui::render_rule(f, layout.rule_bottom, rule_divider_col, false);
-                if sidebar_hidden_now {
-                    let focused_usage = focused_row.and_then(|row| {
-                        facts_cache
-                            .disk
-                            .usage
-                            .iter()
-                            .find(|u| u.name == row.harness)
-                    });
-                    ui::render_footer_narrow_usage(
-                        f,
-                        layout.footer,
-                        focused_usage,
-                        super::state::now_secs(),
-                        local_offset,
-                    );
-                } else {
-                    ui::render_footer(
-                        f,
-                        layout.footer,
-                        &footer_facts,
-                        cfg.score.advise_at,
-                        cfg.score.compact_at,
-                        cfg.score.restart_at,
-                        super::state::now_secs(),
-                        local_offset,
-                        dash_start.elapsed().as_millis() as u64,
-                        motion,
-                    );
-                }
-            }
-            if let Some(pane) = panes.get(focused) {
-                // A selection only ever names the pane it started on
-                // (`Selection::pane_short`); a focus change since then simply
-                // stops it from rendering here rather than needing an
-                // explicit clear anywhere else.
-                let selection_range = selection
-                    .as_ref()
-                    .filter(|sel| sel.pane_short == pane.short())
-                    .map(|sel| {
-                        let (rows, cols) = pane.screen().size();
-                        resolve_selection_range(sel, rows, cols)
-                    });
-                // Draw native conversation inside the dashboard's existing chrome (#490).
-                if let Some(native) = pane.native() {
-                    let facts = native.status_facts();
-                    let (view, presentation) = native.view();
-                    // The whole native frame INSIDE the dashboard's main area:
-                    // the conversation, the agent/task overview beside it, the
-                    // usage/health provenance strip beneath it, and whichever
-                    // modal is open. Which of those exist at all is
-                    // `native_ux::resolve_layout`'s decision against the area
-                    // it is actually given, so the same code draws every
-                    // terminal size with no size-specific branch here.
-                    native_approval_rendered = native_pane::render_native_dashboard(
-                        f,
-                        main_area,
-                        view,
-                        presentation,
-                        &facts,
-                        native.ux(),
-                    );
-                } else {
-                    ui::render_grid(f, main_area, pane.screen(), selection_range);
-                    // Draw a scrollback notice above the grid but below overlays.
-                    ui::render_scroll_marker(f, main_area, pane.scrollback());
-                    // HIGH-1: the focused pane's own caret. ratatui hides the
-                    // cursor on every frame whose `cursor_position` is left
-                    // unset, so without this there is no caret anywhere for the
-                    // whole session. An overlay is drawn on top below, but the
-                    // caret is only set for the bare grid: an open dialog owns
-                    // the screen.
-                    //
-                    // Suppressed while scrolled back as well: `cursor_position`
-                    // is the *live* cursor and knows nothing about the
-                    // scrollback offset, so a caret drawn from it would land on
-                    // an unrelated row of history. tmux hides the cursor in
-                    // copy mode for the same reason.
-                    if matches!(overlay, ui::Overlay::None)
-                        && pane.scrollback() == 0
-                        && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
-                    {
-                        f.set_cursor_position(pos);
+                    } else {
+                        ui::render_footer(
+                            f,
+                            layout.footer,
+                            &footer_facts,
+                            cfg.score.advise_at,
+                            cfg.score.compact_at,
+                            cfg.score.restart_at,
+                            super::state::now_secs(),
+                            local_offset,
+                            dash_start.elapsed().as_millis() as u64,
+                            motion,
+                        );
                     }
                 }
-            }
-            ui::render_overlay(f, main_area, &overlay, render_tick);
+                if let Some(pane) = panes
+                    .get(focused)
+                    .filter(|_| tree_facts.is_none() || tree_view.in_chat())
+                {
+                    // A selection only ever names the pane it started on
+                    // (`Selection::pane_short`); a focus change since then simply
+                    // stops it from rendering here rather than needing an
+                    // explicit clear anywhere else.
+                    let selection_range = selection
+                        .as_ref()
+                        .filter(|sel| sel.pane_short == pane.short())
+                        .map(|sel| {
+                            let (rows, cols) = pane.screen().size();
+                            resolve_selection_range(sel, rows, cols)
+                        });
+                    // Draw native conversation inside the dashboard's existing chrome (#490).
+                    if let Some(native) = pane.native() {
+                        let facts = native.status_facts();
+                        let (view, presentation) = native.view();
+                        // The whole native frame INSIDE the dashboard's main area:
+                        // the conversation, the agent/task overview beside it, the
+                        // usage/health provenance strip beneath it, and whichever
+                        // modal is open. Which of those exist at all is
+                        // `native_ux::resolve_layout`'s decision against the area
+                        // it is actually given, so the same code draws every
+                        // terminal size with no size-specific branch here.
+                        native_approval_rendered = native_pane::render_native_dashboard(
+                            f,
+                            main_area,
+                            view,
+                            presentation,
+                            &facts,
+                            native.ux(),
+                        );
+                    } else {
+                        ui::render_grid(f, main_area, pane.screen(), selection_range);
+                        // Draw a scrollback notice above the grid but below overlays.
+                        ui::render_scroll_marker(f, main_area, pane.scrollback());
+                        // HIGH-1: the focused pane's own caret. ratatui hides the
+                        // cursor on every frame whose `cursor_position` is left
+                        // unset, so without this there is no caret anywhere for the
+                        // whole session. An overlay is drawn on top below, but the
+                        // caret is only set for the bare grid: an open dialog owns
+                        // the screen.
+                        //
+                        // Suppressed while scrolled back as well: `cursor_position`
+                        // is the *live* cursor and knows nothing about the
+                        // scrollback offset, so a caret drawn from it would land on
+                        // an unrelated row of history. tmux hides the cursor in
+                        // copy mode for the same reason.
+                        if matches!(overlay, ui::Overlay::None)
+                            && pane.scrollback() == 0
+                            && let Some(pos) = ui::grid_cursor_position(main_area, pane.screen())
+                        {
+                            f.set_cursor_position(pos);
+                        }
+                    }
+                }
+                ui::render_overlay(f, main_area, &overlay, render_tick);
+                if let Some(strip) = &strip_facts {
+                    let below = Rect::new(
+                        0,
+                        frame_area.y + frame_area.height + chat_bottom,
+                        frame_area.width,
+                        approvals_strip_h,
+                    );
+                    approvals_view::render_strip(f, below, strip);
+                }
+            })
         });
-        if let Err(e) = draw {
+        if let Some(Err(e)) = draw {
             push_error(&mut errors, format!("draw: {e}"));
-        } else {
+        } else if draw.is_some() {
             if native_approval_rendered
                 && matches!(overlay, ui::Overlay::None)
                 && let Some(native) = panes.get_mut(focused).and_then(Pane::native_mut)
@@ -3188,7 +3570,8 @@ fn run_dashboard_inner(
                 .get(focused)
                 .map(|pane| (pane.short(), pane.scrollback()));
             done_unread_ack.observe(ack_candidate(
-                !matches!(overlay, ui::Overlay::None),
+                !matches!(overlay, ui::Overlay::None)
+                    || (tree_facts.is_some() && !tree_view.in_chat()),
                 focused_pane,
                 focused_pane.and_then(|(short, _)| facts_cache.disk.attention.get(short)),
             ));
@@ -3206,6 +3589,307 @@ fn run_dashboard_inner(
         eprintln!("all sessions ended; dashboard closed");
     }
     Ok(exit_code)
+}
+
+/// The dashboard facts the agent tree reads, from what the event loop already holds.
+#[allow(clippy::too_many_arguments)]
+fn build_tree_facts<'a>(
+    facts_cache: &'a FactsCache,
+    approvals_hub: Option<&super::approvals::Hub>,
+    panes: &[Pane],
+    focused: usize,
+    cfg: &CtxConfig,
+    rows: &[ui::SidebarRow],
+    retained: &VecDeque<EndedRow>,
+    kept: &HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+    repo: &Path,
+) -> tree_view::TreeFacts<'a> {
+    let seat = facts_cache.disk.seat_full.as_ref();
+    let pane_shorts: Vec<String> = panes.iter().map(|p| p.short().to_string()).collect();
+    let attention_since = |short: &str| {
+        facts_cache
+            .disk
+            .attention
+            .get(short)
+            .map_or(0, |status| status.last_transition)
+    };
+    let mut waits: Vec<tree_view::WaitFact> = facts_cache
+        .disk
+        .attention
+        .iter()
+        .filter(|(short, _)| pane_shorts.contains(short))
+        .filter_map(|(short, status)| {
+            use super::attention::Attention;
+            let kind = match status.attention {
+                Attention::Question => tree_view::WaitKind::Question,
+                Attention::Permission => tree_view::WaitKind::Permission,
+                Attention::Approval => tree_view::WaitKind::Approval,
+                Attention::WorkflowGate => tree_view::WaitKind::WorkflowGate,
+                _ => return None,
+            };
+            Some(tree_view::WaitFact {
+                short: short.clone(),
+                kind,
+                since: status.last_transition,
+                evidence: tree_view::capped_first_line(&status.evidence, 60),
+            })
+        })
+        .collect();
+    waits.sort_by(|a, b| a.short.cmp(&b.short));
+    let mut stalled: Vec<(String, u64)> = facts_cache
+        .disk
+        .stalled
+        .iter()
+        .filter(|short| pane_shorts.contains(short))
+        .map(|short| (short.clone(), attention_since(short)))
+        .collect();
+    stalled.sort();
+    let retryable = rows
+        .iter()
+        .filter(|row| {
+            let ctx = menu_facts_for(row, panes, retained).action_context();
+            actions::menu_actions(&ctx)
+                .iter()
+                .any(|(action, availability)| {
+                    *action == ui::MenuAction::Retry
+                        && matches!(availability, actions::Availability::Enabled)
+                })
+        })
+        .map(|row| row.short.clone())
+        .collect();
+    tree_view::TreeFacts {
+        repo_name: repo
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        usage_5h: seat.and_then(|s| {
+            facts_cache
+                .disk
+                .usage
+                .iter()
+                .find(|u| u.name == s.agent)
+                .and_then(|u| u.five_hour)
+        }),
+        approval_items: approvals_hub.map_or_else(Vec::new, |hub| {
+            hub.items()
+                .iter()
+                .map(|item| tree_view::ApprovalFact {
+                    short: item.request.short.clone(),
+                    conn: item.conn,
+                    tool: item.request.tool.clone(),
+                    preview: item.request.preview.clone(),
+                    waited_secs: item.since.elapsed().as_secs(),
+                    fully_shown: item.request.fully_shown,
+                    released: item.request.released,
+                    view: tree_view::approval_view(&item.request),
+                })
+                .collect()
+        }),
+        waits,
+        stalled,
+        retryable,
+        pane_meta: panes
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| tree_view::PaneMeta {
+                short: pane.short().to_string(),
+                number: index + 1,
+                worktree: pane
+                    .cwd()
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                brief: kept
+                    .get(pane.short())
+                    .map(|(request, _)| tree_view::capped_first_line(&request.prompt, 80))
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        term_size: crossterm::terminal::size().unwrap_or((0, 0)),
+        strip_rows: approvals_view::current_strip_rows(approvals_hub),
+        seat_harness: seat.map(|s| s.agent.as_str()),
+        seat_model: seat.and_then(|s| s.model.as_deref()),
+        seat_role: seat.map(|s| s.role.as_str()),
+        seat_session: seat.map(|s| s.session.as_str()),
+        rot: seat.and_then(|s| facts_cache.disk.scores.get(&s.short).copied()),
+        spend_micros: facts_cache.disk.spend.map(|s| s.cost_micros),
+        jev: facts_cache.disk.jev.as_ref(),
+        workflow: facts_cache.disk.workflow.as_ref(),
+        approvals: approvals_hub.map_or(0, super::approvals::Hub::count),
+        approval_shorts: approvals_hub.map_or_else(Vec::new, |hub| {
+            hub.shorts().into_iter().map(str::to_string).collect()
+        }),
+        pane_shorts,
+        focused: panes.get(focused).map(|p| {
+            (
+                p.short().to_string(),
+                p.title().to_string(),
+                p.agent().to_string(),
+            )
+        }),
+        panes_used: panes.len(),
+        max_panes: cfg.dash.max_panes,
+        max_writers: cfg.supervise.max_writers,
+        now: super::state::now_secs(),
+        utc_offset: *chrono::Local::now().offset(),
+    }
+}
+
+/// The approval key a decision is answered with.
+fn approval_key(decision: super::approvals::Decision) -> input::ApprovalKey {
+    use super::approvals::Decision;
+    match decision {
+        Decision::Allow => input::ApprovalKey::Allow,
+        Decision::AllowAlways => input::ApprovalKey::AllowAlways,
+        Decision::Deny | Decision::Release => input::ApprovalKey::Deny,
+    }
+}
+
+/// The dashboard state a tree action can change.
+struct TreeDash<'a> {
+    selected: &'a mut usize,
+    focused: &'a mut usize,
+    chrome_selection: &'a mut Option<Hit>,
+    reveal_sidebar: &'a mut bool,
+    overlay: &'a mut ui::Overlay,
+    notices: &'a mut Vec<Notice>,
+    errors: &'a mut ErrorLog,
+    panes: &'a mut Vec<Pane>,
+    nudge_queues: &'a mut Vec<VecDeque<String>>,
+    retained: &'a mut VecDeque<EndedRow>,
+    kept: &'a mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+    cfg: &'a CtxConfig,
+    pane_size: (u16, u16),
+    requests_dir: &'a Path,
+}
+
+/// Carry out what the agent tree asked for after a key or a click.
+fn apply_tree_outcome(
+    outcome: tree_view::Outcome,
+    tree_view: &mut tree_view::TreeView,
+    hub: Option<&mut super::approvals::Hub>,
+    state: &StateDir,
+    repo: &Path,
+    rows: &[ui::SidebarRow],
+    dash: &mut TreeDash,
+) {
+    use tree_view::Outcome;
+    let notice =
+        |dash: &mut TreeDash, text: String| push_notice(dash.notices, Instant::now(), text);
+    match outcome {
+        Outcome::None => {}
+        Outcome::Leave => tree_view.toggle(),
+        Outcome::Notice(text) => notice(dash, text),
+        Outcome::OpenPane(short) => {
+            let attachable = rows
+                .iter()
+                .any(|r| r.short == short && r.attached && r.state != ui::RowState::Dead);
+            if !attachable {
+                return notice(dash, "that pane has ended".into());
+            }
+            *dash.reveal_sidebar = true;
+            *dash.chrome_selection = None;
+            (*dash.selected, *dash.focused) =
+                select_row(&short, rows, *dash.selected, *dash.focused);
+            // The chat opens inside the tree, under its bar, with the pane taking every key.
+            tree_view.open_chat();
+        }
+        Outcome::Mail { to } => {
+            let mut view = build_mail_view(state, repo);
+            view.compose = Some(ui::ComposeDraft {
+                to,
+                body: String::new(),
+            });
+            *dash.overlay = ui::Overlay::Mail(view);
+        }
+        Outcome::MailSubagent { to, body } => {
+            let mut view = build_mail_view(state, repo);
+            view.compose = Some(ui::ComposeDraft { to, body });
+            *dash.overlay = ui::Overlay::Mail(view);
+        }
+        Outcome::BackToFlow => tree_view.close_chat(),
+        Outcome::Spawn => *dash.overlay = ui::Overlay::Spawn(ui::SpawnDraft::default()),
+        Outcome::Nudge { short } => {
+            *dash.overlay = ui::Overlay::Nudge(nudge_draft(&short, dash.panes));
+        }
+        Outcome::Stop { short } => stop_pane(
+            &short,
+            dash.panes,
+            dash.cfg,
+            dash.errors,
+            dash.notices,
+            Instant::now(),
+        ),
+        Outcome::Retry { short } => restore_ended_row(
+            &short,
+            dash.panes,
+            dash.nudge_queues,
+            dash.retained,
+            dash.kept,
+            dash.cfg,
+            state,
+            repo,
+            dash.pane_size,
+            dash.requests_dir,
+            dash.errors,
+            dash.notices,
+            Instant::now(),
+            rows,
+            dash.selected,
+        ),
+        Outcome::AnswerShown {
+            short,
+            conn,
+            decision,
+        } => {
+            let Some(hub) = hub else {
+                return notice(dash, "the approvals inbox is off".into());
+            };
+            // The dashboard drew this request with its answer keys, which is what makes it answerable.
+            if !hub.select_conn(conn, &short) {
+                return notice(dash, "that approval is already gone".into());
+            }
+            let shown = hub.current().map(|item| {
+                (
+                    item.conn,
+                    item.request.fully_shown && !item.request.released,
+                )
+            });
+            hub.mark_drawn(shown);
+            let key = approval_key(decision);
+            if let Some(text) = approvals_view::handle_key(Some(hub), key, state).notice {
+                notice(dash, text);
+            }
+        }
+        Outcome::OverrideRuling { id, short } => {
+            // The dashboard is the operator's own process, so it calls the lever directly; the
+            // CLI refuses inside an agent session.
+            match super::supervisor::override_ruling(state, &id, None) {
+                Ok(_) => tree_view.override_done(&id, &short),
+                Err(e) => notice(dash, format!("override failed: {e}")),
+            }
+        }
+        Outcome::Answer { short, decision } => {
+            let Some(hub) = hub else {
+                return notice(dash, "the approvals inbox is off".into());
+            };
+            // Only the request the last frame drew can be answered; showing it first keeps that rule.
+            if hub
+                .drawn_item()
+                .is_some_and(|item| item.request.short == short)
+            {
+                let key = approval_key(decision);
+                if let Some(text) = approvals_view::handle_key(Some(hub), key, state).notice {
+                    notice(dash, text);
+                }
+            } else if hub.select_short(&short) {
+                notice(
+                    dash,
+                    "showing its request below; press again to answer".into(),
+                );
+            } else {
+                notice(dash, "that approval is already gone".into());
+            }
+        }
+    }
 }
 
 /// On setup failure, finish spawned panes explicitly: Unix has no Windows job

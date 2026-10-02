@@ -240,7 +240,7 @@ pub(super) fn supervise_run(
                 // do not announce delivery before it succeeds. (#310)
                 let slug = super::state::repo_slug(repo);
                 let nudge = super::mail::Message {
-                    from_session: "supervisor".into(),
+                    from_session: "zirv".into(),
                     from_agent: "zirv".into(),
                     to: adapter.name().into(),
                     to_session: Some(registry_short.into()),
@@ -557,6 +557,10 @@ mod tests {
             "a stall must deliver exactly one steering mail"
         );
         assert_eq!(unread[0].1.to_session.as_deref(), Some("11111111"));
+        assert_eq!(
+            unread[0].1.from_session, "zirv",
+            "zirv's own stall nudge must not borrow the supervisor feature's sender"
+        );
     }
 
     #[test]

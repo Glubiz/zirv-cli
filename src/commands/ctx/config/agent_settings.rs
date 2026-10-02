@@ -148,27 +148,7 @@ pub struct ObfuscateConfig {
 
 impl ObfuscateConfig {
     pub(super) fn load_operator_only(env: EnvLookup<'_>) -> CtxResult<Self> {
-        let text = match std::fs::read_to_string(operator_path()?) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let mut operator: toml::Table = toml::from_str(&text)?;
-        let mut merged = toml::Table::new();
-        if let Some(value) = operator.remove("obfuscate") {
-            merged.insert("obfuscate".into(), value);
-        }
-        for (var, path, kind) in ENV_MAP {
-            if path.first() == Some(&"obfuscate")
-                && let Some(raw) = env(var)
-            {
-                insert_path(&mut merged, path, env_value(&raw, *kind)?);
-            }
-        }
-        match merged.remove("obfuscate") {
-            Some(value) => Ok(value.try_into()?),
-            None => Ok(Self::default()),
-        }
+        load_operator_section(env, "obfuscate")
     }
 
     pub(super) fn fail_closed() -> Self {
@@ -290,7 +270,7 @@ impl EndpointTarget {
     pub fn pin_model(&self, requested: Option<&str>) -> String {
         if let Some(model) = requested
             && let Some(vendor) = super::super::catalogue::vendor(&self.vendor)
-            && super::super::catalogue::rung_of(vendor, model).is_some()
+            && super::super::catalogue::rung_of_known(vendor, model).is_some()
         {
             return model.to_string();
         }

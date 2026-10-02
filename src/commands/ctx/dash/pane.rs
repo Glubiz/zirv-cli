@@ -179,6 +179,163 @@ fn injectable_from(
     matches!(state, PaneState::Idle) && !injected_awaiting_turn && !user_typed_since_turn
 }
 
+/// Codex 0.159.2 approval dialog text, read from the installed binary's strings (#842). One heading
+/// plus a "Yes, " and a "No, " option must all be on screen, so ordinary output never trips it.
+const CODEX_APPROVAL_HEADINGS: [&str; 3] = [
+    "Would you like to run the following command?",
+    "Would you like to make the following edits?",
+    "Would you like to grant these permissions?",
+];
+const CODEX_APPROVAL_OPTIONS: [&str; 2] = ["Yes, ", "No, "];
+
+/// Rows from the bottom of the live screen in which the dialog heading must sit.
+const CODEX_DIALOG_BOTTOM_ROWS: usize = 20;
+
+/// An option row starts with a selection marker or a number.
+fn is_dialog_option_line(line: &str) -> bool {
+    line.trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || matches!(c, '\u{203a}' | '>' | '\u{276f}'))
+}
+
+/// The heading row and every row below it, when the LIVE screen text ends in a dialog heading.
+fn codex_dialog_rows(live_contents: &str) -> Option<(&str, Vec<&str>)> {
+    let lines: Vec<&str> = live_contents.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(CODEX_DIALOG_BOTTOM_ROWS)..];
+    let heading = tail.iter().rposition(|line| {
+        CODEX_APPROVAL_HEADINGS
+            .iter()
+            .any(|h| line.trim().starts_with(h))
+    })?;
+    Some((tail[heading].trim(), tail[heading + 1..].to_vec()))
+}
+
+/// Whether the LIVE screen text shows a Codex approval dialog that a typed line or Enter would answer (#842):
+/// a heading line near the bottom, with "Yes, " and "No, " option rows below it. The same strings inside
+/// ordinary output (a diff, source code) have the wrong layout and never match.
+pub(crate) fn codex_approval_dialog_shown(live_contents: &str) -> bool {
+    let Some((_, options)) = codex_dialog_rows(live_contents) else {
+        return false;
+    };
+    CODEX_APPROVAL_OPTIONS.iter().all(|wanted| {
+        options
+            .iter()
+            .any(|line| is_dialog_option_line(line) && line.contains(wanted))
+    })
+}
+
+/// What an open Codex approval dialog shows, read from the screen: the request details plus the key each
+/// option answers with (the "(y)" and "(p)" hints Codex draws after the option text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexDialog {
+    pub tool: &'static str,
+    pub command: String,
+    pub details: super::super::approvals::RequestDetails,
+    allow_key: Option<char>,
+    always_key: Option<char>,
+}
+
+impl CodexDialog {
+    /// The request record for this dialog, owned by dashboard `dash_pid`.
+    pub fn request(&self, short: &str, dash_pid: u32) -> super::super::approvals::Request {
+        super::super::approvals::Request::new(
+            short,
+            self.tool,
+            &self.command,
+            &self.command,
+            dash_pid,
+        )
+        .with_details(self.details.clone())
+    }
+
+    /// The key that selects the option for `decision`; `None` when the dialog has no such option.
+    /// AllowAlways answers only through Codex's own "don't ask again" option, never any other.
+    pub fn answer_key(&self, decision: super::super::approvals::Decision) -> Option<char> {
+        use super::super::approvals::Decision;
+        match decision {
+            Decision::Allow => self.allow_key,
+            Decision::AllowAlways => self.always_key,
+            _ => None,
+        }
+    }
+}
+
+/// An option row's text without its selection marker and number, and the one-character key it ends with.
+fn dialog_option(line: &str) -> (String, Option<char>) {
+    let text = line
+        .trim_start()
+        .trim_start_matches(['\u{203a}', '>', '\u{276f}', ' '])
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start_matches('.')
+        .trim();
+    let key = text
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once('('))
+        .and_then(|(_, key)| {
+            let mut chars = key.chars();
+            chars.next().filter(|_| chars.next().is_none())
+        });
+    let label = match (key, text.rsplit_once('(')) {
+        (Some(_), Some((label, _))) => label.trim(),
+        _ => text,
+    };
+    (label.to_string(), key)
+}
+
+/// Read the open dialog's details from the LIVE screen text; `None` when no dialog is shown.
+pub(crate) fn codex_approval_dialog(live_contents: &str) -> Option<CodexDialog> {
+    if !codex_approval_dialog_shown(live_contents) {
+        return None;
+    }
+    let (heading, rows) = codex_dialog_rows(live_contents)?;
+    let first_option = rows.iter().position(|line| is_dialog_option_line(line))?;
+    let mut reason = None;
+    let mut command = Vec::new();
+    for line in rows[..first_option].iter().map(|line| line.trim()) {
+        if line.is_empty() {
+            continue;
+        }
+        match line.strip_prefix("Reason:") {
+            Some(text) => reason = Some(text.trim().to_string()),
+            None => command.push(line.strip_prefix("$ ").unwrap_or(line)),
+        }
+    }
+    let (mut allow_key, mut always_key, mut always) = (None, None, None);
+    for line in &rows[first_option..] {
+        if !is_dialog_option_line(line) {
+            continue;
+        }
+        let (label, key) = dialog_option(line);
+        if label.starts_with("Yes, proceed") || label.starts_with("Yes, just this once") {
+            allow_key = allow_key.or(key);
+        } else if let Some(rule) = label.strip_prefix("Yes, and don't ask again for ") {
+            always_key = always_key.or(key);
+            always = always.or(Some(rule.to_string()));
+        }
+    }
+    Some(CodexDialog {
+        tool: if heading.contains("edits") {
+            "Edit"
+        } else if heading.contains("permissions") {
+            "Permissions"
+        } else {
+            "Bash"
+        },
+        command: command.join(" "),
+        details: super::super::approvals::RequestDetails {
+            cwd: None,
+            outside_sandbox: heading.contains("permissions")
+                || reason.as_deref().is_some_and(|r| r.contains("sandbox")),
+            reason,
+            // Only an option Codex drew with a key can be selected, so only that is offered.
+            always: always.filter(|_| always_key.is_some()),
+        },
+        allow_key,
+        always_key,
+    })
+}
+
 /// Use the bottom nonblank screen row for sidebar preview.
 fn last_line_of(screen: &vt100::Screen) -> String {
     let (rows, cols) = screen.size();
@@ -491,6 +648,8 @@ pub struct Pane {
     role: PromptRole,
     session_id: String,
     parser: vt100::Parser,
+    /// A Codex approval dialog is on the LIVE screen, whatever the scrollback offset (#842).
+    approval_dialog: bool,
     /// Separate wrapped PTY ownership from native in-process session ownership (#490).
     kind: PaneKind,
     /// An automatic successor under observation; the source still owns this pane.
@@ -522,6 +681,8 @@ pub struct Pane {
     injected_awaiting_turn: bool,
     /// Keep operator typing pending until the next turn signal, blocking idle-gated injection.
     user_typed_since_turn: bool,
+    /// Set while this dashboard holds an `Approval` attention latch for a Codex approval dialog on screen (#842).
+    pub(super) codex_approval_latched: bool,
     exit_code: Option<i32>,
     native_stop_code: Option<i32>,
     /// Monotonic launch age captured when the real child exit is observed.
@@ -835,6 +996,7 @@ impl Pane {
             role,
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
+            approval_dialog: false,
             kind: PaneKind::Native(Box::new(native)),
             pending_handover: None,
             pending_output: false,
@@ -850,6 +1012,7 @@ impl Pane {
             last_local_input_at: None,
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
+            codex_approval_latched: false,
             exit_code: None,
             native_stop_code: None,
             launched_at: Instant::now(),
@@ -1087,6 +1250,7 @@ impl Pane {
             role,
             session_id,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
+            approval_dialog: false,
             kind: PaneKind::Wrapped(PtyPane {
                 master,
                 child,
@@ -1106,6 +1270,7 @@ impl Pane {
             last_local_input_at: None,
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
+            codex_approval_latched: false,
             exit_code: None,
             native_stop_code: None,
             launched_at,
@@ -1162,6 +1327,7 @@ impl Pane {
         };
         self.pending_output = more;
         if any {
+            self.refresh_approval_dialog();
             // Record output time; signal_still_stands decides whether it is a redraw or a new turn.
             self.last_output_at = Some(Instant::now());
             // Mail error output is not proof the child survived the confirmation window.
@@ -1397,6 +1563,10 @@ impl Pane {
             })?;
         }
         self.parser.screen_mut().set_size(rows, cols);
+        // A shrink can cut the dialog's rows until Codex redraws; only output may clear the flag.
+        let open = self.approval_dialog;
+        self.refresh_approval_dialog();
+        self.approval_dialog |= open;
         Ok(())
     }
 
@@ -1430,9 +1600,41 @@ impl Pane {
         )
     }
 
+    /// Whether this Codex pane currently shows an approval dialog; other agents never do (#842).
+    pub(crate) fn codex_approval_open(&self) -> bool {
+        self.approval_dialog
+    }
+
+    /// The open Codex dialog's request details, read from the live screen; `None` when no dialog is open.
+    pub(crate) fn codex_dialog(&mut self) -> Option<CodexDialog> {
+        if !self.codex_approval_open() {
+            return None;
+        }
+        let offset = self.scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+        let dialog = codex_approval_dialog(&self.screen().contents());
+        self.parser.screen_mut().set_scrollback(offset);
+        dialog
+    }
+
+    /// Re-read the dialog from the live screen (scrollback 0, as `screen_tail` does), so scrolling back
+    /// cannot hide an open dialog from the typing guards.
+    fn refresh_approval_dialog(&mut self) {
+        if self.agent_name != "codex" || !matches!(self.kind, PaneKind::Wrapped(_)) {
+            return;
+        }
+        let offset = self.scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+        self.approval_dialog = codex_approval_dialog_shown(&self.screen().contents());
+        self.parser.screen_mut().set_scrollback(offset);
+    }
+
     /// Inject mail or nudges only when pane state and turn signals make typing safe.
     pub fn injectable(&self) -> bool {
         if self.pending_submit.is_some() || self.submit_confirmation.is_some() {
+            return false;
+        }
+        if self.codex_approval_open() {
             return false;
         }
         if self.native().is_some_and(|native| native.has_draft()) {
@@ -1784,6 +1986,9 @@ impl Pane {
 
     /// Write a bounded labelled line first and defer its submit carriage return until the echo settles.
     pub fn inject_visible(&mut self, label: &str, body: &str) -> CtxResult<()> {
+        if self.codex_approval_open() {
+            return Err("codex approval dialog is open; not typing into it".into());
+        }
         // Deliver native messages through the native submit path, never PTY control bytes (#490).
         if let PaneKind::Native(native) = &mut self.kind {
             native.deliver(label, body)?;
@@ -1821,6 +2026,10 @@ impl Pane {
         let Some(deadline) = self.pending_submit else {
             return false;
         };
+        // An Enter now would answer the dialog, so hold the submit until it is gone (#842).
+        if self.codex_approval_open() {
+            return false;
+        }
         let quiet_deadline = self
             .last_output_at
             .map(|output| (output + INJECTION_SUBMIT_DELAY).max(deadline))
@@ -1946,7 +2155,13 @@ impl Pane {
                     .lock()
                     .map_err(|_| "dashboard pane: writer lock poisoned")?;
                 let sink: &mut dyn Write = &mut **writer;
-                wrap::quit_child(sink, &mut pty.child, quit_sequence, QUIT_GRACE)?;
+                // Typing the quit line would answer an open approval dialog; wait out the grace and kill.
+                let quit = if self.approval_dialog {
+                    ""
+                } else {
+                    quit_sequence
+                };
+                wrap::quit_child(sink, &mut pty.child, quit, QUIT_GRACE)?;
             }
             // A native pane has no child to ask politely: ending it is
             // `InteractiveSession::shutdown` (or a `session.detach` for a
@@ -1995,6 +2210,11 @@ impl Pane {
         }
         self.poll_exit();
         if self.exit_code.is_some() {
+            return;
+        }
+        // Enter would accept the highlighted "Yes, proceed": with a dialog open, type nothing; the
+        // shutdown escalation ends the child instead.
+        if self.codex_approval_open() {
             return;
         }
         let _ = self.write_input(quit_sequence.as_bytes());
@@ -5518,6 +5738,154 @@ pub(crate) mod tests {
         // finish_shutdown: immediate, no QUIT_GRACE wait -- see the identical
         // comment on `handover_failure_in_successor_setup_leaves_the_old_pane_untouched`.
         pane.finish_shutdown().expect("shutdown");
+    }
+
+    const DIALOG: &str = "Would you like to run the following command?\r\n  1. Yes, proceed (y)\r\n  3. No, and tell Codex what to do differently (esc)\r\n";
+
+    #[test]
+    fn the_dialog_matcher_needs_the_layout_not_just_the_strings() {
+        assert!(codex_approval_dialog_shown(&DIALOG.replace("\r\n", "\n")));
+        assert!(codex_approval_dialog_shown(
+            "x\nWould you like to make the following edits?\n\u{203a} 1. Yes, proceed\n  2. No, cancel\n"
+        ));
+        // The same strings inside a diff or code are not a dialog.
+        let diff =
+            "+    \"Would you like to run the following command?\",\n+    \"Yes, \", \"No, \"\n";
+        assert!(!codex_approval_dialog_shown(diff));
+        let real_dialog_layout =
+            "Would you like to run the following command?\nsome output\n  1. Yes, x\n  2. No, y\n";
+        assert!(codex_approval_dialog_shown(real_dialog_layout));
+        let far_above = format!(
+            "Would you like to run the following command?\n1. Yes, a\n2. No, b\n{}",
+            "output\n".repeat(CODEX_DIALOG_BOTTOM_ROWS + 1)
+        );
+        assert!(
+            !codex_approval_dialog_shown(&far_above),
+            "not in the bottom part"
+        );
+        assert!(!codex_approval_dialog_shown(
+            "Would you like to run the following command?\nsay Yes, then No, later\n"
+        ));
+    }
+
+    const FULL_DIALOG: &str = "  Would you like to run the following command?\n\n  Reason: Needs network to fetch crates\n\n  $ cargo nextest run --no-fail-fast\n\n\u{203a} 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `cargo nextest run` (p)\n  3. No, and tell Codex what to do differently (esc)\n";
+
+    #[test]
+    fn the_dialog_reader_extracts_command_reason_and_the_offered_always_option() {
+        use super::super::super::approvals::Decision;
+        let dialog = codex_approval_dialog(FULL_DIALOG).expect("dialog");
+        assert_eq!(dialog.tool, "Bash");
+        assert_eq!(dialog.command, "cargo nextest run --no-fail-fast");
+        assert_eq!(
+            dialog.details.reason.as_deref(),
+            Some("Needs network to fetch crates")
+        );
+        assert_eq!(
+            dialog.details.always.as_deref(),
+            Some("commands that start with `cargo nextest run`")
+        );
+        assert_eq!(dialog.answer_key(Decision::Allow), Some('y'));
+        assert_eq!(dialog.answer_key(Decision::AllowAlways), Some('p'));
+        assert_eq!(dialog.answer_key(Decision::Deny), None);
+        let request = dialog.request("abc123", 7);
+        assert_eq!(request.command, "cargo nextest run --no-fail-fast");
+        assert!(request.always.is_some());
+    }
+
+    #[test]
+    fn a_dialog_without_a_dont_ask_again_option_never_offers_always() {
+        use super::super::super::approvals::Decision;
+        let dialog = codex_approval_dialog(DIALOG).expect("dialog");
+        assert_eq!(dialog.details.always, None);
+        assert_eq!(dialog.answer_key(Decision::AllowAlways), None);
+        assert_eq!(dialog.answer_key(Decision::Allow), Some('y'));
+        assert_eq!(codex_approval_dialog("ordinary output\n"), None);
+    }
+
+    #[cfg(unix)]
+    fn codex_dialog_pane(tmp: &Path, script: &str) -> Pane {
+        let state = StateDir::from_root(tmp.join("state"));
+        let mut spec = test_spec("77777777-2222-4333-8444-555555555555");
+        spec.agent_name = "codex".to_string();
+        spec.argv = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        Pane::spawn(
+            spec,
+            &state,
+            tmp,
+            tmp,
+            (100, 24),
+            &[],
+            false,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_dialog(pane: &mut Pane) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !pane.codex_approval_open() {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.codex_approval_open());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scrolled_back_pane_still_reports_its_open_dialog() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = format!(
+            "i=0; while [ $i -lt 60 ]; do echo filler$i; i=$((i+1)); done; printf '{DIALOG}'; sleep 60"
+        );
+        let mut pane = codex_dialog_pane(tmp.path(), &script);
+        wait_for_dialog(&mut pane);
+        pane.parser.screen_mut().set_scrollback(30);
+        assert!(
+            !pane.screen().contents().contains("Yes, proceed"),
+            "scrolled out of view"
+        );
+        pane.refresh_approval_dialog();
+        assert!(pane.codex_approval_open());
+        assert!(
+            !pane.injectable(),
+            "nothing is typed while the dialog is open"
+        );
+        assert_eq!(pane.scrollback(), 30, "the operator's view is left alone");
+        let _ = pane.finish_shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shrink_that_cuts_the_dialog_rows_keeps_it_open() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut pane = codex_dialog_pane(tmp.path(), &format!("printf '{DIALOG}'; sleep 60"));
+        wait_for_dialog(&mut pane);
+        pane.resize(2, 80).expect("resize");
+        assert!(
+            !pane.screen().contents().contains("No, "),
+            "the shrink cut the option rows"
+        );
+        assert!(pane.codex_approval_open());
+        assert!(!pane.injectable(), "nothing is typed before Codex redraws");
+        let _ = pane.finish_shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_a_pane_with_an_open_dialog_types_nothing_into_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("typed");
+        let script = format!(
+            "printf '{DIALOG}'; read x; touch {}; sleep 60",
+            marker.display()
+        );
+        let mut pane = codex_dialog_pane(tmp.path(), &script);
+        wait_for_dialog(&mut pane);
+        pane.request_quit("/quit\r");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!marker.exists(), "no byte reached the dialog");
+        let _ = pane.finish_shutdown();
     }
 
     #[test]

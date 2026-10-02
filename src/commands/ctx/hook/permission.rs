@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::ctx::CtxResult;
-use crate::commands::ctx::adapters::SOCKET_ENV;
+use crate::commands::ctx::adapters::{SESSION_ENV, SOCKET_ENV};
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::state::{StateDir, now_secs};
 
@@ -33,7 +33,9 @@ pub(super) fn finding_kinds(findings: &[crate::commands::ctx::obfuscate::Finding
 const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 
 /// Prefer the socket's stable short ID for attention observations: hook
-/// session IDs can rotate during an internal restart (#349).
+/// session IDs can rotate during an internal restart (#349). Without a socket
+/// (Codex has none), the zirv session beats the payload's harness conversation
+/// id, which the dashboard never keys attention by (#841).
 pub(super) fn attention_short(env: EnvLookup<'_>, session_id_fallback: &str) -> String {
     env(SOCKET_ENV)
         .and_then(|raw| {
@@ -43,7 +45,12 @@ pub(super) fn attention_short(env: EnvLookup<'_>, session_id_fallback: &str) -> 
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| crate::commands::ctx::sessions::short_id(session_id_fallback))
+        .unwrap_or_else(|| {
+            let zirv_session = env(SESSION_ENV).filter(|s| !s.is_empty());
+            crate::commands::ctx::sessions::short_id(
+                zirv_session.as_deref().unwrap_or(session_id_fallback),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -56,6 +63,8 @@ struct PermissionHookPayload {
     reason: Option<String>,
     tool_name: String,
     tool_input: PermissionToolInput,
+    /// Claude's own suggested permission updates; the only source an "always allow" may apply.
+    permission_suggestions: Vec<serde_json::Value>,
 }
 
 impl PermissionHookPayload {
@@ -66,10 +75,40 @@ impl PermissionHookPayload {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-struct PermissionToolInput {
-    command: String,
+pub struct PermissionToolInput {
+    pub command: String,
     file_path: String,
     url: String,
+    /// Every other input field, so the inbox can preview a tool this parser has no typed field for.
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
+}
+
+impl PermissionToolInput {
+    /// A Bash call's own plain-language `description`, read from the untyped fields so previews and ids stay unchanged.
+    fn bash_description(&self, tool_name: &str) -> Option<String> {
+        if !matches!(tool_name, "Bash" | "PowerShell") {
+            return None;
+        }
+        Some(self.other.get("description")?.as_str()?.to_string()).filter(|d| !d.is_empty())
+    }
+
+    fn outside_sandbox(&self) -> bool {
+        self.other
+            .get("dangerouslyDisableSandbox")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// The text the approvals inbox previews: the command, path or URL, else the remaining input fields.
+    pub fn preview_source(&self, tool_name: &str) -> String {
+        match tool_name {
+            "Bash" | "PowerShell" => self.command.clone(),
+            "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => self.file_path.clone(),
+            "WebFetch" => self.url.clone(),
+            _ => serde_json::to_string(&self.other).unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +327,13 @@ pub(super) fn run_permission<W: Write>(
             format!("permission denied: {}", payload.tool_name),
             now_secs(),
         );
+        crate::commands::ctx::approvals::clear_for_tool(
+            &state,
+            &short,
+            &payload.tool_name,
+            &payload.tool_input.command,
+            &payload.tool_input.preview_source(&payload.tool_name),
+        );
     } else if !auto_allowed {
         let _ = crate::commands::ctx::attention::record(
             &state,
@@ -301,6 +347,34 @@ pub(super) fn run_permission<W: Write>(
             .with_attention(crate::commands::ctx::attention::Attention::Approval),
             now_secs(),
         );
+        // Approvals inbox (#840): with the key on and a live owning dashboard, hold for its operator.
+        // Any other outcome prints nothing, so the native dialog shows exactly as it always has.
+        let inbox = crate::commands::ctx::config::ApprovalsConfig::load_operator_only(env)
+            .unwrap_or_default();
+        if inbox.inbox {
+            let rule =
+                crate::commands::ctx::approvals::always_rule(&payload.permission_suggestions);
+            let details = crate::commands::ctx::approvals::RequestDetails {
+                cwd: Some(payload.cwd.clone()).filter(|cwd| !cwd.is_empty()),
+                reason: payload.tool_input.bash_description(&payload.tool_name),
+                outside_sandbox: payload.tool_input.outside_sandbox(),
+                always: rule.as_ref().map(|rule| rule.label.clone()),
+            };
+            if let Some(json) = crate::commands::ctx::approvals::hold_for_dashboard(
+                &state,
+                &short,
+                &payload.tool_name,
+                &payload.tool_input.command,
+                &payload.tool_input.preview_source(&payload.tool_name),
+                details,
+                std::time::Duration::from_secs(inbox.hold_secs),
+            )
+            .and_then(|decision| {
+                crate::commands::ctx::approvals::decision_json(decision, rule.as_ref())
+            }) {
+                let _ = writeln!(w, "{json}");
+            }
+        }
     }
     let Ok(line) = serde_json::to_string(&permission_prompt_row(&payload, now_secs())) else {
         return Ok(0);
@@ -780,5 +854,189 @@ mod tests {
             "got {}",
             crate::commands::ctx::attention::reason(&status)
         );
+    }
+
+    fn inbox_env(state: &Path, inbox: bool) -> impl Fn(&str) -> Option<String> + use<> {
+        let base = permission_env(state);
+        move |key| match key {
+            "ZIRV_CTX_APPROVALS_INBOX" => inbox.then(|| "true".to_string()),
+            "ZIRV_CTX_APPROVALS_HOLD_SECS" => Some("5".to_string()),
+            other => base.get(other).cloned(),
+        }
+    }
+
+    fn permission_request() -> String {
+        permission_stdin(
+            Some("PermissionRequest"),
+            "Bash",
+            serde_json::json!({"command": "cargo nextest run"}),
+        )
+    }
+
+    #[test]
+    fn with_the_inbox_off_the_hook_prints_nothing_and_touches_no_inbox_state() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let lookup = inbox_env(tmp.path(), false);
+        let mut out = Vec::new();
+        run_permission(&mut out, &permission_request(), &lookup).expect("never errors");
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert!(
+            !crate::commands::ctx::approvals::approvals_dir(
+                &StateDir::resolve(&lookup).expect("state")
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn with_the_inbox_on_but_no_live_dashboard_the_hook_prints_nothing_at_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let lookup = inbox_env(tmp.path(), true);
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        run_permission(&mut out, &permission_request(), &lookup).expect("never errors");
+        assert!(out.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_request_prints_exactly_the_one_call_decision() {
+        use crate::commands::ctx::approvals::Decision;
+        for (decision, behavior) in [(Decision::Allow, "allow"), (Decision::Deny, "deny")] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let lookup = inbox_env(tmp.path(), true);
+            let state = StateDir::resolve(&lookup).expect("state");
+            let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+                &state,
+                crate::commands::ctx::sessions::Record::new(
+                    "abc123",
+                    "claude",
+                    Path::new("/work/repo"),
+                    crate::commands::ctx::sessions::Verb::Dash,
+                ),
+            );
+            let mut hub = crate::commands::ctx::approvals::Hub::bind(&state).expect("hub");
+            let dashboard = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while hub.count() == 0 && std::time::Instant::now() < deadline {
+                    hub.poll(&|_| true);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                hub.resolve_current(decision);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            let mut out = Vec::new();
+            run_permission(&mut out, &permission_request(), &lookup).expect("never errors");
+            dashboard.join().expect("dashboard");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(!text.contains("updatedPermissions"), "{text}");
+            let value: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+            assert_eq!(
+                value,
+                serde_json::json!({"hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": behavior}
+                }})
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allow_always_prints_the_suggestion_claude_sent_and_the_request_carries_its_details() {
+        use crate::commands::ctx::approvals::Decision;
+        let suggestion = serde_json::json!({
+            "type": "addRules",
+            "rules": [{"toolName": "Bash", "ruleContent": "cargo nextest run:*"}],
+            "behavior": "allow",
+            "destination": "localSettings"
+        });
+        let stdin = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/work/repo",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "cargo nextest run",
+                "description": "Run the tests",
+                "dangerouslyDisableSandbox": true
+            },
+            "permission_suggestions": [suggestion]
+        })
+        .to_string();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let lookup = inbox_env(tmp.path(), true);
+        let state = StateDir::resolve(&lookup).expect("state");
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "abc123",
+                "claude",
+                Path::new("/work/repo"),
+                crate::commands::ctx::sessions::Verb::Dash,
+            ),
+        );
+        let mut hub = crate::commands::ctx::approvals::Hub::bind(&state).expect("hub");
+        let dashboard = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while hub.count() == 0 && std::time::Instant::now() < deadline {
+                hub.poll(&|_| true);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let request = hub
+                .current()
+                .map(|item| item.request.clone())
+                .expect("held");
+            hub.resolve_current(Decision::AllowAlways);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            request
+        });
+        let mut out = Vec::new();
+        run_permission(&mut out, &stdin, &lookup).expect("never errors");
+        let request = dashboard.join().expect("dashboard");
+        assert_eq!(request.command, "cargo nextest run");
+        assert_eq!(request.cwd.as_deref(), Some("/work/repo"));
+        assert_eq!(request.reason.as_deref(), Some("Run the tests"));
+        assert!(request.outside_sandbox);
+        assert_eq!(
+            request.always.as_deref(),
+            Some("cargo nextest run commands")
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).expect("utf8").trim()).expect("json");
+        assert_eq!(
+            value["hookSpecificOutput"]["decision"],
+            serde_json::json!({"behavior": "allow", "updatedPermissions": [suggestion]})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unanswered_hold_prints_nothing_so_the_native_dialog_shows() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let lookup = {
+            let base = inbox_env(tmp.path(), true);
+            move |key: &str| {
+                if key == "ZIRV_CTX_APPROVALS_HOLD_SECS" {
+                    return Some("1".to_string());
+                }
+                base(key)
+            }
+        };
+        let state = StateDir::resolve(&lookup).expect("state");
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                "abc123",
+                "claude",
+                Path::new("/work/repo"),
+                crate::commands::ctx::sessions::Verb::Dash,
+            ),
+        );
+        let _hub = crate::commands::ctx::approvals::Hub::bind(&state).expect("hub");
+        let mut out = Vec::new();
+        run_permission(&mut out, &permission_request(), &lookup).expect("never errors");
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
     }
 }

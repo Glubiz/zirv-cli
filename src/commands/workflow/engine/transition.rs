@@ -766,6 +766,13 @@ pub fn advance_with_evidence(
     let auto_duration_ms: Option<u64>;
     match outcome {
         StepOutcome::Success => {
+            // A binding supervisor ruling (off by default) can refuse this step.
+            crate::commands::ctx::supervisor::advance_gate(
+                state_dir,
+                &state,
+                current.phase == WorkflowPhase::Plan,
+                state.current_step + 1 >= state.steps.len(),
+            )?;
             let frontend_root: PathBuf = state
                 .frontend_target_root
                 .clone()
@@ -1106,6 +1113,9 @@ pub fn advance_with_evidence(
     let _ = crate::commands::workflow::outcomes::record_terminal(state_dir, &state);
     if outcome == StepOutcome::Success {
         try_auto_spawn(state_dir, &state);
+        if current.phase == WorkflowPhase::Plan {
+            crate::commands::ctx::supervisor::on_plan_completed(state_dir, &state);
+        }
     }
     Ok(state)
 }
@@ -1184,7 +1194,7 @@ mod tests {
         let evidence = TransitionEvidence {
             model: Some("sonnet".to_string()),
             // Combined context total 1_000_000 = 1_000_000 raw input, no
-            // cache -- 1_000_000 tokens @ $3/M (sonnet) = $3.00 = 3_000_000
+            // cache -- 1_000_000 tokens @ $2/M (sonnet) = $2.00 = 2_000_000
             // micros.
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
@@ -1212,7 +1222,7 @@ mod tests {
             Some("aaaa1111"),
             "parent_session_id must be read from PARENT_SESSION_ENV, never left None when set"
         );
-        assert_eq!(phase_completed.cost_micros, Some(3_000_000));
+        assert_eq!(phase_completed.cost_micros, Some(2_000_000));
         assert!(phase_completed.price_as_of.is_some());
     }
 
