@@ -2694,6 +2694,10 @@ pub(crate) fn reviewer_args(
     if !review_model.is_empty() {
         seat_args.extend(adapter.model_args(&review_model));
     }
+    crate::commands::ctx::adapters::require_read_only_floor(
+        adapter.as_ref(),
+        crate::commands::ctx::adapters::LaunchMode::Headless,
+    )?;
     // Append the static read-only floor last so model and system arguments cannot weaken it; dashboard forks re-derive the floor server-side.
     let read_only = crate::commands::ctx::adapters::read_only_args_for_agent_name(
         agent,
@@ -4537,6 +4541,30 @@ mod tests {
             "ctx", "agent", "claude", "review", "--inline",
         ]);
         assert!(parsed.is_err(), "--inline must have no CLI spelling");
+    }
+
+    #[test]
+    fn a_reviewer_on_an_empty_floor_harness_is_refused() {
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        for name in crate::commands::ctx::adapters::floorless_adapter_names(
+            crate::commands::ctx::adapters::LaunchMode::Headless,
+        ) {
+            let result = reviewer_args(
+                RuntimeKind::Harness,
+                name,
+                "review".to_string(),
+                repo.path(),
+                false,
+                None,
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "{name} must not get a read-only reviewer launch"
+            );
+        }
     }
 
     #[test]

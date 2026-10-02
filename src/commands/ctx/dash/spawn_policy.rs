@@ -890,6 +890,14 @@ pub(super) fn fulfill_spawn_request(
     }
     let requested_adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+    // Panes always take the interactive floor; refuse before any reservation, permit or pane when it is empty.
+    if req.mode == super::permit::WorkerMode::ReadOnly {
+        adapters::require_read_only_floor(
+            requested_adapter.as_ref(),
+            adapters::LaunchMode::Interactive,
+        )
+        .map_err(SpawnRefusal::policy)?;
+    }
 
     // Apply the same worker fallback policy to direct dashboard overlay spawns (#186).
     let source_model = req.model.clone().or_else(|| {
@@ -897,6 +905,12 @@ pub(super) fn fulfill_spawn_request(
         adapters::last_model_flag(&model_args).map(str::to_string)
     });
     let now = super::state::now_secs();
+    // Auto-routing must never move read-only work onto a harness with no read-only floor.
+    let read_only_excludes = if req.mode == super::permit::WorkerMode::ReadOnly {
+        adapters::floorless_adapter_names(adapters::LaunchMode::Interactive)
+    } else {
+        Vec::new()
+    };
     let route_request = super::fallback::RouteRequest {
         requested: &req.agent,
         source_model: source_model.as_deref(),
@@ -908,7 +922,7 @@ pub(super) fn fulfill_spawn_request(
         },
         now,
         // Same-harness exclusion applies to `agent::run_with` delegation, not this overlay (#328).
-        exclude: &[],
+        exclude: &read_only_excludes,
         requester: None,
     };
     let route = super::fallback::route_new_delegation(state, cfg, route_request, req.force);

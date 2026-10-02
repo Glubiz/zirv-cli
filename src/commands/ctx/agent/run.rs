@@ -359,6 +359,11 @@ pub fn run_with<W: Write>(
     if args.goal.is_some() && args.mode == WorkerMode::ReadOnly {
         return Err("--goal requires a writing worker because environment preparation changes the checkout; refusing before workspace setup".into());
     }
+    // Refuse before workspace setup, worktree allocation or any permit when the harness cannot enforce read-only.
+    if !native && args.mode == WorkerMode::ReadOnly {
+        let adapter = adapters::select(Some(&args.name), &[], &cfg)?;
+        adapters::require_read_only_floor(adapter.as_ref(), adapters::LaunchMode::Headless)?;
+    }
     let selected_workspace = args
         .workspace
         .as_deref()
@@ -576,7 +581,13 @@ pub fn run_with<W: Write>(
 
     // Exclude the requester from capacity competition so a max-active of one does not permanently drain its own dispatches.
     let requester = super::super::mail::session_identity(env);
-    let base_excludes: Vec<&str> = same_harness_exclude.as_deref().into_iter().collect();
+    let mut base_excludes: Vec<&str> = same_harness_exclude.as_deref().into_iter().collect();
+    // Auto-routing must never move read-only work onto a harness with no read-only floor.
+    if args.mode == WorkerMode::ReadOnly {
+        base_excludes.extend(adapters::floorless_adapter_names(
+            adapters::LaunchMode::Headless,
+        ));
+    }
     let route_request = super::super::fallback::RouteRequest {
         requested: &args.name,
         source_model: requested_model,
@@ -2445,6 +2456,32 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// A read-only worker on a harness with no read-only floor is refused
+    /// before any run state, worktree or permit exists.
+    #[test]
+    fn run_with_refuses_a_read_only_worker_on_an_empty_floor_harness_before_any_side_effect() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+
+        let mut args = args_for("cursor-agent", "go");
+        args.mode = WorkerMode::ReadOnly;
+        args.worktree = true;
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("an empty read-only floor must refuse the launch");
+        let message = err.to_string();
+        assert!(message.contains("'cursor-agent'"), "{message}");
+        assert!(message.contains("claude"), "{message}");
+        assert!(out.is_empty(), "nothing is reported as launched");
+        assert!(
+            !tmp.path().join(".zirv").join("worktrees").exists(),
+            "no worktree may be allocated"
+        );
     }
 
     /// The other half: a `--mode read-only` worker never takes a writer
