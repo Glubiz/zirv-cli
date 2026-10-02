@@ -623,13 +623,25 @@ pub(crate) fn evaluate_with_scratchpad_roots(
     cwd: Option<&Path>,
     now: u64,
 ) -> Outcome {
-    let base = evaluate_candidates(
+    let canonical = canonical_shell_syntax(command);
+    let command = canonical.as_deref().unwrap_or(command);
+    let mut base = evaluate_candidates(
         policy,
         command,
         policy.default_verdict(mode),
         mode,
         scratchpad_roots,
     );
+    // Syntax the scanners cannot model may hide a live command: never Allow it.
+    if canonical.is_none() && base.verdict == Verdict::Allow {
+        base = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "<shell: ambiguous quoting or comment>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
     apply_envelope_outcome(envelope, command, scratchpad_roots, cwd, now, base)
 }
 

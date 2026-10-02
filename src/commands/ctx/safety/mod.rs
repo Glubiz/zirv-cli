@@ -244,9 +244,9 @@ pub(crate) use rules::{
     reserved_zirv_sandbox_exclusion_patterns,
 };
 pub(crate) use shell::{
-    collapse_whitespace, is_shell_identifier_assignment, normalize_segments, split_segments,
-    strip_program_dir, tokenize_quoted, unwrap_compact_run_wrapper, unwrap_env_prefix,
-    unwrap_launcher_prefix, unwrap_shell_wrapper,
+    canonical_shell_syntax, collapse_whitespace, is_shell_identifier_assignment,
+    normalize_segments, split_segments, strip_program_dir, tokenize_quoted,
+    unwrap_compact_run_wrapper, unwrap_env_prefix, unwrap_launcher_prefix, unwrap_shell_wrapper,
 };
 pub(crate) use writes::{orchestrator_repo_write_target, write_targets_confined};
 

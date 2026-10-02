@@ -340,36 +340,6 @@ fn is_long_option_abbreviation(arg: &str, full: &str) -> bool {
     !name.is_empty() && full.starts_with(name)
 }
 
-/// Whether the raw command can hide a quote or comment from the shared
-/// tokenizer: ANSI-C `$'...'` quoting, or an unquoted word-initial `#`.
-fn has_ambiguous_quoting(command: &str) -> bool {
-    if command.contains("$'") {
-        return true;
-    }
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut previous = '\n';
-    for c in command.chars() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && quote != Some('\'') {
-            escaped = true;
-        } else if let Some(active) = quote {
-            if c == active {
-                quote = None;
-            }
-        } else if c == '\'' || c == '"' {
-            quote = Some(c);
-        } else if c == '#'
-            && (previous.is_whitespace() || matches!(previous, ';' | '|' | '&' | '(' | ')'))
-        {
-            return true;
-        }
-        previous = c;
-    }
-    false
-}
-
 /// Flags and operands that make an otherwise read-only filter write or run
 /// a program.
 fn filter_can_write_or_exec(program: &str, tokens: &[String]) -> bool {
@@ -499,7 +469,7 @@ fn command_is_prompt_free(command: &str, exe: &Path, depth: usize, state: &mut P
 pub(crate) fn permission_request_command_is_prompt_free(command: &str, exe: &Path) -> bool {
     let mut state = ParseState::default();
     command.len() <= MAX_COMMAND_BYTES
-        && !has_ambiguous_quoting(command)
+        && canonical_shell_syntax(command).is_some_and(|canonical| canonical == command)
         && command_is_prompt_free(command, exe, 0, &mut state)
         && state.zirv_segments > 0
 }
