@@ -581,7 +581,14 @@ pub(super) fn adoption_stop_nudge(
         skill_loads: record.skill_loads,
     };
     record.substantial = adoption::is_substantial(&signals);
-    record.workflow_active = engine::load_active(state, repo).ok().flatten().is_some();
+    record.workflow_active = engine::load_active_for_session(
+        state,
+        repo,
+        &super::permission::attention_short(env, session),
+    )
+    .ok()
+    .flatten()
+    .is_some();
 
     let telemetry_cfg = telemetry::TelemetryConfig::from_config(&cfg.workflow);
     if record.substantial && !record.detected_recorded {
@@ -849,10 +856,14 @@ pub(super) fn verify_on_stop_nudge(
         return None;
     }
     let changed = verification::changed_paths(repo).ok()?;
-    let active_phase = engine::load_active(state, repo)
-        .ok()
-        .flatten()
-        .and_then(|workflow| workflow.current().map(|step| step.phase));
+    let active_phase = engine::load_active_for_session(
+        state,
+        repo,
+        &crate::commands::ctx::sessions::short_id(session),
+    )
+    .ok()
+    .flatten()
+    .and_then(|workflow| workflow.current().map(|step| step.phase));
     // Ask the shared verification service which fresh check is owed so
     // native and hook sessions use the same rule (#478).
     let owed = crate::commands::ctx::lifecycle::verification(
@@ -1599,6 +1610,55 @@ mod tests {
             .find(|e| e.kind == telemetry::TelemetryKind::AdoptionDetected)
             .expect("AdoptionDetected must still be recorded");
         assert_eq!(detected.workflow_active, Some(true));
+    }
+
+    /// The repo's active workflow belongs to another session: a registered
+    /// session with no binding of its own is still recorded as having none.
+    #[test]
+    fn workflow_active_is_session_bound_not_repo_wide() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let transcript = transcript_with_edits(dir.path(), 12, 12);
+        let _guard = SessionGuard::register(
+            &state,
+            Record::new("sess-unbound", "claude", repo.path(), Verb::Chat),
+        );
+        let wf = crate::commands::workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "someone else's task".into(),
+            crate::commands::workflow::engine::WorkflowKind::Feature,
+            None,
+            true,
+            classify::classify(&classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            })
+            .expect("classify"),
+        );
+        crate::commands::workflow::engine::save(&state, &wf, true).expect("save");
+        let mut cfg = CtxConfig::default();
+        cfg.workflow.adoption = AdoptionPolicy::Nudge;
+
+        let text = adoption_stop_nudge(
+            &state,
+            repo.path(),
+            "sess-unbound",
+            &cfg,
+            &score_with_turns(12),
+            &transcript,
+            &|_| None,
+        );
+        assert!(
+            text.is_some_and(|t| t.contains("no active zirv workflow")),
+            "another session's workflow must not silence this session's nudge"
+        );
     }
 
     /// Once a session is recorded as substantial with no active workflow, a

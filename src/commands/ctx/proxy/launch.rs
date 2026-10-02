@@ -20,9 +20,11 @@ pub enum WorkflowStart {
 
 /// Starts `decision.workflow` (when named) via `engine::start_workflow`,
 /// immediately before a spawn. `Skipped` -- never an error -- when `decision.
-/// workflow` is `None`, or when `repo` already has an active workflow (an
-/// operator's own, or one an earlier launch started): the proxy only ever
-/// fills an empty slot, never displaces one already running. Any other
+/// workflow` is `None`, or when `session` (the short id of an already
+/// running session, `None` for a launch that has no session yet) is already
+/// bound to a live workflow: the proxy only ever fills an empty slot, never
+/// displaces the session's own. Another session's workflow in the same repo
+/// never blocks a start. Any other
 /// failure (an unreadable state directory, a capability preflight refusal,
 /// an unknown registry id the decision named) is `Err(String)`; this
 /// function never panics.
@@ -31,6 +33,7 @@ pub fn start_workflow_for(
     state_dir: &Path,
     repo: &Path,
     request: &str,
+    session: Option<&str>,
 ) -> Result<WorkflowStart, String> {
     let Some(kind) = decision.workflow.clone() else {
         return Ok(WorkflowStart::Skipped {
@@ -38,9 +41,12 @@ pub fn start_workflow_for(
         });
     };
     let state = StateDir::from_path(state_dir.to_path_buf());
-    if let Some(active) = engine::load_active(&state, repo).map_err(|error| error.to_string())? {
+    if let Some(short) = session
+        && let Some(active) = engine::load_active_for_session(&state, repo, short)
+            .map_err(|error| error.to_string())?
+    {
         return Ok(WorkflowStart::Skipped {
-            reason: format!("repo already has an active workflow '{}'", active.id),
+            reason: format!("session already has an active workflow '{}'", active.id),
         });
     }
     let args = StartArgs {
@@ -175,8 +181,14 @@ mod tests {
         let state_dir = tempdir().unwrap();
         let decision = decision(repo.path(), None, Complexity::Bounded, RiskBand::Medium);
 
-        let outcome = start_workflow_for(&decision, state_dir.path(), repo.path(), "fix the typo")
-            .expect("never errors");
+        let outcome = start_workflow_for(
+            &decision,
+            state_dir.path(),
+            repo.path(),
+            "fix the typo",
+            None,
+        )
+        .expect("never errors");
 
         assert_eq!(
             outcome,
@@ -222,18 +234,42 @@ mod tests {
             Complexity::Bounded,
             RiskBand::Medium,
         );
-        let outcome = start_workflow_for(&decision, state_dir.path(), repo.path(), "do more work")
-            .expect("never errors");
+        let session_id = "aaaa1111bbbb2222cccc3333dddd4444";
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                session_id,
+                "claude",
+                repo.path(),
+                crate::commands::ctx::sessions::Verb::Chat,
+            ),
+        );
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        crate::commands::ctx::sessions::bind_workflow_id(&state, &short, &existing.state.id);
+
+        let outcome = start_workflow_for(
+            &decision,
+            state_dir.path(),
+            repo.path(),
+            "do more work",
+            Some(&short),
+        )
+        .expect("never errors");
 
         assert_eq!(
             outcome,
             WorkflowStart::Skipped {
                 reason: format!(
-                    "repo already has an active workflow '{}'",
+                    "session already has an active workflow '{}'",
                     existing.state.id
                 )
             }
         );
+
+        // A launch with no session of its own is never blocked by the repo's.
+        let fresh = start_workflow_for(&decision, state_dir.path(), repo.path(), "do more", None)
+            .expect("never errors");
+        assert!(matches!(fresh, WorkflowStart::Started { .. }), "{fresh:?}");
     }
 
     #[test]
@@ -253,6 +289,7 @@ mod tests {
             state_dir.path(),
             repo.path(),
             "fix a database retry bug",
+            None,
         )
         .expect("starts cleanly");
 
@@ -289,6 +326,7 @@ mod tests {
             state_dir.path(),
             repo.path(),
             "fix a database retry bug",
+            None,
         )
         .expect("starts cleanly");
         let WorkflowStart::Started { id } = outcome else {
@@ -333,6 +371,7 @@ mod tests {
             state_dir.path(),
             repo.path(),
             "fix a database retry bug",
+            None,
         )
         .expect("starts cleanly");
         let WorkflowStart::Started { id } = outcome else {

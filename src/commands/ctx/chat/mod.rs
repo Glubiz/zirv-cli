@@ -396,7 +396,7 @@ fn start_proxy_workflow(
     let ProxyIntakeOutcome::Decided { decision, request } = outcome else {
         return None;
     };
-    match proxy::launch::start_workflow_for(decision, state.root(), repo, request) {
+    match proxy::launch::start_workflow_for(decision, state.root(), repo, request, None) {
         Ok(proxy::launch::WorkflowStart::Started { id }) => Some(id),
         Ok(proxy::launch::WorkflowStart::Skipped { reason }) => {
             announce(format!("proxy: workflow not started; {reason}"));
@@ -4074,11 +4074,10 @@ mod tests {
         );
     }
 
-    /// Issue #537 review: a `Skipped` workflow start (an active workflow
-    /// already on the repo) must not vanish silently -- the operator has no
-    /// other way to learn the proxy's own decision never actually started a
-    /// workflow, unlike `runtime/native.rs`, which already announces this
-    /// case.
+    /// Issue #537 review: a `Skipped` workflow start (a decision that names no
+    /// workflow) must not vanish silently -- the operator has no other way to
+    /// learn the proxy's own decision never actually started a workflow,
+    /// unlike `runtime/native.rs`, which already announces this case.
     #[test]
     fn start_proxy_workflow_announces_a_skipped_start() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -4086,31 +4085,7 @@ mod tests {
         let state_tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_tmp.path().to_path_buf());
 
-        // Seed an existing active workflow so `start_workflow_for` skips.
-        let existing = crate::commands::workflow::engine::start_workflow(
-            &state,
-            &crate::commands::workflow::engine::StartArgs {
-                id: Some("bugfix".to_string()),
-                task: "an earlier launch's workflow".to_string(),
-                agent: None,
-                built_in_only: true,
-                repo: Some(repo.path().to_path_buf()),
-                paths: vec![std::path::PathBuf::from("README.md")],
-                changed_lines: Some(1),
-                tests_changed: false,
-                complexity: None,
-                risk: None,
-                branch: None,
-                frontend_root: None,
-                brainstorm: false,
-                no_brainstorm: false,
-                profile: None,
-                json: false,
-            },
-        )
-        .expect("seed an active workflow");
-
-        let mut decision = sample_decision(repo.path(), "claude", "fable", Some("feature"));
+        let mut decision = sample_decision(repo.path(), "claude", "fable", None);
         decision.complexity = Complexity::Trivial;
         decision.risk = RiskBand::Low;
         let outcome = ProxyIntakeOutcome::Decided {
@@ -4135,8 +4110,8 @@ mod tests {
         assert_eq!(announced.len(), 1, "got {announced:?}");
         assert!(
             announced[0].contains("proxy: workflow not started")
-                && announced[0].contains(&existing.state.id),
-            "must name why and which workflow is already active: {}",
+                && announced[0].contains("no workflow named"),
+            "must name why nothing was started: {}",
             announced[0]
         );
     }

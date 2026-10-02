@@ -878,6 +878,30 @@ pub fn load_active(state: &StateDir, repo: &Path) -> CtxResult<Option<WorkflowSt
     }
 }
 
+/// The live workflow bound to session `short`, never another session's. A
+/// session with no registry record (a plain harness run) has nothing to bind
+/// to, so it falls back to the checkout's active pointer.
+pub fn load_active_for_session(
+    state: &StateDir,
+    repo: &Path,
+    short: &str,
+) -> CtxResult<Option<WorkflowState>> {
+    if crate::commands::ctx::sessions::load_record(state, short).is_none() {
+        return load_active(state, repo);
+    }
+    let Some(id) = crate::commands::ctx::sessions::workflow_id_for(state, short) else {
+        return Ok(None);
+    };
+    let Ok(bound) = load(state, repo, &id) else {
+        return Ok(None);
+    };
+    Ok(matches!(
+        bound.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    )
+    .then_some(bound))
+}
+
 /// Read the requested checkout without migrating state or consulting siblings.
 pub(crate) fn load_active_read_only(
     state: &StateDir,
@@ -914,6 +938,44 @@ mod tests {
 
     use super::super::tests::{choice_answer, jev_gate_config, low_classification, review_finding};
     use super::super::transition::*;
+
+    /// A repo-wide active pointer must not make an unrelated, registered
+    /// session look like it is inside the workflow; an unregistered one has
+    /// no binding to read and keeps the checkout-level answer.
+    #[test]
+    fn active_for_session_is_the_sessions_own_binding_not_the_repo_pointer() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb, bind_workflow_id};
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let wf = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "a task".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &wf, true).unwrap();
+        let record = |id: &str| Record::new(id, "claude", repo.path(), Verb::Chat);
+        let _owner = SessionGuard::register(&state_dir, record("aaaa1111bbbb2222cccc3333dddd4444"));
+        let _other = SessionGuard::register(&state_dir, record("eeee5555ffff6666aaaa7777bbbb8888"));
+        let owner = crate::commands::ctx::sessions::short_id("aaaa1111bbbb2222cccc3333dddd4444");
+        let other = crate::commands::ctx::sessions::short_id("eeee5555ffff6666aaaa7777bbbb8888");
+        bind_workflow_id(&state_dir, &owner, &wf.id);
+
+        let bound = load_active_for_session(&state_dir, repo.path(), &owner).unwrap();
+        assert_eq!(bound.map(|w| w.id), Some(wf.id.clone()));
+        assert!(
+            load_active_for_session(&state_dir, repo.path(), &other)
+                .unwrap()
+                .is_none(),
+            "a registered session with no binding is not in the repo's workflow"
+        );
+        let unregistered = load_active_for_session(&state_dir, repo.path(), "00000000").unwrap();
+        assert_eq!(unregistered.map(|w| w.id), Some(wf.id));
+    }
+
     /// Issue #349: chained design-gate steps (`intent` -> `spec`, both
     /// approval-gated for a high-risk classification -- the same fixture
     /// `reclassify_preserves_completed_steps_and_accepted_artifacts`, above,
