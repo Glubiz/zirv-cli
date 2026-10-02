@@ -1575,6 +1575,7 @@ fn launch_settings_value(
         let mut tools: Vec<&str> = super::super::hook::REHYDRATION_TOOLS.to_vec();
         tools.push("Agent");
         tools.push("Task");
+        tools.push("AskUserQuestion");
         tools.join("|")
     };
     #[cfg_attr(windows, allow(unused_mut))]
@@ -4062,7 +4063,7 @@ mod tests {
         assert_eq!(
             settings.pointer("/hooks/PreToolUse/0/matcher"),
             Some(&serde_json::json!(
-                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task"
+                "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task|AskUserQuestion"
             ))
         );
         assert_eq!(
@@ -4385,7 +4386,7 @@ mod tests {
         assert_eq!(
             settings["hooks"]["PreToolUse"],
             serde_json::json!([{
-                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task",
+                "matcher": "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|Agent|Task|AskUserQuestion",
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"

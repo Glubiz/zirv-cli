@@ -352,6 +352,29 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         );
     }
 
+    // The operator is being asked a question: latch it until the next tool call proves it was answered.
+    if payload.tool_name == "AskUserQuestion"
+        && let Ok(state) = StateDir::resolve(env)
+        && let Some(asked) = payload.tool_input.questions.first()
+    {
+        let now = now_secs();
+        let _ = crate::commands::ctx::attention::record(
+            &state,
+            &attention_short(env, &payload.session_id),
+            crate::commands::ctx::attention::Observation::new(
+                crate::commands::ctx::attention::Authority::AdapterHook,
+                format!(
+                    "AskUserQuestion: {}",
+                    crate::commands::ctx::approvals::redacted_preview(&asked.question)
+                ),
+                100,
+                now,
+            )
+            .with_attention(crate::commands::ctx::attention::Attention::Question),
+            now,
+        );
+    }
+
     if crate::commands::ctx::lifecycle::SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
         crate::commands::ctx::graph::record_agent_dispatch(
             env,
