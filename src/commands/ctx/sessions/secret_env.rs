@@ -123,6 +123,31 @@ pub(crate) fn scrub_worker_env_cmd(
     )
 }
 
+/// Record the stripped NAMES in the decision log; nothing is logged when nothing was stripped.
+pub(crate) fn log_withheld(
+    state: &super::super::state::StateDir,
+    session: &str,
+    verb: &str,
+    stripped: &[String],
+) {
+    if stripped.is_empty() {
+        return;
+    }
+    let _ = super::super::log::append(
+        state,
+        &super::super::log::Decision {
+            ts: super::super::state::now_secs(),
+            session,
+            verb,
+            verdict: "n/a",
+            score: 0,
+            action: "scrub-env",
+            detail: &format!("withheld from worker: {}", stripped.join(", ")),
+            observed_at: None,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
