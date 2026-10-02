@@ -537,6 +537,19 @@ impl AgentAdapter for GeminiAdapter {
         &self.program
     }
 
+    fn credential_env(&self, _env: super::super::config::EnvLookup<'_>) -> Option<Vec<String>> {
+        let mut names: Vec<String> = super::super::provider::provider("google")
+            .map(|p| {
+                p.default_credential_env
+                    .iter()
+                    .map(|n| (*n).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.push("GOOGLE_APPLICATION_CREDENTIALS".to_string());
+        Some(names)
+    }
+
     /// Gemini spends a Google account's limits. Nothing collects readings
     /// for it yet -- see `CodexAdapter::provider`'s own doc comment for why
     /// the provider is still worth naming even so.

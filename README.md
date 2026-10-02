@@ -4929,6 +4929,7 @@ keep only your own.
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
@@ -5044,6 +5045,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `sandbox.enabled` | `ZIRV_CTX_SANDBOX` |
 | `sandbox.extra_allow` | `ZIRV_CTX_SANDBOX_EXTRA_ALLOW` |
 | `sandbox.scrub_subprocess_env` | `ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV` |
+| `sandbox.scrub_worker_secrets` | `ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS` |
 | `prompt.enabled` | `ZIRV_CTX_PROMPT` |
 | `prompt.repo_layer` | `ZIRV_CTX_PROMPT_REPO` |
 | `prompt.max_repo_bytes` | `ZIRV_CTX_PROMPT_MAX_REPO_BYTES` |
@@ -7042,6 +7044,32 @@ enabled = false
 or `ZIRV_CTX_SANDBOX=false`. `sandbox.enabled` is `REPO_FORBIDDEN` (see
 [Trust boundary](#trust-boundary) above): a checkout cannot turn its own
 sandboxing off, only the operator can.
+
+### Worker secret scrub
+
+Delegated workers (`zirv agent`, `zirv ctx exec`, `zirv ctx loop`) start without
+the operator's secret-shaped environment variables. A name is secret-shaped when,
+case-insensitively, it contains `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `API_KEY`,
+`APIKEY`, `ACCESS_KEY`, `PRIVATE_KEY` or `CREDENTIAL`, has `AUTH` as a whole
+`_`-separated word (`SSH_AUTH_SOCK`, not `GIT_AUTHOR_NAME`), or is a well-known
+exact name (`AWS_ACCESS_KEY_ID`, `NPM_TOKEN`, `VAULT_TOKEN`, ...). `ZIRV_*`,
+`PATH`, `HOME`, `USERPROFILE`, `TERM`, `LANG` and `LC_*` are never removed, nor is
+anything the launch itself sets. The harness's own credentials are kept: Claude Code's
+`ANTHROPIC_*`/`CLAUDE_*` login variables (plus its cloud-provider credentials while a
+`CLAUDE_CODE_USE_*` switch is set), codex's `OPENAI_API_KEY`/`CODEX_API_KEY` and any
+`[endpoint.codex]` `credential_env`, Gemini's `GEMINI_API_KEY`/`GOOGLE_API_KEY`/
+`GOOGLE_APPLICATION_CREDENTIALS`, and Copilot's `GH_TOKEN`/`GITHUB_TOKEN`/
+`COPILOT_GITHUB_TOKEN`. A harness that declares no credentials is left unscrubbed.
+The stripped names (never values) are written to the decision log as `scrub-env`.
+The interactive seat you launch yourself is unchanged.
+
+```toml
+[sandbox]
+scrub_worker_secrets = false
+```
+
+or `ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS=false`. The key is `REPO_FORBIDDEN`, and
+is separate from `scrub_subprocess_env`, which configures Claude Code's own subprocess scrub.
 
 ### Command safety policy (issue #83)
 

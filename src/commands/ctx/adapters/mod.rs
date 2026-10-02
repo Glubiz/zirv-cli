@@ -103,6 +103,12 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// module-private `program` field each adapter otherwise keeps to itself.
     fn program(&self) -> &str;
 
+    /// Env var NAMES the harness itself authenticates with, kept when a delegated worker's
+    /// secret-shaped env is scrubbed. `None` = not declared: that harness's env is left alone.
+    fn credential_env(&self, _env: super::config::EnvLookup<'_>) -> Option<Vec<String>> {
+        None
+    }
+
     /// The ACCOUNT/vendor whose rate limits this agent spends, as a stable
     /// lowercase slug (`[a-z0-9-]`): `"anthropic"` for claude, `"openai"`
     /// for codex.

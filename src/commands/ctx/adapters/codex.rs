@@ -1052,6 +1052,21 @@ impl AgentAdapter for CodexAdapter {
         &self.program
     }
 
+    fn credential_env(&self, _env: super::super::config::EnvLookup<'_>) -> Option<Vec<String>> {
+        let mut names: Vec<String> = super::super::provider::provider("openai")
+            .map(|p| {
+                p.default_credential_env
+                    .iter()
+                    .map(|n| (*n).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.push("CODEX_API_KEY".to_string());
+        // An `[endpoint.codex]` override tells codex to read this variable itself.
+        names.extend(self.endpoint.iter().map(|ep| ep.credential_env.clone()));
+        Some(names)
+    }
+
     /// Codex spends an OpenAI account's limits. Nothing collects readings for
     /// it yet, which is exactly why the provider is named: a usage readout
     /// can then say "openai: no usage source" rather than imply zero.
