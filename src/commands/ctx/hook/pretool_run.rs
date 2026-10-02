@@ -35,6 +35,29 @@ pub fn pretool_output(reason: &str) -> String {
     .to_string()
 }
 
+/// Appended to a safety decision made without the repo's `.zirv/ctx.toml`.
+const REPO_CONFIG_REFUSED_NOTE: &str =
+    "The repo .zirv/ctx.toml contains forbidden keys and was not applied.";
+
+/// Mark a safety envelope as decided by the trusted policy alone, because the
+/// repo config was refused.
+fn note_repo_config_refused(envelope: &mut serde_json::Value) {
+    let Some(hook_output) = envelope
+        .get_mut("hookSpecificOutput")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let reason = match hook_output
+        .get("permissionDecisionReason")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(existing) => format!("{existing} {REPO_CONFIG_REFUSED_NOTE}"),
+        None => REPO_CONFIG_REFUSED_NOTE.to_string(),
+    };
+    hook_output.insert("permissionDecisionReason".to_string(), reason.into());
+}
+
 /// The `OrchestratorWrites::Advise` envelope: the write is ALLOWED, and
 /// `note` rides along in the same `additionalContext` channel `safety.rs`'s
 /// own identical-command guard already uses for a non-blocking note on an
@@ -46,6 +69,18 @@ fn pretool_advise_output(note: &str) -> String {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "additionalContext": note
+        }
+    })
+    .to_string()
+}
+
+/// The PreToolUse `ask` envelope: the harness prompts instead of deciding silently.
+fn pretool_ask_output(reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason
         }
     })
     .to_string()
@@ -202,16 +237,40 @@ fn run_pretool_bash_or_powershell<W: Write>(
     payload: &PreToolPayload,
     env: EnvLookup<'_>,
 ) -> CtxResult<i32> {
+    // A repo-forbidden config is a security refusal, never a reason to go
+    // silent: evaluate with the trusted layers alone, and ask if even that
+    // fails. Every other load error still fails open (#769).
+    let (cfg, repo_config_refused) = match CtxConfig::load(Path::new("."), env) {
+        Ok(cfg) => (Some(cfg), false),
+        Err(err) if crate::commands::ctx::config::is_repo_forbidden(err.as_ref()) => {
+            match CtxConfig::load_trusted_only(Path::new("."), env) {
+                Ok(cfg) => (Some(cfg), true),
+                Err(_) => {
+                    let _ = writeln!(
+                        w,
+                        "{}",
+                        pretool_ask_output(&format!(
+                            "{REPO_CONFIG_REFUSED_NOTE} The trusted config could not be loaded either."
+                        ))
+                    );
+                    return Ok(0);
+                }
+            }
+        }
+        Err(_) => (None, false),
+    };
     // Capture the attested verdict alongside its rendered envelope so a
     // silent `dontAsk` Ask cannot trigger a separate explicit Allow.
-    let cfg = CtxConfig::load(Path::new("."), env).ok();
     let mut safety_buf: Vec<u8> = Vec::new();
     let attested_verdict = cfg.as_ref().and_then(|cfg| {
         crate::commands::ctx::safety::run_check_hook_with_verdict(cfg, &mut safety_buf, stdin, env)
             .ok()
             .flatten()
     });
-    let safety_envelope = parsed_json_envelope(safety_buf);
+    let mut safety_envelope = parsed_json_envelope(safety_buf);
+    if repo_config_refused && let Some(envelope) = safety_envelope.as_mut() {
+        note_repo_config_refused(envelope);
+    }
 
     let is_deny_or_ask = safety_envelope.as_ref().is_some_and(|value| {
         matches!(
@@ -244,6 +303,9 @@ fn run_pretool_bash_or_powershell<W: Write>(
             }
             if let Some(reason) = rewrite.pointer("/hookSpecificOutput/permissionDecisionReason") {
                 safety["hookSpecificOutput"]["permissionDecisionReason"] = reason.clone();
+                if repo_config_refused {
+                    note_repo_config_refused(&mut safety);
+                }
             }
             let _ = writeln!(w, "{safety}");
         }
@@ -2141,5 +2203,79 @@ mod tests {
             !second.contains("Stated details to check before you finish:"),
             "must appear at most once per prompt: {second}"
         );
+    }
+
+    /// Runs one Bash PreToolUse payload with the process cwd inside a repo whose
+    /// `.zirv/ctx.toml` is `repo_toml`, and returns what the hook printed.
+    fn bash_pretool_with_repo_config(repo_toml: &str, command: &str, mode: &str) -> String {
+        let home = tempfile::tempdir().expect("home");
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+        let _env = crate::commands::ctx::testenv::EnvGuard::set(home.path(), Some(repo.path()));
+        let stdin = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": repo.path().display().to_string(),
+            "permission_mode": mode,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_pretool(&mut out, &stdin, &|_| None).expect("never errors");
+        assert_eq!(code, 0);
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// SECURITY: a repo `.zirv/ctx.toml` carrying a repo-forbidden key must not
+    /// silence the Bash safety classifier; the trusted policy still denies.
+    #[test]
+    fn run_pretool_bash_still_denies_when_the_repo_config_has_forbidden_keys() {
+        for repo_toml in [
+            "[safety]\nallow = [\"cat *\"]\n",
+            "[safety]\ndefault = \"allow\"\n",
+        ] {
+            for mode in ["default", "dontAsk"] {
+                let printed = bash_pretool_with_repo_config(repo_toml, "cat ~/.ssh/id_rsa", mode);
+                let parsed: serde_json::Value = serde_json::from_str(printed.trim())
+                    .unwrap_or_else(|_| panic!("a forbidden repo config went silent: {printed:?}"));
+                assert_eq!(
+                    parsed["hookSpecificOutput"]["permissionDecision"], "deny",
+                    "{repo_toml} / {mode}: {parsed}"
+                );
+                let reason = parsed["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    reason.contains("forbidden keys") && reason.contains("not applied"),
+                    "the reason must say the repo config was not applied: {reason}"
+                );
+            }
+        }
+    }
+
+    /// A repo-forbidden config still lets the trusted policy clear an ordinary
+    /// command; it is not turned into a blanket refusal.
+    #[test]
+    fn run_pretool_bash_with_forbidden_repo_config_still_clears_a_safe_command() {
+        let printed = bash_pretool_with_repo_config(
+            "[safety]\ndefault = \"allow\"\n",
+            "git status",
+            "default",
+        );
+        assert!(
+            !printed.contains("\"deny\""),
+            "a safe command must not be denied: {printed}"
+        );
+    }
+
+    /// Fail-open (#769) stays for every other load error: a schema error in
+    /// the repo config is an internal fault, not a security refusal.
+    #[test]
+    fn run_pretool_bash_fails_open_on_a_non_forbidden_config_error() {
+        let printed =
+            bash_pretool_with_repo_config("[score]\nwindwo = 4\n", "cat ~/.ssh/id_rsa", "default");
+        assert!(printed.trim().is_empty(), "must fail open: {printed:?}");
     }
 }

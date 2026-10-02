@@ -322,6 +322,16 @@ impl CtxConfig {
     /// Skip and announce TOML syntax failures for diagnostics; schema and forbidden-key errors remain fatal.
     /// Launching callers must use `load_for_launch` to refuse broken operator policy.
     pub fn load(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        Self::load_layers(repo, env, true)
+    }
+
+    /// Built-in, operator (`~/.zirv/ctx.toml`) and `ZIRV_CTX_*` layers only; the repo's `.zirv/` files are not read.
+    /// For security hooks whose repo layer was refused: repo layers can only narrow, so ignoring one never widens policy.
+    pub(crate) fn load_trusted_only(repo: &Path, env: EnvLookup<'_>) -> CtxResult<Self> {
+        Self::load_layers(repo, env, false)
+    }
+
+    fn load_layers(repo: &Path, env: EnvLookup<'_>, read_repo_layer: bool) -> CtxResult<Self> {
         let mut merged = toml::Table::new();
         let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
         let mut key_origins: HashMap<String, KeyOrigin> = HashMap::new();
@@ -485,7 +495,8 @@ impl CtxConfig {
             .join(crate::utils::SCRIPT_DIR_NAME)
             .join(CTX_CONFIG_FILE);
         let mut repo_layer = toml::Table::new();
-        if !crate::utils::repo_is_home(repo)
+        if read_repo_layer
+            && !crate::utils::repo_is_home(repo)
             && let Some(bad) = read_layer(&repo_path, &mut repo_layer, false, &mut key_origins)?
         {
             unparsable_layers.push(bad);
@@ -1665,8 +1676,11 @@ impl CtxConfig {
             ));
         }
 
-        cfg.agents =
-            crate::settings::AgentGate::load(repo, env).map_err(add_config_error_prefix)?;
+        cfg.agents = if read_repo_layer {
+            crate::settings::AgentGate::load(repo, env).map_err(add_config_error_prefix)?
+        } else {
+            crate::settings::AgentGate::load_operator_only(env)
+        };
         cfg.policy = super::policy::resolve(home_policy, repo_policy, env)
             .map_err(add_config_error_prefix)?;
         cfg.safety = super::safety::resolve(home_safety, repo_safety, env)
@@ -1776,6 +1790,28 @@ mod tests {
             is_repo_forbidden(err.as_ref()),
             "must be a security refusal: {err}"
         );
+    }
+
+    /// `load_trusted_only` is the safe fallback for a refused repo layer: it
+    /// loads where `load` refuses, and applies the operator layer, not the repo's.
+    #[test]
+    fn load_trusted_only_ignores_a_repo_layer_that_load_refuses() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[score]\nwindow = 4\n[safety]\ndefault = \"allow\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set safety.default");
+        assert!(is_repo_forbidden(err.as_ref()), "{err}");
+        let trusted = CtxConfig::load_trusted_only(repo.path(), &|k| empty.get(k).cloned())
+            .expect("the trusted layers load");
+        assert_eq!(trusted.score.window, CtxConfig::default().score.window);
     }
 
     #[test]
