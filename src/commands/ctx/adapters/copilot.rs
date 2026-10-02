@@ -290,6 +290,14 @@ impl AgentAdapter for CopilotAdapter {
         &self.program
     }
 
+    fn credential_env(&self, _env: super::super::config::EnvLookup<'_>) -> Option<Vec<String>> {
+        Some(
+            ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"]
+                .map(String::from)
+                .to_vec(),
+        )
+    }
+
     /// The account Copilot CLI actually meters against -- see this module's
     /// own doc comment ("Provider-per-model billing") for the verified
     /// rationale for why this is a constant rather than a per-model

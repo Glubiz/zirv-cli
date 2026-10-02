@@ -5435,6 +5435,53 @@ intake_discipline = true
         );
     }
 
+    /// Delegated workers lose secret-shaped env by default; only the operator may opt out,
+    /// and the environment is the final word.
+    #[test]
+    fn worker_secret_scrub_is_on_by_default_and_only_the_operator_may_opt_out() {
+        assert!(SandboxConfig::default().scrub_worker_secrets);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nscrub_worker_secrets = false\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not disable the scrub")
+            .to_string();
+        assert!(err.contains("sandbox.scrub_worker_secrets"), "got {err}");
+        assert!(
+            err.contains("ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS"),
+            "names the operator escape hatch: {err}"
+        );
+
+        std::fs::remove_file(repo.path().join(".zirv/ctx.toml")).expect("remove");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[sandbox]\nscrub_worker_secrets = false\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        assert!(
+            !cfg.sandbox.scrub_worker_secrets,
+            "the operator layer opts out"
+        );
+
+        std::fs::remove_file(home.path().join(".zirv/ctx.toml")).expect("remove");
+        let env = env_map(&[("ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("loads");
+        assert!(
+            !cfg.sandbox.scrub_worker_secrets,
+            "the environment opts out"
+        );
+    }
+
     /// Issue #329: the subprocess env scrub is off by default (it strips
     /// `SSH_AUTH_SOCK` and forces the permission mode to `default`), only
     /// the operator may turn it on, and the environment is the final word.

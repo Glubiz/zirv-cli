@@ -13,6 +13,7 @@ use super::state::{self, StateDir};
 mod bookkeeping;
 mod nesting;
 mod ops;
+pub(crate) mod secret_env;
 
 #[cfg(test)]
 use super::testenv;

@@ -370,6 +370,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["sandbox", "scrub_subprocess_env"],
         EnvKind::Bool,
     ),
+    (
+        "ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS",
+        &["sandbox", "scrub_worker_secrets"],
+        EnvKind::Bool,
+    ),
     ("ZIRV_CTX_PROMPT", &["prompt", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_PROMPT_REPO",
@@ -1472,6 +1477,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["sandbox", "scrub_subprocess_env"],
         "ZIRV_CTX_SANDBOX_SCRUB_SUBPROCESS_ENV",
+    ),
+    (
+        &["sandbox", "scrub_worker_secrets"],
+        "ZIRV_CTX_SANDBOX_SCRUB_WORKER_SECRETS",
     ),
     (&["prompt", "enabled"], "ZIRV_CTX_PROMPT"),
     (&["prompt", "repo_layer"], "ZIRV_CTX_PROMPT_REPO"),

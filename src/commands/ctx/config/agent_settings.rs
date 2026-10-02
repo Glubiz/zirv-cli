@@ -303,6 +303,7 @@ pub struct EndpointConfig {
 /// Extra rules use Claude permission syntax; Codex has no per-command equivalent, and deny always beats allow.
 /// Subprocess env scrubbing is operator-only and off by default: it strips tool/auth env and forces default permission mode (#329).
 /// Sandbox filesystem and Read denials still block sensitive files when scrubbing is off.
+/// `scrub_worker_secrets` (on by default, operator-only) strips secret-shaped env from delegated workers, keeping the harness's own credentials.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
@@ -310,6 +311,7 @@ pub struct SandboxConfig {
     pub extra_allow: Vec<String>,
     pub extra_deny: Vec<String>,
     pub scrub_subprocess_env: bool,
+    pub scrub_worker_secrets: bool,
 }
 
 impl Default for SandboxConfig {
@@ -319,6 +321,7 @@ impl Default for SandboxConfig {
             extra_allow: Vec::new(),
             extra_deny: Vec::new(),
             scrub_subprocess_env: false,
+            scrub_worker_secrets: true,
         }
     }
 }
@@ -633,6 +636,7 @@ mod tests {
                 extra_allow: vec!["Bash(deploy *)".to_string()],
                 extra_deny: vec!["Bash(deploy *)".to_string()],
                 scrub_subprocess_env: false,
+                scrub_worker_secrets: true,
             },
             ..CtxConfig::default()
         };

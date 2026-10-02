@@ -1995,6 +1995,24 @@ impl AgentAdapter for ClaudeAdapter {
         &self.program
     }
 
+    /// Native/API-key login names always; cloud-provider credentials only once a `CLAUDE_CODE_USE_*` switch selects them.
+    fn credential_env(&self, env: super::super::config::EnvLookup<'_>) -> Option<Vec<String>> {
+        let cloud = super::super::runtime::execution::AUTH_ENV
+            .iter()
+            .any(|name| {
+                name.starts_with("CLAUDE_CODE_USE_") && env(name).is_some_and(|v| !v.is_empty())
+            });
+        Some(
+            super::super::runtime::execution::AUTH_ENV
+                .iter()
+                .filter(|name| {
+                    cloud || name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_")
+                })
+                .map(|name| (*name).to_string())
+                .collect(),
+        )
+    }
+
     /// Claude Code's subscription windows are Anthropic's, and the account is
     /// what the limit belongs to: a different Anthropic-backed harness would
     /// answer `"anthropic"` here too and share these readings.
@@ -5347,6 +5365,7 @@ mod tests {
             extra_allow: vec!["Bash(just test *)".to_string()],
             extra_deny: vec!["Bash(terraform apply *)".to_string()],
             scrub_subprocess_env: false,
+            scrub_worker_secrets: true,
         };
         let args = adapter.default_sandbox_args(
             &sandbox,

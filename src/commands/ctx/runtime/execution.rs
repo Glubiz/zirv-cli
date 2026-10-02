@@ -252,7 +252,7 @@ const SELECTORS: &[&str] = &[
     "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
 ];
 
-const AUTH_ENV: &[&str] = &[
+pub(crate) const AUTH_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
