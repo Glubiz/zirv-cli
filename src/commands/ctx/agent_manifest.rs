@@ -359,6 +359,7 @@ mod tests {
     fn args_for(name: &str, prompt: &str) -> AgentArgs {
         AgentArgs {
             name: name.to_string(),
+            label: None,
             prompt: prompt.to_string(),
             flags: Vec::new(),
             system_prompt: None,

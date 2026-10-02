@@ -1421,6 +1421,7 @@ fn run_dashboard_inner(
                                             Some(SpawnEffect::Submit { agent, prompt }) => {
                                                 let req = spawnreq::SpawnRequest {
                                                     kill: None,
+                                                    name: None,
                                                     agent,
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
@@ -3235,6 +3236,7 @@ fn run_dashboard_inner(
         });
         // Draw focused pane identity and workflow in its pane header; draw nothing without focus.
         let pane_header_facts = focused_row.map(|row| ui::PaneHeaderFacts {
+            name: row.name.clone(),
             harness: row.harness.clone(),
             role: row.role.clone(),
             model: row.model.clone(),
@@ -3382,7 +3384,7 @@ fn run_dashboard_inner(
         {
             hub.mark_drawn(None);
         }
-        // The orchestrator dashboard animates, so it draws about 15 times a second while it shows
+        // The orchestrator dashboard animates, so it draws about 30 times a second while it shows
         // and straight away after input; the classic dashboard's tick is untouched.
         let skip_draw = tree_view.frame_interval().is_some_and(|every| {
             drained == moved_only
@@ -4182,6 +4184,7 @@ mod tests {
     pub(super) fn spawn_request(prompt: &str, cwd: &Path) -> spawnreq::SpawnRequest {
         spawnreq::SpawnRequest {
             kill: None,
+            name: None,
             agent: "claude".to_string(),
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),

@@ -379,7 +379,9 @@ impl<'a> Model<'a> {
     /// was launched with, else its type.
     pub(super) fn job_of(&self, node: &Node) -> String {
         let short = sessions::short_id(&node.id);
-        node_job(node)
+        node.name
+            .clone()
+            .or_else(|| node_job(node))
             .or_else(|| {
                 self.facts
                     .pane_meta

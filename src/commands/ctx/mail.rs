@@ -139,6 +139,9 @@ pub struct DeliveryParty {
     pub model: Option<String>,
     pub role: Option<String>,
     pub repo_slug: String,
+    /// The sender's worker name (`zirv agent --name`), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,6 +627,12 @@ fn render_delivery_message(
     let model = header_value(envelope.from.model.as_deref().unwrap_or("unknown"));
     let role = header_value(envelope.from.role.as_deref().unwrap_or("unknown"));
     let trust = trust_line(&envelope, parent_short);
+    let from_name = envelope
+        .from
+        .name
+        .as_deref()
+        .map(|name| format!(" ({})", header_value(name)))
+        .unwrap_or_default();
     // A pure, best-effort screen of the untrusted
     // body -- flags only, never strips or blocks the content itself (see
     // `screen.rs`'s own module doc comment). Extends this same `Trust:` line
@@ -667,7 +676,7 @@ fn render_delivery_message(
         None => String::new(),
     };
     format!(
-        "## Zirv Message Envelope\n- Id: {}\n- Thread: {}\n- Reply-to: {reply}\n- Topic: {topic}\n- Intent: {intent}\n- From-session: {}\n- Harness: {}\n- Model: {model}\n- Role: {role}\n- Payload-bytes: original={}, stored={}\n- {trust}{screening_suffix}\n\n## Payload\n{jev_prefix}{}\n",
+        "## Zirv Message Envelope\n- Id: {}\n- Thread: {}\n- Reply-to: {reply}\n- Topic: {topic}\n- Intent: {intent}\n- From-session: {}{from_name}\n- Harness: {}\n- Model: {model}\n- Role: {role}\n- Payload-bytes: original={}, stored={}\n- {trust}{screening_suffix}\n\n## Payload\n{jev_prefix}{}\n",
         header_value(&envelope.id),
         header_value(&envelope.thread_id),
         header_value(&envelope.from.session),
@@ -1822,6 +1831,7 @@ fn sender_party(state: &StateDir, own_slug: &str, env: EnvLookup<'_>) -> Deliver
         model: clean_envelope_value(env(super::adapters::SEAT_MODEL_ENV).as_deref()),
         role: record.as_ref().and_then(|record| record.role.clone()),
         repo_slug: own_slug.to_string(),
+        name: super::graph::agent_names(state).remove(&short),
     }
 }
 
@@ -7530,6 +7540,7 @@ This is part of the body too.\n";
                 model: None,
                 role: None,
                 repo_slug: "repo".to_string(),
+                name: None,
             },
             to: DeliverySelector {
                 kind: "claim_once".to_string(),
@@ -7784,6 +7795,7 @@ This is part of the body too.\n";
                 model: None,
                 role: None,
                 repo_slug: "repo".to_string(),
+                name: None,
             },
             to: DeliverySelector {
                 kind: "claim_once".to_string(),
@@ -8074,6 +8086,7 @@ This is part of the body too.\n";
                 model: None,
                 role: None,
                 repo_slug: "repo".to_string(),
+                name: None,
             },
             to: DeliverySelector {
                 kind: "session".to_string(),

@@ -93,8 +93,9 @@ pub(super) struct MailCount {
     pub(super) unread: usize,
 }
 
-/// How often the orchestrator dashboard redraws while it shows: about 15 frames a second.
-pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(66);
+/// How often the orchestrator dashboard redraws while it shows: about 30 frames a second. A draw
+/// costs a few milliseconds, so the interval, not the draw, sets how far a pulse jumps per frame.
+pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// What one background gather produces.
 #[derive(Debug, Default, Clone)]
@@ -714,6 +715,7 @@ mod testkit {
             ended_at: None,
             tokens: Some(12_000),
             label: None,
+            name: None,
             job: None,
             workflow: None,
             session: None,

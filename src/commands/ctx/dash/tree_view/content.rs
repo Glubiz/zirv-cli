@@ -211,8 +211,9 @@ pub(super) fn node_elapsed(node: &Node, now: u64) -> Option<String> {
 }
 
 pub(super) fn node_title(node: &Node) -> String {
-    node.role
+    node.name
         .as_deref()
+        .or(node.role.as_deref())
         .or(node.label.as_deref())
         .unwrap_or(node.kind.as_str())
         .to_string()

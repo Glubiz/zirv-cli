@@ -91,6 +91,10 @@ pub struct Node {
     pub ended_at: Option<u64>,
     pub tokens: Option<u64>,
     pub label: Option<String>,
+    /// The short name a `zirv agent --name` (or the brief) gave a worker pane, unique per
+    /// dashboard; `None` for every other node.
+    #[serde(default)]
+    pub name: Option<String>,
     /// What this agent was asked to do: first line, redacted, at most 80 characters. `None`
     /// when nothing recorded it.
     pub job: Option<String>,
@@ -432,6 +436,8 @@ struct LaunchRecord {
     model: Option<String>,
     /// The task's first line, redacted and capped.
     task: Option<String>,
+    /// The worker's name; see [`Node::name`].
+    name: Option<String>,
     workdir: Option<PathBuf>,
     started_at: u64,
     workflow: Option<WorkflowStamp>,
@@ -445,6 +451,7 @@ pub(super) struct Launch<'a> {
     pub harness: Option<&'a str>,
     pub model: Option<&'a str>,
     pub task: Option<&'a str>,
+    pub name: Option<&'a str>,
     pub workdir: Option<&'a Path>,
 }
 
@@ -463,6 +470,7 @@ pub(super) fn record_worker_launch(state: &StateDir, repo: &Path, launch: &Launc
         harness: launch.harness.map(str::to_string),
         model: launch.model.map(str::to_string),
         task: launch.task.and_then(job_text),
+        name: launch.name.map(str::to_string),
         workdir: launch.workdir.map(Path::to_path_buf),
         started_at: now,
         workflow: active_workflow(state, repo),
@@ -476,6 +484,69 @@ pub(super) fn record_worker_launch(state: &StateDir, repo: &Path, launch: &Launc
         );
     }
     prune_to_newest(&dir, KEEP_LAUNCH_FILES);
+}
+
+/// A short kebab-case name from a brief: its first few salient words, never `worker`.
+pub(super) fn derive_agent_name(brief: &str) -> String {
+    const SKIP: [&str; 14] = [
+        "a", "an", "the", "to", "for", "of", "and", "in", "on", "with", "please", "you", "is", "we",
+    ];
+    let line = brief.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let words: Vec<String> = line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|w| !SKIP.contains(&w.as_str()))
+        .take(3)
+        .collect();
+    clean_agent_name(&words.join("-"))
+}
+
+/// An operator-typed or derived name reduced to kebab-case, at most 24 characters.
+pub(super) fn clean_agent_name(raw: &str) -> String {
+    let kebab: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name: String = kebab
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(24)
+        .collect();
+    let name = name.trim_matches('-');
+    if name.is_empty() || name == "worker" {
+        return "agent".to_string();
+    }
+    name.to_string()
+}
+
+/// `name`, or `name-2`, `name-3`, ... when another worker launch already holds it.
+pub(super) fn unique_agent_name(state: &StateDir, name: &str) -> String {
+    let taken: BTreeSet<String> = agent_names(state).into_values().collect();
+    let mut candidate = name.to_string();
+    let mut n = 2;
+    while taken.contains(&candidate) {
+        candidate = format!("{name}-{n}");
+        n += 1;
+    }
+    candidate
+}
+
+/// Worker names by session short id, from the launch records.
+pub(super) fn agent_names(state: &StateDir) -> BTreeMap<String, String> {
+    read_launch_records(state)
+        .into_iter()
+        .filter_map(|r| Some((sessions::short_id(&r.session), r.name?)))
+        .collect()
 }
 
 type LaunchCache = std::sync::Mutex<BTreeMap<PathBuf, LaunchRecord>>;
@@ -790,6 +861,7 @@ fn codex_head(first_line: &str) -> Option<Node> {
             .get("agent_nickname")
             .and_then(Value::as_str)
             .map(str::to_string),
+        name: None,
         job: None,
         workflow: None,
         session: None,
@@ -1208,6 +1280,7 @@ fn snapshot_in(
                 ended_at: None,
                 tokens: None,
                 label: Some(format!("{} {}", record.short, record.verb)),
+                name: None,
                 job: None,
                 workflow,
                 session: None,
@@ -1240,6 +1313,7 @@ fn snapshot_in(
                 ended_at: g.closed_at,
                 tokens: Some(g.spent_tokens),
                 label: None,
+                name: None,
                 job: None,
                 workflow: None,
                 session: None,
@@ -1272,6 +1346,7 @@ fn snapshot_in(
             ended_at: ended,
             tokens: None,
             label: Some(record.handle.short.clone()),
+            name: None,
             job: None,
             workflow: None,
             session: None,
@@ -1436,6 +1511,7 @@ fn place_subagents(
                     .description
                     .as_deref()
                     .map(super::snapshot::redact_text),
+                name: None,
                 job: record.description.as_deref().and_then(job_text),
                 workflow: line.and_then(|line| line.workflow),
                 session: None,
@@ -1512,6 +1588,7 @@ fn place_workers(
             ended_at: None,
             tokens: None,
             label: Some(sessions::short_id(&launch.session)),
+            name: None,
             job: None,
             workflow: None,
             session: None,
@@ -1524,6 +1601,7 @@ fn place_workers(
         node.harness = node.harness.take().or(launch.harness.clone());
         node.model = node.model.take().or(launch.model.clone());
         node.job = node.job.take().or(launch.task.clone());
+        node.name = node.name.take().or(launch.name.clone());
         node.workflow = launch.workflow.clone().or(node.workflow.take());
     }
     for (session, row) in spend {
@@ -1549,6 +1627,7 @@ fn place_workers(
             ended_at: Some(row.ts),
             tokens: Some(tokens),
             label: Some(sessions::short_id(&session)),
+            name: None,
             job: None,
             workflow: None,
             session: None,
@@ -2097,6 +2176,7 @@ mod tests {
             ended_at: None,
             tokens: None,
             label: None,
+            name: None,
             job: None,
             workflow: None,
             session: None,
@@ -2537,6 +2617,70 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_name_is_derived_from_the_brief_cleaned_and_made_unique() {
+        assert_eq!(
+            derive_agent_name("Review the dashboard changes for PR 851 please"),
+            "review-dashboard-changes"
+        );
+        assert_eq!(derive_agent_name("  \n"), "agent");
+        assert_eq!(derive_agent_name("worker"), "agent");
+        assert!(derive_agent_name("an extraordinarily-long-descriptive-brief-title").len() <= 24);
+        assert_eq!(clean_agent_name("Review Dash!"), "review-dash");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let repo = dir.path().join("repo");
+        let launch = |session: &'static str, name: &'static str| {
+            record_worker_launch(
+                &state,
+                &repo,
+                &Launch {
+                    session,
+                    origin: "pane",
+                    parent_session: None,
+                    harness: Some("codex"),
+                    model: None,
+                    task: Some("brief"),
+                    name: Some(name),
+                    workdir: None,
+                },
+                1,
+            );
+        };
+        assert_eq!(unique_agent_name(&state, "review-dash"), "review-dash");
+        launch("aaaa1111-0000-4000-8000-000000000001", "review-dash");
+        assert_eq!(unique_agent_name(&state, "review-dash"), "review-dash-2");
+    }
+
+    #[test]
+    fn a_named_codex_pane_is_a_graph_node_with_its_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let pane = "dddd4444-0000-4000-8000-000000000004";
+        register_session(&state, pane, "codex", &repo);
+        record_worker_launch(
+            &state,
+            &repo,
+            &Launch {
+                session: pane,
+                origin: "pane",
+                parent_session: None,
+                harness: Some("codex"),
+                model: None,
+                task: Some("Implement the retry flag"),
+                name: Some("review-dash"),
+                workdir: Some(&repo),
+            },
+            100,
+        );
+        let nodes = snapshot_in(&state, &repo, None, Some(dir.path()), now_secs());
+        let node = nodes.iter().find(|n| n.id == pane).expect("pane node");
+        assert_eq!(node.name.as_deref(), Some("review-dash"));
+        assert_eq!(node.job.as_deref(), Some("Implement the retry flag"));
+    }
+
+    #[test]
     fn dispatch_lines_carry_the_caller_and_the_workflow_step() {
         let dir = tempfile::tempdir().expect("tempdir");
         let env = env_for(dir.path());
@@ -2623,6 +2767,7 @@ mod tests {
                 harness: Some("codex"),
                 model: Some("gpt-6.1-sol"),
                 task: Some("Implement the retry flag\nwith tests and docs"),
+                name: None,
                 workdir: Some(&repo),
             },
             100,

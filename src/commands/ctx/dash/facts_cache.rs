@@ -34,6 +34,8 @@ pub(super) struct DiskFacts {
     pub(super) workflow: Option<workflow::ActiveWorkflowSummary>,
     /// Track unread mail per session because the aggregate mail count cannot drive the focused footer (#209).
     pub(super) mail_by_session: MailMap,
+    /// Worker names by session short id, from the launch records (`zirv agent --name`).
+    pub(super) names: HashMap<String, String>,
     /// Track stall latches for attached and registry sessions; absence means no armed stall (#310).
     pub(super) stalled: HashSet<String>,
     /// Resolve each session's bound workflow on refresh; absence never implies
@@ -530,6 +532,10 @@ impl FactsCache {
                 self.disk.scores.insert(record.short.clone(), score);
             }
         }
+
+        self.disk.names = super::super::graph::agent_names(state)
+            .into_iter()
+            .collect();
 
         // Rebuild mail counts for attached and registry sessions so reaped shorts cannot retain stale values (#209).
         self.disk.mail_by_session.clear();

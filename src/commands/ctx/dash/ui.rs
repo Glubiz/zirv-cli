@@ -277,6 +277,8 @@ pub fn glyph_for(row: &SidebarRow) -> Glyph {
 /// Keep selected roster cursor distinct from focused input pane, especially for view-only rows.
 #[derive(Clone)]
 pub struct SidebarRow {
+    /// The worker's name (`zirv agent --name`), shown in place of the short id.
+    pub name: Option<String>,
     /// Short role label (`orch`, `sub-orch`, `worker`, ...), left-aligned in
     /// its 8-column field.
     pub role: String,
@@ -1227,7 +1229,7 @@ pub fn render_header_tabs(
         let name = if row.role == "orch" {
             "orch".to_string()
         } else {
-            style::truncate_display(&row.short, 4).into_owned()
+            style::truncate_display(row.name.as_deref().unwrap_or(&row.short), 8).into_owned()
         };
         let base = if row.focused {
             Style::default().bg(Color::Indexed(236))
@@ -1319,6 +1321,8 @@ fn capitalize_first(word: &str) -> String {
 /// Everything [`render_pane_header`] needs for the focused pane's own header
 /// row -- one row plus the `mid_rule` below it (see [`DashLayout`]).
 pub struct PaneHeaderFacts {
+    /// The worker's name, shown before its role.
+    pub name: Option<String>,
     pub harness: String,
     /// `display_role`'s own short spelling (`orch`, `sub-orch`, `worker`).
     pub role: String,
@@ -1353,7 +1357,13 @@ pub fn render_pane_header(
     let left: Vec<(String, Style)> = vec![
         (format!(" {}", facts.harness), style::tui::accent()),
         (" \u{25b8} ".to_string(), style::tui::muted()),
-        (facts.role.clone(), style::tui::muted()),
+        (
+            facts.name.as_ref().map_or_else(
+                || facts.role.clone(),
+                |n| format!("{n} \u{b7} {}", facts.role),
+            ),
+            style::tui::muted(),
+        ),
         (
             format!(
                 " \u{b7} {}",
@@ -2646,7 +2656,7 @@ fn sidebar_row_parts(
     let name = if row.role == "orch" {
         "orch".to_string()
     } else {
-        row.short.clone()
+        row.name.clone().unwrap_or_else(|| row.short.clone())
     };
     let name_width = (cols as usize).saturating_sub(SIDEBAR_FIXED_COLS);
     let (badge_text, badge_style) = badge_for(row).unwrap_or_else(|| (String::new(), muted));
@@ -4274,6 +4284,7 @@ mod tests {
                 };
                 let mut rows: Vec<SidebarRow> = (0..count)
                     .map(|i| SidebarRow {
+                        name: None,
                         role: "worker".into(),
                         model: None,
                         group: None,
@@ -5583,6 +5594,7 @@ mod tests {
 
     fn sidebar_row(short: &str, harness: &str, state: RowState) -> SidebarRow {
         SidebarRow {
+            name: None,
             role: "worker".into(),
             model: None,
             group: None,
@@ -5826,6 +5838,7 @@ mod tests {
         };
         let member = |short: &str, role: &str, model: &str, age: u64, score: u32, p: Projection| {
             SidebarRow {
+                name: None,
                 role: role.into(),
                 model: Some(model.into()),
                 group: Some(group.clone()),
@@ -5835,6 +5848,7 @@ mod tests {
             }
         };
         let mut rows = vec![SidebarRow {
+            name: None,
             role: "orch".into(),
             model: Some("fable".into()),
             age_secs: Some(840),
@@ -6112,6 +6126,7 @@ mod tests {
     fn view_only_sidebar_rows_are_dimmed_so_an_unfocusable_row_looks_it() {
         let rows = vec![
             SidebarRow {
+                name: None,
                 role: "worker".into(),
                 model: None,
                 group: None,
@@ -6137,6 +6152,7 @@ mod tests {
                 approval_pending: false,
             },
             SidebarRow {
+                name: None,
                 role: "worker".into(),
                 model: None,
                 group: None,
@@ -6192,6 +6208,7 @@ mod tests {
     #[test]
     fn a_long_session_list_scrolls_to_keep_the_selected_row_on_screen() {
         let row = |i: usize, selected: bool| SidebarRow {
+            name: None,
             role: "worker".into(),
             model: None,
             group: None,
@@ -8429,6 +8446,7 @@ mod tests {
 
     fn pane_header_facts() -> PaneHeaderFacts {
         PaneHeaderFacts {
+            name: None,
             harness: "claude".to_string(),
             role: "worker".to_string(),
             model: Some("sonnet-5".to_string()),

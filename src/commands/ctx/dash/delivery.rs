@@ -1194,6 +1194,30 @@ mod tests {
     }
 
     #[test]
+    fn the_flow_is_drawn_every_frame_interval_when_the_idle_poll_is_longer() {
+        let every = super::super::tree_view::FRAME_INTERVAL;
+        let mut since = Duration::ZERO;
+        let mut gaps = Vec::new();
+        let mut waited = Duration::ZERO;
+        for _ in 0..40 {
+            let wait = frame_poll_wait(INPUT_POLL_IDLE_WAIT, Some(every), Some(since));
+            since += wait;
+            waited += wait;
+            if since >= every {
+                gaps.push(waited);
+                since = Duration::ZERO;
+                waited = Duration::ZERO;
+            }
+        }
+        assert!(!gaps.is_empty());
+        assert!(gaps.iter().all(|gap| *gap == every), "{gaps:?}");
+        assert!(
+            every <= Duration::from_millis(34),
+            "about 30 frames a second"
+        );
+    }
+
+    #[test]
     fn input_poll_wait_is_hot_within_the_window_and_idle_past_it() {
         assert_eq!(input_poll_wait(Duration::ZERO), INPUT_POLL_HOT_WAIT);
         assert_eq!(

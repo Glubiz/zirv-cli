@@ -289,6 +289,17 @@ fn header(s: &mut Scene, ctx: &Ctx, w: i32, need_count: usize) {
     // Drop the facts that matter least until what is left fits beside the badge.
     let sep = "  \u{b7}  ";
     let mut parts: Vec<(String, String)> = usage.into_iter().collect();
+    if let Some(a) = &ctx.model.data.supervisor {
+        parts.push((
+            "supervisor ".to_string(),
+            format!(
+                "{} \u{b7} {} {}",
+                content::supervisor_status(ctx.model.data),
+                a.harness,
+                a.model
+            ),
+        ));
+    }
     let parts_w = |parts: &[(String, String)]| -> i32 {
         parts
             .iter()
@@ -3992,7 +4003,7 @@ mod tests {
     }
 
     #[test]
-    fn the_orchestrator_view_redraws_about_15_times_a_second_only_while_it_shows() {
+    fn the_orchestrator_view_redraws_about_30_times_a_second_only_while_it_shows() {
         let mut v = TreeView::default();
         assert_eq!(
             v.frame_interval(),
@@ -4002,8 +4013,8 @@ mod tests {
         v.toggle();
         let every = v.frame_interval().expect("visible");
         assert!(
-            every >= std::time::Duration::from_millis(60)
-                && every <= std::time::Duration::from_millis(70)
+            every >= std::time::Duration::from_millis(30)
+                && every <= std::time::Duration::from_millis(36)
         );
         v.open_chat();
         assert_eq!(v.frame_interval(), None, "an open chat draws with the pane");
@@ -4206,6 +4217,40 @@ mod tests {
             press(&mut v, &f, 160, 60, KeyCode::Char('o')),
             Outcome::Notice(_)
         ));
+    }
+
+    #[test]
+    fn an_enabled_supervisor_shows_in_the_header_with_no_open_ruling_for_a_single_seat() {
+        let (mut data, wf, jev) = busy();
+        data.nodes.retain(|n| n.id == "seat-1");
+        data.rulings.clear();
+        let mut f = orch_facts(&wf, &jev);
+        f.approval_items.clear();
+        let on = draw(160, 40, &view(data.clone()), &f);
+        let header = on.lines().next().expect("header");
+        assert!(
+            header.contains("supervisor on 1/3 \u{b7} codex gpt-6-astra"),
+            "{header}"
+        );
+        data.supervisor = None;
+        let off = draw(160, 40, &view(data), &f);
+        assert!(!off.lines().next().expect("header").contains("supervisor"));
+    }
+
+    #[test]
+    fn a_named_codex_delegation_is_labelled_by_its_name_not_its_role() {
+        let (mut data, wf, jev) = busy();
+        let node = data
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == "w1")
+            .expect("worker");
+        node.name = Some("review-dash".into());
+        let named = node.clone();
+        assert_eq!(content::node_title(&named), "review-dash");
+        let f = orch_facts(&wf, &jev);
+        let text = draw(160, 60, &view(data), &f);
+        assert!(text.contains("review-dash"), "{text}");
     }
 
     #[test]
