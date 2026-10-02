@@ -23,6 +23,8 @@ use crate::commands::workflow::{engine, review};
 
 const TAIL_BYTES: u64 = 256 * 1024;
 const KEEP: usize = 40;
+/// A Jev call this close to a seat's start belongs to the request that launched it.
+pub const INTAKE_GRACE_SECS: u64 = 120;
 const TEXT_COLS: usize = 60;
 /// The floor of a site that has none of its own named in the Jev code.
 const DEFAULT_FLOOR: f32 = 0.5;
@@ -299,8 +301,11 @@ pub fn enabled_sites(jev: &JevConfig) -> Vec<&'static str> {
 }
 
 /// The newest 40 decisions in `scope` at or after `since` (epoch seconds), plus the enabled `[jev]`
-/// sites. A proxy row names no session, so `since` is all that keeps an old repository row out.
+/// sites. A proxy row names no session, so a session scope takes only the one inside the intake window
+/// around `since` (the seat's start minus the grace), and a repository scope takes any at or after it.
 pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>, since: u64) -> JevFeed {
+    let proxy_until =
+        matches!(scope, JevScope::Session { .. }).then(|| since + 2 * INTAKE_GRACE_SECS);
     let (session_ids, repo): (Vec<String>, &Path) = match scope {
         JevScope::Session {
             session,
@@ -332,8 +337,12 @@ pub fn jev_feed(state: &StateDir, cfg: &CtxConfig, scope: JevScope<'_>, since: u
         .iter()
         .filter(|row| row.get("decider").and_then(Value::as_str) == Some("typesafe"))
         .filter(|row| row.get("repo").and_then(Value::as_str).map(Path::new) == Some(repo))
+        .filter(|row| match row.get("session").and_then(Value::as_str) {
+            Some(session) if !session.is_empty() => in_scope(session),
+            _ => true,
+        })
         .filter_map(|row| proxy_decision(row, cfg))
-        .filter(|decision| decision.ts >= since)
+        .filter(|decision| decision.ts >= since && proxy_until.is_none_or(|end| decision.ts <= end))
         .collect();
     let mut decisions: Vec<JevDecision> = rows(&state.root().join(jev::JEV_DECISIONS_FILE))
         .iter()
@@ -380,7 +389,13 @@ mod tests {
     }
 
     fn feed(state: &StateDir, scope: JevScope<'_>) -> JevFeed {
-        jev_feed(state, &CtxConfig::default(), scope, 0)
+        // The fixture's intake rows sit just after a seat that started at 1000 (grace 120 s before it).
+        let since = if matches!(scope, JevScope::Session { .. }) {
+            900
+        } else {
+            0
+        };
+        jev_feed(state, &CtxConfig::default(), scope, since)
     }
 
     fn by_site<'a>(feed: &'a JevFeed, site: &str) -> &'a JevDecision {
@@ -504,8 +519,16 @@ mod tests {
             repo: Path::new("/work/repo"),
         };
         let cfg = CtxConfig::default();
-        let all = jev_feed(&state, &cfg, scope(&[]), 0);
+        // A concurrent seat's intake, ten minutes after this seat started, is not this seat's.
+        let mut proxy = std::fs::read_to_string(state.root().join("proxy-decisions.jsonl"))
+            .expect("proxy rows");
+        proxy.push_str("{\"repo\": \"/work/repo\", \"intent\": \"feature\", \"complexity\": \"bounded\", \"risk\": \"low\", \"decider\": \"typesafe\", \"confidence\": {}, \"usage\": {}, \"created_at\": 1650}\n");
+        std::fs::write(state.root().join("proxy-decisions.jsonl"), proxy).expect("write");
+        let all = jev_feed(&state, &cfg, scope(&[]), 900);
         assert!(all.decisions.iter().any(|d| d.ts == 1050), "{all:?}");
+        assert!(!all.decisions.iter().any(|d| d.ts == 1650), "{all:?}");
+        let repo_wide = jev_feed(&state, &cfg, JevScope::Repo(Path::new("/work/repo")), 900);
+        assert!(repo_wide.decisions.iter().any(|d| d.ts == 1650));
         assert!(
             !all.decisions
                 .iter()
@@ -513,7 +536,7 @@ mod tests {
         );
         let recent = jev_feed(&state, &cfg, scope(&[]), 1051);
         assert!(recent.decisions.iter().all(|d| d.ts >= 1051), "{recent:?}");
-        let with_child = jev_feed(&state, &cfg, scope(&child), 0);
+        let with_child = jev_feed(&state, &cfg, scope(&child), 900);
         assert!(
             with_child
                 .decisions
