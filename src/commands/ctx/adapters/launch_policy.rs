@@ -1335,16 +1335,36 @@ mod tests {
     #[test]
     fn building_the_read_only_refusal_writes_no_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "TMPDIR",
-            Some(tmp.path().to_str().expect("utf8")),
-        )]);
+        let state = tempfile::tempdir().expect("state");
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("TMPDIR", Some(tmp.path().to_str().expect("utf8"))),
+            (
+                crate::commands::ctx::state::STATE_ENV,
+                Some(state.path().to_str().expect("utf8")),
+            ),
+        ]);
         let cursor = cursor::CursorAdapter::new(None);
         for mode in [LaunchMode::Headless, LaunchMode::Interactive] {
             assert!(require_read_only_floor(&cursor, mode).is_err());
         }
-        let written: Vec<_> = std::fs::read_dir(tmp.path()).expect("read_dir").collect();
-        assert!(written.is_empty(), "{written:?}");
+        for dir in [tmp.path(), state.path()] {
+            let written: Vec<_> = std::fs::read_dir(dir).expect("read_dir").collect();
+            assert!(written.is_empty(), "{written:?}");
+        }
+    }
+
+    /// Availability is a cheap pre-check; the launch re-validates the final adapter's real args,
+    /// so a harness that claims a floor but cannot materialize it is still refused.
+    #[test]
+    fn a_floor_that_cannot_be_materialized_at_launch_is_refused() {
+        let blocker = tempfile::NamedTempFile::new().expect("file");
+        let adapter =
+            opencode::OpenCodeAdapter::new(None).with_state_root(blocker.path().join("state"));
+        assert!(adapter.read_only_floor_available(false));
+        for mode in [LaunchMode::Headless, LaunchMode::Interactive] {
+            let message = require_read_only_floor(&adapter, mode).expect_err("empty floor");
+            assert!(message.contains("cannot enforce read-only"), "{message}");
+        }
     }
 
     #[test]

@@ -980,6 +980,11 @@ pub(super) fn fulfill_spawn_request(
     }
     let adapter = adapters::select(Some(&req.agent), &[], cfg)
         .map_err(|e| SpawnRefusal::policy(e.to_string()))?;
+    // Re-check the rerouted adapter with its real args: availability is only a side-effect-free pre-check.
+    if req.mode == super::permit::WorkerMode::ReadOnly {
+        adapters::require_read_only_floor(adapter.as_ref(), adapters::LaunchMode::Interactive)
+            .map_err(SpawnRefusal::policy)?;
+    }
     // Assess degraded capabilities against the final selected adapter, after reroute (#230).
     let mode = if req.interactive {
         adapters::LaunchMode::Interactive

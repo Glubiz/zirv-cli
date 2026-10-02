@@ -2004,9 +2004,9 @@ impl AgentAdapter for ClaudeAdapter {
             ("CLAUDE_CODE_USE_ANTHROPIC_AWS", &["AWS_"]),
             (
                 "CLAUDE_CODE_USE_VERTEX",
-                &["GOOGLE_", "CLOUDSDK_", "CLOUD_ML_"],
+                &["GOOGLE_", "CLOUDSDK_", "CLOUD_ML_", "ANTHROPIC_VERTEX_"],
             ),
-            ("CLAUDE_CODE_USE_FOUNDRY", &["AZURE_"]),
+            ("CLAUDE_CODE_USE_FOUNDRY", &["AZURE_", "ANTHROPIC_FOUNDRY_"]),
         ];
         let on = |switch: &str| env(switch).is_some_and(|v| !v.is_empty());
         let active: Vec<&str> = PROVIDERS
@@ -2027,13 +2027,10 @@ impl AgentAdapter for ClaudeAdapter {
             super::super::runtime::execution::AUTH_ENV
                 .iter()
                 .filter(|name| {
-                    if name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_") {
-                        return true;
-                    }
                     if is_provider_name(name) {
                         return active.iter().any(|prefix| name.starts_with(prefix));
                     }
-                    any_switch
+                    name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE_") || any_switch
                 })
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -2928,6 +2925,18 @@ mod tests {
             assert!(!has(&none, name), "{name} without a switch");
             assert!(!has(&empty_switch, name), "{name} with an empty switch");
         }
+        for name in ["ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_VERTEX_PROJECT_ID"] {
+            assert!(!has(&none, name) && !has(&bedrock, name), "{name}");
+        }
+        assert!(has(&none, "ANTHROPIC_API_KEY") && has(&none, "CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(
+            has(&vertex, "ANTHROPIC_VERTEX_PROJECT_ID")
+                && !has(&vertex, "ANTHROPIC_FOUNDRY_API_KEY")
+        );
+        assert!(
+            has(&foundry, "ANTHROPIC_FOUNDRY_API_KEY")
+                && !has(&foundry, "ANTHROPIC_VERTEX_PROJECT_ID")
+        );
         assert!(has(&bedrock, "AWS_SECRET_ACCESS_KEY") && has(&bedrock, "HTTPS_PROXY"));
         assert!(!has(&bedrock, "GOOGLE_APPLICATION_CREDENTIALS"));
         assert!(!has(&bedrock, "AZURE_CLIENT_SECRET"));
