@@ -120,6 +120,27 @@ pub(super) struct TreeData {
     pub(super) rulings: Vec<supervisor::Ruling>,
 }
 
+/// What a wait is about: the last clause of a composed status evidence (the attention winner's own),
+/// without its `{Authority}: ` label.
+pub(super) fn wait_evidence(status_evidence: &str) -> String {
+    let clause = status_evidence
+        .rsplit("; ")
+        .next()
+        .unwrap_or(status_evidence);
+    let bare = [
+        "AdapterHook",
+        "Supervisor",
+        "Workflow",
+        "Transcript",
+        "ScreenManifest",
+        "QuietHeuristic",
+    ]
+    .iter()
+    .find_map(|label| clause.strip_prefix(label)?.strip_prefix(": "))
+    .unwrap_or(clause);
+    capped_first_line(bare, 60)
+}
+
 pub(super) fn capped_first_line(text: &str, cap: usize) -> String {
     let line: String = text
         .lines()
@@ -1161,6 +1182,16 @@ mod testkit {
 mod tests {
     use super::testkit::*;
     use super::*;
+
+    #[test]
+    fn a_wait_shows_the_attention_winners_clause_without_its_authority_label() {
+        assert_eq!(
+            wait_evidence("pane went Settled; AdapterHook: Bash: cargo test"),
+            "Bash: cargo test"
+        );
+        assert_eq!(wait_evidence("Supervisor: codex dialog"), "codex dialog");
+        assert_eq!(wait_evidence("Bash: cargo test"), "Bash: cargo test");
+    }
 
     #[test]
     fn a_meta_discovered_agent_gets_one_dispatch_row_and_a_hooked_one_none() {

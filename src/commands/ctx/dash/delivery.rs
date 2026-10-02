@@ -141,10 +141,21 @@ pub(super) fn latch_codex_approval(panes: &mut [Pane], state: &StateDir) {
         }
         pane.codex_approval_latched = open;
         let now = super::state::now_secs();
+        // NEEDS YOU names what the dialog asks for, not just that one is open.
+        let evidence = pane
+            .codex_dialog()
+            .filter(|dialog| !dialog.command.is_empty())
+            .map_or_else(
+                || "codex approval dialog is open".to_string(),
+                |dialog| {
+                    let preview = super::super::approvals::redacted_preview(&dialog.command);
+                    format!("{}: {preview}", dialog.tool)
+                },
+            );
         let observation = if open {
             super::attention::Observation::new(
                 super::attention::Authority::Supervisor,
-                "codex approval dialog is open",
+                evidence,
                 80,
                 now,
             )
@@ -3268,7 +3279,7 @@ mod tests {
         cwd: &Path,
         session_id: &str,
     ) -> Pane {
-        let script = "printf 'Would you like to run the following command?\\r\\n  1. Yes, proceed (y)\\r\\n  3. No, and tell Codex what to do differently (esc)\\r\\n'; read x; printf '\\033[2J\\033[Hready\\r\\n'; sleep 60";
+        let script = "printf 'Would you like to run the following command?\\r\\n  $ cargo nextest run\\r\\n  1. Yes, proceed (y)\\r\\n  3. No, and tell Codex what to do differently (esc)\\r\\n'; read x; printf '\\033[2J\\033[Hready\\r\\n'; sleep 60";
         let spec = PaneSpec {
             agent_name: agent.to_string(),
             argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -3360,6 +3371,12 @@ mod tests {
             super::super::attention::load(&state, &short).attention,
             super::super::attention::Attention::Approval,
             "the sidebar shows the dialog like a Claude hook latch"
+        );
+        assert!(
+            super::super::attention::load(&state, &short)
+                .evidence
+                .ends_with("Bash: cargo nextest run"),
+            "NEEDS YOU names the command the dialog asks to run"
         );
         mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
         deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
