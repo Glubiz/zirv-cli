@@ -964,6 +964,12 @@ fn take_ticket(state: &StateDir, session: &str, ticket: &str) -> bool {
 
 const ASK_TICKET: &str = "ask";
 
+/// Exit code of an `--ask` consult whose helper failed or answered unparseably.
+const ASK_FAILED_EXIT: i32 = 3;
+
+/// How much of the consult child's stderr an error message carries.
+const ASK_STDERR_TAIL_BYTES: usize = 400;
+
 fn run_consult(
     session: &str,
     trigger: Option<Trigger>,
@@ -1010,12 +1016,18 @@ fn run_consult(
             &mut tokens,
             &|prompt| delegated_report(&cfg, &repo, RulingKind::Choice, timeout_secs, prompt),
         );
-        match outcome {
-            Ok(Some(ruling)) => println!("{}", serde_json::to_string(&ruling)?),
-            Ok(None) => {}
-            Err(error) => log_fallback(&state, session, &error.to_string()),
-        }
-        return Ok(0);
+        let failure = match outcome {
+            Ok(Some(ruling)) => {
+                println!("{}", serde_json::to_string(&ruling)?);
+                return Ok(0);
+            }
+            Ok(None) => "the helper's reply did not parse".to_string(),
+            Err(error) => error.to_string(),
+        };
+        log_fallback(&state, session, &failure);
+        // A non-zero exit tells `ask` this was an infrastructure failure, so it can refund the call.
+        eprintln!("{failure}");
+        return Ok(ASK_FAILED_EXIT);
     }
     let Some(trigger) = trigger else {
         return Ok(0);
@@ -1068,11 +1080,19 @@ fn spawn_ask_consult(
         .env(CONSULT_ENV, "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(evidence.as_bytes());
     }
+    // Drained on a thread so a chatty child can never fill the pipe and stall the wait below.
+    let stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    });
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + ASK_GRACE_SECS);
     while child.try_wait()?.is_none() {
@@ -1083,11 +1103,25 @@ fn spawn_ask_consult(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let status = child.wait()?;
     let mut out = String::new();
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout.read_to_string(&mut out);
     }
-    Ok(serde_json::from_str(out.trim()).ok())
+    let ruling = serde_json::from_str(out.trim()).ok();
+    if status.success() && ruling.is_some() {
+        return Ok(ruling);
+    }
+    let stderr = stderr
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let tail: String = {
+        let chars: Vec<char> = stderr.trim().chars().collect();
+        chars[chars.len().saturating_sub(ASK_STDERR_TAIL_BYTES)..]
+            .iter()
+            .collect()
+    };
+    Err(format!("the supervisor child {status}: {tail}").into())
 }
 
 /// Reserve one call of the session's `max_calls` budget and write the one-shot ticket.
@@ -1107,6 +1141,24 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> bool {
     push_capped(&mut current.tickets, ASK_TICKET.to_string(), TRIGGERS_KEEP);
     save_state(&path, &current);
     true
+}
+
+/// Give back the call `reserve_ask_call` took when the consult failed for infrastructure reasons.
+fn refund_ask_call(state: &StateDir, session: &str) {
+    let Some(path) = state_path(state, session) else {
+        return;
+    };
+    let Some(_lock) = lock_beside(&path) else {
+        return;
+    };
+    let mut current = load_state(&path);
+    current.calls = current.calls.saturating_sub(1);
+    for list in [&mut current.triggers, &mut current.tickets] {
+        if let Some(at) = list.iter().rposition(|held| held == ASK_TICKET) {
+            list.remove(at);
+        }
+    }
+    save_state(&path, &current);
 }
 
 /// `zirv ctx supervisor ask`: one synchronous consult, never from a hook. Prints the chosen
@@ -1154,6 +1206,7 @@ fn run_ask_with<W: Write>(
     let ruling = match consult(&session, options, &evidence, timeout_secs) {
         Ok(Some(ruling)) => ruling,
         Ok(None) => {
+            refund_ask_call(&state, &session);
             writeln!(
                 w,
                 "the supervisor gave no usable ruling; decide yourself or ask the operator"
@@ -1161,6 +1214,7 @@ fn run_ask_with<W: Write>(
             return Ok(1);
         }
         Err(error) => {
+            refund_ask_call(&state, &session);
             log_fallback(&state, &session, &error.to_string());
             writeln!(
                 w,
@@ -2003,6 +2057,46 @@ mod tests {
             String::from_utf8(out)
                 .expect("utf8")
                 .contains("decide yourself")
+        );
+    }
+
+    /// Issue #856: a consult that failed for infrastructure reasons names its cause and costs no call.
+    #[test]
+    fn an_infrastructure_failure_names_the_cause_and_refunds_the_call() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let failing = |_: &str, _: &[String], _: &str, _: u64| -> CtxResult<Option<Ruling>> {
+            Err("the supervisor child exit status: 3: network denied".into())
+        };
+        let mut out = Vec::new();
+        let code = run_ask_with("q", &options, "", 5, &lookup, &failing, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 1);
+        assert!(text.contains("network denied"), "{text}");
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!((row.calls, row.tickets.len()), (0, 0));
+
+        let unparseable =
+            |_: &str, _: &[String], _: &str, _: u64| -> CtxResult<Option<Ruling>> { Ok(None) };
+        let mut out = Vec::new();
+        run_ask_with("q", &options, "", 5, &lookup, &unparseable, &mut out).expect("ask");
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!(row.calls, 0, "an unusable reply costs nothing either");
+    }
+
+    /// Issue #856: `supervisor ask` spawns a harness child that needs network and `~/.claude`,
+    /// so a sandboxed seat must run it outside the sandbox.
+    #[test]
+    fn supervisor_ask_is_excluded_from_the_seat_sandbox() {
+        let exclusions = crate::commands::ctx::safety::reserved_zirv_sandbox_exclusion_patterns();
+        assert!(
+            exclusions
+                .iter()
+                .any(|pattern| pattern == "zirv ctx supervisor ask *"),
+            "{exclusions:?}"
         );
     }
 
