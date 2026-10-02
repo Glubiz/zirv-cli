@@ -555,6 +555,44 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
     ("Bash(reboot*)", "restarts the machine"),
 ];
 
+fn read_only_floor(adapter: &(impl AgentAdapter + ?Sized), mode: LaunchMode) -> Vec<String> {
+    if mode.is_interactive() {
+        adapter.interactive_read_only_args()
+    } else {
+        adapter.read_only_args()
+    }
+}
+
+/// Registered harnesses that cannot enforce read-only for `mode`; auto-routing excludes them for read-only work.
+pub fn floorless_adapter_names(mode: LaunchMode) -> Vec<&'static str> {
+    ADAPTERS
+        .iter()
+        .filter(|(_, ctor)| read_only_floor(ctor(None).as_ref(), mode).is_empty())
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Fail closed: a worker labelled read-only must not launch on a harness with no enforced read-only floor.
+pub fn require_read_only_floor(
+    adapter: &(impl AgentAdapter + ?Sized),
+    mode: LaunchMode,
+) -> Result<(), String> {
+    if !read_only_floor(adapter, mode).is_empty() {
+        return Ok(());
+    }
+    let floorless = floorless_adapter_names(mode);
+    let capable: Vec<&str> = ADAPTERS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !floorless.contains(name))
+        .collect();
+    Err(format!(
+        "harness '{}' cannot enforce read-only here, so a read-only worker would be able to write files and run commands; refusing to launch. Harnesses that can enforce read-only: {}",
+        adapter.name(),
+        capable.join(", ")
+    ))
+}
+
 /// Resolve a registered adapter's structural read-only flags without needing it installed; unknown names remain `None` so callers can refuse.
 pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec<String>> {
     ADAPTERS
@@ -580,11 +618,7 @@ pub fn extend_read_only_args(
     args: &mut Vec<String>,
     mode: LaunchMode,
 ) {
-    let mut floor = if mode.is_interactive() {
-        adapter.interactive_read_only_args()
-    } else {
-        adapter.read_only_args()
-    };
+    let mut floor = read_only_floor(adapter, mode);
     if adapter.name() == "codex" {
         let uses_profile = floor
             .iter()
@@ -1279,4 +1313,41 @@ mod tests {
     }
 
     // -- the seat role env every launch exports (issues #328/#334) ---------
+
+    #[test]
+    fn a_read_only_launch_is_refused_on_an_empty_floor_harness_naming_the_capable_ones() {
+        let cursor = cursor::CursorAdapter::new(None);
+        for mode in [LaunchMode::Headless, LaunchMode::Interactive] {
+            let message = require_read_only_floor(&cursor, mode).expect_err("empty floor");
+            assert!(message.contains("'cursor-agent'"), "{message}");
+            for capable in ["claude", "codex", "copilot"] {
+                assert!(message.contains(capable), "{message}");
+            }
+            let capable_list = message.rsplit(": ").next().unwrap_or_default();
+            for floorless in ["cursor-agent", "goose", "grok", "muse"] {
+                assert!(!capable_list.contains(floorless), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_only_launch_is_allowed_where_the_floor_is_enforced() {
+        for name in ["claude", "codex", "copilot"] {
+            let (_, ctor) = ADAPTERS.iter().find(|(n, _)| *n == name).expect("adapter");
+            for mode in [LaunchMode::Headless, LaunchMode::Interactive] {
+                assert_eq!(require_read_only_floor(ctor(None).as_ref(), mode), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn floorless_adapter_names_lists_exactly_the_empty_floor_harnesses() {
+        let names = floorless_adapter_names(LaunchMode::Headless);
+        for floorless in ["cursor-agent", "goose", "grok", "muse"] {
+            assert!(names.contains(&floorless), "{names:?}");
+        }
+        for capable in ["claude", "codex", "copilot"] {
+            assert!(!names.contains(&capable), "{names:?}");
+        }
+    }
 }

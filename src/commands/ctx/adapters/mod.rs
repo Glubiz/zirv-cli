@@ -42,8 +42,8 @@ pub(crate) use error::{
 };
 pub use launch_policy::{
     SHIPPED_POSTURE_ALLOW, SHIPPED_POSTURE_ASK, SHIPPED_POSTURE_DENY, extend_read_only_args,
-    flags_pin_policy, policy_launch_args, policy_launch_args_for_surface,
-    read_only_args_for_agent_name, with_workload_writable_roots,
+    flags_pin_policy, floorless_adapter_names, policy_launch_args, policy_launch_args_for_surface,
+    read_only_args_for_agent_name, require_read_only_floor, with_workload_writable_roots,
 };
 pub(crate) use launch_policy::{doubled_slash_rule_base, scratchpad_roots, scratchpad_rules};
 pub use model::{
@@ -357,6 +357,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         .0;
         extra.extend(self.system_prompt_args(&system_prompt));
         if manifest.read_only {
+            require_read_only_floor(self, LaunchMode::Headless)?;
             extend_read_only_args(self, &mut extra, LaunchMode::Headless);
         }
         let session = SessionId::new_v4();
@@ -1804,6 +1805,46 @@ mod tests {
     /// own methods (`policy_args`, `default_sandbox_args`, `read_only_args`),
     /// with an additional single-use check for codex's sandbox and approval
     /// options. No real harness is launched.
+    #[test]
+    fn dispatch_agent_refuses_a_read_only_seat_on_an_empty_floor_adapter() {
+        use crate::commands::workflow::agents::{
+            AGENT_SCHEMA_VERSION, AgentManifest, AgentTask, ModelTier,
+        };
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let manifest = AgentManifest {
+            schema_version: AGENT_SCHEMA_VERSION,
+            id: "floor-probe".to_string(),
+            version: 1,
+            name: "Floor Probe".to_string(),
+            description: "read-only seat without a floor".to_string(),
+            role: "worker".to_string(),
+            model_tier: ModelTier::Standard,
+            read_only: true,
+            required_capabilities: Vec::new(),
+            optional_capabilities: Vec::new(),
+            context_budget_bytes: 4096,
+            instructions: "Do the thing.".to_string(),
+            team_role: None,
+            skills: Vec::new(),
+        };
+        let task = AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+        let adapter = select(Some("cursor-agent"), &[], &permissive_cfg()).expect("cursor-agent");
+        let error = adapter
+            .dispatch_agent(&manifest, &task)
+            .expect_err("an empty read-only floor must refuse the seat");
+        assert!(
+            error.to_string().contains("cannot enforce read-only"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn dispatch_agent_invariants_hold_for_claude_and_codex() {
         use crate::commands::workflow::agents::{
