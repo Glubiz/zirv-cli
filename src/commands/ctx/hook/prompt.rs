@@ -1484,6 +1484,52 @@ mod tests {
         );
     }
 
+    /// #849: a native subagent shares the lead's session id, so it must neither read the lead's
+    /// prompt record nor spend the lead's one-time checkpoint.
+    #[test]
+    fn a_subagent_edit_never_gets_or_spends_the_leads_scope_checkpoint() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let session = "sess-849";
+        run_prompt(
+            &mut Vec::new(),
+            &scope_guard_prompt_stdin(session, repo.path(), SCOPE_GUARD_T24_PROMPT),
+            &lookup,
+        )
+        .expect("run_prompt");
+
+        let mut edit: serde_json::Value = serde_json::from_str(&scope_guard_edit_stdin_for(
+            session,
+            repo.path(),
+            "default",
+            "src/feature.rs",
+        ))
+        .expect("json");
+        edit["agent_id"] = serde_json::json!("sub-a");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &edit.to_string(), &lookup).expect("run_pretool");
+        assert!(out.is_empty(), "a subagent gets no lead checkpoint");
+
+        let lead_edit =
+            scope_guard_edit_stdin_for(session, repo.path(), "default", "src/feature.rs");
+        let mut out = Vec::new();
+        run_pretool(&mut out, &lead_edit, &lookup).expect("run_pretool");
+        assert!(
+            String::from_utf8(out)
+                .expect("utf8")
+                .contains("Scope checkpoint"),
+            "the lead's checkpoint was not spent by the subagent"
+        );
+    }
+
     /// `[scope_guard] enabled = false` with the missing-tests gate left on
     /// (its default): the checkpoint still fires, carrying ONLY the
     /// tests-owed line.

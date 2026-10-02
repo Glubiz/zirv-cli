@@ -330,6 +330,8 @@ pub fn run_posttool_with<W: Write>(
     let shell_checkpoint = parsed
         .as_ref()
         .filter(|payload| matches!(payload.tool_name.as_str(), "Bash" | "PowerShell"))
+        // The prompt record belongs to the lead; a subagent shares its session id (#849).
+        .filter(|payload| payload.agent_id.is_empty())
         .and_then(|payload| {
             let (cwd, cfg) = shared.as_ref()?;
             scope_guard_shell_checkpoint_note(

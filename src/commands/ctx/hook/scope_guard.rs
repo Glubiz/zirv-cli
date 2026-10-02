@@ -463,10 +463,13 @@ pub(super) fn scope_checkpoint_note(
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
 ) -> Option<String> {
-    if !matches!(
-        payload.tool_name.as_str(),
-        "Edit" | "MultiEdit" | "NotebookEdit" | "Write"
-    ) {
+    // A subagent shares the lead's session id, and so its prompt record; the record is the lead's (#849).
+    if !payload.agent_id.is_empty()
+        || !matches!(
+            payload.tool_name.as_str(),
+            "Edit" | "MultiEdit" | "NotebookEdit" | "Write"
+        )
+    {
         return None;
     }
     let target = normalized_write_target(payload, cwd);
