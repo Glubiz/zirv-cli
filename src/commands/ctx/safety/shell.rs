@@ -119,7 +119,13 @@ pub(crate) fn canonical_shell_syntax(command: &str) -> Option<String> {
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
-        if escaped {
+        if escaped && c == '\n' {
+            // bash deletes backslash-newline before any other parsing, so it must not split a word or hide a `#`.
+            out.pop();
+            escaped = false;
+            i += 1;
+            continue;
+        } else if escaped {
             escaped = false;
             word_start = false;
         } else if c == '\\' && quote != Some('\'') {
@@ -3168,6 +3174,26 @@ mod tests {
             evaluate(&policy, command, LaunchMode::Interactive).verdict,
             Verdict::Deny,
             "{command}"
+        );
+    }
+
+    #[test]
+    fn a_line_continuation_cannot_hide_a_comment_quote_from_the_next_line() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "zirv ctx status \\\n#' comment\nzirv ctx status >~/.zirv/ctx.toml #'",
+            "zirv ctx status \"x\\\ny\" \\\n#' c\nzirv ctx status >~/.zirv/ctx.toml #'",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{command}"
+            );
+        }
+        assert_eq!(canonical_shell_syntax("a\\\n#b").as_deref(), Some("a#b"));
+        assert_eq!(
+            canonical_shell_syntax("echo $'a\\\nb' #c").as_deref(),
+            Some("echo 'a\\\nb' ")
         );
     }
 
