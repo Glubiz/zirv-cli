@@ -439,6 +439,8 @@ pub struct RuntimeConfig {
     pub default: Option<String>,
     /// Overrides keyed by native role names, taking precedence over `default`.
     pub roles: std::collections::BTreeMap<String, String>,
+    /// Optional `5m`/`1h` prompt-cache TTL for native Anthropic requests; unset leaves them uncached (#766).
+    pub prompt_cache_ttl: Option<String>,
 }
 
 /// Operator-only native integrations: repos cannot add executable commands, network endpoints or auth references (#483).

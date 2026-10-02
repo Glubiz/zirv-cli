@@ -880,6 +880,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     ),
     // Operator runtime override; also named in forbidden repo-config errors (#491).
     ("ZIRV_CTX_RUNTIME", &["runtime", "default"], EnvKind::Str),
+    (
+        "ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL",
+        &["runtime", "prompt_cache_ttl"],
+        EnvKind::Str,
+    ),
     // Operator proxy overrides; every corresponding config key is repo-forbidden (#537).
     (
         "ZIRV_CTX_PROXY_ENABLED",

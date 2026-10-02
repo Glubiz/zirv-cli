@@ -4820,12 +4820,8 @@ bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
 substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also what an Architectural-complexity request reads; see below
 ```
 
-`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child. The
-same key also opts a native Anthropic route into prompt caching: `"1h"` puts a
-one-hour `cache_control` breakpoint on the stable prefix (system prompt, else
-last tool definition) and never on the moving tail, `"5m"` uses the default
-cache TTL; unset leaves native requests uncached, and every other native
-provider (Bedrock, Google, OpenAI) is unchanged. The
+`prompt_cache_ttl` sets env `CLAUDE_CODE_PROMPT_CACHE_TTL` on the child; it
+does not affect native sessions (see `[runtime] prompt_cache_ttl`). The
 `effort` table classifies the prompt text with the SAME deterministic
 classifier the intake hook uses (`proxy::decision::try_classify_request`,
 text-only by default -- see `jev.launch_effort` below for the opt-in
@@ -5650,6 +5646,13 @@ this table"; `zirv chat` with no `--runtime` resolves the same way at the
 harness with a one-line note rather than failing the command — `zirv ctx
 doctor` is where it is reported. The whole `[runtime]` table is
 `REPO_FORBIDDEN` (see [Trust boundary](#trust-boundary)).
+
+`[runtime] prompt_cache_ttl = "1h"` (or `"5m"`; `ZIRV_CTX_RUNTIME_PROMPT_CACHE_TTL`)
+opts native Anthropic sessions into prompt caching: `"1h"` puts a one-hour
+`cache_control` breakpoint on the stable prefix (system prompt, else last tool
+definition) and never on the moving tail, `"5m"` uses the default cache TTL.
+Unset (the default) leaves native requests uncached; Bedrock, Google and OpenAI
+routes are unchanged. It is independent of `[headless].prompt_cache_ttl`.
 
 **Migration and rollback.** `zirv ctx config migrate [--to harness|native]
 [--dry-run]` brings `~/.zirv/ctx.toml` to schema 2 — the `[runtime]` table

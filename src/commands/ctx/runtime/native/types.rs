@@ -495,13 +495,13 @@ pub struct NativeSessionConfig {
     pub prompt_cache: CacheMode,
 }
 
-/// Opt-in `[headless].prompt_cache_ttl` for native routes whose API supports prompt-cache TTLs
+/// Opt-in `[runtime].prompt_cache_ttl` for native routes whose API supports prompt-cache TTLs
 /// (Anthropic only); every other provider and the unset default stay `Disabled` (#766).
 pub fn prompt_cache_for(cfg: &super::super::super::config::CtxConfig, provider: &str) -> CacheMode {
     if provider != "anthropic" {
         return CacheMode::Disabled;
     }
-    match cfg.headless.prompt_cache_ttl.as_deref() {
+    match cfg.runtime.prompt_cache_ttl.as_deref() {
         Some("1h") => CacheMode::Ephemeral1h,
         Some("5m") => CacheMode::Ephemeral5m,
         _ => CacheMode::Disabled,
@@ -568,7 +568,7 @@ mod tests {
             super::prompt_cache_for(&cfg, "anthropic"),
             super::CacheMode::Disabled
         );
-        cfg.headless.prompt_cache_ttl = Some("1h".to_string());
+        cfg.runtime.prompt_cache_ttl = Some("1h".to_string());
         assert_eq!(
             super::prompt_cache_for(&cfg, "anthropic"),
             super::CacheMode::Ephemeral1h
@@ -577,7 +577,7 @@ mod tests {
             super::prompt_cache_for(&cfg, "bedrock"),
             super::CacheMode::Disabled
         );
-        cfg.headless.prompt_cache_ttl = Some("5m".to_string());
+        cfg.runtime.prompt_cache_ttl = Some("5m".to_string());
         assert_eq!(
             super::prompt_cache_for(&cfg, "anthropic"),
             super::CacheMode::Ephemeral5m
