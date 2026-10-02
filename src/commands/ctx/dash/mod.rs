@@ -991,11 +991,6 @@ fn run_dashboard_inner(
                 (state.clone(), repo.to_path_buf(), cfg.clone());
             let codex_root =
                 std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex/sessions"));
-            let seat_model = facts_cache
-                .disk
-                .seat_full
-                .as_ref()
-                .and_then(|s| s.model.clone());
             let seat_session = facts_cache
                 .disk
                 .seat_full
@@ -1006,7 +1001,6 @@ fn run_dashboard_inner(
                     &tree_state,
                     &tree_repo,
                     codex_root.as_deref(),
-                    seat_model.as_deref(),
                     seat_session.as_deref(),
                     &tree_cfg,
                 )

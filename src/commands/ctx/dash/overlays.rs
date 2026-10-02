@@ -901,7 +901,7 @@ pub(super) const INSPECT_ERRORS: &str = "errors";
 /// Use the same inspector sections for the dashboard target (#354).
 pub(super) const INSPECT_DASH_HARNESS: &str = "harness";
 pub(super) const INSPECT_DASH_SESSIONS: &str = "sessions";
-pub(super) const INSPECT_DASH_SPEND: &str = "spend";
+pub(super) const INSPECT_DASH_DELEGATION: &str = "delegation";
 pub(super) const INSPECT_DASH_USAGE: &str = "usage";
 pub(super) const INSPECT_DASH_REPO: &str = "repo";
 pub(super) const INSPECT_DASH_DASHBOARD: &str = "dashboard";
@@ -1129,30 +1129,10 @@ pub(super) fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::Inspe
         name: INSPECT_DASH_SESSIONS.to_string(),
         lines: session_lines,
     };
-    let mut spend_lines = vec![
-        inspect_line(
-            "delegated",
-            facts.spend.map(|s| format!("{} failed", s.failed)),
-        ),
-        inspect_line(
-            "cost",
-            facts
-                .spend
-                .map(|s| super::price::format_usd(s.cost_micros, false)),
-        ),
-    ];
-    // Show unknown-priced work only when its count is nonzero (#457).
-    if let Some(spend) = facts.spend
-        && spend.skipped_messages > 0
-    {
-        spend_lines.push(inspect_line(
-            "unpriced",
-            Some(format!(
-                "{} message(s)/row(s) skipped (no known price)",
-                spend.skipped_messages
-            )),
-        ));
-    }
+    let mut spend_lines = vec![inspect_line(
+        "delegated",
+        facts.spend.map(|s| format!("{} failed", s.failed)),
+    )];
     for strip in facts.pool {
         spend_lines.push(inspect_line(
             &strip.name,
@@ -1166,7 +1146,7 @@ pub(super) fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::Inspe
         spend_lines.push(inspect_line("as of", Some(age(facts.facts_age_secs))));
     }
     let spend = ui::InspectorSection {
-        name: INSPECT_DASH_SPEND.to_string(),
+        name: INSPECT_DASH_DELEGATION.to_string(),
         lines: spend_lines,
     };
     let usage = ui::InspectorSection {
@@ -2698,11 +2678,7 @@ mod tests {
             sidebar_cols: 44,
             facts_age_secs: 1,
             rows: &rows,
-            spend: Some(AggregateSpendFacts {
-                failed: 2,
-                cost_micros: 420_000,
-                skipped_messages: 0,
-            }),
+            spend: Some(AggregateSpendFacts { failed: 2 }),
             usage: &usage,
             pool: &pool,
             mail: Some((1, 0)),
@@ -2718,7 +2694,7 @@ mod tests {
             vec![
                 INSPECT_DASH_HARNESS,
                 INSPECT_DASH_SESSIONS,
-                INSPECT_DASH_SPEND,
+                INSPECT_DASH_DELEGATION,
                 INSPECT_DASH_USAGE,
                 INSPECT_DASH_REPO,
                 INSPECT_DASH_DASHBOARD,
@@ -2736,7 +2712,7 @@ mod tests {
             );
         }
         assert!(all.contains("headroom 64%"), "{all}");
-        assert!(all.contains("$0.42"), "{all}");
+        assert!(!all.contains('$'), "no cost in the inspector: {all}");
         assert!(all.contains("5h 61%"), "{all}");
         assert!(all.contains("1 broadcast"), "{all}");
         assert!(all.contains("awaits approval"), "{all}");
