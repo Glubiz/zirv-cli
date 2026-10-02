@@ -411,10 +411,51 @@ pub fn auto_start_wanted(request: &str, policy: AutoStartPolicy) -> bool {
         AutoStartPolicy::Always => !request.trim().is_empty(),
         AutoStartPolicy::Detect => {
             !is_question(request)
-                && try_classify_request(request)
+                && (try_classify_request(request)
                     .is_some_and(|classification| classification.intent != Intent::Other)
+                    || has_work_cue(request))
         }
     }
+}
+
+/// Bug-report and investigation wording the leading-verb intent misses
+/// ("X is not working", "figure out why", "follow ups ... issues").
+fn has_work_cue(request: &str) -> bool {
+    const CUES: [&str; 26] = [
+        "figure out",
+        "find out",
+        "make sure",
+        "follow up",
+        "follow ups",
+        "not working",
+        "doesn t work",
+        "does not work",
+        "broken",
+        "fails",
+        "failed",
+        "bug",
+        "bugs",
+        "issue",
+        "issues",
+        "crash",
+        "crashes",
+        "error",
+        "errors",
+        "displays",
+        "renovate",
+        "mergeable",
+        "disable",
+        "why is",
+        "why does",
+        "i would like",
+    ];
+    let lower = request.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let padded = format!(" {} ", words.join(" "));
+    CUES.iter().any(|cue| padded.contains(&format!(" {cue} ")))
 }
 
 /// A leading interrogative, or a trailing `?` that is not a polite request
@@ -431,7 +472,6 @@ fn is_question(request: &str) -> bool {
         "how"
             | "what"
             | "whats"
-            | "why"
             | "when"
             | "where"
             | "who"
@@ -446,7 +486,22 @@ fn is_question(request: &str) -> bool {
     ) {
         return true;
     }
-    lower.ends_with('?') && !matches!(first, "can" | "could" | "would" | "will" | "please")
+    // Only a short single-line prompt without bug-report wording: a long report that ends in "?" still asks for work.
+    lower.ends_with('?')
+        && !has_work_cue(request)
+        && lower.len() < 200
+        && !lower.contains('\n')
+        && ![
+            "can you",
+            "could you",
+            "would you",
+            "please",
+            "i would like",
+            "i want",
+            "i need",
+        ]
+        .iter()
+        .any(|polite| lower.contains(polite))
 }
 
 /// A long or enumerated request describes several requirements; never
@@ -2687,6 +2742,35 @@ mod tests {
         assert_eq!(merged.execution, ExecutionMode::Orchestrated);
         assert_eq!(merged.seat_role, SeatRole::Orchestrator);
         assert!(merged.validation.independent_test);
+    }
+
+    /// Real first prompts (shortened) from recent sessions: bug reports,
+    /// issue lists, investigations, reviews and ops chores start a workflow;
+    /// how-questions, capability checks and chat do not.
+    #[test]
+    fn auto_start_detect_matches_real_first_prompts() {
+        let wanted = |text: &str| auto_start_wanted(text, AutoStartPolicy::Detect);
+        for start in [
+            "Follow ups for the new zirv orchestrator dashboard UI. Issues:\n1 - Not all approval requests appear\n6 - Workflows are not being triggered correctly",
+            "Investigate and fix the following issue: https://linear.app/x/issue/ABC-1",
+            "The list item block in the email builder is not working that well",
+            "The email flows view displays 2 versions of the closed due to date\nExpected: one version?",
+            "Why is this appended to my emails sent through CRM?",
+            "Figure out what can safely be removed from the disk to make room",
+            "Please review the following PR. It is important the implementation is right",
+            "I would like to route password reset mails to CRM on UK brands, can you make that happen?",
+            "Make the following MR's mergeable again:\nhttps://gitlab.example/mr/1",
+        ] {
+            assert!(wanted(start), "must start: {start}");
+        }
+        for skip in [
+            "How can we force certain transactional emails to be sent during the night?",
+            "Are you able to validate and generate motion graphics on this?",
+            "Read the messages between KNN and me on slack from the 29th",
+            "thanks, that makes sense",
+        ] {
+            assert!(!wanted(skip), "must not start: {skip}");
+        }
     }
 
     #[test]
