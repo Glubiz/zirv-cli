@@ -868,8 +868,8 @@ fn apply_slash_command(presentation: &mut NativePresentation, text: &str) -> Opt
             Some(String::new())
         }
         "/help" => Some(
-            "commands: /clear /compact /context /status /agents /agent /team /workflows \
-             /workflow /skills /skill \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C \
+            "commands: /clear /compact /context /status /settings /agents /agent /team \
+             /workflows /workflow /skills /skill \u{b7} keys: Enter submit, Esc interrupt, Ctrl+C Ctrl+C \
              quit, Shift+Tab cycle mode"
                 .to_string(),
         ),
@@ -1939,6 +1939,15 @@ pub fn render_native_dashboard(
     if area.height == 0 || area.width == 0 {
         return false;
     }
+    if let (Some(settings), None) = (&ux.settings, &ux.approval) {
+        let lines: Vec<StyledLine> = settings
+            .lines(area.width as usize, area.height as usize)
+            .into_iter()
+            .map(StyledLine::plain)
+            .collect();
+        render_styled(f, area, &lines);
+        return false;
+    }
     let plan = super::native_ux::resolve_layout(area.width as usize, area.height as usize);
     let usage_rows = (plan.usage_rows as u16).min(area.height.saturating_sub(6));
     let body_height = area.height - usage_rows;
@@ -2089,7 +2098,7 @@ fn composer_hint_line(presentation: &NativePresentation) -> String {
 }
 
 /// Bound completion rows so entry-mode lists fit the composer.
-pub const COMPLETION_ROWS: usize = 11;
+pub const COMPLETION_ROWS: usize = 12;
 
 /// Draw composer and completion list inside the pane's own region (#490).
 pub fn composer_block(
@@ -3723,6 +3732,71 @@ impl NativePaneRuntime {
         &mut self.presentation
     }
 
+    /// Run `f` with this pane's repo and process environment.
+    fn with_settings_ctx<T>(
+        &self,
+        f: impl FnOnce(&super::super::config::settings::SettingsCtx<'_>) -> T,
+    ) -> T {
+        let env = super::super::config::env_from_process();
+        f(&super::super::config::settings::SettingsCtx {
+            repo: &self.repo,
+            env: &env,
+        })
+    }
+
+    /// `/settings`, `/settings <query>` and the `get|set|reset` text forms (#536).
+    fn settings_slash(&mut self, args: &str) {
+        use super::super::config::settings::{self, Slash};
+        match self.with_settings_ctx(|ctx| settings::slash(ctx, args)) {
+            Slash::Notice(text) => self.notice = Some(text),
+            Slash::Open(query) => match self.with_settings_ctx(settings::rows) {
+                Ok(rows) => {
+                    self.ux.settings = Some(super::settings_view::SettingsState::new(rows, &query));
+                    self.ux.focus = super::native_ux::Focus::Settings;
+                }
+                Err(error) => self.notice = Some(format!("/settings: {error}")),
+            },
+        }
+    }
+
+    /// Feed one key to the open settings modal and perform the write it asks for.
+    pub fn settings_key(&mut self, key: KeyEvent) {
+        use super::super::config::settings::{self, Change};
+        use super::settings_view::SettingsAction;
+        let Some(state) = self.ux.settings.as_mut() else {
+            return;
+        };
+        let action = state.key(key);
+        let result = match &action {
+            SettingsAction::None => return,
+            SettingsAction::Close => {
+                self.ux.settings = None;
+                self.ux.focus = super::native_ux::Focus::Composer;
+                return;
+            }
+            SettingsAction::Save { key, raw, scope } => {
+                self.with_settings_ctx(|ctx| settings::change(ctx, key, Change::Set(raw), *scope))
+            }
+            SettingsAction::Reset { key, scope } => {
+                self.with_settings_ctx(|ctx| settings::change(ctx, key, Change::Reset, *scope))
+            }
+        };
+        let rows = self.with_settings_ctx(settings::rows);
+        let Some(state) = self.ux.settings.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(message) => {
+                state.set_message(message);
+                state.finish_edit();
+                if let Ok(rows) = rows {
+                    state.set_rows(rows);
+                }
+            }
+            Err(error) => state.set_message(error.to_string()),
+        }
+    }
+
     /// Applies one composer action, and -- when it was a `Submit` -- routes
     /// the submitted text per [`classify_submit_intent`]. A blocked/mid-turn
     /// submission is never sent through `InteractiveSession::submit`
@@ -3745,6 +3819,13 @@ impl NativePaneRuntime {
                 status_label(classify_status(&facts)),
                 facts.billing
             ));
+            return;
+        }
+        // Settings is zirv control input: handled here, never journaled or sent to the model (#536).
+        if let Some(args) = text.trim().strip_prefix("/settings")
+            && (args.is_empty() || args.starts_with(char::is_whitespace))
+        {
+            self.settings_slash(args);
             return;
         }
         // Resolve agent and team commands with this pane's repo and state access (#541).
@@ -4313,6 +4394,10 @@ pub fn handle_native_key(
         return NativeKey::Consumed;
     }
     *last_ctrl_c = None;
+    if pane.ux().approval.is_none() && pane.ux().settings.is_some() {
+        pane.settings_key(key);
+        return NativeKey::Consumed;
+    }
     // `Ctrl+R` toggles the most recent tool call's expanded state regardless
     // of focus -- the same action the composer's own `e`/`Enter`-while-
     // `Transcript`-focused binding below reaches, just reachable from either
@@ -6377,6 +6462,80 @@ mod tests {
             cwd: PathBuf::from("."),
             git_branch: None,
         }
+    }
+
+    fn submit_text(pane: &mut NativePaneRuntime, text: &str) {
+        pane.presentation.composer.draft = text.to_string();
+        pane.presentation.composer.cursor = text.len();
+        pane.handle_composer_action(ComposerAction::Submit);
+    }
+
+    /// Issue #536: `/settings` in every form is zirv control input -- it never becomes a
+    /// journaled user turn and never reaches the model.
+    #[test]
+    fn settings_commands_never_produce_a_journal_turn() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        pane.repo = tempfile::tempdir().expect("repo").keep();
+        pane.journal
+            .create_session(&identity_for("sess-1", 1))
+            .expect("create session");
+        let before = pane.journal.replay(&pane.session_id).expect("replay");
+
+        for text in [
+            "/settings set score.window 4",
+            "/settings get score.window",
+            "/settings reset score.window",
+            "/settings score",
+        ] {
+            submit_text(&mut pane, text);
+        }
+
+        let after = pane.journal.replay(&pane.session_id).expect("replay");
+        assert_eq!(after.last_sequence, before.last_sequence);
+        assert_eq!(after.messages.len(), before.messages.len());
+        assert!(pane.presentation.composer.queued.is_empty());
+        assert!(pane.ux.settings.is_some(), "the last form opens the modal");
+        assert_eq!(pane.ux.focus, super::super::native_ux::Focus::Settings);
+        assert!(pane.ux.modal_open());
+    }
+
+    #[test]
+    fn the_settings_modal_edits_a_key_by_keyboard_and_esc_closes_it() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let mut pane = pane_fixture(&state, "s1", "sess-1", 1, None);
+        pane.repo = tempfile::tempdir().expect("repo").keep();
+        submit_text(&mut pane, "/settings score.window");
+        let press = |pane: &mut NativePaneRuntime, code: KeyCode| {
+            pane.settings_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        press(&mut pane, KeyCode::Enter);
+        press(&mut pane, KeyCode::Char('7'));
+        press(&mut pane, KeyCode::Enter);
+        let written =
+            std::fs::read_to_string(super::super::config::operator_path().expect("operator path"))
+                .expect("ctx.toml written");
+        assert_eq!(written, "[score]\nwindow = 7\n");
+        let rows = pane
+            .ux
+            .settings
+            .as_ref()
+            .expect("still open")
+            .lines(100, 20)
+            .join("\n");
+        assert!(
+            rows.contains("score.window") && rows.contains("user"),
+            "{rows}"
+        );
+        press(&mut pane, KeyCode::Esc);
+        assert!(pane.ux.settings.is_none());
+        assert_eq!(pane.ux.focus, super::super::native_ux::Focus::Composer);
     }
 
     /// Issue #538 (chunk C), decision 3: `/context` renders real rows from

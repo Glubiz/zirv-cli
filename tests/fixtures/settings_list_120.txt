@@ -1,0 +1,13 @@
++-- /settings ------------------------------------------------------------------------------------------- 2 settings --+
+| search: pace_                                                                                                        |
+|                                                                                                                      |
+|   KEY                            VALUE        SOURCE     SCOPES  APPLIES                                             |
+| > pace.enabled                   true         default    U P     next session                                        |
+|   pace.max_wait_secs             900          project    U P     next session                                        |
+|----------------------------------------------------------------------------------------------------------------------|
+| pace.enabled  (bool, default: built-in)                                                                              |
+| pace.enabled description                                                                                             |
+| Winning layer: default. Shadowed: none. Applies: next session. U=user P=project                                      |
+|----------------------------------------------------------------------------------------------------------------------|
+| type to filter Up/Down move Enter edit Ctrl+R reset Esc close                                                        |
++----------------------------------------------------------------------------------------------------------------------+

@@ -29,6 +29,7 @@ mod overlays;
 mod pane_rollover;
 mod reap;
 mod selection_clipboard;
+pub mod settings_view;
 mod sidebar_facts;
 mod spawn_policy;
 mod subagent_focus;

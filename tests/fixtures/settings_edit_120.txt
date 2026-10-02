@@ -1,0 +1,14 @@
++-- /settings -------------------------------------------------------------------------------------------- 1 setting --+
+| search: max_wait_                                                                                                    |
+|                                                                                                                      |
+|   KEY                            VALUE        SOURCE     SCOPES  APPLIES                                             |
+| > pace.max_wait_secs             900          project    U P     next session                                        |
+|----------------------------------------------------------------------------------------------------------------------|
+| pace.max_wait_secs  (integer, default: built-in)                                                                     |
+| new value: 900_                                                                                                      |
+| scope: (o) user ~/.zirv/ctx.toml ( ) project (narrows only)                                                          |
+| applies: next session                                                                                                |
+| pace.max_wait_secs: expected an integer                                                                              |
+|----------------------------------------------------------------------------------------------------------------------|
+| Enter save Tab scope Ctrl+R reset to inherited Esc cancel                                                            |
++----------------------------------------------------------------------------------------------------------------------+

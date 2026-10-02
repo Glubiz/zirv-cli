@@ -3583,7 +3583,22 @@ trailing text as a task, starts it) and `/workflow status [id]` shows a
 running workflow's status -- all three rendered through the exact same
 `workflow::engine` writer functions the headless `--json`/text CLI uses
 (issue #542 chunk 3b), so the pane and `zirv workflow list`/`show`/`status`
-can never disagree about the same state. `@` file references and a
+can never disagree about the same state. `/settings` opens a searchable,
+keyboard-only list of every configuration key (name, effective value, winning
+layer, scopes `U`ser/`P`roject, reload timing) with a one-line
+detail footer; type to filter, `Up`/`Down` move, `Enter` edits the focused
+row, `Tab` cycles its scope, `Ctrl+R` resets it to the inherited value,
+`Esc` cancels and then closes. `/settings <query>` opens the list filtered,
+`/settings get <key>`, `/settings set <key> <value> [--scope user|project]`
+and `/settings reset <key> [--scope ...]` print one notice instead. It is
+zirv control input: never journaled, never sent to the model. User-scope
+writes go through the exact validated, comment-preserving, atomic edit
+`zirv ctx config set` uses (and are refused when the file changed since it was
+read); project scope writes `<repo>/.zirv/ctx.toml` only for keys a repository
+may set and only when the value narrows, refusing before anything is written;
+there is no session scope yet. Credential-like keys render as
+`(redacted)` and are never accepted. No key is known to reload live, so every
+row says `next session` and a write never claims otherwise. `@` file references and a
 `!`-prefixed shell line are not wired into this loop yet.
 
 `--runtime native` is **not** a separate dashboard any more: the native
@@ -4956,6 +4971,7 @@ keep only your own.
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |

@@ -33,6 +33,7 @@ mod jev_settings;
 mod pace_settings;
 mod prompt_settings;
 mod repo_layer;
+pub mod settings;
 mod supervisor_settings;
 mod validate;
 
@@ -43,10 +44,10 @@ pub use pace_settings::*;
 pub use prompt_settings::*;
 pub use repo_layer::is_repo_forbidden;
 use repo_layer::{
-    ENV_MAP, add_config_error_prefix, bool_at, combine_additive_array, deploy_tier_at, env_value,
-    fallback_harness_map_at, float_at, insert_path, integer_at, merge, narrow_fallback_harness,
-    narrow_fallback_order, narrow_max, narrow_max_f64, narrow_min, narrow_min_f64,
-    narrow_objective_gates, narrow_orchestrator_writes, orchestrator_writes_at,
+    ENV_MAP, REPO_FORBIDDEN, add_config_error_prefix, bool_at, combine_additive_array,
+    deploy_tier_at, env_value, fallback_harness_map_at, float_at, insert_path, integer_at, merge,
+    narrow_fallback_harness, narrow_fallback_order, narrow_max, narrow_max_f64, narrow_min,
+    narrow_min_f64, narrow_objective_gates, narrow_orchestrator_writes, orchestrator_writes_at,
     reject_untrusted_keys, reject_untrusted_workspace_execution, string_array, string_array_at,
     take_nested, take_nested3, value_at,
 };

@@ -1469,7 +1469,7 @@ fn parse_bool(raw: &str) -> CtxResult<bool> {
 }
 
 /// Repos cannot choose launched binaries, failure commands or spending models; operator config, env and flags may.
-const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
+pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["agent_bin"], "ZIRV_CTX_AGENT_BIN"),
     // Configured agent selection bypasses the fallback loop's repo-disable guard; repos must not select the vendor account.
     (&["agent"], "ZIRV_CTX_AGENT"),
