@@ -1655,6 +1655,10 @@ mod tests {
             // `testenv::scrub_supervision_env_for_test_cmd`'s own doc comment
             // for why this is a test-side scrub, not an extended production one.
             crate::commands::ctx::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
+            // Same as the unix harness: the sandbox posture's `Read(./**)`-style rules carry
+            // cmd.exe metacharacters, which `guard_cmd_shim_reparse` refuses behind `cmd /c`.
+            cmd.env("ZIRV_CTX_PACE", "false");
+            cmd.env("ZIRV_CTX_SANDBOX", "false");
             // No terminal: this is also the CI/piped case, which is exactly
             // why the synthetic cursor report cannot be left to a real
             // terminal to send.
