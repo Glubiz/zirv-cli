@@ -710,6 +710,37 @@ pub(super) fn protect_worker_task_prompt(
     )
 }
 
+/// Leave the pane's parent, task and workflow step in the agent graph; the session record the
+/// pane registers is swept once it ends.
+fn record_pane_launch(
+    state: &StateDir,
+    repo: &Path,
+    req: &spawnreq::SpawnRequest,
+    session: &str,
+    verified_parent: Option<&str>,
+    workdir: &Path,
+    now: u64,
+) {
+    let parent = verified_parent.or(req
+        .parent_session
+        .as_deref()
+        .filter(|id| prompt::is_addressable_short(id)));
+    super::super::graph::record_worker_launch(
+        state,
+        repo,
+        &super::super::graph::Launch {
+            session,
+            origin: "pane",
+            parent_session: parent,
+            harness: Some(&req.agent),
+            model: req.model.as_deref(),
+            task: Some(&req.prompt),
+            workdir: Some(workdir),
+        },
+        now,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fulfill_spawn_request(
     req: &spawnreq::SpawnRequest,
@@ -844,6 +875,15 @@ pub(super) fn fulfill_spawn_request(
         pane.set_report_to(report_to_for(req, cfg));
         pane.set_parent_session(verified_parent.clone());
         let short = pane.short().to_string();
+        record_pane_launch(
+            state,
+            repo,
+            req,
+            pane.session_id(),
+            verified_parent.as_deref(),
+            &spawn_cwd,
+            super::state::now_secs(),
+        );
         panes.push(pane);
         nudge_queues.push(VecDeque::new());
         return Ok((short, Vec::new(), None));
@@ -1329,6 +1369,15 @@ pub(super) fn fulfill_spawn_request(
         pane.set_owns_cwd();
     }
     let short = pane.short().to_string();
+    record_pane_launch(
+        state,
+        repo,
+        req,
+        pane.session_id(),
+        verified_parent.as_deref(),
+        &spawn_cwd,
+        now,
+    );
     // Claim a coordinator's work group on this dashboard path and close it on reap (#170).
     if matches!(requested_role, prompt::PromptRole::SubOrchestrator)
         && let Some(group_id) = &req.work_group_id

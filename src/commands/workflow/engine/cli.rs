@@ -680,13 +680,13 @@ pub(crate) fn auto_spawn_decision(
 }
 
 #[cfg(unix)]
-pub(super) fn detach(command: &mut std::process::Command) {
+pub(crate) fn detach(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(windows)]
-pub(super) fn detach(command: &mut std::process::Command) {
+pub(crate) fn detach(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;

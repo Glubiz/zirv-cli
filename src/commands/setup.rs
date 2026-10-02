@@ -118,19 +118,52 @@ pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
 pub(crate) const CLAUDE_SUBAGENT_STOP_HOOK: (&str, Option<&str>, &str) =
     ("SubagentStop", None, "zirv ctx hook subagent-stop");
 
+/// Issue #832: claude's `SubagentStart` hook records one agent-graph node.
+/// Observational only (prints nothing); claude-only like `SubagentStop`.
+pub(crate) const CLAUDE_SUBAGENT_START_HOOK: (&str, Option<&str>, &str) =
+    ("SubagentStart", None, "zirv ctx hook subagent-start");
+
+/// Issue #836: claude's `PostToolUseFailure` hook feeds the `[jev] retry` site; prints
+/// nothing unless that operator-only key is on. Claude-only like `SubagentStop`.
+pub(crate) const CLAUDE_TOOL_FAILURE_HOOK: (&str, Option<&str>, &str) =
+    ("PostToolUseFailure", None, "zirv ctx hook tool-failure");
+
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`. `CLAUDE_SAFETY_HOOK` is deliberately absent (issue
 /// #769: its own job now lives inside `CLAUDE_REHYDRATE_HOOK`'s dispatch, see
 /// that constant's own doc comment) -- it stays defined above only for the
 /// legacy-slot migration and self-suppression checks.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 6] = [
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 7] = [
     CLAUDE_REHYDRATE_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
     CLAUDE_PERMISSION_REQUEST_HOOK,
     CLAUDE_PERMISSION_DENIED_HOOK,
     CLAUDE_SUBAGENT_STOP_HOOK,
+    CLAUDE_SUBAGENT_START_HOOK,
 ];
+
+/// Whether `[jev] retry` or `[supervisor] enabled` is on in the effective operator config (both
+/// keys are repo-forbidden, so the working directory cannot change the answer). Off or unreadable
+/// config means off.
+pub(crate) fn tool_failure_hook_enabled() -> bool {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ctx::config::CtxConfig::load(&cwd, &ctx::config::env_from_process()).ok())
+        .is_some_and(|cfg| cfg.jev.retry || cfg.supervisor.enabled)
+}
+
+/// `CLAUDE_ONLY_HOOKS` plus the `PostToolUseFailure` hook only while `[jev] retry` or
+/// `[supervisor] enabled` is on, so a default install never spawns a process per tool failure (#836).
+pub(crate) fn claude_only_hooks(
+    tool_failure: bool,
+) -> Vec<(&'static str, Option<&'static str>, &'static str)> {
+    let mut hooks = CLAUDE_ONLY_HOOKS.to_vec();
+    if tool_failure {
+        hooks.push(CLAUDE_TOOL_FAILURE_HOOK);
+    }
+    hooks
+}
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
 /// (shared with codex) plus every entry in `CLAUDE_ONLY_HOOKS`. Codex's own
@@ -1225,7 +1258,13 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             hooks_added += 1;
         }
     }
-    for (event, matcher, command) in CLAUDE_ONLY_HOOKS {
+    let tool_failure = tool_failure_hook_enabled();
+    let mut tool_failure_removed = false;
+    if !tool_failure {
+        let (event, matcher, command) = CLAUDE_TOOL_FAILURE_HOOK;
+        tool_failure_removed = remove_harness_hook_at_slot(&mut settings, event, matcher, command);
+    }
+    for (event, matcher, command) in claude_only_hooks(tool_failure) {
         // Slot-scoped, not `ensure_harness_hook`'s whole-tree check -- see
         // `ensure_harness_hook_at_slot`'s own doc comment (Change 5d).
         if ensure_harness_hook_at_slot(&mut settings, event, matcher, command)? {
@@ -1259,7 +1298,12 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         );
         true
     };
-    if !dry_run && (hooks_added > 0 || statusline_added || legacy_safety_hook_removed) {
+    if !dry_run
+        && (hooks_added > 0
+            || statusline_added
+            || legacy_safety_hook_removed
+            || tool_failure_removed)
+    {
         std::fs::create_dir_all(
             settings_path
                 .parent()
@@ -1295,7 +1339,7 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         // hard `setup apply` failure; it just leaves these entries
         // `NoBaseline` in `zirv ctx hook status`.
         let mut current_shapes: Vec<ctx::hook_integrity::HookShape> = HARNESS_HOOKS.to_vec();
-        current_shapes.extend(CLAUDE_ONLY_HOOKS);
+        current_shapes.extend(claude_only_hooks(tool_failure));
         // Issue #420 (delta-review fix): only baseline a shape that is
         // actually live at its own scoped slot -- `ensure_harness_hook`
         // skipped inserting it merely because `contains_command` found the
@@ -2983,7 +3027,7 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         // events, so a whole-tree search would count both as installed the
         // moment either slot is live. `command_live_at_slot` judges each
         // entry by its own (event, matcher) slot instead.
-        + CLAUDE_ONLY_HOOKS
+        + claude_only_hooks(tool_failure_hook_enabled())
             .iter()
             .filter(|(event, matcher, command)| {
                 command_live_at_slot(&claude_settings, event, *matcher, command)
@@ -3022,7 +3066,7 @@ fn status(repo: &Path) -> SetupResult<SetupStatus> {
         context_codex: ctx::context::codex_path(repo).is_file(),
         shared_memory_entries,
         claude_hooks_installed,
-        claude_hooks_total: CLAUDE_HOOKS_TOTAL,
+        claude_hooks_total: CLAUDE_HOOKS_TOTAL + usize::from(tool_failure_hook_enabled()),
         claude_statusline,
         codex_hooks_installed,
         codex_hooks_total: HARNESS_HOOKS.len(),
@@ -5188,6 +5232,56 @@ mod tests {
             ),
             "an operator hook sharing that same slot must survive: {settings}"
         );
+    }
+
+    /// Issue #836: `PostToolUseFailure` is registered only while `[jev] retry` (or #835's
+    /// `[supervisor] enabled`) is on; `apply`
+    /// removes it when off, and the hook-integrity rows follow the same switch.
+    #[test]
+    fn tool_failure_hook_follows_the_retry_key_in_apply_and_integrity() {
+        let home = tempfile::tempdir().expect("home");
+        let state = tempfile::tempdir().expect("state");
+        let state_dir = state.path().display().to_string();
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        let live = |expect: bool| {
+            let settings = load_json_object(&settings_path).expect("settings");
+            let (event, matcher, command) = CLAUDE_TOOL_FAILURE_HOOK;
+            assert_eq!(
+                command_live_at_slot(&settings, event, matcher, command),
+                expect
+            );
+            let state = ctx::state::StateDir::from_root(state.path().to_path_buf());
+            let rows = ctx::hook_integrity::report(&state, home.path()).expect("rows");
+            assert_eq!(
+                rows.iter().any(|row| row.event == "PostToolUseFailure"),
+                expect,
+                "integrity rows must agree with the switch"
+            );
+        };
+
+        assert!(!claude_only_hooks(false).contains(&CLAUDE_TOOL_FAILURE_HOOK));
+        assert!(claude_only_hooks(true).contains(&CLAUDE_TOOL_FAILURE_HOOK));
+
+        let _on = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("ZIRV_CTX_STATE_DIR", Some(state_dir.as_str())),
+            ("ZIRV_CTX_JEV_RETRY", Some("true")),
+        ]);
+        install_claude_integration(home.path(), false).expect("apply on");
+        live(true);
+
+        let _off =
+            crate::commands::ctx::testenv::VarGuard::set(&[("ZIRV_CTX_JEV_RETRY", Some("false"))]);
+        install_claude_integration(home.path(), false).expect("apply off");
+        live(false);
+
+        // `[supervisor] enabled` installs the same hook (#835), with retry still off.
+        let _supervisor = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("ZIRV_CTX_SUPERVISOR_ENABLED", Some("true")),
+            ("ZIRV_CTX_SUPERVISOR_MODEL", Some("m")),
+        ]);
+        install_claude_integration(home.path(), false).expect("apply supervisor");
+        live(true);
     }
 
     /// Change 5d: `zirv setup apply` wires `zirv ctx hook permission` into

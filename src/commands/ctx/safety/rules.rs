@@ -229,7 +229,7 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
             origin: Origin::BuiltIn,
         });
     }
-    if is_permissions_compile_write(&tokens) {
+    if is_permissions_compile_write(&tokens) || is_supervisor_override(&tokens) {
         return None;
     }
     prompt_free_path(&tokens[1..]).map(|path| Rule {
@@ -367,6 +367,10 @@ fn built_in_structural_rule_matches(rule: &Rule, command: &str) -> Option<bool> 
                     && tokens.iter().skip(2).any(|target| target.contains("zirv"))
             }))
         }
+        "zirv ctx supervisor override*" => Some(
+            sql_tokens(&collapse_whitespace(command))
+                .is_some_and(|tokens| is_supervisor_override(&tokens)),
+        ),
         "* | sh" | "* | bash" | "* | zsh" | "*| sh" | "*| bash" => {
             // The semantic pipeline analyzer below owns this family so it
             // can require a network-fetching upstream stage.
@@ -1648,6 +1652,83 @@ mod tests {
                 "zirv ctx kill must be allow under {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_override_prompts_in_every_spelling_the_hook_parses() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "/usr/local/bin/zirv ctx supervisor override x",
+            "./target/debug/zirv ctx supervisor override x",
+            "zirv  ctx   supervisor  override x",
+            "bash -c 'zirv ctx supervisor override x'",
+            "sh -c \"/abs/zirv ctx supervisor override x\"",
+            "echo $(zirv ctx supervisor override x)",
+            "a && zirv ctx supervisor override x",
+            "true; ./zirv ctx supervisor override x --reason y",
+            "FOO=1 /abs/zirv ctx supervisor override x",
+            "env X=1 ./target/debug/zirv ctx supervisor override x",
+            "zirv\tctx supervisor override x",
+            "'zirv' ctx supervisor override x",
+            "ZIRV.exe ctx supervisor override x",
+            "(cd /tmp && /abs/zirv ctx supervisor override x)",
+            "if true; then ./zirv ctx supervisor override x; fi",
+            "ZIRV_CTX_SESSION= ./zirv ctx supervisor override x",
+            "bash -c \"cd /x && ./zirv  ctx supervisor override x\"",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Ask,
+                    "{command} under {mode:?}"
+                );
+            }
+        }
+        for command in [
+            "./target/debug/zirv ctx supervisor ask q --option a --option b",
+            "a && zirv ctx supervisor status",
+        ] {
+            assert_ne!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} must not prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_override_is_never_auto_allowed_or_escape_safe_but_ask_is() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "zirv ctx supervisor override r-1",
+            "zirv ctx supervisor override r-1 --reason x",
+            "ZIRV_CTX_SESSION= zirv ctx supervisor override r-1",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_ne!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} must surface as a prompt under {mode:?}"
+                );
+            }
+            assert!(!is_reserved_zirv_escape_safe(command), "{command}");
+        }
+        assert!(
+            !builtin_allow()
+                .iter()
+                .any(|r| r.pattern == "zirv ctx supervisor *"),
+            "no verb-level supervisor glob"
+        );
+        assert!(is_reserved_zirv_escape_safe("zirv ctx supervisor status"));
+        assert_eq!(
+            evaluate(
+                &policy,
+                "zirv ctx supervisor ask q --option a --option b",
+                LaunchMode::Headless
+            )
+            .verdict,
+            Verdict::Allow
+        );
     }
 
     /// Spec Change 2's read-verb entries (`kubectl get/logs/describe/

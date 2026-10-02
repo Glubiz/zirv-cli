@@ -357,9 +357,157 @@ harness in place — see [Cross-harness fallback and
 handover](#cross-harness-fallback-and-handover) below), `z` zooms the focused
 pane, `b` shows/hides the session column (it hides itself below 100 total
 columns; `b` forces it back regardless of width, or hides it again), `e`
-shows recent errors, `?`/`h` shows help, and `q` quits. On quit, the
-dashboard writes a restore roster so a next launch can offer to reopen the
-same panes.
+shows recent errors, `t` switches to the agent tree (below), `?`/`h` shows
+help, and `q` quits. On quit, the dashboard writes a restore roster so a next
+launch can offer to reopen the same panes.
+
+`Ctrl+A t` (also in the palette and the help overlay) swaps the dashboard for
+the **orchestrator dashboard** (issues #833, #843) and back. The classic
+dashboard stays the default view and panes keep running and receiving output
+underneath; the toggle keeps the selection and focus, and while the orchestrator
+dashboard is shown unprefixed keys and the mouse never reach a hidden pane. It
+is a dashboard about the session, not a chat window: no chat is visible until you
+open an agent, and it answers what is going on, how far the workflow has got and
+how the agents work together.
+
+From 100 columns and 35 rows up it has these panels, top to bottom. It is drawn
+in a fixed palette with real panel backgrounds and rounded borders (24-bit
+colour when `COLORTERM` is `truecolor` or `24bit`, else the nearest of the 256
+colours, decided once) and never uses the terminal's dim attribute:
+
+- **Header**: `zirv <repo> · seat <model> · <role>`; on the right a breathing
+  `⚑ N need you` badge or `✓ all clear`, the seat harness's `usage 5h` reading and
+  the session `spend` (the sidebar's own cached facts, never computed again; an
+  unknown reading is left out), and `? keys`.
+- **Workflow stepper**: `WORKFLOW <pack> · <task>`, each step `✓` done, a turning
+  spinner on the current one or `○` to do, joined by `━━━` after a done step (a
+  light runs along them) and `───` after the others, with `step i/n · <elapsed> ·
+  next gate <gate>` on the right. The steps win over the title, which is cut at a
+  word. With no active workflow it says `No workflow running`.
+- **FLOW**: the seat card with its counts, the **Jev** box (its three newest
+  decisions with site, verdict, a confidence bar, `sure` or `unsure` and age; the
+  seat's line runs through it; `jev off` only when no `[jev]` site is on and the
+  harness proxy does not use TypeSafe), a bus, and one 11-row card per agent: a
+  status glyph (turning braille spinner for running, `⚑` waiting, `✓` done, `✗`
+  failed), the job as its title (two lines, cut at a word), `model · age`, a rule,
+  what it is doing now and its last four steps with their ages. Light flows down the
+  bus to working agents; a dispatch, mail, finish, ask or answer sends a glyph along
+  it, the borders of working and waiting cards breathe, and a new Jev decision flashes
+  Jev's border. Finished agents older than four minutes fold into clickable
+  `FINISHED` pills. The agent order and the scrolling of many rows are as before
+  (wheel, `PgUp`/`PgDn`, arrows). Terminals that are too short shrink the cards, then
+  Jev, before they drop anything.
+- **NEEDS YOU** (right column): the oldest pending approval as a card: who asks (the
+  agent's job), where, how long ago, the whole command wrapped by column to four lines
+  and coloured, why it needs you, and `y Allow once`, `a Always allow`, `d Deny`, `⏎
+  Open its harness`. `y` and `d` are drawn faint and do nothing unless the whole
+  command is shown; `a` unless the request offers it. `1 of N` counts the pending
+  ones. Open supervisor rulings (`not_done`, `revise`, `stop`) are listed too, and `o` overrides
+  the oldest. Under it a compact list: further requests, failed agents, sessions whose
+  attention latch says they wait for you, stalled sessions, and the workflow's next gate.
+  Nothing pending reads `✓ Nothing needs you right now`.
+- **SELECTED** (right column), `PREVIEW` while the pointer hovers another node: status,
+  model, kind (`Codex pane`, `Claude subagent, inside seat`), where it runs, workflow
+  step, what it is doing now and its recent steps. For Jev: today's decisions, cost and
+  how many were unsure, the enabled sites and what it does. Chips `⏎ Open`, `m
+  Message`, `n Nudge`, `x Stop`; one whose action does not apply (`n`, `x` need a pane)
+  is faint and does nothing.
+- **ACTIVITY**: six rows of the merged event log, `time  from ──◆──▶ to  text`, with
+  the glyph for mail `✉`, a Jev or proxy decision `◆`, the supervisor `»`, a dispatch
+  `●` and an agent's ask of you `⚑`; a new row is lit for two seconds. A click on a
+  row selects its agent.
+- **Key bar**: chips for the keys that apply now (`y`/`a`/`d` only while a request is
+  pending), a chip is drawn whole or not at all, and a faint hint row under it. A
+  toast shows on the FLOW border for a few seconds.
+
+Everything animated is drawn from an injected clock and starts only when a background
+gather brings something the previous one did not hold; the view redraws about 15
+times a second while it shows and the classic dashboard's tick is unchanged. Below 100
+columns, or when the terminal is shorter than 35 rows, the earlier tiers draw instead:
+a compact A with the seat and Jev cards hung on the bus, and below 80x24 an indented
+list.
+
+Keys (plain keys while the view shows; every `^A` chord keeps working):
+
+| Key | Does |
+| --- | --- |
+| `←` `→` `h` `l` | previous / next: the seat, Jev, then the agents |
+| `↑` `↓` `k` `j` | the seat, Jev, then a row of agents at a time |
+| `Tab` `Shift+Tab` | every node in turn |
+| `⏎` | open the selected agent's own harness (Jev has none) |
+| `o` | Override the oldest open supervisor ruling shown in NEEDS YOU |
+| `y` `a` `d` | allow once / always allow / deny the request NEEDS YOU draws; `a` only when it offers it |
+| `m` | mail the agent; for a subagent without a pane, its host session, the text started `For your subagent <job>: ` |
+| `n` | nudge the agent (the nudge dialog) |
+| `x` | stop the agent, after `stop <agent>? y / n` (anything but `y` cancels) |
+| `+` | spawn a new agent (the spawn dialog) |
+| `r` | retry a failed pane (relaunch from its original request) |
+| `A` | activity: everything, or only the selected node's |
+| `s` | scope: this dashboard, this repo, all sessions |
+| `PgUp` `PgDn` | scroll the agent rows |
+| `?` | the key list (any key closes it) |
+| `Esc` | back to the classic dashboard |
+| `^A t` | the same, from an open chat back to the flow first |
+
+Mouse: one click on a card, the seat or a `FINISHED` pill opens that agent's own
+harness, never a custom view: a pane agent (Codex or Claude) opens its pane chat, and a
+native Claude subagent, which has no pane because it runs inside its root session's
+Claude Code, opens that session's pane chat, with the bar naming the subagent (when the
+host has no pane on this dashboard a notice names it). A click on Jev, a NEEDS YOU
+row or an activity row selects. A click on a chip does what its key does. Hovering
+previews a node in SELECTED; the terminal must report plain pointer motion for that (the
+dashboard asks for any-motion reports, `?1003`, only while the flow shows and never on
+Windows; otherwise only button, drag and wheel reports, so a terminal that sends no
+motion keeps the previous behaviour). The wheel scrolls the agent rows over the flow and
+the event log over the activity box.
+
+An agent's chat opens in place of the flow, under the header and stepper and a bar,
+`‹ Flow / <glyph> <agent> · <where it runs> · <harness model>`, where `‹ Flow` is a
+button, and with an **others** strip below it listing the other agents with their
+state glyphs. Clicking a name there opens that chat, `^A ←` and `^A →` move to the
+previous or next agent's chat, `^A t` or a click on `‹ Flow` goes back to the flow, and
+every other key, `Esc` included, goes to the agent. Terminals smaller than the
+orchestrator dashboard keep the one-line bar.
+
+Nothing is computed while the classic dashboard shows: the data is gathered on a
+background thread only while the view is visible, at the sidebar facts cadence
+(once a second), with no network call, and every frame is drawn from that and
+the dashboard's cached facts. The classic dashboard's rendering is untouched.
+
+**Approvals inbox** (issue #840, off by default). With `[approvals] inbox =
+true`, a Claude `PermissionRequest` from a pane of a live dashboard is held for
+that dashboard's operator instead of showing the pane's own dialog at once. A
+strip appears across the bottom of the dashboard and of an open agent chat ONLY
+while something is pending (with nothing pending the screens are byte-identical
+to a build without the feature): the oldest request first, with the agent,
+harness and model, pane, wait time, the tool and a redacted one-line preview.
+`^A y` allows it once, `^A Y` allows it and applies the always-allow rule Claude
+itself offered (shown as `^A Y always: <label>`, only when Claude sent one),
+`^A d` denies it, `^A ]` shows the next, `^A g` releases
+it to its pane's native dialog and goes there, and `^A a` lists every live
+dashboard's requests (a request another dashboard holds reads "answer in
+dashboard <pid>"). A `⚑ N approvals` header badge and a `⚑` marker on each
+waiting session row draw only while N is above zero. The terminal is shorter by
+the strip's five rows while it shows, so no pane output is hidden behind it;
+below 16 rows or 40 columns the strip is skipped and the badge and markers
+remain. The orchestrator dashboard draws no strip: its NEEDS YOU card shows the
+oldest request with `y`/`d` instead, and answers only one whose whole command it drew.
+A decision answers ONE call: the hook prints
+`hookSpecificOutput.decision.behavior` and sets `updatedPermissions` only for
+`^A Y` (always allow, below), so nothing else is cached as a lease. After `hold_secs`, on any error, a missing
+dashboard or a dashboard that quits, the hook prints nothing and the native
+dialog shows; the request then reads "waiting in pane" until a `PostToolUse`
+or `PermissionDenied` clears it. The installed `PermissionRequest` hook
+`timeout` is `hold_secs + 30` (only with the inbox on). Codex has no hook
+surface zirv can read, so its panes are never listed and never answered.
+
+The inbox is deliberately unreachable by agents: decisions travel only from the
+dashboard process to the hook over the dashboard's unix socket
+(`<state>/s/a<pid>.sock`), the hook checks the socket peer's pid against the
+session's recorded `owner_pid` before it sends anything, and the dashboard
+discards anything a client sends after its one request line. There is no
+approve or deny verb, no MCP tool and no mail path, and the request records
+under `<state>/approvals/` are display-only data the dashboard never trusts.
 
 The dashboard's own mouse reporting stays on for the whole session (subject
 only to `dash.mouse` below, the operator's on/off switch — there is no
@@ -804,6 +952,20 @@ never the message body itself, the same "advisory, not authority" rule
 addressing is a per-invocation argument, not something an operator or a repo
 would want to pin as a default.
 
+**Mid-turn delivery (Claude only, off by default).** With `[mail] mid_turn = true`
+(`ZIRV_CTX_MAIL_MID_TURN`, operator-only), Claude's `PostToolUse` hook returns
+mail addressed to this exact session (`--to-session`, including root-level
+mail filed in the mailbox it registered from) as `additionalContext`, merged
+beside any compaction or checkpoint note. Each message is framed as
+agent-authored (sender named, no user authority, information not
+instruction), rendered with the same envelope `zirv ctx inbox` prints, and
+moved to `read/` as it is delivered, so the idle-boundary advisory and later
+hooks never repeat it. At most 4 KiB is injected per call; a message that
+does not fit stays unread and is named once by a `N more: zirv ctx inbox`
+pointer. With the key off the hook does no mail work; with it on and no
+`ZIRV_CTX_SESSION` the hook does none either, and with an empty inbox the
+output is byte-identical to the key-off output. Codex is unchanged.
+
 A body over `[mail] max_message_bytes`/`max_delivered_bytes` is still stored,
 truncated, rather than failing the send — but the cut text is no longer just
 lost. The full original body is written to a sidecar file under the
@@ -984,8 +1146,17 @@ to the section that documents it in depth.
   models](#supported-harnesses-and-models).
 - **Dashboard** — several supervised sessions in one terminal, with panes
   for delegated workers, worktree groups, and kill/nudge/send from the
-  keyboard. See [The dashboard: multiple sessions in one
+  keyboard, plus an orchestrator view on `^A t`. See [The dashboard: multiple sessions in one
   terminal](#the-dashboard-multiple-sessions-in-one-terminal).
+- **Agent graph** — `graph` prints a session's agents with each one's parent, job, workflow
+  step and latest steps, and the events between them. See [Hook registration (Claude
+  Code)](#hook-registration-claude-code).
+- **Status line** — `statusline` puts the session's usage and spend on Claude Code's status
+  line. See [Usage pacing](#usage-pacing).
+- **Model discovery** — `models` shows the discovered models and prices that routing and spend
+  use. See [Model discovery and pricing](#model-discovery-and-pricing).
+- **Supervisor** — `supervisor` is an operator-only strong model whose binding rulings the
+  operator can override. See [Supervisor](#supervisor).
 - **Persistent runtime (experimental)** — `session` runs a local service that
   owns the PTYs, so closing or crashing the client leaves the agents running:
   `serve` starts it, `list` shows what it holds, `attach` and `detach` connect
@@ -2881,6 +3052,65 @@ instructions but intentionally withhold repository-authored system layers.
 Full event support is tracked in
 [issue #11](https://github.com/Glubiz/zirv-cli/issues/11).
 
+### Model discovery and pricing
+
+`zirv ctx models` combines the compiled catalogue with account-local evidence:
+Codex's `~/.codex/models_cache.json` and model ids already present in Claude
+transcripts. It never reads Codex authentication data. Known families follow
+their newest available observed version; an unknown family is listed but is
+never placed on the ladder. Run-time tier and rung resolution (handover and
+proxy tiers, review-below, dispatch tiering, pricing equivalence) follows the
+discovered ladder; Claude dispatch still passes aliases. `[models].pin` and
+explicit model configuration hold a family on the operator's selected id, and an
+empty registry leaves every resolver on the compiled ladder. Dated ids, provider prefixes and
+`[1m]` variants normalize to the same ladder and price entry.
+
+`zirv ctx models refresh` persists discovery in `<state>/models.json` and
+conditionally fetches models.dev plus LiteLLM into `<state>/prices.json` with
+short timeouts and ETags. When the registry is older than 24 hours or the price
+cache older than 7 days, `zirv ctx status` and dashboard startup spawn one
+detached `zirv ctx models refresh --quiet` (single-flight lock, at least one
+hour between attempts, gated by `[models].discovery`/`price_fetch`); hooks and
+launch never fetch or wait. Effective pricing is per model: `~/.zirv/prices.toml` (or
+`price.table_path`) wins, then the fetched models.dev cache, then the compiled
+snapshot. A LiteLLM disagreement marks the value approximate (`~$`); an
+unknown model remains unpriced, never free. `zirv ctx status` warns when a
+selected model retires within 14 days and names its advertised upgrade target.
+
+**Scorecard and avoid list.** `zirv ctx models` (and `--json`, now an object with
+`models`, `scorecard` and `avoid`) appends a per-model scorecard folded from logs
+zirv already writes: `logs/delegations.jsonl` and the workflow outcome rows. It
+makes no model call and no request. Failures are classified first and only task
+failures count: a delegation that exits 1 after producing output, or a workflow
+that ends failed (failed verification or review rework) or closed after the
+maximum review rounds. Provider/auth/quota errors, timeouts, signals, rot
+exhaustion, an exit before any output, abandoned workflows and anything
+uncertain are infrastructure and are excluded. Metrics per model and per stratum
+(`task_class`, `complexity`, `effort`, where recorded): task success, first-attempt
+verification pass, mean review rounds, rework rate (two or more review rounds),
+cost per completed task (the effective price table) and median wall time.
+Rates carry a Wilson 95% interval, and anything under 20 samples reads
+"insufficient data". Review findings are not joined to a reviewer model
+(evidence records the adapter only) and rot scores are keyed by transcript, so
+neither is scored. `zirv ctx models refresh` writes the result to
+`<state>/scorecard.json`.
+
+`[models] avoid = ["gpt-6.1-sol"]` (operator-only) stops a tier or rung from
+resolving to that id. The replacement is, in order, a newer or older
+non-avoided version of the same family, then another non-avoided rung of the same
+tier; never a cheaper tier, and the last model of a tier is kept (`zirv ctx
+models` prints a warning). An explicit pin (`[worker]`, `[review]`, `[handover]`,
+`[model_tiers]`, `[models] pin`) wins over avoid and also prints a warning. Claude
+dispatch keeps passing aliases, so an avoided Claude id behind an alias is kept
+with a warning unless another alias of that tier exists. `[models] auto_avoid =
+true` (default false) additionally avoids a model whose task-success upper bound
+is below the lower bound of its best same-tier peer in a stratum of at least 20
+samples on both sides; the refresher records each decision (model, stratum, both
+intervals, peer) in the scorecard cache and `logs/model-auto-avoid.jsonl`.
+Callers with no config (rung lookups such as review-below) read only
+`ZIRV_CTX_MODELS_AVOID`/`ZIRV_CTX_MODELS_AUTO_AVOID`. The agent tree marks an
+avoided model `[avoid]`.
+
 **Platform support.** Supervision is unix only. `wrap` and `exec` need unix
 domain sockets for turn signals, and `wrap` additionally needs raw terminal
 mode and the terminal's window size. On Windows those degrade rather than
@@ -2900,6 +3130,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through, plus (issue #723) a `delegation_conditions` map of delegation id to its typed condition list, alongside (never replacing) each agent's coarse phase |
+| `zirv ctx models [refresh] [--json]` | Lists account-discovered models, ladder placement, availability, effective price provenance, retirements and the per-model scorecard (avoid-list warnings included); `refresh` reads local Codex/Claude evidence and conditionally fetches public price catalogues |
 | `zirv ctx mcp serve [--stdio] [--repo <path>] [--session <id>]` | Serves seven read-only MCP tools for one repository/worktree; optionally binds inbox reads to a registered session. See [MCP bridge](#mcp-bridge) |
 | `zirv ctx mcp doctor [--repo <path>] [--session <id>] [--timeout-seconds <1..60>]` | Launches this executable as a stdio server, checks tool discovery and a snapshot call, and prints JSON; default deadline 10 seconds |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
@@ -4267,6 +4498,25 @@ enabled = true
 max_message_bytes = 4096      # per-message cap, applied by `zirv ctx send`
 max_delivered_bytes = 4096    # cap on a whole batch folded into one launch prompt
 keep = 50                     # unread messages kept per repo before the oldest are pruned
+mid_turn = false              # operator-only: deliver session-addressed mail from a Claude PostToolUse hook
+
+[supervisor]                  # operator-only (#835); off by default, see "Supervisor"
+enabled = false               # ZIRV_CTX_SUPERVISOR_ENABLED; off means no spawns, no state files, unchanged hook output
+harness = "codex"             # claude or codex; ZIRV_CTX_SUPERVISOR_HARNESS
+model = ""                    # explicit consult model (e.g. claude-fable-5-1 or gpt-6-astra), REQUIRED while enabled (config error otherwise); ZIRV_CTX_SUPERVISOR_MODEL
+max_calls = 3                 # consults per session, every ruling kind included; ZIRV_CTX_SUPERVISOR_MAX_CALLS
+max_advice_bytes = 2048       # cap on a ruling's reason; ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES
+
+[models]
+discovery = true              # read Codex's cache and model ids observed in Claude transcripts
+price_fetch = true            # allow public-price fetches (explicit refresh and the automatic background refresh)
+pin = { "anthropic.opus" = "claude-opus-5-5" } # optional family pins
+avoid = []                    # model ids never resolved from a tier or rung; an explicit pin wins
+auto_avoid = false            # also avoid models significantly worse than a same-tier peer (needs 20+ samples)
+
+[price]
+stale_after_days = 90
+# table_path = "~/.zirv/prices.toml" # per-model operator overrides
 
 [memory]
 enabled = true
@@ -4320,6 +4570,7 @@ inject_screen = false # warns (never strips) mail/worker-result text Jev flags a
 inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
 missing_tests = false # when the deterministic `[missing_tests_gate]` is about to block, asks one metadata-only question from local numeric facts and skips that one block on a decisive "not owed" answer; ZIRV_CTX_JEV_MISSING_TESTS
+retry = false       # after 3 identical tool failures in a row, asks Jev ONE retry/stop_and_ask/change_approach question per streak (numeric facts only: failure count, tool class, locally classified error class; never error text); a decisive stop_and_ask or change_approach (confidence >= 0.9, constant floor) adds one advisory line via the `PostToolUseFailure` hook (`zirv ctx hook tool-failure`, registered by `zirv setup apply` only while this key is on; re-run it after enabling); retry, a split answer or any error adds nothing. NOT yet probed for this exact question -- probe before enabling; ZIRV_CTX_JEV_RETRY (#836)
 launch_effort = false # may steer a headless launch's first-turn CLAUDE_CODE_EFFORT_LEVEL pick, from local numeric facts only; see `[headless.effort]` below; ZIRV_CTX_JEV_LAUNCH_EFFORT
 cache_ttl_secs = 604800  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 ```
@@ -4571,11 +4822,48 @@ byte-identical to today's compiled constants) tunes `min_confidence`/
 `harvest_screen`, `handoff_select`, `compaction_select`, `dispatch`,
 `launch_effort`, `classify`, `inject`. Every safety/verification site
 (`approve`, `approve_allow`, `inject_screen`, `stop_verify`, `missing_tests`,
-`review`, `gates`) and the harness proxy's own intake thresholds
+`retry`, `review`, `gates`) and the harness proxy's own intake thresholds
 (`proxy.min_confidence`/`proxy.min_margin`) are NOT configurable here and keep
 their own compiled floors. `[jev.floors]` is `REPO_FORBIDDEN` as a whole
 table, the same trust asymmetry as `[jev]` itself -- see the config reference
 table above.
+
+#### Approvals inbox
+
+Operator-only, off by default (see [the dashboard](#the-dashboard-multiple-sessions-in-one-terminal) for the strip
+and its keys):
+
+```toml
+[approvals]
+inbox = true        # hold Claude PermissionRequests for the owning dashboard; ZIRV_CTX_APPROVALS_INBOX
+hold_secs = 300     # 1-570; the native dialog shows after this long; the hook timeout is hold_secs + 30; ZIRV_CTX_APPROVALS_HOLD_SECS
+```
+
+Each held request also carries display-only details for the dashboard to
+show: `command` (the full command or input summary, redacted, at most 600
+characters), `cwd`, `reason` (Claude's Bash `description`, or the reason line of
+a Codex dialog), `outside_sandbox` (Claude `dangerouslyDisableSandbox`, or a
+Codex permissions dialog) and `always` (a short label for the always-allow rule
+the harness itself offers, `null` when it offers none). Every field is
+redacted, flattened and capped again when the dashboard receives it.
+
+**Always allow** is a third answer beside allow and deny, with every guard of
+allow (the request the last frame drew, shown in full). On Claude the hook
+echoes one entry of the payload's own `permission_suggestions` (the first
+`addRules` entry with `behavior: "allow"`) as
+`hookSpecificOutput.decision.updatedPermissions: [<that entry>]`, per the
+[hooks reference](https://code.claude.com/docs/en/hooks#permissionrequest-decision-control).
+zirv never builds or widens a rule: a mode change, a directory grant or a deny
+suggestion is never offered, and with no suggestion the key is refused and the
+native dialog stays. The dashboard sends only the word `allow_always`; the rule
+is whatever Claude suggested, written to the `destination` Claude named. Codex
+draws a "Yes, and don't ask again for ..." option, which the dialog reader
+reports (with its key) as `always`; no Codex request is listed or answered by
+the inbox yet.
+
+Both keys are `REPO_FORBIDDEN`: a repository cannot switch the inbox on or
+stretch a hold. With `inbox = false` (the default), or with no live dashboard
+serving the session, the hook behaves exactly as before and adds no latency.
 
 #### Tool-output compaction
 
@@ -4638,8 +4926,10 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_PROMPT` | operator environment | selects flag or block for typed prompts that hooks cannot rewrite |
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
+| Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
+| `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 | Autoresearch campaign manifest (`zirv workflow research plan\|run`) and every file it references (corpus, fixture, evaluator, candidate patch) | operator input, like a script | a `[[candidates]]` env overlay may only use a key that is in BOTH the manifest's own `[candidate_space] allow_env` AND a compiled-in allowlist (non-safety Jev gates/floors, `ZIRV_CTX_PROXY_MIN_CONFIDENCE`/`MIN_MARGIN`, the handover ladder, `[headless]` effort, `[score]` token ratios); anything permission/sandbox/safety/credential/base_url-shaped, and the fixed Jev safety gates (approve/approve_allow/inject_screen/stop_verify/missing_tests/review/gates/admin_dispatch), are always refused regardless of what the manifest declares; repo-owned `.zirv/` files cannot widen either list, and a `requires_receipts` entry outside the compiled prefixes is refused at `plan` time |
 
@@ -4659,8 +4949,8 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
-`mail.max_delivered_bytes`, `chrome.events`, any `memory.*` key, any
-`dash.*` key, any `pace.*` key, any `price.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
+`mail.max_delivered_bytes`, `mail.mid_turn`, any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
+`dash.*` key, any `pace.*` key, any `price.*` key, any `models.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
 `handover`, `obfuscate.mode`, `obfuscate.entropy`, `obfuscate.prompt`,
@@ -4768,6 +5058,12 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `context.lint_max_pairs` | `ZIRV_CTX_CONTEXT_LINT_MAX_PAIRS` |
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
+| `mail.mid_turn` | `ZIRV_CTX_MAIL_MID_TURN` |
+| `supervisor.enabled` | `ZIRV_CTX_SUPERVISOR_ENABLED` |
+| `supervisor.harness` | `ZIRV_CTX_SUPERVISOR_HARNESS` |
+| `supervisor.model` | `ZIRV_CTX_SUPERVISOR_MODEL` |
+| `supervisor.max_calls` | `ZIRV_CTX_SUPERVISOR_MAX_CALLS` |
+| `supervisor.max_advice_bytes` | `ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES` |
 | `chrome.events` | `ZIRV_CTX_QUIET` (see the note below on why this one's name looks different) |
 | `memory.enabled` | `ZIRV_CTX_MEMORY` |
 | `memory.harvest` | `ZIRV_CTX_MEMORY_HARVEST` |
@@ -4853,6 +5149,12 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `workflow.max_context_bytes` | `ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES` |
 | `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
 | `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
+| `models.discovery` | `ZIRV_CTX_MODELS_DISCOVERY` |
+| `models.price_fetch` | `ZIRV_CTX_MODELS_PRICE_FETCH` |
+| `models.pin` | `ZIRV_CTX_MODELS_PIN` (`vendor.family=model`, comma-separated) |
+| `models.avoid` | `ZIRV_CTX_MODELS_AVOID` (model ids, comma-separated) |
+| `models.auto_avoid` | `ZIRV_CTX_MODELS_AUTO_AVOID` |
+| `models` | `ZIRV_CTX_MODELS_*` (the table-node match also blocks any other `models.*` key) |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
 | `output.compact` | `ZIRV_CTX_OUTPUT_COMPACT` |
 | `output.compact_min_bytes` | `ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES` |
@@ -4904,6 +5206,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `jev.stop_verify` | `ZIRV_CTX_JEV_STOP_VERIFY` |
 | `jev.missing_tests` | `ZIRV_CTX_JEV_MISSING_TESTS` |
 | `jev.launch_effort` | `ZIRV_CTX_JEV_LAUNCH_EFFORT` |
+| `jev.retry` | `ZIRV_CTX_JEV_RETRY` |
 | `jev.cache_ttl_secs` | `ZIRV_CTX_JEV_CACHE_TTL_SECS` |
 | `jev.floors` | `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE`\|`_MIN_MARGIN` |
 | `headless.prompt_cache_ttl` | `ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL` |
@@ -4912,6 +5215,8 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
 | `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
 | `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
+| `approvals.inbox` | `ZIRV_CTX_APPROVALS_INBOX` |
+| `approvals.hold_secs` | `ZIRV_CTX_APPROVALS_HOLD_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
 | `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |
@@ -5659,7 +5964,9 @@ Add to `~/.claude/settings.json`:
       "matcher": "resume|clear",
       "hooks": [{ "type": "command", "command": "zirv ctx hook session-start" }]
     }],
-    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook subagent-stop" }] }]
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook subagent-start" }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook subagent-stop" }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "zirv ctx hook tool-failure" }] }]
   }
 }
 ```
@@ -5692,6 +5999,82 @@ subagent, ever, and fails open on any doubt (an unreadable transcript,
 enabled` (default `true`) gates it, the identical narrow-only fold
 `[missing_tests_gate] enabled` uses below — a repository checkout may only
 turn it off, never force it on for an operator who disabled it.
+
+`SubagentStart` (issue #832) records one agent-graph node (`<state>/graph/
+<session>/<agent_id>.json`) with a single local file write; it prints nothing,
+exits 0 on any doubt and makes no network call. `SubagentStop` closes the node
+with its status, actual model and tokens read from the subagent's own
+transcript. `zirv ctx graph [--json] [--events N] [--session ID] [--repo]` (read-only) prints the agent
+tree merged from the session registry, delegations, work groups, subagent nodes
+and Codex sub-agent rollouts under `~/.codex/sessions` (codex-cli 0.155/0.159
+`thread_spawn` metadata), plus the newest N events merged from the decision,
+delegation, safety, Jev and proxy logs. Node files are capped per session and
+dropped a week after their session leaves the registry. Re-run `zirv setup
+apply` to install the `SubagentStart` hook; without it the graph still lists
+native agents, read from claude's own `<session>/subagents/agent-<id>.meta.json`
+files (a hook record wins on conflict). Each node carries `job` (first task
+line, redacted, 80 chars), `workflow` (`{id, pack, step}`), `session` (its
+root session) and `steps` (its last five tool calls, newest last, as
+`{ts, tool, arg}`; `arg` is a redacted one-line summary of at most 120
+characters, and the list is always present, empty when nothing is readable).
+Steps are tail-read (at most 128 KB, cached on mtime and length) from a
+subagent's own `subagents/agent-<id>.jsonl`, a live Claude session's transcript,
+or a Codex rollout, in the same background gather as the rest of the graph. Every `Agent` dispatch appends one line to `<state>/graph-dispatch/`
+so a nested agent finds its parent, and every dashboard pane or `zirv agent` run
+writes `<state>/graph-launch/<session>.json` so it keeps its parent, task and
+workflow step after its session is swept. Supervisor rulings appear as an
+`architect` event addressed to its session (the event kind keeps its old name). `--session <id>` and `--repo` scope
+the output; `--json` prints the newest 100 events unless `--events` is given.
+
+`PostToolUseFailure` (issue #836, `zirv ctx hook tool-failure`) prints nothing and
+writes nothing unless `[jev] retry` is on and the TypeSafe credential is set; then it
+counts consecutive failures of one tool call shape in `<state>/jev-retry/<session>.json`
+(a successful `PostToolUse` clears it) and asks Jev once at the third. `zirv setup apply` registers the hook only while `[jev] retry` is on (and removes it when off), so
+enabling the key requires re-running `zirv setup apply`; with the key off no process spawns on a tool failure. `[supervisor] enabled` (#835) installs the same hook and shares the streak file: at the third failure of a streak it also asks the supervisor for a retry-or-stop ruling, with or without `[jev] retry`.
+
+#### Supervisor
+
+`[supervisor]` (issue #835, operator-only, off by default) is a strong model, such as
+`claude-fable-5-1` or `gpt-6-astra`, that helps make decisions and steers the work. Its rulings are
+binding unless the operator overrides them, and they only ever narrow: a ruling can block a step,
+require a revision, stop a retry or pick one of the options the seat offered. It never writes code,
+answers a permission request, grants anything or widens scope.
+
+Hooks never call a model and never wait. A trigger checks local state and, with calls remaining,
+spawns one detached `zirv ctx supervisor consult` (evidence on its stdin) that runs a single
+`zirv ctx agent <harness> --mode read-only --quiet --json --task-class review` delegation with
+`-m <model>` (the delegation ledger records the spend). The reply must match the kind's strict
+format; one that does not produces no ruling, a logged fallback, and today's behaviour. A ruling is
+stored in `<state>/supervisor/rulings/rulings.json` (`id`, `session`, optional `workflow`, `kind`,
+`verdict`, `reason` redacted and capped at `max_advice_bytes`, `ts`, `status` open, resolved or
+overridden or lapsed) and mailed to the session (sender and topic `supervisor`). A consult's own child session
+never triggers (`ZIRV_SUPERVISOR_CONSULT`). `model` is required when enabled and `max_calls`
+bounds every kind per session; once it is spent the seat decides as it would without a supervisor.
+
+| Kind | Reply format | Where it bites |
+|---|---|---|
+| plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook (once per distinct diffstat); while a `not_done` is open the Claude Stop hook blocks with the reason, at most 3 times per ruling, and the workflow's final step is refused. A later `done` resolves it. Codex has no Stop-hook block, so it gets the mail and the workflow gate only |
+| retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
+| choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
+
+`zirv ctx supervisor ask "<question>" --option "<a>" --option "<b>" [--context-file F] [--timeout-secs 180]`
+is synchronous and never runs from a hook: it prints the chosen option and its reason and records
+the ruling. With the supervisor on, the seat's injected instructions carry one line telling it to
+route real design or approach choices through `ask` and follow the ruling. `zirv ctx supervisor
+override <id> [--reason ...]` marks a ruling overridden and is operator-only: it is refused inside an
+agent session (a session, socket or seat-role variable present, even if empty) and unless stdin and
+stdout are terminals, and it is never auto-allowed, so an agent's attempt surfaces as a permission
+prompt (`ask` and `status` stay auto-allowed). The residual: the ruling store lives in the state
+directory, which sessions can write, so binding rulings guard against a seat that drifts, not
+against a hostile agent. A `not_done` or `revise` ruling whose superseding consult cannot run
+lapses instead of binding forever: for `max_calls` spent, only after the Stop hook has blocked on it
+3 times (a plan ruling: after the gate has refused with it once); for nothing to review, only when
+`git status --porcelain` succeeds and is empty. The lapse is logged and mailed, so ACTIVITY shows it.
+Deliberate evasion of the prompt (for example `env -u ... script -q /dev/null ...`) is part of the
+same residual.
+`zirv ctx supervisor status [--json] [--session <short>]` prints per-session state and the open
+rulings. Re-run `zirv setup apply` after enabling.
 
 The Stop hook forwards verdicts to a supervising `wrap` or `exec` when one owns
 the session, and otherwise prints a non-blocking advisory. It exits 0 even when
@@ -5947,6 +6330,17 @@ Three data layers, best available wins:
    The tee records the fields, then runs your original command unchanged. It
    always exits 0 and always prints a statusline, so a failure here can never
    leave you looking at a blank one.
+
+   `zirv ctx statusline [-- <your command>]` (issue #833) composes with it: it
+   runs your command (or the built-in fallback line when none is given),
+   keeps its output and appends `agents n/cap · supervisor off · jev N ·
+   $spend` to the last line, for example `"command": "zirv ctx statusline --
+   zirv ctx usage tee -- bash ~/.claude/statusline-command.sh"`. `n` counts
+   live sessions in the reported directory, `cap` is `dash.max_panes`, `jev` is
+   the 24 hour call count (`off` without a gate and credential, or past a 2 MiB
+   log), and the spend is Claude Code's own `cost.total_cost_usd`. It makes no
+   network call; the segment is dropped if it takes over 40 ms, and any error
+   leaves your line exactly as it was. `subagentStatusLine` is not wired.
 
 2. **Estimator**, an approximation. When no fresh collector reading exists, zirv
    sums token usage across local transcripts (including subagent files) over the

@@ -9,6 +9,7 @@
 //! price, and cache-read price uses one tenth of input where no separate rate is published.
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,34 +86,41 @@ pub struct Vendor {
 // Anthropic's own tier ladder (issue #155/#84's own verified names), copied
 // verbatim from `adapters::claude`/`price::built_in_table` -- the
 // equivalence tests in those modules pin the result.
-const OPUS: ModelPrice = ModelPrice {
-    input_micros: 15_000_000,
-    cache_write_micros: 18_750_000,
-    cache_read_micros: 1_500_000,
-    output_micros: 75_000_000,
+const OPUS_5: ModelPrice = ModelPrice {
+    input_micros: 5_000_000,
+    cache_write_micros: 6_250_000,
+    cache_read_micros: 500_000,
+    output_micros: 25_000_000,
 };
-const OPUS_1M: ModelPrice = ModelPrice {
-    input_micros: 30_000_000,
-    cache_write_micros: 37_500_000,
-    cache_read_micros: 3_000_000,
-    output_micros: 150_000_000,
+const OPUS_5_5: ModelPrice = ModelPrice {
+    input_micros: 4_000_000,
+    cache_write_micros: 5_000_000,
+    cache_read_micros: 200_000,
+    output_micros: 20_000_000,
 };
-// The orchestrator tier above opus, priced AT the opus rate -- see
-// `price.rs`'s own doc comment for why an unpriced top-of-fleet seat is the
-// worse failure mode.
-const FABLE: ModelPrice = OPUS;
-const FABLE_1M: ModelPrice = OPUS_1M;
-const SONNET: ModelPrice = ModelPrice {
-    input_micros: 3_000_000,
-    cache_write_micros: 3_750_000,
-    cache_read_micros: 300_000,
-    output_micros: 15_000_000,
+const FABLE_5_1: ModelPrice = ModelPrice {
+    input_micros: 10_000_000,
+    cache_write_micros: 12_500_000,
+    cache_read_micros: 250_000,
+    output_micros: 50_000_000,
 };
-const HAIKU: ModelPrice = ModelPrice {
-    input_micros: 800_000,
-    cache_write_micros: 1_000_000,
-    cache_read_micros: 80_000,
-    output_micros: 4_000_000,
+const FABLE_5: ModelPrice = ModelPrice {
+    input_micros: 10_000_000,
+    cache_write_micros: 12_500_000,
+    cache_read_micros: 1_000_000,
+    output_micros: 50_000_000,
+};
+const SONNET_5: ModelPrice = ModelPrice {
+    input_micros: 2_000_000,
+    cache_write_micros: 2_500_000,
+    cache_read_micros: 200_000,
+    output_micros: 10_000_000,
+};
+const HAIKU_4_5: ModelPrice = ModelPrice {
+    input_micros: 1_000_000,
+    cache_write_micros: 1_250_000,
+    cache_read_micros: 100_000,
+    output_micros: 5_000_000,
 };
 
 const ANTHROPIC_RUNGS: &[Rung] = &[
@@ -121,7 +129,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         id: "claude-fable-5-1",
         strength: 4,
         context_window: Some(200_000),
-        price: Some(FABLE),
+        price: Some(FABLE_5_1),
         tier: None,
     },
     Rung {
@@ -129,7 +137,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         id: "claude-mythos-5",
         strength: 4,
         context_window: Some(200_000),
-        price: Some(FABLE),
+        price: Some(FABLE_5),
         tier: None,
     },
     Rung {
@@ -137,7 +145,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         id: "claude-opus-5",
         strength: 3,
         context_window: Some(200_000),
-        price: Some(OPUS),
+        price: Some(OPUS_5),
         tier: Some(Tier::Deep),
     },
     Rung {
@@ -147,38 +155,62 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         // The Sonnet 5 context window is 1,000,000 according to Claude JSON model usage
         // output; this rung must match that reported limit.
         context_window: Some(1_000_000),
-        price: Some(SONNET),
+        price: Some(SONNET_5),
         tier: Some(Tier::Standard),
     },
     Rung {
         alias: "haiku",
-        id: "claude-haiku-5",
+        id: "claude-haiku-4-5",
         strength: 1,
         context_window: Some(200_000),
-        price: Some(HAIKU),
+        price: Some(HAIKU_4_5),
         tier: Some(Tier::Cheap),
     },
 ];
 
 // Codex's own tier ladder -- OpenAI's public pricing carries no separate cache-WRITE class,
 // so each rung reuses its own input rate (copied verbatim from `price::built_in_table`).
-const SOL: ModelPrice = ModelPrice {
-    input_micros: 15_000_000,
-    cache_write_micros: 15_000_000,
-    cache_read_micros: 1_500_000,
-    output_micros: 60_000_000,
+const SOL_5_6: ModelPrice = ModelPrice {
+    input_micros: 4_000_000,
+    cache_write_micros: 5_000_000,
+    cache_read_micros: 400_000,
+    output_micros: 20_000_000,
 };
-const TERRA: ModelPrice = ModelPrice {
-    input_micros: 2_500_000,
+const TERRA_5_6: ModelPrice = ModelPrice {
+    input_micros: 2_000_000,
     cache_write_micros: 2_500_000,
-    cache_read_micros: 250_000,
+    cache_read_micros: 200_000,
+    output_micros: 12_000_000,
+};
+const LUNA_5_6: ModelPrice = ModelPrice {
+    input_micros: 200_000,
+    cache_write_micros: 250_000,
+    cache_read_micros: 20_000,
+    output_micros: 1_200_000,
+};
+const SOL_6: ModelPrice = ModelPrice {
+    input_micros: 2_000_000,
+    cache_write_micros: 2_500_000,
+    cache_read_micros: 200_000,
     output_micros: 10_000_000,
 };
-const LUNA: ModelPrice = ModelPrice {
-    input_micros: 1_000_000,
-    cache_write_micros: 1_000_000,
+const SOL_6_1: ModelPrice = ModelPrice {
+    input_micros: 2_000_000,
+    cache_write_micros: 2_500_000,
     cache_read_micros: 100_000,
-    output_micros: 4_000_000,
+    output_micros: 10_000_000,
+};
+const ASTRA_6: ModelPrice = ModelPrice {
+    input_micros: 10_000_000,
+    cache_write_micros: 12_500_000,
+    cache_read_micros: 1_000_000,
+    output_micros: 50_000_000,
+};
+const LUNA_6: ModelPrice = ModelPrice {
+    input_micros: 100_000,
+    cache_write_micros: 125_000,
+    cache_read_micros: 10_000,
+    output_micros: 500_000,
 };
 const MINI: ModelPrice = ModelPrice {
     input_micros: 250_000,
@@ -200,7 +232,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         id: "gpt-6-astra",
         strength: 4,
         context_window: None,
-        price: Some(SOL),
+        price: Some(ASTRA_6),
         tier: None,
     },
     Rung {
@@ -208,7 +240,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         id: "gpt-5.6-sol",
         strength: 4,
         context_window: None,
-        price: Some(SOL),
+        price: Some(SOL_5_6),
         tier: Some(Tier::Deep),
     },
     Rung {
@@ -216,7 +248,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         id: "gpt-5.6-terra",
         strength: 3,
         context_window: None,
-        price: Some(TERRA),
+        price: Some(TERRA_5_6),
         tier: Some(Tier::Standard),
     },
     Rung {
@@ -224,7 +256,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         id: "gpt-5.6-luna",
         strength: 2,
         context_window: None,
-        price: Some(LUNA),
+        price: Some(LUNA_5_6),
         tier: Some(Tier::Cheap),
     },
 ];
@@ -612,11 +644,13 @@ const VENDORS: &[Vendor] = &[
         rungs: ANTHROPIC_RUNGS,
         default_context_window: Some(200_000),
         extra_prices: &[
-            ("claude-fable-5", FABLE),
-            ("claude-fable-5[1m]", FABLE_1M),
-            ("claude-fable-5-1[1m]", FABLE_1M),
-            ("claude-mythos-5[1m]", FABLE_1M),
-            ("claude-opus-5[1m]", OPUS_1M),
+            ("claude-fable-5", FABLE_5),
+            ("claude-fable-5[1m]", FABLE_5),
+            ("claude-fable-5-1[1m]", FABLE_5_1),
+            ("claude-mythos-5[1m]", FABLE_5),
+            ("claude-opus-5[1m]", OPUS_5),
+            ("claude-opus-5-5", OPUS_5_5),
+            ("claude-sonnet-5-5", SONNET_5),
         ],
         as_of: None,
     },
@@ -624,7 +658,13 @@ const VENDORS: &[Vendor] = &[
         slug: "openai",
         rungs: OPENAI_RUNGS,
         default_context_window: None,
-        extra_prices: &[("gpt-5.4-mini", MINI), ("gpt-5-codex", TERRA)],
+        extra_prices: &[
+            ("gpt-5.4-mini", MINI),
+            ("gpt-5-codex", TERRA_5_6),
+            ("gpt-6-sol", SOL_6),
+            ("gpt-6.1-sol", SOL_6_1),
+            ("gpt-6-luna", LUNA_6),
+        ],
         as_of: None,
     },
     Vendor {
@@ -752,11 +792,55 @@ pub fn vendors() -> &'static [Vendor] {
 /// Match the lowercased model against each rung’s alias, then id, strongest first; return
 /// the first match.
 pub fn rung_of(vendor: &Vendor, model: &str) -> Option<&'static Rung> {
-    let model = model.to_lowercase();
+    rung_of_in(vendor, model, &super::models::runtime_ladder(vendor))
+}
+
+/// [`rung_of`] with an explicit resolved ladder (empty = static ladder only). A
+/// discovered id with no static match lands on the static rung of its family.
+pub fn rung_of_in(vendor: &Vendor, model: &str, ladder: &[ResolvedRung]) -> Option<&'static Rung> {
+    let model = normalize_id(model).to_lowercase();
     vendor
         .rungs
         .iter()
         .find(|r| model.contains(r.alias) || model.contains(r.id))
+        .or_else(|| ladder_index(ladder, &model).and_then(|idx| vendor.rungs.get(idx)))
+}
+
+/// [`rung_of`] independent of the local registry: the static ladder, then any id of a known
+/// family. Config validity must never depend on discovery.
+pub fn rung_of_known(vendor: &Vendor, model: &str) -> Option<&'static Rung> {
+    let model = normalize_id(model).to_lowercase();
+    rung_of_in(vendor, &model, &[]).or_else(|| {
+        let family = model_family(vendor.slug, &model)?;
+        vendor
+            .rungs
+            .iter()
+            .find(|r| model_family(vendor.slug, r.id).unwrap_or(r.alias) == family)
+    })
+}
+
+fn ladder_index(ladder: &[ResolvedRung], model: &str) -> Option<usize> {
+    ladder
+        .iter()
+        .position(|r| r.id.eq_ignore_ascii_case(model) || r.alias.eq_ignore_ascii_case(model))
+}
+
+fn ladder_alias<'a>(vendor: &'a Vendor, ladder: &'a [ResolvedRung], idx: usize) -> &'a str {
+    ladder
+        .get(idx)
+        .map_or(vendor.rungs[idx].alias, |r| r.alias.as_str())
+}
+
+/// Leaks each distinct discovered alias once so run-time resolvers can keep
+/// their `&'static str` signatures; bounded by the registry size.
+pub(crate) fn intern(value: &str) -> &'static str {
+    static POOL: std::sync::Mutex<BTreeMap<String, &'static str>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let Ok(mut pool) = POOL.lock() else {
+        return "";
+    };
+    pool.entry(value.to_string())
+        .or_insert_with(|| Box::leak(value.to_string().into_boxed_str()))
 }
 
 /// One tier below `seat` on `vendor`'s ladder, by alias.
@@ -771,23 +855,55 @@ pub fn rung_of(vendor: &Vendor, model: &str) -> Option<&'static Rung> {
 /// `gpt-6-astra`/`gpt-5.6-sol`. A seat already on the floor rung maps to
 /// itself rather than falling off the ladder.
 pub fn rung_below(vendor: &Vendor, seat: Option<&str>) -> &'static str {
-    let rungs = vendor.rungs;
-    if rungs.is_empty() {
+    let ladder = super::models::runtime_ladder(vendor);
+    if vendor.rungs.is_empty() {
         return "";
     }
-    let idx = seat
-        .map(str::to_lowercase)
-        .and_then(|s| {
-            rungs
-                .iter()
-                .position(|r| s.contains(r.alias) || s.contains(r.id))
-        })
-        .unwrap_or(0);
+    if ladder.is_empty() {
+        return static_rung_below(vendor, seat);
+    }
+    intern(&rung_below_in(vendor, seat, &ladder).unwrap_or_default())
+}
+
+fn static_rung_below(vendor: &Vendor, seat: Option<&str>) -> &'static str {
+    let rungs = vendor.rungs;
+    let idx = below_index(vendor, seat, &[]);
     let strength = rungs[idx].strength;
     rungs[idx + 1..]
         .iter()
         .find(|r| r.strength < strength)
         .map_or(rungs[idx].alias, |r| r.alias)
+}
+
+fn below_index(vendor: &Vendor, seat: Option<&str>, ladder: &[ResolvedRung]) -> usize {
+    seat.map(|model| normalize_id(model).to_lowercase())
+        .and_then(|s| {
+            vendor
+                .rungs
+                .iter()
+                .position(|r| s.contains(r.alias) || s.contains(r.id))
+                .or_else(|| ladder_index(ladder, &s))
+        })
+        .unwrap_or(0)
+}
+
+/// [`rung_below`] with an explicit resolved ladder; `None` when the vendor has no rungs.
+pub fn rung_below_in(
+    vendor: &Vendor,
+    seat: Option<&str>,
+    ladder: &[ResolvedRung],
+) -> Option<String> {
+    let rungs = vendor.rungs;
+    if rungs.is_empty() {
+        return None;
+    }
+    let idx = below_index(vendor, seat, ladder);
+    let strength = rungs[idx].strength;
+    let below = rungs[idx + 1..]
+        .iter()
+        .position(|r| r.strength < strength)
+        .map_or(idx, |offset| idx + 1 + offset);
+    Some(ladder_alias(vendor, ladder, below).to_string())
 }
 
 /// `model`'s ladder strength on `vendor`, or `None` when it matches no rung.
@@ -812,11 +928,34 @@ pub fn context_window(vendor: &Vendor, model: Option<&str>) -> Option<u64> {
 /// The model id for `vendor`'s `tier` rung, or `None` when no rung on this
 /// vendor is tagged with it.
 pub fn tier_model(vendor: &Vendor, tier: Tier) -> Option<&'static str> {
+    let ladder = super::models::runtime_ladder(vendor);
+    if ladder.is_empty() {
+        return vendor
+            .rungs
+            .iter()
+            .find(|r| r.tier == Some(tier))
+            .map(|r| r.alias);
+    }
+    tier_model_in(vendor, tier, &ladder).map(|alias| intern(&alias))
+}
+
+/// [`tier_model`] with an explicit resolved ladder (empty = static ladder).
+pub fn tier_model_in(vendor: &Vendor, tier: Tier, ladder: &[ResolvedRung]) -> Option<String> {
+    let idx = vendor.rungs.iter().position(|r| r.tier == Some(tier))?;
+    Some(ladder_alias(vendor, ladder, idx).to_string())
+}
+
+/// Exact rung for `model`: a static alias/id, or a discovered/pinned ladder id.
+pub fn rung_exact_in(
+    vendor: &Vendor,
+    model: &str,
+    ladder: &[ResolvedRung],
+) -> Option<&'static Rung> {
     vendor
         .rungs
         .iter()
-        .find(|r| r.tier == Some(tier))
-        .map(|r| r.alias)
+        .find(|r| r.alias == model || r.id == model)
+        .or_else(|| ladder_index(ladder, model).and_then(|idx| vendor.rungs.get(idx)))
 }
 
 /// Strips the vendor-namespacing decoration real-world model strings carry
@@ -829,7 +968,7 @@ pub fn tier_model(vendor: &Vendor, tier: Tier) -> Option<&'static str> {
 /// model id that legitimately contains `/` or `.` without meaning "vendor
 /// namespace" passes through untouched.
 pub fn normalize_id(model: &str) -> Cow<'_, str> {
-    let mut s = model;
+    let mut s = model.trim();
     match s.split_once('/') {
         // A `/` decides the outcome on its own: whether or not the prefix
         // names a known vendor, this is OpenRouter-shaped and the `.`
@@ -850,7 +989,265 @@ pub fn normalize_id(model: &str) -> Cow<'_, str> {
     if let Some((head, _)) = s.split_once(':') {
         s = head;
     }
+    if s.get(s.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("[1m]"))
+    {
+        s = s.get(..s.len() - 4).unwrap_or(s);
+    }
+    if let Some((head, suffix)) = s.rsplit_once('-')
+        && suffix.len() == 8
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        s = head;
+    }
     Cow::Borrowed(s)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredModel {
+    pub vendor: String,
+    pub id: String,
+    pub available: bool,
+}
+
+impl DiscoveredModel {
+    pub fn new(vendor: impl Into<String>, id: impl Into<String>, available: bool) -> Self {
+        Self {
+            vendor: vendor.into(),
+            id: id.into(),
+            available,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRung {
+    pub alias: String,
+    pub id: String,
+    pub family: String,
+    pub strength: u8,
+    pub context_window: Option<u64>,
+    pub tier: Option<Tier>,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelVersion {
+    major: u32,
+    minor: u32,
+}
+
+const ANTHROPIC_FAMILIES: &[&str] = &["fable", "mythos", "opus", "sonnet", "haiku"];
+const OPENAI_FAMILIES: &[&str] = &["sol", "astra", "terra", "luna"];
+
+fn family_and_version(vendor_slug: &str, model: &str) -> Option<(&'static str, ModelVersion)> {
+    let normalized = normalize_id(model).to_lowercase();
+    match vendor_slug {
+        "anthropic" => {
+            let rest = normalized.strip_prefix("claude-")?;
+            for family in ANTHROPIC_FAMILIES {
+                let Some(version) = rest.strip_prefix(&format!("{family}-")) else {
+                    continue;
+                };
+                let mut parts = version.split('-');
+                let major = parts.next()?.parse().ok()?;
+                let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+                if parts.next().is_none() {
+                    return Some((family, ModelVersion { major, minor }));
+                }
+            }
+            None
+        }
+        "openai" => {
+            let rest = normalized.strip_prefix("gpt-")?;
+            let (version, family) = rest.rsplit_once('-')?;
+            let family = OPENAI_FAMILIES
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == family)?;
+            let mut parts = version.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((family, ModelVersion { major, minor }))
+        }
+        _ => None,
+    }
+}
+
+/// The known ladder family for a normalised model id. Unknown families are
+/// deliberately not inferred: discovery may list them, but it cannot rank
+/// them or alter an existing tier without an explicit catalogue family.
+pub fn model_family(vendor_slug: &str, model: &str) -> Option<&'static str> {
+    family_and_version(vendor_slug, model).map(|(family, _)| family)
+}
+
+/// Resolves a static vendor ladder against account-scoped discoveries and
+/// operator pins. The function is pure; callers load registry/config values
+/// outside this module and inject them here.
+pub fn resolved_ladder(
+    vendor: &Vendor,
+    discovered: &[DiscoveredModel],
+    pins: &BTreeMap<String, String>,
+) -> Vec<ResolvedRung> {
+    resolved_ladder_avoiding(vendor, discovered, pins, &BTreeSet::new()).0
+}
+
+/// What [`resolved_ladder_avoiding`] did with one avoided model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvoidNote {
+    pub avoided: String,
+    /// The replacement id, or `None` when the original had to stay.
+    pub replacement: Option<String>,
+    /// Why the original stayed: `pinned`, or `no same-tier alternative`.
+    pub kept_because: Option<&'static str>,
+}
+
+fn rung_is_avoided(rung: &ResolvedRung, avoid: &BTreeSet<String>) -> bool {
+    avoid.contains(&normalize_id(&rung.id).to_lowercase())
+        || avoid.contains(&rung.alias.to_lowercase())
+}
+
+/// [`resolved_ladder`] with `avoid` (lowercased model ids or aliases) applied. An avoided,
+/// unpinned rung is replaced by, in order: a newer non-avoided version of its family; an older
+/// one (not on Claude, whose alias stays the dispatched name); another non-avoided rung of the
+/// same tier. Never a different tier. When nothing qualifies the rung is kept. An explicit pin
+/// is never replaced. An empty `avoid` returns exactly [`resolved_ladder`]'s ladder.
+pub fn resolved_ladder_avoiding(
+    vendor: &Vendor,
+    discovered: &[DiscoveredModel],
+    pins: &BTreeMap<String, String>,
+    avoid: &BTreeSet<String>,
+) -> (Vec<ResolvedRung>, Vec<AvoidNote>) {
+    let ladder = base_ladder(vendor, discovered, pins);
+    if avoid.is_empty() {
+        return (ladder, Vec::new());
+    }
+    let mut out = ladder.clone();
+    let mut notes = Vec::new();
+    for (idx, rung) in ladder.iter().enumerate() {
+        if !rung_is_avoided(rung, avoid) {
+            continue;
+        }
+        if rung.pinned {
+            notes.push(AvoidNote {
+                avoided: rung.id.clone(),
+                replacement: None,
+                kept_because: Some("pinned"),
+            });
+            continue;
+        }
+        let current = family_and_version(vendor.slug, &rung.id).map(|(_, version)| version);
+        let mut same_family: Vec<(ModelVersion, String)> = discovered
+            .iter()
+            .filter(|candidate| candidate.vendor == vendor.slug && candidate.available)
+            .chain(std::iter::once(&DiscoveredModel::new(
+                vendor.slug,
+                vendor.rungs[idx].id,
+                true,
+            )))
+            .filter_map(|candidate| {
+                let (family, version) = family_and_version(vendor.slug, &candidate.id)?;
+                (family == rung.family).then(|| (version, candidate.id.clone()))
+            })
+            .filter(|(_, id)| !avoid.contains(&normalize_id(id).to_lowercase()))
+            .collect();
+        same_family.sort();
+        let newer = same_family
+            .iter()
+            .rev()
+            .find(|(version, _)| Some(*version) > current)
+            .map(|(_, id)| id.clone());
+        let older = (vendor.slug != "anthropic")
+            .then(|| {
+                same_family
+                    .iter()
+                    .rev()
+                    .find(|(version, _)| Some(*version) < current)
+                    .map(|(_, id)| id.clone())
+            })
+            .flatten();
+        let peer = rung.tier.and_then(|tier| {
+            ladder.iter().enumerate().find(|(other, candidate)| {
+                *other != idx && candidate.tier == Some(tier) && !rung_is_avoided(candidate, avoid)
+            })
+        });
+        if let Some(id) = newer.or(older) {
+            if vendor.slug != "anthropic" {
+                out[idx].alias = id.clone();
+            }
+            out[idx].id = id.clone();
+            notes.push(AvoidNote {
+                avoided: rung.id.clone(),
+                replacement: Some(id),
+                kept_because: None,
+            });
+        } else if let Some((_, peer)) = peer {
+            out[idx].alias = peer.alias.clone();
+            out[idx].id = peer.id.clone();
+            notes.push(AvoidNote {
+                avoided: rung.id.clone(),
+                replacement: Some(peer.id.clone()),
+                kept_because: None,
+            });
+        } else {
+            notes.push(AvoidNote {
+                avoided: rung.id.clone(),
+                replacement: None,
+                kept_because: Some("no same-tier alternative"),
+            });
+        }
+    }
+    (out, notes)
+}
+
+fn base_ladder(
+    vendor: &Vendor,
+    discovered: &[DiscoveredModel],
+    pins: &BTreeMap<String, String>,
+) -> Vec<ResolvedRung> {
+    vendor
+        .rungs
+        .iter()
+        .map(|base| {
+            let family = model_family(vendor.slug, base.id).unwrap_or(base.alias);
+            let pin_key = format!("{}.{}", vendor.slug, family);
+            let pinned = pins
+                .get(&pin_key)
+                .filter(|id| model_family(vendor.slug, id) == Some(family));
+            let newest = discovered
+                .iter()
+                .filter(|candidate| candidate.vendor == vendor.slug && candidate.available)
+                .filter_map(|candidate| {
+                    let (candidate_family, version) =
+                        family_and_version(vendor.slug, &candidate.id)?;
+                    (candidate_family == family).then_some((version, candidate.id.as_str()))
+                })
+                .max_by_key(|(version, _)| *version)
+                .map(|(_, id)| id);
+            let id = pinned
+                .map(String::as_str)
+                .or(newest)
+                .unwrap_or(base.id)
+                .to_string();
+            let alias = if vendor.slug == "anthropic" {
+                base.alias.to_string()
+            } else {
+                id.clone()
+            };
+            ResolvedRung {
+                alias,
+                id,
+                family: family.to_string(),
+                strength: base.strength,
+                context_window: base.context_window,
+                tier: base.tier,
+                pinned: pinned.is_some(),
+            }
+        })
+        .collect()
 }
 
 /// The vendor `model` belongs to, after [`normalize_id`]: the first vendor
@@ -899,6 +1296,14 @@ mod tests {
 
     fn openai() -> &'static Vendor {
         vendor("openai").expect("openai is a built-in vendor")
+    }
+
+    #[test]
+    fn a_known_family_resolves_without_discovery() {
+        let sol = rung_of_known(openai(), "gpt-9.9-sol").expect("known family");
+        assert_eq!(model_family("openai", sol.id), Some("sol"));
+        assert!(rung_of_known(openai(), "gpt-9.9-unheard").is_none());
+        assert!(rung_of_known(anthropic(), "claude-opus-9-9").is_some());
     }
 
     #[test]
@@ -1171,7 +1576,7 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5[1m]",
             "claude-sonnet-5",
-            "claude-haiku-5",
+            "claude-haiku-4-5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -1217,6 +1622,114 @@ mod tests {
                         r.id
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_id_strips_dated_and_long_context_suffixes() {
+        assert_eq!(
+            normalize_id("anthropic/claude-haiku-4-5-20251001[1m]"),
+            Cow::Borrowed("claude-haiku-4-5")
+        );
+        assert_eq!(
+            normalize_id("claude-opus-5-20260915"),
+            Cow::Borrowed("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_newer_available_family_version_replaces_the_static_rung() {
+        let candidates = [
+            DiscoveredModel::new("openai", "gpt-6-sol", true),
+            DiscoveredModel::new("openai", "gpt-6.1-sol", true),
+        ];
+        let ladder = resolved_ladder(openai(), &candidates, &BTreeMap::new());
+        let sol = ladder
+            .iter()
+            .find(|rung| rung.family == "sol")
+            .expect("sol rung");
+        assert_eq!(sol.id, "gpt-6.1-sol");
+        assert_eq!(sol.tier, Some(Tier::Deep));
+    }
+
+    #[test]
+    fn an_unknown_discovered_family_is_never_ranked() {
+        let candidates = [DiscoveredModel::new("openai", "gpt-7-reserve", true)];
+        let ladder = resolved_ladder(openai(), &candidates, &BTreeMap::new());
+        assert!(ladder.iter().all(|rung| rung.id != "gpt-7-reserve"));
+        assert_eq!(model_family("openai", "gpt-7-reserve"), None);
+    }
+
+    #[test]
+    fn an_operator_family_pin_holds_when_a_newer_version_is_available() {
+        let candidates = [
+            DiscoveredModel::new("anthropic", "claude-opus-5", true),
+            DiscoveredModel::new("anthropic", "claude-opus-5-5", true),
+        ];
+        let pins = BTreeMap::from([("anthropic.opus".to_string(), "claude-opus-5".to_string())]);
+        let ladder = resolved_ladder(anthropic(), &candidates, &pins);
+        let opus = ladder
+            .iter()
+            .find(|rung| rung.family == "opus")
+            .expect("opus rung");
+        assert_eq!(opus.id, "claude-opus-5");
+        assert!(opus.pinned);
+    }
+
+    fn ladder_of(vendor: &Vendor, ids: &[&str]) -> Vec<ResolvedRung> {
+        let found: Vec<DiscoveredModel> = ids
+            .iter()
+            .map(|id| DiscoveredModel::new(vendor.slug, *id, true))
+            .collect();
+        resolved_ladder(vendor, &found, &BTreeMap::new())
+    }
+
+    #[test]
+    fn an_unknown_family_never_moves_rung_below_or_the_top_rung() {
+        let vendor = openai();
+        let ladder = ladder_of(vendor, &["gpt-7-reserve", "gpt-6.1-reserve"]);
+        assert_eq!(ladder[0].id, "gpt-6-astra");
+        assert_eq!(
+            rung_below_in(vendor, None, &ladder).as_deref(),
+            Some(rung_below(vendor, None))
+        );
+        assert!(rung_of_in(vendor, "gpt-7-reserve", &ladder).is_none());
+    }
+
+    #[test]
+    fn a_discovered_id_resolves_to_its_family_rung_and_keeps_astra_tierless() {
+        let vendor = openai();
+        let ladder = ladder_of(vendor, &["gpt-6.1-sol", "gpt-6.2-astra"]);
+        let rung = rung_of_in(vendor, "gpt-6.1-sol", &ladder).expect("sol rung");
+        assert_eq!(rung.tier, Some(Tier::Deep));
+        assert_eq!(
+            tier_model_in(vendor, Tier::Deep, &ladder).as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        let astra = rung_of_in(vendor, "gpt-6.2-astra", &ladder).expect("astra rung");
+        assert_eq!(astra.tier, None);
+        // The seat one below a discovered sol is still terra, never another family.
+        assert_eq!(
+            rung_below_in(vendor, Some("gpt-6.1-sol"), &ladder).as_deref(),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn an_empty_ladder_is_byte_identical_to_the_static_ladder() {
+        for vendor in [anthropic(), openai()] {
+            for seat in [None, Some("opus"), Some("gpt-5.6-sol"), Some("unknown")] {
+                assert_eq!(
+                    rung_below_in(vendor, seat, &[]).as_deref(),
+                    Some(rung_below(vendor, seat))
+                );
+            }
+            for tier in [Tier::Cheap, Tier::Standard, Tier::Deep] {
+                assert_eq!(
+                    tier_model_in(vendor, tier, &[]).as_deref(),
+                    tier_model(vendor, tier)
+                );
             }
         }
     }

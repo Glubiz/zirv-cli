@@ -428,6 +428,24 @@ pub fn record_launch(
         }],
     };
     save(state, repo, &record)?;
+    super::graph::record_worker_launch(
+        state,
+        repo,
+        &super::graph::Launch {
+            session: &record.handle.worker_session,
+            origin: "delegation",
+            parent_session: record.parent_session.as_deref(),
+            harness: None,
+            model: None,
+            task: record
+                .handle
+                .objective
+                .as_deref()
+                .or(record.handle.task.as_deref()),
+            workdir: Some(&record.handle.workdir),
+        },
+        now,
+    );
     Ok(record)
 }
 

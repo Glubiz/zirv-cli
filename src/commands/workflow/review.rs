@@ -36,7 +36,7 @@ const MAX_FINDING_PATH_BYTES: usize = 4 * 1024;
 /// Cap the aggregate finding summaries, not only each summary, so repeated review packages stay bounded. (#326)
 const MAX_REVIEW_FINDINGS_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
+pub(crate) const MAX_FIX_REVIEW_ROUNDS: u8 = 3;
 const REVIEW_RESULT_PREFIX: &str = "ZIRV_REVIEW_RESULT ";
 const MAX_JEV_FINDINGS_PER_BATCH: usize = 20;
 const MAX_JEV_PREVIOUS_FINDINGS: usize = 10;

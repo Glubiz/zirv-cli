@@ -217,6 +217,11 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
             .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Working),
             now_secs(),
         );
+        crate::commands::ctx::approvals::clear_released(
+            &state,
+            &attention_short(env, &session_id),
+            env,
+        );
     }
     Ok(0)
 }

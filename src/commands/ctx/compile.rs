@@ -1416,6 +1416,11 @@ pub fn compile_with_harness_roster(
             .saturating_add(cfg.memory.retrieval_max_bytes),
         &cfg.screen.thresholds(),
     );
+    // The supervisor line is static per config, so it precedes the volatile objective counters.
+    let composed = prompt::with_supervisor_layer(
+        composed,
+        cfg.supervisor.enabled && role != PromptRole::Worker,
+    );
     // Objective spend/status is volatile, so it follows memory; closed objectives stay absent (#285).
     let objective_text = super::objective::load(state, &slug)
         .ok()

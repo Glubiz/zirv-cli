@@ -24,10 +24,8 @@
 //! `~/.zirv/prices.toml` (or `price.table_path`), never by editing this
 //! file's constants to chase a vendor's own price-list revision.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::catalogue;
 use super::config::CtxConfig;
@@ -35,12 +33,7 @@ use super::event::TranscriptUsage;
 
 /// The built-in table's own pricing date -- see this module's own doc
 /// comment for why "approximate but dated" beats "exact but silently stale".
-pub const BUILT_IN_AS_OF: &str = "2026-09-01";
-
-/// The filename `resolve_table` reads under the operator's own `~/.zirv/`
-/// when `price.table_path` is unset -- the same "operator override, home
-/// directory only" shape `ctx.toml` itself already establishes.
-const DEFAULT_TABLE_FILENAME: &str = "prices.toml";
+pub const BUILT_IN_AS_OF: &str = "2026-10-01";
 
 /// One model's price, in MICRO-USD PER MILLION TOKENS, split by the same
 /// four raw token classes [`TranscriptUsage`]/`log::Delegation` already
@@ -91,7 +84,11 @@ impl PriceTable {
 /// million` in `u64` would overflow well before the division that scales it
 /// back down.
 pub fn price(model: &str, usage: &TranscriptUsage, table: &PriceTable) -> Option<u64> {
-    let rate = table.models.get(model)?;
+    let normalized = catalogue::normalize_id(model).to_lowercase();
+    let rate = table
+        .models
+        .get(model)
+        .or_else(|| table.models.get(&normalized))?;
     let scaled = |tokens: u64, micros_per_million: u64| -> u64 {
         u64::try_from((u128::from(tokens) * u128::from(micros_per_million)) / 1_000_000)
             .unwrap_or(u64::MAX)
@@ -110,49 +107,11 @@ pub fn price(model: &str, usage: &TranscriptUsage, table: &PriceTable) -> Option
     )
 }
 
-/// Resolves the effective price table: the built-in one ([`built_in_table`]),
-/// overridden WHOLESALE by an operator's own file when present and
-/// parseable -- `cfg.price.table_path` if set (a literal path, `~/` expanded
-/// against the real home directory), else `~/.zirv/prices.toml`. A missing or
-/// unparseable override file is not an error: the built-in table is what "no
-/// override" already meant, and a mistyped operator file must not turn every
-/// cost line in the ledger into a hard failure -- the same best-effort
-/// posture every other state-dir/config reader in this codebase holds.
+/// Resolves the effective price table through the I/O-owning models module:
+/// operator overrides win per model, then the fetched cache, then this
+/// module's compiled snapshot.
 pub fn resolve_table(cfg: &CtxConfig) -> PriceTable {
-    let Some(path) = override_path(cfg) else {
-        return built_in_table();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return built_in_table();
-    };
-    toml::from_str(&text).unwrap_or_else(|_| built_in_table())
-}
-
-/// The path [`resolve_table`] reads its override from, or `None` when no
-/// home directory can be determined at all (the same fallback every other
-/// `~/.zirv/...` reader in this codebase already tolerates).
-fn override_path(cfg: &CtxConfig) -> Option<PathBuf> {
-    match &cfg.price.table_path {
-        Some(configured) => Some(expand_home(configured)),
-        None => crate::utils::home_dir()
-            .ok()
-            .map(|home| home.join(".zirv").join(DEFAULT_TABLE_FILENAME)),
-    }
-}
-
-/// Expands a leading `~/` against the real home directory; any other path
-/// (absolute, or one that already resolved a home some other way) passes
-/// through unchanged. An unresolvable home falls back to the literal `~/...`
-/// path text, which will then simply fail to read -- resolved to "use the
-/// built-in table" by [`resolve_table`]'s own caller, same as any other
-/// missing file.
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = crate::utils::home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(path)
+    super::models::resolve_price_table(cfg)
 }
 
 /// The built-in price table zirv ships, covering the models `handover.rs`
@@ -354,10 +313,15 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5[1m]",
             "claude-sonnet-5",
-            "claude-haiku-5",
+            "claude-haiku-4-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
             "gpt-5.4-mini",
             "gpt-5-codex",
             "gpt-6-astra",
@@ -372,100 +336,73 @@ mod tests {
         assert_eq!(table.as_of, BUILT_IN_AS_OF);
     }
 
-    /// Issue #381: `built_in_table` is now built from `catalogue::
-    /// built_in_prices()` instead of a hand-written map. `old` is a literal
-    /// copy of that pre-catalogue map (the exact `ModelPrice` values that
-    /// used to live in this function); every one of its 21 entries must
-    /// survive the migration unchanged. The new table may carry additional
-    /// keys (the survey vendors `catalogue` adds) -- this only asserts the
-    /// pre-existing subset never moved.
     #[test]
-    fn built_in_table_preserves_every_pre_catalogue_price_verbatim() {
-        const OPUS: ModelPrice = ModelPrice {
-            input_micros: 15_000_000,
-            cache_write_micros: 18_750_000,
-            cache_read_micros: 1_500_000,
-            output_micros: 75_000_000,
-        };
-        const OPUS_1M: ModelPrice = ModelPrice {
-            input_micros: 30_000_000,
-            cache_write_micros: 37_500_000,
-            cache_read_micros: 3_000_000,
-            output_micros: 150_000_000,
-        };
-        const FABLE: ModelPrice = OPUS;
-        const FABLE_1M: ModelPrice = OPUS_1M;
-        const SONNET: ModelPrice = ModelPrice {
-            input_micros: 3_000_000,
-            cache_write_micros: 3_750_000,
-            cache_read_micros: 300_000,
-            output_micros: 15_000_000,
-        };
-        const HAIKU: ModelPrice = ModelPrice {
-            input_micros: 800_000,
-            cache_write_micros: 1_000_000,
-            cache_read_micros: 80_000,
-            output_micros: 4_000_000,
-        };
-        const SOL: ModelPrice = ModelPrice {
-            input_micros: 15_000_000,
-            cache_write_micros: 15_000_000,
-            cache_read_micros: 1_500_000,
-            output_micros: 60_000_000,
-        };
-        const TERRA: ModelPrice = ModelPrice {
-            input_micros: 2_500_000,
-            cache_write_micros: 2_500_000,
-            cache_read_micros: 250_000,
-            output_micros: 10_000_000,
-        };
-        const LUNA: ModelPrice = ModelPrice {
-            input_micros: 1_000_000,
-            cache_write_micros: 1_000_000,
-            cache_read_micros: 100_000,
-            output_micros: 4_000_000,
-        };
-        const MINI: ModelPrice = ModelPrice {
-            input_micros: 250_000,
-            cache_write_micros: 250_000,
-            cache_read_micros: 25_000,
-            output_micros: 1_000_000,
-        };
-
-        let old: BTreeMap<String, ModelPrice> = BTreeMap::from([
-            ("fable".to_string(), FABLE),
-            ("mythos".to_string(), FABLE),
-            ("opus".to_string(), OPUS),
-            ("sonnet".to_string(), SONNET),
-            ("haiku".to_string(), HAIKU),
-            ("claude-fable-5".to_string(), FABLE),
-            ("claude-fable-5[1m]".to_string(), FABLE_1M),
-            ("claude-fable-5-1".to_string(), FABLE),
-            ("claude-fable-5-1[1m]".to_string(), FABLE_1M),
-            ("claude-mythos-5".to_string(), FABLE),
-            ("claude-mythos-5[1m]".to_string(), FABLE_1M),
-            ("claude-opus-5".to_string(), OPUS),
-            ("claude-opus-5[1m]".to_string(), OPUS_1M),
-            ("claude-sonnet-5".to_string(), SONNET),
-            ("claude-haiku-5".to_string(), HAIKU),
-            ("gpt-5.6-sol".to_string(), SOL),
-            ("gpt-5.6-terra".to_string(), TERRA),
-            ("gpt-5.6-luna".to_string(), LUNA),
-            ("gpt-5.4-mini".to_string(), MINI),
-            ("gpt-5-codex".to_string(), TERRA),
-            ("gpt-6-astra".to_string(), SOL),
+    fn built_in_table_matches_the_corrected_published_snapshot() {
+        let expected = BTreeMap::from([
+            (
+                "claude-fable-5-1",
+                (10_000_000, 50_000_000, 250_000, 12_500_000),
+            ),
+            (
+                "claude-fable-5",
+                (10_000_000, 50_000_000, 1_000_000, 12_500_000),
+            ),
+            (
+                "claude-opus-5-5",
+                (4_000_000, 20_000_000, 200_000, 5_000_000),
+            ),
+            ("claude-opus-5", (5_000_000, 25_000_000, 500_000, 6_250_000)),
+            (
+                "claude-sonnet-5-5",
+                (2_000_000, 10_000_000, 200_000, 2_500_000),
+            ),
+            (
+                "claude-sonnet-5",
+                (2_000_000, 10_000_000, 200_000, 2_500_000),
+            ),
+            (
+                "claude-haiku-4-5",
+                (1_000_000, 5_000_000, 100_000, 1_250_000),
+            ),
+            ("gpt-5.6-sol", (4_000_000, 20_000_000, 400_000, 5_000_000)),
+            ("gpt-5.6-terra", (2_000_000, 12_000_000, 200_000, 2_500_000)),
+            ("gpt-5.6-luna", (200_000, 1_200_000, 20_000, 250_000)),
+            ("gpt-6-sol", (2_000_000, 10_000_000, 200_000, 2_500_000)),
+            ("gpt-6.1-sol", (2_000_000, 10_000_000, 100_000, 2_500_000)),
+            (
+                "gpt-6-astra",
+                (10_000_000, 50_000_000, 1_000_000, 12_500_000),
+            ),
+            ("gpt-6-luna", (100_000, 500_000, 10_000, 125_000)),
         ]);
-        assert_eq!(old.len(), 21, "the pre-catalogue map had exactly 21 keys");
-
         let table = built_in_table();
-        for (model, expected) in &old {
+        for (model, (input, output, cache_read, cache_write)) in expected {
             assert_eq!(
                 table.models.get(model),
-                Some(expected),
-                "{model}: price must survive the catalogue migration unchanged"
+                Some(&ModelPrice {
+                    input_micros: input,
+                    output_micros: output,
+                    cache_read_micros: cache_read,
+                    cache_write_micros: cache_write,
+                }),
+                "{model}: corrected published rate"
             );
         }
         assert_eq!(table.as_of, BUILT_IN_AS_OF);
+    }
+
+    #[test]
+    fn dated_provider_prefixed_and_long_context_ids_are_priced() {
+        let table = built_in_table();
+        let one_million_input = usage(1_000_000, 0, 0, 0);
+        assert_eq!(
+            price(
+                "anthropic/claude-haiku-4-5-20251001[1m]",
+                &one_million_input,
+                &table
+            ),
+            Some(1_000_000)
+        );
     }
 
     /// A table older than `stale_after_days` is stale; one within it is not
@@ -549,10 +486,7 @@ mod tests {
         let table = resolve_table(&cfg);
         assert_eq!(table.as_of, "2020-01-01");
         assert!(table.models.contains_key("custom"));
-        assert!(
-            !table.models.contains_key("opus"),
-            "an explicit override replaces the built-in table wholesale, it does not merge"
-        );
+        assert!(table.models.contains_key("opus"));
     }
 
     /// A present-but-unparseable override file must never turn pricing into
@@ -565,7 +499,7 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
         std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
         std::fs::write(
-            tmp.path().join(".zirv").join(DEFAULT_TABLE_FILENAME),
+            tmp.path().join(".zirv").join("prices.toml"),
             "not valid toml {{{",
         )
         .expect("write bad override");

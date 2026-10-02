@@ -489,9 +489,9 @@ mod tests {
         sort_deterministically(&mut aggregated);
 
         assert_eq!(aggregated.len(), 2, "claude and codex");
-        // claude: rows 1, 2, 5 -- $1.32 + $0.48 + $0 (unpriced) = $1.80.
-        let claude = &aggregated[0];
-        assert_eq!(claude.key, "claude", "claude's $1.80 beats codex's $1.7775");
+        // claude: rows 1, 2, 5 -- $0.88 + $0.32 + $0 (unpriced) = $1.20.
+        let claude = &aggregated[1];
+        assert_eq!(claude.key, "claude", "codex's total beats claude's $1.20");
         assert_eq!(claude.runs, 3);
         assert_eq!(claude.ok, 2);
         assert_eq!(claude.failed, 1);
@@ -499,11 +499,11 @@ mod tests {
         assert_eq!(claude.cache_read_tokens, 1_000_000);
         assert_eq!(claude.output_tokens, 70_500);
         assert_eq!(claude.wall_ms, 15_500);
-        assert_eq!(claude.cost_micros, Some(1_800_000), "$1.80 exactly");
+        assert_eq!(claude.cost_micros, Some(1_200_000), "$1.20 exactly");
         assert_eq!(claude.unpriced_runs, 1, "the unknown-model-x row");
 
-        // codex: rows 3, 4 -- $1.70 + $0.0775 = $1.7775.
-        let codex = &aggregated[1];
+        // codex: rows 3, 4 -- $1.76 + $0.082 = $1.842.
+        let codex = &aggregated[0];
         assert_eq!(codex.key, "codex");
         assert_eq!(codex.runs, 2);
         assert_eq!(codex.ok, 2);
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(codex.cache_read_tokens, 810_000);
         assert_eq!(codex.output_tokens, 105_000);
         assert_eq!(codex.wall_ms, 21_000);
-        assert_eq!(codex.cost_micros, Some(1_777_500), "$1.7775 exactly");
+        assert_eq!(codex.cost_micros, Some(1_842_000), "$1.842 exactly");
         assert_eq!(codex.unpriced_runs, 0);
 
         let total = totals(&aggregated);
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(total.cache_read_tokens, 1_810_000);
         assert_eq!(total.output_tokens, 175_500);
         assert_eq!(total.wall_ms, 36_500);
-        assert_eq!(total.cost_micros, Some(3_577_500), "$3.5775 total");
+        assert_eq!(total.cost_micros, Some(3_042_000), "$3.042 total");
         assert_eq!(total.unpriced_runs, 1);
     }
 
@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("claude"), "got {text}");
-        assert!(text.contains("$3.00"), "1M input tokens @ $3/M: {text}");
+        assert!(text.contains("$2.00"), "1M input tokens @ $2/M: {text}");
     }
 
     /// D-9: the unit multiplier overflowed `u64` on an absurd `--since`,
@@ -904,7 +904,7 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            text.contains("$3.00"),
+            text.contains("$2.00"),
             "only the aliased row counts: {text}"
         );
     }

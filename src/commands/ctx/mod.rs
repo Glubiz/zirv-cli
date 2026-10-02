@@ -6,6 +6,7 @@ pub mod agent_manifest;
 pub mod allocator;
 pub mod announce;
 pub mod api;
+pub mod approvals;
 pub mod ask;
 pub mod attention;
 pub mod attribution;
@@ -35,6 +36,8 @@ pub mod envelope;
 pub mod event;
 pub mod exec;
 pub mod fallback;
+pub mod graph;
+pub mod graph_steps;
 pub mod group;
 pub mod handoff;
 pub mod handover;
@@ -47,6 +50,7 @@ pub(crate) mod hook_project;
 pub(crate) mod inject_gate;
 pub mod inject_screen;
 pub mod jev;
+pub mod jev_feed;
 pub(crate) mod jev_probe;
 pub mod jev_relay;
 pub mod judge;
@@ -61,6 +65,7 @@ pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
 pub(crate) mod model_window;
+pub mod models;
 pub(crate) mod native_account;
 pub mod native_hooks;
 pub mod native_worker;
@@ -114,7 +119,9 @@ pub mod spend;
 pub mod stall;
 pub mod state;
 pub mod status;
+pub mod statusline;
 pub mod supervise;
+pub mod supervisor;
 pub mod surface;
 pub mod surface_collect;
 pub mod task;
@@ -580,6 +587,8 @@ pub enum CtxVerb {
     /// seat transcript, its native subagent transcripts, and every `zirv
     /// agent` delegation row -- never delegations alone (issue #457).
     Status(status::StatusArgs),
+    /// List discovered models and effective prices, or refresh their caches.
+    Models(models::ModelsArgs),
     /// Explain one session's composed attention projection: what it is,
     /// why, which authority decided, and every fallback that was suppressed
     /// (issue #349).
@@ -649,6 +658,15 @@ pub enum CtxVerb {
     Permissions(permissions::PermissionsArgs),
     /// Open, inspect or close a bounded group of delegated work.
     Group(group::GroupArgs),
+    /// Print the agent graph (sessions, delegations, groups, subagents) and
+    /// the merged event log (issue #832).
+    Graph(graph::GraphArgs),
+    /// Claude Code's `statusLine` command: the operator's own line plus a short
+    /// agents/supervisor/Jev/spend segment (issue #833).
+    Statusline(statusline::StatuslineArgs),
+    /// Show or run the on-call supervisor: one bounded read-only consult at error-repeats,
+    /// before-done and before-plan (issue #835, off by default).
+    Supervisor(supervisor::SupervisorArgs),
     /// Compose the session prompt for the current repo/role/harness -- print
     /// it, or measure its per-layer byte/token cost with `--measure`.
     Compile(compile::CompileArgs),
@@ -831,6 +849,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Resume(a) => resume::run(a, &mut out),
         CtxVerb::Hook(a) => hook::run(a, &mut out),
         CtxVerb::Status(a) => status::run(a, &mut out),
+        CtxVerb::Models(a) => models::run(a, &mut out),
         CtxVerb::ExplainStatus(a) => attention::run_explain_status(a, &mut out),
         CtxVerb::Wait(a) => attention::run_wait(a, &mut out),
         CtxVerb::Watch(a) => attention::run_watch(a, &mut out),
@@ -856,6 +875,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Handover(a) => handover::run(a, &mut out),
         CtxVerb::Permissions(a) => permissions::run(a, &mut out),
         CtxVerb::Group(a) => group::run(a, &mut out),
+        CtxVerb::Graph(a) => graph::run(a, &mut out),
+        CtxVerb::Statusline(a) => statusline::run(a, &mut out),
+        CtxVerb::Supervisor(a) => supervisor::run(a, &mut out),
         CtxVerb::Compile(a) => compile::run(a, &mut out),
         CtxVerb::Objective(a) => objective::run(a, &mut out),
         CtxVerb::Spend(a) => spend::run(a, &mut out),

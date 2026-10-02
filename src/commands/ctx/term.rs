@@ -264,6 +264,21 @@ pub fn dash_mouse_on_bytes() -> &'static [u8] {
     DASH_MOUSE_ON
 }
 
+/// Any-motion tracking (`?1003`), for the orchestrator dashboard's hover preview, only while its
+/// FLOW is on screen and never on Windows, where Windows Terminal reports every pointer movement
+/// and floods the input drain (see [`dash_mouse_on_bytes`]). Turning it off re-asserts the default
+/// button and drag tracking, because the tracking modes replace one another.
+pub fn dash_hover_bytes(on: bool) -> &'static [u8] {
+    if cfg!(windows) {
+        return b"";
+    }
+    if on {
+        b"\x1b[?1003h"
+    } else {
+        b"\x1b[?1003l\x1b[?1000h\x1b[?1002h"
+    }
+}
+
 /// See [`dash_mouse_on_bytes`]. A constant for the same allocation-free
 /// reason every other sequence in this module is one.
 const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -1150,6 +1165,28 @@ mod tests {
                 String::from_utf8_lossy(mode)
             );
         }
+    }
+
+    /// Hover tracking is a flow-only toggle: on is `?1003h`, off is `?1003l` followed by the default
+    /// button and drag tracking again, and Windows never turns it on.
+    #[test]
+    fn hover_tracking_is_a_toggle_that_restores_the_default_capture_and_is_off_on_windows() {
+        if cfg!(windows) {
+            assert!(dash_hover_bytes(true).is_empty() && dash_hover_bytes(false).is_empty());
+            return;
+        }
+        assert_eq!(dash_hover_bytes(true), b"\x1b[?1003h");
+        let off = dash_hover_bytes(false);
+        assert!(off.starts_with(b"\x1b[?1003l"));
+        for mode in [&b"\x1b[?1000h"[..], &b"\x1b[?1002h"[..]] {
+            assert!(off.windows(mode.len()).any(|w| w == mode), "{off:?}");
+        }
+        // The default capture itself still never carries it.
+        assert!(
+            !dash_mouse_on_bytes()
+                .windows(8)
+                .any(|w| w == b"\x1b[?1003h")
+        );
     }
 
     /// The enable set is button+wheel reporting, button-drag tracking, and

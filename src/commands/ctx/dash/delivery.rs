@@ -132,6 +132,38 @@ pub(super) fn log_mail_attention_event(
     );
 }
 
+/// Latch `Approval` attention while a Codex approval dialog is on screen and release it when the dialog is gone, so the sidebar shows it like a Claude hook latch (#842).
+pub(super) fn latch_codex_approval(panes: &mut [Pane], state: &StateDir) {
+    for pane in panes.iter_mut() {
+        let open = pane.codex_approval_open();
+        if open == pane.codex_approval_latched {
+            continue;
+        }
+        pane.codex_approval_latched = open;
+        let now = super::state::now_secs();
+        let observation = if open {
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "codex approval dialog is open",
+                80,
+                now,
+            )
+            .with_attention(super::attention::Attention::Approval)
+        } else {
+            super::attention::Observation::new(
+                super::attention::Authority::Supervisor,
+                "codex approval dialog closed",
+                80,
+                now,
+            )
+            .with_attention(super::attention::Attention::None)
+        };
+        super::attention::record_if(state, pane.short(), observation, now, |prev| {
+            open || prev.attention == super::attention::Attention::Approval
+        });
+    }
+}
+
 /// Inject at most one mail body per pane per tick so a burst remains readable;
 /// consume it only after successful injection, leaving failures retryable.
 #[allow(clippy::too_many_arguments)]
@@ -917,6 +949,20 @@ pub(super) fn input_poll_wait(since_activity: Duration) -> Duration {
     }
 }
 
+/// Pure: while the animated flow shows, wake no later than the next frame is due, so the idle
+/// poll (longer than a frame) does not halve the frame rate. `since_draw` is `None` before the
+/// first flow frame, which leaves the wait alone.
+pub(super) fn frame_poll_wait(
+    wait: Duration,
+    frame_interval: Option<Duration>,
+    since_draw: Option<Duration>,
+) -> Duration {
+    match (frame_interval, since_draw) {
+        (Some(every), Some(since)) => wait.min(every.saturating_sub(since)),
+        _ => wait,
+    }
+}
+
 /// Quit only after reap leaves no panes to supervise.
 pub(super) fn should_exit_empty(live_panes: usize, restore_pending: bool) -> bool {
     live_panes == 0 && !restore_pending
@@ -1042,6 +1088,22 @@ mod tests {
     /// The hot/idle poll-wait boundary: hot at zero and just under the
     /// window, still hot exactly at the window (the check is `<=`), idle the
     /// instant it passes.
+    #[test]
+    fn the_idle_poll_never_sleeps_past_the_next_flow_frame() {
+        let idle = INPUT_POLL_IDLE_WAIT;
+        let frame = Some(Duration::from_millis(66));
+        let ms = Duration::from_millis;
+        assert_eq!(frame_poll_wait(idle, None, Some(ms(10))), idle, "no flow");
+        assert_eq!(frame_poll_wait(idle, frame, None), idle, "no frame yet");
+        assert_eq!(frame_poll_wait(idle, frame, Some(ms(0))), idle);
+        assert_eq!(frame_poll_wait(idle, frame, Some(ms(50))), ms(16));
+        assert_eq!(frame_poll_wait(idle, frame, Some(ms(70))), Duration::ZERO);
+        assert_eq!(
+            frame_poll_wait(INPUT_POLL_HOT_WAIT, frame, Some(ms(10))),
+            INPUT_POLL_HOT_WAIT
+        );
+    }
+
     #[test]
     fn input_poll_wait_is_hot_within_the_window_and_idle_past_it() {
         assert_eq!(input_poll_wait(Duration::ZERO), INPUT_POLL_HOT_WAIT);
@@ -3194,6 +3256,185 @@ mod tests {
         for pane in panes.iter_mut() {
             let _ = pane.finish_shutdown();
         }
+    }
+
+    /// A signal-less pane whose child prints a dialog, then (after one line of input)
+    /// clears the screen. `agent` decides whether the dashboard treats it as Codex.
+    #[cfg(unix)]
+    fn spawn_dialog_pane(
+        agent: &str,
+        state: &StateDir,
+        repo: &Path,
+        cwd: &Path,
+        session_id: &str,
+    ) -> Pane {
+        let script = "printf 'Would you like to run the following command?\\r\\n  1. Yes, proceed (y)\\r\\n  3. No, and tell Codex what to do differently (esc)\\r\\n'; read x; printf '\\033[2J\\033[Hready\\r\\n'; sleep 60";
+        let spec = PaneSpec {
+            agent_name: agent.to_string(),
+            argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: session_id.to_string(),
+            title: "wrk dialog".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            state,
+            repo,
+            cwd,
+            (100, 24),
+            &[],
+            false,
+            Duration::from_millis(200),
+        )
+        .expect("spawn");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !pane.screen().contents().contains("No, and")
+        {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pane
+    }
+
+    /// Drain for `ms` so the signal-less quiet window (200 ms) closes.
+    #[cfg(unix)]
+    fn settle(pane: &mut Pane, ms: u64) {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #842: while a Codex approval dialog is on screen, mail, a queued nudge and the
+    /// report-back reminder type nothing and stay queued; once it is gone they deliver.
+    /// The pane's workdir is a worktree of the dashboard's repo (#841).
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_approval_dialog_blocks_every_injection_until_it_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let worktree = repo.join(".claude/worktrees/wt-x");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+        let slug = super::super::state::repo_slug(&repo);
+        let cfg = CtxConfig::default();
+
+        let mut pane = spawn_dialog_pane(
+            "codex",
+            &state,
+            &repo,
+            &worktree,
+            "abababab-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("cccc3333".to_string()));
+        settle(&mut pane, 500);
+        assert!(
+            matches!(pane.state(), PaneState::Idle),
+            "the quiet rule alone calls the static dialog idle"
+        );
+        assert!(!pane.injectable(), "but the dialog makes it uninjectable");
+        let short = pane.short().to_string();
+        let mut panes = vec![pane];
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: "aaaa1111".to_string(),
+                from_agent: "claude".to_string(),
+                to: "codex".to_string(),
+                to_session: Some(short.clone()),
+                sent: super::super::state::now_secs(),
+                body: "the build is red".to_string(),
+            },
+            &cfg,
+        )
+        .expect("store");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::from(vec!["ping".to_string()])];
+        let mut errors = ErrorLog::default();
+        let mut advised = HashMap::new();
+
+        latch_codex_approval(&mut panes, &state);
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::Approval,
+            "the sidebar shows the dialog like a Claude hook latch"
+        );
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+        settle(&mut panes[0], 400);
+        assert!(
+            !panes[0].screen().contents().contains("zirv"),
+            "nothing was typed into the dialog: {}",
+            panes[0].screen().contents()
+        );
+        assert!(!panes[0].has_pending_submit());
+        assert_eq!(
+            mail::list(&state, &slug, Some("codex"), Some(&short))
+                .expect("list")
+                .len(),
+            1,
+            "mail stays queued"
+        );
+        assert_eq!(queues[0].len(), 1, "the nudge stays queued");
+        assert!(!panes[0].report_reminder_sent(), "the reminder waits");
+
+        panes[0].write_input(b"y\n").expect("answer the dialog");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && panes[0].codex_approval_open() {
+            panes[0].drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        settle(&mut panes[0], 500);
+        latch_codex_approval(&mut panes, &state);
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::None,
+            "the latch is released with the dialog"
+        );
+        mail_sweep(&mut panes, &cfg, &state, &repo, &mut advised, &mut errors);
+        assert!(
+            mail::list(&state, &slug, Some("codex"), Some(&short))
+                .expect("list")
+                .is_empty(),
+            "mail is delivered once the dialog is gone"
+        );
+        // Retire the mail's own deferred Enter and confirmation window so the next path is judged on its own.
+        panes[0].cancel_submission();
+        settle(&mut panes[0], 600);
+        deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
+        assert!(queues[0].is_empty(), "the nudge is delivered");
+        panes[0].cancel_submission();
+        settle(&mut panes[0], 600);
+        report_back_reminder_sweep(&mut panes, &state, &mut errors);
+        assert!(panes[0].report_reminder_sent(), "the reminder is delivered");
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// #842: the same screen on a non-Codex pane changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_dialog_text_on_a_claude_pane_still_delivers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let mut pane = spawn_dialog_pane(
+            "claude",
+            &state,
+            &repo,
+            &repo,
+            "bcbcbcbc-2222-4333-8444-555555555555",
+        );
+        settle(&mut pane, 500);
+        assert!(!pane.codex_approval_open());
+        assert!(pane.injectable());
+        let _ = pane.finish_shutdown();
     }
 
     /// A second sweep, on an already-reminded pane, must not inject a second

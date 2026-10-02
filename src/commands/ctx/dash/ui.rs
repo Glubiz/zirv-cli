@@ -63,6 +63,8 @@ pub struct HeaderFacts {
     pub sessions: usize,
     pub working: usize,
     pub needs_you: usize,
+    /// Pending approvals on this dashboard; the badge draws only while this is above zero (#840).
+    pub approvals: usize,
     pub error_count: usize,
     pub latest_error: Option<String>,
     pub notice: Option<String>,
@@ -330,6 +332,8 @@ pub struct SidebarRow {
     /// Absent under reduced motion; overlay the tint rather than replacing
     /// span styles so glyph and rot colours survive.
     pub flash: Option<Style>,
+    /// A held approval for this session is waiting on the dashboard strip (#840).
+    pub approval_pending: bool,
 }
 
 /// Keep rollover badges limited to actionable pending and parked states.
@@ -776,6 +780,9 @@ pub enum Overlay {
     /// acknowledge: these are historical rollup rows, not the dashboard's
     /// own live error buffer, so this carries no `mark`.
     JevErrors(JevErrorsView),
+    /// `Ctrl+A a`: a read-only snapshot of every dashboard's pending approvals (#840). Shares the
+    /// jev-errors list shape; rows are display-only text, there is nothing to answer here.
+    Approvals(JevErrorsView),
     /// Open the target row's action menu from prefix, pointer or header hint (#354).
     Menu(MenuView),
     /// Open the row inspector from prefix or menu (#354).
@@ -796,6 +803,7 @@ impl Overlay {
             Overlay::Handover(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::Errors(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::JevErrors(view) => Some((view.cursor, view.offset, view.items.len())),
+            Overlay::Approvals(view) => Some((view.cursor, view.offset, view.items.len())),
             Overlay::Menu(view) => Some((view.cursor, view.offset, view.entries.len())),
             Overlay::Inspector(view) => Some((view.cursor, view.offset, view.rows().len())),
             Overlay::Palette(view) => Some((view.cursor, view.offset, view.rows().len())),
@@ -827,7 +835,7 @@ impl Overlay {
                 view.cursor = cursor;
                 view.offset = offset;
             }
-            Overlay::JevErrors(view) => {
+            Overlay::JevErrors(view) | Overlay::Approvals(view) => {
                 view.cursor = cursor;
                 view.offset = offset;
             }
@@ -1100,6 +1108,12 @@ fn header_layout(facts: &HeaderFacts, area: Rect) -> (Vec<Span<'static>>, Vec<(R
         counts.push((
             format!("{} needs you", facts.needs_you),
             style::tui::warning(),
+        ));
+    }
+    if facts.approvals > 0 {
+        counts.push((
+            format!("\u{2691} {} approvals", facts.approvals),
+            style::tui::warning().add_modifier(Modifier::BOLD),
         ));
     }
     for (text, style) in counts {
@@ -2566,6 +2580,12 @@ fn badge_for(row: &SidebarRow) -> Option<(String, Style)> {
             style::tui::warning().add_modifier(Modifier::BOLD),
         ));
     }
+    if row.approval_pending {
+        return Some((
+            "\u{2691} ".to_string(),
+            style::tui::warning().add_modifier(Modifier::BOLD),
+        ));
+    }
     match row.rollover_badge {
         Some(RolloverBadge::Pending) => {
             return Some((
@@ -3907,6 +3927,17 @@ pub fn list_spec_for(overlay: &Overlay, tick: usize) -> Option<ListDialogSpec<'s
             empty_message: "no jev errors in the last 24h",
             input: None,
         }),
+        Overlay::Approvals(view) => Some(ListDialogSpec {
+            title: "approvals".to_string(),
+            count: Some(view.items.len()),
+            rows: view.items.iter().map(error_dialog_row).collect(),
+            cursor: cursor_of(view.items.len(), view.cursor),
+            offset: view.offset,
+            footer: JEV_ERRORS_FOOTER,
+            warn: true,
+            empty_message: "no pending approvals",
+            input: None,
+        }),
         Overlay::Menu(view) => Some(ListDialogSpec {
             title: format!("actions \u{b7} {}", view.subject),
             count: None,
@@ -4271,6 +4302,7 @@ mod tests {
                         unread_mail: 0,
                         rollover_badge: None,
                         flash: None,
+                        approval_pending: false,
                     })
                     .collect();
                 if scenario == "nine-panes" {
@@ -5207,6 +5239,7 @@ mod tests {
             sessions: 1,
             working: 0,
             needs_you: 0,
+            approvals: 0,
             error_count: 0,
             latest_error: None,
             notice: None,
@@ -5537,6 +5570,17 @@ mod tests {
         }
     }
 
+    /// Issue #840: the `\u{2691}` marker appears on a session row only while its approval is pending.
+    #[test]
+    fn the_sidebar_marks_a_row_only_while_its_approval_is_pending() {
+        let mut row = sidebar_row("abc12345", "claude", RowState::Idle);
+        let plain = sidebar_row_text(&row, 0, 28);
+        assert!(!plain.contains('\u{2691}'), "{plain}");
+        row.approval_pending = true;
+        let marked = sidebar_row_text(&row, 0, 28);
+        assert!(marked.contains('\u{2691}'), "{marked}");
+    }
+
     fn sidebar_row(short: &str, harness: &str, state: RowState) -> SidebarRow {
         SidebarRow {
             role: "worker".into(),
@@ -5561,6 +5605,7 @@ mod tests {
             unread_mail: 0,
             rollover_badge: None,
             flash: None,
+            approval_pending: false,
         }
     }
 
@@ -6089,6 +6134,7 @@ mod tests {
                 unread_mail: 0,
                 rollover_badge: None,
                 flash: None,
+                approval_pending: false,
             },
             SidebarRow {
                 role: "worker".into(),
@@ -6113,6 +6159,7 @@ mod tests {
                 unread_mail: 0,
                 rollover_badge: None,
                 flash: None,
+                approval_pending: false,
             },
         ];
         let backend = TestBackend::new(40, 6);
@@ -6167,6 +6214,7 @@ mod tests {
             unread_mail: 0,
             rollover_badge: None,
             flash: None,
+            approval_pending: false,
         };
         let rows: Vec<SidebarRow> = (0..12).map(|i| row(i, i == 10)).collect();
         let text = render_and_capture_text(Rect::new(0, 0, 30, 6), |f, area| {

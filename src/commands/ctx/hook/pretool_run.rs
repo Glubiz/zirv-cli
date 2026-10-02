@@ -290,6 +290,16 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         );
     }
 
+    if crate::commands::ctx::lifecycle::SUBAGENT_TOOLS.contains(&payload.tool_name.as_str()) {
+        crate::commands::ctx::graph::record_agent_dispatch(
+            env,
+            &payload.session_id,
+            &payload.tool_use_id,
+            &payload.agent_id,
+            resolved_cwd(&payload).as_deref(),
+        );
+    }
+
     if let Some(seat) = env(adapters::SEAT_MODEL_ENV)
         && let Some(reason) = pretool_decision(Some(&seat), &payload)
     {

@@ -362,6 +362,8 @@ pub enum PromptSource {
     Context,
     /// Volatile objective counters follow memory; missing or closed objectives add no layer (#285).
     Objective,
+    /// One line when the supervisor is on: route design choices through `zirv ctx supervisor ask`.
+    Supervisor,
     /// Per-launch proxy advice follows the objective and cannot grant permissions or override instructions (#537).
     Proxy,
     /// Mail changes per launch, so append after stable repo context and before the operator's final instruction.
@@ -385,6 +387,7 @@ impl PromptSource {
             PromptSource::Memory => "memory",
             PromptSource::Context => "canonical context",
             PromptSource::Objective => "objective",
+            PromptSource::Supervisor => "supervisor",
             PromptSource::Proxy => "proxy",
             PromptSource::User => "user",
             PromptSource::Repo => "repo",
@@ -1191,6 +1194,24 @@ pub fn with_objective_layer(
     };
     composed.text.push_str(text);
     composed.sources.push(PromptSource::Objective);
+    Some(composed)
+}
+
+const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
+choices through `zirv ctx supervisor ask \"<question>\" --option \"<a>\" --option \"<b>\"`, and follow \
+its ruling unless the operator overrides it.";
+
+/// The one-line supervisor instruction; absent when the supervisor is off (the default).
+pub fn with_supervisor_layer(
+    composed: Option<ComposedPrompt>,
+    enabled: bool,
+) -> Option<ComposedPrompt> {
+    let mut composed = composed?;
+    if !enabled {
+        return Some(composed);
+    }
+    composed.text.push_str(SUPERVISOR_LAYER);
+    composed.sources.push(PromptSource::Supervisor);
     Some(composed)
 }
 
@@ -6965,6 +6986,31 @@ mod tests {
             None,
             "no composed prompt in, no composed prompt out"
         );
+    }
+
+    /// The supervisor line exists only while the supervisor is on and never turns composition on.
+    #[test]
+    fn the_supervisor_layer_is_one_line_present_only_when_the_supervisor_is_on() {
+        let base = || {
+            Some(ComposedPrompt {
+                text: String::from("base"),
+                sources: vec![PromptSource::Default],
+                version: DEFAULT_PROMPT_VERSION,
+            })
+        };
+        let off = with_supervisor_layer(base(), false).expect("composed");
+        assert_eq!(
+            (off.text.as_str(), off.sources),
+            ("base", vec![PromptSource::Default])
+        );
+        let on = with_supervisor_layer(base(), true).expect("composed");
+        assert!(on.text.contains("zirv ctx supervisor ask"), "{}", on.text);
+        assert!(on.text.contains("unless the operator overrides it"));
+        assert_eq!(
+            on.sources,
+            vec![PromptSource::Default, PromptSource::Supervisor]
+        );
+        assert!(with_supervisor_layer(None, true).is_none());
     }
 
     /// Issue #537: the harness proxy's own bounded layer is present only

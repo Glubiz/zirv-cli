@@ -1,6 +1,6 @@
 //! Versioned workflow definitions and durable execution state.
 
-mod cli;
+pub(crate) mod cli;
 mod definitions;
 mod lifecycle;
 mod state;
@@ -8,7 +8,7 @@ mod transition;
 
 pub use cli::{StartArgs, WorkflowArgs, WorkflowSubcommand, run, start_workflow};
 pub(crate) use cli::{
-    load_workflow_registry, resolve_repo, resolve_state, write_definition_status,
+    detach, load_workflow_registry, resolve_repo, resolve_state, write_definition_status,
     write_registry_entry, write_registry_list, write_start_outcome, write_state,
 };
 pub use definitions::{

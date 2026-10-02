@@ -360,10 +360,29 @@ pub(super) const ZIRV_CTX_ESCAPE_SAFE_VERBS: &[&str] = &[
     "safety",
     "permissions",
     "group",
+    // `supervisor ask` runs one read-only helper with a fixed argv; the question is a prompt, not argv.
+    "supervisor",
     // `kill` takes one session-id prefix, not caller-controlled subprocess
     // argv, so it meets this list's escape-safe contract.
     "kill",
 ];
+
+/// `zirv ctx supervisor override` lifts a binding ruling and is operator-only: it never auto-allows or
+/// retries unsandboxed, so an agent's attempt surfaces as a permission prompt. `ask`/`status` stay safe.
+/// Token-based, so a path-qualified or quoted `zirv` and extra whitespace match too.
+pub(super) fn is_supervisor_override(tokens: &[String]) -> bool {
+    tokens
+        .first()
+        .is_some_and(|program| sql_program_name(program) == "zirv")
+        && tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("ctx"))
+        && tokens
+            .get(2)
+            .is_some_and(|t| t.eq_ignore_ascii_case("supervisor"))
+        && tokens
+            .iter()
+            .skip(3)
+            .any(|t| t.eq_ignore_ascii_case("override"))
+}
 
 /// Require every segment of a reserved zirv command to be retry-safe.
 /// Reserved names alone do not prove sandbox safety: ctx launchers and
@@ -406,7 +425,7 @@ pub(super) fn is_reserved_zirv_escape_safe_segment(candidate: &str) -> bool {
             // operator's own `[safety] allow`/`escape_allow`, the same
             // subcommand-level exception `usage tee` gets below -- see
             // `is_permissions_compile_write`'s own doc comment.
-            if is_permissions_compile_write(&tokens) {
+            if is_permissions_compile_write(&tokens) || is_supervisor_override(&tokens) {
                 return false;
             }
             // `usage tee` launches an arbitrary command, even when flags precede the

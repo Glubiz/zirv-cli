@@ -55,6 +55,20 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let Ok(payload) = HookPayload::parse(stdin) else {
         return Ok(0);
     };
+    let socket = env(SOCKET_ENV).map(std::path::PathBuf::from);
+    // The stable registry short from the bound socket; session IDs rotate during supervised
+    // restarts and cannot key per-session records (#243).
+    let stable_short = crate::commands::ctx::supervisor::socket_short(env)
+        .unwrap_or_else(|| crate::commands::ctx::sessions::short_id(&payload.session_id));
+    // A binding supervisor ruling blocks before the `stop_hook_active` exit: its own cap of
+    // three blocks per ruling is what stops the loop. The shape is the documented
+    // `{"decision":"block","reason":...}` (https://code.claude.com/docs/en/hooks).
+    if let Some(reason) =
+        crate::commands::ctx::supervisor::stop_block(env, &payload.repo(), &stable_short)
+    {
+        let _ = writeln!(w, "{}", with_stop_block(None, &reason));
+        return Ok(0);
+    }
     if payload.stop_hook_active || payload.transcript_path.is_empty() {
         return Ok(0);
     }
@@ -71,7 +85,6 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         return Ok(0);
     };
 
-    let socket = env(SOCKET_ENV).map(std::path::PathBuf::from);
     let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
 
     if let Some(path) = socket.as_deref() {
@@ -130,15 +143,6 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 observed_at: None,
             },
         );
-        // Resolve the stable registry short ID from the bound socket; session
-        // IDs rotate during supervised restarts and cannot key this record (#243).
-        let stable_short = socket
-            .as_deref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| crate::commands::ctx::sessions::short_id(&payload.session_id));
         // Record both zirv and harness session identities at lifecycle hooks;
         // they can differ after a harness-minted conversation starts (#462).
         if let Some(agent) = env(adapters::AGENT_ENV) {
@@ -154,7 +158,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // from lower-ranked authorities (#349).
         let _ = crate::commands::ctx::attention::record(
             &state,
-            &stable_short,
+            &super::permission::attention_short(env, &payload.session_id),
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
                 "turn completed cleanly",
@@ -164,6 +168,11 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Settled)
             .with_attention(crate::commands::ctx::attention::Attention::None),
             now_secs(),
+        );
+        crate::commands::ctx::approvals::clear_released(
+            &state,
+            &super::permission::attention_short(env, &payload.session_id),
+            env,
         );
         // A fresh process every turn has nothing to compare a repeated
         // summary against, and no `Announcer` of its own -- the decision-
@@ -230,6 +239,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         }
         rot_advisory_deferred =
             stop_rot_advisory_deferred(&state, &cfg, &stable_short, &score, socket.is_some());
+        crate::commands::ctx::supervisor::on_stop(&state, &cfg, env, &repo, &stable_short);
     }
 
     // Combine verify and adoption advice into the one Stop advisory line;
@@ -774,6 +784,63 @@ mod tests {
         );
     }
 
+    /// Issue #841: a Codex pane has no turn-signal socket, and its harness session id is
+    /// not the zirv session id the dashboard keys attention by. The Stop hook must clear
+    /// a latched `Stalled` under the zirv session's short (`SESSION_ENV`), not under a
+    /// short derived from the harness conversation id, or mail stays blocked forever.
+    #[test]
+    fn stop_without_a_socket_clears_attention_under_the_zirv_session_short() {
+        use crate::commands::ctx::attention::{self, Attention, Authority, Observation};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write");
+
+        let state_dir = dir.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let zirv_session = "aae6758d-d494-4880-a064-d8a231483405";
+        let harness_session = "01a0f719-6df3-7e61-a600-1bde4d533862";
+        attention::record(
+            &state,
+            "aae6758d",
+            Observation::new(Authority::Supervisor, "stalled", 90, 10)
+                .with_attention(Attention::Stalled),
+            10,
+        );
+
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), zirv_session.to_string()),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": harness_session,
+            "transcript_path": transcript,
+            "cwd": dir.path(),
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        assert_eq!(
+            attention::load(&state, "aae6758d").attention,
+            Attention::None,
+            "Stop must clear the latch the dashboard reads"
+        );
+        assert_eq!(
+            attention::load(&state, "01a0f719").lifecycle,
+            attention::Lifecycle::default(),
+            "and must not write under the harness conversation's short"
+        );
+    }
+
     /// A supervisor cannot derive the agent's transcript path: the agent mints
     /// its own session id. The Stop hook runs inside that session, so it is the
     /// only party that knows, and the signal is the only channel it has.
@@ -1053,6 +1120,59 @@ mod tests {
                 .unwrap_or_default()
                 .contains("test"),
             "{parsed:?}"
+        );
+    }
+
+    /// A binding supervisor `not_done` ruling blocks the Stop with the documented envelope, even
+    /// on a continuation Stop (`stop_hook_active`), and stops after three blocks.
+    #[test]
+    fn a_not_done_ruling_blocks_the_stop_exactly_three_times() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "").expect("write");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISOR_ENABLED".to_string(),
+                "true".to_string(),
+            ),
+            ("ZIRV_CTX_SUPERVISOR_MODEL".to_string(), "m".to_string()),
+        ]
+        .into();
+        crate::commands::ctx::supervisor::record_for_test(
+            &StateDir::from_root(state),
+            &crate::commands::ctx::sessions::short_id("s"),
+            "tests are missing",
+        );
+        let stdin = serde_json::json!({
+            "session_id": "s",
+            "transcript_path": transcript,
+            "cwd": repo.path(),
+            "stop_hook_active": true,
+        })
+        .to_string();
+        let blocks = (0..5)
+            .map(|_| {
+                let mut out = Vec::new();
+                run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+                String::from_utf8(out).expect("utf8")
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        let parsed: serde_json::Value = serde_json::from_str(blocks[0].trim()).expect("json");
+        assert_eq!(parsed["decision"], "block");
+        assert!(
+            parsed["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tests are missing")
         );
     }
 

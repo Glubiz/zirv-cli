@@ -205,6 +205,28 @@ pub fn session_transcript_usage(transcript: Option<&Path>, since: Option<u64>) -
     }
 }
 
+/// One native subagent transcript's own usage, bucketed by model. Unlike
+/// [`session_transcript_usage`]'s main-transcript branch this keeps
+/// `isSidechain` rows, which is every row of a subagent transcript (#832).
+pub fn subagent_transcript_usage(transcript: &Path) -> TranscriptFold {
+    let Ok(text) = std::fs::read_to_string(transcript) else {
+        return TranscriptFold::default();
+    };
+    let mut buckets: BTreeMap<Option<String>, (TranscriptUsage, u64)> = BTreeMap::new();
+    fold_model_usage(&mut buckets, &text, None, |_| true);
+    TranscriptFold {
+        buckets: buckets
+            .into_iter()
+            .map(|(model, (usage, messages))| ModelUsage {
+                model,
+                usage,
+                messages,
+            })
+            .collect(),
+        source_present: true,
+    }
+}
+
 /// The shared fold behind both branches of [`session_transcript_usage`]:
 /// every assistant row `keep` accepts, deduplicated by
 /// `adapters::claude::response_identity` exactly like
@@ -454,7 +476,13 @@ mod tests {
         .expect("write main");
         std::fs::write(
             session_dir.join("subagents").join("agent-1.jsonl"),
-            sidechain_row("claude-haiku-5", "m2", "2026-09-01T00:00:01Z", 0, 1_000_000),
+            sidechain_row(
+                "claude-haiku-4-5",
+                "m2",
+                "2026-09-01T00:00:01Z",
+                0,
+                1_000_000,
+            ),
         )
         .expect("write subagent");
 
@@ -514,8 +542,8 @@ mod tests {
         );
         assert_eq!(
             spend.cost_micros,
-            Some(15_000_000),
-            "1M sonnet output @ $15/M"
+            Some(10_000_000),
+            "1M sonnet output @ $10/M"
         );
         assert_eq!(spend.delegation_failed, 0);
     }
@@ -621,7 +649,7 @@ mod tests {
         );
         assert_eq!(
             spend.cost_micros,
-            Some(15_000_000),
+            Some(10_000_000),
             "only orch0001's own row"
         );
         assert_eq!(
@@ -689,12 +717,12 @@ mod tests {
 
         let table = price::built_in_table();
         let spend = fold_session_spend(&rows, None, Some(since), &fold, &table);
-        // Transcript: only the newer 1M sonnet input row ($3.00). Delegations:
-        // only the newer 1M sonnet output row ($15.00). The older row of
+        // Transcript: only the newer 1M sonnet input row ($2.00). Delegations:
+        // only the newer 1M sonnet output row ($10.00). The older row of
         // each source must be excluded by `since`.
         assert_eq!(
             spend.cost_micros,
-            Some(18_000_000),
+            Some(12_000_000),
             "only the in-window row of each source: {spend:?}"
         );
     }

@@ -120,6 +120,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx ask",
     "zirv ctx config show",
     "zirv ctx status",
+    "zirv ctx models",
     "zirv ctx mcp serve",
     "zirv ctx mcp doctor",
     "zirv ctx usage",
@@ -134,6 +135,10 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx hook audit",
     "zirv ctx objective show",
     "zirv ctx group status",
+    "zirv ctx graph",
+    // Issue #833: stdin JSON in, one line out; reads local state, writes nothing.
+    "zirv ctx statusline",
+    "zirv ctx supervisor status",
     "zirv ctx compile",
     "zirv ctx spend",
     // Issue #537 seam: decides and prints a harness-proxy routing decision,
@@ -275,6 +280,7 @@ const MUTATING: &[&str] = &[
     // Issue #491: rewrites `~/.zirv/ctx.toml`, writes a backup beside it and
     // a schema marker; `--downgrade` restores that backup.
     "zirv ctx config migrate",
+    "zirv ctx models refresh",
     "zirv ctx agent",
     "zirv ctx handoff",
     "zirv ctx resume",
@@ -293,6 +299,15 @@ const MUTATING: &[&str] = &[
     "zirv ctx hook stop",
     // Issue #774: persists the SubagentStop block-cap record on a violation.
     "zirv ctx hook subagent-stop",
+    // Issue #832: appends one agent-graph node file to the state dir.
+    "zirv ctx hook subagent-start",
+    // Issue #836: appends a per-session failure-streak file when `[jev] retry` is on.
+    "zirv ctx hook tool-failure",
+    // Issue #835: runs one read-only helper delegation and mails its advice.
+    "zirv ctx supervisor consult",
+    // Rulings: `ask` runs one read-only consult and records the ruling; `override` marks one overridden.
+    "zirv ctx supervisor ask",
+    "zirv ctx supervisor override",
     "zirv ctx loop",
     "zirv ctx exec",
     "zirv ctx wrap",

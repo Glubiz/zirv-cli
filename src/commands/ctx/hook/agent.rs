@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::checkpoints::cfg_or_operator_only_gate;
-use super::posttool::run_posttool;
+use super::posttool::{run_posttool, run_posttool_with};
 use super::pretool_run::{pretool_output, run_pretool};
 use crate::commands::ctx::CtxResult;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
@@ -280,7 +280,8 @@ pub fn run_posttool_for_agent<W: Write>(
                 return Ok(0);
             };
             let mut buf: Vec<u8> = Vec::new();
-            let code = run_posttool(&mut buf, &projected, env)?;
+            // Copilot's envelope drops `additionalContext`, so mid-turn mail would be consumed unseen.
+            let code = run_posttool_with(&mut buf, &projected, env, false)?;
             let claude_envelope = String::from_utf8(buf)
                 .ok()
                 .map(|text| text.trim().to_string())

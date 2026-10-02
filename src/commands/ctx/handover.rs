@@ -45,7 +45,7 @@ pub const TIERS: [&str; 3] = ["cheap", "standard", "deep"];
 /// Resolves through `catalogue::tier_model` rather than a hand-written per-agent match --
 /// `catalogue::vendor` returning `None` for any agent other than `claude`/`codex` already
 /// reproduces the old `_ => None` arm without a separate catch-all here (#381).
-fn tier_default(agent: &str, tier: &str) -> Option<&'static str> {
+fn tier_default(agent: &str, tier: &str, cfg: &CtxConfig) -> Option<String> {
     let vendor_slug = match agent {
         "claude" => "anthropic",
         "codex" => "openai",
@@ -57,7 +57,8 @@ fn tier_default(agent: &str, tier: &str) -> Option<&'static str> {
         "deep" => catalogue::Tier::Deep,
         _ => return None,
     };
-    catalogue::vendor(vendor_slug).and_then(|v| catalogue::tier_model(v, tier))
+    let vendor = catalogue::vendor(vendor_slug)?;
+    catalogue::tier_model_in(vendor, tier, &super::models::ladder_for(cfg, vendor))
 }
 
 /// The operator's own `[handover.<agent>]` override for `tier`, if any --
@@ -86,8 +87,8 @@ pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult
         if let Some(v) = handover_config_tier(cfg, agent, &tier).filter(|s| !s.trim().is_empty()) {
             return Ok(v.trim().to_string());
         }
-        if let Some(v) = tier_default(agent, &tier) {
-            return Ok(v.to_string());
+        if let Some(v) = tier_default(agent, &tier, cfg) {
+            return Ok(v);
         }
         return Err(format!(
             "zirv ctx handover: no tier ladder for adapter '{agent}'; pass a literal model id \
@@ -121,10 +122,11 @@ pub fn tier_for_model(agent: &str, model: &str, cfg: &CtxConfig) -> Option<&'sta
             let adapter = ctor(None);
             let vendor = catalogue::vendor(adapter.provider_for_model(Some(model)))?;
             // Only exact catalogue aliases/ids establish quality equivalence.
-            let rung = vendor
-                .rungs
-                .iter()
-                .find(|r| r.alias == model || r.id == model)?;
+            let rung = catalogue::rung_exact_in(
+                vendor,
+                model,
+                &super::models::identity_ladder_for(cfg, vendor),
+            )?;
             for (tier, name) in [
                 (catalogue::Tier::Deep, "deep"),
                 (catalogue::Tier::Standard, "standard"),
@@ -862,6 +864,70 @@ mod tests {
         assert!(err.to_string().contains("handover"), "got {err}");
     }
 
+    fn observed(vendor: &str, ids: &[&str]) {
+        crate::commands::ctx::models::set_test_discovered(
+            ids.iter()
+                .map(|id| catalogue::DiscoveredModel::new(vendor, *id, true))
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn a_discovered_codex_deep_model_is_used_unless_config_pins_the_family() {
+        observed("openai", &["gpt-6.1-sol"]);
+        let cfg = CtxConfig::default();
+        assert_eq!(resolve_model("codex", "deep", &cfg).unwrap(), "gpt-6.1-sol");
+        assert_eq!(
+            resolve_model("codex", "cheap", &cfg).unwrap(),
+            "gpt-5.6-luna",
+            "a family with no discovery keeps its static rung"
+        );
+
+        let mut pinned = CtxConfig::default();
+        pinned.worker.codex = Some("gpt-5.6-sol".into());
+        assert_eq!(
+            resolve_model("codex", "deep", &pinned).unwrap(),
+            "gpt-5.6-sol"
+        );
+
+        let mut pinned = CtxConfig::default();
+        pinned
+            .models
+            .pin
+            .insert("openai.sol".into(), "gpt-5.6-sol".into());
+        assert_eq!(
+            resolve_model("codex", "deep", &pinned).unwrap(),
+            "gpt-5.6-sol"
+        );
+
+        let mut off = CtxConfig::default();
+        off.models.discovery = false;
+        assert_eq!(resolve_model("codex", "deep", &off).unwrap(), "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn an_observed_claude_id_maps_to_its_tier_and_claude_keeps_aliases() {
+        let cfg = CtxConfig::default();
+        assert_eq!(tier_for_model("claude", "claude-opus-5-5", &cfg), None);
+        observed("anthropic", &["claude-opus-5-5"]);
+        assert_eq!(
+            tier_for_model("claude", "claude-opus-5-5", &cfg),
+            Some("deep")
+        );
+        assert_eq!(resolve_model("claude", "deep", &cfg).unwrap(), "opus");
+    }
+
+    #[test]
+    fn a_discovered_codex_id_keeps_its_tier_across_harnesses() {
+        observed("openai", &["gpt-6.1-sol"]);
+        let cfg = CtxConfig::default();
+        assert_eq!(tier_for_model("codex", "gpt-6.1-sol", &cfg), Some("deep"));
+        assert_eq!(
+            equivalent_model("codex", Some("gpt-6.1-sol"), true, "claude", &cfg).as_deref(),
+            Some("opus")
+        );
+    }
+
     #[test]
     fn resolve_model_falls_back_to_the_built_in_ladder() {
         let cfg = CtxConfig::default();
@@ -1575,7 +1641,7 @@ mod tests {
             Some("standard")
         );
         assert_eq!(
-            tier_for_model("claude", "claude-haiku-5", &cfg),
+            tier_for_model("claude", "claude-haiku-4-5", &cfg),
             Some("cheap")
         );
         assert_eq!(

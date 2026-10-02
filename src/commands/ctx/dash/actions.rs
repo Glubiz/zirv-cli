@@ -51,6 +51,7 @@ pub enum ActionId {
     Zoom,
     /// Toggle sidebar visibility below or above the narrow-terminal threshold.
     ToggleSidebar,
+    ToggleTree,
     Palette,
     Help,
     Quit,
@@ -568,6 +569,16 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         checks: &[(ch('b'), DashAction::ToggleSidebar)],
     },
     ActionDescriptor {
+        id: ActionId::ToggleTree,
+        chord: "^A t",
+        label: "agent tree",
+        description: "switch between the dashboard and the agent tree",
+        section: ActionSection::Dashboard,
+        availability: always,
+        menu: None,
+        checks: &[(ch('t'), DashAction::ToggleTree)],
+    },
+    ActionDescriptor {
         id: ActionId::Palette,
         chord: "^A p",
         label: "palette",
@@ -918,6 +929,7 @@ mod tests {
         show_errors: bool,
         zoom: bool,
         toggle_sidebar: bool,
+        toggle_tree: bool,
         quit: bool,
         scroll_page_up: bool,
         scroll_page_down: bool,
@@ -952,6 +964,9 @@ mod tests {
                     DashAction::ShowJevErrors => {
                         panic!("mouse-only; covered by route_mouse tests")
                     }
+                    DashAction::Approvals(_) => {
+                        panic!("approvals chords are covered by the approvals tests")
+                    }
                     DashAction::ContextActions => cov.context_actions = true,
                     DashAction::CollapseGroup => cov.collapse_group = true,
                     DashAction::ExpandGroup => cov.expand_group = true,
@@ -967,6 +982,7 @@ mod tests {
                     DashAction::ShowErrors => cov.show_errors = true,
                     DashAction::Zoom => cov.zoom = true,
                     DashAction::ToggleSidebar => cov.toggle_sidebar = true,
+                    DashAction::ToggleTree => cov.toggle_tree = true,
                     DashAction::Quit => cov.quit = true,
                     DashAction::ScrollPageUp => cov.scroll_page_up = true,
                     DashAction::ScrollPageDown => cov.scroll_page_down = true,
@@ -993,6 +1009,7 @@ mod tests {
                 && cov.show_errors
                 && cov.zoom
                 && cov.toggle_sidebar
+                && cov.toggle_tree
                 && cov.quit
                 && cov.scroll_page_up
                 && cov.scroll_page_down

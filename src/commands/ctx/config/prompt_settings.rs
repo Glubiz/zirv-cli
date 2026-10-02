@@ -97,6 +97,8 @@ pub struct MailConfig {
     pub max_delivered_bytes: usize,
     /// Prune the oldest unread messages beyond this count; never touch `read/` entries.
     pub keep: usize,
+    /// Deliver mail addressed to a Claude session from its `PostToolUse` hook, mid-turn.
+    pub mid_turn: bool,
 }
 
 impl Default for MailConfig {
@@ -106,6 +108,7 @@ impl Default for MailConfig {
             max_message_bytes: 4096,
             max_delivered_bytes: 4096,
             keep: 50,
+            mid_turn: false,
         }
     }
 }
@@ -295,6 +298,41 @@ impl Default for PriceConfig {
             stale_after_days: 90,
             table_path: None,
         }
+    }
+}
+
+/// Operator-only account model discovery, fetched-price refresh and family pins.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelsConfig {
+    /// Read account-local Codex cache and observed Claude transcript model ids.
+    pub discovery: bool,
+    /// Allow `ctx models refresh` (explicit or the automatic background run) to fetch public price catalogues.
+    pub price_fetch: bool,
+    /// Family pins keyed as `vendor.family`, for example `openai.sol`.
+    pub pin: BTreeMap<String, String>,
+    /// Model ids never resolved from a tier or rung (an explicit pin still wins).
+    pub avoid: Vec<String>,
+    /// Also avoid models whose recorded task success is significantly worse than a same-tier peer's.
+    pub auto_avoid: bool,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            discovery: true,
+            price_fetch: true,
+            pin: BTreeMap::new(),
+            avoid: Vec::new(),
+            auto_avoid: false,
+        }
+    }
+}
+
+impl ModelsConfig {
+    /// Operator file plus `ZIRV_CTX_MODELS_*` only; `models.*` is repo-forbidden, so this is the whole truth.
+    pub(crate) fn load_operator_only(env: EnvLookup<'_>) -> CtxResult<Self> {
+        load_operator_section(env, "models")
     }
 }
 
@@ -609,6 +647,16 @@ mod tests {
         assert_eq!(mail.max_message_bytes, 4096);
         assert_eq!(mail.max_delivered_bytes, 4096);
         assert_eq!(mail.keep, 50);
+    }
+
+    #[test]
+    fn model_discovery_and_price_fetch_default_on_without_pins() {
+        let models = ModelsConfig::default();
+        assert!(models.discovery);
+        assert!(models.price_fetch);
+        assert!(models.pin.is_empty());
+        assert!(models.avoid.is_empty());
+        assert!(!models.auto_avoid);
     }
 
     #[test]

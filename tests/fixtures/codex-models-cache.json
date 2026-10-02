@@ -1,0 +1,58 @@
+{
+  "fetched_at": "2026-10-01T10:58:27.044406Z",
+  "etag": "W/\"fixture\"",
+  "client_version": "0.159.2",
+  "models": [
+    {
+      "slug": "gpt-6.1-sol",
+      "display_name": "GPT-6.1-Sol",
+      "visibility": "list",
+      "priority": 0,
+      "context_window": 272000,
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        { "effort": "low" },
+        { "effort": "medium" },
+        { "effort": "high" },
+        { "effort": "xhigh" },
+        { "effort": "max" },
+        { "effort": "ultra" }
+      ],
+      "upgrade": null,
+      "supported_in_api": true
+    },
+    {
+      "slug": "gpt-5.5",
+      "display_name": "GPT-5.5",
+      "visibility": "list",
+      "priority": 8,
+      "context_window": 272000,
+      "default_reasoning_level": "xhigh",
+      "supported_reasoning_levels": [
+        { "effort": "low" },
+        { "effort": "medium" },
+        { "effort": "high" },
+        { "effort": "xhigh" }
+      ],
+      "upgrade": {
+        "model": "gpt-6.1-sol",
+        "retirement_at": "2026-10-14T19:00:00Z"
+      },
+      "supported_in_api": true
+    },
+    {
+      "slug": "codex-auto-review",
+      "display_name": "Codex Auto Review",
+      "visibility": "hide",
+      "priority": 43,
+      "context_window": 272000,
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        { "effort": "low" },
+        { "effort": "medium" }
+      ],
+      "upgrade": null,
+      "supported_in_api": true
+    }
+  ]
+}

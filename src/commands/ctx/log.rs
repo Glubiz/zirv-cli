@@ -299,7 +299,7 @@ fn read_jsonl_best_effort<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T>
 /// than the window is read whole. Same best-effort tolerance in every
 /// direction: an unreadable file or an unseekable handle is an empty list, a
 /// corrupt line is skipped.
-fn read_jsonl_tail_best_effort<T: serde::de::DeserializeOwned>(
+pub(crate) fn read_jsonl_tail_best_effort<T: serde::de::DeserializeOwned>(
     path: &Path,
     tail_bytes: u64,
 ) -> Vec<T> {

@@ -27,6 +27,9 @@ pub struct PreToolPayload {
     pub session_id: String,
     #[serde(default)]
     pub agent_id: String,
+    /// The call's own id; a subagent dispatch records it so the agent it starts can name its parent.
+    #[serde(default)]
+    pub tool_use_id: String,
     #[serde(default)]
     // retained from Claude's documented payload; agent_id is the discriminator
     #[allow(dead_code)]
@@ -414,7 +417,9 @@ fn dispatch_tier_advise(
     };
     let vendor_slug = crate::commands::ctx::catalogue::vendor_of(seat)?;
     let vendor = crate::commands::ctx::catalogue::vendor(vendor_slug)?;
-    let alias = crate::commands::ctx::catalogue::tier_model(vendor, tier)?;
+    let ladder = crate::commands::ctx::models::ladder_for(cfg, vendor);
+    let alias = crate::commands::ctx::catalogue::tier_model_in(vendor, tier, &ladder)?;
+    let alias = crate::commands::ctx::catalogue::intern(&alias);
     let mut effect = crate::commands::ctx::jev::JevEffect::new("dispatch", "tier_selected");
     effect.reason = Some(tier_label);
     effect.outcome = Some(alias);

@@ -1,0 +1,6 @@
+{"timestamp":"2026-10-01T07:26:05.800Z","type":"session_meta","payload":{"session_id":"01a0f65a-9111-71d3-a061-354ed3c9f85d","id":"01a0f65b-2d47-7b30-b693-bbc402b90dc5","parent_thread_id":"01a0f65a-9111-71d3-a061-354ed3c9f85d","timestamp":"2026-10-01T07:26:05.729Z","cwd":"/work/repo","originator":"codex-tui","cli_version":"0.159.2","source":{"subagent":{"thread_spawn":{"parent_thread_id":"01a0f65a-9111-71d3-a061-354ed3c9f85d","depth":1,"agent_path":"/root/frontend_sol","agent_nickname":"Mencius","agent_role":null}}},"thread_source":"subagent","agent_nickname":"Mencius","agent_path":"/root/frontend_sol","model_provider":"openai","multi_agent_version":"v2"}}
+{"timestamp":"2026-10-01T07:26:06.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"2026-10-01T07:26:06.100Z","type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"high"}}
+not json at all
+{"timestamp":"2026-10-01T07:40:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":50,"total_tokens":1050}}}}
+{"timestamp":"2026-10-01T07:50:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}

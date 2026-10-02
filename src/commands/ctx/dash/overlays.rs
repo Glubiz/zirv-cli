@@ -1,6 +1,49 @@
 //! Overlay reducers: mail, spawn, memory, restore, errors, menu, inspector, palette, quit, handover.
 use super::*;
 
+/// Exactly the quit path's own first half (`shutdown_all`): ask the harness to quit and let this
+/// tick's `reap_ended_panes` do the rest, so the row is retained, the spend accounted and the group
+/// closed by the one code path that knows how. The context menu's `stop` and the agent tree's `x`
+/// both come here.
+pub(super) fn stop_pane(
+    target: &str,
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+) {
+    let Some(pane) = panes.iter_mut().find(|p| p.short() == target) else {
+        return push_notice(notices, now, format!("{target} is no longer running"));
+    };
+    if pane.is_native() {
+        match pane.stop_now(0) {
+            Ok(()) => push_notice(notices, now, format!("asked {target} to stop")),
+            Err(error) => push_error(errors, format!("could not stop {target}: {error}")),
+        }
+        return;
+    }
+    let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
+        .map(|adapter| adapter.quit_sequence())
+        .unwrap_or("");
+    pane.request_quit(quit_sequence);
+    push_notice(notices, now, format!("asked {target} to quit"));
+}
+
+/// The nudge dialog for one session: its pane when this dashboard owns one, else the view-only
+/// registry session.
+pub(super) fn nudge_draft(target: &str, panes: &[Pane]) -> ui::NudgeDraft {
+    let attached = panes.iter().any(|p| p.short() == target);
+    ui::NudgeDraft {
+        target: if attached {
+            ui::NudgeTarget::AttachedPane(target.to_string())
+        } else {
+            ui::NudgeTarget::ViewOnlySession(target.to_string())
+        },
+        input: String::new(),
+    }
+}
+
 /// Relaunch a retained row from its original request through the normal spawn gate (#354).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn restore_ended_row(
@@ -2639,6 +2682,11 @@ mod tests {
             kind: "feature",
             step: "design".to_string(),
             awaiting_approval: true,
+            pack: String::new(),
+            steps: Vec::new(),
+            title: String::new(),
+            started_at: 0,
+            next_gate: None,
         };
         let facts = DashboardFacts {
             harness: "claude \u{b7} fable",

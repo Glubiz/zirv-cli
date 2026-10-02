@@ -394,6 +394,13 @@ fn subagent_stop_violation(scan: &SubagentTranscriptScan) -> Option<String> {
 /// and are shared by its subagents (#774). Nothing here may `unwrap`,
 /// `expect` or return `Err`.
 pub fn run_subagent_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let result = subagent_stop_gate(w, stdin, env);
+    // After the gate, so no transcript is read for the graph before the gate decides.
+    crate::commands::ctx::graph::record_subagent_stop(stdin, env);
+    result
+}
+
+fn subagent_stop_gate<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let Ok(payload) = HookPayload::parse(stdin) else {
         return Ok(0);
     };
@@ -1105,6 +1112,42 @@ mod tests {
                 .expect("reason is a string")
                 .to_string(),
         )
+    }
+
+    /// The graph node is still written, and after the gate's own decision.
+    #[test]
+    fn run_subagent_stop_still_records_the_graph_node_after_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let transcript = subagent_transcript(
+            dir.path(),
+            &[user_text("Do thing."), assistant_text("BLOCKED")],
+        );
+        let stdin = serde_json::json!({
+            "session_id": "sess-graph",
+            "agent_id": "subagent-graph",
+            "agent_transcript_path": transcript,
+            "cwd": "/work/repo",
+            "stop_hook_active": false,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_subagent_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert!(block_reason(&out).is_some(), "the gate decided first");
+        let found = walkdir_has(&dir.path().join("state"), "subagent-graph.json");
+        assert!(found, "the node was recorded");
+    }
+
+    fn walkdir_has(root: &Path, name: &str) -> bool {
+        std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                let path = entry.path();
+                path.file_name().is_some_and(|n| n == name)
+                    || (path.is_dir() && walkdir_has(&path, name))
+            })
     }
 
     /// A subagent that declared an OUTPUT CONTRACT (its own first user

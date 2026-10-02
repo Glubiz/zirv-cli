@@ -235,6 +235,7 @@ pub(super) fn assemble_sidebar(
         // Enrich placeholders from the throttled seat and flash facts.
         rollover_badge: None,
         flash: None,
+        approval_pending: false,
     };
     let mut rows: Vec<ui::SidebarRow> = live_panes.iter().copied().map(row_of).collect();
 
@@ -282,6 +283,7 @@ pub(super) fn assemble_sidebar(
             unread_mail: 0,
             rollover_badge: None,
             flash: None,
+            approval_pending: false,
         });
     }
 
@@ -573,6 +575,7 @@ pub(super) fn assemble_header_facts(
         sessions,
         working,
         needs_you,
+        approvals: 0,
         error_count,
         latest_error,
         notice,
@@ -1612,6 +1615,7 @@ mod tests {
             unread_mail: 0,
             rollover_badge: None,
             flash: None,
+            approval_pending: false,
         }
     }
 
@@ -2130,6 +2134,11 @@ mod tests {
             kind: "feature",
             step: "design".to_string(),
             awaiting_approval: false,
+            pack: String::new(),
+            steps: Vec::new(),
+            title: String::new(),
+            started_at: 0,
+            next_gate: None,
         };
         let facts =
             assemble_footer_facts(Some(&row), None, Some(&summary), None, false, None, None);
@@ -2151,6 +2160,11 @@ mod tests {
             kind: "feature",
             step: "spec".to_string(),
             awaiting_approval: true,
+            pack: String::new(),
+            steps: Vec::new(),
+            title: String::new(),
+            started_at: 0,
+            next_gate: None,
         };
         let facts =
             assemble_footer_facts(Some(&row), None, Some(&summary), None, false, None, None);

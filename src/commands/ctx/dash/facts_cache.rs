@@ -1086,8 +1086,8 @@ mod tests {
 
         let spend = cache.disk.spend.expect("the owner's own row is not empty");
         assert_eq!(
-            spend.cost_micros, 15_000_000,
-            "only the owner's own 1M sonnet output tokens ($15) may be counted"
+            spend.cost_micros, 10_000_000,
+            "only the owner's own 1M sonnet output tokens ($10) may be counted"
         );
         assert_eq!(
             spend.failed, 0,
