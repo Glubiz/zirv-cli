@@ -1595,5 +1595,59 @@ mod tests {
             hub.poll(&|_| true);
             assert_eq!(hub.count(), 0);
         }
+
+        /// Issue #854: two hooks that ask at the same moment are both held and both counted.
+        fn simultaneous_requests(shorts: [&str; 2]) {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let sock = socket_path(&state, std::process::id());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let waiters: Vec<_> = shorts
+                .iter()
+                .enumerate()
+                .map(|(n, short)| {
+                    let mut req = Request::new(
+                        short,
+                        "Bash",
+                        &format!("cargo test {n}"),
+                        &format!("cargo test {n}"),
+                        std::process::id(),
+                    );
+                    req.nonce = n as u32 + 1;
+                    write_record(&state, &req).expect("record");
+                    let (sock, barrier) = (sock.clone(), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        hold(&sock, std::process::id(), &req, Duration::from_secs(5))
+                    })
+                })
+                .collect();
+            wait_for(&mut hub, 2);
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(100));
+                hub.poll(&|_| true);
+                assert_eq!(hub.count(), 2, "both requests stay pending");
+            }
+            // Resolving one leaves the other pending and counted.
+            assert_eq!(hub.resolve_current(Decision::Allow), Resolved::Sent);
+            hub.poll(&|_| true);
+            assert_eq!(hub.count(), 1);
+            assert_eq!(hub.resolve_current(Decision::Deny), Resolved::Sent);
+            for waiter in waiters {
+                assert!(waiter.join().expect("hook").is_some());
+            }
+            assert_eq!(hub.count(), 0);
+        }
+
+        #[test]
+        fn two_simultaneous_requests_from_one_session_are_both_pending() {
+            simultaneous_requests(["abc123", "abc123"]);
+        }
+
+        #[test]
+        fn two_simultaneous_requests_from_different_sessions_are_both_pending() {
+            simultaneous_requests(["abc123", "def456"]);
+        }
     }
 }
