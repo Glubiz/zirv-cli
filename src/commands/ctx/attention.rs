@@ -1128,7 +1128,7 @@ pub fn open_prompt(state: &super::state::StateDir, short: &str, prompt: OpenProm
     let _ = super::state::create_private_dir_all(&state.attention());
     let _guard = lock_status(state, short);
     let mut prompts = read_prompts(state, short);
-    prompts.retain(|open| open.id != prompt.id);
+    prompts.retain(|open| open.id != prompt.id || open.agent != prompt.agent);
     prompts.push(prompt);
     write_prompts(state, short, &prompts);
 }

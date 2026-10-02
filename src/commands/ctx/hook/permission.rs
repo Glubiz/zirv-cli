@@ -345,7 +345,7 @@ pub(super) fn run_permission<W: Write>(
             &short,
             format!("permission denied: {}", payload.tool_name),
             now_secs(),
-            |open| open.id == permission_id,
+            |open| open.id == permission_id && open.agent == payload.agent_id,
         );
         crate::commands::ctx::approvals::clear_for_tool(
             &state,
@@ -851,6 +851,60 @@ mod tests {
         assert_ne!(
             crate::commands::ctx::attention::load(&state, &short).attention,
             crate::commands::ctx::attention::Attention::Approval
+        );
+    }
+
+    #[test]
+    fn two_subagents_prompting_for_the_same_command_hold_approval_until_both_resolve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let with_agent = |stdin: String, agent: &str| {
+            let mut value: serde_json::Value = serde_json::from_str(&stdin).expect("json");
+            value["agent_id"] = serde_json::json!(agent);
+            value.to_string()
+        };
+        for agent in ["agent-a", "agent-b"] {
+            run_permission(
+                &mut Vec::new(),
+                &with_agent(
+                    permission_stdin(
+                        Some("PermissionRequest"),
+                        "Bash",
+                        serde_json::json!({"command": "rm -rf /tmp/x"}),
+                    ),
+                    agent,
+                ),
+                &lookup,
+            )
+            .expect("never errors");
+        }
+        let mut post: serde_json::Value = serde_json::json!({
+            "session_id": "abc123",
+            "cwd": "/work/repo",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /tmp/x"},
+            "tool_response": {"stdout": "", "stderr": ""},
+            "agent_id": "agent-b",
+        });
+        super::super::posttool::run_posttool(&mut Vec::new(), &post.to_string(), &lookup)
+            .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::Approval,
+            "agent a's dialog is still open"
+        );
+        post["agent_id"] = serde_json::json!("agent-a");
+        super::super::posttool::run_posttool(&mut Vec::new(), &post.to_string(), &lookup)
+            .expect("never errors");
+        assert_eq!(
+            crate::commands::ctx::attention::load(&state, &short).attention,
+            crate::commands::ctx::attention::Attention::None
         );
     }
 

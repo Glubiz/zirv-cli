@@ -370,7 +370,7 @@ pub fn run_posttool_with<W: Write>(
             &short,
             format!("permission resolved: {}", payload.tool_name),
             now_secs(),
-            |open| open.id == permission_id,
+            |open| open.id == permission_id && open.agent == payload.agent_id,
         );
         crate::commands::ctx::approvals::clear_for_tool(
             &state,
