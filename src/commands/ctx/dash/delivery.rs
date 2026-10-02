@@ -846,6 +846,7 @@ pub(super) fn report_stalled_compaction_with(
 const UNREAD_MAIL_IDLE_SECS: u64 = 600;
 
 /// Raise one notice (and mail the supervisor) when an idle pane has left mail unread past [`UNREAD_MAIL_IDLE_SECS`] (#829).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn report_idle_unread_mail(
     pane: &mut Pane,
     state: &StateDir,
@@ -854,6 +855,7 @@ pub(super) fn report_idle_unread_mail(
     errors: &mut ErrorLog,
     notices: &mut Vec<Notice>,
     now: u64,
+    no_cached_unread: bool,
 ) {
     if !cfg.mail.enabled || matches!(pane.state(), PaneState::Ended(_)) {
         return;
@@ -862,11 +864,18 @@ pub(super) fn report_idle_unread_mail(
         super::attention::project(&super::attention::load(state, pane.short())),
         super::attention::Projection::IdleSeen | super::attention::Projection::DoneUnread
     );
-    let oldest = idle
-        .then(|| mail::list(state, slug, Some(pane.agent()), Some(pane.short())).ok())
-        .flatten()
-        .and_then(|found| found.iter().map(|(_, msg)| msg.sent).min());
-    let Some(sent) = oldest else {
+    // The latch holds across busy/idle cycles; only an empty unread set ends the episode.
+    if !idle {
+        return;
+    }
+    if no_cached_unread {
+        pane.unread_mail_notice_sent = false;
+        return;
+    }
+    let Ok(found) = mail::list(state, slug, Some(pane.agent()), Some(pane.short())) else {
+        return;
+    };
+    let Some(sent) = found.iter().map(|(_, msg)| msg.sent).min() else {
         pane.unread_mail_notice_sent = false;
         return;
     };
@@ -3218,6 +3227,7 @@ mod tests {
             &mut errors,
             &mut notices,
             sent + UNREAD_MAIL_IDLE_SECS - 1,
+            false,
         );
         assert!(notices.is_empty(), "mail younger than the fuse is normal");
         for _ in 0..3 {
@@ -3229,11 +3239,59 @@ mod tests {
                 &mut errors,
                 &mut notices,
                 sent + UNREAD_MAIL_IDLE_SECS + 60,
+                false,
             );
         }
         assert_eq!(notices.len(), 1, "one notice, not one per sweep");
         assert!(notices[0].text.contains("idle with mail unread for 11 min"));
         assert!(errors.entries.is_empty(), "{:?}", errors.entries);
+        // A busy turn between sweeps does not reopen the episode for the same unread mail.
+        super::super::attention::record(
+            &state,
+            pane.short(),
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "turn started",
+                100,
+                sent + 700,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Working),
+            sent + 700,
+        );
+        let at = sent + UNREAD_MAIL_IDLE_SECS + 120;
+        report_idle_unread_mail(
+            &mut pane,
+            &state,
+            &cfg,
+            &slug,
+            &mut errors,
+            &mut notices,
+            at,
+            false,
+        );
+        super::super::attention::record(
+            &state,
+            pane.short(),
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "turn settled",
+                100,
+                sent + 800,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Settled),
+            sent + 800,
+        );
+        report_idle_unread_mail(
+            &mut pane,
+            &state,
+            &cfg,
+            &slug,
+            &mut errors,
+            &mut notices,
+            at + 60,
+            false,
+        );
+        assert_eq!(notices.len(), 1, "same unread mail, same episode");
         pane.finish_shutdown().expect("shutdown");
     }
 

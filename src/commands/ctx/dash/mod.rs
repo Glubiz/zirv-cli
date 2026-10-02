@@ -898,6 +898,11 @@ fn run_dashboard_inner(
                     &mut errors,
                     &mut notices,
                     super::state::now_secs(),
+                    facts_cache
+                        .disk
+                        .mail_by_session
+                        .get(pane.short())
+                        .is_some_and(|(unread, _)| *unread == 0),
                 );
             }
         }
