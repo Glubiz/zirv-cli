@@ -855,7 +855,7 @@ pub(super) fn report_idle_unread_mail(
     errors: &mut ErrorLog,
     notices: &mut Vec<Notice>,
     now: u64,
-    no_cached_unread: bool,
+    cached_unread: Option<(usize, usize)>,
 ) {
     if !cfg.mail.enabled || matches!(pane.state(), PaneState::Ended(_)) {
         return;
@@ -868,7 +868,8 @@ pub(super) fn report_idle_unread_mail(
     if !idle {
         return;
     }
-    if no_cached_unread {
+    // The cache holds (broadcast, direct); only both zero proves nothing is unread.
+    if cached_unread == Some((0, 0)) {
         pane.unread_mail_notice_sent = false;
         return;
     }
@@ -3227,9 +3228,35 @@ mod tests {
             &mut errors,
             &mut notices,
             sent + UNREAD_MAIL_IDLE_SECS - 1,
-            false,
+            None,
         );
         assert!(notices.is_empty(), "mail younger than the fuse is normal");
+        let old = sent + UNREAD_MAIL_IDLE_SECS + 60;
+        report_idle_unread_mail(
+            &mut pane,
+            &state,
+            &cfg,
+            &slug,
+            &mut errors,
+            &mut notices,
+            old,
+            Some((0, 0)),
+        );
+        assert!(
+            notices.is_empty(),
+            "a cache with no unread mail skips the scan"
+        );
+        report_idle_unread_mail(
+            &mut pane,
+            &state,
+            &cfg,
+            &slug,
+            &mut errors,
+            &mut notices,
+            old,
+            Some((0, 1)),
+        );
+        assert_eq!(notices.len(), 1, "a direct-only unread count still scans");
         for _ in 0..3 {
             report_idle_unread_mail(
                 &mut pane,
@@ -3239,7 +3266,7 @@ mod tests {
                 &mut errors,
                 &mut notices,
                 sent + UNREAD_MAIL_IDLE_SECS + 60,
-                false,
+                None,
             );
         }
         assert_eq!(notices.len(), 1, "one notice, not one per sweep");
@@ -3267,7 +3294,7 @@ mod tests {
             &mut errors,
             &mut notices,
             at,
-            false,
+            None,
         );
         super::super::attention::record(
             &state,
@@ -3289,7 +3316,7 @@ mod tests {
             &mut errors,
             &mut notices,
             at + 60,
-            false,
+            None,
         );
         assert_eq!(notices.len(), 1, "same unread mail, same episode");
         pane.finish_shutdown().expect("shutdown");
