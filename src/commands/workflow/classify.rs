@@ -727,6 +727,16 @@ fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf
 }
 
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
+    git_change_input_with(repo, task, true)
+}
+
+/// `git_change_input`, optionally leaving out untracked files: a workflow
+/// that has not started yet has not written them, so they are noise.
+fn git_change_input_with(
+    repo: &Path,
+    task: String,
+    include_untracked: bool,
+) -> CtxResult<ClassificationInput> {
     // Measure against the same merge base as review so committed branch changes remain visible to classification.
     let base = super::review::default_base(repo)?;
     let (mut paths, mut lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base])?;
@@ -735,6 +745,11 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         .arg(repo)
         .args(["ls-files", "--others", "--exclude-standard"])
         .output()?;
+    let untracked_stdout = if include_untracked {
+        untracked.stdout.as_slice()
+    } else {
+        &[]
+    };
     if !untracked.status.success() {
         return Err(format!(
             "cannot inspect untracked paths: {}",
@@ -742,7 +757,7 @@ pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationIn
         )
         .into());
     }
-    for path in String::from_utf8_lossy(&untracked.stdout)
+    for path in String::from_utf8_lossy(untracked_stdout)
         .lines()
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
@@ -846,14 +861,38 @@ fn measured_input(
     repo: &Path,
     branch: Option<&str>,
     task: String,
+    include_untracked: bool,
 ) -> CtxResult<ClassificationInput> {
     match branch {
         Some(branch) => git_change_input_for_branch(repo, branch, task),
-        None => git_change_input(repo, task),
+        None => git_change_input_with(repo, task, include_untracked),
     }
 }
 
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
+    classify_args(args, true)
+}
+
+/// `from_args` for `zirv workflow start`: nothing has been written yet, so
+/// untracked files are not part of the change, and the task text can only
+/// raise complexity (an explicit `--complexity` stands).
+pub fn from_start_args(args: &ClassifyArgs) -> CtxResult<Classification> {
+    let mut classification = classify_args(args, false)?;
+    let text_only = crate::commands::ctx::proxy::decision::try_classify_request(&args.task);
+    if let Some(text_only) = text_only
+        && args.complexity.is_none()
+        && text_only.complexity > classification.complexity
+    {
+        classification.complexity = text_only.complexity;
+        classification
+            .reasons
+            .push(format!("task text complexity: {:?}", text_only.complexity));
+        classification.reasons.sort();
+    }
+    Ok(classification)
+}
+
+fn classify_args(args: &ClassifyArgs, include_untracked: bool) -> CtxResult<Classification> {
     let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let declared = !args.paths.is_empty() || args.changed_lines.is_some();
     let mut input = if declared {
@@ -867,7 +906,12 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
             risk_override: None,
         }
     } else {
-        measured_input(&repo, args.branch.as_deref(), args.task.clone())?
+        measured_input(
+            &repo,
+            args.branch.as_deref(),
+            args.task.clone(),
+            include_untracked,
+        )?
     };
     input.intent_override = args.intent;
     input.complexity_override = args.complexity;
@@ -878,7 +922,12 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     }
     classification.declared_scope = true;
     // Combine declared and Git-measured risk at the higher band; if Git cannot be measured, record that state and raise risk one step so declarations cannot bypass review.
-    let Ok(mut measured) = measured_input(&repo, args.branch.as_deref(), args.task.clone()) else {
+    let Ok(mut measured) = measured_input(
+        &repo,
+        args.branch.as_deref(),
+        args.task.clone(),
+        include_untracked,
+    ) else {
         mark_unavailable(
             &mut classification,
             "git measurement unavailable (not a repository, or no commits)",
@@ -1153,6 +1202,56 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("measured-tree risk floor"))
         );
+    }
+
+    fn start_args(repo: &Path, task: &str) -> ClassifyArgs {
+        ClassifyArgs {
+            task: task.into(),
+            paths: Vec::new(),
+            changed_lines: None,
+            tests_changed: false,
+            intent: None,
+            complexity: None,
+            risk: None,
+            repo: Some(repo.to_path_buf()),
+            branch: None,
+            json: false,
+        }
+    }
+
+    /// A start has written nothing yet: untracked root-level files are noise,
+    /// not a change surface, and must not inflate risk or complexity.
+    #[test]
+    fn start_classification_ignores_untracked_files() {
+        let repo = repo_with_pending_file("src/auth/session.rs");
+        for index in 0..8 {
+            std::fs::write(repo.path().join(format!("extra-{index}.rs")), "x\n").unwrap();
+        }
+        let args = start_args(repo.path(), "fix the dashboard");
+
+        let at_start = from_start_args(&args).unwrap();
+        assert_eq!(at_start.complexity, Complexity::Trivial, "{at_start:?}");
+        assert!(at_start.changed_paths.is_empty(), "{at_start:?}");
+        let measured = from_args(&args).unwrap();
+        assert!(measured.complexity > Complexity::Trivial, "{measured:?}");
+    }
+
+    /// With no diff yet, a long enumerated task is still sized by its text.
+    #[test]
+    fn start_classification_takes_the_heavier_of_task_text_and_tracked_diff() {
+        let repo = repo_with_pending_file("src/lib.rs");
+        let task = (1..=8)
+            .map(|n| format!("- fix issue {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let classification = from_start_args(&start_args(repo.path(), &task)).unwrap();
+        assert_eq!(classification.complexity, Complexity::Substantial);
+
+        let mut explicit = start_args(repo.path(), &task);
+        explicit.complexity = Some(Complexity::Trivial);
+        let classification = from_start_args(&explicit).unwrap();
+        assert_eq!(classification.complexity, Complexity::Trivial);
     }
 
     /// Risk is not the only band a declared scope could talk down: complexity
