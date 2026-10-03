@@ -23,9 +23,10 @@ Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
 - `vanilla` -- `claude -p` directly, prompt on stdin. With
   `--vanilla-plugin-dir` (used for the current grid) it instead loads a
   plugin such as obra/superpowers, drops the user settings layer (so the
-  operator's own global zirv hooks can't leak in) and restates
-  `bypassPermissions` explicitly, so the plugin's own `SessionStart` hook
-  still runs.
+  operator's own global zirv hooks can't leak in) and launches with
+  `--permission-mode dontAsk` plus an `--allowedTools` list of every bare tool
+  name (the policy-safe stand-in for `bypassPermissions`), so the plugin's
+  own `SessionStart` hook still runs.
 - `zirv` -- `zirv ctx exec --agent claude --prompt <prompt> -- ...`, no proxy
   call at all.
 - `zirv-nojev` -- the fair "zirv minus Jev" baseline for `zirv-jev-full`
