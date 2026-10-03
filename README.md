@@ -863,6 +863,7 @@ decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
 min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN -- see "Decider chain" above
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+validation_gate = false      # ZIRV_CTX_PROXY_VALIDATION_GATE
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
@@ -870,6 +871,8 @@ credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_E
 model = "jev-1.13.0"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL -- pinned; see below
 timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 ```
+
+**Validation gate.** `validation_gate = true` makes the Stop hook block (instead of only advising) a seat whose stored proxy profile requires tests (`validation.independent_test`, the condition behind the single seat's `validate:` line) while code changed and verification evidence is stale. It reuses the `[verify_on_stop]` nudge, so it needs `verify_on_stop.enabled` and stops blocking after `max_nudges`; it never blocks a Stop that is already a continuation. Operator-only: a repo layer that sets it is a hard error.
 
 **Pinned model.** `model` defaults to a specific Jev release (`jev-1.13.0`,
 what `jev-latest` itself resolves to today) rather than the `jev-latest`
@@ -2505,8 +2508,9 @@ and chat start none, and "no workflow" in the prompt opts out. It is skipped
 for a session that already has a bound workflow, for delegated seats
 (worker, sub-orchestrator, single, or a `zirv agent` child), and for unattended or
 zirv-spawned launches (`ZIRV_CTX_HEADLESS=1`, or `ZIRV_CTX_INTERNAL=1` on the
-distiller/handoff/memory model call and `zirv ctx loop` cycles), so a worker brief
-never inherits another session's workflow.
+distiller/handoff/memory model call, supervisor consults and `zirv ctx loop` cycles), so a worker brief
+never inherits another session's workflow. An `INTERNAL` session also gets no per-turn `[zirv]` health-marker
+instruction, so a helper whose reply zirv parses strictly is never told to prefix it.
 
 ### Workflow adoption
 
@@ -4640,6 +4644,7 @@ decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
 min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+validation_gate = false      # ZIRV_CTX_PROXY_VALIDATION_GATE
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
@@ -5029,9 +5034,9 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
-| `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
-| `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off |
+| `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
 | `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
@@ -5289,6 +5294,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `proxy.min_confidence` | `ZIRV_CTX_PROXY_MIN_CONFIDENCE` |
 | `proxy.min_margin` | `ZIRV_CTX_PROXY_MIN_MARGIN` |
 | `proxy.request_max_bytes` | `ZIRV_CTX_PROXY_REQUEST_MAX_BYTES` |
+| `proxy.validation_gate` | `ZIRV_CTX_PROXY_VALIDATION_GATE` |
 | `proxy.typesafe.base_url` | `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL` |
 | `proxy.typesafe.credential_env` | `ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV` |
 | `proxy.typesafe.model` | `ZIRV_CTX_PROXY_TYPESAFE_MODEL` |

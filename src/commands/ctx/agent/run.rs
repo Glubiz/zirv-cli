@@ -1583,7 +1583,9 @@ pub fn run_with<W: Write>(
                 result_path = Some(path);
             }
 
+            // A supervisor consult reports through its own ruling and fallback path, never as worker mail.
             if code != 0
+                && env(super::super::supervisor::CONSULT_ENV).is_none()
                 && let Some(parent_short) = super::super::mail::session_identity(&env)
                 && super::super::prompt::is_addressable_short(&parent_short)
             {
@@ -3364,6 +3366,59 @@ mod tests {
             1,
             "exactly one durable post-mortem record, even with no report text"
         );
+    }
+
+    /// #868: a failed delegation mails the delegating seat, except a supervisor consult's helper.
+    #[test]
+    fn a_failed_supervisor_consult_helper_sends_no_report_back_mail() {
+        let mailed = |consult: bool| {
+            let tmp = crate::commands::ctx::testenv::repo();
+            let home = tmp.path().join("home");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let state_dir = tmp.path().join("state");
+            let mut env = base_env(&state_dir);
+            env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
+            env.insert(
+                crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+                "seat0001-2222-4333-8444-555555555555".to_string(),
+            );
+            if consult {
+                env.insert(
+                    crate::commands::ctx::supervisor::CONSULT_ENV.to_string(),
+                    "1".to_string(),
+                );
+            }
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                std::env::set_var("FAKE_AGENT_MODE", "fail");
+                std::env::set_var("FAKE_AGENT_TURNS", "0");
+            }
+            let mut args = args_for("claude", "do the work");
+            args.json = true;
+            args.max_restarts = Some(0);
+            let mut out = Vec::new();
+            let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+            unsafe {
+                std::env::remove_var("FAKE_AGENT_MODE");
+                std::env::remove_var("FAKE_AGENT_TURNS");
+            }
+            assert_eq!(code.expect("runs"), 3);
+            crate::commands::ctx::mail::list(
+                &StateDir::from_root(state_dir),
+                &crate::commands::ctx::state::repo_slug(tmp.path()),
+                None,
+                Some("seat0001"),
+            )
+            .expect("mail")
+            .len()
+        };
+
+        assert_eq!(
+            mailed(false),
+            1,
+            "control: an ordinary failure mails the seat"
+        );
+        assert_eq!(mailed(true), 0);
     }
 
     /// Issue #722 (orchestrator follow-up): confirms what a reader actually

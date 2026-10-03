@@ -122,6 +122,19 @@ cache-write billing. `zirv-jev-full` turns on every `[jev]` gate in
 See the top-level `README.md`'s "Headless cost levers" section for the full
 `[headless]` reference.
 
+Jev telemetry and validity (#869): every zirv run gets its own
+`ZIRV_CTX_STATE_DIR` (`<run>/zirv-state`), and `result.json` carries a `jev`
+block (`calls_by_site`, `live`, `cached`, `errors`, `fallbacks`,
+`effects_by_site`, `spend`) read from it; the three Jev/proxy jsonl logs are
+copied next to it. A `zirv-jev-*` run with no live or cached non-intake Jev
+decision, or a `zirv-nojev` run with any Jev decision or a non-deterministic
+intake, gets `jev_invalid` set; `compare.py` and `aggregate.py` leave those out
+and print how many. `compare.py --baseline zirv-nojev` gives the Jev on vs off
+table with per-site call/effect columns and the intake decider mix. Gates inert
+by design in headless runs (`gates`, `approve`, `approve_allow`) are forced off
+in every arm and are not ablation conditions; `ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
+= low` makes `launch_effort` able to change something.
+
 ## Large-task grid (t16-t21 XL, t22 EPIC)
 
 t13-t15 ("LARGE") turned out to still be small for a wrapper built for

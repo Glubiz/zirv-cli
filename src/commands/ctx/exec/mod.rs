@@ -517,8 +517,18 @@ fn run_with_clock_inner<W: Write>(
         if let Some((key, value)) = adapters::headless_marker_env(adapters::LaunchMode::Headless) {
             command.env(key, value);
         }
-        let stripped =
-            super::sessions::secret_env::scrub_worker_env_cmd(command, &cfg, adapter.as_ref());
+        // The scrub above drops the internal marker; a supervisor consult's helper is zirv-internal.
+        // The consult marker is consumed here, so nothing below the helper inherits either variable.
+        command.env_remove(super::supervisor::CONSULT_ENV);
+        if env(super::supervisor::CONSULT_ENV).is_some_and(|value| !value.is_empty()) {
+            command.env(adapters::INTERNAL_ENV, "1");
+        }
+        let stripped = super::sessions::secret_env::scrub_worker_env_cmd(
+            command,
+            &cfg,
+            adapter.as_ref(),
+            false,
+        );
         super::sessions::secret_env::log_withheld(&state, session.as_str(), "exec", &stripped);
     };
 
@@ -2099,6 +2109,58 @@ mod tests {
         }
 
         assert_eq!(code.expect("runs"), 0);
+    }
+
+    /// #868: the helper process a supervisor consult launches is zirv-internal; an ordinary nested launch still has it scrubbed.
+    #[test]
+    fn only_a_supervisor_consult_helper_receives_the_internal_marker() {
+        let received = |consult: bool| {
+            let tmp = crate::commands::ctx::testenv::repo();
+            let home = tmp.path().join("home");
+            let session = "44444444-2222-4333-8444-555555555555";
+            let mut env = base_env(&tmp.path().join("state"));
+            if consult {
+                env.insert(
+                    crate::commands::ctx::supervisor::CONSULT_ENV.to_string(),
+                    "1".to_string(),
+                );
+            }
+            let log = tmp.path().join("internal.log");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                std::env::set_var("FAKE_AGENT_MODE", "healthy");
+                std::env::set_var("FAKE_AGENT_INTERNAL_ENV_LOG", &log);
+                std::env::set_var(adapters::INTERNAL_ENV, "1");
+                if consult {
+                    std::env::set_var(crate::commands::ctx::supervisor::CONSULT_ENV, "1");
+                }
+            }
+            let args = ExecArgs {
+                agent: Some("claude".to_string()),
+                session_id: Some(session.to_string()),
+                transcript: Some(transcript_for(&home, tmp.path(), session)),
+                prompt: Some("do the work".to_string()),
+                max_restarts: Some(2),
+                timeout_secs: Some(60),
+                command: fake_agent_command(session),
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+            unsafe {
+                std::env::remove_var("FAKE_AGENT_MODE");
+                std::env::remove_var("FAKE_AGENT_INTERNAL_ENV_LOG");
+                std::env::remove_var(adapters::INTERNAL_ENV);
+                std::env::remove_var(crate::commands::ctx::supervisor::CONSULT_ENV);
+            }
+            assert_eq!(code.expect("runs"), 0);
+            std::fs::read_to_string(&log).expect("log")
+        };
+
+        // The consult marker is consumed: the helper is internal and passes neither variable on.
+        assert_eq!(received(true).trim(), "1 unset");
+        assert_eq!(received(false).trim(), "unset unset");
     }
 
     /// T11: the fail-safe blind delay (T8) actually reaches the injected

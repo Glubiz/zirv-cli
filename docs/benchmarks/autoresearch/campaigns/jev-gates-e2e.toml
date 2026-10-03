@@ -6,8 +6,11 @@
 # conditions already use (see ../../wrapped-vs-vanilla/run.py's
 # `JEV_GATE_KEYS`/`cond_env_for`), just driven through the runner's
 # candidate env instead of a hardcoded condition name. Backend is run.py
-# itself (`--cond zirv-proxy`, the fixed arm both baseline and candidate
-# share; `--trial`'s spec.env carries the ZIRV_CTX_JEV_* overlay). Costs
+# itself (`--cond zirv-nojev`, the fixed arm both baseline and candidate
+# share: every gate forced off and no Jev credential, so the baseline records 0
+# Jev decisions; `--trial`'s spec.env carries the ZIRV_CTX_JEV_* overlay, and
+# `merge_spec_env` hands the credential back when an overlay enables a gate,
+# #869). Costs
 # real money (every trial is a live agent run); never run in CI.
 #
 # Always-refused gates (approve/approve_allow/inject_screen/stop_verify/
@@ -56,7 +59,7 @@ file = "docs/benchmarks/wrapped-vs-vanilla/corpus.toml"
 
 [backend]
 kind = "command"
-command = ["python", "docs/benchmarks/wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}"]
+command = ["python", "docs/benchmarks/wrapped-vs-vanilla/run.py", "--trial", "{spec}", "--out", "{out}", "--cond", "zirv-nojev"]
 per_trial_ceiling_usd = 1.50
 calls_per_trial = 3
 timeout_secs = 1200

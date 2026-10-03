@@ -88,7 +88,7 @@ pub(crate) fn is_relay_host() -> bool {
 pub(crate) struct Handle {
     stop: Arc<AtomicBool>,
     listener: Arc<Listener>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    path: std::path::PathBuf,
 }
 
 impl Drop for Handle {
@@ -98,9 +98,9 @@ impl Drop for Handle {
         // `stop` and returns instead of waiting for the next connection that
         // may never come.
         self.listener.wake();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // Never joined: an in-flight forward can run for the whole request timeout, and a dashboard
+        // reaping a pane must not freeze on it. The thread exits on its own once that forward ends.
+        let _ = std::fs::remove_file(&self.path);
         IS_RELAY_HOST.store(false, Ordering::SeqCst);
     }
 }
@@ -118,7 +118,7 @@ pub(crate) fn start(
     state: &StateDir,
     session: &str,
 ) -> Option<Handle> {
-    if !jev_enabled || !jev::available(cfg) {
+    if !jev_enabled || !jev::has_credential(cfg) {
         return None;
     }
     let endpoint = Endpoint::for_jev_relay(state, session);
@@ -128,7 +128,7 @@ pub(crate) fn start(
 
     let thread_listener = Arc::clone(&listener);
     let thread_stop = Arc::clone(&stop);
-    let thread = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("jev-relay".to_string())
         .spawn(move || accept_loop(&thread_listener, &thread_stop, &cfg))
         .ok()?;
@@ -137,7 +137,7 @@ pub(crate) fn start(
     Some(Handle {
         stop,
         listener,
-        thread: Some(thread),
+        path: endpoint.path().to_path_buf(),
     })
 }
 
@@ -236,6 +236,12 @@ fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
             },
         },
     }
+}
+
+/// Whether `session`'s relay endpoint is listening right now, so a process without the credential
+/// (a worker whose env was scrubbed) can still reach Jev through its supervisor.
+pub(crate) fn is_reachable(state: &StateDir, session: &str) -> bool {
+    !is_relay_host() && transport::probe(&Endpoint::for_jev_relay(state, session))
 }
 
 /// Tries to answer one already-encoded request via `session`'s relay
@@ -498,6 +504,120 @@ mod tests {
             !text.contains("\"fallbacks\":[]"),
             "the row must carry the fallback: {text}"
         );
+    }
+
+    /// A scrubbed worker holds no key: `available` and `ask` still work through its supervisor's relay.
+    #[test]
+    fn a_worker_without_the_key_is_available_and_asks_through_the_relay() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let (cfg, state, _dir, vendor) = relay_case("NOKEY870");
+        let session = "relay-no-key-session-870";
+        // Without a relay endpoint there is nothing to reach.
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state.root());
+        }
+        assert!(!jev::available(&cfg.proxy.typesafe));
+        let listener = Listener::bind(&Endpoint::for_jev_relay(&state, session)).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _frame) = accept_one_real_request(&listener);
+            connection
+                .write_frame(&RelayResponseFrame {
+                    status: Some(200),
+                    body: Some(text),
+                    ..Default::default()
+                })
+                .expect("write");
+        });
+        let available = jev::available(&cfg.proxy.typesafe);
+        let answered = jev::ask(
+            &cfg.proxy.typesafe,
+            state.root(),
+            0,
+            &sample_state(),
+            &sample_questions(),
+        );
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        server.join().expect("server thread must not panic");
+        assert!(available, "a reachable relay makes Jev available");
+        assert!(answered.is_ok(), "{answered:?}");
+        assert!(vendor.accept().is_err(), "no direct request");
+    }
+
+    /// A relay host with no key of its own must not bind, even when a parent's relay is reachable.
+    #[test]
+    fn start_refuses_without_a_key_even_when_a_parent_relay_is_reachable() {
+        let (cfg, state, _dir, _vendor) = relay_case("NOKEYSTART870");
+        let parent = "relay-parent-session-870";
+        let _listener = Listener::bind(&Endpoint::for_jev_relay(&state, parent)).expect("bind");
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::remove_var(&cfg.proxy.typesafe.credential_env);
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, parent);
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state.root());
+        }
+        assert!(jev::available(&cfg.proxy.typesafe));
+        let started = start(&cfg.proxy.typesafe, true, &state, "relay-child-session-870");
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        assert!(
+            started.is_none(),
+            "a key-less process must not host a relay"
+        );
+    }
+
+    /// Dropping a relay while a forward is in flight must not wait for the upstream.
+    #[test]
+    fn dropping_a_relay_mid_forward_returns_promptly() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("upstream");
+        let base_url = format!("http://{}", upstream.local_addr().expect("addr"));
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let slow = std::thread::spawn(move || {
+            let Ok((stream, _)) = upstream.accept() else {
+                return;
+            };
+            let _ = accepted_tx.send(());
+            std::thread::sleep(Duration::from_secs(3));
+            drop(stream);
+        });
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let session = "relay-drop-mid-forward-870";
+        with_credential("JEV_RELAY_TEST_DROP870", "secret", || {
+            let cfg = config(base_url, "JEV_RELAY_TEST_DROP870");
+            let handle = start(&cfg, true, &state, session).expect("relay must start");
+            let request = jev::encode_for_test(&sample_state(), &sample_questions(), &cfg.model)
+                .expect("encode");
+            let mut connection =
+                transport::connect(&Endpoint::for_jev_relay(&state, session)).expect("connect");
+            connection
+                .write_frame(&RelayRequestFrame { body: request })
+                .expect("write");
+            accepted_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the forward reached the upstream");
+            let started = std::time::Instant::now();
+            drop(handle);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "drop blocked on the in-flight forward: {:?}",
+                started.elapsed()
+            );
+        });
+        slow.join().expect("slow upstream must not panic");
     }
 
     /// The relay reported a vendor failure (an error frame) after the request was written: the

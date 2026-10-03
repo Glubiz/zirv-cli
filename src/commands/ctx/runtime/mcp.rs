@@ -2220,6 +2220,14 @@ mod tests {
             "MCP_HANG_MARKER".to_string(),
             marker.to_string_lossy().into_owned(),
         );
+        // The cmd fixture reads stdin with `set /p`, which keeps one line per read and drops the rest of the pipe chunk, so the cancel must not be written before the fixture has consumed the request (#635).
+        #[cfg(windows)]
+        let ready = std::path::PathBuf::from(format!("{}.ready", marker.display()));
+        #[cfg(windows)]
+        environment.insert(
+            "MCP_HANG_READY".to_string(),
+            ready.to_string_lossy().into_owned(),
+        );
         let mut transport =
             spawn_fixture_stdio("mcp-hang-server", environment).expect("spawn the hang fixture");
 
@@ -2229,8 +2237,17 @@ mod tests {
         // or only before the call starts.
         let cancel = Arc::new(CancellationFlag::default());
         let cancel_thread = Arc::clone(&cancel);
+        #[cfg(windows)]
+        let ready_thread = ready.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
+            #[cfg(windows)]
+            {
+                let wait_until = Instant::now() + Duration::from_secs(10);
+                while !ready_thread.exists() && Instant::now() < wait_until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             cancel_thread.cancel();
         });
 
@@ -2276,6 +2293,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = std::fs::remove_file(&marker);
+        #[cfg(windows)]
+        let _ = std::fs::remove_file(&ready);
     }
 
     #[test]

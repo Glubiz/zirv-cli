@@ -20,11 +20,19 @@ from pathlib import Path
 # can produce, mirrored here so the two scripts agree on condition names
 # without a shared module (same duplication CANONICAL_CONDS/JUDGE_DISALLOWED
 # etc. already had between the two files).
+# run.py is not imported: it rewrites os.environ["PATH"] at import time. A test
+# (test_trial.JevGateMirrorTests) asserts these mirrors equal run.py's.
 JEV_GATE_KEYS = [
     "memory", "supervisor", "dispatch", "review", "gates", "context",
     "intake_savings", "review_reuse", "harvest_screen", "admin_dispatch",
+    "approve", "approve_allow", "classify", "handoff_select", "inject_screen",
+    "inject", "stop_verify",
+    "missing_tests", "launch_effort", "compaction_select", "retry",
 ]
-JEV_ABLATION_CONDS = ["zirv-jev-full"] + [f"zirv-jev-{g}" for g in JEV_GATE_KEYS]
+# Inert by design in headless runs (see run.py's JEV_INERT_GATES): no ablation condition.
+JEV_INERT_GATES = {"gates", "approve", "approve_allow"}
+JEV_ABLATION_CONDS = ["zirv-jev-full"] + [
+    f"zirv-jev-{g}" for g in JEV_GATE_KEYS if g not in JEV_INERT_GATES]
 # zirv-proxy and every jev ablation condition carry `proxy`/`model_used`
 # metadata from the same `zirv ctx proxy --json` call run.py makes for them.
 PROXY_LIKE_CONDS = {"zirv-proxy", *JEV_ABLATION_CONDS}
@@ -410,7 +418,13 @@ def main():
     # stashed under _proxy_* for the zirv-proxy decision table (mode needs
     # the raw, possibly-None values, not the flattened display strings).
     rows = []
-    for obj in raw_rows:
+    # Runs run.py flagged `jev_invalid` (#869) do not measure their condition: kept in the
+    # CSV, left out of every table.
+    valid_rows = [obj for obj in raw_rows if not obj.get("jev_invalid")]
+    n_invalid = len(raw_rows) - len(valid_rows)
+    if n_invalid:
+        print(f"Excluded {n_invalid} jev_invalid run(s) from the report tables.")
+    for obj in valid_rows:
         r = flatten(obj)
         px = obj.get("proxy") or {}
         r["_proxy_complexity"] = px.get("complexity")
@@ -426,6 +440,9 @@ def main():
     parts = []
     parts.append("# zirv-vs-vanilla benchmark report\n")
     parts.append(f"Runs found: {n_total} (errored/timed out: {n_err}). Conditions: {', '.join(conds_present)}.\n")
+    if n_invalid:
+        parts.append(f"Excluded {n_invalid} `jev_invalid` run(s) (the run's own Jev log "
+                     "contradicts its condition, see #869); they stay in results.csv.\n")
 
     parts.append("## Headline\n")
     parts.append(headline_table(rows, conds_present))

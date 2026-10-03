@@ -15,7 +15,7 @@ use super::content::pal;
 
 const TAIL_BYTES: u64 = 1024 * 1024;
 const REFRESH: Duration = Duration::from_millis(500);
-const ENTRY_LINES: usize = 12;
+const ENTRY_LINES: usize = 3;
 
 /// A file's modified time and length.
 type Stamp = (SystemTime, u64);
@@ -58,6 +58,26 @@ fn first_line(text: &str) -> String {
     }
 }
 
+/// A brief sent by a teammate arrives wrapped in a `<teammate-message ...>` tag, whose first line
+/// is attributes rather than the ask.
+fn brief_body(text: &str) -> &str {
+    let text = text.trim_start();
+    if !text.starts_with("<teammate-message") {
+        return text;
+    }
+    // The first `>` outside a quoted attribute ends the opening tag.
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if q == c => quote = None,
+            (None, '>') => return &text[at + 1..],
+            _ => {}
+        }
+    }
+    text
+}
+
 /// The first non-empty output line, plus how many more lines there are.
 fn result_summary(text: &str) -> String {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -68,8 +88,45 @@ fn result_summary(text: &str) -> String {
     }
 }
 
+/// A path under the subagent's working directory shows relative to it, whole unless very long
+/// (then `…/` and its tail). An absolute path outside it keeps a `/…/` tail, so the leading slash
+/// marks it as another checkout. Anything else is returned as it is.
+fn short_path(path: &str, cwd: &str) -> String {
+    let under = path
+        .strip_prefix(cwd)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|_| !cwd.is_empty());
+    let parts = |p: &str| p.split('/').filter(|s| !s.is_empty()).count();
+    match under {
+        Some(rest) if parts(rest) <= 6 => rest.to_string(),
+        Some(rest) => format!("\u{2026}/{}", tail(rest, 4)),
+        None if path.starts_with('/') && parts(path) > 3 => {
+            format!("/\u{2026}/{}", tail(path, 3))
+        }
+        None => path.to_string(),
+    }
+}
+
+/// The last `n` components of `path`.
+fn tail(path: &str, n: usize) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    parts[parts.len().saturating_sub(n)..].join("/")
+}
+
+/// `text` with every absolute path in it shortened by `short_path`.
+fn shorten_paths(text: &str, cwd: &str) -> String {
+    let word = |w: &str| match w.starts_with('/') && w[1..].contains('/') {
+        true => short_path(w, cwd),
+        false => w.to_string(),
+    };
+    text.lines()
+        .map(|l| l.split(' ').map(word).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `Name(primary arg)` for a tool call; never the raw input JSON.
-fn tool_summary(name: &str, input: &Value) -> String {
+fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
     let primary = match name {
         "Bash" => field("command"),
@@ -87,13 +144,36 @@ fn tool_summary(name: &str, input: &Value) -> String {
             .find(|v| !v.trim().is_empty() && v.chars().count() <= 80)
     })
     .map(|v| {
-        v.lines()
+        let line = v
+            .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
-            .trim()
+            .trim();
+        let Some((dir, command)) = line
+            .strip_prefix("cd ")
+            .and_then(|rest| rest.split_once(" && "))
+            .filter(|_| name == "Bash")
+        else {
+            return line.to_string();
+        };
+        // Running where the call started says nothing; another checkout does.
+        let dir = dir.trim().trim_matches(['"', '\'']);
+        if dir == cwd {
+            return command.trim().to_string();
+        }
+        format!("cd {} && {}", short_path(dir, cwd), command.trim())
     })
-    .unwrap_or("");
-    format!("{name}({primary})")
+    .unwrap_or_default();
+    let is_path = matches!(name, "Read" | "Edit" | "Write" | "NotebookEdit");
+    let primary = if is_path {
+        short_path(&primary, cwd)
+    } else {
+        primary
+    };
+    match (name, field("path")) {
+        ("Grep" | "Glob", Some(path)) => format!("{name}({primary}, {})", short_path(path, cwd)),
+        _ => format!("{name}({primary})"),
+    }
 }
 
 fn block_text(value: &Value) -> String {
@@ -116,7 +196,7 @@ fn parse(text: &str) -> Vec<Entry> {
     let mut push = |kind: Kind, text: String| {
         let text = crate::commands::ctx::snapshot::redact_text(&text);
         let text = match kind {
-            Kind::User => first_line(&text),
+            Kind::User => first_line(brief_body(&text)),
             Kind::Result => result_summary(&text),
             Kind::Assistant | Kind::Tool => text,
         };
@@ -124,10 +204,14 @@ fn parse(text: &str) -> Vec<Entry> {
             entries.push(Entry { kind, text });
         }
     };
+    let mut cwd = String::new();
     for line in text.lines() {
         let Ok(row) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if let Some(dir) = row.get("cwd").and_then(Value::as_str) {
+            dir.clone_into(&mut cwd);
+        }
         let Some(content) = row.pointer("/message/content") else {
             continue;
         };
@@ -138,7 +222,7 @@ fn parse(text: &str) -> Vec<Entry> {
                     match block.get("type").and_then(Value::as_str) {
                         Some("tool_result") => {
                             let body = block.get("content").map(block_text).unwrap_or_default();
-                            push(Kind::Result, body);
+                            push(Kind::Result, shorten_paths(&body, &cwd));
                         }
                         Some("text") => push(
                             Kind::User,
@@ -166,7 +250,7 @@ fn parse(text: &str) -> Vec<Entry> {
                         Some("tool_use") => {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
                             let input = block.get("input").cloned().unwrap_or(Value::Null);
-                            push(Kind::Tool, tool_summary(name, &input));
+                            push(Kind::Tool, tool_summary(name, &input, &cwd));
                         }
                         _ => {}
                     }
@@ -179,14 +263,17 @@ fn parse(text: &str) -> Vec<Entry> {
 }
 
 /// Word-wraps each line of `text` (blank lines and indentation survive); an over-long word is
-/// the only thing cut mid-word. At most ENTRY_LINES lines, the last ending in `…` when cut.
+/// the only thing cut mid-word. Runs of blank lines collapse to one; at most ENTRY_LINES lines,
+/// then a `… (+N lines)` line when cut.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
     let mut out: Vec<String> = Vec::new();
-    for raw in text.lines() {
+    for raw in text.trim().lines() {
         let raw = raw.trim_end();
         if raw.is_empty() {
-            out.push(String::new());
+            if out.last().is_some_and(|l| !l.is_empty()) {
+                out.push(String::new());
+            }
             continue;
         }
         let indent: String = raw.chars().take_while(|c| *c == ' ').collect();
@@ -216,10 +303,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(line);
     }
     if out.len() > ENTRY_LINES {
+        let more = out.len() - ENTRY_LINES;
         out.truncate(ENTRY_LINES);
-        if let Some(last) = out.last_mut() {
-            last.push('\u{2026}');
-        }
+        out.push(format!("\u{2026} (+{more} lines)"));
     }
     out
 }
@@ -486,10 +572,11 @@ mod tests {
             "only the first brief line: {joined}"
         );
         assert!(lines[0].ends_with('\u{2026}'), "{joined}");
+        assert!(joined.contains("\u{2026} (+1 lines)"), "{joined}");
         for item in [
+            "Found three problems",
             "- the backoff never resets",
             "- the jitter",
-            "- the retry limit",
         ] {
             assert!(
                 lines
@@ -504,7 +591,7 @@ mod tests {
         assert!(joined.contains("line 1 of output (+39 lines)"), "{joined}");
         assert!(!joined.contains("line 2 of output"), "{joined}");
         // No word is split: every rendered word is a whole word of the source.
-        let source = format!("{brief} {reply} cargo test retry output lines of");
+        let source = format!("{brief} {reply} cargo test retry output lines of more");
         for word in joined
             .split_whitespace()
             .filter(|w| w.chars().all(char::is_alphabetic))
@@ -515,5 +602,73 @@ mod tests {
             );
         }
         assert!(lines.iter().all(|l| l.chars().count() <= 58), "{joined}");
+    }
+
+    #[test]
+    fn a_teammate_brief_and_a_long_final_report_stay_a_few_lines() {
+        let brief = "<teammate-message teammate_id=\"team-lead\" summary=\"fixes -> view\">\nYou are an implementation worker on a Rust CLI. \
+            Work only in the given worktree and follow the repository instructions exactly, then report back.\n\nHard rules:\n- no git changes\n</teammate-message>";
+        let report: String = (1..=5)
+            .map(|p| format!("**Part {p}.** The change is made and tested.\n\n\n- file {p}\n- file {p} again\n\n"))
+            .collect();
+        let rows = [
+            serde_json::json!({"type":"user","cwd":"/Users/x/wt-a","message":{"content":brief}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/x/wt-a && cargo test -q"}},{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/x/repo && git commit -am wip"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/wt-a/src/commands/ctx/dash/tree_view/pane.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/repo/src/commands/ctx/dash/pane.rs"}}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok\nsecond\nthird"}]}}),
+            serde_json::json!({"type":"assistant","cwd":"/Users/x/wt-a","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/wt-a/src/a.rs"}},{"type":"tool_use","name":"Read","input":{"file_path":"/Users/x/other/deep/src/commands/ctx/supervisor.rs"}}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"The file /Users/x/wt-a/src/a.rs has been updated successfully."}]}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":report}]}}),
+        ];
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("agent-z.jsonl");
+        std::fs::write(&path, text).expect("write");
+        let view = SubagentView::open("t".into(), path);
+        let lines: Vec<String> = view.lines(100).into_iter().map(|(_, l)| l).collect();
+        let joined = lines.join("\n");
+        assert!(
+            lines[0].starts_with("asked  You are an implementation worker"),
+            "{joined}"
+        );
+        assert!(!joined.contains("teammate"), "{joined}");
+        assert!(joined.contains("\u{25b8} Bash(cargo test -q)"), "{joined}");
+        assert!(joined.contains("ok (+2 lines)"), "{joined}");
+        assert!(
+            joined.contains("\u{25b8} Edit(src/a.rs)"),
+            "under cwd: {joined}"
+        );
+        assert!(
+            joined.contains("Read(/\u{2026}/commands/ctx/supervisor.rs)"),
+            "outside cwd keeps an absolute-looking tail: {joined}"
+        );
+        assert!(
+            joined.contains("Bash(cd /Users/x/repo && git commit -am wip)"),
+            "another checkout stays visible: {joined}"
+        );
+        assert!(
+            joined.contains("Edit(src/commands/ctx/dash/tree_view/pane.rs)")
+                && joined.contains("Edit(/\u{2026}/ctx/dash/pane.rs)"),
+            "under cwd whole, outside cwd tailed: {joined}"
+        );
+        assert!(
+            joined.contains("The file src/a.rs has been updated successfully."),
+            "{joined}"
+        );
+        let says = lines
+            .iter()
+            .position(|l| l.starts_with("says"))
+            .expect("says");
+        let report_lines = &lines[says..];
+        assert_eq!(report_lines.len(), ENTRY_LINES + 1, "{joined}");
+        assert!(
+            report_lines.last().is_some_and(|l| l.contains("(+")),
+            "{joined}"
+        );
+        assert!(
+            report_lines
+                .windows(2)
+                .all(|w| !(w[0].trim().is_empty() && w[1].trim().is_empty())),
+            "blank runs collapse: {joined}"
+        );
     }
 }

@@ -24,9 +24,15 @@ mod rulings;
 pub use rulings::RulingStatus;
 pub use rulings::{Ruling, RulingKind, open_rulings, override_ruling};
 
-/// Set on a consult process (and so inherited by the helper session it launches); any trigger
-/// that sees it stays silent, so a consult can never trigger another consult.
+/// Set on a consult process only: `exec` consumes it into `ZIRV_CTX_INTERNAL` for the helper, so
+/// nothing below the helper inherits it.
 pub(crate) const CONSULT_ENV: &str = "ZIRV_SUPERVISOR_CONSULT";
+
+/// A consult process or the internal helper session it launched; any trigger that sees this
+/// stays silent, so a consult can never trigger another consult.
+fn in_consult(env: EnvLookup<'_>) -> bool {
+    env(CONSULT_ENV).is_some() || env(super::adapters::INTERNAL_ENV).as_deref() == Some("1")
+}
 
 const STATE_DIR: &str = "supervisor";
 const PLAN_CAP: usize = 4096;
@@ -37,14 +43,18 @@ const REPORT_CAP: usize = 64 * 1024;
 const LAST_ADVICE_CHARS: usize = 200;
 const SEEN_KEEP: usize = 16;
 const TRIGGERS_KEEP: usize = 20;
-const HELPER_MAX_TOOL_CALLS: u32 = 4;
+/// What the prompt tells the helper it may use; the enforced cap sits above it so the model
+/// still has turns left to answer when it overshoots (#868).
+const HELPER_STATED_TOOL_CALLS: u32 = 3;
+const HELPER_MAX_TOOL_CALLS: u32 = 6;
 /// The exec budget sums every turn's whole context (cache reads included), so a consult costs
 /// one turn's context per turn, not its brief once. A real Claude consult measured 42k context
 /// on turn 1 and 47k on turn 2 (91,012 in all, #866); 50k per turn covers that with growth, and
 /// 5k per turn covers its reasoning output (2k observed).
 const HELPER_TURN_TOKENS: u64 = 55_000;
-/// One turn per tool call plus the answering turn.
-const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_MAX_TOOL_CALLS as u64 + 1);
+/// One turn per stated tool call, the answering turn and one spare; the tool cap above the stated
+/// limit is a stop for a model that overshoots, not budget to plan on.
+const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_STATED_TOOL_CALLS as u64 + 2);
 const ASK_TIMEOUT_SECS: u64 = 180;
 const ASK_GRACE_SECS: u64 = 20;
 
@@ -328,7 +338,7 @@ pub(crate) fn has_budget(
     env: EnvLookup<'_>,
     session: &str,
 ) -> bool {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return false;
     }
     let Some(path) = state_path(state, session) else {
@@ -347,7 +357,7 @@ pub(crate) fn fire(
     unit: Option<&str>,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> bool {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return false;
     }
     let Some(path) = state_path(state, &request.session) else {
@@ -390,6 +400,14 @@ pub(crate) fn fire(
 }
 
 /// Spawn `zirv ctx supervisor consult` detached, with the evidence on its stdin.
+/// Mark a consult child, and so the helper session it launches, as a zirv-internal call: it never
+/// consults again and its prompt hook adds neither workflow nor health marker.
+fn mark_consult(command: &mut std::process::Command) {
+    command
+        .env(CONSULT_ENV, "1")
+        .env(super::adapters::INTERNAL_ENV, "1");
+}
+
 fn spawn_consult(request: &ConsultRequest) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
@@ -412,10 +430,10 @@ fn spawn_consult(request: &ConsultRequest) -> bool {
                 .flat_map(|id| ["--workflow", id.as_str()]),
         )
         .current_dir(&request.repo)
-        .env(CONSULT_ENV, "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    mark_consult(&mut command);
     crate::commands::workflow::engine::detach(&mut command);
     let Ok(mut child) = command.spawn() else {
         return false;
@@ -552,7 +570,7 @@ fn on_stop_with(
     session: &str,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> Vec<Ruling> {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return Vec::new();
     }
     if !has_budget(state, cfg, env, session) {
@@ -708,7 +726,7 @@ pub(crate) fn record_for_test(state: &StateDir, session: &str, reason: &str) {
 /// `decision: "block"` with the reason as the next prompt (https://learn.chatgpt.com/docs/hooks).
 /// Never errors; any failure means no block.
 pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Option<String> {
-    if env(CONSULT_ENV).is_some() {
+    if in_consult(env) {
         return None;
     }
     // A repo config the loader refuses must not silence a binding ruling.
@@ -751,7 +769,7 @@ fn build_prompt(kind: RulingKind, evidence: &str, options: &[String], diffstat: 
         .map(|(at, option)| format!("{}. {option}\n", at + 1))
         .collect::<String>();
     format!(
-        "Ruling: {}\n\nEvidence:\n{}\n\n{}git diff --stat HEAD:\n{}\n",
+        "Ruling: {}\n\nTool budget: at most {HELPER_STATED_TOOL_CALLS} tool calls, then reply in the required format.\n\nEvidence:\n{}\n\n{}git diff --stat HEAD:\n{}\n",
         kind.as_str(),
         crate::utils::truncate_bytes(evidence.to_string(), Some(PLAN_CAP)),
         if options.is_empty() {
@@ -877,10 +895,14 @@ fn rule_with(
     *tokens = (prompt.len() / 4) as u64;
     let report = run_helper(&prompt)?;
     let Some((verdict, reason)) = rulings::parse_reply(kind, &report, &options) else {
+        let reply = crate::utils::truncate_bytes(
+            super::snapshot::redact_text(&report),
+            Some(cfg.supervisor.max_advice_bytes),
+        );
         log_fallback(
             state,
             session,
-            &format!("unparseable {} reply: no ruling", kind.as_str()),
+            &format!("unparseable {} reply: no ruling: {reply}", kind.as_str()),
         );
         return Ok(None);
     };
@@ -1156,11 +1178,11 @@ fn spawn_ask_consult(
                 .flat_map(|option| ["--option", option.as_str()]),
         )
         .args(["--timeout-secs", &timeout_secs.to_string()])
-        .env(CONSULT_ENV, "1")
         .env(ASK_TICKET_ENV, ticket)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    mark_consult(&mut command);
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(evidence.as_bytes());
@@ -1187,15 +1209,45 @@ fn spawn_ask_consult(
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout.read_to_string(&mut out);
     }
-    let ruling = serde_json::from_str(out.trim()).ok();
-    if status.success() && ruling.is_some() {
-        return Ok(ruling);
-    }
     let stderr = stderr
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let tail = super::run_loop::tail_of_bytes(stderr.trim().as_bytes(), ASK_STDERR_TAIL_BYTES);
-    Err(format!("the supervisor child {status}: {tail}").into())
+    ask_child_outcome(status, &out, &stderr)
+}
+
+/// What a finished `--ask` child means: its last JSON stdout line is the ruling; otherwise the
+/// error names what happened (an exit 0 without a ruling is not a stderr matter).
+fn ask_child_outcome(
+    status: std::process::ExitStatus,
+    out: &str,
+    stderr: &str,
+) -> CtxResult<Option<Ruling>> {
+    let ruling = out
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line.trim()).ok());
+    if status.success() && ruling.is_some() {
+        return Ok(ruling);
+    }
+    if status.success() {
+        let seen = crate::utils::truncate_bytes(
+            super::snapshot::redact_text(out.trim()),
+            Some(ASK_STDERR_TAIL_BYTES),
+        );
+        return Err(format!(
+            "the supervisor child exited 0 without printing a ruling; stdout: {seen:?}"
+        )
+        .into());
+    }
+    // The child ends with its own failure line; the lines before it are pacing notices from the helper launch.
+    let failure = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let failure =
+        crate::utils::truncate_bytes(failure.trim().to_string(), Some(ASK_STDERR_TAIL_BYTES));
+    Err(format!("the supervisor child {status}: {failure}").into())
 }
 
 /// How to run the ask outside Claude Code's sandbox; shared by both hint strengths (#856).
@@ -1283,7 +1335,7 @@ fn run_ask_with<W: Write>(
     let state = StateDir::resolve(env)?;
     let cfg = CtxConfig::load(&repo, env)?;
     let session = mail::session_identity(env).unwrap_or_else(|| "operator".to_string());
-    if env(CONSULT_ENV).is_some() || !cfg.supervisor.enabled {
+    if in_consult(env) || !cfg.supervisor.enabled {
         writeln!(
             w,
             "the supervisor is off; decide yourself or ask the operator"
@@ -1776,6 +1828,58 @@ mod tests {
         assert!(row.tokens_read > 0);
     }
 
+    /// #868: the child exited 0 with its ruling on the last stdout line behind other output.
+    #[cfg(unix)]
+    #[test]
+    fn an_ask_child_ruling_is_found_behind_other_stdout_and_a_missing_one_is_named() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, state) = fresh_state();
+        let ruling = rulings::record(&state, "s", None, RulingKind::Choice, "A", "why").expect("r");
+        let json = serde_json::to_string(&ruling).expect("json");
+        let ok = std::process::ExitStatus::from_raw(0);
+
+        let out = format!("noise before\n{json}\n");
+        let got = ask_child_outcome(ok, &out, "pacing notice").expect("ruling");
+        assert_eq!(got.expect("some").verdict, "A");
+
+        let error = ask_child_outcome(ok, "just noise\n", "pacing notice")
+            .expect_err("no ruling")
+            .to_string();
+        assert!(
+            error.contains("exited 0 without printing a ruling"),
+            "{error}"
+        );
+        assert!(error.contains("just noise"), "{error}");
+        assert!(!error.contains("pacing notice"), "{error}");
+    }
+
+    #[test]
+    fn the_internal_helper_session_gets_no_consult_budget() {
+        let (_dir, state) = fresh_state();
+        let cfg = enabled_cfg();
+        let internal =
+            |key: &str| (key == crate::commands::ctx::adapters::INTERNAL_ENV).then(|| "1".into());
+        assert!(has_budget(&state, &cfg, &no_env, "s"));
+        assert!(!has_budget(&state, &cfg, &internal, "s"));
+    }
+
+    #[test]
+    fn a_consult_child_is_marked_internal() {
+        let mut command = std::process::Command::new("true");
+        mark_consult(&mut command);
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
+            .collect();
+        for key in [CONSULT_ENV, crate::commands::ctx::adapters::INTERNAL_ENV] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsString::from("1"))),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn an_unparseable_reply_records_a_fallback_and_no_ruling() {
         let (_dir, state) = fresh_state();
@@ -1790,6 +1894,7 @@ mod tests {
         assert!(open_rulings(&state, None).is_empty());
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(log.contains("unparseable done reply"), "{log}");
+        assert!(log.contains("NO_ADVICE"), "the reply is logged: {log}");
     }
 
     #[test]
@@ -1867,13 +1972,13 @@ mod tests {
             "the measured consult must not be stopped"
         );
         // Every allowed turn at the observed ~47k context and 2k output stays under the ceiling.
-        let turns = u64::from(HELPER_MAX_TOOL_CALLS) + 1;
+        let turns = u64::from(HELPER_STATED_TOOL_CALLS) + 2;
         assert!(args.budget_tokens.expect("budget") > turns * (47_000 + 2_000));
     }
 
     /// Issue #866: a consult whose helper hit the budget is refunded once and says so plainly.
     /// A codex consult carries no tool cap (exec's preflight refuses one) yet keeps the token
-    /// budget; the claude consult keeps its 4-call cap and 275k budget.
+    /// budget; the claude consult keeps its 6-call cap and 275k budget.
     #[test]
     fn only_a_tool_counting_harness_gets_the_consult_tool_cap() {
         let mut cfg = enabled_cfg();
@@ -1893,7 +1998,7 @@ mod tests {
         cfg.supervisor.harness = "claude".to_string();
         let claude =
             consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("claude");
-        assert_eq!(claude.max_tool_calls, Some(4));
+        assert_eq!(claude.max_tool_calls, Some(HELPER_MAX_TOOL_CALLS));
         assert_eq!(claude.budget_tokens, Some(275_000));
     }
 
@@ -1930,6 +2035,16 @@ mod tests {
         let prompt = build_prompt(RulingKind::Retry, &req.evidence, &[], &"s".repeat(100_000));
         assert!(prompt.len() < PLAN_CAP + DIFFSTAT_CAP + 200);
         assert!(prompt.contains("git diff --stat HEAD"));
+    }
+
+    #[test]
+    fn the_prompt_states_a_tool_limit_below_the_enforced_cap() {
+        let prompt = build_prompt(RulingKind::Choice, "q", &[], "");
+        assert!(
+            prompt.contains(&format!("at most {HELPER_STATED_TOOL_CALLS} tool calls")),
+            "{prompt}"
+        );
+        const { assert!(HELPER_STATED_TOOL_CALLS < HELPER_MAX_TOOL_CALLS) };
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub(crate) fn parse_reply(
     options: &[String],
 ) -> Option<(String, String)> {
     let reply = reply.trim();
+    // A Claude helper's turn opens with zirv's own health marker, on its own line or ahead of the verdict.
+    let reply = reply
+        .strip_prefix("[zirv]")
+        .map_or(reply, |rest| rest.trim_start());
     let (head, rest) = reply.split_once('\n').unwrap_or((reply, ""));
     let (head, rest) = (head.trim(), rest.trim());
     let pair = |good: &str, good_verdict: &str, bad: &str, bad_verdict: &str| {
@@ -360,6 +364,25 @@ mod tests {
             parse(RulingKind::Choice, "CHOICE: 2\nREASON: simpler"),
             pair("table", "simpler")
         );
+    }
+
+    /// #868: the real fable helper reply opened with the `[zirv]` health marker line.
+    #[test]
+    fn a_leading_health_marker_does_not_hide_the_verdict() {
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &opts());
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            parse("[zirv]\nCHOICE: 2\nREASON: read-only session"),
+            pair("table", "read-only session")
+        );
+        assert_eq!(parse("[zirv] CHOICE: 1"), pair("queue", ""));
+        assert_eq!(parse("[two words]\nCHOICE: 1"), None);
+        assert_eq!(parse("[x]\nCHOICE: 1"), None);
+        assert_eq!(
+            parse_reply(RulingKind::Done, "[x]\nNOT_DONE: retry", &opts()),
+            None
+        );
+        assert_eq!(parse("[zirv]\nI pick the table"), None);
     }
 
     #[test]

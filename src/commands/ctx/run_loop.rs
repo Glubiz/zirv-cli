@@ -430,7 +430,13 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             command.env(super::adapters::INTERNAL_ENV, "1");
             // Export this cycle's harness for nested command defaults.
             command.env(super::adapters::AGENT_ENV, adapter.name());
-            super::sessions::secret_env::scrub_worker_env_cmd(command, &cfg, adapter.as_ref());
+            // A loop cycle has no relay (its session is unknown to the child), so a gated hook needs the key.
+            super::sessions::secret_env::scrub_worker_env_cmd(
+                command,
+                &cfg,
+                adapter.as_ref(),
+                super::jev::any_gate_enabled(&cfg.jev),
+            );
         };
         apply_session_env(&mut command);
 

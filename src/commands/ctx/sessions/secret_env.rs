@@ -107,13 +107,18 @@ pub(crate) fn scrub_worker_secrets_pty(
 }
 
 /// The launch-seam entry: the operator's `[sandbox] scrub_worker_secrets`, the adapter's own
-/// credentials and the real process env, in one call. Returns the stripped NAMES.
+/// credentials and the real process env, in one call. Returns the stripped NAMES. `keep_jev_key`
+/// is for a launch with no relay to the supervisor, so a hook-side `[jev]` gate must hold the key itself.
 pub(crate) fn scrub_worker_env_cmd(
     command: &mut Command,
     cfg: &super::super::config::CtxConfig,
     adapter: &dyn super::super::adapters::AgentAdapter,
+    keep_jev_key: bool,
 ) -> Vec<String> {
-    let keep = adapter.credential_env(&super::super::config::env_from_process());
+    let mut keep = adapter.credential_env(&super::super::config::env_from_process());
+    if let Some(keep) = keep.as_mut().filter(|_| keep_jev_key) {
+        keep.push(cfg.proxy.typesafe.credential_env.clone());
+    }
     let ambient = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok());
     scrub_worker_secrets_cmd(
         command,
@@ -270,5 +275,29 @@ mod tests {
         ] {
             assert!(!is_secret_env_name(plain), "{plain}");
         }
+    }
+
+    #[test]
+    fn the_jev_key_is_kept_only_when_the_launch_asks_and_other_keys_stay_withheld() {
+        let mut cfg = crate::commands::ctx::config::CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV870_API_KEY".to_string();
+        let adapter = crate::commands::ctx::adapters::select(Some("claude"), &[], &cfg)
+            .expect("claude adapter");
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var("JEV870_API_KEY", "x");
+            std::env::set_var("OTHER870_API_KEY", "x");
+        }
+        let mut without = Command::new("agent");
+        scrub_worker_env_cmd(&mut without, &cfg, adapter.as_ref(), false);
+        let mut with = Command::new("agent");
+        scrub_worker_env_cmd(&mut with, &cfg, adapter.as_ref(), true);
+        unsafe {
+            std::env::remove_var("JEV870_API_KEY");
+            std::env::remove_var("OTHER870_API_KEY");
+        }
+        assert!(removed(&without).contains("JEV870_API_KEY"));
+        assert!(!removed(&with).contains("JEV870_API_KEY"));
+        assert!(removed(&with).contains("OTHER870_API_KEY"));
     }
 }

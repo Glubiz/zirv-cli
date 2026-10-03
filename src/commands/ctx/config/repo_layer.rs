@@ -912,6 +912,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_PROXY_VALIDATION_GATE",
+        &["proxy", "validation_gate"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
         &["proxy", "typesafe", "base_url"],
         EnvKind::Str,
@@ -1943,6 +1948,10 @@ pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["proxy", "request_max_bytes"],
         "ZIRV_CTX_PROXY_REQUEST_MAX_BYTES",
+    ),
+    (
+        &["proxy", "validation_gate"],
+        "ZIRV_CTX_PROXY_VALIDATION_GATE",
     ),
     (
         &["proxy", "typesafe", "base_url"],

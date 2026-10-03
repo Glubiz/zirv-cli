@@ -1,5 +1,7 @@
 # Benchmark → fix loop, 2026-09-24/25: results and handover
 
+> **Correction (issue #869): none of the "Jev on" vs "Jev off" columns in r0-r7 measure Jev.** r0-r6 compare intake and workflow routing (`zirv-nojev` had no proxy at all). In r7 the intake changed no decision, the "Jev off is slower" time is the no-Jev intake path falling through to the helper model's ~15 s timeout, and most of the 20 gates cannot fire in these task shapes or were inert by config. No result recorded which gate fired. The data below is kept, but read the Jev on/off deltas and the r7 headline as routing and intake artifacts. The harness now isolates state per run, records a per-site `jev` block and flags `jev_invalid` runs; re-measure with `compare.py --baseline zirv-nojev`.
+
 **Target (operator):** zirv with Jev **off** and zirv with Jev **on** must each be at least **20% cheaper**, at least **20% faster**, and at least **1% better in work quality** than vanilla Claude Code with the superpowers plugin (v6.4.1). Tasks should be large or long-running. Beating the target is welcome.
 
 **Status: not met. Round 7 was the full and final benchmark** (4.30.0 at ff4fc885, all 20 Jev gates on in `zirv-jev-full`, same headless levers and intake in both zirv conditions). Cost and work quality clear the bar on the large tasks; time does not, in any condition, on any task group:
