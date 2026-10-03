@@ -287,6 +287,28 @@ enum ProxyIntakeOutcome {
     },
 }
 
+/// Persist the decided profile so stats and a successor of this seat find it, wrapped or native (#537).
+fn save_proxy_profile(
+    intake: &ProxyIntakeOutcome,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    session: &str,
+    started_workflow_id: Option<&str>,
+) {
+    let ProxyIntakeOutcome::Decided { decision, .. } = intake else {
+        return;
+    };
+    let _ = proxy::store::save(
+        state.root(),
+        session,
+        &proxy::store::StoredProfile {
+            decision: (**decision).clone(),
+            operator_override: Some(cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
+            started_workflow_id: started_workflow_id.map(str::to_string),
+        },
+    );
+}
+
 /// Run intake before adapter resolution or terminal takeover; simple/resume skip it (#537, #799).
 /// Only explicit proxy requests announce those skips; active intake requires terminal input and VT-capable stderr.
 fn proxy_intake(
@@ -581,6 +603,7 @@ fn run_native_chat<E: Write>(
     }
     // Share role mapping with wrapped launches so direct decisions stay Single (#537).
     let seat_role = proxy_prompt_role(&intake);
+    save_proxy_profile(&intake, cfg, &state, &session, None);
     // Use the ordinary dashboard so native conversations share roster, mail, attention and worker panes (#490).
     // Carry the decided model as a route candidate alongside its role; spawn must still validate it (#703).
     let model = proxy_decided_model(&intake);
@@ -776,17 +799,13 @@ pub fn run_with<W: Write, E: Write>(
     // Share one bounded proxy layer across every launch shape (#537).
     let proxy_layer = proxy_layer_text(&intake, started_workflow_id.as_deref());
     // A successor of this seat re-renders its layer from the stored profile (#537).
-    if let ProxyIntakeOutcome::Decided { decision, .. } = &intake {
-        let _ = proxy::store::save(
-            state.root(),
-            session.as_str(),
-            &proxy::store::StoredProfile {
-                decision: (**decision).clone(),
-                operator_override: Some(cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
-                started_workflow_id: started_workflow_id.clone(),
-            },
-        );
-    }
+    save_proxy_profile(
+        &intake,
+        &cfg,
+        &state,
+        session.as_str(),
+        started_workflow_id.as_deref(),
+    );
     // Resolve the role once so all prompt, env and launch consumers agree (#537).
     let seat_role = proxy_prompt_role(&intake);
     let initial_prompt = orchestrator_initial_prompt(
@@ -3648,6 +3667,25 @@ mod tests {
 
         assert_eq!(requested_agent, "codex");
         assert_eq!(cfg.chat.model.as_deref(), Some("o-fast"));
+    }
+
+    /// Native seats call `save_proxy_profile` with no workflow; the stored profile feeds stats and the successor layer (#537).
+    #[test]
+    fn save_proxy_profile_stores_a_native_decision_without_a_workflow() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "abcd1234-0000-4000-8000-000000000000";
+        let intake = ProxyIntakeOutcome::Decided {
+            decision: Box::new(sample_decision(repo.path(), "claude", "fable", None)),
+            request: "fix a typo".to_string(),
+        };
+
+        save_proxy_profile(&intake, &CtxConfig::default(), &state, session, None);
+
+        let stored = proxy::store::load(state.root(), session).expect("profile stored");
+        assert_eq!(stored.started_workflow_id, None);
+        assert!(proxy::store::layer_for_session(state.root(), "abcd1234").is_some());
     }
 
     /// Issue #537 (T3): `run_with` reads the seat this launch runs as

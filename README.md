@@ -863,6 +863,7 @@ decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
 min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN -- see "Decider chain" above
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+validation_gate = false      # ZIRV_CTX_PROXY_VALIDATION_GATE
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
@@ -870,6 +871,8 @@ credential_env = "TYPESAFE_API_KEY"       # ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_E
 model = "jev-1.13.0"                      # ZIRV_CTX_PROXY_TYPESAFE_MODEL -- pinned; see below
 timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 ```
+
+**Validation gate.** `validation_gate = true` makes the Stop hook block (instead of only advising) a seat whose stored proxy profile requires tests (`validation.independent_test`, the condition behind the single seat's `validate:` line) while code changed and verification evidence is stale. It reuses the `[verify_on_stop]` nudge, so it needs `verify_on_stop.enabled` and stops blocking after `max_nudges`; it never blocks a Stop that is already a continuation. Operator-only: a repo layer that sets it is a hard error.
 
 **Pinned model.** `model` defaults to a specific Jev release (`jev-1.13.0`,
 what `jev-latest` itself resolves to today) rather than the `jev-latest`
@@ -2505,8 +2508,9 @@ and chat start none, and "no workflow" in the prompt opts out. It is skipped
 for a session that already has a bound workflow, for delegated seats
 (worker, sub-orchestrator, single, or a `zirv agent` child), and for unattended or
 zirv-spawned launches (`ZIRV_CTX_HEADLESS=1`, or `ZIRV_CTX_INTERNAL=1` on the
-distiller/handoff/memory model call and `zirv ctx loop` cycles), so a worker brief
-never inherits another session's workflow.
+distiller/handoff/memory model call, supervisor consults and `zirv ctx loop` cycles), so a worker brief
+never inherits another session's workflow. An `INTERNAL` session also gets no per-turn `[zirv]` health-marker
+instruction, so a helper whose reply zirv parses strictly is never told to prefix it.
 
 ### Workflow adoption
 
@@ -4640,6 +4644,7 @@ decider = "typesafe"         # typesafe | helper | deterministic; ZIRV_CTX_PROXY
 min_confidence = 0.5         # ZIRV_CTX_PROXY_MIN_CONFIDENCE
 min_margin = 0.2             # ZIRV_CTX_PROXY_MIN_MARGIN
 request_max_bytes = 16384    # ZIRV_CTX_PROXY_REQUEST_MAX_BYTES
+validation_gate = false      # ZIRV_CTX_PROXY_VALIDATION_GATE
 
 [proxy.typesafe]
 base_url = "https://api.typesafe.ai/v1"   # ZIRV_CTX_PROXY_TYPESAFE_BASE_URL
@@ -5289,6 +5294,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `proxy.min_confidence` | `ZIRV_CTX_PROXY_MIN_CONFIDENCE` |
 | `proxy.min_margin` | `ZIRV_CTX_PROXY_MIN_MARGIN` |
 | `proxy.request_max_bytes` | `ZIRV_CTX_PROXY_REQUEST_MAX_BYTES` |
+| `proxy.validation_gate` | `ZIRV_CTX_PROXY_VALIDATION_GATE` |
 | `proxy.typesafe.base_url` | `ZIRV_CTX_PROXY_TYPESAFE_BASE_URL` |
 | `proxy.typesafe.credential_env` | `ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV` |
 | `proxy.typesafe.model` | `ZIRV_CTX_PROXY_TYPESAFE_MODEL` |

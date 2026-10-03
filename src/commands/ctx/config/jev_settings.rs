@@ -27,6 +27,8 @@ pub struct ProxyConfig {
     pub min_margin: f32,
     /// Request byte cap before any model call; at least [`MIN_PROXY_REQUEST_MAX_BYTES`].
     pub request_max_bytes: usize,
+    /// Block a direct single seat's Stop while its profile requires tests and verification is stale (#537).
+    pub validation_gate: bool,
     pub typesafe: ProxyTypesafeConfig,
     /// One-launch operator overrides from CLI flags; never read from a config file (#537).
     #[serde(skip)]
@@ -41,6 +43,7 @@ impl Default for ProxyConfig {
             min_confidence: 0.5,
             min_margin: crate::commands::ctx::jev::DEFAULT_MIN_MARGIN,
             request_max_bytes: 16_384,
+            validation_gate: false,
             typesafe: ProxyTypesafeConfig::default(),
             overrides: Default::default(),
         }

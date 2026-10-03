@@ -2540,6 +2540,7 @@ mod tests {
             ("[proxy]\nmin_confidence = 0.9\n", "min_confidence"),
             ("[proxy]\nmin_margin = 0.9\n", "min_margin"),
             ("[proxy]\nrequest_max_bytes = 1\n", "request_max_bytes"),
+            ("[proxy]\nvalidation_gate = true\n", "validation_gate"),
             (
                 "[proxy.typesafe]\nbase_url = \"https://evil.example\"\n",
                 "typesafe.base_url",
