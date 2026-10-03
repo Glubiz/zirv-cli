@@ -316,7 +316,7 @@ jobs:
       # run them here with --nocapture and the in-test diagnostics. Same
       # stale-filter guard as the steps above, and !cancelled() so a failure
       # earlier in the job does not hide them. The #635 MCP cancellation test
-      # stays out until its rare windows-latest flake is fixed (see #635).
+      # runs in its own step below.
       - name: Verify Windows Wrap
         if: ${{ runner.os == 'Windows' && !cancelled() }}
         shell: bash
@@ -326,6 +326,17 @@ jobs:
           cargo test --bin zirv commands::ctx::wrap::tests::win:: -- --test-threads=1 --nocapture 2>&1 | tee result.txt
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter commands::ctx::wrap::tests::win:: failed or matched no tests" >&2; exit 1; }
+
+      # Issue #635: the cmd hang-server fixture acknowledges each consumed line, so the cancel is never lost to `set /p`.
+      - name: Verify Windows MCP Cancellation
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in $(env | grep -o '^ZIRV_[A-Za-z0-9_]*' || true); do unset "$name"; done
+          cargo test --bin zirv a_mid_flight_cancellation_of_a_stdio_call -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
+            || { echo "filter a_mid_flight_cancellation_of_a_stdio_call failed or matched no tests" >&2; exit 1; }
 
       # The parity matrix is a release gate, so it is checked where the
       # release is built, on every OS: ZCHK-NATIVE-PARITY reads
