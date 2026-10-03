@@ -801,5 +801,14 @@ class CompareJevTests(unittest.TestCase):
         self.assertIn("typesafe x1", table)
 
 
+class PosixExecutableTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "POSIX resolution only")
+    def test_resolved_executables_are_not_windows_paths(self):
+        for exe in (run_module.CLAUDE_EXE, run_module.ZIRV_FALLBACK,
+                    run_module.PYTHON_EXE, run_module.GIT_EXE, run_module.zirv_exe()):
+            self.assertNotIn("C:\\", exe)
+        self.assertEqual(run_module.resolve_exe("no-such-tool-xyz", r"C:\x.exe"), "no-such-tool-xyz")
+
+
 if __name__ == "__main__":
     unittest.main()

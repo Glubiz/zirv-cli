@@ -65,6 +65,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -74,11 +75,20 @@ import time
 import traceback
 from pathlib import Path
 
-CLAUDE_EXE = r"C:\Users\josj\.local\bin\claude.exe"
-ZIRV_FALLBACK = r"C:\ProgramData\chocolatey\bin\zirv.exe"
-PYTHON_EXE = r"C:\Python311\python.exe"
-GIT_EXE = r"C:\Program Files\Git\cmd\git.exe"
+def resolve_exe(name, windows_path):
+    """The pinned Windows path on nt; the PATH lookup (else the bare name) elsewhere."""
+    if os.name == "nt":
+        return windows_path
+    return shutil.which(name) or name
+
+
+CLAUDE_EXE = resolve_exe("claude", r"C:\Users\josj\.local\bin\claude.exe")
+ZIRV_FALLBACK = resolve_exe("zirv", r"C:\ProgramData\chocolatey\bin\zirv.exe")
+PYTHON_EXE = resolve_exe("python3", r"C:\Python311\python.exe")
+GIT_EXE = resolve_exe("git", r"C:\Program Files\Git\cmd\git.exe")
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
+# POSIX children lead their own session so kill_tree can signal the whole group.
+POPEN_GROUP_KW = {} if os.name == "nt" else {"start_new_session": True}
 DEFAULT_TIMEOUT_MIN = 20
 
 # Issue #758: every `[jev]` advisory gate (config.rs::JevConfig / jev.rs),
@@ -320,9 +330,10 @@ _CLEAN_PATH = [
     r"C:\Users\josj\.cargo\bin", r"C:\Windows\System32", r"C:\Windows",
     r"C:\Windows\System32\WindowsPowerShell\v1.0", r"C:\Program Files\PowerShell\7",
 ]
-os.environ["PATH"] = ";".join(_CLEAN_PATH) + ";" + ";".join(
-    p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
-)
+if os.name == "nt":
+    os.environ["PATH"] = ";".join(_CLEAN_PATH) + ";" + ";".join(
+        p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
+    )
 
 
 def child_env(env_extra):
@@ -584,6 +595,14 @@ def rmtree_robust(path):
 
 
 def kill_tree(pid):
+    if os.name != "nt":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                return
+            time.sleep(2)
+        return
     subprocess.run([TASKKILL_EXE, "/T", "/F", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -630,10 +649,10 @@ def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path,
         if cond == "vanilla":
             stdin_f = open(prompt_path, "rb")
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=stdin_f,
-                                     stdout=stdout_f, stderr=stderr_f, env=env)
+                                     stdout=stdout_f, stderr=stderr_f, env=env, **POPEN_GROUP_KW)
         else:
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
-                                     stdout=stdout_f, stderr=stderr_f, env=env)
+                                     stdout=stdout_f, stderr=stderr_f, env=env, **POPEN_GROUP_KW)
     except Exception:
         stdout_f.close()
         stderr_f.close()
@@ -2669,7 +2688,7 @@ def run_trial(spec_path, out_dir, cond):
 
     zirv_dir = spec.get("zirv_dir")
     if zirv_dir:
-        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + os.pathsep +os.environ["PATH"]
 
     bench_root = Path(__file__).resolve().parent
     task = spec["task"]
@@ -2945,7 +2964,7 @@ def main():
             print("--trial requires --out", file=sys.stderr)
             sys.exit(2)
         if args.zirv_dir:
-            os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+            os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
         run_trial(args.trial, args.out, args.cond)
         return
 
@@ -2956,7 +2975,7 @@ def main():
 
     STAGGER_S = args.stagger_s
     if args.zirv_dir:
-        os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
         print("zirv under test:", shutil.which("zirv"))
     tasks_dir = bench_root / "tasks"
 
