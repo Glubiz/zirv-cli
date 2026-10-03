@@ -18,8 +18,13 @@ this rubric is the only grading signal. Score 0-10 on:
   just appended as an unstructured dump at the bottom?
 - **Final-reply summary (0-4)**: does the agent's own final chat response
   (not the README) give a clear, accurate, step-by-step summary of the
-  whole session's changes, explicitly naming (a) the OFX/unknown-currency
-  bug it found and fixed, and (b) AT LEAST ONE of the two places where a
+  whole session's changes, explicitly naming (a) the unknown-currency
+  crash it found and fixed (step 10: `fx convert 100 USD CAD` raised a
+  raw `KeyError: 'CAD'` traceback from `currency.convert`; the fix is
+  `UnknownCurrencyError` plus `error: ...` / exit 2 in the CLI callers --
+  the bug is in the currency conversion path, NOT in the OFX importer, so
+  do not require, or reward, any OFX attribution; a summary that says the
+  bug was not in OFX is correct), and (b) AT LEAST ONE of the two places where a
   default behavior changed but the old one was kept behind a flag (`list
   --legacy-order` for the sort-order change, or `summary --raw-currency`
   for the USD-conversion default) -- full marks here name BOTH. A summary
