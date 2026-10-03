@@ -793,7 +793,9 @@ fn consult_agent_args(
         task_class: Some(log::TaskClass::Review),
         system_prompt: Some(ruling_instructions(kind)),
         budget_tokens: Some(HELPER_BUDGET_TOKENS),
-        max_tool_calls: Some(HELPER_MAX_TOOL_CALLS),
+        // exec refuses a tool cap for an adapter that cannot count tool calls (codex), so only
+        // a counting harness gets it; elsewhere the turn-derived token budget alone bounds the run.
+        max_tool_calls: adapter.counts_tool_calls().then_some(HELPER_MAX_TOOL_CALLS),
         timeout_secs,
         flags,
         ..Default::default()
@@ -1870,6 +1872,31 @@ mod tests {
     }
 
     /// Issue #866: a consult whose helper hit the budget is refunded once and says so plainly.
+    /// A codex consult carries no tool cap (exec's preflight refuses one) yet keeps the token
+    /// budget; the claude consult keeps its 4-call cap and 275k budget.
+    #[test]
+    fn only_a_tool_counting_harness_gets_the_consult_tool_cap() {
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.harness = "codex".to_string();
+        let codex =
+            consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("codex");
+        assert_eq!(codex.max_tool_calls, None);
+        assert_eq!(codex.budget_tokens, Some(275_000));
+        let adapter = super::super::adapters::all(None)
+            .into_iter()
+            .find(|candidate| candidate.name() == "codex")
+            .expect("codex adapter");
+        assert!(
+            codex.max_tool_calls.is_none() || adapter.counts_tool_calls(),
+            "exec's preflight would refuse this argv"
+        );
+        cfg.supervisor.harness = "claude".to_string();
+        let claude =
+            consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("claude");
+        assert_eq!(claude.max_tool_calls, Some(4));
+        assert_eq!(claude.budget_tokens, Some(275_000));
+    }
+
     #[test]
     fn an_exhausted_consult_is_refunded_once_and_reports_the_budget() {
         let (dir, state) = fresh_state();
