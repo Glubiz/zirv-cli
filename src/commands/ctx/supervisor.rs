@@ -390,6 +390,14 @@ pub(crate) fn fire(
 }
 
 /// Spawn `zirv ctx supervisor consult` detached, with the evidence on its stdin.
+/// Mark a consult child, and so the helper session it launches, as a zirv-internal call: it never
+/// consults again and its prompt hook adds neither workflow nor health marker.
+fn mark_consult(command: &mut std::process::Command) {
+    command
+        .env(CONSULT_ENV, "1")
+        .env(super::adapters::INTERNAL_ENV, "1");
+}
+
 fn spawn_consult(request: &ConsultRequest) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
@@ -412,10 +420,10 @@ fn spawn_consult(request: &ConsultRequest) -> bool {
                 .flat_map(|id| ["--workflow", id.as_str()]),
         )
         .current_dir(&request.repo)
-        .env(CONSULT_ENV, "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    mark_consult(&mut command);
     crate::commands::workflow::engine::detach(&mut command);
     let Ok(mut child) = command.spawn() else {
         return false;
@@ -877,10 +885,14 @@ fn rule_with(
     *tokens = (prompt.len() / 4) as u64;
     let report = run_helper(&prompt)?;
     let Some((verdict, reason)) = rulings::parse_reply(kind, &report, &options) else {
+        let reply = crate::utils::truncate_bytes(
+            super::snapshot::redact_text(&report),
+            Some(cfg.supervisor.max_advice_bytes),
+        );
         log_fallback(
             state,
             session,
-            &format!("unparseable {} reply: no ruling", kind.as_str()),
+            &format!("unparseable {} reply: no ruling: {reply}", kind.as_str()),
         );
         return Ok(None);
     };
@@ -1156,11 +1168,11 @@ fn spawn_ask_consult(
                 .flat_map(|option| ["--option", option.as_str()]),
         )
         .args(["--timeout-secs", &timeout_secs.to_string()])
-        .env(CONSULT_ENV, "1")
         .env(ASK_TICKET_ENV, ticket)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    mark_consult(&mut command);
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(evidence.as_bytes());
@@ -1194,8 +1206,15 @@ fn spawn_ask_consult(
     let stderr = stderr
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let tail = super::run_loop::tail_of_bytes(stderr.trim().as_bytes(), ASK_STDERR_TAIL_BYTES);
-    Err(format!("the supervisor child {status}: {tail}").into())
+    // The child ends with its own failure line; the lines before it are pacing notices from the helper launch.
+    let failure = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let failure =
+        crate::utils::truncate_bytes(failure.trim().to_string(), Some(ASK_STDERR_TAIL_BYTES));
+    Err(format!("the supervisor child {status}: {failure}").into())
 }
 
 /// How to run the ask outside Claude Code's sandbox; shared by both hint strengths (#856).
@@ -1777,6 +1796,23 @@ mod tests {
     }
 
     #[test]
+    fn a_consult_child_is_marked_internal() {
+        let mut command = std::process::Command::new("true");
+        mark_consult(&mut command);
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
+            .collect();
+        for key in [CONSULT_ENV, crate::commands::ctx::adapters::INTERNAL_ENV] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsString::from("1"))),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn an_unparseable_reply_records_a_fallback_and_no_ruling() {
         let (_dir, state) = fresh_state();
         let cfg = enabled_cfg();
@@ -1790,6 +1826,7 @@ mod tests {
         assert!(open_rulings(&state, None).is_empty());
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(log.contains("unparseable done reply"), "{log}");
+        assert!(log.contains("NO_ADVICE"), "the reply is logged: {log}");
     }
 
     #[test]

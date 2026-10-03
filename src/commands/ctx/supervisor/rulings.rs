@@ -91,6 +91,14 @@ pub(crate) fn parse_reply(
     options: &[String],
 ) -> Option<(String, String)> {
     let reply = reply.trim();
+    // A Claude helper's turn opens with the per-turn health marker (`[zirv]`), on its own line or ahead of the verdict.
+    let reply = match reply
+        .strip_prefix('[')
+        .and_then(|text| text.split_once(']'))
+    {
+        Some((tag, rest)) if !tag.contains(char::is_whitespace) => rest.trim_start(),
+        _ => reply,
+    };
     let (head, rest) = reply.split_once('\n').unwrap_or((reply, ""));
     let (head, rest) = (head.trim(), rest.trim());
     let pair = |good: &str, good_verdict: &str, bad: &str, bad_verdict: &str| {
@@ -360,6 +368,20 @@ mod tests {
             parse(RulingKind::Choice, "CHOICE: 2\nREASON: simpler"),
             pair("table", "simpler")
         );
+    }
+
+    /// #868: the real fable helper reply opened with the `[zirv]` health marker line.
+    #[test]
+    fn a_leading_health_marker_does_not_hide_the_verdict() {
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &opts());
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            parse("[zirv]\nCHOICE: 2\nREASON: read-only session"),
+            pair("table", "read-only session")
+        );
+        assert_eq!(parse("[zirv] CHOICE: 1"), pair("queue", ""));
+        assert_eq!(parse("[two words]\nCHOICE: 1"), None);
+        assert_eq!(parse("[zirv]\nI pick the table"), None);
     }
 
     #[test]
