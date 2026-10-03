@@ -181,6 +181,11 @@ pub(crate) struct Snapshot {
     pub advising: bool,
     /// The moment that fired most recently.
     pub last_trigger: Option<Trigger>,
+    /// The newest recorded trigger name as stored, which includes `ask` (not a `Trigger`).
+    pub last_name: String,
+    /// When the state file was last written (unix seconds): the start of a running consult, the end of
+    /// the last one. The state records no timestamps of its own.
+    pub updated: Option<u64>,
 }
 
 /// Read-only state for `session`; absent state is the idle zero snapshot.
@@ -195,7 +200,23 @@ pub(crate) fn snapshot(state: &StateDir, session: &str) -> Snapshot {
         last_advice: st.last_advice,
         advising: st.state == "advising",
         last_trigger: st.triggers.last().and_then(|name| Trigger::from_name(name)),
+        last_name: st.triggers.last().cloned().unwrap_or_default(),
+        updated: std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs()),
     }
+}
+
+/// The newest `n` rulings recorded for `session`, open or not, oldest first.
+pub(crate) fn recent_rulings(state: &StateDir, session: &str, n: usize) -> Vec<Ruling> {
+    let mut mine: Vec<Ruling> = rulings::all(state)
+        .into_iter()
+        .filter(|ruling| ruling.session == session)
+        .collect();
+    mine.drain(..mine.len().saturating_sub(n));
+    mine
 }
 
 /// What a trigger asks a consult to look at.

@@ -62,6 +62,7 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
     match st {
         St::Done => format!("done {} ago", since(node.ended_at)),
         St::Failed => format!("failed {} ago", since(node.ended_at)),
+        St::Idle if node.kind == "supervisor" && node.ended_at.is_none() => "idle".to_string(),
         St::Idle if parked(node) => format!("idle {}", since(node.ended_at)),
         St::Idle => "not started".to_string(),
         _ => content::node_elapsed(node, wall).unwrap_or_default(),
@@ -70,6 +71,24 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
 
 /// The NOW line of a card or of SELECTED: what the agent is doing, with its colour.
 pub(super) fn now_line(node: &Node, st: St) -> (String, Rgb) {
+    // The supervisor's label is its consult budget (`1/3`), shown on every state.
+    if node.kind == "supervisor" {
+        let budget = node.label.as_deref().unwrap_or_default();
+        return match (st, node_steps(node).last()) {
+            // A running consult's step carries the moment that fired it as its argument.
+            (St::Running, Some(step)) => (
+                format!(
+                    "\u{25b8} {} \u{b7} {budget}",
+                    Some(step.arg.as_str())
+                        .filter(|arg| !arg.is_empty())
+                        .unwrap_or("consulting")
+                ),
+                c::FG,
+            ),
+            (_, Some(_)) => (format!("ruled \u{b7} {budget}"), c::FG),
+            _ => (format!("idle \u{b7} {budget}"), c::DIM),
+        };
+    }
     match st {
         St::Waiting => ("waiting for you".into(), c::WARN),
         St::Done => ("finished".into(), c::OK),

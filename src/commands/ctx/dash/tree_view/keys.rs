@@ -793,6 +793,14 @@ fn open_sel(model: &Model, sel: &Sel) -> (Outcome, Option<Option<Sel>>) {
     if let Some(short) = model.selected_pane(sel) {
         return (Outcome::OpenPane(short), Some(None));
     }
+    // The supervisor has no pane: Enter reads out its newest ruling, SELECTED lists the rest.
+    if let Some(node) = model.node(sel).filter(|n| n.kind == "supervisor") {
+        let notice = match node.steps.iter().rev().find(|s| s.tool == "ruled") {
+            Some(step) => format!("supervisor ruled {}", step.arg),
+            None => "the supervisor has not ruled yet".to_string(),
+        };
+        return (Outcome::Notice(notice), None);
+    }
     let Some(node) = model.node(sel) else {
         let notice = Outcome::Notice(format!("{} has no pane to open", name_of(model, sel)));
         return (notice, None);
