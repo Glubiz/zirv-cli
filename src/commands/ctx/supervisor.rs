@@ -43,14 +43,18 @@ const REPORT_CAP: usize = 64 * 1024;
 const LAST_ADVICE_CHARS: usize = 200;
 const SEEN_KEEP: usize = 16;
 const TRIGGERS_KEEP: usize = 20;
-const HELPER_MAX_TOOL_CALLS: u32 = 4;
+/// What the prompt tells the helper it may use; the enforced cap sits above it so the model
+/// still has turns left to answer when it overshoots (#868).
+const HELPER_STATED_TOOL_CALLS: u32 = 3;
+const HELPER_MAX_TOOL_CALLS: u32 = 6;
 /// The exec budget sums every turn's whole context (cache reads included), so a consult costs
 /// one turn's context per turn, not its brief once. A real Claude consult measured 42k context
 /// on turn 1 and 47k on turn 2 (91,012 in all, #866); 50k per turn covers that with growth, and
 /// 5k per turn covers its reasoning output (2k observed).
 const HELPER_TURN_TOKENS: u64 = 55_000;
-/// One turn per tool call plus the answering turn.
-const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_MAX_TOOL_CALLS as u64 + 1);
+/// One turn per stated tool call, the answering turn and one spare; the tool cap above the stated
+/// limit is a stop for a model that overshoots, not budget to plan on.
+const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_STATED_TOOL_CALLS as u64 + 2);
 const ASK_TIMEOUT_SECS: u64 = 180;
 const ASK_GRACE_SECS: u64 = 20;
 
@@ -765,7 +769,7 @@ fn build_prompt(kind: RulingKind, evidence: &str, options: &[String], diffstat: 
         .map(|(at, option)| format!("{}. {option}\n", at + 1))
         .collect::<String>();
     format!(
-        "Ruling: {}\n\nEvidence:\n{}\n\n{}git diff --stat HEAD:\n{}\n",
+        "Ruling: {}\n\nTool budget: at most {HELPER_STATED_TOOL_CALLS} tool calls, then reply in the required format.\n\nEvidence:\n{}\n\n{}git diff --stat HEAD:\n{}\n",
         kind.as_str(),
         crate::utils::truncate_bytes(evidence.to_string(), Some(PLAN_CAP)),
         if options.is_empty() {
@@ -1968,13 +1972,13 @@ mod tests {
             "the measured consult must not be stopped"
         );
         // Every allowed turn at the observed ~47k context and 2k output stays under the ceiling.
-        let turns = u64::from(HELPER_MAX_TOOL_CALLS) + 1;
+        let turns = u64::from(HELPER_STATED_TOOL_CALLS) + 2;
         assert!(args.budget_tokens.expect("budget") > turns * (47_000 + 2_000));
     }
 
     /// Issue #866: a consult whose helper hit the budget is refunded once and says so plainly.
     /// A codex consult carries no tool cap (exec's preflight refuses one) yet keeps the token
-    /// budget; the claude consult keeps its 4-call cap and 275k budget.
+    /// budget; the claude consult keeps its 6-call cap and 275k budget.
     #[test]
     fn only_a_tool_counting_harness_gets_the_consult_tool_cap() {
         let mut cfg = enabled_cfg();
@@ -1994,7 +1998,7 @@ mod tests {
         cfg.supervisor.harness = "claude".to_string();
         let claude =
             consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("claude");
-        assert_eq!(claude.max_tool_calls, Some(4));
+        assert_eq!(claude.max_tool_calls, Some(HELPER_MAX_TOOL_CALLS));
         assert_eq!(claude.budget_tokens, Some(275_000));
     }
 
@@ -2031,6 +2035,16 @@ mod tests {
         let prompt = build_prompt(RulingKind::Retry, &req.evidence, &[], &"s".repeat(100_000));
         assert!(prompt.len() < PLAN_CAP + DIFFSTAT_CAP + 200);
         assert!(prompt.contains("git diff --stat HEAD"));
+    }
+
+    #[test]
+    fn the_prompt_states_a_tool_limit_below_the_enforced_cap() {
+        let prompt = build_prompt(RulingKind::Choice, "q", &[], "");
+        assert!(
+            prompt.contains(&format!("at most {HELPER_STATED_TOOL_CALLS} tool calls")),
+            "{prompt}"
+        );
+        const { assert!(HELPER_STATED_TOOL_CALLS < HELPER_MAX_TOOL_CALLS) };
     }
 
     #[test]
