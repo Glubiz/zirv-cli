@@ -523,8 +523,12 @@ fn run_with_clock_inner<W: Write>(
         if env(super::supervisor::CONSULT_ENV).is_some_and(|value| !value.is_empty()) {
             command.env(adapters::INTERNAL_ENV, "1");
         }
-        let stripped =
-            super::sessions::secret_env::scrub_worker_env_cmd(command, &cfg, adapter.as_ref());
+        let stripped = super::sessions::secret_env::scrub_worker_env_cmd(
+            command,
+            &cfg,
+            adapter.as_ref(),
+            false,
+        );
         super::sessions::secret_env::log_withheld(&state, session.as_str(), "exec", &stripped);
     };
 

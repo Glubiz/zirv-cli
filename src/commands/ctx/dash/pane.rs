@@ -657,6 +657,8 @@ pub struct Pane {
     /// Remember whether channel output remains after this pane's budget share, delaying reap until it drains (#330).
     pending_output: bool,
     guard: SessionGuard,
+    /// Serves this worker's gated hooks, which hold no Jev key; dropped with the pane.
+    _jev_relay: Option<super::super::jev_relay::Handle>,
     state_dir: StateDir,
     /// Keep signal and output timestamps so prompt redraws can be distinguished from a new turn.
     last_signal_at: Option<Instant>,
@@ -1000,6 +1002,7 @@ impl Pane {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_ROWS),
             approval_dialog: false,
             kind: PaneKind::Native(Box::new(native)),
+            _jev_relay: None,
             pending_handover: None,
             pending_output: false,
             guard,
@@ -1128,6 +1131,21 @@ impl Pane {
         sessions::scrub_supervision_env(&mut command);
         let stripped = scrub_worker_pane_env(&mut command, role, repo, &agent_name);
         sessions::secret_env::log_withheld(state, &session_id, "pane", &stripped);
+        // A scrubbed worker's gated hooks reach Jev through this dashboard's relay for its session.
+        let jev_relay = (role == PromptRole::Worker)
+            .then(|| {
+                let cfg = super::super::config::CtxConfig::load_refusal_safe(
+                    repo,
+                    &super::super::config::env_from_process(),
+                );
+                super::super::jev_relay::start(
+                    &cfg.proxy.typesafe,
+                    super::super::jev::any_gate_enabled(&cfg.jev),
+                    state,
+                    &session_id,
+                )
+            })
+            .flatten();
         // Derive launch mode from the same environment given to the child (#160).
         let launch_mode = if turn_env.iter().any(|(k, v)| {
             k == super::super::adapters::LAUNCH_MODE_ENV
@@ -1267,6 +1285,7 @@ impl Pane {
             pending_handover: None,
             pending_output: false,
             guard,
+            _jev_relay: jev_relay,
             state_dir: state.clone(),
             last_signal_at: None,
             last_output_at: None,

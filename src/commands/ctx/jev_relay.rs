@@ -118,7 +118,7 @@ pub(crate) fn start(
     state: &StateDir,
     session: &str,
 ) -> Option<Handle> {
-    if !jev_enabled || !jev::available(cfg) {
+    if !jev_enabled || !jev::has_credential(cfg) {
         return None;
     }
     let endpoint = Endpoint::for_jev_relay(state, session);
@@ -236,6 +236,12 @@ fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
             },
         },
     }
+}
+
+/// Whether `session`'s relay endpoint is listening right now, so a process without the credential
+/// (a worker whose env was scrubbed) can still reach Jev through its supervisor.
+pub(crate) fn is_reachable(state: &StateDir, session: &str) -> bool {
+    !is_relay_host() && transport::probe(&Endpoint::for_jev_relay(state, session))
 }
 
 /// Tries to answer one already-encoded request via `session`'s relay
@@ -498,6 +504,55 @@ mod tests {
             !text.contains("\"fallbacks\":[]"),
             "the row must carry the fallback: {text}"
         );
+    }
+
+    /// A scrubbed worker holds no key: `available` and `ask` still work through its supervisor's relay.
+    #[test]
+    fn a_worker_without_the_key_is_available_and_asks_through_the_relay() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let (cfg, state, _dir, vendor) = relay_case("NOKEY870");
+        let session = "relay-no-key-session-870";
+        // Without a relay endpoint there is nothing to reach.
+        // SAFETY (test-only): unique names owned by this test.
+        unsafe {
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
+            std::env::set_var(crate::commands::ctx::state::STATE_ENV, state.root());
+        }
+        assert!(!jev::available(&cfg.proxy.typesafe));
+        let listener = Listener::bind(&Endpoint::for_jev_relay(&state, session)).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut connection, _frame) = accept_one_real_request(&listener);
+            connection
+                .write_frame(&RelayResponseFrame {
+                    status: Some(200),
+                    body: Some(text),
+                    ..Default::default()
+                })
+                .expect("write");
+        });
+        let available = jev::available(&cfg.proxy.typesafe);
+        let answered = jev::ask(
+            &cfg.proxy.typesafe,
+            state.root(),
+            0,
+            &sample_state(),
+            &sample_questions(),
+        );
+        unsafe {
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
+            std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+        }
+        server.join().expect("server thread must not panic");
+        assert!(available, "a reachable relay makes Jev available");
+        assert!(answered.is_ok(), "{answered:?}");
+        assert!(vendor.accept().is_err(), "no direct request");
     }
 
     /// The relay reported a vendor failure (an error frame) after the request was written: the

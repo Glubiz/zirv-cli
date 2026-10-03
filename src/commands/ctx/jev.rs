@@ -989,15 +989,24 @@ pub(crate) fn send_request(
 /// caller (`ask`, below) then falls straight through to [`send_request`]
 /// exactly as it always has -- a relay is an optimisation, never required.
 fn relay_send(state_dir: &Path, payload: &str, wait: Duration) -> Option<Result<String, JevError>> {
-    let session = std::env::var(adapters::SESSION_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
+    let session = relay_session()?;
     jev_relay::try_via_relay(
         &StateDir::from_path(state_dir.to_path_buf()),
         &session,
         payload,
         wait,
     )
+}
+
+fn relay_session() -> Option<String> {
+    std::env::var(adapters::SESSION_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// A scrubbed worker holds no credential but its supervisor's relay answers for it.
+fn relay_reachable(state: &StateDir) -> bool {
+    relay_session().is_some_and(|session| jev_relay::is_reachable(state, &session))
 }
 
 pub(crate) fn ask(
@@ -1007,10 +1016,12 @@ pub(crate) fn ask(
     state: &impl Serialize,
     questions: &[Question],
 ) -> Result<(Answers, Usage, bool), JevError> {
-    let credential = match std::env::var(&cfg.credential_env) {
-        Ok(value) if !value.is_empty() => value,
-        _ => return Err(JevError::NoCredential(cfg.credential_env.clone())),
-    };
+    let credential = std::env::var(&cfg.credential_env)
+        .ok()
+        .filter(|value| !value.is_empty());
+    if credential.is_none() && !relay_reachable(&StateDir::from_path(state_dir.to_path_buf())) {
+        return Err(JevError::NoCredential(cfg.credential_env.clone()));
+    }
     let safe_state = serde_json::to_value(state).map_err(|_| JevError::UnsafeState)?;
     if !safe_metadata_request(&safe_state, questions, &cfg.model) {
         return Err(JevError::UnsafeState);
@@ -1045,7 +1056,10 @@ pub(crate) fn ask(
     let relay_wait = Duration::from_secs(cfg.timeout_secs).saturating_add(Duration::from_secs(3));
     let body = match relay_send(state_dir, &payload, relay_wait) {
         Some(result) => result?,
-        None => send_request(&cfg.base_url, &credential, cfg.timeout_secs, payload)?,
+        None => match &credential {
+            Some(credential) => send_request(&cfg.base_url, credential, cfg.timeout_secs, payload)?,
+            None => return Err(JevError::NoCredential(cfg.credential_env.clone())),
+        },
     };
     let parsed: SystemOneResponse =
         serde_json::from_str(&body).map_err(|error| JevError::Malformed(error.to_string()))?;
@@ -1068,9 +1082,14 @@ pub(crate) fn ask(
 /// checks for the harness proxy's own `typesafe` decider, so the two never
 /// drift on what "usable" means.
 pub(crate) fn available(cfg: &ProxyTypesafeConfig) -> bool {
-    std::env::var(&cfg.credential_env)
-        .map(|value| !value.is_empty())
-        .unwrap_or(false)
+    has_credential(cfg)
+        || StateDir::resolve(&crate::commands::ctx::config::env_from_process())
+            .is_ok_and(|state| relay_reachable(&state))
+}
+
+/// Only this process's own env: what a relay host needs, since it forwards with that credential.
+pub(crate) fn has_credential(cfg: &ProxyTypesafeConfig) -> bool {
+    std::env::var(&cfg.credential_env).is_ok_and(|value| !value.is_empty())
 }
 
 /// Whether at least one `[jev]` gate is on -- the other half of
