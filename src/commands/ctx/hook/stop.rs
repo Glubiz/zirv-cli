@@ -238,7 +238,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // this seat's stored profile requires tests; the nudge's own counter caps it (#537).
         if cfg.proxy.validation_gate && stop_verify_block.is_none() && scope_guard_block.is_none() {
             validation_block = verify_nudge.clone().filter(|_| {
-                crate::commands::ctx::proxy::store::load(state.root(), &session)
+                crate::commands::ctx::proxy::store::load(state.root(), &stable_short)
                     .is_some_and(|profile| profile.decision.validation.independent_test)
             });
         }
@@ -1285,7 +1285,8 @@ mod tests {
         decision.validation.independent_test = true;
         crate::commands::ctx::proxy::store::save(
             &state,
-            "s",
+            // The seat's stable short; this Stop's own session id ("s") differs, as after a restart.
+            "aaaa1111",
             &crate::commands::ctx::proxy::store::StoredProfile {
                 decision,
                 operator_override: None,
@@ -1301,6 +1302,10 @@ mod tests {
             (
                 "ZIRV_CTX_PROXY_VALIDATION_GATE".to_string(),
                 gate.to_string(),
+            ),
+            (
+                SOCKET_ENV.to_string(),
+                state.join("sockets/aaaa1111.sock").display().to_string(),
             ),
         ]
         .into_iter()

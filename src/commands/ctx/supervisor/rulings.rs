@@ -91,14 +91,10 @@ pub(crate) fn parse_reply(
     options: &[String],
 ) -> Option<(String, String)> {
     let reply = reply.trim();
-    // A Claude helper's turn opens with the per-turn health marker (`[zirv]`), on its own line or ahead of the verdict.
-    let reply = match reply
-        .strip_prefix('[')
-        .and_then(|text| text.split_once(']'))
-    {
-        Some((tag, rest)) if !tag.contains(char::is_whitespace) => rest.trim_start(),
-        _ => reply,
-    };
+    // A Claude helper's turn opens with zirv's own health marker, on its own line or ahead of the verdict.
+    let reply = reply
+        .strip_prefix("[zirv]")
+        .map_or(reply, |rest| rest.trim_start());
     let (head, rest) = reply.split_once('\n').unwrap_or((reply, ""));
     let (head, rest) = (head.trim(), rest.trim());
     let pair = |good: &str, good_verdict: &str, bad: &str, bad_verdict: &str| {
@@ -381,6 +377,11 @@ mod tests {
         );
         assert_eq!(parse("[zirv] CHOICE: 1"), pair("queue", ""));
         assert_eq!(parse("[two words]\nCHOICE: 1"), None);
+        assert_eq!(parse("[x]\nCHOICE: 1"), None);
+        assert_eq!(
+            parse_reply(RulingKind::Done, "[x]\nNOT_DONE: retry", &opts()),
+            None
+        );
         assert_eq!(parse("[zirv]\nI pick the table"), None);
     }
 
