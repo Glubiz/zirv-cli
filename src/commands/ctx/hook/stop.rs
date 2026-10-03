@@ -169,11 +169,20 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .with_attention(crate::commands::ctx::attention::Attention::None),
             now_secs(),
         );
-        // A turn boundary ends every prompt the session had open.
-        crate::commands::ctx::attention::close_prompts(
+        // A turn boundary ends every prompt the session had open. Closing them and clearing their
+        // latch share one lock, so a dialog confirmed since the record above cannot outlive its entry (#864).
+        crate::commands::ctx::attention::resolve_prompts(
             &state,
             &super::permission::attention_short(env, &payload.session_id),
             |_| true,
+            crate::commands::ctx::attention::Observation::new(
+                crate::commands::ctx::attention::Authority::AdapterHook,
+                "turn completed cleanly",
+                100,
+                now_secs(),
+            )
+            .with_attention(crate::commands::ctx::attention::Attention::None),
+            now_secs(),
         );
         crate::commands::ctx::approvals::clear_released(
             &state,
