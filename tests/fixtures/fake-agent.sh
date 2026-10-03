@@ -23,7 +23,7 @@
 #                                           can see which session the child
 #                                           was told is its own supervisor
 #   FAKE_AGENT_HEADLESS_ENV_LOG=<path>      append $ZIRV_CTX_HEADLESS per run
-#   FAKE_AGENT_INTERNAL_ENV_LOG=<path>      append $ZIRV_CTX_INTERNAL (or `unset`) per run
+#   FAKE_AGENT_INTERNAL_ENV_LOG=<path>      append `$ZIRV_CTX_INTERNAL $ZIRV_SUPERVISOR_CONSULT` (`unset` when absent)
 #   FAKE_AGENT_EFFORT_ENV_LOG=<path>       append $CLAUDE_CODE_EFFORT_LEVEL per run
 #   FAKE_AGENT_ARGV_LOG=<path>              append the full argv of each run,
 #                                           so a test can assert on injected
@@ -276,7 +276,7 @@ if [ -n "${FAKE_AGENT_HEADLESS_ENV_LOG:-}" ]; then
   printf '%s\n' "${ZIRV_CTX_HEADLESS:-}" >> "$FAKE_AGENT_HEADLESS_ENV_LOG"
 fi
 if [ -n "${FAKE_AGENT_INTERNAL_ENV_LOG:-}" ]; then
-  printf '%s\n' "${ZIRV_CTX_INTERNAL:-unset}" >> "$FAKE_AGENT_INTERNAL_ENV_LOG"
+  printf '%s %s\n' "${ZIRV_CTX_INTERNAL:-unset}" "${ZIRV_SUPERVISOR_CONSULT:-unset}" >> "$FAKE_AGENT_INTERNAL_ENV_LOG"
 fi
 if [ -n "${FAKE_AGENT_EFFORT_ENV_LOG:-}" ]; then
   printf '%s\n' "${CLAUDE_CODE_EFFORT_LEVEL:-}" >> "$FAKE_AGENT_EFFORT_ENV_LOG"

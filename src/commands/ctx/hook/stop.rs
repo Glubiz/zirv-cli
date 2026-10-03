@@ -55,6 +55,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     let Ok(payload) = HookPayload::parse(stdin) else {
         return Ok(0);
     };
+    // A zirv-internal helper is a read-only model call: no Stop gate may block or advise it (#868).
+    if env(adapters::INTERNAL_ENV).as_deref() == Some("1") {
+        return Ok(0);
+    }
     let socket = env(SOCKET_ENV).map(std::path::PathBuf::from);
     // The stable registry short from the bound socket; session IDs rotate during supervised
     // restarts and cannot key per-session records (#243).
@@ -237,8 +241,12 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // Last in the one-block-per-Stop order: the stale-evidence nudge becomes the block when
         // this seat's stored profile requires tests; the nudge's own counter caps it (#537).
         if cfg.proxy.validation_gate && stop_verify_block.is_none() && scope_guard_block.is_none() {
+            // The profile is stored under the seat's stable short, else zirv's own session id
+            // (a harness-minted payload id can differ from it).
+            let profile_key = crate::commands::ctx::supervisor::socket_short(env)
+                .unwrap_or(crate::commands::ctx::sessions::short_id(&session));
             validation_block = verify_nudge.clone().filter(|_| {
-                crate::commands::ctx::proxy::store::load(state.root(), &stable_short)
+                crate::commands::ctx::proxy::store::load(state.root(), &profile_key)
                     .is_some_and(|profile| profile.decision.validation.independent_test)
             });
         }
@@ -1274,7 +1282,7 @@ mod tests {
 
     /// Runs a Stop for a repo with an edited, unverified source file and a stored profile
     /// that requires tests; returns the stdout line (#537).
-    fn validation_gate_stop(gate: bool) -> String {
+    fn validation_gate_stop(gate: bool, socket: bool) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
         let repo = git_repo();
@@ -1303,13 +1311,22 @@ mod tests {
                 "ZIRV_CTX_PROXY_VALIDATION_GATE".to_string(),
                 gate.to_string(),
             ),
-            (
-                SOCKET_ENV.to_string(),
-                state.join("sockets/aaaa1111.sock").display().to_string(),
-            ),
         ]
         .into_iter()
         .collect();
+        let mut env = env;
+        if socket {
+            env.insert(
+                SOCKET_ENV.to_string(),
+                state.join("sockets/aaaa1111.sock").display().to_string(),
+            );
+        } else {
+            // No socket: zirv's own session id keys the profile, not the payload's harness id.
+            env.insert(
+                SESSION_ENV.to_string(),
+                "aaaa1111-0000-4000-8000-000000000000".to_string(),
+            );
+        }
         let mut out = Vec::new();
         run_stop(&mut out, &stop_payload(&transcript, repo.path()), &|k| {
             env.get(k).cloned()
@@ -1320,21 +1337,59 @@ mod tests {
 
     #[test]
     fn validation_gate_blocks_when_the_profile_requires_tests_and_evidence_is_stale() {
-        let text = validation_gate_stop(true);
-        let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
-        assert_eq!(parsed["decision"], "block", "{text}");
+        // With a socket the stable short keys the profile; without one zirv's session id does.
+        for socket in [true, false] {
+            let text = validation_gate_stop(true, socket);
+            let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+            assert_eq!(parsed["decision"], "block", "socket={socket}: {text}");
+            assert!(
+                parsed["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("code changed since the last passing run"),
+                "{text}"
+            );
+        }
+    }
+
+    /// #868: a zirv-internal helper is never blocked by any Stop gate.
+    #[test]
+    fn an_internal_session_is_never_blocked_at_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
+        let transcript = transcript_with_edits(dir.path(), 1, 1);
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                dir.path().join("state").display().to_string(),
+            ),
+            (adapters::HEADLESS_ENV.to_string(), "1".to_string()),
+        ]
+        .into();
+        let run = |internal: bool| {
+            let mut env = env.clone();
+            if internal {
+                env.insert(adapters::INTERNAL_ENV.to_string(), "1".to_string());
+            }
+            let mut out = Vec::new();
+            run_stop(&mut out, &stop_payload(&transcript, repo.path()), &|k| {
+                env.get(k).cloned()
+            })
+            .expect("runs");
+            String::from_utf8(out).expect("utf8")
+        };
         assert!(
-            parsed["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("code changed since the last passing run"),
-            "{text}"
+            run(false).contains("\"decision\":\"block\""),
+            "control blocks"
         );
+        assert_eq!(run(true), "");
     }
 
     #[test]
     fn validation_gate_does_nothing_when_off() {
-        let text = validation_gate_stop(false);
+        let text = validation_gate_stop(false, true);
         assert!(!text.contains("\"decision\":\"block\""), "{text}");
     }
 

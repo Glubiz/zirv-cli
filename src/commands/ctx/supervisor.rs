@@ -24,9 +24,15 @@ mod rulings;
 pub use rulings::RulingStatus;
 pub use rulings::{Ruling, RulingKind, open_rulings, override_ruling};
 
-/// Set on a consult process (and so inherited by the helper session it launches); any trigger
-/// that sees it stays silent, so a consult can never trigger another consult.
+/// Set on a consult process only: `exec` consumes it into `ZIRV_CTX_INTERNAL` for the helper, so
+/// nothing below the helper inherits it.
 pub(crate) const CONSULT_ENV: &str = "ZIRV_SUPERVISOR_CONSULT";
+
+/// A consult process or the internal helper session it launched; any trigger that sees this
+/// stays silent, so a consult can never trigger another consult.
+fn in_consult(env: EnvLookup<'_>) -> bool {
+    env(CONSULT_ENV).is_some() || env(super::adapters::INTERNAL_ENV).as_deref() == Some("1")
+}
 
 const STATE_DIR: &str = "supervisor";
 const PLAN_CAP: usize = 4096;
@@ -328,7 +334,7 @@ pub(crate) fn has_budget(
     env: EnvLookup<'_>,
     session: &str,
 ) -> bool {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return false;
     }
     let Some(path) = state_path(state, session) else {
@@ -347,7 +353,7 @@ pub(crate) fn fire(
     unit: Option<&str>,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> bool {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return false;
     }
     let Some(path) = state_path(state, &request.session) else {
@@ -560,7 +566,7 @@ fn on_stop_with(
     session: &str,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> Vec<Ruling> {
-    if !cfg.supervisor.enabled || env(CONSULT_ENV).is_some() {
+    if !cfg.supervisor.enabled || in_consult(env) {
         return Vec::new();
     }
     if !has_budget(state, cfg, env, session) {
@@ -716,7 +722,7 @@ pub(crate) fn record_for_test(state: &StateDir, session: &str, reason: &str) {
 /// `decision: "block"` with the reason as the next prompt (https://learn.chatgpt.com/docs/hooks).
 /// Never errors; any failure means no block.
 pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Option<String> {
-    if env(CONSULT_ENV).is_some() {
+    if in_consult(env) {
         return None;
     }
     // A repo config the loader refuses must not silence a binding ruling.
@@ -1199,13 +1205,36 @@ fn spawn_ask_consult(
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout.read_to_string(&mut out);
     }
-    let ruling = serde_json::from_str(out.trim()).ok();
-    if status.success() && ruling.is_some() {
-        return Ok(ruling);
-    }
     let stderr = stderr
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
+    ask_child_outcome(status, &out, &stderr)
+}
+
+/// What a finished `--ask` child means: its last JSON stdout line is the ruling; otherwise the
+/// error names what happened (an exit 0 without a ruling is not a stderr matter).
+fn ask_child_outcome(
+    status: std::process::ExitStatus,
+    out: &str,
+    stderr: &str,
+) -> CtxResult<Option<Ruling>> {
+    let ruling = out
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line.trim()).ok());
+    if status.success() && ruling.is_some() {
+        return Ok(ruling);
+    }
+    if status.success() {
+        let seen = crate::utils::truncate_bytes(
+            super::snapshot::redact_text(out.trim()),
+            Some(ASK_STDERR_TAIL_BYTES),
+        );
+        return Err(format!(
+            "the supervisor child exited 0 without printing a ruling; stdout: {seen:?}"
+        )
+        .into());
+    }
     // The child ends with its own failure line; the lines before it are pacing notices from the helper launch.
     let failure = stderr
         .lines()
@@ -1302,7 +1331,7 @@ fn run_ask_with<W: Write>(
     let state = StateDir::resolve(env)?;
     let cfg = CtxConfig::load(&repo, env)?;
     let session = mail::session_identity(env).unwrap_or_else(|| "operator".to_string());
-    if env(CONSULT_ENV).is_some() || !cfg.supervisor.enabled {
+    if in_consult(env) || !cfg.supervisor.enabled {
         writeln!(
             w,
             "the supervisor is off; decide yourself or ask the operator"
@@ -1793,6 +1822,41 @@ mod tests {
             row.last_advice
         );
         assert!(row.tokens_read > 0);
+    }
+
+    /// #868: the child exited 0 with its ruling on the last stdout line behind other output.
+    #[cfg(unix)]
+    #[test]
+    fn an_ask_child_ruling_is_found_behind_other_stdout_and_a_missing_one_is_named() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, state) = fresh_state();
+        let ruling = rulings::record(&state, "s", None, RulingKind::Choice, "A", "why").expect("r");
+        let json = serde_json::to_string(&ruling).expect("json");
+        let ok = std::process::ExitStatus::from_raw(0);
+
+        let out = format!("noise before\n{json}\n");
+        let got = ask_child_outcome(ok, &out, "pacing notice").expect("ruling");
+        assert_eq!(got.expect("some").verdict, "A");
+
+        let error = ask_child_outcome(ok, "just noise\n", "pacing notice")
+            .expect_err("no ruling")
+            .to_string();
+        assert!(
+            error.contains("exited 0 without printing a ruling"),
+            "{error}"
+        );
+        assert!(error.contains("just noise"), "{error}");
+        assert!(!error.contains("pacing notice"), "{error}");
+    }
+
+    #[test]
+    fn the_internal_helper_session_gets_no_consult_budget() {
+        let (_dir, state) = fresh_state();
+        let cfg = enabled_cfg();
+        let internal =
+            |key: &str| (key == crate::commands::ctx::adapters::INTERNAL_ENV).then(|| "1".into());
+        assert!(has_budget(&state, &cfg, &no_env, "s"));
+        assert!(!has_budget(&state, &cfg, &internal, "s"));
     }
 
     #[test]

@@ -518,6 +518,8 @@ fn run_with_clock_inner<W: Write>(
             command.env(key, value);
         }
         // The scrub above drops the internal marker; a supervisor consult's helper is zirv-internal.
+        // The consult marker is consumed here, so nothing below the helper inherits either variable.
+        command.env_remove(super::supervisor::CONSULT_ENV);
         if env(super::supervisor::CONSULT_ENV).is_some_and(|value| !value.is_empty()) {
             command.env(adapters::INTERNAL_ENV, "1");
         }
@@ -2126,6 +2128,9 @@ mod tests {
                 std::env::set_var("FAKE_AGENT_MODE", "healthy");
                 std::env::set_var("FAKE_AGENT_INTERNAL_ENV_LOG", &log);
                 std::env::set_var(adapters::INTERNAL_ENV, "1");
+                if consult {
+                    std::env::set_var(crate::commands::ctx::supervisor::CONSULT_ENV, "1");
+                }
             }
             let args = ExecArgs {
                 agent: Some("claude".to_string()),
@@ -2143,13 +2148,15 @@ mod tests {
                 std::env::remove_var("FAKE_AGENT_MODE");
                 std::env::remove_var("FAKE_AGENT_INTERNAL_ENV_LOG");
                 std::env::remove_var(adapters::INTERNAL_ENV);
+                std::env::remove_var(crate::commands::ctx::supervisor::CONSULT_ENV);
             }
             assert_eq!(code.expect("runs"), 0);
             std::fs::read_to_string(&log).expect("log")
         };
 
-        assert_eq!(received(true).trim(), "1");
-        assert_eq!(received(false).trim(), "unset");
+        // The consult marker is consumed: the helper is internal and passes neither variable on.
+        assert_eq!(received(true).trim(), "1 unset");
+        assert_eq!(received(false).trim(), "unset unset");
     }
 
     /// T11: the fail-safe blind delay (T8) actually reaches the injected
