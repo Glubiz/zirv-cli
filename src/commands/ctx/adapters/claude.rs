@@ -1090,6 +1090,9 @@ pub struct ClaudeAdapter {
     forced_file_support: Option<bool>,
     #[cfg(test)]
     forced_launch_settings: Option<Option<PathBuf>>,
+    /// Test seam: reports a cmd-shim launch on every platform.
+    #[cfg(test)]
+    forced_cmd_shim: bool,
     /// Test seam: bypasses the real registry load/state dir resolution/sync
     /// `claude_plugin_dir` otherwise performs -- defaults to `Some(None)` so
     /// an ordinary test never touches the developer's real state dir or
@@ -1120,6 +1123,8 @@ impl ClaudeAdapter {
             forced_launch_settings: Some(Some(PathBuf::from(
                 "zirv-test-claude-launch-settings.json",
             ))),
+            #[cfg(test)]
+            forced_cmd_shim: false,
             #[cfg(test)]
             forced_plugin_dir: Some(None),
         }
@@ -1178,6 +1183,12 @@ impl ClaudeAdapter {
     #[cfg(test)]
     pub fn with_launch_settings_forced(mut self, path: Option<PathBuf>) -> Self {
         self.forced_launch_settings = Some(path);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cmd_shim_forced(mut self) -> Self {
+        self.forced_cmd_shim = true;
         self
     }
 
@@ -1243,6 +1254,7 @@ impl ClaudeAdapter {
         sandbox: &super::super::config::SandboxConfig,
         safety: &super::super::safety::SafetyPolicy,
         lean: bool,
+        carried: Option<(&[String], &[String])>,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
@@ -1264,6 +1276,15 @@ impl ClaudeAdapter {
             Some(timeout) => path.with_extension(format!("ap{timeout}.json")),
             None => path,
         };
+        // Carried rules make a different settings file, so launches with different postures never share one.
+        let path = match carried {
+            Some((allow, deny)) => {
+                let rules =
+                    super::super::safety::sha256_hex(format!("{allow:?}{deny:?}").as_bytes());
+                path.with_extension(format!("r{}.json", &rules[..16]))
+            }
+            None => path,
+        };
         let supervisor = super::super::config::CtxConfig::load_refusal_safe(
             &std::env::current_dir().unwrap_or_default(),
             &super::super::config::env_from_process(),
@@ -1281,6 +1302,10 @@ impl ClaudeAdapter {
         launch_environment.approvals_hook_timeout = self.approvals_hook_timeout;
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
         launch_environment.lean = lean;
+        if let Some((allow, deny)) = carried {
+            launch_environment.carried_allow = allow.to_vec();
+            launch_environment.carried_deny = deny.to_vec();
+        }
         let result = (|| -> std::io::Result<()> {
             super::super::state::create_private_dir_all(&dir)?;
             super::super::state::create_private_dir_all(&policy_dir)?;
@@ -1429,6 +1454,9 @@ struct LaunchEnvironment {
     approvals_hook_timeout: Option<u64>,
     /// `[supervisor] enabled`: the Stop and tool-failure hooks its done gate and retry rulings need, wired here so a session does not depend on `zirv setup` having written them globally.
     supervisor: bool,
+    /// Sandbox-posture allow/deny rules carried in `permissions` instead of `--allowedTools`/`--disallowedTools` argv, for a launch through a Windows cmd shim whose reparse guard refuses `(`/`)` on argv (#860).
+    carried_allow: Vec<String>,
+    carried_deny: Vec<String>,
 }
 
 impl LaunchEnvironment {
@@ -1479,6 +1507,8 @@ impl LaunchEnvironment {
             lean: false,
             approvals_hook_timeout: None,
             supervisor: false,
+            carried_allow: Vec::new(),
+            carried_deny: Vec::new(),
         }
     }
 }
@@ -1731,6 +1761,14 @@ fn launch_settings_value(
             settings["hooks"][event] = serde_json::json!([{
                 "hooks": [{ "type": "command", "command": command }]
             }]);
+        }
+    }
+    for (key, rules) in [
+        ("allow", &launch_environment.carried_allow),
+        ("deny", &launch_environment.carried_deny),
+    ] {
+        if let Some(list) = settings["permissions"][key].as_array_mut() {
+            list.extend(rules.iter().map(|rule| serde_json::json!(rule)));
         }
     }
     if launch_environment.lean {
@@ -2314,6 +2352,10 @@ impl AgentAdapter for ClaudeAdapter {
     /// cmd.exe, so on it the prompt is delivered via stdin instead
     /// (`headless_cmd_stdin`).
     fn launches_through_cmd_shim(&self) -> bool {
+        #[cfg(test)]
+        if self.forced_cmd_shim {
+            return true;
+        }
         super::launches_through_cmd_shim(&self.program)
     }
 
@@ -2715,13 +2757,21 @@ impl AgentAdapter for ClaudeAdapter {
             args.push("--permission-mode".to_string());
             args.push(permission_mode.to_string());
         }
-        args.push(format!("--allowedTools={allow}"));
-        args.push(format!("--disallowedTools={deny}"));
         // Issue #788: `[headless] lean` only ever narrows a HEADLESS launch's
         // settings layer -- see `launch_settings_path`/`launch_settings_
         // value`'s own doc comments.
         let lean = !mode.is_interactive() && self.headless.lean;
-        if let Some(path) = self.launch_settings_path(sandbox, safety, lean) {
+        // #860: a cmd shim reparses argv and the rules hold `(`/`)`, so they travel in the settings file instead.
+        let carried = self
+            .launches_through_cmd_shim()
+            .then_some((allow_entries.as_slice(), deny_entries.as_slice()));
+        let settings = self.launch_settings_path(sandbox, safety, lean, carried);
+        // With no settings file to carry them, argv keeps the rules and the shim guard refuses the launch, never dropping the deny list.
+        if carried.is_none() || settings.is_none() {
+            args.push(format!("--allowedTools={allow}"));
+            args.push(format!("--disallowedTools={deny}"));
+        }
+        if let Some(path) = settings {
             args.push("--settings".to_string());
             args.push(path.display().to_string());
         }
@@ -5112,7 +5162,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&Default::default(), &policy, false)
+            .launch_settings_path(&Default::default(), &policy, false, None)
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -5186,10 +5236,10 @@ mod tests {
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
         let lean_path = adapter
-            .launch_settings_path(&Default::default(), &policy, true)
+            .launch_settings_path(&Default::default(), &policy, true, None)
             .expect("lean settings materialized");
         let plain_path = adapter
-            .launch_settings_path(&Default::default(), &policy, false)
+            .launch_settings_path(&Default::default(), &policy, false, None)
             .expect("non-lean settings materialized");
 
         assert_ne!(
@@ -5216,6 +5266,66 @@ mod tests {
         assert_eq!(lean_written["disableBundledSkills"], true);
         assert!(plain_written["autoMemoryEnabled"].is_null());
         assert!(plain_written["disableBundledSkills"].is_null());
+    }
+
+    /// #860: behind a Windows cmd shim the posture rules hold `(`/`)`, which the reparse guard refuses on argv, so the same rules travel in the launch settings file's `permissions` and argv stays clean.
+    #[test]
+    fn a_cmd_shim_launch_carries_the_posture_rules_in_the_settings_file_not_argv() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let state = tempfile::tempdir().expect("state");
+        let _state = super::super::super::testenv::VarGuard::set(&[(
+            super::super::super::state::STATE_ENV,
+            Some(state.path().to_str().expect("utf8 state path")),
+        )]);
+        let _home = super::super::super::testenv::HomeGuard::set(home.path());
+        let mode = super::super::LaunchMode::Headless;
+        let plain = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings()
+            .default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
+        let shim = ClaudeAdapter::new(Some("claude.cmd"))
+            .with_home(home.path().to_path_buf())
+            .with_live_launch_settings()
+            .with_cmd_shim_forced();
+        let args = shim.default_sandbox_args(&Default::default(), &Default::default(), &[], mode);
+
+        assert!(
+            !args.iter().any(
+                |arg| arg.starts_with("--allowedTools") || arg.starts_with("--disallowedTools")
+            )
+        );
+        assert!(
+            super::super::guard_cmd_shim_reparse(
+                "cmd.exe",
+                &[&["/c".to_string(), "claude.cmd".to_string()][..], &args].concat()
+            )
+            .is_ok()
+        );
+        let path = args
+            .iter()
+            .skip_while(|arg| *arg != "--settings")
+            .nth(1)
+            .expect("settings path");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read settings"))
+                .expect("valid settings JSON");
+        for (key, flag) in [("allow", "--allowedTools="), ("deny", "--disallowedTools=")] {
+            let carried: Vec<String> = written["permissions"][key]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .map(|rule| rule.as_str().expect("rule").to_string())
+                .collect();
+            // The settings layer's own rules come first; the posture list is appended unchanged.
+            let posture = plain
+                .iter()
+                .find_map(|arg| arg.strip_prefix(flag))
+                .expect("flag");
+            assert!(
+                carried.join(",").ends_with(posture),
+                "{key} posture must be carried verbatim"
+            );
+        }
     }
 
     /// If the private settings file cannot be materialized, the projection
