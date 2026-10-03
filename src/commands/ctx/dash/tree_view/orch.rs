@@ -4502,6 +4502,62 @@ mod tests {
     }
 
     #[test]
+    fn the_supervisor_card_never_targets_a_real_session_named_like_it() {
+        let (mut data, wf, jev) = supervisor_world(supervisor_fact_of(false, 1));
+        data.nodes.push(node_k(
+            "supervisor-real-1",
+            "seat-1",
+            "session",
+            "claude",
+            "sonnet",
+            "worker",
+            "running",
+        ));
+        let mut f = orch_facts(&wf, &jev);
+        f.pane_shorts.push("supervis".into());
+        let mut v = view(data);
+        v.selected = Sel::Agent("~".into());
+        let model = Model::build(&v.data, &f, v.scope);
+        assert_eq!(model.selected_pane(&v.selected), None);
+        assert_eq!(
+            model.sel_for_short("supervis"),
+            Some(Sel::Agent("supervisor-real-1".into()))
+        );
+        drop(model);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Char('m'),
+            KeyCode::Char('x'),
+        ] {
+            let out = press(&mut v, &f, 160, 45, code);
+            assert!(matches!(out, Outcome::Notice(_)), "{code:?} -> {out:?}");
+        }
+        assert!(v.confirm_stop.is_none());
+    }
+
+    #[test]
+    fn an_idle_supervisor_stays_a_card_among_more_than_four_idle_agents() {
+        let (mut data, wf, jev) = supervisor_world(supervisor_fact_of(false, 1));
+        for i in 0..6u64 {
+            let mut n = node_k(
+                &format!("idle{i}"),
+                "seat-1",
+                "delegation",
+                "codex",
+                "sol",
+                "worker",
+                "idle",
+            );
+            n.ended_at = Some(2_000 + i);
+            data.nodes.push(n);
+        }
+        let f = orch_facts(&wf, &jev);
+        let text = draw(200, 60, &view(data), &f);
+        assert!(text.contains("\u{25cc} supervisor"), "{text}");
+    }
+
+    #[test]
     fn selecting_the_supervisor_shows_its_rulings_in_selected_and_enter_reads_the_newest() {
         let mut fact = supervisor_fact_of(false, 2);
         fact.ruled = vec![
@@ -4514,7 +4570,7 @@ mod tests {
         let text = draw(160, 45, &v, &f);
         let (x, y) = at_flow(&text, "\u{25cc} supervisor");
         click(&mut v, &f, (160, 45), (x + 2, y));
-        assert_eq!(v.selected, Sel::Agent("supervisor".into()));
+        assert_eq!(v.selected, Sel::Agent("~".into()));
         let panel: String = draw(160, 45, &v, &f)
             .lines()
             .map(|l| l.chars().skip(110).collect::<String>() + "\n")

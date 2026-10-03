@@ -1192,6 +1192,7 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
     // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
     current.reserved.push(ticket.clone());
+    current.state = "advising".to_string();
     save_state(&path, &current);
     Some(ticket)
 }
@@ -1210,6 +1211,9 @@ fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
         return;
     };
     current.reserved.remove(at);
+    if current.reserved.is_empty() {
+        current.state = "idle".to_string();
+    }
     if refund {
         current.calls = current.calls.saturating_sub(1);
         if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
@@ -2207,6 +2211,31 @@ mod tests {
         settle_ask_call(&state, "operator", &other, false);
         settle_ask_call(&state, "operator", &other, true);
         assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn an_ask_is_advising_from_its_reservation_until_it_settles_and_a_failure_returns_to_idle() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let running = snapshot(&state, "operator");
+        assert!((running.advising, running.last_name.as_str()) == (true, "ask"));
+        assert!(running.updated.is_some(), "the mtime marks its start");
+        settle_ask_call(&state, "operator", &id, true);
+        let failed = snapshot(&state, "operator");
+        assert!(
+            !failed.advising && failed.calls == 0,
+            "a failed ask settles to idle"
+        );
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        settle_ask_call(&state, "operator", &id, false);
+        assert!(
+            !snapshot(&state, "operator").advising,
+            "a ruled ask settles to idle"
+        );
     }
 
     #[test]

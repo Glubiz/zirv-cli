@@ -306,6 +306,9 @@ impl<'a> Model<'a> {
 
     /// The dashboard pane that runs this node, if any.
     pub(super) fn pane_short(&self, node: &Node) -> Option<String> {
+        if node.kind == "supervisor" {
+            return None;
+        }
         let short = sessions::short_id(&node.id);
         self.facts.pane_shorts.contains(&short).then_some(short)
     }
@@ -332,7 +335,7 @@ impl<'a> Model<'a> {
             return Some(Sel::Seat);
         }
         self.agents.iter().find_map(|a| {
-            if sessions::short_id(&a.node.id) == short {
+            if a.node.kind != "supervisor" && sessions::short_id(&a.node.id) == short {
                 return Some(Sel::Agent(a.node.id.clone()));
             }
             a.kids
@@ -345,6 +348,9 @@ impl<'a> Model<'a> {
     /// The session a node without a pane runs inside: its nearest ancestor with a pane, else its
     /// root session. A native Claude subagent has no pane; it runs inside its host's Claude Code.
     pub(super) fn host(&self, node: &Node) -> Option<Host> {
+        if node.kind == "supervisor" {
+            return None;
+        }
         let seat_short = self.facts.seat_session.map(sessions::short_id);
         let host_of = |n: &Node| {
             let short = sessions::short_id(&n.id);

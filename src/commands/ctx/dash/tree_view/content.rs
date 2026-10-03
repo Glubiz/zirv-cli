@@ -484,7 +484,7 @@ pub(super) fn hints(model: &Model, sel: &Sel) -> Vec<Hint> {
     let waiting = pane
         .as_deref()
         .is_some_and(|short| model.facts.approval_shorts.iter().any(|s| s == short));
-    let mailable = node.is_some_and(|n| n.harness.is_some());
+    let mailable = node.is_some_and(|n| n.harness.is_some() && n.kind != "supervisor");
     let mut out = vec![Hint {
         prio: 4,
         key: "\u{2190}\u{2192}",

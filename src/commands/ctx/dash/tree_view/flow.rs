@@ -134,7 +134,8 @@ pub(super) fn split(ctx: &Ctx) -> (Vec<usize>, Vec<usize>) {
             St::Done => node
                 .ended_at
                 .is_none_or(|end| ctx.wall.saturating_sub(end) >= FOLD_SECS),
-            St::Idle if parked(node) => {
+            // The supervisor always keeps its own card.
+            St::Idle if parked(node) && node.kind != "supervisor" => {
                 idle_cards += 1;
                 idle_cards > IDLE_CARDS
             }

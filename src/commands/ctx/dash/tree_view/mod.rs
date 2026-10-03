@@ -62,6 +62,8 @@ const EVENTS_KEPT: usize = 50;
 /// With no seat session the Jev box shows this much of the repository's recent past.
 const JEV_REPO_WINDOW_SECS: u64 = 12 * 3600;
 const ADVICE_CHARS: usize = 60;
+/// The supervisor node's id: no letter or digit, so no session id, name or short id equals it.
+const SUPERVISOR_NODE_ID: &str = "~";
 
 /// One of the supervisor's three moments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +121,9 @@ fn supervisor_node(fact: &SupervisorFact, seat: Option<&str>) -> Node {
         });
     }
     Node {
-        id: "supervisor".to_string(),
+        // Short ids keep only ASCII letters and digits, so this one's short form is empty and can never
+        // equal a real session's, whatever its name starts with. Actions key off `kind` as well.
+        id: SUPERVISOR_NODE_ID.to_string(),
         parent: seat.map(str::to_string),
         kind: "supervisor".to_string(),
         harness: Some(fact.harness.clone()),
