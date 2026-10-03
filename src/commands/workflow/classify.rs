@@ -516,13 +516,8 @@ const BUGFIX_ANYWHERE: &[&str] = &[
     "corrupt",
     "corrupted",
 ];
-/// Error words a feature request uses for the behaviour it asks for ("print an error"); a bare "error" is a symptom.
+/// Error words a feature request uses for the behaviour it asks for ("print an error to stderr"); a bare "error" is a symptom.
 const CONTRACT_ERROR_WORDS: &[&str] = &["error", "errors", "exception", "exceptions"];
-/// A verb within three tokens before an error word makes it something the program should do.
-const CONTRACT_VERBS: &[&str] = &[
-    "print", "prints", "raise", "raises", "return", "returns", "exit", "exits", "emit", "emits",
-    "reject", "rejects", "throw", "throws",
-];
 /// A feature word right after one of these is a symptom ("cannot add"), not a request.
 const NEGATED_FEATURE_PRECEDERS: &[&str] =
     &["cannot", "can", "t", "not", "unable", "fails", "failed"];
@@ -625,17 +620,20 @@ fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
             .iter()
             .filter(|token| BUGFIX_ANYWHERE.contains(token))
     };
-    // A feature request often names its error contract ("print an error", "is an error",
-    // "usage error", "ties broken", "not corrupted", "a fixed amount"); only those uses are not a bug report.
+    // A feature request often names its error contract ("an error to stderr", "exit 2",
+    // "not an error", "ties broken", "not corrupted", "a fixed amount"); only those uses are not a bug report.
     let is_contract_use = |index: usize| {
         let token = tokens[index];
         let before = |back: usize| index.checked_sub(back).map(|at| tokens[at]);
         if CONTRACT_ERROR_WORDS.contains(&token) {
-            let after_verb =
-                (1..=3).any(|back| before(back).is_some_and(|t| CONTRACT_VERBS.contains(&t)));
-            let after_is_an = matches!(before(1), Some("a" | "an"))
-                && matches!(before(2), Some("is" | "as" | "not"));
-            return after_verb || after_is_an || before(1) == Some("usage");
+            let to_stderr = (1..=3).any(|ahead| {
+                tokens
+                    .get(index + ahead)
+                    .is_some_and(|t| matches!(*t, "stderr" | "exit"))
+            });
+            let negated =
+                matches!(before(1), Some("a" | "an")) && matches!(before(2), Some("not" | "as"));
+            return to_stderr || negated;
         }
         (token == "fixed" && matches!(before(1), Some("a" | "an")))
             || (token == "broken" && before(1) == Some("ties"))
@@ -1133,7 +1131,7 @@ mod tests {
                 Intent::Feature,
             ),
             (
-                "I'd like tags on transactions. Add a tagging module; a blank tag is an error, and a malformed store is rejected.",
+                "I'd like tags on transactions. Add a tagging module; a blank tag prints an error to stderr, and a malformed store is rejected.",
                 Intent::Feature,
             ),
             (
@@ -1151,6 +1149,43 @@ mod tests {
             (
                 "Add envelopes that each budget a fixed amount per month. Rejects (error to stderr, exit 2) an unknown name.",
                 Intent::Feature,
+            ),
+            (
+                "Silently skipped months are fine, not an error. Please add a monthly report.",
+                Intent::Feature,
+            ),
+            // An indicative verb in a symptom report reads like a spec but is a bug.
+            (
+                "The API returns an error when the cart is empty. Add a guard.",
+                Intent::Bugfix,
+            ),
+            (
+                "The parser throws an exception if the input has a BOM, add handling for it",
+                Intent::Bugfix,
+            ),
+            (
+                "The CLI exits with an error. Add a --force flag so it can proceed",
+                Intent::Bugfix,
+            ),
+            (
+                "It returns an error when the user has no email; add a default",
+                Intent::Bugfix,
+            ),
+            (
+                "The import raises an exception on blank rows. Please add skipping of blank rows.",
+                Intent::Bugfix,
+            ),
+            (
+                "The job exits with an exception when disk is full, add a retry",
+                Intent::Bugfix,
+            ),
+            (
+                "When I click save it prints an error. Add the missing handler",
+                Intent::Bugfix,
+            ),
+            (
+                "The service emits an error log on startup, please add the missing config",
+                Intent::Bugfix,
             ),
             // Symptom words stay bug words even when the report also asks to add something.
             (

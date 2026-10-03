@@ -48,7 +48,7 @@ def _run_unittest(python, repo_dir, start_dir):
 
 # Real skip mechanisms only, so a docstring, comment or test name saying "skip blank rows" is not one.
 SKIP_RE = re.compile(
-    r"@\s*(unittest\.)?(skip\w*|expectedFailure)\b|\bself\.skipTest\s*\(|\bunittest\.expectedFailure\b"
+    r"@\s*(unittest\.)?(skip\w*|expectedFailure)\b|\bself\.skipTest\s*\(|\bSkipTest\b|\bunittest\.expectedFailure\b"
 )
 
 
