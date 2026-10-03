@@ -189,6 +189,39 @@ def per_task(rows, conds, tasks):
     return out
 
 
+def jev_table(rows, conds):
+    """Jev on vs off (#869): per site, mean Jev calls / effects per run for each
+    condition (from each run's own `jev` block), plus the intake decider mix. []
+    when no run carries a `jev` block."""
+    jev_conds = [c for c in conds if any(r["cond"] == c and r.get("jev") for r in rows)]
+    if not jev_conds:
+        return []
+    by = defaultdict(list)
+    for r in rows:
+        by[r["cond"]].append(r)
+    sites = sorted({s for r in rows for s in
+                    {**((r.get("jev") or {}).get("calls_by_site") or {}),
+                     **((r.get("jev") or {}).get("effects_by_site") or {})}})
+    out = ["| Site (calls / effects per run) | " + " | ".join(COND_LABELS.get(c, c) for c in conds) + " |",
+           "|---|" + "---:|" * len(conds)]
+    for site in sites:
+        cells = []
+        for c in conds:
+            rs = by.get(c, [])
+            calls = sum(((r.get("jev") or {}).get("calls_by_site") or {}).get(site, 0) for r in rs)
+            effects = sum(((r.get("jev") or {}).get("effects_by_site") or {}).get(site, 0) for r in rs)
+            cells.append(f"{calls / len(rs):.1f} / {effects / len(rs):.1f}" if rs else "-")
+        out.append(f"| {site} | " + " | ".join(cells) + " |")
+    mix = []
+    for c in conds:
+        deciders = defaultdict(int)
+        for r in by.get(c, []):
+            deciders[(r.get("proxy") or {}).get("decider") or "none"] += 1
+        mix.append(", ".join(f"{d} x{n}" for d, n in sorted(deciders.items())) or "-")
+    out.append("| Intake decider | " + " | ".join(mix) + " |")
+    return out
+
+
 def chain_step_table(rows, conds):
     """Per-step table for `kind=chain` runs (spec item 4): step -> score/cost/
     min per condition, averaged over reps. `rows` without a non-empty
@@ -245,6 +278,10 @@ def main():
     args = ap.parse_args()
 
     rows = load(args.runs)
+    # Runs flagged `jev_invalid` (#869) do not measure their condition.
+    valid = [r for r in rows if not r.get("jev_invalid")]
+    n_invalid = len(rows) - len(valid)
+    rows = valid
     order = list(COND_LABELS)
     conds = sorted({r["cond"] for r in rows}, key=lambda c: order.index(c) if c in order else 99)
     tasks = sorted({r["task"] for r in rows})
@@ -257,7 +294,10 @@ def main():
         f"Change vs **{COND_LABELS.get(args.baseline, args.baseline)}** below each value; "
         "*better*/*worse* = paired-bootstrap 95% CI over tasks excludes zero, *n.s.* = within noise.\n",
         *head, "", *verdicts, "",
+        *([f"Excluded {n_invalid} `jev_invalid` run(s): their own Jev log contradicts their "
+           "condition (#869).\n"] if n_invalid else []),
         "## Reliability\n", *reliability(rows, conds), "",
+        *(["## Jev on vs off\n", *jev_table(rows, conds), ""] if jev_table(rows, conds) else []),
         "## By task group\n", *split_table(rows, conds, args.baseline, tasks), "",
         "## Per task\n", *per_task(rows, conds, tasks), "",
     ]

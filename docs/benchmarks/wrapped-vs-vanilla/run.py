@@ -101,7 +101,16 @@ JEV_FULL_COND = "zirv-jev-full"
 # `jev::available` is false at every site regardless of ~/.zirv/ctx.toml.
 NOJEV_COND = "zirv-nojev"
 JEV_CREDENTIAL_ENV = "TYPESAFE_API_KEY"
-JEV_GATE_CONDS = [f"zirv-jev-{g}" for g in JEV_GATE_KEYS]
+# Gates that cannot fire in headless runs by design (#869): forced off in every
+# arm, never part of the Jev-on arm or a one-gate ablation.
+JEV_INERT_GATES = {
+    # The metadata guard refuses artifact-substance/gate-reclass on every call.
+    "gates",
+    # No Jev call under `--permission-mode dontAsk`, which every headless launch uses.
+    "approve", "approve_allow",
+}
+JEV_ACTIVE_GATE_KEYS = [g for g in JEV_GATE_KEYS if g not in JEV_INERT_GATES]
+JEV_GATE_CONDS = [f"zirv-jev-{g}" for g in JEV_ACTIVE_GATE_KEYS]
 JEV_ABLATION_CONDS = [JEV_FULL_COND] + JEV_GATE_CONDS
 # zirv-nojev/zirv-jev-full/zirv-jev-<gate> all launch exactly like
 # zirv-proxy: a headless `zirv ctx proxy --json --headless` call first, then
@@ -119,6 +128,8 @@ JEV_PROXY_LIKE_CONDS = {"zirv-proxy", NOJEV_COND, *JEV_ABLATION_CONDS}
 ZIRV_HEADLESS_LEVERS = {
     "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL": "5m",
     "ZIRV_CTX_HEADLESS_LEAN": "true",
+    # A trivial tier below the others, so the launch_effort gate can change the effort (#869).
+    "ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL": "low",
     "ZIRV_CTX_HEADLESS_EFFORT_BOUNDED": "medium",
     "ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL": "medium",
 }
@@ -163,7 +174,8 @@ def cond_env_for(cond):
     # harness to finish on (wait_run ends a parked zirv run instead).
     env = {**ZIRV_HEADLESS_LEVERS, "ZIRV_CTX_FALLBACK": "false"}
     if cond == JEV_FULL_COND:
-        env.update({jev_env_var(g): "true" for g in JEV_GATE_KEYS})
+        env.update({jev_env_var(g): "true" for g in JEV_ACTIVE_GATE_KEYS})
+        env.update({jev_env_var(g): "false" for g in JEV_INERT_GATES})
     elif cond == NOJEV_COND:
         # None = remove the variable from the child environment (child_env).
         env.update({jev_env_var(g): "false" for g in JEV_GATE_KEYS})
@@ -171,10 +183,118 @@ def cond_env_for(cond):
     elif cond in JEV_GATE_CONDS:
         gate = cond[len("zirv-jev-"):]
         env[jev_env_var(gate)] = "true"
-        if gate == "approve_allow":
-            # approve_allow is inert unless approve is on too (config.rs).
-            env[jev_env_var("approve")] = "true"
     return env
+
+
+def isolate_state(env_extra, run_dir, cond):
+    """Give a zirv run its own `ZIRV_CTX_STATE_DIR` (<run_dir>/zirv-state) so the
+    Jev logs hold only that run's rows. A state dir already chosen by the caller
+    (trial mode, spec env overlay) is left alone."""
+    if not cond.startswith("zirv") or "ZIRV_CTX_STATE_DIR" in env_extra \
+            or "ZIRV_CTX_STATE_DIR" in os.environ:
+        return env_extra
+    return {**env_extra, "ZIRV_CTX_STATE_DIR": str(Path(run_dir) / "zirv-state")}
+
+
+JEV_LOG_FILES = ("jev-decisions.jsonl", "jev-effects.jsonl", "proxy-decisions.jsonl")
+
+
+def read_jsonl(path, trial_id=None):
+    """Parsed rows of a jsonl file; `trial_id` keeps only rows attributed to that
+    trial (a state dir shared by several trials)."""
+    rows = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if trial_id and (row.get("attribution") or {}).get("trial") != trial_id:
+            continue
+        rows.append(row)
+    return rows
+
+
+def jev_telemetry(state_dir, trial_id=None):
+    """The `jev` result block from a run's own state dir, or None when the dir has no
+    Jev log at all. Field meanings follow jev.rs's DecisionRecord/EffectRecord:
+    `cached` rows were served from the answer cache, a row with `fallbacks` errored
+    (and fell back to the deterministic path), the rest were live calls."""
+    decisions = read_jsonl(Path(state_dir) / "jev-decisions.jsonl", trial_id)
+    effects = read_jsonl(Path(state_dir) / "jev-effects.jsonl", trial_id)
+    if not decisions and not effects:
+        return None
+    calls_by_site, effects_by_site, fallbacks = {}, {}, {}
+    live = cached = errors = served_non_intake = in_tokens = out_tokens = 0
+    for row in decisions:
+        site = row.get("site")
+        calls_by_site[site] = calls_by_site.get(site, 0) + 1
+        usage = row.get("usage") or {}
+        in_tokens += usage.get("input_tokens") or 0
+        out_tokens += usage.get("output_tokens") or 0
+        if row.get("fallbacks"):
+            errors += 1
+            for reason in row["fallbacks"]:
+                fallbacks[reason] = fallbacks.get(reason, 0) + 1
+            continue
+        if row.get("cached"):
+            cached += 1
+        else:
+            live += 1
+        if site != "intake":
+            served_non_intake += 1
+    for row in effects:
+        effects_by_site[row.get("site")] = effects_by_site.get(row.get("site"), 0) + 1
+    return {
+        "calls_by_site": calls_by_site, "live": live, "cached": cached, "errors": errors,
+        "non_intake_served": served_non_intake,
+        "fallbacks": fallbacks, "effects_by_site": effects_by_site,
+        "spend": {"input_tokens": in_tokens, "output_tokens": out_tokens,
+                  "cost_usd": in_tokens * PROXY_COST_PER_INPUT_TOKEN} if decisions else None,
+    }
+
+
+def jev_validity(cond, jev, decider):
+    """None when the run measures what its condition claims, else why not (#869).
+    `jev` is the telemetry block (None = no Jev log), `decider` the intake decider."""
+    jev = jev or {}
+    sites = jev.get("calls_by_site") or {}
+    if cond == NOJEV_COND:
+        if sum(sites.values()):
+            return "zirv-nojev run made Jev decisions"
+        if decider not in (None, "deterministic"):
+            return f"zirv-nojev intake decider was {decider}"
+        return None
+    if not cond.startswith("zirv-jev-"):
+        return None
+    if not jev.get("non_intake_served"):
+        return "no live or cached non-intake Jev decision"
+    return None
+
+
+def attach_jev_telemetry(run_dir, result):
+    """Copy the run's Jev logs next to result.json and add `jev`/`jev_invalid` to it."""
+    cond = result.get("cond") or ""
+    if not cond.startswith("zirv"):
+        return
+    state_dir = Path(run_dir) / "zirv-state"
+    trial_id = None
+    if os.environ.get("ZIRV_CTX_STATE_DIR"):
+        # Trial mode: the campaign's shared state dir, narrowed to this trial's rows.
+        trial_id = os.environ.get("ZIRV_ATTR_TRIAL")
+        state_dir = Path(os.environ["ZIRV_CTX_STATE_DIR"])
+        if not trial_id:
+            return
+    for name in JEV_LOG_FILES:
+        rows = read_jsonl(state_dir / name, trial_id)
+        if rows:
+            (Path(run_dir) / name).write_text(
+                "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    result["jev"] = jev_telemetry(state_dir, trial_id)
+    result["jev_invalid"] = jev_validity(cond, result["jev"], (result.get("proxy") or {}).get("decider"))
 
 # The launching shell's PATH can be mangled (mixed `:`/`;` separators); give every
 # child -- and therefore both conditions equally -- one clean Windows PATH.
@@ -1208,6 +1328,7 @@ def build_proxy_layer(proxy_obj, model, started_workflow_id=None):
 
 
 def write_result(run_dir, result):
+    attach_jev_telemetry(run_dir, result)
     (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 
@@ -1290,6 +1411,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total,
     env_extra = cond_env_for(cond)
     if spec_env:
         env_extra = merge_spec_env(env_extra, spec_env)
+    env_extra = isolate_state(env_extra, run_dir, cond)
 
     if cond in JEV_PROXY_LIKE_CONDS:
         proxy_obj, proxy_elapsed, proxy_err, _raw = call_proxy(
@@ -1559,6 +1681,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
     env_extra = cond_env_for(cond)
     if spec_env:
         env_extra = merge_spec_env(env_extra, spec_env)
+    env_extra = isolate_state(env_extra, run_dir, cond)
     session_id = None
     model_used = model
     remaining_budget = timeout_s
@@ -1941,6 +2064,10 @@ def merge_spec_env(base_env, overlay_env):
     already uses). `base_env`/`overlay_env` may each be `None` or `{}`."""
     merged = dict(base_env or {})
     merged.update(overlay_env or {})
+    # A gate turned on over the zirv-nojev baseline needs the credential back.
+    if merged.get(JEV_CREDENTIAL_ENV, "") is None and any(
+            merged.get(jev_env_var(g)) == "true" for g in JEV_GATE_KEYS):
+        del merged[JEV_CREDENTIAL_ENV]
     return merged
 
 
@@ -2301,7 +2428,7 @@ def run_escalate_trial(bench_root, spec, cond, out_dir, model, timeout_s, spec_e
         raise RuntimeError(f"template is not pristine, refusing to copy:\n{dirty}")
     shutil.copytree(template_dir, repo_dir)
 
-    env_extra = merge_spec_env(cond_env_for(cond), spec_env)
+    env_extra = isolate_state(merge_spec_env(cond_env_for(cond), spec_env), out_dir, cond)
 
     result = {
         "task": task, "cond": cond, "rep": spec.get("rep", 1), "model": model,

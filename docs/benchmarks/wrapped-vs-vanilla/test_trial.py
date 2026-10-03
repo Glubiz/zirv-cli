@@ -632,5 +632,117 @@ class RunSingleTrialIntegrationTests(unittest.TestCase):
             self.assertIsNone(trial["quality"])
 
 
+def _jsonl(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+class JevTelemetryTests(unittest.TestCase):
+    def test_nojev_forces_every_gate_off_and_drops_credential(self):
+        env = run_module.cond_env_for(run_module.NOJEV_COND)
+        self.assertTrue(all(env[run_module.jev_env_var(g)] == "false"
+                            for g in run_module.JEV_GATE_KEYS))
+        self.assertIsNone(env[run_module.JEV_CREDENTIAL_ENV])
+
+    def test_full_arm_skips_inert_gates_and_sets_effort_tier(self):
+        env = run_module.cond_env_for(run_module.JEV_FULL_COND)
+        self.assertEqual(env["ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL"], "low")
+        self.assertEqual(env["ZIRV_CTX_JEV_GATES"], "false")
+        self.assertEqual(env["ZIRV_CTX_JEV_APPROVE"], "false")
+        self.assertEqual(env["ZIRV_CTX_JEV_MEMORY"], "true")
+        self.assertNotIn("zirv-jev-gates", run_module.JEV_GATE_CONDS)
+
+    def test_overlay_gate_over_nojev_restores_credential(self):
+        base = run_module.cond_env_for(run_module.NOJEV_COND)
+        merged = run_module.merge_spec_env(base, {"ZIRV_CTX_JEV_MEMORY": "true"})
+        self.assertNotIn(run_module.JEV_CREDENTIAL_ENV, merged)
+        self.assertEqual(merged["ZIRV_CTX_JEV_DISPATCH"], "false")
+
+    def test_isolate_state_sets_run_local_dir_for_zirv_only(self):
+        saved = run_module.os.environ.pop("ZIRV_CTX_STATE_DIR", None)
+        try:
+            env = run_module.isolate_state({}, "/r", "zirv-nojev")
+            self.assertEqual(Path(env["ZIRV_CTX_STATE_DIR"]), Path("/r") / "zirv-state")
+            self.assertEqual(run_module.isolate_state({}, "/r", "vanilla"), {})
+            kept = run_module.isolate_state({"ZIRV_CTX_STATE_DIR": "/x"}, "/r", "zirv")
+            self.assertEqual(kept["ZIRV_CTX_STATE_DIR"], "/x")
+        finally:
+            if saved is not None:
+                run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved
+
+    def test_telemetry_counts_sites_live_cached_errors_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            _jsonl(state / "jev-decisions.jsonl", [
+                {"site": "intake", "cached": False, "fallbacks": [],
+                 "usage": {"input_tokens": 100, "output_tokens": 5}},
+                {"site": "memory", "cached": True, "fallbacks": [], "usage": {}},
+                {"site": "memory", "cached": False, "fallbacks": ["boom"], "usage": {}},
+            ])
+            _jsonl(state / "jev-effects.jsonl", [{"site": "memory", "action": "trim"}])
+            jev = run_module.jev_telemetry(state)
+        self.assertEqual(jev["calls_by_site"], {"intake": 1, "memory": 2})
+        self.assertEqual((jev["live"], jev["cached"], jev["errors"]), (1, 1, 1))
+        self.assertEqual(jev["fallbacks"], {"boom": 1})
+        self.assertEqual(jev["effects_by_site"], {"memory": 1})
+        self.assertEqual(jev["non_intake_served"], 1)
+        self.assertEqual(jev["spend"]["input_tokens"], 100)
+
+    def test_telemetry_without_logs_is_none_not_zero_spend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run_module.jev_telemetry(tmp))
+
+    def test_validity_rules(self):
+        intake_only = {"calls_by_site": {"intake": 1}, "non_intake_served": 0}
+        served = {"calls_by_site": {"intake": 1, "memory": 1}, "non_intake_served": 1}
+        self.assertIsNotNone(run_module.jev_validity("zirv-jev-full", intake_only, "typesafe"))
+        self.assertIsNotNone(run_module.jev_validity("zirv-jev-full", None, "typesafe"))
+        self.assertIsNone(run_module.jev_validity("zirv-jev-full", served, "typesafe"))
+        self.assertIsNotNone(run_module.jev_validity("zirv-nojev", served, "deterministic"))
+        self.assertIsNotNone(run_module.jev_validity("zirv-nojev", None, "typesafe"))
+        self.assertIsNone(run_module.jev_validity("zirv-nojev", None, "deterministic"))
+        self.assertIsNone(run_module.jev_validity("vanilla", None, None))
+
+    def test_write_result_attaches_block_and_copies_logs(self):
+        saved = run_module.os.environ.pop("ZIRV_CTX_STATE_DIR", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                (run_dir / "zirv-state").mkdir()
+                _jsonl(run_dir / "zirv-state" / "jev-decisions.jsonl",
+                       [{"site": "memory", "cached": False, "fallbacks": [], "usage": {}}])
+                result = {"cond": "zirv-nojev", "proxy": {"decider": "deterministic"}}
+                run_module.write_result(run_dir, result)
+                written = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(written["jev"]["calls_by_site"], {"memory": 1})
+                self.assertIn("Jev decisions", written["jev_invalid"])
+                self.assertTrue((run_dir / "jev-decisions.jsonl").exists())
+        finally:
+            if saved is not None:
+                run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved
+
+
+class JevGateMirrorTests(unittest.TestCase):
+    def test_aggregate_mirrors_run_py_gate_lists(self):
+        import aggregate as aggregate_module
+        self.assertEqual(aggregate_module.JEV_GATE_KEYS, run_module.JEV_GATE_KEYS)
+        self.assertEqual(aggregate_module.JEV_INERT_GATES, run_module.JEV_INERT_GATES)
+        self.assertEqual(aggregate_module.JEV_ABLATION_CONDS, run_module.JEV_ABLATION_CONDS)
+        self.assertEqual(aggregate_module.CANONICAL_CONDS, run_module.CANONICAL_CONDS)
+
+
+class CompareJevTests(unittest.TestCase):
+    def test_jev_table_shows_site_columns_and_decider_mix(self):
+        import compare as compare_module
+        rows = [
+            {"cond": "zirv-nojev", "proxy": {"decider": "deterministic"}, "jev": None},
+            {"cond": "zirv-jev-full", "proxy": {"decider": "typesafe"},
+             "jev": {"calls_by_site": {"memory": 3}, "effects_by_site": {"memory": 1}}},
+        ]
+        table = "\n".join(compare_module.jev_table(rows, ["zirv-nojev", "zirv-jev-full"]))
+        self.assertIn("| memory | 0.0 / 0.0 | 3.0 / 1.0 |", table)
+        self.assertIn("deterministic x1", table)
+        self.assertIn("typesafe x1", table)
+
+
 if __name__ == "__main__":
     unittest.main()
