@@ -359,7 +359,7 @@ pub(super) fn run_permission<W: Write>(
             &state,
             &short,
             crate::commands::ctx::attention::OpenPrompt {
-                id: permission_id,
+                id: permission_id.clone(),
                 agent: payload.agent_id.clone(),
                 at: now_secs(),
             },
@@ -408,6 +408,17 @@ pub(super) fn run_permission<W: Write>(
                 crate::commands::ctx::approvals::decision_json(decision, rule.as_ref())
             }) {
                 let _ = writeln!(w, "{json}");
+                // Answered here, so the prompt is over now, not when the allowed command finishes (#864).
+                clear_resolved_approval(
+                    &state,
+                    &short,
+                    format!(
+                        "permission answered in the dashboard: {}",
+                        payload.tool_name
+                    ),
+                    now_secs(),
+                    |open| open.id == permission_id && open.agent == payload.agent_id,
+                );
             }
         }
     }
@@ -1119,6 +1130,62 @@ mod tests {
                     "hookEventName": "PermissionRequest",
                     "decision": {"behavior": behavior}
                 }})
+            );
+        }
+    }
+
+    /// #864: a request the operator answers from the dashboard is over at that moment. Its latch
+    /// must not stay in NEEDS YOU for as long as the allowed command then runs (only PostToolUse
+    /// cleared it), while a released one keeps its latch because the pane's dialog now shows it.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_answered_in_the_dashboard_leaves_no_latch_and_a_released_one_keeps_it() {
+        use crate::commands::ctx::approvals::Decision;
+        use crate::commands::ctx::attention::{self, Attention};
+        for (decision, open) in [
+            (Decision::Allow, 0),
+            (Decision::Deny, 0),
+            (Decision::Release, 1),
+        ] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let lookup = inbox_env(tmp.path(), true);
+            let state = StateDir::resolve(&lookup).expect("state");
+            let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+                &state,
+                crate::commands::ctx::sessions::Record::new(
+                    "abc123",
+                    "claude",
+                    Path::new("/work/repo"),
+                    crate::commands::ctx::sessions::Verb::Dash,
+                ),
+            );
+            let mut hub = crate::commands::ctx::approvals::Hub::bind(&state).expect("hub");
+            let dashboard = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while hub.count() == 0 && std::time::Instant::now() < deadline {
+                    hub.poll(&|_| true);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                hub.resolve_current(decision);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            run_permission(&mut Vec::new(), &permission_request(), &lookup).expect("never errors");
+            dashboard.join().expect("dashboard");
+            let short = crate::commands::ctx::sessions::short_id("abc123");
+            let latch = if open == 0 {
+                Attention::None
+            } else {
+                Attention::Approval
+            };
+            assert_eq!(
+                attention::load(&state, &short).attention,
+                latch,
+                "{decision:?}"
+            );
+            assert_eq!(
+                attention::close_prompts(&state, &short, |_| false),
+                open,
+                "{decision:?}"
             );
         }
     }

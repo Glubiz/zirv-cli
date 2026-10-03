@@ -1548,6 +1548,11 @@ fn place_session_steps(
         };
         if let (Some(path), Some(node)) = (path, nodes.get_mut(&record.session)) {
             node.steps = super::graph_steps::latest(&path);
+            // A Codex TUI stays at its prompt once its turn ends: idle, like a finished subagent (#863).
+            if let Some(ended) = super::graph_steps::turn_ended(&path) {
+                node.status = "idle".to_string();
+                node.ended_at = Some(ended);
+            }
         }
     }
 }
@@ -2718,6 +2723,43 @@ mod tests {
         let node = nodes.iter().find(|n| n.id == pane).expect("pane node");
         assert_eq!(node.name.as_deref(), Some("review-dash"));
         assert_eq!(node.job.as_deref(), Some("Implement the retry flag"));
+    }
+
+    /// #863: a Codex TUI stays at its prompt after `task_complete`, so its session never stops
+    /// being alive; the rollout's last turn event says whether the pane is still working.
+    #[test]
+    fn a_live_codex_pane_whose_turn_ended_is_idle_and_one_mid_turn_stays_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let repo = dir.path().join("repo");
+        let done = "eeee5555-0000-4000-8000-000000000005";
+        let busy = "ffff6666-0000-4000-8000-000000000006";
+        let started = r#"{"timestamp":"2026-10-02T19:24:25.244Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#;
+        let complete = r#"{"timestamp":"2026-10-02T19:28:47.259Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"done"}}"#;
+        std::fs::create_dir_all(state.rollouts()).expect("rollouts");
+        for (session, rows) in [
+            (done, vec![started, complete]),
+            (busy, vec![started, complete, started]),
+        ] {
+            register_session(&state, session, "codex", &repo);
+            let rollout = dir.path().join(format!("{}.jsonl", &session[..8]));
+            let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+            std::fs::write(&rollout, text).expect("rollout");
+            std::fs::write(
+                state.rollouts().join(format!("{}.path", &session[..8])),
+                rollout.display().to_string(),
+            )
+            .expect("pointer");
+        }
+        let nodes = snapshot_in(&state, &repo, None, Some(dir.path()), now_secs());
+        let node = |id: &str| nodes.iter().find(|n| n.id == id).expect(id);
+        assert_eq!(node(done).status, "idle");
+        assert_eq!(
+            node(done).ended_at,
+            super::super::window::parse_iso8601_utc("2026-10-02T19:28:47.259Z")
+        );
+        assert_eq!(node(busy).status, "live");
+        assert_eq!(node(busy).ended_at, None);
     }
 
     #[test]

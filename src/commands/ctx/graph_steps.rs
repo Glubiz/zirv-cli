@@ -29,7 +29,15 @@ pub struct Step {
     pub arg: String,
 }
 
-type Cache = Mutex<BTreeMap<PathBuf, ((SystemTime, u64), Vec<Step>)>>;
+/// What the tail of one transcript or rollout says.
+#[derive(Debug, Clone, Default)]
+struct Tail {
+    steps: Vec<Step>,
+    /// When a Codex rollout's last turn ended; `None` while a turn is open or none is in the tail.
+    turn_ended: Option<u64>,
+}
+
+type Cache = Mutex<BTreeMap<PathBuf, ((SystemTime, u64), Tail)>>;
 
 fn cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -38,29 +46,39 @@ fn cache() -> &'static Cache {
 
 /// The last `KEEP_STEPS` tool calls in `path`, newest last; empty when the file is missing or has none.
 pub fn latest(path: &Path) -> Vec<Step> {
+    tail(path).steps
+}
+
+/// When the last turn of the Codex rollout at `path` ended (`task_complete` or `turn_aborted`), or
+/// `None` while a later `task_started` holds a turn open. A Claude transcript has no such rows.
+pub fn turn_ended(path: &Path) -> Option<u64> {
+    tail(path).turn_ended
+}
+
+fn tail(path: &Path) -> Tail {
     let Some(key) = std::fs::metadata(path)
         .ok()
         .and_then(|meta| Some((meta.modified().ok()?, meta.len())))
     else {
-        return Vec::new();
+        return Tail::default();
     };
     let mut cache = cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((cached, steps)) = cache.get(path)
+    if let Some((cached, tail)) = cache.get(path)
         && *cached == key
     {
-        return steps.clone();
+        return tail.clone();
     }
-    let steps = read_tail(path, key.1);
+    let tail = read_tail(path, key.1);
     if cache.len() >= CACHE_LIMIT {
         cache.clear();
     }
-    cache.insert(path.to_path_buf(), (key, steps.clone()));
-    steps
+    cache.insert(path.to_path_buf(), (key, tail.clone()));
+    tail
 }
 
-fn read_tail(path: &Path, len: u64) -> Vec<Step> {
+fn read_tail(path: &Path, len: u64) -> Tail {
     let start = len.saturating_sub(TAIL_BYTES);
     let mut bytes = Vec::new();
     let read = std::fs::File::open(path).and_then(|mut file| {
@@ -68,7 +86,7 @@ fn read_tail(path: &Path, len: u64) -> Vec<Step> {
         file.take(TAIL_BYTES).read_to_end(&mut bytes)
     });
     if read.is_err() {
-        return Vec::new();
+        return Tail::default();
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();
@@ -76,12 +94,26 @@ fn read_tail(path: &Path, len: u64) -> Vec<Step> {
     if start > 0 {
         lines.next();
     }
-    let mut steps: Vec<Step> = lines
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .flat_map(|row| steps_of(&row))
-        .collect();
-    steps.drain(..steps.len().saturating_sub(KEEP_STEPS));
-    steps
+    let mut tail = Tail::default();
+    for row in lines.filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        match event_type(&row) {
+            Some("task_started") => tail.turn_ended = None,
+            Some("task_complete" | "turn_aborted") => tail.turn_ended = Some(row_ts(&row)),
+            _ => {}
+        }
+        tail.steps.extend(steps_of(&row));
+    }
+    tail.steps
+        .drain(..tail.steps.len().saturating_sub(KEEP_STEPS));
+    tail
+}
+
+/// The payload type of a Codex `event_msg` row (`task_started`, `task_complete`, ...).
+fn event_type(row: &Value) -> Option<&str> {
+    if row.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    row.pointer("/payload/type").and_then(Value::as_str)
 }
 
 fn row_ts(row: &Value) -> u64 {

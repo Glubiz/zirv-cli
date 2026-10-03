@@ -395,7 +395,8 @@ colours, decided once) and never uses the terminal's dim attribute:
   it, the borders of working and waiting cards breathe, and a new Jev decision flashes
   Jev's border. Finished agents older than four minutes fold into clickable
   `FINISHED` pills. A finished native subagent of a live session reads `idle`
-  (it can still be messaged); past four idle cards the rest fold into `IDLE` pills. The agent order and the scrolling of many rows are as before
+  (it can still be messaged), and so does a Codex pane whose rollout's last turn
+  ended (`task_complete` or `turn_aborted`): its TUI waits at its prompt; past four idle cards the rest fold into `IDLE` pills. The agent order and the scrolling of many rows are as before
   (wheel, `PgUp`/`PgDn`, arrows). Terminals that are too short shrink the cards, then
   Jev, before they drop anything.
 - **NEEDS YOU** (right column): every pending operator wait shows here (a Claude or
@@ -505,7 +506,11 @@ A decision answers ONE call: the hook prints
 `^A Y` (always allow, below), so nothing else is cached as a lease. After `hold_secs`, on any error, a missing
 dashboard or a dashboard that quits, the hook prints nothing and the native
 dialog shows; the request then reads "waiting in pane" until a `PostToolUse`
-or `PermissionDenied` clears it. The installed `PermissionRequest` hook
+or `PermissionDenied` clears it. A request answered in the dashboard, or every
+prompt once you submit the session's next prompt, clears its wait at once;
+one answered in the pane's own dialog clears only at that `PostToolUse`, after
+the allowed command has finished, because Claude Code fires no hook when its
+dialog is answered. The installed `PermissionRequest` hook
 `timeout` is `hold_secs + 30` (only with the inbox on). Codex has no hook
 surface zirv can read, so its panes are never listed and never answered.
 
