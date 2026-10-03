@@ -525,7 +525,9 @@ pub(super) fn scope_checkpoint_mark_shown(payload: &PreToolPayload, env: EnvLook
 /// Fold tests-owed guidance into the first edit checkpoint so a headless
 /// agent sees it before the Stop gate.
 pub(super) const MISSING_TESTS_OWED_LINE: &str = "Write a focused test for each behaviour change in this same pass -- the run cannot finish \
-     without one.";
+     without one. Extend the existing test file or class for that code in place (never after an \
+     entry-point block, never re-declare a test class); the test count must rise by exactly your \
+     tests.";
 
 /// Identify code changes for which the missing-tests gate expects tests;
 /// test files and docs-only paths do not create that debt.

@@ -2509,8 +2509,8 @@ for a session that already has a bound workflow, for delegated seats
 (worker, sub-orchestrator, single, or a `zirv agent` child), and for unattended or
 zirv-spawned launches (`ZIRV_CTX_HEADLESS=1`, or `ZIRV_CTX_INTERNAL=1` on the
 distiller/handoff/memory model call, supervisor consults and `zirv ctx loop` cycles), so a worker brief
-never inherits another session's workflow. An `INTERNAL` session also gets no per-turn `[zirv]` health-marker
-instruction, so a helper whose reply zirv parses strictly is never told to prefix it.
+never inherits another session's workflow. An `INTERNAL` or `HEADLESS` session also gets no per-turn `[zirv]` health-marker
+instruction, so a helper or worker whose reply a script parses is never told to prefix it.
 
 ### Workflow adoption
 
@@ -4879,7 +4879,7 @@ Every key is unset or off by default. The example below is an opt-in configurati
 ```toml
 [headless]
 prompt_cache_ttl = "5m"          # "5m" | "1h", unset by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
-lean = true                      # adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer; ZIRV_CTX_HEADLESS_LEAN
+lean = true                      # adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer and denies the `Workflow` tool (else Claude Code inlines its authoring guide, ~6k tokens); ZIRV_CTX_HEADLESS_LEAN
 disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
 
 [headless.effort]
@@ -6262,7 +6262,7 @@ changes an existing tracked file, worded for a change that already happened,
 for a headless agent that edits through the shell and never touches
 `Edit`/`Write` at all. The same checkpoint also folds in a "tests owed" line
 ("Write a focused test for each behaviour change in this same pass -- the run
-cannot finish without one.") whenever the missing-tests gate below is enabled,
+cannot finish without one. Extend the existing test file or class ...") whenever the missing-tests gate below is enabled,
 the session is headless, and the file being changed is a non-test, non-doc
 source file -- fired at the FIRST edit rather than waiting for the
 missing-tests Stop gate to say it after the whole turn is already done. This

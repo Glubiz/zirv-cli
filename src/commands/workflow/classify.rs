@@ -516,6 +516,27 @@ const BUGFIX_ANYWHERE: &[&str] = &[
     "corrupt",
     "corrupted",
 ];
+/// The [`BUGFIX_ANYWHERE`] words a feature request also uses to specify its error contract or constraints.
+const CONTRACT_WORDS: &[&str] = &[
+    "error",
+    "errors",
+    "cannot",
+    "exception",
+    "exceptions",
+    "wrong",
+    "incorrect",
+    "broken",
+    "fixed",
+    "fails",
+    "failing",
+    "failure",
+    "failures",
+    "corrupt",
+    "corrupted",
+];
+/// A feature word right after one of these is a symptom ("cannot add"), not a request.
+const NEGATED_FEATURE_PRECEDERS: &[&str] =
+    &["cannot", "can", "t", "not", "unable", "fails", "failed"];
 const REFACTOR_ANYWHERE: &[&str] = &[
     "refactor",
     "refactoring",
@@ -610,8 +631,25 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
 /// fixed priority order, only reached when tier 1 found no leading verb.
 fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
     let has_does_nothing = tokens.windows(2).any(|pair| pair == ["does", "nothing"]);
-    if has_does_nothing || tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
-        return Some(Intent::Bugfix);
+    let bug_words = || {
+        tokens
+            .iter()
+            .filter(|token| BUGFIX_ANYWHERE.contains(token))
+    };
+    // A feature request often names its error contract ("print an error"); those words alone do not make a bugfix.
+    let only_contract_words = bug_words().all(|token| CONTRACT_WORDS.contains(token));
+    let asks_for_feature = tokens.iter().enumerate().any(|(index, token)| {
+        FEATURE_ANYWHERE.contains(token)
+            && !(index > 0 && NEGATED_FEATURE_PRECEDERS.contains(&tokens[index - 1]))
+    });
+    if has_does_nothing || bug_words().next().is_some() {
+        return Some(
+            if only_contract_words && !has_does_nothing && asks_for_feature {
+                Intent::Feature
+            } else {
+                Intent::Bugfix
+            },
+        );
     }
     let has_clean_up = tokens.windows(2).any(|pair| pair == ["clean", "up"]);
     let has_dead_code = tokens.windows(2).any(|pair| pair == ["dead", "code"]);
@@ -1070,6 +1108,50 @@ mod tests {
             let lowered = task.to_ascii_lowercase();
             assert_eq!(
                 infer_intent(&lowered),
+                *expected,
+                "task {task:?} should classify as {expected:?}"
+            );
+        }
+    }
+
+    /// Benchmark finding: a feature request that specifies its error contract
+    /// ("print an error", "malformed input is broken") is a Feature, while a
+    /// report of broken behaviour stays a Bugfix.
+    #[test]
+    fn a_feature_request_with_an_error_contract_is_a_feature() {
+        let cases: &[(&str, Intent)] = &[
+            (
+                "The ledger needs a way to export. Please add an export command. An unknown format prints an error to stderr and exits 2.",
+                Intent::Feature,
+            ),
+            (
+                "I'd like tags on transactions. Add a tagging module; a blank tag is an error, and a corrupted store is rejected.",
+                Intent::Feature,
+            ),
+            (
+                "I want category shares that add up to 100% or the report looks broken. Add category_shares(txns).",
+                Intent::Feature,
+            ),
+            (
+                "Users cannot add items to the cart and get a wrong total",
+                Intent::Bugfix,
+            ),
+            (
+                "Something is off with the pagination. Can you find and fix whatever is causing this? Please add a test.",
+                Intent::Bugfix,
+            ),
+            (
+                "The import crashes on 1,234.50 and gives an error. Please add support for thousands separators.",
+                Intent::Bugfix,
+            ),
+            (
+                "tests/test_rules.py::test_regex is failing on this repo, please find the root cause",
+                Intent::Bugfix,
+            ),
+        ];
+        for (task, expected) in cases {
+            assert_eq!(
+                infer_intent(&task.to_ascii_lowercase()),
                 *expected,
                 "task {task:?} should classify as {expected:?}"
             );

@@ -2707,6 +2707,10 @@ impl AgentAdapter for ClaudeAdapter {
         // present to answer a prompt, so this lever never narrows it.
         if !mode.is_interactive() {
             deny_entries.extend(self.headless.disallowed_tools.iter().cloned());
+            // `lean` drops the bundled workflow-authoring skill, which Claude Code then inlines into the Workflow tool's description.
+            if self.headless.lean {
+                deny_entries.push("Workflow".to_string());
+            }
         }
         let deny = deny_entries.join(",");
 
@@ -5853,6 +5857,34 @@ mod tests {
             !deny_arg.contains("WebFetch"),
             "interactive must not be narrowed by a headless-only lever: {deny_arg}"
         );
+    }
+
+    /// Benchmark finding: `lean` removes the bundled `workflow-authoring` skill, so Claude Code
+    /// inlines that guide into the `Workflow` tool description (~6k tokens per request). Denying
+    /// the tool drops the description; a lean headless launch denies it, nothing else does.
+    #[test]
+    fn a_lean_headless_launch_denies_the_workflow_tool() {
+        let deny_of = |lean: bool, mode: super::super::LaunchMode| {
+            let adapter = ClaudeAdapter::new(None).with_headless_config(
+                crate::commands::ctx::config::HeadlessConfig {
+                    lean,
+                    ..Default::default()
+                },
+            );
+            adapter
+                .default_sandbox_args(&Default::default(), &Default::default(), &[], mode)
+                .into_iter()
+                .find(|a| a.starts_with("--disallowedTools="))
+                .expect("a --disallowedTools= token")
+        };
+        let headless = super::super::LaunchMode::Headless;
+        assert!(
+            deny_of(true, headless)
+                .split(',')
+                .any(|t| t.trim_start_matches("--disallowedTools=") == "Workflow")
+        );
+        assert!(!deny_of(false, headless).contains("Workflow"));
+        assert!(!deny_of(true, super::super::LaunchMode::Interactive).contains("Workflow"));
     }
 
     /// The scoping rule verified live to actually confine a write to the
