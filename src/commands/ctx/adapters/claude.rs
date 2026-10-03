@@ -5268,6 +5268,22 @@ mod tests {
         assert!(plain_written["disableBundledSkills"].is_null());
     }
 
+    /// #860: with no settings file to carry them, a shim launch keeps the rules on argv so the reparse guard refuses it instead of launching without its deny list.
+    #[test]
+    fn a_cmd_shim_launch_keeps_the_posture_on_argv_when_the_settings_write_fails() {
+        let args = ClaudeAdapter::new(Some("claude.cmd"))
+            .with_launch_settings_forced(None)
+            .with_cmd_shim_forced()
+            .default_sandbox_args(
+                &Default::default(),
+                &Default::default(),
+                &[],
+                super::super::LaunchMode::Headless,
+            );
+        assert!(args.iter().any(|arg| arg.starts_with("--allowedTools=")));
+        assert!(args.iter().any(|arg| arg.starts_with("--disallowedTools=")));
+    }
+
     /// #860: behind a Windows cmd shim the posture rules hold `(`/`)`, which the reparse guard refuses on argv, so the same rules travel in the launch settings file's `permissions` and argv stays clean.
     #[test]
     fn a_cmd_shim_launch_carries_the_posture_rules_in_the_settings_file_not_argv() {

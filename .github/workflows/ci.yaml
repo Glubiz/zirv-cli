@@ -327,6 +327,17 @@ jobs:
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' result.txt \
             || { echo "filter commands::ctx::wrap::tests::win:: failed or matched no tests" >&2; exit 1; }
 
+      # Issue #860: the reparse guard only has a verdict on Windows, so the cmd shim posture tests run there.
+      - name: Verify Windows Cmd Shim Posture
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in $(env | grep -o '^ZIRV_[A-Za-z0-9_]*' || true); do unset "$name"; done
+          cargo test --bin zirv adapters::claude::tests::a_cmd_shim_launch_ -- --test-threads=1 2>&1 | tee result.txt
+          grep -Eq 'test result: ok\. ([2-9]|[1-9][0-9]+) passed' result.txt \
+            || { echo "filter adapters::claude::tests::a_cmd_shim_launch_ failed or matched fewer than 2 tests" >&2; exit 1; }
+
       # Issue #635: the cmd hang-server fixture acknowledges each consumed line, so the cancel is never lost to `set /p`.
       - name: Verify Windows MCP Cancellation
         if: ${{ runner.os == 'Windows' && !cancelled() }}
