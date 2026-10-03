@@ -27,7 +27,7 @@ JEV_GATE_KEYS = [
     "intake_savings", "review_reuse", "harvest_screen", "admin_dispatch",
     "approve", "approve_allow", "classify", "handoff_select", "inject_screen",
     "inject", "stop_verify",
-    "missing_tests", "launch_effort", "compaction_select",
+    "missing_tests", "launch_effort", "compaction_select", "retry",
 ]
 # Inert by design in headless runs (see run.py's JEV_INERT_GATES): no ablation condition.
 JEV_INERT_GATES = {"gates", "approve", "approve_allow"}

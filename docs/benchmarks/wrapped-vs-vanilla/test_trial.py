@@ -663,8 +663,6 @@ class JevTelemetryTests(unittest.TestCase):
             env = run_module.isolate_state({}, "/r", "zirv-nojev")
             self.assertEqual(Path(env["ZIRV_CTX_STATE_DIR"]), Path("/r") / "zirv-state")
             self.assertEqual(run_module.isolate_state({}, "/r", "vanilla"), {})
-            kept = run_module.isolate_state({"ZIRV_CTX_STATE_DIR": "/x"}, "/r", "zirv")
-            self.assertEqual(kept["ZIRV_CTX_STATE_DIR"], "/x")
         finally:
             if saved is not None:
                 run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved
@@ -719,6 +717,63 @@ class JevTelemetryTests(unittest.TestCase):
         finally:
             if saved is not None:
                 run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved
+
+
+class JevReviewFixTests(unittest.TestCase):
+    def test_grid_isolation_overrides_inherited_state_dir(self):
+        saved = run_module.os.environ.get("ZIRV_CTX_STATE_DIR")
+        run_module.os.environ["ZIRV_CTX_STATE_DIR"] = "/operator/state"
+        run_module.TRIAL_SHARED_STATE = False
+        try:
+            env = run_module.isolate_state({}, "/r", "zirv-jev-full")
+            self.assertEqual(Path(env["ZIRV_CTX_STATE_DIR"]), Path("/r") / "zirv-state")
+            with tempfile.TemporaryDirectory() as tmp:
+                result = {"cond": "zirv-jev-full", "proxy": {}}
+                run_module.attach_jev_telemetry(tmp, result)
+                self.assertIsNotNone(result["jev_invalid"])
+                self.assertIsNone(result["jev"])
+        finally:
+            if saved is None:
+                run_module.os.environ.pop("ZIRV_CTX_STATE_DIR", None)
+            else:
+                run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved
+
+    def test_shared_trial_dir_without_trial_id_is_invalid_not_valid(self):
+        saved = (run_module.TRIAL_SHARED_STATE, run_module.os.environ.get("ZIRV_CTX_STATE_DIR"),
+                 run_module.os.environ.pop("ZIRV_ATTR_TRIAL", None))
+        run_module.TRIAL_SHARED_STATE = True
+        run_module.os.environ["ZIRV_CTX_STATE_DIR"] = "/shared"
+        try:
+            result = {"cond": "zirv-nojev", "proxy": {"decider": "deterministic"}}
+            run_module.attach_jev_telemetry("/nowhere", result)
+            self.assertIn("unreadable", result["jev_invalid"])
+            self.assertEqual(run_module.isolate_state({}, "/r", "zirv"), {})
+        finally:
+            run_module.TRIAL_SHARED_STATE = saved[0]
+            if saved[1] is None:
+                run_module.os.environ.pop("ZIRV_CTX_STATE_DIR", None)
+            else:
+                run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved[1]
+
+    def test_nojev_disables_typesafe_through_zirv_config_env(self):
+        env = run_module.cond_env_for(run_module.NOJEV_COND)
+        self.assertEqual(env["ZIRV_CTX_PROXY_DECIDER"], "deterministic")
+        self.assertNotEqual(env["ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV"],
+                            run_module.JEV_CREDENTIAL_ENV)
+        merged = run_module.merge_spec_env(env, {"ZIRV_CTX_JEV_MEMORY": "true"})
+        self.assertNotIn("ZIRV_CTX_PROXY_DECIDER", merged)
+        self.assertNotIn("ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV", merged)
+
+    def test_gate_keys_match_rust_env_table(self):
+        import re
+        source = (Path(__file__).resolve().parents[3] / "src/commands/ctx/config/repo_layer.rs"
+                  ).read_text(encoding="utf-8")
+        table = re.findall(
+            r'"ZIRV_CTX_JEV_([A-Z_]+)",\s*&\["jev",\s*"(\w+)"\],\s*EnvKind::Bool', source)
+        self.assertTrue(table)
+        self.assertTrue(all(env == key.upper() for env, key in table))
+        self.assertEqual(sorted(k for _, k in table), sorted(run_module.JEV_GATE_KEYS))
+        self.assertIn("retry", run_module.JEV_GATE_KEYS)
 
 
 class JevGateMirrorTests(unittest.TestCase):

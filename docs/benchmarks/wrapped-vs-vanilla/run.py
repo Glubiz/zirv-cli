@@ -94,6 +94,7 @@ JEV_GATE_KEYS = [
     "inject", "stop_verify",
     # Round 7: headless missing-tests, launch-effort and compaction keep-list gates.
     "missing_tests", "launch_effort", "compaction_select",
+    "retry",
 ]
 JEV_FULL_COND = "zirv-jev-full"
 # zirv-nojev launches exactly like zirv but with Jev fully off: every gate
@@ -101,6 +102,13 @@ JEV_FULL_COND = "zirv-jev-full"
 # `jev::available` is false at every site regardless of ~/.zirv/ctx.toml.
 NOJEV_COND = "zirv-nojev"
 JEV_CREDENTIAL_ENV = "TYPESAFE_API_KEY"
+# zirv's own config switches the no-Jev arm out, so a custom `[proxy.typesafe]
+# credential_env` cannot leave Jev reachable: the intake decider is
+# deterministic and the credential env name points at a variable nothing sets.
+NOJEV_CONFIG_ENV = {
+    "ZIRV_CTX_PROXY_DECIDER": "deterministic",
+    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV": "ZIRV_BENCH_NOJEV_UNSET_CREDENTIAL",
+}
 # Gates that cannot fire in headless runs by design (#869): forced off in every
 # arm, never part of the Jev-on arm or a one-gate ablation.
 JEV_INERT_GATES = {
@@ -180,18 +188,22 @@ def cond_env_for(cond):
         # None = remove the variable from the child environment (child_env).
         env.update({jev_env_var(g): "false" for g in JEV_GATE_KEYS})
         env[JEV_CREDENTIAL_ENV] = None
+        env.update(NOJEV_CONFIG_ENV)
     elif cond in JEV_GATE_CONDS:
         gate = cond[len("zirv-jev-"):]
         env[jev_env_var(gate)] = "true"
     return env
 
 
+# True once `--trial` mode picked the campaign's shared state dir (see run_trial).
+TRIAL_SHARED_STATE = False
+
+
 def isolate_state(env_extra, run_dir, cond):
     """Give a zirv run its own `ZIRV_CTX_STATE_DIR` (<run_dir>/zirv-state) so the
-    Jev logs hold only that run's rows. A state dir already chosen by the caller
-    (trial mode, spec env overlay) is left alone."""
-    if not cond.startswith("zirv") or "ZIRV_CTX_STATE_DIR" in env_extra \
-            or "ZIRV_CTX_STATE_DIR" in os.environ:
+    Jev logs hold only that run's rows, overriding any inherited value (a grid
+    launched inside a zirv session). Trial mode keeps its deliberate shared dir."""
+    if not cond.startswith("zirv") or TRIAL_SHARED_STATE:
         return env_extra
     return {**env_extra, "ZIRV_CTX_STATE_DIR": str(Path(run_dir) / "zirv-state")}
 
@@ -282,11 +294,14 @@ def attach_jev_telemetry(run_dir, result):
         return
     state_dir = Path(run_dir) / "zirv-state"
     trial_id = None
-    if os.environ.get("ZIRV_CTX_STATE_DIR"):
+    if TRIAL_SHARED_STATE:
         # Trial mode: the campaign's shared state dir, narrowed to this trial's rows.
         trial_id = os.environ.get("ZIRV_ATTR_TRIAL")
         state_dir = Path(os.environ["ZIRV_CTX_STATE_DIR"])
         if not trial_id:
+            # Rows cannot be attributed to this run: unknown, never valid.
+            result["jev"] = None
+            result["jev_invalid"] = "shared state dir without a trial id: Jev log unreadable"
             return
     for name in JEV_LOG_FILES:
         rows = read_jsonl(state_dir / name, trial_id)
@@ -2068,6 +2083,9 @@ def merge_spec_env(base_env, overlay_env):
     if merged.get(JEV_CREDENTIAL_ENV, "") is None and any(
             merged.get(jev_env_var(g)) == "true" for g in JEV_GATE_KEYS):
         del merged[JEV_CREDENTIAL_ENV]
+        for key, value in NOJEV_CONFIG_ENV.items():
+            if merged.get(key) == value:
+                del merged[key]
     return merged
 
 
@@ -2638,6 +2656,8 @@ def run_trial(spec_path, out_dir, cond):
 
     state_dir = spec.get("state_dir")
     if state_dir:
+        global TRIAL_SHARED_STATE
+        TRIAL_SHARED_STATE = True
         os.environ["ZIRV_CTX_STATE_DIR"] = str(state_dir)
     for env_key, spec_key in (
         ("ZIRV_ATTR_CAMPAIGN", "campaign"), ("ZIRV_ATTR_CANDIDATE", "candidate"),
