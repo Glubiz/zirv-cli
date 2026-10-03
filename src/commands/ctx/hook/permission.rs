@@ -67,6 +67,10 @@ struct PermissionHookPayload {
     tool_input: PermissionToolInput,
     /// Claude's own suggested permission updates; the only source an "always allow" may apply.
     permission_suggestions: Vec<serde_json::Value>,
+    /// A `Notification`'s kind; `permission_prompt` means a dialog has been shown for a while (#864).
+    notification_type: String,
+    /// A `Notification`'s own text, such as "Claude needs your permission to use Bash".
+    message: String,
 }
 
 impl PermissionHookPayload {
@@ -326,6 +330,19 @@ pub(super) fn run_permission<W: Write>(
         return Ok(0);
     };
     let short = attention_short(env, &payload.session_id);
+    // A request alone is no dialog; Claude's notification after one has waited about six seconds is (#864).
+    if payload.hook_event_name.as_deref() == Some("Notification") {
+        if payload.notification_type == "permission_prompt" {
+            let shown = crate::commands::ctx::approvals::redacted_preview(&payload.message);
+            let fallback = if shown.is_empty() {
+                "permission dialog shown".to_string()
+            } else {
+                shown
+            };
+            crate::commands::ctx::attention::confirm_prompts(&state, &short, &fallback, now_secs());
+        }
+        return Ok(0);
+    }
     let auto_allowed = permission_request_is_prompt_free(&payload, stdin, env);
     let permission_id = crate::commands::ctx::approvals::request_id(
         &short,
@@ -338,7 +355,8 @@ pub(super) fn run_permission<W: Write>(
     }
     // Observe live permission prompts. A denial also clears the prompt latch
     // because the decision is resolved (#349, #456); an auto-allowed prompt
-    // never waits on the operator, so it sets no latch.
+    // never waits on the operator, so it opens no prompt. A request opens one
+    // unconfirmed: the latch waits for Claude to report its dialog shown (#864).
     if payload.hook_event_name.as_deref() == Some("PermissionDenied") {
         clear_resolved_approval(
             &state,
@@ -362,19 +380,9 @@ pub(super) fn run_permission<W: Write>(
                 id: permission_id.clone(),
                 agent: payload.agent_id.clone(),
                 at: now_secs(),
+                confirmed: false,
+                evidence: permission_evidence(&payload),
             },
-        );
-        let _ = crate::commands::ctx::attention::record(
-            &state,
-            &short,
-            crate::commands::ctx::attention::Observation::new(
-                crate::commands::ctx::attention::Authority::AdapterHook,
-                permission_evidence(&payload),
-                100,
-                now_secs(),
-            )
-            .with_attention(crate::commands::ctx::attention::Attention::Approval),
-            now_secs(),
         );
         // Approvals inbox (#840): with the key on and a live owning dashboard, hold for its operator.
         // Any other outcome prints nothing, so the native dialog shows exactly as it always has.
@@ -438,11 +446,10 @@ pub(super) fn run_permission<W: Write>(
     Ok(0)
 }
 
-/// Clear Approval or Question only when it is still the persisted attention state and `closes`
-/// leaves no other permission prompt of the session open (#854).
-/// Tool hooks and PermissionDenied prove the prompt ended; a locked
-/// conditional write preserves unrelated higher-priority latches. Read
-/// without the lock first to avoid common-path hot-hook latency (#456).
+/// Close the prompts `closes` selects, confirmed or not, and clear Approval or Question once no
+/// confirmed prompt of the session is left open (#854, #864), all under one lock.
+/// Tool hooks and PermissionDenied prove the prompt ended; the clear only replaces an Approval or
+/// Question latch, so unrelated higher-priority latches survive (#456).
 pub(super) fn clear_resolved_approval(
     state: &StateDir,
     short: &str,
@@ -450,17 +457,10 @@ pub(super) fn clear_resolved_approval(
     now: u64,
     closes: impl Fn(&crate::commands::ctx::attention::OpenPrompt) -> bool,
 ) {
-    use crate::commands::ctx::attention::Attention;
-    if crate::commands::ctx::attention::close_prompts(state, short, closes) > 0 {
-        return;
-    }
-    let waiting = |attention| matches!(attention, Attention::Approval | Attention::Question);
-    if !waiting(crate::commands::ctx::attention::load(state, short).attention) {
-        return;
-    }
-    let _ = crate::commands::ctx::attention::record_if(
+    crate::commands::ctx::attention::resolve_prompts(
         state,
         short,
+        closes,
         crate::commands::ctx::attention::Observation::new(
             crate::commands::ctx::attention::Authority::AdapterHook,
             evidence,
@@ -469,14 +469,15 @@ pub(super) fn clear_resolved_approval(
         )
         .with_attention(crate::commands::ctx::attention::Attention::None),
         now,
-        |prev| waiting(prev.attention),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::pretool_run::run_pretool;
-    use super::super::tests::{permission_env, permission_stdin, pretool_stdin};
+    use super::super::tests::{
+        permission_env, permission_prompt_notification, permission_stdin, pretool_stdin,
+    };
     use super::*;
 
     #[test]
@@ -894,6 +895,8 @@ mod tests {
             )
             .expect("never errors");
         }
+        run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+            .expect("never errors");
         let mut post: serde_json::Value = serde_json::json!({
             "session_id": "abc123",
             "cwd": "/work/repo",
@@ -941,6 +944,7 @@ mod tests {
             &lookup,
         )
         .expect("never errors");
+        run_permission(&mut out, &permission_prompt_notification(), &lookup).expect("never errors");
         assert_eq!(
             crate::commands::ctx::attention::load(&state, &short).attention,
             crate::commands::ctx::attention::Attention::Approval
@@ -970,6 +974,8 @@ mod tests {
                 ),
                 agent: String::new(),
                 at: 1,
+                confirmed: true,
+                ..Default::default()
             },
         );
         let mut out = Vec::new();
@@ -1018,6 +1024,7 @@ mod tests {
             &lookup,
         )
         .expect("never errors");
+        run_permission(&mut out, &permission_prompt_notification(), &lookup).expect("never errors");
         assert_eq!(
             crate::commands::ctx::attention::load(&state, &short).attention,
             crate::commands::ctx::attention::Attention::Approval
@@ -1134,12 +1141,12 @@ mod tests {
         }
     }
 
-    /// #864: a request the operator answers from the dashboard is over at that moment. Its latch
-    /// must not stay in NEEDS YOU for as long as the allowed command then runs (only PostToolUse
-    /// cleared it), while a released one keeps its latch because the pane's dialog now shows it.
+    /// #864: a request the operator answers from the dashboard is over at that moment, so its prompt
+    /// closes at once instead of when the allowed command finishes. A released one stays open, and
+    /// latches once Claude reports the pane's own dialog shown.
     #[cfg(unix)]
     #[test]
-    fn a_request_answered_in_the_dashboard_leaves_no_latch_and_a_released_one_keeps_it() {
+    fn a_request_answered_in_the_dashboard_closes_and_a_released_one_waits_for_its_dialog() {
         use crate::commands::ctx::approvals::Decision;
         use crate::commands::ctx::attention::{self, Attention};
         for (decision, open) in [
@@ -1172,14 +1179,9 @@ mod tests {
             run_permission(&mut Vec::new(), &permission_request(), &lookup).expect("never errors");
             dashboard.join().expect("dashboard");
             let short = crate::commands::ctx::sessions::short_id("abc123");
-            let latch = if open == 0 {
-                Attention::None
-            } else {
-                Attention::Approval
-            };
             assert_eq!(
                 attention::load(&state, &short).attention,
-                latch,
+                Attention::None,
                 "{decision:?}"
             );
             assert_eq!(
@@ -1187,6 +1189,14 @@ mod tests {
                 open,
                 "{decision:?}"
             );
+            if open == 1 {
+                run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+                    .expect("never errors");
+                assert_eq!(
+                    attention::load(&state, &short).attention,
+                    Attention::Approval
+                );
+            }
         }
     }
 

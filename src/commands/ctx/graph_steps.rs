@@ -49,8 +49,9 @@ pub fn latest(path: &Path) -> Vec<Step> {
     tail(path).steps
 }
 
-/// When the last turn of the Codex rollout at `path` ended (`task_complete` or `turn_aborted`), or
-/// `None` while a later `task_started` holds a turn open. A Claude transcript has no such rows.
+/// When the newest turn of the Codex rollout at `path` ended (its own `task_complete` or
+/// `turn_aborted`, matched by `turn_id`), or `None` while it is open. A Claude transcript has no
+/// such rows.
 pub fn turn_ended(path: &Path) -> Option<u64> {
     tail(path).turn_ended
 }
@@ -95,10 +96,22 @@ fn read_tail(path: &Path, len: u64) -> Tail {
         lines.next();
     }
     let mut tail = Tail::default();
+    // The `turn_id` of the newest `task_started` in the tail; a late end of an earlier turn is not it.
+    let mut newest_turn: Option<Option<String>> = None;
     for row in lines.filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let turn = row.pointer("/payload/turn_id").and_then(Value::as_str);
         match event_type(&row) {
-            Some("task_started") => tail.turn_ended = None,
-            Some("task_complete" | "turn_aborted") => tail.turn_ended = Some(row_ts(&row)),
+            Some("task_started") => {
+                newest_turn = Some(turn.map(str::to_string));
+                tail.turn_ended = None;
+            }
+            Some("task_complete" | "turn_aborted")
+                if newest_turn
+                    .as_ref()
+                    .is_none_or(|newest| newest.as_deref() == turn) =>
+            {
+                tail.turn_ended = Some(row_ts(&row));
+            }
             _ => {}
         }
         tail.steps.extend(steps_of(&row));
@@ -349,6 +362,43 @@ mod tests {
         );
         let long = &steps[1].arg;
         assert_eq!(long.chars().count(), ARG_COLS, "{long}");
+    }
+
+    /// #863 review: a late `task_complete` of an earlier turn, written after the next turn started,
+    /// must not read as the pane being idle; only the newest started turn's own end does.
+    #[test]
+    fn a_turn_ends_only_with_the_end_of_the_newest_started_turn() {
+        let event = |ty: &str, turn: &str, second: u32| {
+            format!(
+                "{{\"timestamp\":\"2026-10-02T19:00:{second:02}Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"{ty}\",\"turn_id\":\"{turn}\"}}}}\n"
+            )
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let ended = |name: &str, rows: &[String]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, rows.concat()).expect("write");
+            turn_ended(&path)
+        };
+        let late_end = [
+            event("task_started", "t1", 1),
+            event("task_started", "t2", 2),
+            event("task_complete", "t1", 3),
+        ];
+        assert_eq!(ended("late.jsonl", &late_end), None);
+        let mut both = late_end.to_vec();
+        both.push(event("turn_aborted", "t2", 4));
+        assert_eq!(
+            ended("both.jsonl", &both),
+            super::super::window::parse_iso8601_utc("2026-10-02T19:00:04Z")
+        );
+        let one = [
+            event("task_started", "t1", 1),
+            event("task_complete", "t1", 5),
+        ];
+        assert_eq!(
+            ended("one.jsonl", &one),
+            super::super::window::parse_iso8601_utc("2026-10-02T19:00:05Z")
+        );
     }
 
     #[test]

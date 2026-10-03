@@ -911,6 +911,8 @@ mod tests {
                     id: "p1".to_string(),
                     agent: "a1".to_string(),
                     at: 10,
+                    confirmed: true,
+                    ..Default::default()
                 },
             );
             attention::record(

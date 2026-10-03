@@ -402,7 +402,10 @@ colours, decided once) and never uses the terminal's dim attribute:
 - **NEEDS YOU** (right column): every pending operator wait shows here (a Claude or
   Codex approval naming its command, an `AskUserQuestion` until the next tool call, a
   workflow awaiting approval); a wait only its harness can answer is a card with
-  `⏎ Open its pane`. The oldest pending approval is a card: who asks (the
+  `⏎ Open its pane`. A Claude permission wait appears only once Claude reports
+  its dialog shown (the `permission_prompt` notification, after about six
+  seconds): a `PermissionRequest` alone can resolve with no dialog at all, such
+  as an auto-mode background subagent's. The oldest pending approval is a card: who asks (the
   agent's job), where, how long ago, the whole command wrapped by column to four lines
   and coloured, why it needs you, and `y Allow once`, `a Always allow`, `d Deny`, `⏎
   Open its harness`. `y` and `d` are drawn faint and do nothing unless the whole
@@ -510,8 +513,12 @@ or `PermissionDenied` clears it. A request answered in the dashboard, or every
 prompt once you submit the session's next prompt, clears its wait at once;
 one answered in the pane's own dialog clears only at that `PostToolUse`, after
 the allowed command has finished, because Claude Code fires no hook when its
-dialog is answered. The installed `PermissionRequest` hook
-`timeout` is `hold_secs + 30` (only with the inbox on). Codex has no hook
+dialog is answered. Mail and advisories are never typed into a pane while any
+of its permission requests is open, shown or not. The installed `PermissionRequest` hook
+`timeout` is `hold_secs + 30` (only with the inbox on). `zirv setup apply` and
+zirv's own Claude launches register `zirv ctx hook permission` on
+`PermissionRequest`, `PermissionDenied` and the `Notification` matcher
+`permission_prompt`. Codex has no hook
 surface zirv can read, so its panes are never listed and never answered.
 
 The inbox is deliberately unreachable by agents: decisions travel only from the

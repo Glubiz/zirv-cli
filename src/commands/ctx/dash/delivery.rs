@@ -97,11 +97,12 @@ pub(super) fn mail_injection_label(
     )
 }
 
-/// Block typing while hook-driven attention holds a prompt, even if the turn signal reports idle; use the shared predicate (#468, #479).
-pub(super) fn mail_blocked_by_attention(
-    status: &super::attention::SessionStatus,
-) -> Option<super::attention::Attention> {
-    super::attention::blocking(status)
+/// Block typing while hook-driven attention holds a prompt, even if the turn signal reports idle; use the shared
+/// predicate (#468, #479). An open permission prompt blocks before its dialog is confirmed too: keys could answer it (#864).
+pub(super) fn mail_blocked(state: &StateDir, short: &str) -> Option<super::attention::Attention> {
+    super::attention::blocking(&super::attention::load(state, short)).or_else(|| {
+        super::attention::prompt_open(state, short).then_some(super::attention::Attention::Approval)
+    })
 }
 
 /// Log the specific blocking attention reason rather than a generic skip (#468).
@@ -211,8 +212,7 @@ pub(crate) fn sweep_one_pane<I: Injector>(
         .unwrap_or_default();
 
     // Check hook-driven attention as well as turn-signal injectability before typing (#468).
-    let status = super::attention::load(state, short);
-    if let Some(attention) = mail_blocked_by_attention(&status) {
+    if let Some(attention) = mail_blocked(state, short) {
         let reason = mail_block_reason(attention);
         let already_logged = injector
             .mail_block_log()
@@ -320,8 +320,7 @@ pub(crate) fn advise_one_pane<I: Injector>(
     }
 
     // Check hook-driven attention before typing an advisory into an apparently idle orchestrator (#468).
-    let status = super::attention::load(state, short);
-    if let Some(attention) = mail_blocked_by_attention(&status) {
+    if let Some(attention) = mail_blocked(state, short) {
         let reason = mail_block_reason(attention);
         let already_logged = injector
             .mail_block_log()
@@ -1834,6 +1833,43 @@ mod tests {
             "nothing may be typed into the pane while approval is pending: {:?}",
             injector.calls
         );
+    }
+
+    /// #864: a permission request opens its ledger entry before Claude reports the dialog shown
+    /// and the latch rises; typing in that window could still answer it, so the open entry blocks.
+    #[test]
+    fn advise_one_pane_never_types_while_a_prompt_is_open_but_not_yet_latched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        store_one(&state, slug, &cfg, "s1", "the build is red");
+        super::super::attention::open_prompt(
+            &state,
+            "short0000",
+            super::super::attention::OpenPrompt {
+                id: "p1".to_string(),
+                at: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut injector = RecordingInjector {
+            calls: Vec::new(),
+            mail_block_log: None,
+        };
+        let delivered = advise_one_pane(
+            &mut injector,
+            "session-a",
+            &state,
+            slug,
+            "claude",
+            "short0000",
+            &mut HashMap::new(),
+            &mut ErrorLog::default(),
+        );
+        assert!(!delivered, "must not advise while a prompt is open");
+        assert!(injector.calls.is_empty(), "{:?}", injector.calls);
     }
 
     /// Acceptance test (a): mail arrives while the pane is `Approval`; the

@@ -1678,6 +1678,15 @@ fn launch_settings_value(
                     "type": "command",
                     "command": "zirv ctx hook permission"
                 }]
+            }],
+            // #864: a request alone is no dialog; this notification, after one has waited about
+            // six seconds, is what raises the NEEDS YOU latch.
+            "Notification": [{
+                "matcher": "permission_prompt",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook permission"
+                }]
             }]
         },
         "permissions": {
@@ -4530,6 +4539,17 @@ mod tests {
         }]);
         assert_eq!(settings["hooks"]["PermissionRequest"], observer);
         assert_eq!(settings["hooks"]["PermissionDenied"], observer);
+        // #864: only a dialog Claude reports shown raises the NEEDS YOU latch.
+        assert_eq!(
+            settings["hooks"]["Notification"],
+            serde_json::json!([{
+                "matcher": "permission_prompt",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook permission"
+                }]
+            }])
+        );
     }
 
     /// Issues #326 and #466: the compact/obfuscation hook covers every tool
