@@ -64,6 +64,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -483,16 +484,50 @@ def result_is_valid(run_dir):
     return not obj.get("is_error", True)
 
 
+def _hook_runs_zirv(command):
+    """True when a hook command's program (first word, after any leading
+    VAR=value words) is zirv, e.g. `zirv ctx hook pretool` or `zirv.exe ...`."""
+    try:
+        words = shlex.split(command or "")
+    except ValueError:
+        return False
+    words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)] or [""]
+    return re.sub(r"\.exe$", "", os.path.basename(words[0]), flags=re.IGNORECASE) == "zirv"
+
+
+def non_zirv_hooks(hooks):
+    """`hooks` (a settings.json `hooks` object) without any hook entry whose
+    command runs zirv; groups and events left empty are dropped."""
+    kept = {}
+    for event, groups in (hooks or {}).items():
+        kept_groups = []
+        for group in groups or []:
+            entries = [h for h in group.get("hooks") or [] if not _hook_runs_zirv(h.get("command"))]
+            if entries:
+                kept_groups.append({**group, "hooks": entries})
+        if kept_groups:
+            kept[event] = kept_groups
+    return kept
+
+
 def operator_plugin_settings():
-    """The operator's user-level `enabledPlugins` as a `--settings` JSON, so
-    vanilla (which drops the user layer to keep zirv's hooks out) still loads
-    the same plugins the zirv conditions get from that layer. None if unset."""
+    """The operator's user-level `enabledPlugins` and non-zirv `hooks` as a
+    `--settings` JSON, so vanilla (which drops the user layer to keep zirv's
+    hooks out) still loads the same plugins and runs the same operator hooks
+    (e.g. enforce-rules.sh) the zirv conditions get from that layer. None if
+    neither is set."""
     try:
         user = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
     except Exception:
         return None
+    settings = {}
     enabled = {k: True for k, v in (user.get("enabledPlugins") or {}).items() if v}
-    return json.dumps({"enabledPlugins": enabled}, separators=(",", ":")) if enabled else None
+    if enabled:
+        settings["enabledPlugins"] = enabled
+    hooks = non_zirv_hooks(user.get("hooks"))
+    if hooks:
+        settings["hooks"] = hooks
+    return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
 def build_argv(cond, model, prompt_text, resume_session_id=None):
@@ -1074,7 +1109,7 @@ def run_unittest_discover(repo_dir, start_dir, timeout_s=UNITTEST_TIMEOUT_S):
     -- the step boundary IS the grading boundary, so grading lives here)."""
     try:
         proc = subprocess.run(
-            [PYTHON_EXE, "-m", "unittest", "discover", "-s", start_dir, "-t", str(repo_dir)],
+            [PYTHON_EXE, "-m", "unittest", "discover", "-s", start_dir, "-t", str(Path(repo_dir).resolve())],
             cwd=str(repo_dir), capture_output=True, text=True, timeout=timeout_s,
         )
     except Exception as exc:

@@ -876,6 +876,28 @@ class RunProvenanceTests(unittest.TestCase):
         self.assertFalse((tmp / "transcripts").exists())
 
 
+class NonZirvHooksTests(unittest.TestCase):
+    def test_zirv_hook_dropped_operator_hook_kept(self):
+        hooks = {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/enforce-rules.sh"}]},
+                {"matcher": "Edit", "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "FOO=1 /usr/local/bin/zirv.exe ctx hook x"},
+                                               {"type": "command", "command": "~/bin/zirvish.sh"}]},
+            ],
+            "Stop": [{"hooks": [{"type": "command", "command": "zirv ctx hook stop"}]}],
+        }
+        kept = run_module.non_zirv_hooks(hooks)
+        self.assertEqual(list(kept), ["PreToolUse"])
+        commands = [h["command"] for g in kept["PreToolUse"] for h in g["hooks"]]
+        self.assertEqual(commands, ["~/.claude/hooks/enforce-rules.sh", "~/bin/zirvish.sh"])
+        self.assertEqual(kept["PreToolUse"][0]["matcher"], "Bash")
+
+    def test_empty_hooks_add_nothing(self):
+        self.assertEqual(run_module.non_zirv_hooks({}), {})
+        self.assertEqual(run_module.non_zirv_hooks(None), {})
+
+
 class PosixExecutableTests(unittest.TestCase):
     @unittest.skipIf(sys.platform == "win32", "POSIX resolution only")
     def test_resolved_executables_are_not_windows_paths(self):

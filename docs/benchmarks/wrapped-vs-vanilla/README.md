@@ -64,7 +64,7 @@ Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
 
 Plugin and hook parity (2026-09-24, d256124e):
 - **zirv conditions keep the user settings layer.** zirv's own hooks (Stop, UserPromptSubmit, PreCompact, PreToolUse) are installed in `~/.claude/settings.json`, so a zirv launch with `--setting-sources project,local` silently runs without them. Rounds r1–r3 in `results/2026-09-24-fix-loop/` did exactly that.
-- **Vanilla gets the same plugins through `--settings`.** Its `--setting-sources project,local` branch (used with `--vanilla-plugin-dir`) receives the operator's `enabledPlugins` from `~/.claude/settings.json` that way, so both sides load the same unrelated operator plugins and only zirv's hooks differ.
+- **Vanilla gets the same plugins through `--settings`.** Its `--setting-sources project,local` branch (used with `--vanilla-plugin-dir`) receives the operator's `enabledPlugins` from `~/.claude/settings.json` that way, so both sides load the same unrelated operator plugins and only zirv's hooks differ (the operator's own non-zirv hooks go the same way; see "Known parity gap" below).
 
 Known parity gap (checked against zirv 4.47.0, 2026-10-03): the zirv arms
 still need the user settings layer. The `--settings <launch-settings>` file
@@ -74,11 +74,15 @@ zirv passes carries only PreToolUse, PostToolUse, PostToolUseFailure, Stop
 `~/.claude/settings.json`. A one-turn haiku probe with `--setting-sources
 project,local` through `zirv ctx exec` showed no `UserPromptSubmit` hook
 context in the transcript, while the default launch had it. So the zirv arms
-cannot switch to `project,local` yet, and the operator's own non-zirv user
-hooks (e.g. `~/.claude/hooks/enforce-rules.sh`, ~96 ms per Bash call in r8) run
-only in the zirv arm. Run the benchmark from a machine whose user-layer hooks
-are only zirv's, or fix this on the zirv side (put those hooks in the launch
-settings), before comparing wall time.
+cannot switch to `project,local` yet and stay as they are. Instead vanilla's
+`--settings` JSON (`operator_plugin_settings`) carries, next to
+`enabledPlugins`, the operator's `hooks` from `~/.claude/settings.json` minus
+every hook whose command's program is zirv (`non_zirv_hooks`), so the operator's
+own hooks (e.g. `~/.claude/hooks/enforce-rules.sh`, ~96 ms per Bash call in r8)
+run in both arms and only zirv's hooks differ. Verified with a one-turn haiku
+vanilla probe: the transcript shows a `hook_success` PreToolUse attachment for
+`enforce-rules.sh` and no zirv hook. This applies to the `--vanilla-plugin-dir`
+vanilla branch; the `disableAllHooks` branch still runs no hooks at all.
 
 Put `--bench-root` outside any directory that has a `CLAUDE.md` in its
 ancestors: both arms load those. In r8 the bench root sat inside the zirv

@@ -9,7 +9,8 @@ rules are case-sensitive), whose root-cause fix is
 failure; fixing it must happen in the library code, not by editing that
 test, so -- like t07_redtest -- this grader forces score 0 if an existing line
 of tests/test_rules.py is changed or removed (`git diff --unified=0 HEAD`
-shows a '-' line). Added lines (new tests) are allowed.
+shows a '-' line) or an added line holds skip/skipIf/skipUnless/skipTest/
+expectedFailure. Other added lines (new tests) are allowed.
 """
 import json
 import re
@@ -45,9 +46,13 @@ def _run_unittest(python, repo_dir, start_dir):
     return passed, total, fail_names, output
 
 
+SKIP_RE = re.compile(r"\b(skip|skipIf|skipUnless|skipTest|expectedFailure)\b")
+
+
 def _test_file_lines_removed(repo_dir):
     """True when tests/test_rules.py lost or changed an existing line (a diff
-    '-' line); pure additions are allowed. Fails closed on a git error."""
+    '-' line) or gained a skip/expectedFailure line (which could disable the
+    failing test); other additions are allowed. Fails closed on a git error."""
     try:
         proc = subprocess.run(
             ["git", "diff", "--unified=0", "HEAD", "--", "tests/test_rules.py"],
@@ -60,7 +65,12 @@ def _test_file_lines_removed(repo_dir):
         return True
     if proc.returncode != 0:
         return True
-    return any(line.startswith("-") and not line.startswith("---") for line in proc.stdout.splitlines())
+    for line in proc.stdout.splitlines():
+        if line.startswith("-") and not line.startswith("---"):
+            return True
+        if line.startswith("+") and not line.startswith("+++") and SKIP_RE.search(line):
+            return True
+    return False
 
 
 def main():
@@ -70,7 +80,7 @@ def main():
         python = sys.executable or "python"
 
         if _test_file_lines_removed(repo_dir):
-            result["details"] = "tests/test_rules.py had existing lines changed or removed; the D4 fix must not edit the existing tests"
+            result["details"] = "tests/test_rules.py had existing lines changed or removed, or a skip added; the D4 fix must not edit or disable the existing tests"
             print(json.dumps(result))
             return
 
