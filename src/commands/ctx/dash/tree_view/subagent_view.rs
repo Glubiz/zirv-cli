@@ -65,7 +65,17 @@ fn brief_body(text: &str) -> &str {
     if !text.starts_with("<teammate-message") {
         return text;
     }
-    text.split_once('>').map_or(text, |(_, body)| body)
+    // The first `>` outside a quoted attribute ends the opening tag.
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if q == c => quote = None,
+            (None, '>') => return &text[at + 1..],
+            _ => {}
+        }
+    }
+    text
 }
 
 /// The first non-empty output line, plus how many more lines there are.
@@ -78,22 +88,29 @@ fn result_summary(text: &str) -> String {
     }
 }
 
-/// A path relative to the subagent's working directory when under it; a long one keeps its tail,
-/// so the file name stays visible. Anything not an absolute path is returned as it is.
+/// A path under the subagent's working directory shows relative to it, whole unless very long
+/// (then `…/` and its tail). An absolute path outside it keeps a `/…/` tail, so the leading slash
+/// marks it as another checkout. Anything else is returned as it is.
 fn short_path(path: &str, cwd: &str) -> String {
-    let rest = match path
+    let under = path
         .strip_prefix(cwd)
         .and_then(|rest| rest.strip_prefix('/'))
-    {
-        Some(rest) if !cwd.is_empty() => rest,
-        _ if path.starts_with('/') => path,
-        _ => return path.to_string(),
-    };
-    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-    if parts.len() <= 4 {
-        return rest.to_string();
+        .filter(|_| !cwd.is_empty());
+    let parts = |p: &str| p.split('/').filter(|s| !s.is_empty()).count();
+    match under {
+        Some(rest) if parts(rest) <= 6 => rest.to_string(),
+        Some(rest) => format!("\u{2026}/{}", tail(rest, 4)),
+        None if path.starts_with('/') && parts(path) > 3 => {
+            format!("/\u{2026}/{}", tail(path, 3))
+        }
+        None => path.to_string(),
     }
-    format!("\u{2026}/{}", parts[parts.len() - 3..].join("/"))
+}
+
+/// The last `n` components of `path`.
+fn tail(path: &str, n: usize) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    parts[parts.len().saturating_sub(n)..].join("/")
 }
 
 /// `text` with every absolute path in it shortened by `short_path`.
@@ -132,21 +149,26 @@ fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
             .trim();
-        // The worktree every call starts in says nothing about the call.
-        match line
+        let Some((dir, command)) = line
             .strip_prefix("cd ")
             .and_then(|rest| rest.split_once(" && "))
-        {
-            Some((_, command)) if name == "Bash" => command.trim(),
-            _ => line,
+            .filter(|_| name == "Bash")
+        else {
+            return line.to_string();
+        };
+        // Running where the call started says nothing; another checkout does.
+        let dir = dir.trim().trim_matches(['"', '\'']);
+        if dir == cwd {
+            return command.trim().to_string();
         }
+        format!("cd {} && {}", short_path(dir, cwd), command.trim())
     })
-    .unwrap_or("");
+    .unwrap_or_default();
     let is_path = matches!(name, "Read" | "Edit" | "Write" | "NotebookEdit");
     let primary = if is_path {
-        short_path(primary, cwd)
+        short_path(&primary, cwd)
     } else {
-        primary.to_string()
+        primary
     };
     match (name, field("path")) {
         ("Grep" | "Glob", Some(path)) => format!("{name}({primary}, {})", short_path(path, cwd)),
@@ -584,14 +606,14 @@ mod tests {
 
     #[test]
     fn a_teammate_brief_and_a_long_final_report_stay_a_few_lines() {
-        let brief = "<teammate-message teammate_id=\"team-lead\" summary=\"Fix the wall\">\nYou are an implementation worker on a Rust CLI. \
+        let brief = "<teammate-message teammate_id=\"team-lead\" summary=\"fixes -> view\">\nYou are an implementation worker on a Rust CLI. \
             Work only in the given worktree and follow the repository instructions exactly, then report back.\n\nHard rules:\n- no git changes\n</teammate-message>";
         let report: String = (1..=5)
             .map(|p| format!("**Part {p}.** The change is made and tested.\n\n\n- file {p}\n- file {p} again\n\n"))
             .collect();
         let rows = [
-            serde_json::json!({"type":"user","message":{"content":brief}}),
-            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/x/.claude/worktrees/wt-a && cargo test -q"}}]}}),
+            serde_json::json!({"type":"user","cwd":"/Users/x/wt-a","message":{"content":brief}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/x/wt-a && cargo test -q"}},{"type":"tool_use","name":"Bash","input":{"command":"cd /Users/x/repo && git commit -am wip"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/wt-a/src/commands/ctx/dash/tree_view/pane.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/repo/src/commands/ctx/dash/pane.rs"}}]}}),
             serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok\nsecond\nthird"}]}}),
             serde_json::json!({"type":"assistant","cwd":"/Users/x/wt-a","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/x/wt-a/src/a.rs"}},{"type":"tool_use","name":"Read","input":{"file_path":"/Users/x/other/deep/src/commands/ctx/supervisor.rs"}}]}}),
             serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"The file /Users/x/wt-a/src/a.rs has been updated successfully."}]}}),
@@ -616,8 +638,17 @@ mod tests {
             "under cwd: {joined}"
         );
         assert!(
-            joined.contains("Read(\u{2026}/commands/ctx/supervisor.rs)"),
-            "outside cwd keeps the tail: {joined}"
+            joined.contains("Read(/\u{2026}/commands/ctx/supervisor.rs)"),
+            "outside cwd keeps an absolute-looking tail: {joined}"
+        );
+        assert!(
+            joined.contains("Bash(cd /Users/x/repo && git commit -am wip)"),
+            "another checkout stays visible: {joined}"
+        );
+        assert!(
+            joined.contains("Edit(src/commands/ctx/dash/tree_view/pane.rs)")
+                && joined.contains("Edit(/\u{2026}/ctx/dash/pane.rs)"),
+            "under cwd whole, outside cwd tailed: {joined}"
         );
         assert!(
             joined.contains("The file src/a.rs has been updated successfully."),
