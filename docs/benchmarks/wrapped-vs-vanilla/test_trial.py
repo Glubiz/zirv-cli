@@ -754,6 +754,8 @@ class JevReviewFixTests(unittest.TestCase):
                 run_module.os.environ.pop("ZIRV_CTX_STATE_DIR", None)
             else:
                 run_module.os.environ["ZIRV_CTX_STATE_DIR"] = saved[1]
+            if saved[2] is not None:
+                run_module.os.environ["ZIRV_ATTR_TRIAL"] = saved[2]
 
     def test_nojev_disables_typesafe_through_zirv_config_env(self):
         env = run_module.cond_env_for(run_module.NOJEV_COND)
