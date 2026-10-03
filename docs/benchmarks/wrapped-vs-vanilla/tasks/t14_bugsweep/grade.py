@@ -46,7 +46,10 @@ def _run_unittest(python, repo_dir, start_dir):
     return passed, total, fail_names, output
 
 
-SKIP_RE = re.compile(r"\b(skip|skipIf|skipUnless|skipTest|expectedFailure)\b")
+# Real skip mechanisms only, so a docstring, comment or test name saying "skip blank rows" is not one.
+SKIP_RE = re.compile(
+    r"@\s*(unittest\.)?(skip\w*|expectedFailure)\b|\bself\.skipTest\s*\(|\bunittest\.expectedFailure\b"
+)
 
 
 def _test_file_lines_removed(repo_dir):

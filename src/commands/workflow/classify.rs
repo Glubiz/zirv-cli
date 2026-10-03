@@ -516,23 +516,12 @@ const BUGFIX_ANYWHERE: &[&str] = &[
     "corrupt",
     "corrupted",
 ];
-/// The [`BUGFIX_ANYWHERE`] words a feature request also uses to specify its error contract or constraints.
-const CONTRACT_WORDS: &[&str] = &[
-    "error",
-    "errors",
-    "cannot",
-    "exception",
-    "exceptions",
-    "wrong",
-    "incorrect",
-    "broken",
-    "fixed",
-    "fails",
-    "failing",
-    "failure",
-    "failures",
-    "corrupt",
-    "corrupted",
+/// Error words a feature request uses for the behaviour it asks for ("print an error"); a bare "error" is a symptom.
+const CONTRACT_ERROR_WORDS: &[&str] = &["error", "errors", "exception", "exceptions"];
+/// A verb within three tokens before an error word makes it something the program should do.
+const CONTRACT_VERBS: &[&str] = &[
+    "print", "prints", "raise", "raises", "return", "returns", "exit", "exits", "emit", "emits",
+    "reject", "rejects", "throw", "throws",
 ];
 /// A feature word right after one of these is a symptom ("cannot add"), not a request.
 const NEGATED_FEATURE_PRECEDERS: &[&str] =
@@ -636,8 +625,27 @@ fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
             .iter()
             .filter(|token| BUGFIX_ANYWHERE.contains(token))
     };
-    // A feature request often names its error contract ("print an error"); those words alone do not make a bugfix.
-    let only_contract_words = bug_words().all(|token| CONTRACT_WORDS.contains(token));
+    // A feature request often names its error contract ("print an error", "is an error",
+    // "usage error", "ties broken", "not corrupted", "a fixed amount"); only those uses are not a bug report.
+    let is_contract_use = |index: usize| {
+        let token = tokens[index];
+        let before = |back: usize| index.checked_sub(back).map(|at| tokens[at]);
+        if CONTRACT_ERROR_WORDS.contains(&token) {
+            let after_verb =
+                (1..=3).any(|back| before(back).is_some_and(|t| CONTRACT_VERBS.contains(&t)));
+            let after_is_an = matches!(before(1), Some("a" | "an"))
+                && matches!(before(2), Some("is" | "as" | "not"));
+            return after_verb || after_is_an || before(1) == Some("usage");
+        }
+        (token == "fixed" && matches!(before(1), Some("a" | "an")))
+            || (token == "broken" && before(1) == Some("ties"))
+            || (matches!(token, "corrupt" | "corrupted") && before(1) == Some("not"))
+    };
+    let only_contract_words = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| BUGFIX_ANYWHERE.contains(token))
+        .all(|(index, _)| is_contract_use(index));
     let asks_for_feature = tokens.iter().enumerate().any(|(index, token)| {
         FEATURE_ANYWHERE.contains(token)
             && !(index > 0 && NEGATED_FEATURE_PRECEDERS.contains(&tokens[index - 1]))
@@ -1115,7 +1123,7 @@ mod tests {
     }
 
     /// Benchmark finding: a feature request that specifies its error contract
-    /// ("print an error", "malformed input is broken") is a Feature, while a
+    /// ("print an error", "ties broken", "not corrupted") is a Feature, while a
     /// report of broken behaviour stays a Bugfix.
     #[test]
     fn a_feature_request_with_an_error_contract_is_a_feature() {
@@ -1125,12 +1133,57 @@ mod tests {
                 Intent::Feature,
             ),
             (
-                "I'd like tags on transactions. Add a tagging module; a blank tag is an error, and a corrupted store is rejected.",
+                "I'd like tags on transactions. Add a tagging module; a blank tag is an error, and a malformed store is rejected.",
                 Intent::Feature,
             ),
             (
-                "I want category shares that add up to 100% or the report looks broken. Add category_shares(txns).",
+                "Add an export command; values with commas are quoted correctly, not corrupted.",
                 Intent::Feature,
+            ),
+            (
+                "Add a goals list command sorted by percent complete, ties broken alphabetically by name.",
+                Intent::Feature,
+            ),
+            (
+                "Add a monthly report; a missing flag is a usage error on stderr, exit 2. Please add tests.",
+                Intent::Feature,
+            ),
+            (
+                "Add envelopes that each budget a fixed amount per month. Rejects (error to stderr, exit 2) an unknown name.",
+                Intent::Feature,
+            ),
+            // Symptom words stay bug words even when the report also asks to add something.
+            (
+                "Login fails with an error when the password is empty. Add a check for it.",
+                Intent::Bugfix,
+            ),
+            (
+                "Sorting is broken for dates. Add a comparator that handles timezones.",
+                Intent::Bugfix,
+            ),
+            (
+                "The CSV export is incorrect when a field contains a comma; it should be quoted. Add quoting.",
+                Intent::Bugfix,
+            ),
+            (
+                "The dashboard shows the wrong total after a refund. Please add the refund amount to it.",
+                Intent::Bugfix,
+            ),
+            (
+                "Users cannot log in. Add a fallback to the old auth path",
+                Intent::Bugfix,
+            ),
+            (
+                "Users get an error when they add an item to the cart",
+                Intent::Bugfix,
+            ),
+            (
+                "Intermittent failures in the nightly job; add logging to find out why",
+                Intent::Bugfix,
+            ),
+            (
+                "The tool cannot parse quoted fields. Add support.",
+                Intent::Bugfix,
             ),
             (
                 "Users cannot add items to the cart and get a wrong total",

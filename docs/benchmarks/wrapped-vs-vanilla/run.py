@@ -64,7 +64,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -485,14 +484,10 @@ def result_is_valid(run_dir):
 
 
 def _hook_runs_zirv(command):
-    """True when a hook command's program (first word, after any leading
-    VAR=value words) is zirv, e.g. `zirv ctx hook pretool` or `zirv.exe ...`."""
-    try:
-        words = shlex.split(command or "")
-    except ValueError:
-        return False
-    words = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)] or [""]
-    return re.sub(r"\.exe$", "", os.path.basename(words[0]), flags=re.IGNORECASE) == "zirv"
+    """True when a hook command invokes `zirv ctx hook`, bare or by path
+    (POSIX or Windows, with or without .exe), alone or behind a wrapper
+    (`env X=1 zirv ...`, `sh -c "zirv ..."`, `cd x && zirv ...`)."""
+    return bool(re.search(r"(^|[\s/\\;&|\"'])zirv(\.exe)?[\"']?\s+ctx\s+hook\b", command or "", re.IGNORECASE))
 
 
 def non_zirv_hooks(hooks):

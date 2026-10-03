@@ -893,6 +893,19 @@ class NonZirvHooksTests(unittest.TestCase):
         self.assertEqual(commands, ["~/.claude/hooks/enforce-rules.sh", "~/bin/zirvish.sh"])
         self.assertEqual(kept["PreToolUse"][0]["matcher"], "Bash")
 
+    def test_windows_path_and_wrapper_forms_are_zirv_hooks(self):
+        dropped = [
+            r"C:\ProgramData\chocolatey\bin\zirv.exe ctx hook pretool",
+            r'"C:\Program Files\zirv\zirv.exe" ctx hook pretool',
+            "env FOO=1 zirv ctx hook pretool",
+            'sh -c "zirv ctx hook pretool"',
+            "cd /x && zirv ctx hook pretool",
+        ]
+        for command in dropped:
+            self.assertTrue(run_module._hook_runs_zirv(command), command)
+        for command in ["~/.claude/hooks/enforce-rules.sh", "~/bin/zirvish.sh", "zirv ctx status", ""]:
+            self.assertFalse(run_module._hook_runs_zirv(command), command)
+
     def test_empty_hooks_add_nothing(self):
         self.assertEqual(run_module.non_zirv_hooks({}), {})
         self.assertEqual(run_module.non_zirv_hooks(None), {})
