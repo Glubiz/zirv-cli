@@ -568,6 +568,15 @@ fn sweep_orphan_endpoints(state: &StateDir, found: &[(Record, Liveness)]) {
         if live.contains(short) {
             continue;
         }
+        // An approvals inbox socket is `a<pid>.sock`: its owner's liveness decides, because a
+        // sandboxed caller's denied connect would read as dead and delete a live inbox (#865).
+        if short
+            .strip_prefix('a')
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(is_alive)
+        {
+            continue;
+        }
         if !super::signal::probe(&path) {
             let _ = std::fs::remove_file(&path);
         }
@@ -2075,6 +2084,25 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "{ORPHANS} dead endpoints took {elapsed:?} to probe; a probe must not retry a              nonexistent endpoint (one second each here blocks the dashboard before its              first frame)"
         );
+    }
+
+    /// #865: an inbox socket whose owner pid is alive is kept even when no probe can connect to
+    /// it (a sandboxed caller's EPERM, here a plain file nobody listens on); a dead owner's is swept.
+    #[test]
+    fn an_approvals_socket_is_kept_while_its_owner_pid_lives_and_swept_when_dead() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        super::super::state::create_private_dir_all(&state.sockets()).expect("sockets dir");
+        let alive = state
+            .sockets()
+            .join(format!("a{}.sock", std::process::id()));
+        // Above Linux/macOS pid_max (and within i32), so no process can own it.
+        let dead = state.sockets().join("a2000000000.sock");
+        std::fs::write(&alive, "").expect("alive endpoint");
+        std::fs::write(&dead, "").expect("dead endpoint");
+        let _ = list(&state);
+        assert!(alive.exists(), "a live owner's inbox socket must survive");
+        assert!(!dead.exists(), "a dead owner's inbox socket must be swept");
     }
 
     /// #681 review: a staged rollover socket is named `<short>.<nonce>`, not

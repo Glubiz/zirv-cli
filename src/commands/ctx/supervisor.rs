@@ -37,8 +37,14 @@ const REPORT_CAP: usize = 64 * 1024;
 const LAST_ADVICE_CHARS: usize = 200;
 const SEEN_KEEP: usize = 16;
 const TRIGGERS_KEEP: usize = 20;
-const HELPER_BUDGET_TOKENS: u64 = 60_000;
-const HELPER_MAX_TOOL_CALLS: u32 = 10;
+const HELPER_MAX_TOOL_CALLS: u32 = 4;
+/// The exec budget sums every turn's whole context (cache reads included), so a consult costs
+/// one turn's context per turn, not its brief once. A real Claude consult measured 42k context
+/// on turn 1 and 47k on turn 2 (91,012 in all, #866); 50k per turn covers that with growth, and
+/// 5k per turn covers its reasoning output (2k observed).
+const HELPER_TURN_TOKENS: u64 = 55_000;
+/// One turn per tool call plus the answering turn.
+const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_MAX_TOOL_CALLS as u64 + 1);
 const ASK_TIMEOUT_SECS: u64 = 180;
 const ASK_GRACE_SECS: u64 = 20;
 
@@ -939,6 +945,14 @@ fn consult_with(
     save_state(&path, &session);
 }
 
+/// A failed helper's reason: the exit code plus what zirv's own codes (77 = budget spent) mean.
+fn helper_exit_error(code: i32) -> String {
+    format!(
+        "supervisor helper exited {code}: {}",
+        super::exec::describe_exit(code)
+    )
+}
+
 /// The real helper runner: a read-only delegation through `agent::run_with`.
 fn delegated_report(
     cfg: &CtxConfig,
@@ -958,7 +972,7 @@ fn delegated_report(
     };
     let code = super::agent::run_with(&args, &mut output, repo, &env)?;
     if code != 0 {
-        return Err(format!("supervisor helper exited {code}").into());
+        return Err(helper_exit_error(code).into());
     }
     crate::commands::workflow::review::reviewer_report(&output, REPORT_CAP)
 }
@@ -1818,6 +1832,67 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("never write code")
+        );
+    }
+
+    /// Issue #866: the budget sums every turn's whole context, so the consult's must cover the
+    /// measured two-turn Claude consult (91,012 tokens) and every turn its tool cap allows.
+    #[test]
+    fn the_consult_budget_covers_a_measured_consult_and_its_tool_cap() {
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.harness = "claude".to_string();
+        let args =
+            consult_agent_args(&cfg, RulingKind::Choice, "p".to_string(), None).expect("args");
+        assert_eq!(args.max_tool_calls, Some(HELPER_MAX_TOOL_CALLS));
+        let budget = super::super::agent::WorkerBudget {
+            tokens: args.budget_tokens,
+            tool_calls: args.max_tool_calls,
+        };
+        let usage = |input, creation, read, output| super::super::event::TranscriptUsage {
+            input_tokens: input,
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read,
+            output_tokens: output,
+        };
+        // The two turns of the live consult: 44,057 + 46,955 = 91,012.
+        let measured = usage(2 + 32, 42_045 + 4_629, 42_045, 2_010 + 249);
+        assert_eq!(super::super::agent::token_spend(&measured), 91_012);
+        assert!(
+            !matches!(
+                super::super::agent::budget_state(&budget, &measured, 1),
+                super::super::agent::BudgetState::HardStop { .. }
+            ),
+            "the measured consult must not be stopped"
+        );
+        // Every allowed turn at the observed ~47k context and 2k output stays under the ceiling.
+        let turns = u64::from(HELPER_MAX_TOOL_CALLS) + 1;
+        assert!(args.budget_tokens.expect("budget") > turns * (47_000 + 2_000));
+    }
+
+    /// Issue #866: a consult whose helper hit the budget is refunded once and says so plainly.
+    #[test]
+    fn an_exhausted_consult_is_refunded_once_and_reports_the_budget() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let exhausted =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                Err(helper_exit_error(super::super::exec::EXIT_BUDGET_EXHAUSTED).into())
+            };
+        let mut out = Vec::new();
+        let code = run_ask_with("q", &options, "", 5, &lookup, &exhausted, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 1);
+        assert!(
+            text.contains("exited 77") && text.contains("token/tool-call budget was spent"),
+            "{text}"
+        );
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!(
+            (row.calls, row.tickets.len(), row.reserved.len()),
+            (0, 0, 0)
         );
     }
 
