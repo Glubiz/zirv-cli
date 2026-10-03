@@ -1009,6 +1009,9 @@ fn kv(s: &mut Scene, x: i32, y: i32, k: &str, v: &str, iw: i32) {
 
 /// Where a node runs, in words.
 fn where_line(model: &Model, node: &Node) -> String {
+    if node.kind == "supervisor" {
+        return "on call, read-only consults".to_string();
+    }
     let short = sessions::short_id(&node.id);
     if let Some(m) = model.facts.pane_meta.iter().find(|m| m.short == short) {
         return format!("pane {} \u{b7} {}", m.number, m.worktree);
@@ -1035,6 +1038,9 @@ fn kind_line(model: &Model, node: &Node) -> String {
         ch.next()
             .map_or(String::new(), |f| f.to_uppercase().chain(ch).collect())
     };
+    if node.kind == "supervisor" {
+        return format!("{} supervisor", cap(harness));
+    }
     if model.pane_short(node).is_some() {
         return format!("{} pane", cap(harness));
     }
@@ -1047,6 +1053,9 @@ fn kind_line(model: &Model, node: &Node) -> String {
 /// Whether `m` can mail this node: it has a harness, or a host that does.
 pub(super) fn mail_target(model: &Model, sel: &Sel) -> Option<(String, Option<String>)> {
     let node = model.node(sel);
+    if node.is_some_and(|n| n.kind == "supervisor") {
+        return None;
+    }
     let own = match sel {
         Sel::Seat => model.facts.seat_harness.map(str::to_string),
         _ => node.and_then(|n| n.harness.clone()),
@@ -4229,7 +4238,7 @@ mod tests {
         let on = draw(160, 40, &view(data.clone()), &f);
         let header = on.lines().next().expect("header");
         assert!(
-            header.contains("supervisor on 1/3 \u{b7} codex gpt-6-astra"),
+            header.contains("supervisor on 1/3 consults \u{b7} codex gpt-6-astra"),
             "{header}"
         );
         data.supervisor = None;
@@ -4395,5 +4404,193 @@ mod tests {
         assert!(v.wants_hover((160, 45)) && !v.wants_hover((99, 45)));
         v.open_chat();
         assert!(!v.wants_hover((160, 45)), "a chat does not ask for motion");
+    }
+
+    /// The seat alone plus the supervisor as the gather would add it, drawn at 120 columns.
+    fn supervisor_world(fact: SupervisorFact) -> (TreeData, ActiveWorkflowSummary, JevSectionFact) {
+        let (mut data, wf, jev) = busy();
+        data.nodes.retain(|n| n.id == "seat-1");
+        data.rulings.clear();
+        data.nodes.push(supervisor_node(&fact, Some("seat-1")));
+        data.supervisor = Some(fact);
+        (data, wf, jev)
+    }
+
+    fn supervisor_fact_of(advising: bool, calls: u32) -> SupervisorFact {
+        SupervisorFact {
+            harness: "codex".into(),
+            model: "gpt-6-astra".into(),
+            calls,
+            max_calls: 3,
+            tokens_read: 0,
+            advice: String::new(),
+            advising,
+            last: (advising || calls > 0).then_some(Moment::BeforePlan),
+            updated: (advising || calls > 0).then_some(1_240),
+            trigger: "before plan".into(),
+            ruled: Vec::new(),
+        }
+    }
+
+    fn agents_area(text: &str) -> String {
+        text.lines()
+            .map(|l| {
+                l.chars()
+                    .take(108)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_supervisor_node_is_drawn_with_its_budget_while_idle() {
+        let (data, wf, jev) = supervisor_world(supervisor_fact_of(false, 0));
+        let f = orch_facts(&wf, &jev);
+        let text = draw(120, 40, &view(data), &f);
+        eprintln!("IDLE\n{}", agents_area(&text));
+        assert!(text.contains("supervisor"), "{text}");
+        assert!(text.contains("codex gpt-6-astra"), "{text}");
+        assert!(text.contains("idle \u{b7} 0/3 consults"), "{text}");
+    }
+
+    #[test]
+    fn a_running_consult_shows_its_trigger_and_how_long_it_has_run() {
+        let (data, wf, jev) = supervisor_world(supervisor_fact_of(true, 2));
+        let f = orch_facts(&wf, &jev);
+        let text = draw(120, 40, &view(data), &f);
+        eprintln!("WORKING\n{}", agents_area(&text));
+        assert!(text.contains("\u{25b8} before plan \u{b7} 2/3 "), "{text}");
+        assert!(!text.contains("2/3 con"), "never cut mid-word:\n{text}");
+        assert!(text.contains("codex gpt-6-astra \u{b7} "), "{text}");
+    }
+
+    #[test]
+    fn a_running_ask_consult_reads_ask_and_never_a_fragment() {
+        let mut fact = supervisor_fact_of(true, 1);
+        fact.trigger = "ask".into();
+        let (data, wf, jev) = supervisor_world(fact);
+        let f = orch_facts(&wf, &jev);
+        let text = draw(120, 40, &view(data), &f);
+        eprintln!("ASK\n{}", agents_area(&text));
+        assert!(text.contains("\u{25b8} ask \u{b7} 1/3 consults"), "{text}");
+        let mut unknown = supervisor_fact_of(true, 1);
+        unknown.trigger = String::new();
+        let (data, wf, jev) = supervisor_world(unknown);
+        let text = draw(120, 40, &view(data), &orch_facts(&wf, &jev));
+        assert!(text.contains("\u{25b8} consulting \u{b7} 1/3"), "{text}");
+    }
+
+    #[test]
+    fn a_ruled_supervisor_shows_the_first_line_of_its_ruling_with_its_age() {
+        let mut fact = supervisor_fact_of(false, 1);
+        fact.updated = Some(1_200);
+        fact.ruled = vec![(
+            1_200,
+            "plan revise: split the work in two\nsecond line".into(),
+        )];
+        let (data, wf, jev) = supervisor_world(fact);
+        let f = orch_facts(&wf, &jev);
+        let text = draw(120, 40, &view(data), &f);
+        eprintln!("RULED\n{}", agents_area(&text));
+        assert!(text.contains("ruled \u{b7} 1/3 consults"), "{text}");
+        assert!(text.contains("ruled plan revise:"), "{text}");
+        assert!(!text.contains("second line"), "{text}");
+        assert!(text.contains("idle 40s"), "{text}");
+    }
+
+    #[test]
+    fn the_supervisor_card_never_targets_a_real_session_named_like_it() {
+        let (mut data, wf, jev) = supervisor_world(supervisor_fact_of(false, 1));
+        data.nodes.push(node_k(
+            "supervisor-real-1",
+            "seat-1",
+            "session",
+            "claude",
+            "sonnet",
+            "worker",
+            "running",
+        ));
+        let mut f = orch_facts(&wf, &jev);
+        f.pane_shorts.push("supervis".into());
+        let mut v = view(data);
+        v.selected = Sel::Agent("~".into());
+        let model = Model::build(&v.data, &f, v.scope);
+        assert_eq!(model.selected_pane(&v.selected), None);
+        assert_eq!(
+            model.sel_for_short("supervis"),
+            Some(Sel::Agent("supervisor-real-1".into()))
+        );
+        drop(model);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Char('m'),
+            KeyCode::Char('x'),
+        ] {
+            let out = press(&mut v, &f, 160, 45, code);
+            assert!(matches!(out, Outcome::Notice(_)), "{code:?} -> {out:?}");
+        }
+        assert!(v.confirm_stop.is_none());
+    }
+
+    #[test]
+    fn an_idle_supervisor_stays_a_card_among_more_than_four_idle_agents() {
+        let (mut data, wf, jev) = supervisor_world(supervisor_fact_of(false, 1));
+        for i in 0..6u64 {
+            let mut n = node_k(
+                &format!("idle{i}"),
+                "seat-1",
+                "delegation",
+                "codex",
+                "sol",
+                "worker",
+                "idle",
+            );
+            n.ended_at = Some(2_000 + i);
+            data.nodes.push(n);
+        }
+        let f = orch_facts(&wf, &jev);
+        let text = draw(200, 60, &view(data), &f);
+        assert!(text.contains("\u{25cc} supervisor"), "{text}");
+    }
+
+    #[test]
+    fn selecting_the_supervisor_shows_its_rulings_in_selected_and_enter_reads_the_newest() {
+        let mut fact = supervisor_fact_of(false, 2);
+        fact.ruled = vec![
+            (1_100, "retry stop: the same error three times".into()),
+            (1_200, "plan revise: split the work in two".into()),
+        ];
+        let (data, wf, jev) = supervisor_world(fact);
+        let f = orch_facts(&wf, &jev);
+        let mut v = view(data);
+        let text = draw(160, 45, &v, &f);
+        let (x, y) = at_flow(&text, "\u{25cc} supervisor");
+        click(&mut v, &f, (160, 45), (x + 2, y));
+        assert_eq!(v.selected, Sel::Agent("~".into()));
+        let panel: String = draw(160, 45, &v, &f)
+            .lines()
+            .map(|l| l.chars().skip(110).collect::<String>() + "\n")
+            .collect();
+        eprintln!("SELECTED\n{panel}");
+        for part in [
+            "SELECTED",
+            "Codex supervisor",
+            "on call, read-only consults",
+            "retry stop: the same error",
+            "plan revise: split the work",
+        ] {
+            assert!(panel.contains(part), "{part} in:\n{panel}");
+        }
+        match press(&mut v, &f, 160, 45, KeyCode::Enter) {
+            Outcome::Notice(text) => {
+                assert_eq!(text, "supervisor ruled plan revise: split the work in two");
+            }
+            other => panic!("Enter on the supervisor: {other:?}"),
+        }
     }
 }

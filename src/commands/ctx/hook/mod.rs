@@ -98,8 +98,9 @@ pub enum HookEvent {
         agent: Option<String>,
     },
     /// Observe Claude permission requests and denials without changing their
-    /// flow. Sandboxed-command network prompts emit a `Notification` instead
-    /// and do not invoke `PermissionRequest` hooks.
+    /// flow. Its `permission_prompt` `Notification` confirms a dialog is shown,
+    /// which alone raises the approval latch (#864); sandboxed-command network
+    /// prompts emit only that notification, never a `PermissionRequest`.
     Permission,
     /// Claude SessionStart hook: re-inject the latest handoff on resume/clear.
     SessionStart,
@@ -346,6 +347,19 @@ pub(super) mod tests {
             payload["hook_event_name"] = serde_json::json!(event);
         }
         payload.to_string()
+    }
+
+    /// The `Notification` Claude sends once a permission dialog has waited about six seconds (#864).
+    pub(super) fn permission_prompt_notification() -> String {
+        serde_json::json!({
+            "session_id": "abc123",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/work/repo",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash",
+        })
+        .to_string()
     }
 
     // -- Issue #456: a resolved permission prompt must not stay `Approval` --

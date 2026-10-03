@@ -199,7 +199,6 @@ pub(crate) fn record(
 }
 
 /// Every stored ruling, open or not.
-#[cfg(test)]
 pub(crate) fn all(state: &StateDir) -> Vec<Ruling> {
     load(&path(state))
 }

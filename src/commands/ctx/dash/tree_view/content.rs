@@ -418,10 +418,10 @@ pub(super) fn spawn_label(facts: &TreeFacts) -> String {
     label
 }
 
-/// `supervisor on 1/3`, or `off`.
+/// `on 1/3 consults`, or `off`.
 pub(super) fn supervisor_status(data: &TreeData) -> String {
     data.supervisor.as_ref().map_or("off".to_string(), |a| {
-        format!("on {}/{}", a.calls, a.max_calls)
+        format!("on {}/{} consults", a.calls, a.max_calls)
     })
 }
 
@@ -484,7 +484,7 @@ pub(super) fn hints(model: &Model, sel: &Sel) -> Vec<Hint> {
     let waiting = pane
         .as_deref()
         .is_some_and(|short| model.facts.approval_shorts.iter().any(|s| s == short));
-    let mailable = node.is_some_and(|n| n.harness.is_some());
+    let mailable = node.is_some_and(|n| n.harness.is_some() && n.kind != "supervisor");
     let mut out = vec![Hint {
         prio: 4,
         key: "\u{2190}\u{2192}",

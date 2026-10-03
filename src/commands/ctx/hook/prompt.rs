@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use super::HookPayload;
 use super::checkpoints::{adoption_record_path, load_adoption_record, save_adoption_record};
-use super::permission::{attention_short, finding_kinds, hook_obfuscation_options};
+use super::permission::{
+    attention_short, clear_resolved_approval, finding_kinds, hook_obfuscation_options,
+};
 use super::scope_guard::record_scope_guard_request;
 use crate::commands::ctx::adapters::{self, SESSION_ENV};
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
@@ -226,12 +228,23 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
             .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Working),
             now_secs(),
         );
-        // A turn boundary ends every prompt the session had open.
-        crate::commands::ctx::attention::close_prompts(
-            &state,
-            &attention_short(env, &session_id),
-            |_| true,
-        );
+        // A turn boundary ends every prompt the session had open. The operator's own prompt also
+        // proves no dialog holds the input, so the latch goes too; a harness-started turn does not (#864).
+        if is_harness_injected_prompt(&prompt_text_from(stdin)) {
+            crate::commands::ctx::attention::close_prompts(
+                &state,
+                &attention_short(env, &session_id),
+                |_| true,
+            );
+        } else {
+            clear_resolved_approval(
+                &state,
+                &attention_short(env, &session_id),
+                "user prompt submitted".to_string(),
+                now_secs(),
+                |_| true,
+            );
+        }
         crate::commands::ctx::approvals::clear_released(
             &state,
             &attention_short(env, &session_id),
@@ -869,6 +882,71 @@ mod tests {
             );
         }
         env
+    }
+
+    /// #864: the operator's own prompt proves no permission dialog is open (the dialog owns the
+    /// input), and this hook already ends every prompt in the ledger; the latch NEEDS YOU reads must
+    /// go with them instead of standing until the next turn's first tool call. A harness-started
+    /// turn proves nothing about a background agent's dialog, so its latch stays.
+    #[test]
+    fn a_submitted_prompt_ends_the_approval_latch_with_the_open_prompts() {
+        use crate::commands::ctx::attention::{
+            self, Attention, Authority, Observation, OpenPrompt,
+        };
+        for (prompt, latch) in [
+            ("carry on", Attention::None),
+            (
+                "<task-notification><status>completed</status></task-notification>",
+                Attention::Approval,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+            let state = StateDir::from_root(dir.path().join("state"));
+            let short = "aae6758d";
+            attention::open_prompt(
+                &state,
+                short,
+                OpenPrompt {
+                    id: "p1".to_string(),
+                    agent: "a1".to_string(),
+                    at: 10,
+                    confirmed: true,
+                    ..Default::default()
+                },
+            );
+            attention::record(
+                &state,
+                short,
+                Observation::new(Authority::AdapterHook, "Bash: cargo nextest run", 100, 10)
+                    .with_attention(Attention::Approval),
+                10,
+            );
+            let env: std::collections::HashMap<String, String> = [
+                (
+                    crate::commands::ctx::state::STATE_ENV.to_string(),
+                    state.root().display().to_string(),
+                ),
+                (
+                    SESSION_ENV.to_string(),
+                    "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+                ),
+            ]
+            .into();
+            let stdin = serde_json::json!({
+                "session_id": "01a0f719-6df3-7e61-a600-1bde4d533862",
+                "cwd": dir.path(),
+                "prompt": prompt
+            })
+            .to_string();
+            run_prompt(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("hook");
+            assert_eq!(
+                attention::close_prompts(&state, short, |_| false),
+                0,
+                "{prompt}"
+            );
+            assert_eq!(attention::load(&state, short).attention, latch, "{prompt}");
+        }
     }
 
     fn run_prompt_captured(

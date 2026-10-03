@@ -29,7 +29,15 @@ pub struct Step {
     pub arg: String,
 }
 
-type Cache = Mutex<BTreeMap<PathBuf, ((SystemTime, u64), Vec<Step>)>>;
+/// What the tail of one transcript or rollout says.
+#[derive(Debug, Clone, Default)]
+struct Tail {
+    steps: Vec<Step>,
+    /// When a Codex rollout's last turn ended; `None` while a turn is open or none is in the tail.
+    turn_ended: Option<u64>,
+}
+
+type Cache = Mutex<BTreeMap<PathBuf, ((SystemTime, u64), Tail)>>;
 
 fn cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -38,29 +46,40 @@ fn cache() -> &'static Cache {
 
 /// The last `KEEP_STEPS` tool calls in `path`, newest last; empty when the file is missing or has none.
 pub fn latest(path: &Path) -> Vec<Step> {
+    tail(path).steps
+}
+
+/// When the newest turn of the Codex rollout at `path` ended (its own `task_complete` or
+/// `turn_aborted`, matched by `turn_id`), or `None` while it is open. A Claude transcript has no
+/// such rows.
+pub fn turn_ended(path: &Path) -> Option<u64> {
+    tail(path).turn_ended
+}
+
+fn tail(path: &Path) -> Tail {
     let Some(key) = std::fs::metadata(path)
         .ok()
         .and_then(|meta| Some((meta.modified().ok()?, meta.len())))
     else {
-        return Vec::new();
+        return Tail::default();
     };
     let mut cache = cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((cached, steps)) = cache.get(path)
+    if let Some((cached, tail)) = cache.get(path)
         && *cached == key
     {
-        return steps.clone();
+        return tail.clone();
     }
-    let steps = read_tail(path, key.1);
+    let tail = read_tail(path, key.1);
     if cache.len() >= CACHE_LIMIT {
         cache.clear();
     }
-    cache.insert(path.to_path_buf(), (key, steps.clone()));
-    steps
+    cache.insert(path.to_path_buf(), (key, tail.clone()));
+    tail
 }
 
-fn read_tail(path: &Path, len: u64) -> Vec<Step> {
+fn read_tail(path: &Path, len: u64) -> Tail {
     let start = len.saturating_sub(TAIL_BYTES);
     let mut bytes = Vec::new();
     let read = std::fs::File::open(path).and_then(|mut file| {
@@ -68,7 +87,7 @@ fn read_tail(path: &Path, len: u64) -> Vec<Step> {
         file.take(TAIL_BYTES).read_to_end(&mut bytes)
     });
     if read.is_err() {
-        return Vec::new();
+        return Tail::default();
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines();
@@ -76,12 +95,38 @@ fn read_tail(path: &Path, len: u64) -> Vec<Step> {
     if start > 0 {
         lines.next();
     }
-    let mut steps: Vec<Step> = lines
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .flat_map(|row| steps_of(&row))
-        .collect();
-    steps.drain(..steps.len().saturating_sub(KEEP_STEPS));
-    steps
+    let mut tail = Tail::default();
+    // The `turn_id` of the newest `task_started` in the tail; a late end of an earlier turn is not it.
+    let mut newest_turn: Option<Option<String>> = None;
+    for row in lines.filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+        let turn = row.pointer("/payload/turn_id").and_then(Value::as_str);
+        match event_type(&row) {
+            Some("task_started") => {
+                newest_turn = Some(turn.map(str::to_string));
+                tail.turn_ended = None;
+            }
+            Some("task_complete" | "turn_aborted")
+                if newest_turn
+                    .as_ref()
+                    .is_none_or(|newest| newest.as_deref() == turn) =>
+            {
+                tail.turn_ended = Some(row_ts(&row));
+            }
+            _ => {}
+        }
+        tail.steps.extend(steps_of(&row));
+    }
+    tail.steps
+        .drain(..tail.steps.len().saturating_sub(KEEP_STEPS));
+    tail
+}
+
+/// The payload type of a Codex `event_msg` row (`task_started`, `task_complete`, ...).
+fn event_type(row: &Value) -> Option<&str> {
+    if row.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    row.pointer("/payload/type").and_then(Value::as_str)
 }
 
 fn row_ts(row: &Value) -> u64 {
@@ -317,6 +362,43 @@ mod tests {
         );
         let long = &steps[1].arg;
         assert_eq!(long.chars().count(), ARG_COLS, "{long}");
+    }
+
+    /// #863 review: a late `task_complete` of an earlier turn, written after the next turn started,
+    /// must not read as the pane being idle; only the newest started turn's own end does.
+    #[test]
+    fn a_turn_ends_only_with_the_end_of_the_newest_started_turn() {
+        let event = |ty: &str, turn: &str, second: u32| {
+            format!(
+                "{{\"timestamp\":\"2026-10-02T19:00:{second:02}Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"{ty}\",\"turn_id\":\"{turn}\"}}}}\n"
+            )
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let ended = |name: &str, rows: &[String]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, rows.concat()).expect("write");
+            turn_ended(&path)
+        };
+        let late_end = [
+            event("task_started", "t1", 1),
+            event("task_started", "t2", 2),
+            event("task_complete", "t1", 3),
+        ];
+        assert_eq!(ended("late.jsonl", &late_end), None);
+        let mut both = late_end.to_vec();
+        both.push(event("turn_aborted", "t2", 4));
+        assert_eq!(
+            ended("both.jsonl", &both),
+            super::super::window::parse_iso8601_utc("2026-10-02T19:00:04Z")
+        );
+        let one = [
+            event("task_started", "t1", 1),
+            event("task_complete", "t1", 5),
+        ];
+        assert_eq!(
+            ended("one.jsonl", &one),
+            super::super::window::parse_iso8601_utc("2026-10-02T19:00:05Z")
+        );
     }
 
     #[test]

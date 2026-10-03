@@ -62,6 +62,8 @@ const EVENTS_KEPT: usize = 50;
 /// With no seat session the Jev box shows this much of the repository's recent past.
 const JEV_REPO_WINDOW_SECS: u64 = 12 * 3600;
 const ADVICE_CHARS: usize = 60;
+/// The supervisor node's id: no letter or digit, so no session id, name or short id equals it.
+const SUPERVISOR_NODE_ID: &str = "~";
 
 /// One of the supervisor's three moments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,61 @@ pub(super) struct SupervisorFact {
     pub(super) advising: bool,
     /// The moment that fired most recently.
     pub(super) last: Option<Moment>,
+    /// When the consult state last changed: a running consult's start, else the last one's end.
+    pub(super) updated: Option<u64>,
+    /// The newest trigger in words (`ask`, `before plan`, ...); empty when none is recorded.
+    pub(super) trigger: String,
+    /// Its newest rulings as `(ts, "<kind> <verdict>: <reason>")`, oldest first.
+    pub(super) ruled: Vec<(u64, String)>,
+}
+
+/// The supervisor as an agent of the seat it supervises, so the tree draws it like any other: running
+/// while a consult is, idle otherwise, with its budget in `label` and its rulings as its steps.
+fn supervisor_node(fact: &SupervisorFact, seat: Option<&str>) -> Node {
+    let mut steps: Vec<graph::Step> = fact
+        .ruled
+        .iter()
+        .map(|(ts, text)| graph::Step {
+            ts: *ts,
+            tool: "ruled".to_string(),
+            arg: capped_first_line(text, ADVICE_CHARS),
+        })
+        .collect();
+    if steps.is_empty() && !fact.advice.is_empty() {
+        steps.push(graph::Step {
+            ts: fact.updated.unwrap_or_default(),
+            tool: "ruled".to_string(),
+            arg: fact.advice.clone(),
+        });
+    }
+    if fact.advising {
+        steps.push(graph::Step {
+            ts: fact.updated.unwrap_or_default(),
+            tool: "consulting".to_string(),
+            arg: fact.trigger.clone(),
+        });
+    }
+    Node {
+        // Short ids keep only ASCII letters and digits, so this one's short form is empty and can never
+        // equal a real session's, whatever its name starts with. Actions key off `kind` as well.
+        id: SUPERVISOR_NODE_ID.to_string(),
+        parent: seat.map(str::to_string),
+        kind: "supervisor".to_string(),
+        harness: Some(fact.harness.clone()),
+        model: Some(fact.model.clone()),
+        effort: None,
+        role: None,
+        status: if fact.advising { "running" } else { "idle" }.to_string(),
+        started_at: fact.updated.filter(|_| fact.advising),
+        ended_at: fact.updated.filter(|_| !fact.advising && !steps.is_empty()),
+        tokens: None,
+        label: Some(format!("{}/{}", fact.calls, fact.max_calls)),
+        name: Some("supervisor".to_string()),
+        job: None,
+        workflow: None,
+        session: seat.map(str::to_string),
+        steps,
+    }
 }
 
 /// Recent mail touching one node, by session short id.
@@ -173,6 +230,26 @@ fn supervisor_fact(
             supervisor::Trigger::ErrorRepeats => Moment::ErrorRepeats,
             supervisor::Trigger::BeforeDone => Moment::BeforeDone,
         }),
+        updated: snap.updated,
+        trigger: match snap.last_name.as_str() {
+            "ask" => "ask",
+            "before-plan" => "before plan",
+            "error-repeats" => "error repeats",
+            "before-done" => "before done",
+            _ => "",
+        }
+        .to_string(),
+        ruled: seat_short
+            .map(|short| supervisor::recent_rulings(state, short, 4))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.ts,
+                    format!("{} {}: {}", r.kind.as_str(), r.verdict, r.reason),
+                )
+            })
+            .collect(),
     })
 }
 
@@ -298,13 +375,20 @@ pub(super) fn compute(
         .map_or(now_secs().saturating_sub(JEV_REPO_WINDOW_SECS), |start| {
             start.saturating_sub(super::super::jev_feed::INTAKE_GRACE_SECS)
         });
+    let supervisor = supervisor_fact(state, cfg, seat_short);
+    let mut nodes = nodes;
+    nodes.extend(
+        supervisor
+            .iter()
+            .map(|fact| supervisor_node(fact, seat_session)),
+    );
     TreeData {
         loaded: true,
         nodes,
         events,
         jev_verdicts: graph::jev_site_verdicts(state),
         avoided: super::super::models::avoid_for_state(cfg, state),
-        supervisor: supervisor_fact(state, cfg, seat_short),
+        supervisor,
         repo_ids: graph::read_session_records(state)
             .into_iter()
             .filter(|(record, _)| record.repo_slug == slug)
@@ -912,6 +996,9 @@ mod testkit {
                 advice: "fixture path wrong, check tests/fixtures before the next run".into(),
                 advising: false,
                 last: Some(Moment::ErrorRepeats),
+                updated: None,
+                trigger: String::new(),
+                ruled: Vec::new(),
             }),
             mail_counts: [(
                 "w1".to_string(),
@@ -1475,6 +1562,29 @@ mod tests {
         let long = format!("fixture path wrong\nsecond line\n{}", "x".repeat(200));
         assert_eq!(capped_first_line(&long, 60), "fixture path wrong");
         assert_eq!(capped_first_line(&"y".repeat(100), 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn the_gather_adds_the_supervisor_node_under_the_seat_only_when_the_supervisor_is_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        let gather = |cfg: &CtxConfig| compute(&state, dir.path(), None, Some("seat-1"), cfg);
+        let off = gather(&cfg);
+        assert!(off.nodes.iter().all(|n| n.kind != "supervisor"));
+        assert!(off.supervisor.is_none());
+        cfg.supervisor.enabled = true;
+        let on = gather(&cfg);
+        let node = on
+            .nodes
+            .iter()
+            .find(|n| n.kind == "supervisor")
+            .expect("node");
+        assert_eq!(node.parent.as_deref(), Some("seat-1"));
+        assert_eq!(
+            (node.status.as_str(), node.label.as_deref()),
+            ("idle", Some("0/3"))
+        );
     }
 
     /// Enter opens a box's chat inside the tree, `^A t` comes back to the flow, and Esc is the

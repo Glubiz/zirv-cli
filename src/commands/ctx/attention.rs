@@ -1099,11 +1099,18 @@ fn lock_status(state: &super::state::StateDir, short: &str) -> Option<super::sta
 }
 
 /// One permission prompt a session has open. Parallel subagents open several at once.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenPrompt {
     pub id: String,
     pub agent: String,
     pub at: u64,
+    /// Claude reported a permission dialog shown while this prompt was open; only then does it
+    /// hold the NEEDS YOU latch (#864).
+    #[serde(default)]
+    pub confirmed: bool,
+    /// What the latch says it waits on once confirmed: the tool and a redacted preview.
+    #[serde(default)]
+    pub evidence: String,
 }
 
 fn prompts_path(state: &super::state::StateDir, short: &str) -> PathBuf {
@@ -1151,6 +1158,80 @@ pub fn close_prompts(
         write_prompts(state, short, &prompts);
     }
     prompts.len()
+}
+
+/// Whether `short` has a permission prompt open, shown or not: a key typed into its pane now could
+/// answer it (#864).
+pub fn prompt_open(state: &super::state::StateDir, short: &str) -> bool {
+    !read_prompts(state, short).is_empty()
+}
+
+/// A `permission_prompt` notification: Claude has shown a dialog for about six seconds, so every
+/// prompt the session has open is confirmed and the Approval latch rises with the newest one's
+/// evidence, or `fallback` when none is on record (a network approval has no request). One lock
+/// covers both writes, so no clear can land between them (#864).
+pub fn confirm_prompts(
+    state: &super::state::StateDir,
+    short: &str,
+    fallback: &str,
+    now: u64,
+) -> SessionStatus {
+    let _ = super::state::create_private_dir_all(&state.attention());
+    let _guard = lock_status(state, short);
+    let mut prompts = read_prompts(state, short);
+    for open in &mut prompts {
+        open.confirmed = true;
+    }
+    if !prompts.is_empty() {
+        write_prompts(state, short, &prompts);
+    }
+    let evidence = prompts
+        .iter()
+        .max_by_key(|open| open.at)
+        .map(|open| open.evidence.clone())
+        .filter(|evidence| !evidence.is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    let observation = Observation::new(Authority::AdapterHook, evidence, 100, now)
+        .with_attention(Attention::Approval);
+    let next = compose(Some(&load(state, short)), &[observation], now);
+    persist(state, short, &next);
+    next
+}
+
+/// Closes the prompts `closes` selects and, under the same lock, ends an Approval or Question latch
+/// once no confirmed prompt is left. A prompt confirmed concurrently is either seen here and keeps
+/// the latch, or confirms afterwards and raises it again (#854, #864). The unlocked first read keeps
+/// the common hook call with nothing pending free of any lock (#456).
+pub fn resolve_prompts(
+    state: &super::state::StateDir,
+    short: &str,
+    closes: impl Fn(&OpenPrompt) -> bool,
+    observation: Observation,
+    now: u64,
+) {
+    let waiting = |attention| matches!(attention, Attention::Approval | Attention::Question);
+    if !prompts_path(state, short).exists() && !waiting(load(state, short).attention) {
+        return;
+    }
+    let _guard = lock_status(state, short);
+    let mut prompts = read_prompts(state, short);
+    let before = prompts.len();
+    prompts.retain(|open| !closes(open));
+    if prompts.len() != before {
+        write_prompts(state, short, &prompts);
+    }
+    if prompts.iter().any(|open| open.confirmed) {
+        return;
+    }
+    let prev = load(state, short);
+    if !waiting(prev.attention) {
+        return;
+    }
+    persist(
+        state,
+        short,
+        &compose(Some(&prev), std::slice::from_ref(&observation), now),
+    );
 }
 
 /// Reads the persisted status for `short`, or a fresh default when the file

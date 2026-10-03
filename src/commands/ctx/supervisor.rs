@@ -37,8 +37,14 @@ const REPORT_CAP: usize = 64 * 1024;
 const LAST_ADVICE_CHARS: usize = 200;
 const SEEN_KEEP: usize = 16;
 const TRIGGERS_KEEP: usize = 20;
-const HELPER_BUDGET_TOKENS: u64 = 60_000;
-const HELPER_MAX_TOOL_CALLS: u32 = 10;
+const HELPER_MAX_TOOL_CALLS: u32 = 4;
+/// The exec budget sums every turn's whole context (cache reads included), so a consult costs
+/// one turn's context per turn, not its brief once. A real Claude consult measured 42k context
+/// on turn 1 and 47k on turn 2 (91,012 in all, #866); 50k per turn covers that with growth, and
+/// 5k per turn covers its reasoning output (2k observed).
+const HELPER_TURN_TOKENS: u64 = 55_000;
+/// One turn per tool call plus the answering turn.
+const HELPER_BUDGET_TOKENS: u64 = HELPER_TURN_TOKENS * (HELPER_MAX_TOOL_CALLS as u64 + 1);
 const ASK_TIMEOUT_SECS: u64 = 180;
 const ASK_GRACE_SECS: u64 = 20;
 
@@ -170,6 +176,25 @@ struct SessionState {
     tickets: Vec<String>,
     /// Ask reservations their parent has not settled yet; a refund needs its id here, so it is idempotent.
     reserved: Vec<String>,
+    /// Consults running now (asks and fired ones): `state` is `advising` while any is.
+    inflight: u32,
+}
+
+impl SessionState {
+    fn consult_started(&mut self) {
+        self.inflight = self.inflight.saturating_add(1);
+        self.state = "advising".to_string();
+    }
+
+    fn consult_settled(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.state = if self.inflight == 0 {
+            "idle"
+        } else {
+            "advising"
+        }
+        .to_string();
+    }
 }
 
 /// One session's consult state as the agent tree shows it.
@@ -181,6 +206,11 @@ pub(crate) struct Snapshot {
     pub advising: bool,
     /// The moment that fired most recently.
     pub last_trigger: Option<Trigger>,
+    /// The newest recorded trigger name as stored, which includes `ask` (not a `Trigger`).
+    pub last_name: String,
+    /// When the state file was last written (unix seconds): the start of a running consult, the end of
+    /// the last one. The state records no timestamps of its own.
+    pub updated: Option<u64>,
 }
 
 /// Read-only state for `session`; absent state is the idle zero snapshot.
@@ -195,7 +225,23 @@ pub(crate) fn snapshot(state: &StateDir, session: &str) -> Snapshot {
         last_advice: st.last_advice,
         advising: st.state == "advising",
         last_trigger: st.triggers.last().and_then(|name| Trigger::from_name(name)),
+        last_name: st.triggers.last().cloned().unwrap_or_default(),
+        updated: std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs()),
     }
+}
+
+/// The newest `n` rulings recorded for `session`, open or not, oldest first.
+pub(crate) fn recent_rulings(state: &StateDir, session: &str, n: usize) -> Vec<Ruling> {
+    let mut mine: Vec<Ruling> = rulings::all(state)
+        .into_iter()
+        .filter(|ruling| ruling.session == session)
+        .collect();
+    mine.drain(..mine.len().saturating_sub(n));
+    mine
 }
 
 /// What a trigger asks a consult to look at.
@@ -334,7 +380,7 @@ pub(crate) fn fire(
         request.trigger.as_str().to_string(),
         TRIGGERS_KEEP,
     );
-    next.state = "advising".to_string();
+    next.consult_started();
     save_state(&path, &next);
     if spawn(&request) {
         return true;
@@ -747,7 +793,9 @@ fn consult_agent_args(
         task_class: Some(log::TaskClass::Review),
         system_prompt: Some(ruling_instructions(kind)),
         budget_tokens: Some(HELPER_BUDGET_TOKENS),
-        max_tool_calls: Some(HELPER_MAX_TOOL_CALLS),
+        // exec refuses a tool cap for an adapter that cannot count tool calls (codex), so only
+        // a counting harness gets it; elsewhere the turn-derived token budget alone bounds the run.
+        max_tool_calls: adapter.counts_tool_calls().then_some(HELPER_MAX_TOOL_CALLS),
         timeout_secs,
         flags,
         ..Default::default()
@@ -879,7 +927,7 @@ fn consult_with(
     });
     let _lock = lock_beside(&path);
     let mut session = load_state(&path);
-    session.state = "idle".to_string();
+    session.consult_settled();
     session.tokens_read += tokens;
     match outcome {
         Ok(Some(ruling)) => {
@@ -897,6 +945,14 @@ fn consult_with(
         Err(error) => log_fallback(state, &request.session, &error.to_string()),
     }
     save_state(&path, &session);
+}
+
+/// A failed helper's reason: the exit code plus what zirv's own codes (77 = budget spent) mean.
+fn helper_exit_error(code: i32) -> String {
+    format!(
+        "supervisor helper exited {code}: {}",
+        super::exec::describe_exit(code)
+    )
 }
 
 /// The real helper runner: a read-only delegation through `agent::run_with`.
@@ -918,7 +974,7 @@ fn delegated_report(
     };
     let code = super::agent::run_with(&args, &mut output, repo, &env)?;
     if code != 0 {
-        return Err(format!("supervisor helper exited {code}").into());
+        return Err(helper_exit_error(code).into());
     }
     crate::commands::workflow::review::reviewer_report(&output, REPORT_CAP)
 }
@@ -1065,6 +1121,15 @@ fn run_consult(
 /// What `ask` needs from the consult: the one seam its tests stub.
 type AskConsult<'a> = &'a dyn Fn(&str, &[String], &str, u64, &str) -> CtxResult<Option<Ruling>>;
 
+/// When an `ask` stops waiting. An absurd `--timeout-secs` must not overflow the clock (a panic
+/// between reserve and settle would leave the session advising): with no representable deadline
+/// the wait has none.
+fn ask_deadline(timeout_secs: u64) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(std::time::Duration::from_secs(
+        timeout_secs.saturating_add(ASK_GRACE_SECS),
+    ))
+}
+
 /// The real consult for `ask`: the same detached-consult child, but waited on, with the options
 /// on its command line and the evidence on its stdin. The child carries `CONSULT_ENV`, so the
 /// helper session it launches can never trigger a consult of its own.
@@ -1108,10 +1173,9 @@ fn spawn_ask_consult(
             text
         })
     });
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + ASK_GRACE_SECS);
+    let deadline = ask_deadline(timeout_secs);
     while child.try_wait()?.is_none() {
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             let _ = child.kill();
             let _ = child.wait();
             return Err("the supervisor did not answer in time".into());
@@ -1171,6 +1235,7 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
     // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
     current.reserved.push(ticket.clone());
+    current.consult_started();
     save_state(&path, &current);
     Some(ticket)
 }
@@ -1189,6 +1254,7 @@ fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
         return;
     };
     current.reserved.remove(at);
+    current.consult_settled();
     if refund {
         current.calls = current.calls.saturating_sub(1);
         if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
@@ -1771,6 +1837,92 @@ mod tests {
         );
     }
 
+    /// Issue #866: the budget sums every turn's whole context, so the consult's must cover the
+    /// measured two-turn Claude consult (91,012 tokens) and every turn its tool cap allows.
+    #[test]
+    fn the_consult_budget_covers_a_measured_consult_and_its_tool_cap() {
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.harness = "claude".to_string();
+        let args =
+            consult_agent_args(&cfg, RulingKind::Choice, "p".to_string(), None).expect("args");
+        assert_eq!(args.max_tool_calls, Some(HELPER_MAX_TOOL_CALLS));
+        let budget = super::super::agent::WorkerBudget {
+            tokens: args.budget_tokens,
+            tool_calls: args.max_tool_calls,
+        };
+        let usage = |input, creation, read, output| super::super::event::TranscriptUsage {
+            input_tokens: input,
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read,
+            output_tokens: output,
+        };
+        // The two turns of the live consult: 44,057 + 46,955 = 91,012.
+        let measured = usage(2 + 32, 42_045 + 4_629, 42_045, 2_010 + 249);
+        assert_eq!(super::super::agent::token_spend(&measured), 91_012);
+        assert!(
+            !matches!(
+                super::super::agent::budget_state(&budget, &measured, 1),
+                super::super::agent::BudgetState::HardStop { .. }
+            ),
+            "the measured consult must not be stopped"
+        );
+        // Every allowed turn at the observed ~47k context and 2k output stays under the ceiling.
+        let turns = u64::from(HELPER_MAX_TOOL_CALLS) + 1;
+        assert!(args.budget_tokens.expect("budget") > turns * (47_000 + 2_000));
+    }
+
+    /// Issue #866: a consult whose helper hit the budget is refunded once and says so plainly.
+    /// A codex consult carries no tool cap (exec's preflight refuses one) yet keeps the token
+    /// budget; the claude consult keeps its 4-call cap and 275k budget.
+    #[test]
+    fn only_a_tool_counting_harness_gets_the_consult_tool_cap() {
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.harness = "codex".to_string();
+        let codex =
+            consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("codex");
+        assert_eq!(codex.max_tool_calls, None);
+        assert_eq!(codex.budget_tokens, Some(275_000));
+        let adapter = super::super::adapters::all(None)
+            .into_iter()
+            .find(|candidate| candidate.name() == "codex")
+            .expect("codex adapter");
+        assert!(
+            codex.max_tool_calls.is_none() || adapter.counts_tool_calls(),
+            "exec's preflight would refuse this argv"
+        );
+        cfg.supervisor.harness = "claude".to_string();
+        let claude =
+            consult_agent_args(&cfg, RulingKind::Plan, "p".to_string(), None).expect("claude");
+        assert_eq!(claude.max_tool_calls, Some(4));
+        assert_eq!(claude.budget_tokens, Some(275_000));
+    }
+
+    #[test]
+    fn an_exhausted_consult_is_refunded_once_and_reports_the_budget() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let options = vec!["a".to_string(), "b".to_string()];
+        let exhausted =
+            |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
+                Err(helper_exit_error(super::super::exec::EXIT_BUDGET_EXHAUSTED).into())
+            };
+        let mut out = Vec::new();
+        let code = run_ask_with("q", &options, "", 5, &lookup, &exhausted, &mut out).expect("ask");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 1);
+        assert!(
+            text.contains("exited 77") && text.contains("token/tool-call budget was spent"),
+            "{text}"
+        );
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!(
+            (row.calls, row.tickets.len(), row.reserved.len()),
+            (0, 0, 0)
+        );
+    }
+
     #[test]
     fn the_prompt_is_bounded_and_carries_only_the_diffstat() {
         let mut req = request(Trigger::ErrorRepeats);
@@ -2186,6 +2338,64 @@ mod tests {
         settle_ask_call(&state, "operator", &other, false);
         settle_ask_call(&state, "operator", &other, true);
         assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn the_session_stays_advising_until_the_last_overlapping_consult_settles() {
+        let (_dir, state) = fresh_state();
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.max_calls = 5;
+        let id = reserve_ask_call(&state, &cfg, "abcd1234").expect("reserved");
+        assert!(fire(
+            &state,
+            &cfg,
+            &no_env,
+            request(Trigger::BeforePlan),
+            None,
+            &|_| true
+        ));
+        let advising = || snapshot(&state, "abcd1234").advising;
+        settle_ask_call(&state, "abcd1234", &id, false);
+        assert!(advising(), "the fired consult still runs");
+        consult_with(
+            &state,
+            &cfg,
+            &request(Trigger::BeforePlan),
+            &|_| Err("boom".into()),
+            &|_| panic!("nothing to deliver"),
+        );
+        assert!(!advising(), "the last one settled");
+    }
+
+    #[test]
+    fn an_absurd_ask_timeout_cannot_overflow_the_deadline() {
+        assert!(ask_deadline(u64::MAX).is_none());
+        assert!(ask_deadline(180).is_some());
+    }
+
+    #[test]
+    fn an_ask_is_advising_from_its_reservation_until_it_settles_and_a_failure_returns_to_idle() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let running = snapshot(&state, "operator");
+        assert!((running.advising, running.last_name.as_str()) == (true, "ask"));
+        assert!(running.updated.is_some(), "the mtime marks its start");
+        settle_ask_call(&state, "operator", &id, true);
+        let failed = snapshot(&state, "operator");
+        assert!(
+            !failed.advising && failed.calls == 0,
+            "a failed ask settles to idle"
+        );
+        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        settle_ask_call(&state, "operator", &id, false);
+        assert!(
+            !snapshot(&state, "operator").advising,
+            "a ruled ask settles to idle"
+        );
     }
 
     #[test]

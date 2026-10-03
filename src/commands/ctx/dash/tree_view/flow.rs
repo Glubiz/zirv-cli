@@ -62,6 +62,7 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
     match st {
         St::Done => format!("done {} ago", since(node.ended_at)),
         St::Failed => format!("failed {} ago", since(node.ended_at)),
+        St::Idle if node.kind == "supervisor" && node.ended_at.is_none() => "idle".to_string(),
         St::Idle if parked(node) => format!("idle {}", since(node.ended_at)),
         St::Idle => "not started".to_string(),
         _ => content::node_elapsed(node, wall).unwrap_or_default(),
@@ -70,6 +71,24 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
 
 /// The NOW line of a card or of SELECTED: what the agent is doing, with its colour.
 pub(super) fn now_line(node: &Node, st: St) -> (String, Rgb) {
+    // The supervisor's label is its consult budget (`1/3`), shown on every state.
+    if node.kind == "supervisor" {
+        let budget = format!("{} consults", node.label.as_deref().unwrap_or_default());
+        return match (st, node_steps(node).last()) {
+            // A running consult's step carries the moment that fired it as its argument.
+            (St::Running, Some(step)) => (
+                format!(
+                    "\u{25b8} {} \u{b7} {budget}",
+                    Some(step.arg.as_str())
+                        .filter(|arg| !arg.is_empty())
+                        .unwrap_or("consulting")
+                ),
+                c::FG,
+            ),
+            (_, Some(_)) => (format!("ruled \u{b7} {budget}"), c::FG),
+            _ => (format!("idle \u{b7} {budget}"), c::DIM),
+        };
+    }
     match st {
         St::Waiting => ("waiting for you".into(), c::WARN),
         St::Done => ("finished".into(), c::OK),
@@ -115,7 +134,8 @@ pub(super) fn split(ctx: &Ctx) -> (Vec<usize>, Vec<usize>) {
             St::Done => node
                 .ended_at
                 .is_none_or(|end| ctx.wall.saturating_sub(end) >= FOLD_SECS),
-            St::Idle if parked(node) => {
+            // The supervisor always keeps its own card.
+            St::Idle if parked(node) && node.kind != "supervisor" => {
                 idle_cards += 1;
                 idle_cards > IDLE_CARDS
             }
@@ -692,7 +712,13 @@ fn card(s: &mut Scene, ctx: &Ctx, agent: &Agent, (x, y, w, h): (i32, i32, i32, i
     for i in x + 2..x + w - 2 {
         s.grid.put(i, y + 4, '─', Some(rule), None, false);
     }
-    let (now_text, nc) = now_line(node, st);
+    let (mut now_text, nc) = now_line(node, st);
+    // The supervisor's budget is never cut mid-word: `2/3 consults` gives way to `2/3`.
+    if node.kind == "supervisor" && now_text.chars().count() as i32 > iw {
+        now_text = now_text
+            .strip_suffix(" consults")
+            .map_or(now_text.clone(), str::to_string);
+    }
     s.grid.text(x + 2, y + 5, &cut(&now_text, iw), nc);
     for (k, (age, label)) in recent(node, st, ctx.wall, 4).into_iter().enumerate() {
         let row = y + 6 + k as i32;

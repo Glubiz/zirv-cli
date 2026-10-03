@@ -782,6 +782,18 @@ fn answer_shown(model: &Model, shown: &[ShownApproval], sel: &Sel, decision: Dec
     }
 }
 
+/// The supervisor has no pane or mailbox: opening it reads out its newest ruling (SELECTED lists
+/// the rest). `None` for every other node.
+fn supervisor_notice(model: &Model, sel: &Sel) -> Option<Outcome> {
+    let node = model.node(sel).filter(|n| n.kind == "supervisor")?;
+    Some(Outcome::Notice(
+        match node.steps.iter().rev().find(|s| s.tool == "ruled") {
+            Some(step) => format!("supervisor ruled {}", step.arg),
+            None => "the supervisor has not ruled yet".to_string(),
+        },
+    ))
+}
+
 /// Open a node's harness: its own pane's chat, or for an agent without a pane the chat of the
 /// session it runs inside. When even that has no pane here, say which session it is. The second
 /// value is the new `opened` node, when this changes it.
@@ -792,6 +804,9 @@ fn open_sel(model: &Model, sel: &Sel) -> (Outcome, Option<Option<Sel>>) {
     }
     if let Some(short) = model.selected_pane(sel) {
         return (Outcome::OpenPane(short), Some(None));
+    }
+    if let Some(notice) = supervisor_notice(model, sel) {
+        return (notice, None);
     }
     let Some(node) = model.node(sel) else {
         let notice = Outcome::Notice(format!("{} has no pane to open", name_of(model, sel)));
@@ -854,6 +869,9 @@ fn retry(model: &Model, sel: &Sel) -> Outcome {
 }
 
 fn open(model: &Model, sel: &Sel) -> Outcome {
+    if let Some(notice) = supervisor_notice(model, sel) {
+        return notice;
+    }
     match model.selected_pane(sel) {
         Some(short) => Outcome::OpenPane(short),
         None => Outcome::Notice(format!("{} has no pane to open", name_of(model, sel))),
@@ -872,7 +890,10 @@ fn answer(model: &Model, sel: &Sel, decision: Decision) -> Outcome {
 fn mail(model: &Model, sel: &Sel) -> Outcome {
     let harness = match sel {
         Sel::Seat => model.facts.seat_harness,
-        _ => model.node(sel).and_then(|n| n.harness.as_deref()),
+        _ => model
+            .node(sel)
+            .filter(|n| n.kind != "supervisor")
+            .and_then(|n| n.harness.as_deref()),
     };
     match harness {
         Some(to) => Outcome::Mail { to: to.to_string() },
@@ -1043,6 +1064,42 @@ mod tests {
                 to: "claude".into()
             }
         );
+    }
+
+    #[test]
+    fn in_the_narrow_layout_enter_and_m_on_the_supervisor_open_no_pane_and_mail_nobody() {
+        let mut data = fixture();
+        let fact = super::super::SupervisorFact {
+            harness: "codex".into(),
+            model: "gpt-6-astra".into(),
+            calls: 1,
+            max_calls: 3,
+            tokens_read: 0,
+            advice: String::new(),
+            advising: false,
+            last: None,
+            updated: Some(1_200),
+            trigger: String::new(),
+            ruled: vec![(1_200, "plan revise: split the work".into())],
+        };
+        data.nodes
+            .push(super::super::supervisor_node(&fact, Some("seat-1")));
+        let mut view = view(data);
+        let mut f = facts(None);
+        f.pane_shorts = vec!["supervis".into(), "seat-1".into()];
+        view.selected = Sel::Agent("~".into());
+        assert_eq!(
+            press(&mut view, &f, KeyCode::Enter),
+            Outcome::Notice("supervisor ruled plan revise: split the work".into())
+        );
+        assert!(matches!(
+            press(&mut view, &f, KeyCode::Char('m')),
+            Outcome::Notice(_)
+        ));
+        assert!(matches!(
+            press(&mut view, &f, KeyCode::Char('y')),
+            Outcome::Notice(_)
+        ));
     }
 
     #[test]

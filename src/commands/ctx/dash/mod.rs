@@ -806,9 +806,11 @@ fn run_dashboard_inner(
         // Approvals inbox (#840): drain requests, then give the strip its rows (none while nothing is pending).
         if let Some(hub) = approvals_hub.as_mut() {
             hub.poll(&|short| panes.iter().any(|pane| pane.short() == short));
+            // A released request stays while its prompt is open, latched or still unconfirmed (#864).
             hub.drop_released_unless(&|short| {
                 super::attention::load(state, short).attention
                     == super::attention::Attention::Approval
+                    || super::attention::prompt_open(state, short)
             });
         }
         let tick_term = crossterm::terminal::size().unwrap_or((term_cols, term_rows));

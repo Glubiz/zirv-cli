@@ -106,6 +106,14 @@ pub(crate) const CLAUDE_PERMISSION_REQUEST_HOOK: (&str, Option<&str>, &str) =
 /// Sibling of `CLAUDE_PERMISSION_REQUEST_HOOK` above; see its doc comment.
 pub(crate) const CLAUDE_PERMISSION_DENIED_HOOK: (&str, Option<&str>, &str) =
     ("PermissionDenied", None, "zirv ctx hook permission");
+/// Issue #864: the `permission_prompt` notification Claude sends once a permission dialog has
+/// waited about six seconds; only it raises the NEEDS YOU latch, since a request alone may resolve
+/// with no dialog. Same command and slot-scoped install as its two siblings above.
+pub(crate) const CLAUDE_PERMISSION_PROMPT_HOOK: (&str, Option<&str>, &str) = (
+    "Notification",
+    Some("permission_prompt"),
+    "zirv ctx hook permission",
+);
 
 /// Issue #774: claude's `SubagentStop` hook, fired once a native `Task`
 /// subagent's own turn ends -- gates a small set of cheap, deterministic
@@ -133,12 +141,13 @@ pub(crate) const CLAUDE_TOOL_FAILURE_HOOK: (&str, Option<&str>, &str) =
 /// #769: its own job now lives inside `CLAUDE_REHYDRATE_HOOK`'s dispatch, see
 /// that constant's own doc comment) -- it stays defined above only for the
 /// legacy-slot migration and self-suppression checks.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 7] = [
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 8] = [
     CLAUDE_REHYDRATE_HOOK,
     CLAUDE_SESSION_START_HOOK,
     CLAUDE_COMPACT_OUTPUT_HOOK,
     CLAUDE_PERMISSION_REQUEST_HOOK,
     CLAUDE_PERMISSION_DENIED_HOOK,
+    CLAUDE_PERMISSION_PROMPT_HOOK,
     CLAUDE_SUBAGENT_STOP_HOOK,
     CLAUDE_SUBAGENT_START_HOOK,
 ];
@@ -5320,6 +5329,15 @@ mod tests {
             ),
             "PermissionDenied must carry the permission hook too, independently of \
              PermissionRequest: {settings}"
+        );
+        assert!(
+            command_live_at_slot(
+                &settings,
+                "Notification",
+                Some("permission_prompt"),
+                "zirv ctx hook permission"
+            ),
+            "a shown permission dialog must reach the permission hook (#864): {settings}"
         );
 
         let (hooks_added_again, _) =

@@ -576,13 +576,14 @@ mod tests {
     use super::super::permission::run_permission;
     use super::super::prompt::run_prompt;
     use super::super::tests::{
-        SCOPE_GUARD_T24_PROMPT, SEAT, decide, permission_env, permission_stdin,
-        scope_guard_bash_posttool_stdin, scope_guard_prompt_stdin, scope_guard_shell_rig,
+        SCOPE_GUARD_T24_PROMPT, SEAT, decide, permission_env, permission_prompt_notification,
+        permission_stdin, scope_guard_bash_posttool_stdin, scope_guard_prompt_stdin,
+        scope_guard_shell_rig,
     };
     use super::*;
 
-    /// A `PermissionRequest` raises `Attention::Approval`; a `PostToolUse` for
-    /// the SAME tool that just ran is proof the prompt is gone.
+    /// A `PermissionRequest` whose dialog Claude reports shown raises `Attention::Approval`; a
+    /// `PostToolUse` for the SAME tool that just ran is proof the prompt is gone.
     #[test]
     fn posttool_after_a_permission_request_clears_approval() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -603,10 +604,17 @@ mod tests {
             &lookup,
         )
         .expect("never errors");
+        run_permission(&mut out, &permission_prompt_notification(), &lookup).expect("never errors");
+        let latched = crate::commands::ctx::attention::load(&state, &short);
         assert_eq!(
-            crate::commands::ctx::attention::load(&state, &short).attention,
+            latched.attention,
             crate::commands::ctx::attention::Attention::Approval,
-            "the request must raise the latch before the assertion below means anything"
+            "the shown dialog must raise the latch before the assertion below means anything"
+        );
+        assert!(
+            crate::commands::ctx::attention::reason(&latched).contains("Bash: echo hi"),
+            "the latch names the request it waits on: {}",
+            crate::commands::ctx::attention::reason(&latched)
         );
 
         let posttool_stdin = serde_json::json!({
@@ -666,6 +674,8 @@ mod tests {
             )
             .expect("never errors");
         }
+        run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+            .expect("never errors");
 
         post("Read", "");
         assert_eq!(load(&state, &short).attention, Attention::Approval);
@@ -673,6 +683,101 @@ mod tests {
         assert_eq!(load(&state, &short).attention, Attention::Approval);
         post("Bash", "echo b");
         assert_eq!(load(&state, &short).attention, Attention::None);
+    }
+
+    /// #864: a `PermissionRequest` alone is no dialog. Auto-mode background subagents get requests
+    /// that resolve in about a second with nothing shown, so with no `permission_prompt`
+    /// notification no latch rises at any point, and the finished call still closes its entry.
+    #[test]
+    fn a_permission_request_without_a_shown_dialog_never_latches() {
+        use crate::commands::ctx::attention::{Attention, close_prompts, load};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        run_permission(
+            &mut Vec::new(),
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "cargo nextest run"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(load(&state, &short).attention, Attention::None);
+        assert_eq!(close_prompts(&state, &short, |_| false), 1, "still tracked");
+        let stdin = serde_json::json!({
+            "session_id": "abc123", "tool_name": "Bash", "tool_input": {"command": "cargo nextest run"},
+            "tool_response": {"stdout": "", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo", "tool_use_id": "toolu_x",
+        })
+        .to_string();
+        run_posttool(&mut Vec::new(), &stdin, &lookup).expect("never errors");
+        assert_eq!(load(&state, &short).attention, Attention::None);
+        assert_eq!(close_prompts(&state, &short, |_| false), 0);
+    }
+
+    /// #864: a dialog Claude reports shown with no request on record (a sandboxed command's network
+    /// approval has no `PermissionRequest`) still latches, generically, so it is never hidden.
+    #[test]
+    fn a_shown_dialog_with_no_request_on_record_latches_generically() {
+        use crate::commands::ctx::attention::{Attention, load, reason};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+            .expect("never errors");
+        let status = load(&state, &short);
+        assert_eq!(status.attention, Attention::Approval);
+        assert!(
+            reason(&status).contains("Claude needs your permission to use Bash"),
+            "{}",
+            reason(&status)
+        );
+    }
+
+    /// #864 with #854: the latch belongs to the dialogs Claude reported shown. A request still
+    /// unconfirmed when the shown one resolves does not hold the latch; its own notification will.
+    #[test]
+    fn an_unconfirmed_request_does_not_hold_the_latch_of_a_resolved_one() {
+        use crate::commands::ctx::attention::{Attention, close_prompts, load};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = permission_env(&dir.path().join("state"));
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = crate::commands::ctx::sessions::short_id("abc123");
+        let request = |command: &str| {
+            run_permission(
+                &mut Vec::new(),
+                &permission_stdin(
+                    Some("PermissionRequest"),
+                    "Bash",
+                    serde_json::json!({ "command": command }),
+                ),
+                &lookup,
+            )
+            .expect("never errors");
+        };
+        request("echo a");
+        run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+            .expect("never errors");
+        request("echo b");
+        let stdin = serde_json::json!({
+            "session_id": "abc123", "tool_name": "Bash", "tool_input": {"command": "echo a"},
+            "tool_response": {"stdout": "", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo", "tool_use_id": "toolu_a",
+        })
+        .to_string();
+        run_posttool(&mut Vec::new(), &stdin, &lookup).expect("never errors");
+        assert_eq!(load(&state, &short).attention, Attention::None);
+        assert_eq!(close_prompts(&state, &short, |_| false), 1, "b stays open");
+        run_permission(&mut Vec::new(), &permission_prompt_notification(), &lookup)
+            .expect("never errors");
+        assert_eq!(load(&state, &short).attention, Attention::Approval);
     }
 
     /// A guard, not an unconditional clear: a `PostToolUse` firing while the

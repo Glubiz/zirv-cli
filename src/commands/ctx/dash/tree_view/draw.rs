@@ -264,7 +264,7 @@ fn header(c: &mut Canvas, m: &Model, plan: &Plan) {
         (Some(a), false) => {
             arch_part.push(span(sep, pal::dim()));
             arch_part.push(span(
-                format!("supervisor on \u{b7} {}/{}", a.calls, a.max_calls),
+                format!("supervisor on \u{b7} {}/{} consults", a.calls, a.max_calls),
                 pal::fg(pal::ARCH),
             ));
         }
@@ -286,6 +286,19 @@ fn header(c: &mut Canvas, m: &Model, plan: &Plan) {
     ];
     let width = usize::from(w);
     let fits = |l: &[Span], r: &[Span]| spans_width(l) + spans_width(r) + 3 <= width;
+    // The compact chip says `consults`; where that would push it out of the header it keeps the short form.
+    if let (Some(a), false) = (&m.data.supervisor, full) {
+        let long: Vec<Span> = left.iter().chain(&arch_part).cloned().collect();
+        if !fits(&long, &scope) {
+            arch_part = vec![
+                span(sep, pal::dim()),
+                span(
+                    format!("supervisor on \u{b7} {}/{}", a.calls, a.max_calls),
+                    pal::fg(pal::ARCH),
+                ),
+            ];
+        }
+    }
     let with_arch: Vec<Span> = left.iter().chain(&arch_part).cloned().collect();
     let mut right: Vec<Span> = scope.iter().chain(&hint).cloned().collect();
     if fits(&with_arch, &right) {
@@ -882,11 +895,11 @@ fn draw_sidecar(c: &mut Canvas, m: &Model, plan: &Plan, side: Rect) {
     };
     let usage = vec![
         vec![
-            span("calls", pal::dim()),
             span(
-                format!(" {}/{}", a.calls, a.max_calls),
+                format!("{}/{}", a.calls, a.max_calls),
                 pal::strong(pal::ARCH),
             ),
+            span(" consults", pal::dim()),
         ],
         vec![
             span("tokens read ", pal::dim()),
@@ -1404,7 +1417,7 @@ mod tests {
             "\u{25c6} error repeats",
             "\u{25c7} before done",
             "\u{bb} fixture path wrong",
-            "calls 1/3",
+            "1/3 consults",
             "tokens read 224k",
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
