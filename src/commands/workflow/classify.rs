@@ -516,6 +516,11 @@ const BUGFIX_ANYWHERE: &[&str] = &[
     "corrupt",
     "corrupted",
 ];
+/// Error words a feature request uses for the behaviour it asks for ("print an error to stderr"); a bare "error" is a symptom.
+const CONTRACT_ERROR_WORDS: &[&str] = &["error", "errors", "exception", "exceptions"];
+/// A feature word right after one of these is a symptom ("cannot add"), not a request.
+const NEGATED_FEATURE_PRECEDERS: &[&str] =
+    &["cannot", "can", "t", "not", "unable", "fails", "failed"];
 const REFACTOR_ANYWHERE: &[&str] = &[
     "refactor",
     "refactoring",
@@ -610,8 +615,47 @@ fn leading_intent(tokens: &[&str], start: usize) -> Option<Intent> {
 /// fixed priority order, only reached when tier 1 found no leading verb.
 fn tier2_intent(tokens: &[&str]) -> Option<Intent> {
     let has_does_nothing = tokens.windows(2).any(|pair| pair == ["does", "nothing"]);
-    if has_does_nothing || tokens.iter().any(|token| BUGFIX_ANYWHERE.contains(token)) {
-        return Some(Intent::Bugfix);
+    let bug_words = || {
+        tokens
+            .iter()
+            .filter(|token| BUGFIX_ANYWHERE.contains(token))
+    };
+    // A feature request often names its error contract ("an error to stderr", "exit 2",
+    // "not an error", "ties broken", "not corrupted", "a fixed amount"); only those uses are not a bug report.
+    let is_contract_use = |index: usize| {
+        let token = tokens[index];
+        let before = |back: usize| index.checked_sub(back).map(|at| tokens[at]);
+        if CONTRACT_ERROR_WORDS.contains(&token) {
+            let to_stderr = (1..=3).any(|ahead| {
+                tokens
+                    .get(index + ahead)
+                    .is_some_and(|t| matches!(*t, "stderr" | "exit"))
+            });
+            let negated =
+                matches!(before(1), Some("a" | "an")) && matches!(before(2), Some("not" | "as"));
+            return to_stderr || negated;
+        }
+        (token == "fixed" && matches!(before(1), Some("a" | "an")))
+            || (token == "broken" && before(1) == Some("ties"))
+            || (matches!(token, "corrupt" | "corrupted") && before(1) == Some("not"))
+    };
+    let only_contract_words = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| BUGFIX_ANYWHERE.contains(token))
+        .all(|(index, _)| is_contract_use(index));
+    let asks_for_feature = tokens.iter().enumerate().any(|(index, token)| {
+        FEATURE_ANYWHERE.contains(token)
+            && !(index > 0 && NEGATED_FEATURE_PRECEDERS.contains(&tokens[index - 1]))
+    });
+    if has_does_nothing || bug_words().next().is_some() {
+        return Some(
+            if only_contract_words && !has_does_nothing && asks_for_feature {
+                Intent::Feature
+            } else {
+                Intent::Bugfix
+            },
+        );
     }
     let has_clean_up = tokens.windows(2).any(|pair| pair == ["clean", "up"]);
     let has_dead_code = tokens.windows(2).any(|pair| pair == ["dead", "code"]);
@@ -1070,6 +1114,132 @@ mod tests {
             let lowered = task.to_ascii_lowercase();
             assert_eq!(
                 infer_intent(&lowered),
+                *expected,
+                "task {task:?} should classify as {expected:?}"
+            );
+        }
+    }
+
+    /// Benchmark finding: a feature request that specifies its error contract
+    /// ("print an error", "ties broken", "not corrupted") is a Feature, while a
+    /// report of broken behaviour stays a Bugfix.
+    #[test]
+    fn a_feature_request_with_an_error_contract_is_a_feature() {
+        let cases: &[(&str, Intent)] = &[
+            (
+                "The ledger needs a way to export. Please add an export command. An unknown format prints an error to stderr and exits 2.",
+                Intent::Feature,
+            ),
+            (
+                "I'd like tags on transactions. Add a tagging module; a blank tag prints an error to stderr, and a malformed store is rejected.",
+                Intent::Feature,
+            ),
+            (
+                "Add an export command; values with commas are quoted correctly, not corrupted.",
+                Intent::Feature,
+            ),
+            (
+                "Add a goals list command sorted by percent complete, ties broken alphabetically by name.",
+                Intent::Feature,
+            ),
+            (
+                "Add a monthly report; a missing flag is a usage error on stderr, exit 2. Please add tests.",
+                Intent::Feature,
+            ),
+            (
+                "Add envelopes that each budget a fixed amount per month. Rejects (error to stderr, exit 2) an unknown name.",
+                Intent::Feature,
+            ),
+            (
+                "Silently skipped months are fine, not an error. Please add a monthly report.",
+                Intent::Feature,
+            ),
+            // An indicative verb in a symptom report reads like a spec but is a bug.
+            (
+                "The API returns an error when the cart is empty. Add a guard.",
+                Intent::Bugfix,
+            ),
+            (
+                "The parser throws an exception if the input has a BOM, add handling for it",
+                Intent::Bugfix,
+            ),
+            (
+                "The CLI exits with an error. Add a --force flag so it can proceed",
+                Intent::Bugfix,
+            ),
+            (
+                "It returns an error when the user has no email; add a default",
+                Intent::Bugfix,
+            ),
+            (
+                "The import raises an exception on blank rows. Please add skipping of blank rows.",
+                Intent::Bugfix,
+            ),
+            (
+                "The job exits with an exception when disk is full, add a retry",
+                Intent::Bugfix,
+            ),
+            (
+                "When I click save it prints an error. Add the missing handler",
+                Intent::Bugfix,
+            ),
+            (
+                "The service emits an error log on startup, please add the missing config",
+                Intent::Bugfix,
+            ),
+            // Symptom words stay bug words even when the report also asks to add something.
+            (
+                "Login fails with an error when the password is empty. Add a check for it.",
+                Intent::Bugfix,
+            ),
+            (
+                "Sorting is broken for dates. Add a comparator that handles timezones.",
+                Intent::Bugfix,
+            ),
+            (
+                "The CSV export is incorrect when a field contains a comma; it should be quoted. Add quoting.",
+                Intent::Bugfix,
+            ),
+            (
+                "The dashboard shows the wrong total after a refund. Please add the refund amount to it.",
+                Intent::Bugfix,
+            ),
+            (
+                "Users cannot log in. Add a fallback to the old auth path",
+                Intent::Bugfix,
+            ),
+            (
+                "Users get an error when they add an item to the cart",
+                Intent::Bugfix,
+            ),
+            (
+                "Intermittent failures in the nightly job; add logging to find out why",
+                Intent::Bugfix,
+            ),
+            (
+                "The tool cannot parse quoted fields. Add support.",
+                Intent::Bugfix,
+            ),
+            (
+                "Users cannot add items to the cart and get a wrong total",
+                Intent::Bugfix,
+            ),
+            (
+                "Something is off with the pagination. Can you find and fix whatever is causing this? Please add a test.",
+                Intent::Bugfix,
+            ),
+            (
+                "The import crashes on 1,234.50 and gives an error. Please add support for thousands separators.",
+                Intent::Bugfix,
+            ),
+            (
+                "tests/test_rules.py::test_regex is failing on this repo, please find the root cause",
+                Intent::Bugfix,
+            ),
+        ];
+        for (task, expected) in cases {
+            assert_eq!(
+                infer_intent(&task.to_ascii_lowercase()),
                 *expected,
                 "task {task:?} should classify as {expected:?}"
             );

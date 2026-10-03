@@ -801,5 +801,124 @@ class CompareJevTests(unittest.TestCase):
         self.assertIn("typesafe x1", table)
 
 
+class JudgeBlindingTests(unittest.TestCase):
+    def test_strip_zirv_marker_only_at_line_one(self):
+        strip = run_module.strip_zirv_marker
+        self.assertEqual(strip("[zirv]\nAll done."), "All done.")
+        self.assertEqual(strip("[zirv] Tagging is implemented."), "Tagging is implemented.")
+        self.assertEqual(strip("  [zirv]\r\nAll done."), "All done.")
+        self.assertEqual(strip("[zirv]"), "")
+        self.assertEqual(strip("Done.\n[zirv]\nmore"), "Done.\n[zirv]\nmore")
+        self.assertEqual(strip(None), "")
+
+    def test_every_judge_prompt_is_stripped(self):
+        prompts = []
+
+        def fake_call_judge(prompt, model="sonnet"):
+            prompts.append(prompt)
+            return {"score": 5, "reasoning": "x"}, "", []
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rubric = tmp / "rubric.md"
+        rubric.write_text("rubric", encoding="utf-8")
+        orig = run_module.call_judge
+        run_module.call_judge = fake_call_judge
+        self.addCleanup(setattr, run_module, "call_judge", orig)
+        run_module.call_quality_judge("p", tmp, "[zirv]\nQ-SINGLE")
+        run_module.call_quality_judge_chain(["p"], tmp, ["[zirv] Q-CHAIN"])
+        run_module.grade_step_judge(rubric, "p", tmp, "[zirv]\nQ-STEP")
+        self.assertEqual(len(prompts), 3)
+        for prompt in prompts:
+            self.assertNotIn("[zirv]", prompt)
+        self.assertIn("Q-SINGLE", prompts[0])
+        self.assertIn("Q-CHAIN", prompts[1])
+        self.assertIn("Q-STEP", prompts[2])
+
+
+class RunProvenanceTests(unittest.TestCase):
+    def test_archives_transcripts_and_records_version_and_effort(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        projects = tmp / "projects"
+        (projects / "slug-a").mkdir(parents=True)
+        (projects / "slug-b").mkdir(parents=True)
+        events = [{"type": "assistant", "effort": "low"}, {"type": "user"},
+                  {"type": "assistant", "effort": "medium"}, {"type": "assistant", "effort": "medium"},
+                  {"type": "assistant", "effort": "medium"}]
+        (projects / "slug-a" / "s1.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\nnot json\n", encoding="utf-8")
+        (projects / "slug-b" / "s2.jsonl").write_text(
+            json.dumps({"type": "assistant", "effort": "low"}) + "\n", encoding="utf-8")
+        run_dir = tmp / "run"
+        run_dir.mkdir()
+        orig = run_module.claude_version
+        run_module.claude_version = lambda: "9.9.9 (Claude Code)"
+        self.addCleanup(setattr, run_module, "claude_version", orig)
+        result = {}
+        run_module.record_run_provenance(run_dir, result, ["s1", "s2", "s1", None, "missing"], projects)
+        self.assertEqual(result["claude_version"], "9.9.9 (Claude Code)")
+        self.assertEqual(result["effort"], "medium")
+        self.assertEqual(result["effort_counts"], {"low": 2, "medium": 3})
+        self.assertEqual(result["transcripts"], ["s1.jsonl", "s2.jsonl"])
+        self.assertTrue((run_dir / "transcripts" / "s2.jsonl").exists())
+
+    def test_effort_is_null_without_a_transcript(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        orig = run_module.claude_version
+        run_module.claude_version = lambda: None
+        self.addCleanup(setattr, run_module, "claude_version", orig)
+        result = {}
+        run_module.record_run_provenance(tmp, result, ["nope"], tmp / "projects")
+        self.assertIsNone(result["effort"])
+        self.assertEqual(result["transcripts"], [])
+        self.assertFalse((tmp / "transcripts").exists())
+
+
+class NonZirvHooksTests(unittest.TestCase):
+    def test_zirv_hook_dropped_operator_hook_kept(self):
+        hooks = {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "~/.claude/hooks/enforce-rules.sh"}]},
+                {"matcher": "Edit", "hooks": [{"type": "command", "command": "zirv ctx hook pretool"}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "FOO=1 /usr/local/bin/zirv.exe ctx hook x"},
+                                               {"type": "command", "command": "~/bin/zirvish.sh"}]},
+            ],
+            "Stop": [{"hooks": [{"type": "command", "command": "zirv ctx hook stop"}]}],
+        }
+        kept = run_module.non_zirv_hooks(hooks)
+        self.assertEqual(list(kept), ["PreToolUse"])
+        commands = [h["command"] for g in kept["PreToolUse"] for h in g["hooks"]]
+        self.assertEqual(commands, ["~/.claude/hooks/enforce-rules.sh", "~/bin/zirvish.sh"])
+        self.assertEqual(kept["PreToolUse"][0]["matcher"], "Bash")
+
+    def test_windows_path_and_wrapper_forms_are_zirv_hooks(self):
+        dropped = [
+            r"C:\ProgramData\chocolatey\bin\zirv.exe ctx hook pretool",
+            r'"C:\Program Files\zirv\zirv.exe" ctx hook pretool',
+            "env FOO=1 zirv ctx hook pretool",
+            'sh -c "zirv ctx hook pretool"',
+            "cd /x && zirv ctx hook pretool",
+        ]
+        for command in dropped:
+            self.assertTrue(run_module._hook_runs_zirv(command), command)
+        for command in ["~/.claude/hooks/enforce-rules.sh", "~/bin/zirvish.sh", "zirv ctx status", ""]:
+            self.assertFalse(run_module._hook_runs_zirv(command), command)
+
+    def test_empty_hooks_add_nothing(self):
+        self.assertEqual(run_module.non_zirv_hooks({}), {})
+        self.assertEqual(run_module.non_zirv_hooks(None), {})
+
+
+class PosixExecutableTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "POSIX resolution only")
+    def test_resolved_executables_are_not_windows_paths(self):
+        for exe in (run_module.CLAUDE_EXE, run_module.ZIRV_FALLBACK,
+                    run_module.PYTHON_EXE, run_module.GIT_EXE, run_module.zirv_exe()):
+            self.assertNotIn("C:\\", exe)
+        self.assertEqual(run_module.resolve_exe("no-such-tool-xyz", r"C:\x.exe"), "no-such-tool-xyz")
+
+
 if __name__ == "__main__":
     unittest.main()

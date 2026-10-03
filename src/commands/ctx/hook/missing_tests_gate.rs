@@ -201,7 +201,9 @@ pub(super) fn missing_tests_gate_reason(
     Some(
         "zirv: this turn edited source files with no test of its own -- add a focused test for \
          each behaviour change the request asks for, asserting the exact formats, orderings and \
-         messages it states and the invalid-input/unhappy path, then run the test suite and \
+         messages it states and the invalid-input/unhappy path. Extend the existing test file or \
+         class for that code in place (never after an entry-point block, never re-declare a test \
+         class), then run the suite, confirm the test count rose by exactly your tests, and \
          finish."
             .to_string(),
     )

@@ -20,7 +20,10 @@ def _txn(i, d, amount, category=None):
 def _run(args):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = main(args)
+        try:
+            code = main(args)
+        except SystemExit as exc:  # argparse's parser.error() exits 2 instead of returning it
+            code = exc.code
     return code, out.getvalue(), err.getvalue()
 
 
@@ -170,7 +173,7 @@ class TestReportCli(unittest.TestCase):
         code, out, err = _run(["report", "--trend", "groceries", "--store", self.store_path])
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
-        self.assertTrue(err.strip())
+        self.assertIn("months", err.lower())  # the error must name the missing flag, not just any exit 2
 
     def test_year_and_trend_together_is_rejected(self):
         code, out, _err = _run_expect_systemexit(

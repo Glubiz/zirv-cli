@@ -62,6 +62,9 @@ Invocation: `python grade.py <repo_dir> <result_text_file>` (cwd irrelevant). Pr
  "subagents_spawned": int, "permission_denials": int, "is_error": bool, "exit_code": int,
  "zirv_cmds": {"workflow": n, "skill": n, "agent": n, "ctx": n, "other": n},   # Bash tool calls in the transcript starting with `zirv ...`
  "tool_calls": int,                                                            # total tool_use blocks in the transcript
+ "claude_version": str|null, "effort": str|null, "effort_counts": {level: n}, "transcripts": [file, ...],
+   # `claude --version`; the effort the transcripts show (null when none found); the session
+   # transcripts copied to `<run>/transcripts/`. A chain's `duration_api_ms` is a sum of per-step deltas
  "score": float, "passed": int, "total": int, "visible_ok": bool, "details": str,
  "judge_score": float|null, "judge_reasoning": str|null,
  "quality_score": float|null, "quality_reasoning": str|null}   # kind=tests only; see "Work-quality judge" below
@@ -99,7 +102,9 @@ every task) instead of a per-task rubric.md. Prompt: quality_rubric.md + the
 task prompt + `git diff HEAD` of the repo, excluding `tests_hidden/` (cap 80
 KB) + the agent's final result text. Same answer contract
 (`{"score": 0-10, "reasoning": "..."}`); run.py stores `score/10` as
-`quality_score` and the reasoning as `quality_reasoning` -- both `null` for
+`quality_score` and the reasoning as `quality_reasoning` (a leading `[zirv]`
+marker is stripped from the agent text before every judge call, this one
+included) -- both `null` for
 kind=judge/answer runs, which don't get this second judge. The hidden-test
 `score` is unaffected either way: this is a second, independent metric, not
 a replacement. `regrade.py --rejudge-quality <runs_root> [tasks...]`

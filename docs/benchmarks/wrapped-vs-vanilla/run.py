@@ -65,6 +65,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -74,11 +75,20 @@ import time
 import traceback
 from pathlib import Path
 
-CLAUDE_EXE = r"C:\Users\josj\.local\bin\claude.exe"
-ZIRV_FALLBACK = r"C:\ProgramData\chocolatey\bin\zirv.exe"
-PYTHON_EXE = r"C:\Python311\python.exe"
-GIT_EXE = r"C:\Program Files\Git\cmd\git.exe"
+def resolve_exe(name, windows_path):
+    """The pinned Windows path on nt; the PATH lookup (else the bare name) elsewhere."""
+    if os.name == "nt":
+        return windows_path
+    return shutil.which(name) or name
+
+
+CLAUDE_EXE = resolve_exe("claude", r"C:\Users\josj\.local\bin\claude.exe")
+ZIRV_FALLBACK = resolve_exe("zirv", r"C:\ProgramData\chocolatey\bin\zirv.exe")
+PYTHON_EXE = resolve_exe("python3", r"C:\Python311\python.exe")
+GIT_EXE = resolve_exe("git", r"C:\Program Files\Git\cmd\git.exe")
 TASKKILL_EXE = r"C:\Windows\System32\taskkill.exe"
+# POSIX children lead their own session so kill_tree can signal the whole group.
+POPEN_GROUP_KW = {} if os.name == "nt" else {"start_new_session": True}
 DEFAULT_TIMEOUT_MIN = 20
 
 # Issue #758: every `[jev]` advisory gate (config.rs::JevConfig / jev.rs),
@@ -144,6 +154,12 @@ ZIRV_HEADLESS_LEVERS = {
 
 CANONICAL_CONDS = ["vanilla", "zirv", NOJEV_COND, "zirv-proxy", *JEV_ABLATION_CONDS]
 JUDGE_DISALLOWED = "Write,Edit,Bash,NotebookEdit,Read,Glob,Grep,Agent,WebFetch,WebSearch"
+# Vanilla's bypassPermissions stand-in: org managed policy may refuse that mode, so
+# dontAsk plus every bare tool name (probed live: 0 denials, nothing ever asks).
+VANILLA_ALLOWED_TOOLS = ("Bash,Edit,Write,MultiEdit,NotebookEdit,Read,Glob,Grep,WebFetch,"
+                         "WebSearch,Skill,Task,Agent,TodoWrite,TaskCreate,TaskUpdate,"
+                         "TaskList,TaskGet,TaskOutput,TaskStop,BashOutput,KillShell,"
+                         "SlashCommand,ExitPlanMode,AskUserQuestion,ToolSearch")
 # The operator's "smarter, not just more hidden tests passed" target: a
 # second blind judge, on every tests-kind run, scoring things a hidden
 # unittest suite structurally cannot -- see quality_rubric.md. A pricier
@@ -320,9 +336,10 @@ _CLEAN_PATH = [
     r"C:\Users\josj\.cargo\bin", r"C:\Windows\System32", r"C:\Windows",
     r"C:\Windows\System32\WindowsPowerShell\v1.0", r"C:\Program Files\PowerShell\7",
 ]
-os.environ["PATH"] = ";".join(_CLEAN_PATH) + ";" + ";".join(
-    p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
-)
+if os.name == "nt":
+    os.environ["PATH"] = ";".join(_CLEAN_PATH) + ";" + ";".join(
+        p for p in os.environ.get("PATH", "").split(";") if p and ":" not in p[2:]
+    )
 
 
 def child_env(env_extra):
@@ -466,16 +483,46 @@ def result_is_valid(run_dir):
     return not obj.get("is_error", True)
 
 
+def _hook_runs_zirv(command):
+    """True when a hook command invokes `zirv ctx hook`, bare or by path
+    (POSIX or Windows, with or without .exe), alone or behind a wrapper
+    (`env X=1 zirv ...`, `sh -c "zirv ..."`, `cd x && zirv ...`)."""
+    return bool(re.search(r"(^|[\s/\\;&|\"'])zirv(\.exe)?[\"']?\s+ctx\s+hook\b", command or "", re.IGNORECASE))
+
+
+def non_zirv_hooks(hooks):
+    """`hooks` (a settings.json `hooks` object) without any hook entry whose
+    command runs zirv; groups and events left empty are dropped."""
+    kept = {}
+    for event, groups in (hooks or {}).items():
+        kept_groups = []
+        for group in groups or []:
+            entries = [h for h in group.get("hooks") or [] if not _hook_runs_zirv(h.get("command"))]
+            if entries:
+                kept_groups.append({**group, "hooks": entries})
+        if kept_groups:
+            kept[event] = kept_groups
+    return kept
+
+
 def operator_plugin_settings():
-    """The operator's user-level `enabledPlugins` as a `--settings` JSON, so
-    vanilla (which drops the user layer to keep zirv's hooks out) still loads
-    the same plugins the zirv conditions get from that layer. None if unset."""
+    """The operator's user-level `enabledPlugins` and non-zirv `hooks` as a
+    `--settings` JSON, so vanilla (which drops the user layer to keep zirv's
+    hooks out) still loads the same plugins and runs the same operator hooks
+    (e.g. enforce-rules.sh) the zirv conditions get from that layer. None if
+    neither is set."""
     try:
         user = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
     except Exception:
         return None
+    settings = {}
     enabled = {k: True for k, v in (user.get("enabledPlugins") or {}).items() if v}
-    return json.dumps({"enabledPlugins": enabled}, separators=(",", ":")) if enabled else None
+    if enabled:
+        settings["enabledPlugins"] = enabled
+    hooks = non_zirv_hooks(user.get("hooks"))
+    if hooks:
+        settings["hooks"] = hooks
+    return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
 def build_argv(cond, model, prompt_text, resume_session_id=None):
@@ -493,10 +540,12 @@ def build_argv(cond, model, prompt_text, resume_session_id=None):
             # Vanilla + a plugin (e.g. superpowers): drop the user settings layer
             # (where the operator's global zirv hooks live) instead of disabling
             # all hooks, so the plugin's own SessionStart hook still runs. The
-            # user layer's bypassPermissions default is restated explicitly.
+            # user layer's bypass default becomes dontAsk + a bare-tool allow list
+            # (managed policy may refuse bypassPermissions; this never asks either).
             argv = [CLAUDE_EXE, "-p", "--output-format", "json", "--model", model,
                     "--setting-sources", "project,local",
-                    "--permission-mode", "bypassPermissions",
+                    "--permission-mode", "dontAsk",
+                    f"--allowedTools={VANILLA_ALLOWED_TOOLS}",
                     "--plugin-dir", VANILLA_PLUGIN_DIR]
             plugins = operator_plugin_settings()
             if plugins:
@@ -584,6 +633,14 @@ def rmtree_robust(path):
 
 
 def kill_tree(pid):
+    if os.name != "nt":
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                return
+            time.sleep(2)
+        return
     subprocess.run([TASKKILL_EXE, "/T", "/F", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -630,10 +687,10 @@ def launch(cond, model, prompt_text, prompt_path, cwd, stdout_path, stderr_path,
         if cond == "vanilla":
             stdin_f = open(prompt_path, "rb")
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=stdin_f,
-                                     stdout=stdout_f, stderr=stderr_f, env=env)
+                                     stdout=stdout_f, stderr=stderr_f, env=env, **POPEN_GROUP_KW)
         else:
             proc = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.DEVNULL,
-                                     stdout=stdout_f, stderr=stderr_f, env=env)
+                                     stdout=stdout_f, stderr=stderr_f, env=env, **POPEN_GROUP_KW)
     except Exception:
         stdout_f.close()
         stderr_f.close()
@@ -724,6 +781,65 @@ def find_session_transcript(repo_dir, session_id):
         return candidate
     matches = glob.glob(str(home / ".claude" / "projects" / "*" / f"{session_id}.jsonl"))
     return Path(matches[0]) if matches else None
+
+
+_CLAUDE_VERSION = []
+
+
+def claude_version():
+    """`claude --version` output (e.g. "2.1.288 (Claude Code)"), run once per
+    harness process; None if it cannot be read."""
+    if not _CLAUDE_VERSION:
+        try:
+            proc = subprocess.run([CLAUDE_EXE, "--version"], capture_output=True, text=True, timeout=30)
+            _CLAUDE_VERSION.append(proc.stdout.strip() or None)
+        except Exception:
+            _CLAUDE_VERSION.append(None)
+    return _CLAUDE_VERSION[0]
+
+
+def transcript_effort_counts(path):
+    """{effort level: assistant-message count} from one Claude transcript.
+    Claude Code stamps each assistant entry with the effort it actually ran at
+    (`effort`), whatever set it (env, flag, settings or model default)."""
+    counts = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                effort = ev.get("effort") if isinstance(ev, dict) and ev.get("type") == "assistant" else None
+                if isinstance(effort, str):
+                    counts[effort] = counts.get(effort, 0) + 1
+    except OSError:
+        pass
+    return counts
+
+
+def record_run_provenance(run_dir, result, session_ids, projects_root=None):
+    """Archive every session transcript of this run into `<run_dir>/transcripts/`
+    and record `claude_version`, `effort` (the most common effort level seen in
+    those transcripts, null when no transcript was found) and `effort_counts`
+    in `result`."""
+    projects_root = Path(projects_root) if projects_root else Path(os.path.expanduser("~")) / ".claude" / "projects"
+    effort_counts = {}
+    archived = []
+    for session_id in dict.fromkeys(s for s in session_ids if s):
+        matches = glob.glob(str(projects_root / "*" / f"{session_id}.jsonl"))
+        if not matches:
+            continue
+        dest_dir = Path(run_dir) / "transcripts"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(matches[0], dest_dir / f"{session_id}.jsonl")
+        archived.append(f"{session_id}.jsonl")
+        for level, n in transcript_effort_counts(matches[0]).items():
+            effort_counts[level] = effort_counts.get(level, 0) + n
+    result["claude_version"] = claude_version()
+    result["effort"] = max(effort_counts, key=effort_counts.get) if effort_counts else None
+    result["effort_counts"] = effort_counts
+    result["transcripts"] = archived
 
 
 def iso_utc_ms(epoch_s):
@@ -838,6 +954,15 @@ def get_capped_diff(repo_dir, cap_bytes=60_000, exclude=None):
     return data.decode("utf-8", errors="replace")
 
 
+_ZIRV_MARKER_RE = re.compile(r"\A[ \t]*\[zirv\][ \t]*(?:\r?\n|\Z)?")
+
+
+def strip_zirv_marker(text):
+    """Drop a leading `[zirv]` marker (alone on line 1, or a line-1 prefix)
+    from an agent's final text, so no judge can tell which condition wrote it."""
+    return _ZIRV_MARKER_RE.sub("", text or "", count=1)
+
+
 def parse_judge_json(text):
     text = (text or "").strip()
     if text.startswith("```"):
@@ -925,7 +1050,7 @@ def call_quality_judge(prompt_text, repo_dir, result_text):
     judge_prompt = (
         rubric + "\n\n## Task prompt\n" + prompt_text +
         "\n\n## Diff (git diff HEAD, may be truncated, excludes tests_hidden/)\n" + diff_text +
-        "\n\n## Agent's final message\n" + (result_text or "") +
+        "\n\n## Agent's final message\n" + strip_zirv_marker(result_text) +
         "\n\n## Your answer\nScore the change against the rubric. Reply with ONLY a JSON object "
         "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
         "No prose before or after it, no code fence."
@@ -951,7 +1076,7 @@ def call_quality_judge_chain(step_prompts, repo_dir, step_texts):
     rubric = read_text(_QUALITY_RUBRIC_PATH) if _QUALITY_RUBRIC_PATH.exists() else ""
     diff_text = get_capped_diff(repo_dir, cap_bytes=QUALITY_DIFF_CAP_BYTES, exclude=["tests_hidden"])
     prompts_block = "\n\n".join(f"### Step {i+1}\n{p}" for i, p in enumerate(step_prompts))
-    responses_block = "\n\n".join(f"### Step {i+1} response\n{t}" for i, t in enumerate(step_texts))
+    responses_block = "\n\n".join(f"### Step {i+1} response\n{strip_zirv_marker(t)}" for i, t in enumerate(step_texts))
     judge_prompt = (
         rubric + "\n\n## Task prompts (one long session, sent one after another)\n" + prompts_block +
         "\n\n## Diff (git diff HEAD, final state, may be truncated, excludes tests_hidden/)\n" + diff_text +
@@ -979,7 +1104,7 @@ def run_unittest_discover(repo_dir, start_dir, timeout_s=UNITTEST_TIMEOUT_S):
     -- the step boundary IS the grading boundary, so grading lives here)."""
     try:
         proc = subprocess.run(
-            [PYTHON_EXE, "-m", "unittest", "discover", "-s", start_dir, "-t", str(repo_dir)],
+            [PYTHON_EXE, "-m", "unittest", "discover", "-s", start_dir, "-t", str(Path(repo_dir).resolve())],
             cwd=str(repo_dir), capture_output=True, text=True, timeout=timeout_s,
         )
     except Exception as exc:
@@ -1059,7 +1184,7 @@ def grade_step_judge(rubric_path, step_prompt_text, repo_dir, step_result_text):
     judge_prompt = (
         rubric + "\n\n## Step prompt\n" + step_prompt_text +
         "\n\n## Diff so far (git diff against the pristine template, may be truncated)\n" + diff_text +
-        "\n\n## Agent's response for this step\n" + (step_result_text or "") +
+        "\n\n## Agent's response for this step\n" + strip_zirv_marker(step_result_text) +
         "\n\n## Your answer\nScore this step against the rubric. Reply with ONLY a JSON object "
         "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
         "No prose before or after it, no code fence."
@@ -1121,7 +1246,7 @@ def grade(task_dir, kind, repo_dir, result_txt_path, prompt_text):
             judge_prompt = (
                 rubric + "\n\n## Task prompt\n" + prompt_text +
                 "\n\n## Diff (git diff HEAD, may be truncated)\n" + diff_text +
-                "\n\n## Agent's final message\n" + result_text +
+                "\n\n## Agent's final message\n" + strip_zirv_marker(result_text) +
                 "\n\n## Your answer\nScore the change against the rubric. Reply with ONLY a JSON object "
                 "on one line: {\"score\": <integer 0-10>, \"reasoning\": \"<one or two sentences>\"}. "
                 "No prose before or after it, no code fence."
@@ -1589,6 +1714,7 @@ def do_one_run(bench_root, task, cond, rep, model, timeout_s, resume, k, total,
     result["zirv_cmds"] = zirv_cmds
     if transcript_note:
         result["details"] = (result["details"] + "; " if result["details"] else "") + transcript_note
+    record_run_provenance(run_dir, result, [session_id])
 
     grading = grade(task_dir, kind, repo_dir, run_dir / "result.txt", prompt_text)
     result["score"] = grading.get("score", 0.0)
@@ -1705,6 +1831,7 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
     step_scores = []
 
     prev_session_cost = 0.0
+    prev_session_api_ms = 0
     # Calibration data for a session-switch step's cost estimate (see below):
     # accumulated cost and weighted-token totals from this run's own earlier
     # non-switch steps only -- a switch step's cost is itself partly
@@ -1936,7 +2063,12 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
                     result["cache_creation_ephemeral_5m_input_tokens"] or 0) + m5
             result["num_turns"] += step_record["num_turns"] or 0
             result["duration_ms"] += obj.get("duration_ms") or 0
-            result["duration_api_ms"] += obj.get("duration_api_ms") or 0
+            # `duration_api_ms` is cumulative for a resumed session (verified:
+            # a 1-turn resume reported 2095 ms API against 1091 ms duration_ms,
+            # whose own value is per invocation), so sum deltas like the cost.
+            api_ms = obj.get("duration_api_ms") or 0
+            result["duration_api_ms"] += api_ms if is_switch else max(0, api_ms - prev_session_api_ms)
+            prev_session_api_ms = api_ms if is_switch else max(prev_session_api_ms, api_ms)
             result["agent_cost_usd"] += agent_cost
             result["total_cost_usd"] += agent_cost
             subagent_stats = obj.get("subagent_stats", {}) or {}
@@ -1993,6 +2125,9 @@ def do_one_chain_run(bench_root, task, cond, rep, model, timeout_s, resume, k, t
     result["zirv_cmds"] = zirv_cmds
     if transcript_note:
         result["details"] = (result["details"] + "; " if result["details"] else "") + transcript_note
+    record_run_provenance(
+        run_dir, result,
+        [s.get("session_id") for s in result["steps"]] + [sw["from"] for sw in result["session_switches"]])
 
     result["score"] = statistics_mean_or_zero(step_scores)
 
@@ -2618,6 +2753,7 @@ def run_escalate_trial(bench_root, spec, cond, out_dir, model, timeout_s, spec_e
     result["zirv_cmds"] = zirv_cmds
     if transcript_note:
         result["details"] = (result["details"] + "; " if result["details"] else "") + transcript_note
+    record_run_provenance(out_dir, result, [a.get("session_id") for a in result["attempts"]])
 
     grading = grade(task_dir, kind, repo_dir, out_dir / "result.txt", prompt_text)
     result["score"] = grading.get("score", 0.0)
@@ -2669,7 +2805,7 @@ def run_trial(spec_path, out_dir, cond):
 
     zirv_dir = spec.get("zirv_dir")
     if zirv_dir:
-        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
 
     bench_root = Path(__file__).resolve().parent
     task = spec["task"]
@@ -2945,7 +3081,7 @@ def main():
             print("--trial requires --out", file=sys.stderr)
             sys.exit(2)
         if args.zirv_dir:
-            os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+            os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
         run_trial(args.trial, args.out, args.cond)
         return
 
@@ -2956,7 +3092,7 @@ def main():
 
     STAGGER_S = args.stagger_s
     if args.zirv_dir:
-        os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + ";" + os.environ["PATH"]
+        os.environ["PATH"] = str(Path(args.zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
         print("zirv under test:", shutil.which("zirv"))
     tasks_dir = bench_root / "tasks"
 

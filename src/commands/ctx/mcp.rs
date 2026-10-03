@@ -849,7 +849,10 @@ impl ServerHandler for Bridge {
                 None,
             ));
         }
-        Ok(ListToolsResult::with_all_items(tools()))
+        // The 2026-07-28 spec requires both fields; Claude Code rejects the list without them.
+        Ok(ListToolsResult::with_all_items(tools())
+            .with_ttl_ms(300_000)
+            .with_cache_scope(rmcp::model::CacheScope::Private))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -2197,6 +2200,12 @@ mod tests {
             2,
         );
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 11);
+        if stateless {
+            // Claude Code's 2026-07-28 client rejects a tools/list without both
+            // fields, retries for ~1.7 s, then drops every zirv tool.
+            assert!(listed["result"]["ttlMs"].is_u64(), "{listed}");
+            assert_eq!(listed["result"]["cacheScope"], "private", "{listed}");
+        }
         let result = request(
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
                 "name":"workflow_status", "arguments":{}

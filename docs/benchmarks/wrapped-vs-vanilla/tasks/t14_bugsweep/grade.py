@@ -7,8 +7,10 @@ reports visible_ok. One of the four symptoms in this task is D4 (regex
 rules are case-sensitive), whose root-cause fix is
 `tests/test_rules.py::test_regex_rule_case_insensitive`'s known baseline
 failure; fixing it must happen in the library code, not by editing that
-test, so -- like t07_redtest -- this grader forces score 0 if
-tests/test_rules.py appears in `git diff --name-only HEAD`.
+test, so -- like t07_redtest -- this grader forces score 0 if an existing line
+of tests/test_rules.py is changed or removed (`git diff --unified=0 HEAD`
+shows a '-' line) or an added line holds skip/skipIf/skipUnless/skipTest/
+expectedFailure. Other added lines (new tests) are allowed.
 """
 import json
 import re
@@ -44,18 +46,34 @@ def _run_unittest(python, repo_dir, start_dir):
     return passed, total, fail_names, output
 
 
-def _git_diff_files(repo_dir):
+# Real skip mechanisms only, so a docstring, comment or test name saying "skip blank rows" is not one.
+SKIP_RE = re.compile(
+    r"@\s*(unittest\.)?(skip\w*|expectedFailure)\b|\bself\.skipTest\s*\(|\bSkipTest\b|\bunittest\.expectedFailure\b"
+)
+
+
+def _test_file_lines_removed(repo_dir):
+    """True when tests/test_rules.py lost or changed an existing line (a diff
+    '-' line) or gained a skip/expectedFailure line (which could disable the
+    failing test); other additions are allowed. Fails closed on a git error."""
     try:
         proc = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--unified=0", "HEAD", "--", "tests/test_rules.py"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
             timeout=30,
         )
-        return {line.strip().replace("\\", "/") for line in proc.stdout.splitlines() if line.strip()}
     except Exception:
-        return set()
+        return True
+    if proc.returncode != 0:
+        return True
+    for line in proc.stdout.splitlines():
+        if line.startswith("-") and not line.startswith("---"):
+            return True
+        if line.startswith("+") and not line.startswith("+++") and SKIP_RE.search(line):
+            return True
+    return False
 
 
 def main():
@@ -64,9 +82,8 @@ def main():
         repo_dir = Path(sys.argv[1]).resolve()
         python = sys.executable or "python"
 
-        changed = _git_diff_files(repo_dir)
-        if "tests/test_rules.py" in changed:
-            result["details"] = "tests/test_rules.py was modified; the D4 fix must not touch the test file"
+        if _test_file_lines_removed(repo_dir):
+            result["details"] = "tests/test_rules.py had existing lines changed or removed, or a skip added; the D4 fix must not edit or disable the existing tests"
             print(json.dumps(result))
             return
 

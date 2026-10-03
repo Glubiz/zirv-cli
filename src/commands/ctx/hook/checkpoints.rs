@@ -354,6 +354,11 @@ pub(super) fn compact_advisory_stop_nudge(
     let advisory = model_window
         .filter(|window| *window > 0)
         .and_then(|window| {
+            // Checked before the costly prompt compile below: most turns sit far under the window.
+            let window_fraction = score.context_tokens as f64 / window as f64;
+            if window_fraction < cfg.compact_advisory.window_fraction {
+                return None;
+            }
             let now = now_secs();
             let fresh = checkpoint
                 .cached_prompt_bytes
@@ -402,10 +407,6 @@ pub(super) fn compact_advisory_stop_nudge(
             );
 
             if summary.tool_results_stale < cfg.compact_advisory.min_reclaim_tokens {
-                return None;
-            }
-            let window_fraction = score.context_tokens as f64 / window as f64;
-            if window_fraction < cfg.compact_advisory.window_fraction {
                 return None;
             }
             let trigger_tokens = (cfg.compact_advisory.window_fraction * window as f64) as u64;
@@ -1127,6 +1128,14 @@ mod tests {
             None,
             "5% of the window must not clear the window_fraction gate"
         );
+        // Under the trigger the prompt is never compiled (~100 ms on a cold Stop hook).
+        let saved = load_compact_advisory_checkpoint(
+            &compact_advisory_checkpoint_path(&state, &transcript),
+            &transcript,
+            crate::commands::ctx::adapters::AgentAdapter::name(&adapter),
+        )
+        .expect("checkpoint saved");
+        assert!(saved.cached_prompt_bytes.is_none());
     }
 
     /// Issue #312's own hysteresis acceptance criterion: once the advisory

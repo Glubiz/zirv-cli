@@ -23,9 +23,10 @@ Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
 - `vanilla` -- `claude -p` directly, prompt on stdin. With
   `--vanilla-plugin-dir` (used for the current grid) it instead loads a
   plugin such as obra/superpowers, drops the user settings layer (so the
-  operator's own global zirv hooks can't leak in) and restates
-  `bypassPermissions` explicitly, so the plugin's own `SessionStart` hook
-  still runs.
+  operator's own global zirv hooks can't leak in) and launches with
+  `--permission-mode dontAsk` plus an `--allowedTools` list of every bare tool
+  name (the policy-safe stand-in for `bypassPermissions`), so the plugin's
+  own `SessionStart` hook still runs.
 - `zirv` -- `zirv ctx exec --agent claude --prompt <prompt> -- ...`, no proxy
   call at all.
 - `zirv-nojev` -- the fair "zirv minus Jev" baseline for `zirv-jev-full`
@@ -63,7 +64,46 @@ Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
 
 Plugin and hook parity (2026-09-24, d256124e):
 - **zirv conditions keep the user settings layer.** zirv's own hooks (Stop, UserPromptSubmit, PreCompact, PreToolUse) are installed in `~/.claude/settings.json`, so a zirv launch with `--setting-sources project,local` silently runs without them. Rounds r1–r3 in `results/2026-09-24-fix-loop/` did exactly that.
-- **Vanilla gets the same plugins through `--settings`.** Its `--setting-sources project,local` branch (used with `--vanilla-plugin-dir`) receives the operator's `enabledPlugins` from `~/.claude/settings.json` that way, so both sides load the same unrelated operator plugins and only zirv's hooks differ.
+- **Vanilla gets the same plugins through `--settings`.** Its `--setting-sources project,local` branch (used with `--vanilla-plugin-dir`) receives the operator's `enabledPlugins` from `~/.claude/settings.json` that way, so both sides load the same unrelated operator plugins and only zirv's hooks differ (the operator's own non-zirv hooks go the same way; see "Known parity gap" below).
+
+Known parity gap (checked against zirv 4.47.0, 2026-10-03): the zirv arms
+still need the user settings layer. The `--settings <launch-settings>` file
+zirv passes carries only PreToolUse, PostToolUse, PostToolUseFailure, Stop
+(supervisor), Permission* and Notification hooks; `UserPromptSubmit`,
+`PreCompact`, `SessionStart` and `SubagentStart/Stop` still come only from
+`~/.claude/settings.json`. A one-turn haiku probe with `--setting-sources
+project,local` through `zirv ctx exec` showed no `UserPromptSubmit` hook
+context in the transcript, while the default launch had it. So the zirv arms
+cannot switch to `project,local` yet and stay as they are. Instead vanilla's
+`--settings` JSON (`operator_plugin_settings`) carries, next to
+`enabledPlugins`, the operator's `hooks` from `~/.claude/settings.json` minus
+every hook whose command's program is zirv (`non_zirv_hooks`), so the operator's
+own hooks (e.g. `~/.claude/hooks/enforce-rules.sh`, ~96 ms per Bash call in r8)
+run in both arms and only zirv's hooks differ. Verified with a one-turn haiku
+vanilla probe: the transcript shows a `hook_success` PreToolUse attachment for
+`enforce-rules.sh` and no zirv hook. This applies to the `--vanilla-plugin-dir`
+vanilla branch; the `disableAllHooks` branch still runs no hooks at all.
+
+Put `--bench-root` outside any directory that has a `CLAUDE.md` in its
+ancestors: both arms load those. In r8 the bench root sat inside the zirv
+checkout, so both arms loaded `~/CLAUDE.md` and the zirv repo's `CLAUDE.md`.
+
+Judge blinding: `run.py` strips a leading `[zirv]` marker (alone on line 1, or
+as a line-1 prefix) from the agent's final text before every judge call
+(quality judge, chain judge, step judges, `kind=judge`), so zirv's marker does
+not unblind the judge. `result.txt` and `result_step_NN.txt` keep the raw text.
+
+Archival and recording: every run dir gets `transcripts/<session_id>.jsonl`
+(a chain: one per step session, including a session abandoned at a switch), and
+`result.json` gets `claude_version` (`claude --version`, read once per harness
+process), `effort` and `effort_counts`. Effort is read from the transcripts:
+Claude Code stamps each assistant entry with the effort it actually ran at
+(env, flag, settings or model default alike), so `effort` is the most common
+level across the run's transcripts and `effort_counts` the per-level assistant
+message counts. It is `null` (never guessed) when no transcript was found.
+Chain `duration_api_ms` is summed per step as a delta, because `claude -p
+--resume` reports it cumulative for the session (`duration_ms` and `num_turns`
+are per invocation; `total_cost_usd` is cumulative).
 
 `--noninteractive` prefixes every condition's prompt with the same
 "nobody will answer questions" notice, so a plugin that likes to stop and

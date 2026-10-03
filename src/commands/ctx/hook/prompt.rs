@@ -42,10 +42,11 @@ pub fn prompt_output(
         })
         .map(|messages| crate::commands::ctx::lifecycle::mail_note(messages.len()));
     // A zirv-internal helper call has no rot to track and its reply is parsed strictly (#868).
-    let marker = match env(adapters::INTERNAL_ENV).as_deref() {
-        Some("1") => "",
-        _ => marker,
-    };
+    // A headless run's output is read by scripts, so a stray `[zirv]` line would corrupt it.
+    let silent = [adapters::INTERNAL_ENV, adapters::HEADLESS_ENV]
+        .iter()
+        .any(|key| env(key).as_deref() == Some("1"));
+    let marker = if silent { "" } else { marker };
     // Use shared prompt assembly so native and hooked sessions inject notes
     // in the same order (#478).
     let context = crate::commands::ctx::lifecycle::prompt_notes(
@@ -784,6 +785,19 @@ mod tests {
             None,
             Path::new("."),
             &internal,
+            &CtxConfig::default(),
+        );
+        assert!(out.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn a_headless_session_gets_no_health_marker() {
+        let headless = |key: &str| (key == adapters::HEADLESS_ENV).then(|| "1".to_string());
+        let out = prompt_output(
+            "[zirv]",
+            None,
+            Path::new("."),
+            &headless,
             &CtxConfig::default(),
         );
         assert!(out.is_empty(), "{out}");
