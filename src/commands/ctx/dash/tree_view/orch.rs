@@ -4238,7 +4238,7 @@ mod tests {
         let on = draw(160, 40, &view(data.clone()), &f);
         let header = on.lines().next().expect("header");
         assert!(
-            header.contains("supervisor on 1/3 \u{b7} codex gpt-6-astra"),
+            header.contains("supervisor on 1/3 consults \u{b7} codex gpt-6-astra"),
             "{header}"
         );
         data.supervisor = None;
@@ -4454,7 +4454,7 @@ mod tests {
         eprintln!("IDLE\n{}", agents_area(&text));
         assert!(text.contains("supervisor"), "{text}");
         assert!(text.contains("codex gpt-6-astra"), "{text}");
-        assert!(text.contains("idle \u{b7} 0/3"), "{text}");
+        assert!(text.contains("idle \u{b7} 0/3 consults"), "{text}");
     }
 
     #[test]
@@ -4463,7 +4463,8 @@ mod tests {
         let f = orch_facts(&wf, &jev);
         let text = draw(120, 40, &view(data), &f);
         eprintln!("WORKING\n{}", agents_area(&text));
-        assert!(text.contains("\u{25b8} before plan \u{b7} 2/3"), "{text}");
+        assert!(text.contains("\u{25b8} before plan \u{b7} 2/3 "), "{text}");
+        assert!(!text.contains("2/3 con"), "never cut mid-word:\n{text}");
         assert!(text.contains("codex gpt-6-astra \u{b7} "), "{text}");
     }
 
@@ -4475,7 +4476,7 @@ mod tests {
         let f = orch_facts(&wf, &jev);
         let text = draw(120, 40, &view(data), &f);
         eprintln!("ASK\n{}", agents_area(&text));
-        assert!(text.contains("\u{25b8} ask \u{b7} 1/3"), "{text}");
+        assert!(text.contains("\u{25b8} ask \u{b7} 1/3 consults"), "{text}");
         let mut unknown = supervisor_fact_of(true, 1);
         unknown.trigger = String::new();
         let (data, wf, jev) = supervisor_world(unknown);
@@ -4495,7 +4496,7 @@ mod tests {
         let f = orch_facts(&wf, &jev);
         let text = draw(120, 40, &view(data), &f);
         eprintln!("RULED\n{}", agents_area(&text));
-        assert!(text.contains("ruled \u{b7} 1/3"), "{text}");
+        assert!(text.contains("ruled \u{b7} 1/3 consults"), "{text}");
         assert!(text.contains("ruled plan revise:"), "{text}");
         assert!(!text.contains("second line"), "{text}");
         assert!(text.contains("idle 40s"), "{text}");

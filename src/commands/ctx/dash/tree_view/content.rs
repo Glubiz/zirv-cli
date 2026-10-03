@@ -418,10 +418,10 @@ pub(super) fn spawn_label(facts: &TreeFacts) -> String {
     label
 }
 
-/// `supervisor on 1/3`, or `off`.
+/// `on 1/3 consults`, or `off`.
 pub(super) fn supervisor_status(data: &TreeData) -> String {
     data.supervisor.as_ref().map_or("off".to_string(), |a| {
-        format!("on {}/{}", a.calls, a.max_calls)
+        format!("on {}/{} consults", a.calls, a.max_calls)
     })
 }
 

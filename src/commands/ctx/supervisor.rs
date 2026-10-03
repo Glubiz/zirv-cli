@@ -170,6 +170,25 @@ struct SessionState {
     tickets: Vec<String>,
     /// Ask reservations their parent has not settled yet; a refund needs its id here, so it is idempotent.
     reserved: Vec<String>,
+    /// Consults running now (asks and fired ones): `state` is `advising` while any is.
+    inflight: u32,
+}
+
+impl SessionState {
+    fn consult_started(&mut self) {
+        self.inflight = self.inflight.saturating_add(1);
+        self.state = "advising".to_string();
+    }
+
+    fn consult_settled(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.state = if self.inflight == 0 {
+            "idle"
+        } else {
+            "advising"
+        }
+        .to_string();
+    }
 }
 
 /// One session's consult state as the agent tree shows it.
@@ -355,7 +374,7 @@ pub(crate) fn fire(
         request.trigger.as_str().to_string(),
         TRIGGERS_KEEP,
     );
-    next.state = "advising".to_string();
+    next.consult_started();
     save_state(&path, &next);
     if spawn(&request) {
         return true;
@@ -900,7 +919,7 @@ fn consult_with(
     });
     let _lock = lock_beside(&path);
     let mut session = load_state(&path);
-    session.state = "idle".to_string();
+    session.consult_settled();
     session.tokens_read += tokens;
     match outcome {
         Ok(Some(ruling)) => {
@@ -1086,6 +1105,15 @@ fn run_consult(
 /// What `ask` needs from the consult: the one seam its tests stub.
 type AskConsult<'a> = &'a dyn Fn(&str, &[String], &str, u64, &str) -> CtxResult<Option<Ruling>>;
 
+/// When an `ask` stops waiting. An absurd `--timeout-secs` must not overflow the clock (a panic
+/// between reserve and settle would leave the session advising): with no representable deadline
+/// the wait has none.
+fn ask_deadline(timeout_secs: u64) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(std::time::Duration::from_secs(
+        timeout_secs.saturating_add(ASK_GRACE_SECS),
+    ))
+}
+
 /// The real consult for `ask`: the same detached-consult child, but waited on, with the options
 /// on its command line and the evidence on its stdin. The child carries `CONSULT_ENV`, so the
 /// helper session it launches can never trigger a consult of its own.
@@ -1129,10 +1157,9 @@ fn spawn_ask_consult(
             text
         })
     });
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + ASK_GRACE_SECS);
+    let deadline = ask_deadline(timeout_secs);
     while child.try_wait()?.is_none() {
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             let _ = child.kill();
             let _ = child.wait();
             return Err("the supervisor did not answer in time".into());
@@ -1192,7 +1219,7 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
     // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
     current.reserved.push(ticket.clone());
-    current.state = "advising".to_string();
+    current.consult_started();
     save_state(&path, &current);
     Some(ticket)
 }
@@ -1211,9 +1238,7 @@ fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
         return;
     };
     current.reserved.remove(at);
-    if current.reserved.is_empty() {
-        current.state = "idle".to_string();
-    }
+    current.consult_settled();
     if refund {
         current.calls = current.calls.saturating_sub(1);
         if let Some(at) = current.triggers.iter().rposition(|held| held == ASK_TICKET) {
@@ -2211,6 +2236,39 @@ mod tests {
         settle_ask_call(&state, "operator", &other, false);
         settle_ask_call(&state, "operator", &other, true);
         assert_eq!(calls(), 1, "a success settles without a refund, once");
+    }
+
+    #[test]
+    fn the_session_stays_advising_until_the_last_overlapping_consult_settles() {
+        let (_dir, state) = fresh_state();
+        let mut cfg = enabled_cfg();
+        cfg.supervisor.max_calls = 5;
+        let id = reserve_ask_call(&state, &cfg, "abcd1234").expect("reserved");
+        assert!(fire(
+            &state,
+            &cfg,
+            &no_env,
+            request(Trigger::BeforePlan),
+            None,
+            &|_| true
+        ));
+        let advising = || snapshot(&state, "abcd1234").advising;
+        settle_ask_call(&state, "abcd1234", &id, false);
+        assert!(advising(), "the fired consult still runs");
+        consult_with(
+            &state,
+            &cfg,
+            &request(Trigger::BeforePlan),
+            &|_| Err("boom".into()),
+            &|_| panic!("nothing to deliver"),
+        );
+        assert!(!advising(), "the last one settled");
+    }
+
+    #[test]
+    fn an_absurd_ask_timeout_cannot_overflow_the_deadline() {
+        assert!(ask_deadline(u64::MAX).is_none());
+        assert!(ask_deadline(180).is_some());
     }
 
     #[test]
