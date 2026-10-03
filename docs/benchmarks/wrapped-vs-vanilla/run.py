@@ -2810,7 +2810,7 @@ def run_trial(spec_path, out_dir, cond):
 
     zirv_dir = spec.get("zirv_dir")
     if zirv_dir:
-        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + os.pathsep +os.environ["PATH"]
+        os.environ["PATH"] = str(Path(zirv_dir).resolve()) + os.pathsep + os.environ["PATH"]
 
     bench_root = Path(__file__).resolve().parent
     task = spec["task"]
