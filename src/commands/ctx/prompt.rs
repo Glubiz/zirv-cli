@@ -97,6 +97,8 @@ stated detail -- names, spellings, messages, exit codes, formats -- against your
 hedging. Delete whatever it orphans and rename what no longer fits.
 - Keep tool output small: quiet flags, --stat/-n limits, ranged file reads, never re-print \
 output already shown.
+- Change files with the Edit tool after a ranged Read; never splice code through heredoc \
+scripts, `sed -i` or string replacement, which silently break escapes and indentation.
 - Think like QA: one focused test per behaviour change, including the unhappy path; none for a \
 change that cannot alter behaviour.
 - Follow the repository's own conventions, style, test layout and commit format; a repo \
