@@ -4905,16 +4905,17 @@ The classifier sees the request text only, so the class follows its size unless 
 
 The effort decision is made ONCE, from the FIRST headless launch of a conversation, and every later launch of that SAME session -- a `--resume`, an in-place compaction, any other relaunch that keeps the id -- reuses it regardless of its own prompt text, including a bare resume with no new prompt at all. Changing `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation invalidates Claude's whole prompt cache, not just that turn's own addition to it, so re-classifying every launch independently was actively counter-productive.
 
-**`jev.launch_effort`** (off by default) may refine that FIRST launch's pick:
+**`jev.launch_effort`** (off by default) may RAISE that FIRST launch's pick:
 when the gate is on and Jev is available (same `[proxy.typesafe]` credential
 every other `[jev]` site shares), a metadata-only Noul question asks whether
-the request is unusually hard, deliberate work (-> `headless.effort.
-substantial`) or a small, low-deliberation follow-up (-> `headless.effort.
-trivial`), from local numeric facts only -- prompt word-count bucket,
-enumerated-item count, the deterministic classifier's own complexity index,
-and whether the prompt reads as a question -- never the prompt text itself.
-An indecisive answer, a failed call, an unavailable credential, or a decisive
-pick whose tier has no configured value all fall back to the plain
+the request is unusually hard, deliberate work, from local numeric facts only
+-- prompt word-count bucket, enumerated-item count, the deterministic
+classifier's own complexity index, and whether the prompt reads as a question
+-- never the prompt text itself. Only a decisive yes selects
+`headless.effort.substantial`; Jev can never lower effort, because "not
+unusually hard" is no evidence of a small follow-up. A decisive no, an
+indecisive answer, a failed call, an unavailable credential, or a decisive
+yes whose `substantial` tier has no configured value all keep the plain
 deterministic classification above, exactly as with the gate off. Whichever
 value wins goes through the SAME sticky, per-session record as the
 deterministic path: a resumed session never re-asks and never changes effort

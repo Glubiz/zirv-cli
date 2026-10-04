@@ -353,7 +353,7 @@ Action vocabulary per SITE (kept in one place -- `SITE_FALLBACK` in
 `context-skill`: omit|keep, fallback `keep`; `handoff-thin`: demote|keep,
 fallback `keep`; `handoff-select`: drop|keep, fallback `keep`;
 `compaction-select`: keep|omit, fallback `omit`; `dispatch`:
-cheap|standard|frontier, fallback `deny`; `launch-effort`: high|low,
+cheap|standard|frontier, fallback `deny`; `launch-effort`: high|classifier,
 fallback `classifier`; `classify-domain`: tag|none per domain tag id,
 fallback `none`; `inject`: defer|inject_now, fallback `inject_now`.
 

@@ -26,7 +26,7 @@ SITE_ACTIONS = {
     "handoff-select": {"drop", "keep"},
     "compaction-select": {"keep", "omit"},
     "dispatch": {"cheap", "standard", "frontier", "deny"},
-    "launch-effort": {"high", "low", "classifier"},
+    "launch-effort": {"high", "classifier"},
     "classify-domain": {"tag", "none"},
     "inject": {"defer", "inject_now"},
 }
