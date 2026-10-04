@@ -13,8 +13,12 @@ import glob
 import json
 import random
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import compliance  # noqa: E402
 
 XL_TASKS = {"t16_tags", "t17_schema_migration", "t18_ledger_layer", "t19_goals_saga",
             "t20_audit_log", "t21_search", "t22_envelopes"}
@@ -41,14 +45,40 @@ METRICS = [
     ("out", "Output tokens (k)", False, "{:.1f}", lambda r: (r.get("output_tokens") or 0) / 1000),
     ("quality", "Work quality (judge, 0-100)", True, "{:.0f}",
      lambda r: 100 * r["quality_score"] if r.get("quality_score") is not None else None),
+    # Worker-rule compliance, scanned from each run's transcripts/ (compliance.py).
+    ("rounds", "API rounds", False, "{:.0f}", lambda r: _comp(r, "api_rounds")),
+    ("cpr", "Tool calls per round", True, "{:.2f}", lambda r: _comp(r, "calls_per_round")),
+    ("par", "Parallel rounds (2+ calls)", True, "{:.1f}", lambda r: _comp(r, "parallel_rounds")),
+    ("rd", "Read tool calls", True, "{:.1f}", lambda r: _comp(r, "read_tool")),
+    ("ed", "Edit/Write tool calls", True, "{:.1f}", lambda r: _comp(r, "edit_tool")),
+    ("shr", "Shell file reads (sed/cat/head)", False, "{:.1f}", lambda r: _comp(r, "shell_reads")),
+    ("sw", "Script-written files", False, "{:.1f}", lambda r: _comp(r, "script_writes")),
+    ("swe", "Syntax errors after script write", False, "{:.2f}",
+     lambda r: _comp(r, "syntax_errors_after_script_write")),
+    ("den", "Edit-guard denials", False, "{:.2f}", lambda r: _comp(r, "edit_guard_denials")),
+    ("zcr", "zirv ctx run calls", True, "{:.1f}", lambda r: _comp(r, "zirv_ctx_run")),
 ]
+
+_COMPLIANCE_CACHE = {}
+
+
+def _comp(r, key):
+    """One compliance metric for a result row; scans its run dir once."""
+    d = r.get("_run_dir")
+    if not d:
+        return None
+    if d not in _COMPLIANCE_CACHE:
+        _COMPLIANCE_CACHE[d] = compliance.scan(d)
+    return _COMPLIANCE_CACHE[d][key]
 
 
 def load(runs_dir):
     rows = []
     for p in glob.glob(str(Path(runs_dir) / "*" / "result.json")):
         try:
-            rows.append(json.loads(Path(p).read_text(encoding="utf-8")))
+            row = json.loads(Path(p).read_text(encoding="utf-8"))
+            row["_run_dir"] = str(Path(p).parent)
+            rows.append(row)
         except Exception:
             pass
     return rows

@@ -174,26 +174,13 @@ fn run_pretool_bash_rewrite<W: Write>(
         );
         let _ = writeln!(w, "{}", pretool_rewrite_output(&rewritten, &reason));
 
-        // Best-effort, matching every other decision log write on this path:
-        // a row that fails to write costs an operator one audit-log entry,
-        // never a hook failure.
-        if let Ok(state) = StateDir::resolve(env) {
-            let session = crate::commands::ctx::mail::session_identity(env)
-                .unwrap_or_else(|| payload.session_id.clone());
-            let _ = log::append(
-                &state,
-                &log::Decision {
-                    ts: now_secs(),
-                    session: &session,
-                    verb: "hook",
-                    verdict: "n/a",
-                    score: 0,
-                    action: "rewrite",
-                    detail: &format!("{command} -> {rewritten}"),
-                    observed_at: None,
-                },
-            );
-        }
+        log_bash_hook_decision(
+            payload,
+            env,
+            "n/a",
+            "rewrite",
+            &format!("{command} -> {rewritten}"),
+        );
         return Ok(0);
     }
 
@@ -202,29 +189,38 @@ fn run_pretool_bash_rewrite<W: Write>(
     // this policy default (#419).
     if env(crate::commands::ctx::adapters::HEADLESS_ENV).as_deref() == Some("1") {
         let _ = writeln!(w, "{}", pretool_safety_allow_output());
-
-        // Best-effort, matching every other decision log write on this
-        // path: a row that fails to write costs an operator one audit-log
-        // entry, never a hook failure.
-        if let Ok(state) = StateDir::resolve(env) {
-            let session = crate::commands::ctx::mail::session_identity(env)
-                .unwrap_or_else(|| payload.session_id.clone());
-            let _ = log::append(
-                &state,
-                &log::Decision {
-                    ts: now_secs(),
-                    session: &session,
-                    verb: "hook",
-                    verdict: "allow",
-                    score: 0,
-                    action: "allow",
-                    detail: command,
-                    observed_at: None,
-                },
-            );
-        }
+        log_bash_hook_decision(payload, env, "allow", "allow", command);
     }
     Ok(0)
+}
+
+/// Best-effort decision-log row for a Bash hook outcome: a row that fails to
+/// write costs an operator one audit-log entry, never a hook failure.
+fn log_bash_hook_decision(
+    payload: &PreToolPayload,
+    env: EnvLookup<'_>,
+    verdict: &str,
+    action: &str,
+    detail: &str,
+) {
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let session = crate::commands::ctx::mail::session_identity(env)
+        .unwrap_or_else(|| payload.session_id.clone());
+    let _ = log::append(
+        &state,
+        &log::Decision {
+            ts: now_secs(),
+            session: &session,
+            verb: "hook",
+            verdict,
+            score: 0,
+            action,
+            detail,
+            observed_at: None,
+        },
+    );
 }
 
 /// Run consolidated Bash/PowerShell safety in-process, keeping the safety
@@ -287,6 +283,21 @@ fn run_pretool_bash_or_powershell<W: Write>(
         if let Some(envelope) = &safety_envelope {
             let _ = writeln!(w, "{envelope}");
         }
+        return Ok(0);
+    }
+
+    // Safety stays the final word above; only now may the edit guard refuse a
+    // scripted rewrite of a tracked file, once per distinct command.
+    if let Some(reason) = super::shell_edit_guard::shell_edit_guard_reason(payload, env) {
+        let _ = writeln!(w, "{}", pretool_output(&reason));
+        let first_line = payload
+            .tool_input
+            .command
+            .lines()
+            .next()
+            .unwrap_or_default();
+        let detail: String = first_line.chars().take(120).collect();
+        log_bash_hook_decision(payload, env, "deny", "edit-guard", &detail);
         return Ok(0);
     }
 
@@ -1326,6 +1337,97 @@ mod tests {
                 .contains("rewrite"),
             "got {parsed}"
         );
+    }
+
+    // -- PreToolUse: the shell edit guard ----------------------------------
+
+    const SPLICE: &str = "python - <<'EOF'\np='pkg/mod.py'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF";
+
+    /// A git repo whose `pkg/mod.py` is tracked.
+    fn repo_with_tracked_module() -> tempfile::TempDir {
+        let repo = super::super::tests::git_repo();
+        std::fs::create_dir_all(repo.path().join("pkg")).expect("pkg dir");
+        std::fs::write(repo.path().join("pkg/mod.py"), "a = 1\n").expect("write mod.py");
+        let status = std::process::Command::new("git")
+            .args(["add", "pkg/mod.py"])
+            .current_dir(repo.path())
+            .status()
+            .expect("run git add");
+        assert!(status.success());
+        repo
+    }
+
+    /// One Bash `run_pretool` call; returns whatever it printed.
+    fn run_bash_guarded(repo: &Path, state_dir: &Path, supervised: bool, command: &str) -> String {
+        let mut env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]
+        .into();
+        if supervised {
+            env.insert(SESSION_ENV.to_string(), "zirv-sess-edit-guard".to_string());
+        }
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.display().to_string(), command),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        String::from_utf8(out).expect("utf8")
+    }
+
+    fn is_edit_guard_deny(printed: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(printed.trim())
+            .ok()
+            .is_some_and(|v| {
+                v["hookSpecificOutput"]["permissionDecision"] == "deny"
+                    && v["hookSpecificOutput"]["permissionDecisionReason"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("zirv edit guard:"))
+            })
+    }
+
+    #[test]
+    fn run_pretool_denies_a_scripted_tracked_edit_once_then_allows_the_rerun() {
+        let repo = repo_with_tracked_module();
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        let first = run_bash_guarded(repo.path(), state_dir.path(), true, SPLICE);
+        assert!(is_edit_guard_deny(&first), "got {first}");
+        assert!(first.contains("tracked file pkg/mod.py."), "got {first}");
+
+        let again = run_bash_guarded(repo.path(), state_dir.path(), true, SPLICE);
+        assert!(!is_edit_guard_deny(&again), "re-run must pass: {again}");
+    }
+
+    #[test]
+    fn run_pretool_allows_a_script_that_writes_only_an_untracked_path() {
+        let repo = repo_with_tracked_module();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let command = "python - <<'EOF'\nopen('/tmp/out.txt','w').write('x')\nEOF";
+        let printed = run_bash_guarded(repo.path(), state_dir.path(), true, command);
+        assert!(!is_edit_guard_deny(&printed), "got {printed}");
+    }
+
+    #[test]
+    fn run_pretool_denies_a_tracked_edit_even_when_it_also_names_out_of_repo_paths() {
+        let repo = repo_with_tracked_module();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let command = format!(
+            "{SPLICE}\npython - <<'EOF'\nopen('/tmp/out.txt','w').write('x')\nx='../elsewhere.txt'\nEOF"
+        );
+        let printed = run_bash_guarded(repo.path(), state_dir.path(), true, &command);
+        assert!(is_edit_guard_deny(&printed), "got {printed}");
+    }
+
+    #[test]
+    fn run_pretool_edit_guard_is_silent_outside_a_supervised_session() {
+        let repo = repo_with_tracked_module();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let printed = run_bash_guarded(repo.path(), state_dir.path(), false, SPLICE);
+        assert!(!is_edit_guard_deny(&printed), "got {printed}");
     }
 
     /// F7 (wrapper-overhead benchmark, 2026-09-24): a heredoc -- one of the

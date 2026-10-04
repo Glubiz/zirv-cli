@@ -98,9 +98,7 @@ hedging. Delete whatever it orphans and rename what no longer fits.
 - Keep tool output small: quiet flags, --stat/-n limits, ranged file reads, never re-print \
 output already shown.
 - Think like QA: one focused test per behaviour change, including the unhappy path; none for a \
-change that cannot alter behaviour. Extend the existing test file or class in place (never after \
-an entry-point block, never re-declare a test class) and confirm the test count rose by exactly \
-yours.
+change that cannot alter behaviour.
 - Follow the repository's own conventions, style, test layout and commit format; a repo \
 instruction file wins over these defaults.
 - Finish the whole task: never hand back partial work. If genuinely blocked, finish the rest \
