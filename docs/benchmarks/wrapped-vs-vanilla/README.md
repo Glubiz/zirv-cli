@@ -115,6 +115,24 @@ Each run is graded (tests, answer-check, or judge rubric, per task) and
 scored, timed, and cost-tracked; `aggregate.py` rolls the per-run
 `result.json` files into a report.
 
+### Worker-rule compliance columns
+
+`compare.py` appends rows scanned by `compliance.py` from each run's
+`transcripts/*.jsonl` (main thread only, sidechains skipped), so they also work
+on already-finished runs; `python compliance.py <run dir>` prints one run's
+numbers. A run with no transcripts scores zero on all of them.
+
+| Row | Meaning / rule it measures | Better |
+|---|---|---|
+| API rounds | distinct assistant `message.id`s; fewer round trips | lower |
+| Tool calls per round, Parallel rounds | batching independent calls in one message | higher |
+| Read tool calls, Edit/Write tool calls | using the dedicated tools | higher |
+| Shell file reads | `sed -n`/`cat`/`head`/`tail`/`nl`/`awk` reads instead of `Read` | lower |
+| Script-written files | inline `python`/`node`/... script that writes a file instead of `Edit`/`Write` | lower |
+| Syntax errors after script write | a `SyntaxError`/`IndentationError` result after a script write, before the next edit (at most 1 per write) | lower |
+| Edit-guard denials | tool results containing `zirv edit guard:` (the PreToolUse denial of such edits) | lower |
+| `zirv ctx run` calls | commands that use `zirv ctx run` | higher |
+
 ## Reproducing the recorded grids
 
 From this directory, current grid (zirv under test vs. vanilla + superpowers,
