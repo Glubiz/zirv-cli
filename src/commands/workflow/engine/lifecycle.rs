@@ -581,9 +581,16 @@ pub fn render_current_context(
     Ok(Some(cap_workflow_context(rendered, max_context_bytes)))
 }
 
-pub fn active_skill_context(repo: &Path) -> CtxResult<Option<String>> {
+/// Only the workflow bound to `session` is rendered; with no session, or none bound, the repo's active pointer (possibly another session's finished task) is never injected.
+pub fn active_skill_context(repo: &Path, session: Option<&str>) -> CtxResult<Option<String>> {
+    let Some(short) = session else {
+        return Ok(None);
+    };
     let state_dir = StateDir::resolve(&|key| std::env::var(key).ok())?;
-    let Some(state) = load_active(&state_dir, repo)? else {
+    if crate::commands::ctx::sessions::workflow_id_for(&state_dir, short).is_none() {
+        return Ok(None);
+    }
+    let Some(state) = load_active_for_session(&state_dir, repo, short)? else {
         return Ok(None);
     };
     match render_current_context(&state, repo, dirs::home_dir().as_deref()) {

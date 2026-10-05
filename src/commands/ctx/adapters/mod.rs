@@ -815,6 +815,12 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Whether the host already lists the skills natively for `role` (the same roles `plugin_dir_args` registers them for), making a prompt-embedded listing a duplicate.
+    fn lists_skills_natively(&self, role: super::prompt::PromptRole) -> bool {
+        let _ = role;
+        false
+    }
+
     /// Register native host skills when the launch permits them; worker and single-seat prompts already carry the compact skill index.
     fn plugin_dir_args(&self, flags: &[String], role: super::prompt::PromptRole) -> Vec<String> {
         let _ = (flags, role);

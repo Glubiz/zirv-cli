@@ -2806,6 +2806,18 @@ impl AgentAdapter for ClaudeAdapter {
     /// `PromptRole::SubOrchestrator` still decide which harnesses run and
     /// still need `zirv:<id>` resolvable through the `Skill` tool, so they
     /// keep the plugin.
+    fn lists_skills_natively(&self, role: crate::commands::ctx::prompt::PromptRole) -> bool {
+        use crate::commands::ctx::prompt::PromptRole;
+        if matches!(role, PromptRole::Worker | PromptRole::Single) {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(forced) = &self.forced_plugin_dir {
+            return forced.is_some();
+        }
+        self.resolved_plugin_dir().is_some()
+    }
+
     fn plugin_dir_args(
         &self,
         flags: &[String],
@@ -5108,11 +5120,19 @@ mod tests {
                 adapter.plugin_dir_args(&[], role).is_empty(),
                 "{role:?} must never register the native skill plugin"
             );
+            assert!(
+                !adapter.lists_skills_natively(role),
+                "{role:?} keeps the prompt pointer"
+            );
         }
         for role in [PromptRole::Orchestrator, PromptRole::SubOrchestrator] {
             assert!(
                 !adapter.plugin_dir_args(&[], role).is_empty(),
                 "{role:?} must still register the native skill plugin"
+            );
+            assert!(
+                adapter.lists_skills_natively(role),
+                "{role:?} gets the list through the plugin, so the prompt must not repeat it"
             );
         }
     }

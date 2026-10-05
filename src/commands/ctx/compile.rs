@@ -1182,11 +1182,15 @@ pub fn compile_with_harness_roster(
     probe_cache.save();
     let harness_lines = harness_report.lines;
 
+    let prompt_cfg = super::config::PromptConfig {
+        skill_index_native: adapter.lists_skills_natively(role),
+        ..cfg.prompt.clone()
+    };
     let composed = prompt::compose(
         home,
         repo,
         simple,
-        &cfg.prompt,
+        &prompt_cfg,
         role,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
@@ -1221,7 +1225,12 @@ pub fn compile_with_harness_roster(
     // Keep volatile workflow text after canonical context to preserve the cacheable prefix.
     let composed = prompt::with_workflow_layer(
         composed,
-        prompt::workflow_context_for_role(repo, role).as_deref(),
+        prompt::workflow_context_for_role(
+            repo,
+            role,
+            super::mail::session_identity(&|key| std::env::var(key).ok()).as_deref(),
+        )
+        .as_deref(),
     );
     // Sum independently selected memory budgets so neither selection crowds out the other (#155).
     let composed = prompt::with_memory_layer(
@@ -2515,9 +2524,30 @@ mod tests {
             true,
         )
         .expect("save active workflow");
+        // A prompt carries only the workflow bound to the composing session.
+        let session = "aaaa1111bbbb2222cccc3333dddd4444";
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                session,
+                "claude",
+                repo.path(),
+                crate::commands::ctx::sessions::Verb::Chat,
+            ),
+        );
+        let workflow_id = crate::commands::workflow::engine::load_active(&state, repo.path())
+            .expect("load")
+            .expect("active workflow")
+            .id;
+        crate::commands::ctx::sessions::bind_workflow_id(
+            &state,
+            &crate::commands::ctx::sessions::short_id(session),
+            &workflow_id,
+        );
 
         unsafe {
             std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_dir.path());
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
         }
         let adapter = ClaudeAdapter::new(None);
         let orchestrator_compiled = compile(
@@ -2546,6 +2576,7 @@ mod tests {
         );
         unsafe {
             std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
         }
 
         let orchestrator_composed = orchestrator_compiled.composed.expect("composed");
@@ -4320,7 +4351,8 @@ mod tests {
             "Always run the full test suite before committing.",
         )]);
         let cfg = CtxConfig::default();
-        let adapter = ClaudeAdapter::new(None);
+        // Codex has no native skill listing, so it keeps the full index (Claude's plugin lists it instead).
+        let adapter = CodexAdapter::new(None);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 

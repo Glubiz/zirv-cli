@@ -2741,11 +2741,13 @@ persists that choice across resume and prompt composition. Repository skills are
 they can request logical capabilities but never grant themselves filesystem,
 shell, network, or other permissions.
 
-An orchestrator or sub-orchestrator seat carries a standing skill index; a
-worker or single-seat session instead gets one fixed pointer line (run
-`zirv skill list`, then `zirv skill load <id>`), because a headless worker
-pays the full catalogue on every turn and loads a skill in only a small
-share of runs. The index is one line per
+An orchestrator or sub-orchestrator seat on a harness without a native skill
+listing (Codex) carries a standing skill index; a worker or single-seat
+session, and a Claude orchestrator whose plugin directory already lists the
+skills, instead get one fixed pointer line (run `zirv skill list`, then
+`zirv skill load <id>`), because a headless worker pays the full catalogue on
+every turn and loads a skill in only a small share of runs, and the plugin
+listing would duplicate the index. The index is one line per
 implicit-activation skill (`- <id>: <first sentence>`, the first sentence of
 the skill's own description, a repository-layer skill marked
 `(repository-untrusted)`), in a stable, task-independent layer so it never

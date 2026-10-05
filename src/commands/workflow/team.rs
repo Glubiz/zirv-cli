@@ -962,7 +962,7 @@ pub fn compile_for_objective(
     objective: &str,
     seat: Option<&str>,
 ) -> CtxResult<TeamPlan> {
-    let classification = classify::from_args(&classify::ClassifyArgs {
+    let classification = classify::from_plan_args(&classify::ClassifyArgs {
         task: objective.to_string(),
         paths: Vec::new(),
         changed_lines: None,
@@ -1132,7 +1132,7 @@ fn run_plan(args: &TeamPlanArgs, writer: &mut impl Write) -> CtxResult<i32> {
         branch: None,
         json: false,
     };
-    let classification = classify::from_args(&classify_args)?;
+    let classification = classify::from_plan_args(&classify_args)?;
     let profile = ExecutionProfile::derive(&args.objective, &classification);
     let home = dirs::home_dir();
     let registry = AgentRegistry::load_for_repo(&repo, home.as_deref(), !args.built_in_only)?;
@@ -1366,6 +1366,43 @@ mod tests {
 
     fn always_eligible(_role: TeamRole) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Planning happens before any work is written, so untracked junk in the checkout
+    /// (.DS_Store, a stray log) must not size the team, exactly as for `workflow start`.
+    #[test]
+    fn team_plan_classification_ignores_untracked_files() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").expect("seed");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let objective = "Evidence-only analysis of zirv";
+        let clean = compile_for_objective(repo.path(), None, objective, None).expect("clean plan");
+
+        std::fs::write(repo.path().join(".DS_Store"), "x\n".repeat(60)).expect("junk");
+        std::fs::write(repo.path().join("return-argv.log"), "x\n".repeat(60)).expect("junk");
+        let dirty = compile_for_objective(repo.path(), None, objective, None).expect("dirty plan");
+
+        assert_eq!(dirty.profile.classification, clean.profile.classification);
     }
 
     fn classification_with(

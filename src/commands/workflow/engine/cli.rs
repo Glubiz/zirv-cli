@@ -3307,6 +3307,10 @@ mod tests {
             )
             .unwrap();
         }
+        // Team planning measures tracked changes only, so stage the pending files.
+        if count > 0 {
+            git(&["add", "src"]);
+        }
         repo
     }
 

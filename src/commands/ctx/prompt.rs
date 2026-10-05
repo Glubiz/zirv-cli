@@ -159,8 +159,8 @@ zirv meta-harness (v21)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
-- This seat coordinates and integrates; implementation, tests and docs are a worker's, whatever \
-the task size. Delegate inside your own harness with its native subagent mechanism. `zirv agent \
+- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
@@ -206,8 +206,8 @@ than trusting remembered or hand-copied command text.";
 pub const HARNESS_PROMPT_STANDARD: &str = "\
 zirv meta-harness (standard)
 
-- This seat coordinates and integrates; implementation, tests and docs are a worker's, whatever \
-the task size. Delegate inside your own harness with its native subagent mechanism. `zirv agent \
+- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
@@ -251,8 +251,8 @@ choice in `.zirv/.settings.toml`.";
 pub const HARNESS_PROMPT_MINIMAL: &str = "\
 zirv meta-harness (minimal)
 
-- This seat coordinates and integrates; implementation, tests and docs are a worker's, whatever \
-the task size. Delegate inside your own harness with its native subagent mechanism. `zirv agent \
+- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
@@ -1083,7 +1083,7 @@ pub fn compose(
     // Task-independent discovery belongs in the stable prefix; Worker/Single use a compact pointer (#539).
     // Disabling the layer leaves skills loadable by command.
     if cfg.skill_index {
-        if matches!(role, PromptRole::Worker | PromptRole::Single) {
+        if matches!(role, PromptRole::Worker | PromptRole::Single) || cfg.skill_index_native {
             text.push_str(SKILL_POINTER_LAYER);
             sources.push(PromptSource::SkillPointer);
         } else if let Some(index) = skill_index_text(repo, home, cfg.skill_index_repo_filter) {
@@ -1158,11 +1158,16 @@ controls capabilities.\n\n";
 
 /// Only Orchestrator/Single drive the repo workflow; dispatched roles must never inherit its active step.
 /// That step can override their self-contained task briefs, even when unrelated to their work (#253, #537).
-pub fn workflow_context_for_role(repo: &Path, role: PromptRole) -> Option<String> {
+/// A known `session` gets only its own bound workflow, never another session's (the repo pointer is for unregistered sessions).
+pub fn workflow_context_for_role(
+    repo: &Path,
+    role: PromptRole,
+    session: Option<&str>,
+) -> Option<String> {
     if !matches!(role, PromptRole::Orchestrator | PromptRole::Single) {
         return None;
     }
-    crate::commands::workflow::engine::active_skill_context(repo)
+    crate::commands::workflow::engine::active_skill_context(repo, session)
         .ok()
         .flatten()
 }
@@ -4011,6 +4016,11 @@ mod tests {
                 "make trivial edits",
                 "Repository writes from this seat are recorded",
             ),
+            (
+                OrchestratorWrites::Deny,
+                "it does not implement",
+                "make trivial edits",
+            ),
         ] {
             let cfg = PromptConfig {
                 orchestrator_writes: posture,
@@ -4043,6 +4053,12 @@ mod tests {
             assert!(
                 !merged.text.contains(want_absent),
                 "posture={posture:?}: did not expect '{want_absent}':\n{}",
+                merged.text
+            );
+            // The write rule belongs to the posture layer; the shared harness layer must not overstate it.
+            assert!(
+                !merged.text.contains("whatever the task size"),
+                "posture={posture:?}: no shared layer may claim 'whatever the task size':\n{}",
                 merged.text
             );
         }
@@ -7182,6 +7198,28 @@ mod tests {
         with_active_workflow_with_task(repo, "run the database migration", f)
     }
 
+    /// As [`with_active_workflow`], with the workflow bound to a registered session whose short id `f` receives:
+    /// the only way a workflow reaches a composed prompt.
+    fn with_bound_workflow<R>(repo: &Path, f: impl FnOnce(&str) -> R) -> R {
+        use crate::commands::ctx::sessions::{
+            Record, SessionGuard, Verb, bind_workflow_id, short_id,
+        };
+        with_active_workflow(repo, || {
+            let state =
+                crate::commands::ctx::state::StateDir::resolve(&|key| std::env::var(key).ok())
+                    .expect("state dir");
+            let workflow = crate::commands::workflow::engine::load_active(&state, repo)
+                .expect("load")
+                .expect("active workflow");
+            let session = "aaaa1111bbbb2222cccc3333dddd4444";
+            let _guard =
+                SessionGuard::register(&state, Record::new(session, "claude", repo, Verb::Chat));
+            let short = short_id(session);
+            bind_workflow_id(&state, &short, &workflow.id);
+            f(&short)
+        })
+    }
+
     /// As [`with_active_workflow`], with the started workflow's own task
     /// text parameterized for a caller that needs a task scoring against the
     /// skill registry, unlike the empty-classification placeholder every
@@ -7244,7 +7282,7 @@ mod tests {
     fn the_workflow_step_layer_reaches_only_the_orchestrator_role() {
         let (_tmp, home, repo) = tree();
 
-        let orchestrator = with_active_workflow(&repo, || {
+        let orchestrator = with_bound_workflow(&repo, |session| {
             let composed = compose(
                 Some(&home),
                 &repo,
@@ -7257,7 +7295,8 @@ mod tests {
             );
             with_workflow_layer(
                 composed,
-                workflow_context_for_role(&repo, PromptRole::Orchestrator).as_deref(),
+                workflow_context_for_role(&repo, PromptRole::Orchestrator, Some(session))
+                    .as_deref(),
             )
             .expect("composed")
         });
@@ -7268,7 +7307,7 @@ mod tests {
         );
         assert!(orchestrator.text.contains("run the database migration"));
 
-        let worker = with_active_workflow(&repo, || {
+        let worker = with_bound_workflow(&repo, |session| {
             let composed = compose(
                 Some(&home),
                 &repo,
@@ -7281,7 +7320,7 @@ mod tests {
             );
             with_workflow_layer(
                 composed,
-                workflow_context_for_role(&repo, PromptRole::Worker).as_deref(),
+                workflow_context_for_role(&repo, PromptRole::Worker, Some(session)).as_deref(),
             )
             .expect("composed")
         });
@@ -7292,7 +7331,7 @@ mod tests {
         );
         assert!(!worker.text.contains("run the database migration"));
 
-        let sub_orchestrator = with_active_workflow(&repo, || {
+        let sub_orchestrator = with_bound_workflow(&repo, |session| {
             let composed = compose(
                 Some(&home),
                 &repo,
@@ -7305,7 +7344,8 @@ mod tests {
             );
             with_workflow_layer(
                 composed,
-                workflow_context_for_role(&repo, PromptRole::SubOrchestrator).as_deref(),
+                workflow_context_for_role(&repo, PromptRole::SubOrchestrator, Some(session))
+                    .as_deref(),
             )
             .expect("composed")
         });
@@ -7326,6 +7366,88 @@ mod tests {
     /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
     /// together with `with_workflow_layer`, directly against the extracted
     /// function instead. Issue #537 (T3) widened the gate to also admit
+    /// A registered session sees only the workflow bound to it: the repo-wide pointer must not
+    /// inject another session's (possibly long-finished) task into it.
+    #[test]
+    fn the_skill_list_is_omitted_only_where_the_host_lists_skills_natively() {
+        let (_tmp, home, repo) = tree();
+        for (native, want) in [
+            (false, PromptSource::SkillIndex),
+            (true, PromptSource::SkillPointer),
+        ] {
+            let cfg = PromptConfig {
+                skill_index_native: native,
+                ..PromptConfig::default()
+            };
+            let composed = compose(
+                Some(&home),
+                &repo,
+                false,
+                &cfg,
+                PromptRole::Orchestrator,
+                &[],
+                usize::MAX,
+                &super::super::screen::Thresholds::default(),
+            )
+            .expect("composed");
+            assert!(
+                composed.sources.contains(&want),
+                "native={native}: expected {want:?}: {:?}",
+                composed.sources
+            );
+            assert_eq!(
+                composed.text.contains(SKILL_INDEX_HEADER),
+                !native,
+                "native={native}: the full index must appear only when the host lists nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_context_needs_a_session_bound_workflow() {
+        let (_tmp, _home, repo) = tree();
+        let context = with_active_workflow(&repo, || {
+            workflow_context_for_role(&repo, PromptRole::Orchestrator, None)
+        });
+        assert_eq!(
+            context, None,
+            "a running repo-pointer workflow must not reach a composition with no session"
+        );
+    }
+
+    #[test]
+    fn workflow_context_is_bound_to_the_session_that_owns_the_workflow() {
+        use crate::commands::ctx::sessions::{
+            Record, SessionGuard, Verb, bind_workflow_id, short_id,
+        };
+        let (_tmp, _home, repo) = tree();
+
+        with_active_workflow(&repo, || {
+            let state =
+                crate::commands::ctx::state::StateDir::resolve(&|key| std::env::var(key).ok())
+                    .expect("state dir");
+            let workflow = crate::commands::workflow::engine::load_active(&state, &repo)
+                .expect("load")
+                .expect("active workflow");
+            let record = |id: &str| Record::new(id, "claude", &repo, Verb::Chat);
+            let _owner = SessionGuard::register(&state, record("aaaa1111bbbb2222cccc3333dddd4444"));
+            let _other = SessionGuard::register(&state, record("eeee5555ffff6666aaaa7777bbbb8888"));
+            let owner = short_id("aaaa1111bbbb2222cccc3333dddd4444");
+            let other = short_id("eeee5555ffff6666aaaa7777bbbb8888");
+            bind_workflow_id(&state, &owner, &workflow.id);
+
+            let for_owner =
+                workflow_context_for_role(&repo, PromptRole::Orchestrator, Some(&owner))
+                    .expect("the owning session keeps its step");
+            assert!(for_owner.contains("run the database migration"));
+            assert_eq!(
+                workflow_context_for_role(&repo, PromptRole::Orchestrator, Some(&other)),
+                None,
+                "another registered session must not inherit the owner's step"
+            );
+        });
+    }
+
     /// `PromptRole::Single`: it is the seat actually doing the work a
     /// `Bounded` decision's own workflow was started for, unlike a
     /// dispatched Worker/SubOrchestrator.
@@ -7333,28 +7455,28 @@ mod tests {
     fn workflow_context_for_role_reaches_the_orchestrator_and_single_roles_only() {
         let (_tmp, _home, repo) = tree();
 
-        let orchestrator_context = with_active_workflow(&repo, || {
-            workflow_context_for_role(&repo, PromptRole::Orchestrator)
+        let orchestrator_context = with_bound_workflow(&repo, |session| {
+            workflow_context_for_role(&repo, PromptRole::Orchestrator, Some(session))
         })
         .expect("orchestrator gets the active step");
         assert!(orchestrator_context.contains("run the database migration"));
 
-        let single_context = with_active_workflow(&repo, || {
-            workflow_context_for_role(&repo, PromptRole::Single)
+        let single_context = with_bound_workflow(&repo, |session| {
+            workflow_context_for_role(&repo, PromptRole::Single, Some(session))
         })
         .expect("a single seat gets the active step too -- it is the one doing the work");
         assert!(single_context.contains("run the database migration"));
 
-        let worker_context = with_active_workflow(&repo, || {
-            workflow_context_for_role(&repo, PromptRole::Worker)
+        let worker_context = with_bound_workflow(&repo, |session| {
+            workflow_context_for_role(&repo, PromptRole::Worker, Some(session))
         });
         assert_eq!(
             worker_context, None,
             "a dispatched worker must never receive the active step's guidance"
         );
 
-        let sub_orchestrator_context = with_active_workflow(&repo, || {
-            workflow_context_for_role(&repo, PromptRole::SubOrchestrator)
+        let sub_orchestrator_context = with_bound_workflow(&repo, |session| {
+            workflow_context_for_role(&repo, PromptRole::SubOrchestrator, Some(session))
         });
         assert_eq!(
             sub_orchestrator_context, None,
