@@ -555,8 +555,44 @@ fn head_sha(repo: &Path) -> CtxResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// A checkout's git root and changed paths, each spawned for once and shared by every caller of
+/// one hook run, so a Stop hook does not repeat the same `git` calls per consumer.
+pub struct ChangeScan {
+    repo: PathBuf,
+    root: Option<PathBuf>,
+    paths: Option<Vec<PathBuf>>,
+}
+
+impl ChangeScan {
+    pub fn new(repo: &Path) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            root: None,
+            paths: None,
+        }
+    }
+
+    fn root(&mut self) -> PathBuf {
+        self.root
+            .get_or_insert_with(|| git_root(&self.repo))
+            .clone()
+    }
+
+    pub fn paths(&mut self) -> CtxResult<&[PathBuf]> {
+        if self.paths.is_none() {
+            let root = self.root();
+            self.paths = Some(changed_paths_at_root(&root)?);
+        }
+        Ok(self.paths.as_deref().unwrap_or_default())
+    }
+}
+
 pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
-    let root = git_root(repo);
+    change_fingerprint_with(&mut ChangeScan::new(repo))
+}
+
+pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
+    let root = scan.root();
     let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
     if !head.status.success() {
         return Err("cannot fingerprint repository HEAD".into());
@@ -567,7 +603,7 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     }
     let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
     input.push_str(&String::from_utf8_lossy(&diff.stdout));
-    let paths = changed_paths_at_root(&root)?;
+    let paths = scan.paths()?;
     // One `hash-object` for every plain file; `--stdin-paths` splits on newlines and unquotes a
     // leading `"`, so those names fall back to a spawn of their own below.
     let batchable: Vec<&PathBuf> = paths
@@ -618,7 +654,7 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
                 .zip(hashes.lines().map(str::to_string)),
         );
     }
-    for path in &paths {
+    for path in paths {
         input.push_str("\npath:");
         input.push_str(&path.to_string_lossy());
         match std::fs::symlink_metadata(root.join(path)) {
@@ -2125,7 +2161,19 @@ pub fn latest_is_fresh_and_passing(
     final_only: bool,
     branch: Option<&str>,
 ) -> CtxResult<bool> {
-    if latest_is_fresh_and_passing_at(state, repo, final_only, None)? {
+    latest_is_fresh_and_passing_scan(state, repo, &mut ChangeScan::new(repo), final_only, branch)
+}
+
+/// [`latest_is_fresh_and_passing`] over a caller-owned scan of `repo`, so the caller can reuse the
+/// changed paths this check already listed.
+pub fn latest_is_fresh_and_passing_scan(
+    state: &StateDir,
+    repo: &Path,
+    scan: &mut ChangeScan,
+    final_only: bool,
+    branch: Option<&str>,
+) -> CtxResult<bool> {
+    if latest_is_fresh_and_passing_at(state, repo, scan, final_only, None)? {
         return Ok(true);
     }
     // Keep reports keyed to literal checkouts; widen gate reads only to siblings whose recorded branch exactly matches a nonempty workflow branch. (#467)
@@ -2137,7 +2185,14 @@ pub fn latest_is_fresh_and_passing(
         if sibling == canonical {
             continue;
         }
-        if latest_is_fresh_and_passing_at(state, &sibling, final_only, Some(branch))? {
+        let mut sibling_scan = ChangeScan::new(&sibling);
+        if latest_is_fresh_and_passing_at(
+            state,
+            &sibling,
+            &mut sibling_scan,
+            final_only,
+            Some(branch),
+        )? {
             return Ok(true);
         }
     }
@@ -2157,6 +2212,7 @@ pub fn latest_is_fresh_and_passing(
 fn latest_is_fresh_and_passing_at(
     state: &StateDir,
     repo: &Path,
+    scan: &mut ChangeScan,
     final_only: bool,
     required_branch: Option<&str>,
 ) -> CtxResult<bool> {
@@ -2172,7 +2228,7 @@ fn latest_is_fresh_and_passing_at(
         // A `--check format` run is evidence about formatting, not about the
         // change set, so it can never satisfy a step gate.
         && report.narrowed_to.is_empty()
-        && report.change_fingerprint == change_fingerprint(repo)?)
+        && report.change_fingerprint == change_fingerprint_with(scan)?)
     {
         return Ok(false);
     }
@@ -4461,6 +4517,23 @@ mod tests {
             before,
             "an ordinary untracked file must still move the fingerprint"
         );
+    }
+
+    /// A shared scan yields the very fingerprint and paths the one-shot calls do, and lists the
+    /// changed paths once: a file created after the fingerprint is not in the shared list.
+    #[test]
+    fn a_shared_scan_keeps_the_fingerprint_and_lists_paths_once() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+        let expected_paths = changed_paths(repo.path()).unwrap();
+        let expected = change_fingerprint(repo.path()).unwrap();
+
+        let mut scan = ChangeScan::new(repo.path());
+        assert_eq!(change_fingerprint_with(&mut scan).unwrap(), expected);
+        std::fs::write(repo.path().join("c.txt"), "c\n").unwrap();
+        assert_eq!(scan.paths().unwrap(), expected_paths.as_slice());
+        assert_ne!(change_fingerprint(repo.path()).unwrap(), expected);
     }
 
     #[cfg(unix)]
