@@ -1711,6 +1711,15 @@ fn render_report<W: Write>(
             style::paint("(unreadable)", Tone::Err, colour)
         )?,
     }
+    if let Ok(found) = crate::commands::workflow::engine::abandoned_workflows(
+        &state,
+        repo,
+        mail_session.as_deref(),
+        now_secs(),
+    ) && let Some(line) = workflows_line(&found)
+    {
+        writeln!(w, "{} {line}", label(colour, "workflows:"))?;
+    }
     if !args.brief {
         let recent_mail =
             mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
@@ -2621,6 +2630,38 @@ fn billing_label(cfg: &CtxConfig, repo: &Path) -> String {
 /// read alike.
 fn repo_state_env(env: EnvLookup<'_>) -> EnvLookup<'_> {
     env
+}
+
+/// The `workflows:` status value for workflows nobody is advancing; `None` when there are none (#878).
+fn workflows_line(
+    found: &[crate::commands::workflow::engine::AbandonedWorkflow],
+) -> Option<String> {
+    if found.is_empty() {
+        return None;
+    }
+    let shown = found
+        .iter()
+        .take(5)
+        .map(|w| {
+            let brief = if w.this_session {
+                "(this session, not advanced)"
+            } else {
+                w.brief.as_str()
+            };
+            format!("{} {brief}", w.id.chars().take(8).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = found.len().saturating_sub(5);
+    let more = if more > 0 {
+        format!(", +{more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} running with no advance ({shown}{more}) -- close: zirv workflow close <id> --reason <why>",
+        found.len()
+    ))
 }
 
 pub fn run_with<W: Write>(
@@ -4386,6 +4427,64 @@ mod tests {
             prefix_count, 1,
             "prefix should appear exactly once in chat line, but got {}: {}",
             prefix_count, chat_line
+        );
+    }
+
+    /// Issue #878: the `workflows:` line appears only when a workflow is stale with no advance.
+    #[test]
+    fn status_reports_unadvanced_workflows_only_when_they_exist() {
+        use crate::commands::workflow::engine::{WorkflowKind, WorkflowState};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+            agents: false,
+        };
+        let render = || {
+            let mut out = Vec::new();
+            run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+            String::from_utf8(out).expect("utf8")
+        };
+        assert!(!render().contains("workflows:"), "{}", render());
+
+        let classification = crate::commands::workflow::classify::Classification {
+            intent: crate::commands::workflow::classify::Intent::Feature,
+            complexity: crate::commands::workflow::classify::Complexity::Trivial,
+            risk: crate::commands::workflow::classify::RiskBand::Low,
+            risk_score: 0,
+            changed_files: 1,
+            changed_lines: 5,
+            changed_paths: Vec::new(),
+            declared_scope: false,
+            work_domain: Default::default(),
+            risk_measurement: crate::commands::workflow::classify::RiskMeasurement::Measured,
+            reasons: Vec::new(),
+        };
+        let mut stale = WorkflowState::start(
+            tmp.path().to_path_buf(),
+            "old".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        );
+        stale.id = "836d0cfe".into();
+        stale.updated_at = 1_000;
+        crate::commands::workflow::engine::save(&state, &stale, true).expect("save");
+        let text = render();
+        assert!(
+            text.contains("workflows: 1 running with no advance (836d0cfe ")
+                && text.contains("zirv workflow close <id> --reason <why>"),
+            "{text}"
         );
     }
 

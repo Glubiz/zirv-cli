@@ -205,7 +205,8 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
 
     let adoption_nudge = prompt_adoption_nudge(&repo, &cfg, env);
     let intake_note = intake_discipline_note(&cfg, &payload.session_id, stdin, env);
-    let workflow_note = auto_start_workflow_note(&cfg, &payload.session_id, stdin, &repo, env);
+    let workflow_note = auto_start_workflow_note(&cfg, &payload.session_id, stdin, &repo, env)
+        .or_else(|| workflow_step_change_note(&cfg, &payload.session_id, stdin, &repo, env));
     let extra = [intake_note, workflow_note, adoption_nudge]
         .into_iter()
         .flatten()
@@ -415,6 +416,10 @@ fn auto_start_workflow_note(
     }
     let state = StateDir::resolve(env).ok()?;
     let short = crate::commands::ctx::sessions::short_id(&session);
+    // Once per session, close workflows nobody is advancing so they stop shadowing this one (#878).
+    if !declined && claim_first_prompt(&state, &format!("{session}#sweep")) {
+        sweep_abandoned_workflows(&state, repo, &short);
+    }
     if engine::load_active_for_session(&state, repo, &short)
         .ok()?
         .is_some()
@@ -430,8 +435,9 @@ fn auto_start_workflow_note(
     else {
         return None;
     };
+    crate::commands::ctx::sessions::bind_workflow_id(&state, &short, &id);
     let started = engine::load(&state, repo, &id).ok()?;
-    let _ = engine::waive_first_gate(&state, started);
+    let started = engine::waive_first_gate(&state, started.clone()).unwrap_or(started);
     let _ = log::append(
         &state,
         &log::Decision {
@@ -445,9 +451,62 @@ fn auto_start_workflow_note(
             observed_at: None,
         },
     );
-    Some(format!(
-        "[zirv workflow] Started workflow {id} for this session. Follow `zirv workflow status` and its artifacts."
-    ))
+    // The seat prompt was composed before this start, so carry the step itself, not a pointer (#878).
+    Some(
+        engine::step_context_note(
+            &state,
+            &short,
+            &started,
+            repo,
+            cfg.workflow.max_context_bytes,
+            true,
+        )
+        .unwrap_or_else(|| {
+            format!(
+                "[zirv workflow] Started workflow {id} for this session. Follow `zirv workflow status` and its artifacts."
+            )
+        }),
+    )
+}
+
+/// Best-effort: close this repo's abandoned zero-progress workflows; never the asking session's own.
+fn sweep_abandoned_workflows(state: &StateDir, repo: &Path, short: &str) {
+    let Ok(found) = engine::abandoned_workflows(state, repo, Some(short), now_secs()) else {
+        return;
+    };
+    for workflow in found.iter().filter(|w| !w.this_session) {
+        let _ = crate::commands::ctx::proxy::launch::close_started(
+            state.root(),
+            repo,
+            &workflow.id,
+            &workflow.reason,
+        );
+    }
+}
+
+/// On a prompt after the workflow's step or status moved, carry the new step's context once (#878).
+/// Same silence gates as auto-start; every failure leaves the prompt unchanged.
+fn workflow_step_change_note(
+    cfg: &CtxConfig,
+    payload_session: &str,
+    stdin: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<String> {
+    let flagged = |key: &str| env(key).as_deref() == Some("1");
+    if intake_skipped_for_launch(env)
+        || flagged(adapters::INTERNAL_ENV)
+        || flagged(adapters::HEADLESS_ENV)
+        || is_harness_injected_prompt(&prompt_text_from(stdin))
+    {
+        return None;
+    }
+    let session = env(SESSION_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let state = StateDir::resolve(env).ok()?;
+    let short = crate::commands::ctx::sessions::short_id(&session);
+    engine::changed_step_context(&state, repo, &short, cfg.workflow.max_context_bytes)
 }
 
 /// Closed set of read-only administrative operations that need no model
@@ -1415,6 +1474,126 @@ mod tests {
             ),
             None,
             "a session that has its workflow starts no second one"
+        );
+    }
+
+    /// Issue #878: the auto-start turn carries the step context, binds the session, and every later
+    /// step change is injected exactly once.
+    #[test]
+    fn auto_start_binds_the_session_and_injects_each_step_once() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb, short_id};
+        let state = tempfile::tempdir().expect("state");
+        let repo = git_repo_with_commit();
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let cfg = CtxConfig::default();
+        let store = StateDir::from_root(state.path().to_path_buf());
+        let _guard = SessionGuard::register(
+            &store,
+            Record::new("sess-intake", "claude", repo.path(), Verb::Chat),
+        );
+        let short = short_id("sess-intake");
+
+        let note = auto_start_workflow_note(
+            &cfg,
+            "s1",
+            &intake_stdin(CODING_PROMPT),
+            repo.path(),
+            &lookup,
+        )
+        .expect("started");
+        assert!(
+            note.starts_with("[zirv workflow] Started workflow "),
+            "{note}"
+        );
+        assert!(
+            note.contains("zirv workflow step\nworkflow: "),
+            "the turn must carry the step context, not a pointer: {note}"
+        );
+        let mut active = engine::load_active_for_session(&store, repo.path(), &short)
+            .expect("readable")
+            .expect("bound to the session");
+        assert_eq!(
+            crate::commands::ctx::sessions::workflow_id_for(&store, &short).as_deref(),
+            Some(active.id.as_str())
+        );
+        assert_eq!(
+            workflow_step_change_note(&cfg, "s1", &intake_stdin("go on"), repo.path(), &lookup),
+            None,
+            "an unchanged step injects nothing"
+        );
+
+        active
+            .completed_steps
+            .push(active.steps[active.current_step].id.clone());
+        active.current_step += 1;
+        engine::save(&store, &active, true).expect("save");
+        let next =
+            workflow_step_change_note(&cfg, "s1", &intake_stdin("go on"), repo.path(), &lookup)
+                .expect("the new step is injected");
+        assert!(
+            next.contains(&format!("step: {}", active.steps[active.current_step].id)),
+            "{next}"
+        );
+        assert_eq!(
+            workflow_step_change_note(&cfg, "s1", &intake_stdin("go on"), repo.path(), &lookup),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_start_sweeps_abandoned_workflows_but_not_a_live_fresh_one() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb};
+        let state = tempfile::tempdir().expect("state");
+        let repo = git_repo_with_commit();
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let store = StateDir::from_root(state.path().to_path_buf());
+        let _guard = SessionGuard::register(
+            &store,
+            Record::new("sess-intake", "claude", repo.path(), Verb::Chat),
+        );
+        let mut old = crate::commands::workflow::engine::WorkflowState::start(
+            repo.path().to_path_buf(),
+            "old task".into(),
+            engine::WorkflowKind::Feature,
+            None,
+            true,
+            crate::commands::workflow::classify::Classification {
+                intent: crate::commands::workflow::classify::Intent::Feature,
+                complexity: crate::commands::workflow::classify::Complexity::Trivial,
+                risk: crate::commands::workflow::classify::RiskBand::Low,
+                risk_score: 0,
+                changed_files: 1,
+                changed_lines: 5,
+                changed_paths: Vec::new(),
+                declared_scope: false,
+                work_domain: Default::default(),
+                risk_measurement: crate::commands::workflow::classify::RiskMeasurement::Measured,
+                reasons: Vec::new(),
+            },
+        );
+        old.id = "w-old".into();
+        old.updated_at = 1_000;
+        engine::save(&store, &old, true).expect("save");
+
+        let note = auto_start_workflow_note(
+            &CtxConfig::default(),
+            "s1",
+            &intake_stdin(CODING_PROMPT),
+            repo.path(),
+            &lookup,
+        );
+        assert!(note.is_some(), "the swept pointer no longer blocks a start");
+        let closed = engine::load(&store, repo.path(), "w-old").expect("load");
+        assert_eq!(closed.status, engine::WorkflowStatus::Closed);
+        assert!(
+            closed
+                .closed_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("stale: no advance in")),
+            "{:?}",
+            closed.closed_reason
         );
     }
 

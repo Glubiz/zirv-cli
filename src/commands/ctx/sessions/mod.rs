@@ -27,7 +27,7 @@ pub use bookkeeping::set_last_screening;
 pub use bookkeeping::{
     bind_workflow_id, last_screening, native_conversation, peek_interrupted_in_flight,
     record_conversation_on, record_native_conversation, record_screening,
-    take_interrupted_in_flight, workflow_id_for,
+    take_interrupted_in_flight, workflow_bindings, workflow_id_for,
 };
 use bookkeeping::{
     screening_path, sweep_orphaned_screening_summaries, sweep_orphaned_workflow_markers,
