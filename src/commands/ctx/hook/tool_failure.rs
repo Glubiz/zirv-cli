@@ -47,6 +47,8 @@ struct ToolFailurePayload {
     is_interrupt: bool,
     session_id: String,
     cwd: String,
+    /// Non-empty inside a native subagent.
+    agent_id: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -291,11 +293,19 @@ pub(super) fn run_tool_failure<W: Write>(
     let Ok(state) = StateDir::resolve(env) else {
         return Ok(0);
     };
-    crate::commands::ctx::approvals::clear_released(
-        &state,
-        &super::permission::attention_short(env, &payload.session_id),
-        env,
-    );
+    let short = super::permission::attention_short(env, &payload.session_id);
+    crate::commands::ctx::approvals::clear_released(&state, &short, env);
+    // A dialog answered "No" in the pane fires no other hook, so the failure is what ends its prompt.
+    if let Ok(tool_input) = serde_json::from_value(payload.tool_input.clone()) {
+        super::permission::clear_finished_call(
+            &state,
+            &short,
+            &payload.tool_name,
+            &tool_input,
+            &payload.agent_id,
+            format!("permission ended by failure: {}", payload.tool_name),
+        );
+    }
     let supervisor_fire = |payload: &ToolFailurePayload| {
         let session = supervisor::hook_session_short(env, &payload.session_id);
         let request =
@@ -463,6 +473,49 @@ mod tests {
             run_tool_failure(&mut out, &stdin, &|k| env.get(k).cloned()).expect("hook");
         }
         assert!(out.is_empty());
+    }
+
+    /// A pane dialog answered "No" ends the call with a tool failure and no other hook: the request
+    /// record, the open prompt and the Approval latch for that exact call must go with it.
+    #[test]
+    fn a_failed_call_ends_its_open_permission_prompt_and_request_record() {
+        use crate::commands::ctx::{approvals, attention};
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let env = std::collections::HashMap::from([(
+            "ZIRV_CTX_STATE_DIR".to_string(),
+            state_root.path().display().to_string(),
+        )]);
+        let state = StateDir::resolve(&|k| env.get(k).cloned()).expect("state");
+        let short = crate::commands::ctx::sessions::short_id("sess-1");
+        let mut request = approvals::Request::new(&short, "Bash", "cargo test", "cargo test", 1);
+        request.released = true;
+        let record = approvals::write_record(&state, &request).expect("record");
+        attention::open_prompt(
+            &state,
+            &short,
+            attention::OpenPrompt {
+                id: request.id.clone(),
+                ..attention::OpenPrompt::default()
+            },
+        );
+        attention::confirm_prompts(&state, &short, "Bash: cargo test", 2);
+        let stdin = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+            "error": "The user doesn't want to proceed with this tool use.",
+            "session_id": "sess-1",
+            "cwd": home.path().display().to_string()
+        })
+        .to_string();
+        run_tool_failure(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("hook");
+        assert!(!record.exists(), "the request record outlived the call");
+        assert!(!attention::prompt_open(&state, &short));
+        assert_eq!(
+            attention::load(&state, &short).attention,
+            attention::Attention::None
+        );
     }
 
     #[test]

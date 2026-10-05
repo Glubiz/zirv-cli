@@ -538,8 +538,12 @@ impl CompiledContext {
                     )
                 }
                 // The skill index precedes volatile workflow content to preserve the cacheable prefix.
+                // It ends at the next layer separator: the user and repo blocks that may follow carry no anchor of their own.
                 PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
-                    .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
+                    .map(|header_at| {
+                        let start = header_at + prompt::SKILL_INDEX_HEADER.len();
+                        (start, find_after(text, start, "\n\n---\n\n"), None)
+                    }),
                 PromptSource::SkillDescriptions => {
                     find_after(text, cursor, prompt::SKILL_DESCRIPTIONS_HEADER).map(|header_at| {
                         (
@@ -610,199 +614,6 @@ impl CompiledContext {
 fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
     haystack[from..].find(needle).map(|at| from + at)
 }
-/// Caps Jev request size independently of the configured retrieval limit.
-const MEMORY_ADVISE_MAX_CANDIDATES: usize = 32;
-const MEMORY_ADVISE_MAX_CHANGED_PATHS: usize = 100;
-
-/// Shared instructions keep questions metadata-only; candidate keys and bodies stay local (#743).
-const MEMORY_ADVISE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is \
-    [candidate index, trust tier (0 shared, 1 private, 2 explicit), \
-    retrieval score, body size in bytes, verified age in days, 1 if the \
-    candidate's key/body mentions a changed path else 0, count of query \
-    terms it shares]. A higher score, higher tier, a path mention, and \
-    more shared terms indicate a more useful candidate; a larger age \
-    indicates a less useful one. Is this candidate likely directly useful \
-    for carrying out the request? Answer true if uncertain.";
-
-/// Shared memory questions let probes exercise the production decision without constructing candidates.
-pub(crate) fn memory_rerank_questions(ids: &[String]) -> Vec<jev::Question> {
-    ids.iter()
-        .map(|id| {
-            jev::Question::metadata_noul(
-                id,
-                MEMORY_ADVISE_INSTRUCTIONS,
-                "candidate is useful; keep it",
-                "candidate is not useful; prune it",
-            )
-        })
-        .collect()
-}
-
-/// Prunes only decisive below-floor answers; missing or uncertain answers preserve candidates.
-pub(crate) fn memory_rerank_action(
-    answer: Option<&jev::Answer>,
-    min_confidence: f32,
-    min_margin: f32,
-) -> &'static str {
-    match answer {
-        None => "keep",
-        Some(answer) if !answer.decisive(min_confidence, min_margin) => "keep",
-        Some(answer) => match answer.as_noul() {
-            Some(noul) if noul >= memory::MEMORY_RELEVANCE_FLOOR => "keep",
-            Some(_) => "prune",
-            None => "keep",
-        },
-    }
-}
-
-/// Keep probe and production thresholds identical so their keep/prune decisions cannot drift.
-pub(crate) const MEMORY_RERANK_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
-
-/// Normalizes terms for local overlap counts; no word leaves the process.
-fn normalized_terms(text: &str) -> std::collections::BTreeSet<String> {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|word| word.len() >= 3)
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
-/// Metadata row: `[index, trust tier, score, body bytes, verified days, changed-path mention, query overlap]`.
-/// All cells are bounded non-negative integers; candidate keys and bodies are never serialized.
-fn memory_advise_facts_row(
-    index: usize,
-    ranked: &retrieval::Ranked<'_>,
-    query_terms: &std::collections::BTreeSet<String>,
-    changed_paths: &[String],
-) -> Vec<u32> {
-    let entry = &ranked.candidate.entry;
-    let tier: u32 = if ranked.candidate.shared {
-        0
-    } else if entry.source == "explicit" {
-        2
-    } else {
-        1
-    };
-    let mentions_changed_path =
-        u32::from(changed_paths.iter().any(|path| {
-            !path.is_empty() && (entry.body.contains(path) || entry.key.contains(path))
-        }));
-    let overlap = normalized_terms(&format!("{} {}", entry.key, entry.body))
-        .intersection(query_terms)
-        .count()
-        .min(31) as u32;
-    vec![
-        index as u32,
-        tier,
-        u32::try_from(ranked.score.max(0))
-            .unwrap_or(u32::MAX)
-            .min(1_000_000),
-        u32::try_from(entry.body.len())
-            .unwrap_or(u32::MAX)
-            .min(1_000_000),
-        u32::try_from(ranked.candidate.verified_age_days)
-            .unwrap_or(u32::MAX)
-            .min(1_000_000),
-        mentions_changed_path,
-        overlap,
-    ]
-}
-
-/// Metadata-only advice may reorder/prune preselected candidates, never add any (#537, #743, #746).
-/// Disabled gates, missing credentials and call failures must preserve order, membership and length.
-fn rerank_memory_candidates<'a>(
-    cfg: &CtxConfig,
-    state: &StateDir,
-    query: &str,
-    changed_paths: &[String],
-    selected: Vec<retrieval::Ranked<'a>>,
-) -> Vec<retrieval::Ranked<'a>> {
-    if selected.is_empty() {
-        return selected;
-    }
-    // Bound only the request: unsent candidates must survive unchanged at the output's tail.
-    let sent_len = selected.len().min(MEMORY_ADVISE_MAX_CANDIDATES);
-    let ids: Vec<String> = (0..sent_len).map(|i| format!("c{i}")).collect();
-    let changed_paths_bounded =
-        &changed_paths[..changed_paths.len().min(MEMORY_ADVISE_MAX_CHANGED_PATHS)];
-    let query_terms = normalized_terms(query);
-    let facts: Vec<Vec<u32>> = selected[..sent_len]
-        .iter()
-        .enumerate()
-        .map(|(index, ranked)| {
-            memory_advise_facts_row(index, ranked, &query_terms, changed_paths_bounded)
-        })
-        .collect();
-    let questions = memory_rerank_questions(&ids);
-    let advise_state = ParentReportMetadata {
-        _zirv_metadata_only: true,
-        facts,
-    };
-    let Some(answers) = jev::advise(
-        cfg,
-        state,
-        "memory",
-        cfg.jev.memory,
-        &advise_state,
-        &questions,
-    ) else {
-        return selected;
-    };
-
-    let sent_body_bytes: Vec<usize> = selected[..sent_len]
-        .iter()
-        .map(|ranked| ranked.candidate.entry.body.len())
-        .collect();
-    let mut remaining = selected;
-    let tail = remaining.split_off(sent_len);
-    let sent = remaining;
-
-    let mut scored: Vec<(f64, retrieval::Ranked<'a>)> = Vec::new();
-    let mut unanswered: Vec<retrieval::Ranked<'a>> = Vec::new();
-    let mut retained_body_bytes = 0usize;
-    let (memory_min_confidence, memory_min_margin) = jev::floor(
-        cfg,
-        jev::FloorSite::Memory,
-        MEMORY_RERANK_DEFAULT_FLOOR.0,
-        MEMORY_RERANK_DEFAULT_FLOOR.1,
-    );
-    for ((index, ranked), id) in sent.into_iter().enumerate().zip(ids.iter()) {
-        // Missing, uncertain or unparseable answers must neither score nor prune a candidate;
-        // keep their relative order after ranked candidates and before the unsent tail.
-        let answer = answers.get(id);
-        if memory_rerank_action(answer, memory_min_confidence, memory_min_margin) == "prune" {
-            continue;
-        }
-        retained_body_bytes += sent_body_bytes[index];
-        let decisive_noul = answer.and_then(|answer| {
-            answer
-                .decisive(memory_min_confidence, memory_min_margin)
-                .then(|| answer.as_noul())
-                .flatten()
-        });
-        match decisive_noul {
-            Some(noul) => scored.push((noul, ranked)),
-            None => unanswered.push(ranked), // missing/indecisive/unparseable: kept, original position.
-        }
-    }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let pruned_count = sent_len - scored.len() - unanswered.len();
-    // Only successful pruning counts as an effect; unsent candidates cannot contribute to these totals.
-    if pruned_count > 0 {
-        let mut effect = jev::JevEffect::new("memory", "candidates_pruned");
-        effect.baseline_count = u32::try_from(sent_len).ok();
-        effect.actual_count = u32::try_from(scored.len() + unanswered.len()).ok();
-        effect.removed_bytes =
-            u64::try_from(sent_body_bytes.iter().sum::<usize>() - retained_body_bytes).ok();
-        jev::record_effect(cfg, state, cfg.jev.memory, &effect);
-    }
-
-    let mut result: Vec<retrieval::Ranked<'a>> =
-        scored.into_iter().map(|(_, ranked)| ranked).collect();
-    result.extend(unanswered);
-    result.extend(tail);
-    result
-}
 
 /// Return the actual capped core, never the full bank: the merged selections must fit their summed
 /// budgets without a second recency selection displacing retrieval's ranked picks (#326).
@@ -815,7 +626,7 @@ pub(crate) fn gather_memory(
 ) -> (Vec<prompt::MemoryLine>, Vec<prompt::MemoryLine>) {
     // Share one bank snapshot between core and retrieval to avoid duplicate file reads.
     let loaded = memory::load_all_scopes(repo, state, slug, cfg);
-    let full_bank = memory::render_for_prompt_from_loaded(&loaded);
+    let full_bank = memory::render_for_prompt_from_loaded(&loaded, cfg.memory.max_entry_bytes);
     // Share one changed-path scan between core relevance and retrieval (#760).
     let changed_paths = changed_repo_paths(repo);
     let branch_tokens = branch_name_tokens(repo);
@@ -866,6 +677,7 @@ pub(crate) fn gather_memory(
         changed_paths: changed_paths.clone(),
         // Active task and step text provide the launch-time retrieval query (#241).
         query: active_workflow_query(state, repo),
+        entry_cap: Some(cfg.memory.max_entry_bytes),
         ..Default::default()
     };
     let selection = retrieval::select(
@@ -874,15 +686,8 @@ pub(crate) fn gather_memory(
         cfg.memory.retrieval_max_bytes,
         cfg.memory.retrieval_max_entries,
     );
-    // Advisory reranking may only reorder or prune the already-budgeted selection (#537).
-    let reranked = rerank_memory_candidates(
-        cfg,
-        state,
-        &retrieval_context.query,
-        &retrieval_context.changed_paths,
-        selection.selected,
-    );
-    let retrieved = reranked
+    let retrieved = selection
+        .selected
         .into_iter()
         .filter(|ranked| {
             !core_keys.contains(&(
@@ -892,7 +697,11 @@ pub(crate) fn gather_memory(
         })
         .map(|ranked| prompt::MemoryLine {
             key: ranked.candidate.entry.key.clone(),
-            body: ranked.candidate.entry.body.clone(),
+            body: memory::injected_body(
+                &ranked.candidate.entry.key,
+                &ranked.candidate.entry.body,
+                cfg.memory.max_entry_bytes,
+            ),
             verified: ranked.candidate.entry.verified,
             written: ranked.candidate.entry.written,
             scope: if ranked.candidate.shared {
@@ -999,16 +808,24 @@ fn core_relevance_map(
 
 fn changed_repo_paths(repo: &Path) -> Vec<String> {
     let mut paths = std::collections::BTreeSet::new();
-    for args in [
-        &["diff", "--name-only", "--relative", "HEAD"][..],
-        &["ls-files", "--others", "--exclude-standard"][..],
-    ] {
-        let Ok(output) = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-        else {
+    let outputs = std::thread::scope(|scope| {
+        [
+            &["diff", "--name-only", "--relative", "HEAD"][..],
+            &["ls-files", "--others", "--exclude-standard"][..],
+        ]
+        .map(|args| {
+            scope.spawn(move || {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .output()
+            })
+        })
+        .map(|handle| handle.join())
+    });
+    for output in outputs {
+        let Ok(Ok(output)) = output else {
             continue;
         };
         if !output.status.success() {
@@ -1347,6 +1164,38 @@ pub fn compile_with_harness_roster(
     mode: super::adapters::LaunchMode,
     log_truncation: bool,
 ) -> CompiledContext {
+    compile_with_launch_flags(
+        home,
+        repo,
+        simple,
+        cfg,
+        adapter,
+        role,
+        state,
+        now,
+        include_harness_roster,
+        mode,
+        log_truncation,
+        &[],
+    )
+}
+
+/// `launch_flags` are the flags the launch will carry: the prompt drops its skill list only when they let the host list the skills itself.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_launch_flags(
+    home: Option<&Path>,
+    repo: &Path,
+    simple: bool,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    state: &StateDir,
+    now: u64,
+    include_harness_roster: bool,
+    mode: super::adapters::LaunchMode,
+    log_truncation: bool,
+    launch_flags: &[String],
+) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
     let core_memory = prompt::memory_injection_summary(&memory_entries, cfg.memory.core_max_bytes);
@@ -1366,11 +1215,15 @@ pub fn compile_with_harness_roster(
     probe_cache.save();
     let harness_lines = harness_report.lines;
 
+    let prompt_cfg = super::config::PromptConfig {
+        skill_index_native: adapter.lists_skills_natively(role, launch_flags),
+        ..cfg.prompt.clone()
+    };
     let composed = prompt::compose(
         home,
         repo,
         simple,
-        &cfg.prompt,
+        &prompt_cfg,
         role,
         &harness_lines,
         cfg.context.max_harness_roster_bytes,
@@ -1405,7 +1258,12 @@ pub fn compile_with_harness_roster(
     // Keep volatile workflow text after canonical context to preserve the cacheable prefix.
     let composed = prompt::with_workflow_layer(
         composed,
-        prompt::workflow_context_for_role(repo, role).as_deref(),
+        prompt::workflow_context_for_role(
+            repo,
+            role,
+            super::mail::session_identity(&|key| std::env::var(key).ok()).as_deref(),
+        )
+        .as_deref(),
     );
     // Sum independently selected memory budgets so neither selection crowds out the other (#155).
     let composed = prompt::with_memory_layer(
@@ -2074,433 +1932,6 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // Issue #537 (A3): `rerank_memory_candidates` tests.
-
-    fn retrieval_candidate(key: &str, body: &str) -> retrieval::RetrievalCandidate {
-        retrieval::RetrievalCandidate {
-            entry: memory::Entry {
-                key: key.to_string(),
-                written_by: "claude".to_string(),
-                written: 1_700_000_000,
-                verified: 1_700_000_000,
-                source: "explicit".to_string(),
-                body: body.to_string(),
-                importance: None,
-                confidence: None,
-                tags: Vec::new(),
-                paths: Vec::new(),
-            },
-            shared: false,
-            verified_age_days: 0,
-            lifecycle: retrieval::Lifecycle::Active,
-        }
-    }
-
-    fn ranked(candidate: &retrieval::RetrievalCandidate) -> retrieval::Ranked<'_> {
-        retrieval::Ranked {
-            candidate,
-            base_score: 5,
-            score: 5,
-            reasons: Vec::new(),
-        }
-    }
-
-    fn keys(ranked: &[retrieval::Ranked]) -> Vec<String> {
-        ranked
-            .iter()
-            .map(|r| r.candidate.entry.key.clone())
-            .collect()
-    }
-
-    /// A minimal fake HTTP server, structurally like `jev::tests::
-    /// one_shot_server`, that additionally CAPTURES the exact bytes of the
-    /// one request it accepts (as the decoded request body) instead of
-    /// discarding them -- what this module's own metadata-only assertions
-    /// need that the shared `jev::tests` helper does not expose.
-    fn capturing_one_shot_server(
-        status: u16,
-        body: &'static str,
-    ) -> (
-        String,
-        std::sync::mpsc::Receiver<String>,
-        std::thread::JoinHandle<()>,
-    ) {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("local_addr");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let header_end = loop {
-                let Ok(n) = stream.read(&mut chunk) else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break at + 4;
-                }
-            };
-            let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            while buf.len() < header_end + content_length {
-                let Ok(n) = stream.read(&mut chunk) else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            let _ = tx.send(
-                String::from_utf8_lossy(&buf[header_end..header_end + content_length]).into_owned(),
-            );
-            let reason = if status == 200 { "OK" } else { "Error" };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: \
-                 {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-        });
-        (format!("http://{address}"), rx, handle)
-    }
-
-    /// Issue #743: since issue #746's `jev::safe_metadata_request` egress
-    /// boundary, the legacy text-carrying state this test used to exercise
-    /// is unreachable dead code end to end -- `rerank_memory_candidates` now
-    /// sends only numeric metadata, which is what makes an enabled call
-    /// reach Jev at all. Replaces the old `rejects_text_state_without_
-    /// egress` test (that boundary is still covered directly by `jev.rs`'s
-    /// own `unsafe_text_and_mutated_question_never_read_cache_or_reach_
-    /// http`); this is the success path it used to make impossible to test
-    /// here.
-    #[test]
-    fn rerank_memory_candidates_enabled_prunes_a_decisive_candidate_and_records_an_effect() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body text"),
-            retrieval_candidate("bravo", "bravo body text, prune this one"),
-            retrieval_candidate("charlie", "charlie body text"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let response_body = r#"{"model":"jev-1.13.0","answers":{
-            "c0":{"type":"noul","noul":0.9},
-            "c1":{"type":"noul","noul":0.05},
-            "c2":{"type":"noul","noul":0.8}
-        },"usage":{"input_tokens":10,"output_tokens":3}}"#;
-        let (url, request_rx, handle) = capturing_one_shot_server(200, response_body);
-        let credential_env = "COMPILE_TEST_MEMORY_METADATA_743";
-        // SAFETY (test-only): this test owns a unique env variable name.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.into();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(
-            &cfg,
-            &state,
-            "irrelevant query text",
-            &["src/some/changed/path.rs".to_string()],
-            selected,
-        );
-        unsafe { std::env::remove_var(credential_env) };
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(
-            keys(&result),
-            vec!["alpha", "charlie"],
-            "bravo (decisive noul 0.05, below the relevance floor) must be pruned; \
-             alpha/charlie remain, ranked by noul descending"
-        );
-
-        let sent = request_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the request body must have been captured");
-        assert!(
-            sent.contains("\"_zirv_metadata_only\":true") || sent.contains("_zirv_metadata_only"),
-            "got: {sent}"
-        );
-        for banned in [
-            "alpha",
-            "bravo",
-            "charlie",
-            "body text",
-            "irrelevant query",
-            "changed/path",
-        ] {
-            assert!(
-                !sent.contains(banned),
-                "no candidate key/body or query/path text may reach the wire, got: {sent}"
-            );
-        }
-
-        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
-            .expect("jev-effects.jsonl must exist after a successful prune");
-        let line = effects.lines().next().expect("one effect line");
-        let value: serde_json::Value = serde_json::from_str(line).expect("parse effect line");
-        assert_eq!(value["site"], "memory");
-        assert_eq!(value["action"], "candidates_pruned");
-        assert_eq!(value["baseline_count"].as_u64(), Some(3));
-        assert_eq!(value["actual_count"].as_u64(), Some(2));
-        assert_eq!(
-            value["removed_bytes"].as_u64(),
-            Some(candidates[1].entry.body.len() as u64)
-        );
-    }
-
-    /// Issue #537 (A3): with the gate off, `rerank_memory_candidates` never
-    /// even attempts a call (no server listening at that address, so any
-    /// attempt would error) and returns the deterministic list untouched --
-    /// the same outcome the 500 fallback below produces, proven independent
-    /// ways. Issue #743: also confirms no decision, cache, or effect file is
-    /// ever created on this path.
-    #[test]
-    fn rerank_memory_candidates_is_a_pass_through_when_the_gate_is_off() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-            retrieval_candidate("charlie", "charlie body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected);
-        let cfg = CtxConfig::default();
-        assert!(!cfg.jev.memory, "the gate defaults off");
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        assert_eq!(keys(&result), deterministic_keys);
-        assert_eq!(
-            result.len(),
-            3,
-            "the ranked list must never be longer than the deterministic one"
-        );
-        assert!(!state.root().join("jev-decisions.jsonl").exists());
-        assert!(!state.root().join("jev-cache").exists());
-        assert!(!state.root().join("jev-effects.jsonl").exists());
-    }
-
-    /// Issue #743: gate off must not even READ a cache entry that a prior,
-    /// gate-on call already left behind for the identical request -- not
-    /// merely "make no new call". Warms the cache with a real call (gate
-    /// on) that decisively prunes `bravo`, then repeats the identical
-    /// request (same query/changed_paths/candidates, so the same cache
-    /// key) with the gate off and no server listening at all: any attempt
-    /// to reach the network OR read that cache entry would either fail the
-    /// call or return the already-pruned list, so the full deterministic
-    /// list surviving is the proof neither happened.
-    #[test]
-    fn rerank_memory_candidates_gate_off_ignores_a_warm_cache_entry() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body, prune this one"),
-        ];
-        let response_body = r#"{"model":"jev-1.13.0","answers":{
-            "c0":{"type":"noul","noul":0.9},
-            "c1":{"type":"noul","noul":0.05}
-        },"usage":{"input_tokens":5,"output_tokens":2}}"#;
-        let (url, handle) = jev::tests::one_shot_server(200, response_body);
-        let credential_env = "COMPILE_TEST_MEMORY_WARM_CACHE_743";
-        // SAFETY (test-only): this test owns a unique env variable name.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let mut cfg_on = CtxConfig::default();
-        cfg_on.jev.memory = true;
-        cfg_on.proxy.typesafe.base_url = url;
-        cfg_on.proxy.typesafe.credential_env = credential_env.into();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let selected_on: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected_on);
-        let warmed = rerank_memory_candidates(&cfg_on, &state, "a query", &[], selected_on);
-        handle.join().expect("server thread must not panic");
-        assert_eq!(
-            keys(&warmed),
-            vec!["alpha"],
-            "the warming call itself must have pruned bravo"
-        );
-        assert!(state.root().join("jev-cache").exists());
-        let decisions_after_warm =
-            std::fs::read_to_string(state.root().join("jev-decisions.jsonl"))
-                .expect("decisions after the warming call");
-        assert_eq!(decisions_after_warm.lines().count(), 1);
-
-        let mut cfg_off = cfg_on.clone();
-        cfg_off.jev.memory = false;
-        let selected_off: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let result = rerank_memory_candidates(&cfg_off, &state, "a query", &[], selected_off);
-        unsafe { std::env::remove_var(credential_env) };
-
-        assert_eq!(
-            keys(&result),
-            deterministic_keys,
-            "gate off must return the full deterministic list even though a matching \
-             warm cache entry (from the earlier gate-on call) would have pruned bravo"
-        );
-        let decisions_after_off = std::fs::read_to_string(state.root().join("jev-decisions.jsonl"))
-            .expect("decisions file must still exist");
-        assert_eq!(
-            decisions_after_off.lines().count(),
-            1,
-            "gate off must write no new decision line"
-        );
-        let effect_lines = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
-            .map(|text| text.lines().count())
-            .unwrap_or(0);
-        assert_eq!(
-            effect_lines, 1,
-            "gate off must write no new effect line beyond the warming call's own"
-        );
-    }
-
-    /// Issue #743: the gate is on but the named credential env var is unset,
-    /// so `jev::available` is false -- `advise` short-circuits to
-    /// `MissingCredential` before any cache read or connection attempt (no
-    /// server is even started here, so an attempt would hang or error).
-    /// Deterministic order, membership, and length are preserved, and no
-    /// decision/cache/effect file is ever created.
-    #[test]
-    fn rerank_memory_candidates_missing_key_is_a_pass_through() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected);
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.credential_env = "COMPILE_TEST_MEMORY_MISSING_KEY_743_UNSET".into();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        assert_eq!(keys(&result), deterministic_keys);
-        assert!(!state.root().join("jev-decisions.jsonl").exists());
-        assert!(!state.root().join("jev-cache").exists());
-        assert!(!state.root().join("jev-effects.jsonl").exists());
-    }
-
-    /// Issue #743: a non-decisive answer (margin below `jev::
-    /// DEFAULT_MIN_MARGIN`) and a missing answer (the id absent from the
-    /// response entirely) are both treated the same as each other -- kept,
-    /// in their original relative order -- and are never grounds to prune.
-    /// Only the one decisive answer (`alpha`) can move at all, promoted
-    /// ahead of both; nothing is pruned, so no effect row is written.
-    #[test]
-    fn rerank_memory_candidates_uncertain_and_missing_answers_keep_their_candidates() {
-        let candidates = [
-            retrieval_candidate("bravo", "bravo body"), // non-decisive answer
-            retrieval_candidate("alpha", "alpha body"), // decisive, promoted
-            retrieval_candidate("charlie", "charlie body"), // missing answer entirely
-        ];
-        let response_body = r#"{"model":"jev-1.13.0","answers":{
-            "c0":{"type":"noul","noul":0.55},
-            "c1":{"type":"noul","noul":0.9}
-        },"usage":{"input_tokens":4,"output_tokens":2}}"#;
-        let (url, handle) = jev::tests::one_shot_server(200, response_body);
-        let credential_env = "COMPILE_TEST_MEMORY_UNCERTAIN_743";
-        // SAFETY (test-only): this test owns a unique env variable name.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.into();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-        unsafe { std::env::remove_var(credential_env) };
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(
-            keys(&result),
-            vec!["alpha", "bravo", "charlie"],
-            "alpha (decisive) is promoted; bravo (non-decisive) and charlie (missing \
-             answer) both keep their original relative order"
-        );
-        assert!(
-            !state.root().join("jev-effects.jsonl").exists(),
-            "nothing was pruned, so no effect row must be written"
-        );
-    }
-
-    /// Issue #743: a failed call (here, a 500 response) falls back to the
-    /// deterministic list exactly like the gate-off/missing-key paths, and
-    /// writes no effect row -- `jev::advise` itself still records the
-    /// failed attempt as a decision-log fallback (covered directly by
-    /// `jev.rs`'s own `advise_on_a_500_response_returns_none_and_records_
-    /// the_fallback`); this test is the call-site guarantee that a failure
-    /// never touches `selected` and never prunes.
-    #[test]
-    fn rerank_memory_candidates_on_a_failed_call_keeps_the_deterministic_list() {
-        let candidates = [
-            retrieval_candidate("alpha", "alpha body"),
-            retrieval_candidate("bravo", "bravo body"),
-        ];
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected);
-        let (url, handle) = jev::tests::one_shot_server(500, "{}");
-        let credential_env = "COMPILE_TEST_MEMORY_FALLBACK_743";
-        // SAFETY (test-only): this test owns a unique env variable name.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.into();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-        unsafe { std::env::remove_var(credential_env) };
-        handle.join().expect("server thread must not panic");
-
-        assert_eq!(keys(&result), deterministic_keys);
-        assert!(!state.root().join("jev-effects.jsonl").exists());
-    }
-
-    /// Review finding (#537 A3): the per-call cap on candidates SENT to Jev
-    /// must never truncate the RETURNED list when the gate is off -- an
-    /// operator whose `retrieval_max_entries` exceeds
-    /// `MEMORY_ADVISE_MAX_CANDIDATES` must not silently lose candidates.
-    #[test]
-    fn rerank_memory_candidates_never_truncates_on_the_gate_off_path() {
-        let candidates: Vec<retrieval::RetrievalCandidate> = (0..40)
-            .map(|i| retrieval_candidate(&format!("key-{i}"), "body"))
-            .collect();
-        let selected: Vec<retrieval::Ranked> = candidates.iter().map(ranked).collect();
-        let deterministic_keys = keys(&selected);
-        let cfg = CtxConfig::default();
-        assert!(!cfg.jev.memory, "the gate defaults off");
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let result = rerank_memory_candidates(&cfg, &state, "a query", &[], selected);
-
-        assert_eq!(keys(&result), deterministic_keys);
-        assert_eq!(result.len(), 40, "all 40 candidates must survive untouched");
-    }
-
     /// Issue #537 (T2a): `compile::with_proxy_layer` only ever appends the
     /// harness proxy's own bounded layer onto whatever `compile` already
     /// produced, and is a byte-identical no-op with `None` -- the launch
@@ -2972,35 +2403,110 @@ mod tests {
         }));
     }
 
-    /// Issue #743: `gather_memory` computes `core` (`select_memory_within_
-    /// cap`) independently of, and before, `rerank_memory_candidates` --
-    /// only the separately budgeted `retrieved` layer is ever sent to Jev.
-    /// An entry that is both core AND (sharing the same underlying bank) a
-    /// retrieval candidate is decisively PRUNED from retrieval here, yet
-    /// still reaches the final merged memory layer through `core`,
-    /// untouched -- proving core/explicit facts can never be pruned by
-    /// Jev's ruling on a retrieval-layer duplicate of the same key.
+    /// An active workflow whose task is `task`, which gives retrieval its query.
+    fn start_workflow_for_test(state: &StateDir, repo: &Path, task: &str) {
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        crate::commands::workflow::engine::save(
+            state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.to_path_buf(),
+                task.into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            ),
+            true,
+        )
+        .expect("save active workflow");
+    }
+
+    /// Retrieval budgets the capped body a prompt carries, so one relevant long entry is not skipped as over budget.
     #[test]
-    fn gather_memory_core_survives_a_decisive_jev_prune_of_its_retrieval_duplicate() {
+    fn a_relevant_long_entry_is_retrieved_with_the_truncation_pointer() {
         let repo = tempfile::tempdir().expect("repo");
         let state_dir = tempfile::tempdir().expect("state");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
         let slug = super::super::state::repo_slug(repo.path());
-        let response_body = r#"{"model":"jev-1.13.0","answers":{
-            "c0":{"type":"noul","noul":0.05}
-        },"usage":{"input_tokens":2,"output_tokens":1}}"#;
-        let (url, handle) = jev::tests::one_shot_server(200, response_body);
-        let credential_env = "COMPILE_TEST_MEMORY_CORE_PROTECTED_743";
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 20;
+        cfg.memory.retrieval_max_bytes = 1024;
+        cfg.memory.max_entry_bytes = 512;
+        let entry = |key: &str, body: String, verified: u64| memory::Entry {
+            key: key.to_string(),
+            body,
+            written: verified,
+            verified,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        // The newest entry is the one core keeps; the long, older one can only arrive through retrieval.
+        for entry in [
+            entry("fresh-note", "unrelated".to_string(), 10),
+            entry("release-process", "release steps ".repeat(400), 1),
+        ] {
+            memory::upsert_scoped(
+                memory::MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                &entry,
+            )
+            .expect("store the entry");
+        }
+        start_workflow_for_test(&state, repo.path(), "document the release process");
+
+        let (_, retrieved) = gather_memory(&state, repo.path(), &slug, &cfg, now_secs());
+
+        let line = retrieved
+            .iter()
+            .find(|line| line.key == "release-process")
+            .expect("the relevant long entry is retrieved");
+        assert!(
+            line.body
+                .ends_with("[truncated: zirv ctx recall --key release-process]"),
+            "{}",
+            line.body
+        );
+    }
+
+    /// `[jev] memory` is a deprecated key: `true` still loads, and the memory path asks Jev nothing.
+    #[test]
+    fn the_deprecated_jev_memory_key_loads_and_gather_memory_makes_no_jev_call() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let loaded: crate::commands::ctx::config::JevConfig =
+            toml::from_str("memory = true").expect("the deprecated key must still parse");
+        assert!(loaded.memory);
+        let credential_env = "COMPILE_TEST_JEV_MEMORY_DEPRECATED";
         // SAFETY (test-only): this test owns a unique env variable name.
         unsafe { std::env::set_var(credential_env, "secret") };
         let mut cfg = CtxConfig::default();
         cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
+        cfg.proxy.typesafe.base_url = "http://127.0.0.1:1".into();
         cfg.proxy.typesafe.credential_env = credential_env.into();
-
+        cfg.proxy.typesafe.timeout_secs = 1;
         let entry = memory::Entry {
-            key: "explicit-core".to_string(),
-            body: "database migration explicit core fact".to_string(),
+            key: "some-fact".to_string(),
+            body: "database migration fact".to_string(),
             written: 1,
             verified: 1,
             written_by: "test".to_string(),
@@ -3018,54 +2524,21 @@ mod tests {
             &cfg,
             &entry,
         )
-        .expect("store the explicit core entry");
-
-        let classification = crate::commands::workflow::classify::classify(
-            &crate::commands::workflow::classify::ClassificationInput {
-                task: String::new(),
-                paths: Vec::new(),
-                changed_lines: 0,
-                tests_changed: true,
-                intent_override: None,
-                complexity_override: None,
-                risk_override: None,
-            },
-        )
-        .expect("classify");
-        crate::commands::workflow::engine::save(
-            &state,
-            &crate::commands::workflow::engine::WorkflowState::start(
-                repo.path().to_path_buf(),
-                "run the database migration".into(),
-                crate::commands::workflow::engine::WorkflowKind::Feature,
-                None,
-                true,
-                classification,
-            ),
-            true,
-        )
-        .expect("save active workflow");
+        .expect("store the entry");
+        // An active workflow gives retrieval a query, so it selects the entry: the old rerank asked Jev here.
+        start_workflow_for_test(&state, repo.path(), "run the database migration");
 
         let (core, retrieved) = gather_memory(&state, repo.path(), &slug, &cfg, now_secs());
         unsafe { std::env::remove_var(credential_env) };
-        handle.join().expect("server thread must not panic");
 
         assert!(
-            core.iter().any(|line| line.key == "explicit-core"),
-            "the explicit entry must still be in core: {core:?}"
+            core.iter()
+                .chain(&retrieved)
+                .any(|line| line.key == "some-fact")
         );
-        let merged = merge_memory_layers(&core, &retrieved);
         assert!(
-            merged.iter().any(|line| line.key == "explicit-core"),
-            "and therefore still in the final merged memory layer, regardless of \
-             what Jev answered about its retrieval-layer duplicate: {merged:?}"
-        );
-        let effects = std::fs::read_to_string(state.root().join("jev-effects.jsonl"))
-            .expect("jev-effects.jsonl");
-        assert!(
-            effects.contains("\"candidates_pruned\""),
-            "Jev must actually have decisively pruned the retrieval-layer duplicate \
-             for this to be a meaningful proof, got: {effects}"
+            !state.root().join("jev-decisions.jsonl").exists(),
+            "the memory path must not reach Jev, not even to record a fallback"
         );
     }
 
@@ -3143,9 +2616,30 @@ mod tests {
             true,
         )
         .expect("save active workflow");
+        // A prompt carries only the workflow bound to the composing session.
+        let session = "aaaa1111bbbb2222cccc3333dddd4444";
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(
+            &state,
+            crate::commands::ctx::sessions::Record::new(
+                session,
+                "claude",
+                repo.path(),
+                crate::commands::ctx::sessions::Verb::Chat,
+            ),
+        );
+        let workflow_id = crate::commands::workflow::engine::load_active(&state, repo.path())
+            .expect("load")
+            .expect("active workflow")
+            .id;
+        crate::commands::ctx::sessions::bind_workflow_id(
+            &state,
+            &crate::commands::ctx::sessions::short_id(session),
+            &workflow_id,
+        );
 
         unsafe {
             std::env::set_var(crate::commands::ctx::state::STATE_ENV, state_dir.path());
+            std::env::set_var(crate::commands::ctx::adapters::SESSION_ENV, session);
         }
         let adapter = ClaudeAdapter::new(None);
         let orchestrator_compiled = compile(
@@ -3174,6 +2668,7 @@ mod tests {
         );
         unsafe {
             std::env::remove_var(crate::commands::ctx::state::STATE_ENV);
+            std::env::remove_var(crate::commands::ctx::adapters::SESSION_ENV);
         }
 
         let orchestrator_composed = orchestrator_compiled.composed.expect("composed");
@@ -4948,7 +4443,8 @@ mod tests {
             "Always run the full test suite before committing.",
         )]);
         let cfg = CtxConfig::default();
-        let adapter = ClaudeAdapter::new(None);
+        // Codex has no native skill listing, so it keeps the full index (Claude's plugin lists it instead).
+        let adapter = CodexAdapter::new(None);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
@@ -4975,6 +4471,49 @@ mod tests {
         assert!(
             table.contains(&measure_row("skill index", layer.range.len(), "")),
             "got:\n{table}"
+        );
+    }
+
+    /// The skill index range ended "at the next anchor", so the unanchored user-layer block that
+    /// follows it was billed to the skill index row.
+    #[test]
+    fn the_skill_index_range_stops_before_the_user_layer() {
+        let repo = repo_with_context_files(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/system-prompt.md"),
+            "USER-LAYER-SENTINEL",
+        )
+        .expect("write");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let text = &compiled.composed.as_ref().expect("composed").text;
+        assert!(text.contains("USER-LAYER-SENTINEL"), "user layer present");
+        let layer = compiled
+            .emitted_layers()
+            .into_iter()
+            .find(|l| l.source == PromptSource::SkillIndex)
+            .expect("skill index layer");
+        assert!(
+            !text[layer.range].contains("USER-LAYER-SENTINEL"),
+            "the skill index row must not include the user layer"
         );
     }
 

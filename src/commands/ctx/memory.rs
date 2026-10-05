@@ -98,27 +98,6 @@ impl Entry {
     }
 }
 
-/// Truncates `entry`'s body to `cap` bytes with a visible `[truncated]`
-/// marker -- the per-entry cap every tier's writer applies just before
-/// storing, factored out so `rollback`'s multi-entry restore applies the
-/// identical rule rather than a fourth copy of it.
-/// The one-line stderr warning `zirv ctx remember`/`zirv
-/// memory remember` print when a body is about to be silently truncated by
-/// `cap_body` -- seven repo entries were cut at 512 bytes with no operator
-/// ever told. `None` when `body_len` is already within `cap`. Pure and
-/// directly testable, unlike the `eprintln!` at each of the two call sites;
-/// `pub(super)`, not private, the same cross-module-within-`ctx` reuse
-/// `is_temporary_or_generic` already gets, since `memory_cli.rs`'s own
-/// `--shared` handler needs the identical message (#537).
-pub(super) fn truncation_warning(command: &str, body_len: usize, cap: usize) -> Option<String> {
-    (body_len > cap).then(|| {
-        format!(
-            "{command}: body is {body_len} bytes, over the {cap}-byte cap \
-             (memory.max_entry_bytes); it will be truncated"
-        )
-    })
-}
-
 /// The most `duplicate_write_warning` will ever compare a new
 /// entry's body against on a single `remember` -- an uncapped `list_scoped`
 /// read plus a Jaccard comparison against every OTHER entry in the bank made
@@ -146,8 +125,7 @@ const DUPLICATE_CHECK_MAX_ENTRIES: usize = 200;
 /// see that constant's doc comment. The session tier has no scope-generic
 /// listing (`upsert_scoped`'s own `Session` doc comment) and is skipped
 /// outright: ephemeral, per-session notes are not the durable-bank
-/// duplication this exists to catch. `pub(super)`, the same cross-module
-/// reuse `truncation_warning` above gets, since `memory_cli.rs`'s own
+/// duplication this exists to catch. `pub(super)`, since `memory_cli.rs`'s own
 /// `--shared` handler needs it too. Never blocks or alters the write --
 /// `memory_optimize::duplicate_keys_for` does the actual comparison and this
 /// only formats its result (#773).
@@ -183,16 +161,17 @@ pub(super) fn duplicate_write_warning(
     ))
 }
 
-fn cap_body(entry: &Entry, cap: usize) -> Entry {
-    let mut entry = entry.clone();
-    if entry.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        let keep = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(entry.body.clone(), Some(keep));
-        truncated.push_str(MARKER);
-        entry.body = truncated;
+/// The body a prompt gets for `key`: the whole stored body, or its first `cap` bytes ending in a pointer
+/// to the full text. Banks keep the full body; only injection is bounded by `memory.max_entry_bytes`.
+pub(crate) fn injected_body(key: &str, body: &str, cap: usize) -> String {
+    if body.len() <= cap {
+        return body.to_string();
     }
-    entry
+    let marker = format!("\n[truncated: zirv ctx recall --key {key}]");
+    let keep = cap.saturating_sub(marker.len());
+    let mut capped = crate::utils::truncate_bytes(body.to_string(), Some(keep));
+    capped.push_str(&marker);
+    capped
 }
 
 /// Same bullet styles `mail::strip_bullet` accepts. Duplicated locally
@@ -1064,14 +1043,6 @@ pub(crate) fn upsert_shared_inner(
         .into());
     }
 
-    // Mirror `remember`'s (the private path's) own per-entry body cap: a
-    // shared write is committed to the repository and read by every future
-    // clone, so an oversized body has no more business landing there
-    // unbounded than in the private bank -- checked (and, on the private
-    // path, only checked) against the ORIGINAL body above, then truncated
-    // here for storage, so the credential guard always sees the full text.
-    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
-
     // Guard the overwrite, and capture
     // `before_body` for the journal, BEFORE touching the file. A file that
     // exists but cannot be read is an error that stops the write outright,
@@ -1822,8 +1793,6 @@ fn remember_inner(
         }
     }
 
-    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
-
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
     let path = claim_and_write(&dir, &base, &after_body)?;
@@ -2151,8 +2120,6 @@ fn remember_session_inner(
         }
     }
 
-    let entry = cap_body(entry, cfg.memory.max_entry_bytes);
-
     let after_body = entry.to_markdown();
     let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
     let path = claim_and_write(&dir, &base, &after_body)?;
@@ -2332,41 +2299,49 @@ pub fn render_for_prompt(
     slug: &str,
     cfg: &CtxConfig,
 ) -> Vec<super::prompt::MemoryLine> {
-    render_for_prompt_from_loaded(&load_all_scopes(repo, state, slug, cfg))
+    render_for_prompt_from_loaded(
+        &load_all_scopes(repo, state, slug, cfg),
+        cfg.memory.max_entry_bytes,
+    )
 }
 
 /// The same rendering `render_for_prompt` does, over entries a caller already
 /// loaded via [`load_all_scopes`] -- see that function's own doc comment for
 /// why this split exists (`compile::gather_memory` needs the identical bank
 /// for the retrieval layer too, and must not read every file a second time to
-/// get it).
+/// get it). Each body is capped at `entry_cap` bytes ([`injected_body`]).
 pub(crate) fn render_for_prompt_from_loaded(
     loaded: &LoadedMemory,
+    entry_cap: usize,
 ) -> Vec<super::prompt::MemoryLine> {
     let mut lines: Vec<super::prompt::MemoryLine> = loaded
         .private
         .iter()
-        .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Private))
+        .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Private, entry_cap))
         .collect();
     lines.extend(
         loaded
             .global
             .iter()
-            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Global)),
+            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Global, entry_cap)),
     );
     lines.extend(
         loaded
             .shared
             .iter()
-            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Shared)),
+            .map(|(_, entry)| render_prompt_line(entry.clone(), MemoryScope::Shared, entry_cap)),
     );
     lines
 }
 
-fn render_prompt_line(entry: Entry, scope: MemoryScope) -> super::prompt::MemoryLine {
+fn render_prompt_line(
+    entry: Entry,
+    scope: MemoryScope,
+    entry_cap: usize,
+) -> super::prompt::MemoryLine {
     super::prompt::MemoryLine {
+        body: injected_body(&entry.key, &entry.body, entry_cap),
         key: entry.key,
-        body: entry.body,
         verified: entry.verified,
         written: entry.written,
         scope,
@@ -2701,11 +2676,9 @@ fn harvest_candidate_credential_match(key: &str, body: &str) -> Option<String> {
 /// (`validate_shared_key` -- not lowercase kebab-case, too long, all-hyphen,
 /// or a reserved Windows device name) is dropped; a body matching
 /// `is_temporary_or_generic` is dropped; a body that looks credential-shaped
-/// (`harvest_candidate_credential_match`, checked against the raw body before
-/// truncation) is dropped; truncation could hide a sensitive value from the check.
-/// The body is then truncated to `cfg.memory.max_entry_bytes` (the same per-entry cap
-/// every other entry in this store gets) and dropped entirely if truncation
-/// leaves nothing but whitespace. Only survivors count against the two NEW
+/// (`harvest_candidate_credential_match`) is dropped. The body is kept whole (only
+/// injection is bounded by `cfg.memory.max_entry_bytes`) and dropped entirely if it
+/// is nothing but whitespace. Only survivors count against the two NEW
 /// per-session caps issue #37 asks for: `cfg.memory.harvest_max_entries` (stops accepting
 /// once reached, keeping the model's own answer order as a priority order)
 /// and `cfg.memory.harvest_max_bytes` (a cumulative budget over
@@ -2728,7 +2701,6 @@ pub fn filter_durable_candidates(
         if harvest_candidate_credential_match(key, body).is_some() {
             continue;
         }
-        let body = crate::utils::truncate_bytes(body.clone(), Some(cfg.memory.max_entry_bytes));
         if body.trim().is_empty() {
             continue;
         }
@@ -2736,7 +2708,7 @@ pub fn filter_durable_candidates(
             continue;
         }
         bytes += body.len();
-        out.push((key.clone(), body));
+        out.push((key.clone(), body.clone()));
         if out.len() >= cfg.memory.harvest_max_entries {
             break;
         }
@@ -2744,165 +2716,10 @@ pub fn filter_durable_candidates(
     out
 }
 
-/// The floor a Jev durability/relevance `noul` must clear to keep a candidate, shared by
-/// the harvest gate below and `compile::rerank_memory_candidates`. From a live 2026-09-18
-/// probe: 0.3 cleanly separated all 24 recorded candidates (true/false positives never
+/// The floor a Jev `noul` must clear to keep an item, used by the handoff and compaction selects. From a
+/// live 2026-09-18 probe: 0.3 cleanly separated all 24 recorded candidates (true/false positives never
 /// crossed it either way); 0.5 dropped a true positive (#537).
 pub(crate) const MEMORY_RELEVANCE_FLOOR: f64 = 0.3;
-
-/// Bounded numeric-only metadata state (issue #759's re-projection onto the
-/// `jev::safe_metadata_request` egress boundary issue #746 established):
-/// one fact row per candidate the keyword filter already accepted, in the
-/// same order as `accepted` -- `[content size bucket 0-4, durable-fact-
-/// shape line count, duplicate ratio per mille against existing memory]`.
-/// Never the candidate's own key or body -- computed with the same
-/// `harvest_screen_size_bucket`/`harvest_screen_durable_shape_count`/
-/// `harvest_screen_duplicate_permille` helpers `jev_harvest_prescreen`
-/// already uses on this same candidate text, so the two never drift on
-/// what those numbers mean.
-#[derive(Debug, Serialize)]
-struct HarvestGateState {
-    _zirv_metadata_only: bool,
-    facts: Vec<Vec<u32>>,
-}
-
-/// Static instructions naming the facts row order above -- see
-/// [`HarvestGateState`]'s own doc comment.
-const HARVEST_GATE_INSTRUCTIONS: &str = "Facts row N (0-based; id cN) is [content size bucket \
-    0-4, durable-fact-shape line count, duplicate ratio per mille against existing memory]. \
-    Based only on these counts, is this candidate a durable fact a future session cannot \
-    derive from the code or git history, rather than transient narration or a status update?";
-
-/// [`apply_jev_harvest_gate`]'s own one-noul-per-candidate question,
-/// factored out so `zirv ctx jev probe` can ask the exact same question set
-/// from a fixture's own candidate ids.
-pub(crate) fn memory_harvest_questions(ids: &[String]) -> Vec<jev::Question> {
-    ids.iter()
-        .map(|id| {
-            jev::Question::metadata_noul(
-                id,
-                HARVEST_GATE_INSTRUCTIONS,
-                "yes, a durable fact",
-                "no, transient narration or a status update",
-            )
-        })
-        .collect()
-}
-
-/// [`apply_jev_harvest_gate`]'s own floor default -- named (issue: `zirv ctx
-/// jev probe`) so a later retune targets exactly this constant.
-pub(crate) const MEMORY_HARVEST_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
-
-/// [`apply_jev_harvest_gate`]'s per-candidate decision: `"skip"` only for a
-/// decisive noul below [`MEMORY_RELEVANCE_FLOOR`] (dropped, logged
-/// `"harvest-skipped"`); `"keep"` for a missing, indecisive, unparseable, or
-/// accepting answer -- the keyword filter's own verdict. Shared with `zirv
-/// ctx jev probe`, which reports exactly this outcome per candidate id.
-pub(crate) fn memory_harvest_action(
-    answer: Option<&jev::Answer>,
-    min_confidence: f32,
-    min_margin: f32,
-) -> &'static str {
-    match answer.and_then(|answer| answer.as_noul().map(|noul| (answer, noul))) {
-        Some((answer, value))
-            if value < MEMORY_RELEVANCE_FLOOR && answer.decisive(min_confidence, min_margin) =>
-        {
-            "skip"
-        }
-        _ => "keep",
-    }
-}
-
-/// Send bounded structural state only; authority-side filtering must reject free-form
-/// candidate text (#537).
-fn apply_jev_harvest_gate(
-    accepted: Vec<(String, String)>,
-    cfg: &CtxConfig,
-    state: &StateDir,
-    repo: &Path,
-    slug: &str,
-    now: u64,
-) -> Vec<(String, String)> {
-    if accepted.is_empty() {
-        return accepted;
-    }
-    let ids: Vec<String> = (0..accepted.len()).map(|i| format!("c{i}")).collect();
-    let existing = load_all_scopes(repo, state, slug, cfg);
-    let facts: Vec<Vec<u32>> = accepted
-        .iter()
-        .map(|(_, body)| {
-            let lines: Vec<String> = body
-                .lines()
-                .map(normalize_for_dedup)
-                .filter(|line| !line.is_empty())
-                .collect();
-            vec![
-                harvest_screen_size_bucket(body.len()),
-                harvest_screen_durable_shape_count(&lines),
-                harvest_screen_duplicate_permille(&lines, &existing),
-            ]
-        })
-        .collect();
-    let questions = memory_harvest_questions(&ids);
-    let advise_state = HarvestGateState {
-        _zirv_metadata_only: true,
-        facts,
-    };
-    let Some(answers) = jev::advise(
-        cfg,
-        state,
-        "memory",
-        cfg.jev.memory,
-        &advise_state,
-        &questions,
-    ) else {
-        return accepted;
-    };
-    let (memory_min_confidence, memory_min_margin) = jev::floor(
-        cfg,
-        jev::FloorSite::Memory,
-        MEMORY_HARVEST_DEFAULT_FLOOR.0,
-        MEMORY_HARVEST_DEFAULT_FLOOR.1,
-    );
-    accepted
-        .into_iter()
-        .zip(ids)
-        .filter(|((key, _), id)| {
-            let answer = answers.get(id);
-            // Jev determinism fix: an explicit rejection only prunes the
-            // candidate when it is also `decisive` (margin at or above
-            // `jev::DEFAULT_MIN_MARGIN` -- a noul has no separate
-            // confidence to check, so this is a margin-only gate). A
-            // below-floor but thin-margin verdict is treated the same as a
-            // missing answer: kept. `memory_harvest_action` is the exact
-            // same keep/skip rule `zirv ctx jev probe` reports.
-            if memory_harvest_action(answer, memory_min_confidence, memory_min_margin) == "skip" {
-                let value = answer.and_then(jev::Answer::as_noul).unwrap_or(0.0);
-                let detail = format!("'{key}' scored {value:.2} below the Jev durability floor");
-                let _ = super::log::append(
-                    state,
-                    &super::log::Decision {
-                        ts: now,
-                        session: "n/a",
-                        verb: "memory",
-                        verdict: "n/a",
-                        score: 0,
-                        action: "harvest-skipped",
-                        detail: &detail,
-                        observed_at: None,
-                    },
-                );
-                false
-            } else {
-                // An accepting score, a thin-margin verdict, or a missing/
-                // unparseable answer: keep the keyword filter's own verdict
-                // (accepted).
-                true
-            }
-        })
-        .map(|((key, body), _)| (key, body))
-        .collect()
-}
 
 /// Writes an already-filtered batch to the SHARED bank, each entry through
 /// `upsert_scoped(Shared, ...)` -- an existing key (harvested before, or from
@@ -3396,10 +3213,6 @@ fn harvest_durable_with_tool_errors(
         }
     }
     let accepted = filter_durable_candidates(&candidates, cfg);
-    // Narrows (never widens) the keyword filter's own output with one batched Jev advisory
-    // call when `[jev] memory` is on; a byte-identical pass-through otherwise
-    // (`apply_jev_harvest_gate`'s own doc comment) (#537).
-    let accepted = apply_jev_harvest_gate(accepted, cfg, state, repo, slug, now_secs());
     let written = write_durable(repo, state, slug, &accepted, cfg, now_secs())?;
     // A one-line summary on the `zirv ▸` channel every time a harvest actually ran (this
     // function is the single choke point every call site funnels through), so harvesting is
@@ -3639,15 +3452,8 @@ pub fn promote(
         }
     }
 
-    // I-5: the destination write (`upsert_shared_inner`/`remember_inner`)
-    // truncates an oversized body to `cfg.memory.max_entry_bytes` before
-    // writing it -- `entry.to_markdown()` here is the pre-truncation ORIGIN
-    // body, not what actually landed at `path`. Journaling that mismatch
-    // means this record's own `after_body` never equals the destination's
-    // real on-disk content, so `rollback`'s `current_raw_body == record.
-    // after_body` conflict check always fails and every promotion of an
-    // oversized entry becomes permanently un-rollback-able. Read back what
-    // was actually written instead of re-deriving it from `entry`.
+    // I-5: journal what actually landed at `path`, not `entry.to_markdown()`, so `rollback`'s
+    // `current_raw_body == record.after_body` conflict check compares real on-disk content.
     let after_body = std::fs::read_to_string(&path).map_err(|e| {
         format!(
             "'{key}' was promoted to {}, but its written body could not be read back to journal ({e})",
@@ -3734,8 +3540,8 @@ fn current_raw_body(
 ///   inverse re-parses `before_body` into an `Entry` and writes it back
 ///   through `remember`/`upsert_shared`/`remember_session` -- the same caps,
 ///   prune, and (for `Shared`) secret screen a fresh write already goes
-///   through, so a rollback that would exceed `max_entry_bytes` truncates
-///   the same way a normal write does, and a rollback whose restored body
+///   through, so a rollback restores the whole body as a normal write stores
+///   it, and a rollback whose restored body
 ///   now trips `sensitive_shared_match` is refused, not written.
 ///
 /// Idempotent: if a `"rollback"` record already targets this `id` (checked
@@ -3895,13 +3701,13 @@ pub fn rollback(
 /// through `remember_inner` instead would be self-defeating: that clears
 /// every entry under the key before writing, so each restore would delete the
 /// sibling the previous one just put back. Each is written directly beside
-/// it, under the same body cap and prune a fresh write gets.
+/// it, under the same prune a fresh write gets.
 fn restore_extra_entries(dir: &Path, bodies: &[String], cfg: &CtxConfig) -> CtxResult<()> {
     if bodies.is_empty() {
         return Ok(());
     }
     for markdown in bodies {
-        let entry = cap_body(&parse_markdown(markdown), cfg.memory.max_entry_bytes);
+        let entry = parse_markdown(markdown);
         let base = format!("{:010}-{}", entry.written, slug_key(&entry.key));
         claim_and_write(dir, &base, &entry.to_markdown())?;
     }
@@ -4120,11 +3926,6 @@ pub fn run_remember_with<W: Write>(
                     "zirv ctx remember: no text given; pass --text, --text-file, or pipe one on stdin"
                         .into(),
                 );
-            }
-            if let Some(warning) =
-                truncation_warning("zirv ctx remember", body.len(), cfg.memory.max_entry_bytes)
-            {
-                eprintln!("{warning}");
             }
             let body =
                 super::obfuscate_store::protect_text(&state, repo, &cfg, &body, "memory_remember")?
@@ -4641,20 +4442,6 @@ pub fn cadence_for_shared(
 mod tests {
     use super::super::state;
     use super::*;
-
-    /// Issue #537 (A3): pure, so both `zirv ctx remember` and `zirv memory
-    /// remember --shared` can share one tested message rather than each
-    /// carrying its own untested `eprintln!` copy.
-    #[test]
-    fn truncation_warning_only_fires_over_the_cap_and_names_both_numbers() {
-        assert_eq!(truncation_warning("zirv ctx remember", 100, 512), None);
-        assert_eq!(truncation_warning("zirv ctx remember", 512, 512), None);
-        let warning =
-            truncation_warning("zirv ctx remember", 600, 512).expect("over the cap must warn");
-        assert!(warning.contains("zirv ctx remember"), "{warning}");
-        assert!(warning.contains("600"), "{warning}");
-        assert!(warning.contains("512"), "{warning}");
-    }
 
     fn dedup_test_entry(key: &str, body: &str, written: u64) -> Entry {
         Entry {
@@ -5435,32 +5222,29 @@ This is part of the body too.\n";
     }
 
     #[test]
-    fn an_oversized_entry_body_is_truncated_and_says_so() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
-        let mut cfg = CtxConfig::default();
-        cfg.memory.max_entry_bytes = 50;
-
+    fn an_oversized_entry_body_is_stored_in_full_and_capped_with_a_pointer_when_injected() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
         let mut entry = sample("huge", 1);
-        entry.body = "x".repeat(500);
+        entry.body = "x".repeat(700);
 
         let path = remember(&state, "-work-repo", &entry, &cfg)
             .expect("remember must not fail on oversize");
         let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert_eq!(stored.body.len(), 700, "the bank keeps the whole body");
+
+        let rendered = render_for_prompt(&state, repo.path(), "-work-repo", &cfg);
+        let body = &rendered[0].body;
+        assert!(body.len() <= cfg.memory.max_entry_bytes, "{}", body.len());
         assert!(
-            stored.body.len() <= 50,
-            "body respects the cap: {} bytes",
-            stored.body.len()
-        );
-        assert!(
-            stored.body.ends_with("[truncated]"),
-            "says it was truncated: {}",
-            stored.body
+            body.ends_with("[truncated: zirv ctx recall --key huge]"),
+            "{body}"
         );
     }
 
     #[test]
-    fn upsert_scoped_shared_truncates_an_oversized_body_to_the_cap_like_the_private_path() {
+    fn upsert_scoped_shared_stores_an_oversized_body_in_full_like_the_private_path() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -5479,16 +5263,7 @@ This is part of the body too.\n";
         )
         .expect("upsert_scoped must not fail on oversize");
         let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
-        assert!(
-            stored.body.len() <= 50,
-            "body respects the cap: {} bytes",
-            stored.body.len()
-        );
-        assert!(
-            stored.body.ends_with("[truncated]"),
-            "says it was truncated: {}",
-            stored.body
-        );
+        assert_eq!(stored.body.len(), 500);
     }
 
     #[test]
@@ -7079,99 +6854,6 @@ This is part of the body too.\n";
             vec![("fact-small".to_string(), "tiny".to_string())],
             "an oversized candidate is skipped, not a hard stop: {accepted:?}"
         );
-    }
-
-    // Issue #537 (A3): `apply_jev_harvest_gate` tests.
-
-    /// Issue #759: since issue #746's `jev::safe_metadata_request` egress
-    /// boundary, the free-text state this used to send (each candidate's
-    /// own key and body) was rejected before any cache read or network
-    /// call -- the old version of this test (`..._rejects_text_state_
-    /// without_egress`) proved exactly that rejection, which made this
-    /// gate's own `[jev] memory` key a dead deny-only fallback end to end.
-    /// This is the success path re-projecting onto metadata-only facts
-    /// makes reachable: a decisive below-floor noul answer for one
-    /// candidate prunes it, a decisive above-floor answer for the other
-    /// keeps it, and the request actually reaching this fake server (the
-    /// `.join()` below, plus the recorded decision line) is what proves the
-    /// request `apply_jev_harvest_gate` builds passes `safe_metadata_
-    /// request` -- an unsafe state returns `UnsafeState` before any
-    /// connection is ever opened (`jev::ask`'s own doc comment).
-    #[test]
-    fn apply_jev_harvest_gate_enabled_prunes_a_decisive_rejection() {
-        let accepted = vec![
-            (
-                "fact-a".to_string(),
-                "a fact that Jev will reject".to_string(),
-            ),
-            (
-                "fact-b".to_string(),
-                "a fact that Jev will keep".to_string(),
-            ),
-        ];
-        let body = r#"{"model": "jev-latest", "answers": {
-            "c0": {"type": "noul", "noul": 0.05},
-            "c1": {"type": "noul", "noul": 0.95}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "MEMORY_TEST_HARVEST_GATE_METADATA_759";
-        // SAFETY (test-only): this test owns a unique env variable name.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
-        cfg.proxy.typesafe.base_url = url;
-        cfg.proxy.typesafe.credential_env = credential_env.into();
-        cfg.proxy.typesafe.timeout_secs = 5;
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let gated = apply_jev_harvest_gate(
-            accepted.clone(),
-            &cfg,
-            &state,
-            repo.path(),
-            "-work-repo",
-            now_secs(),
-        );
-
-        unsafe { std::env::remove_var(credential_env) };
-        handle.join().expect("server thread must not panic");
-        assert_eq!(
-            gated,
-            vec![(
-                "fact-b".to_string(),
-                "a fact that Jev will keep".to_string()
-            )],
-            "the decisively-rejected candidate is pruned, the decisively-kept one survives: {gated:?}"
-        );
-        assert!(state.root().join("jev-decisions.jsonl").exists());
-    }
-
-    /// With the gate off, `apply_jev_harvest_gate` never even attempts a
-    /// call and returns the keyword filter's own output untouched.
-    #[test]
-    fn apply_jev_harvest_gate_is_a_pass_through_when_the_gate_is_off() {
-        let cfg = CtxConfig::default();
-        assert!(!cfg.jev.memory, "the gate defaults off");
-        let accepted = vec![(
-            "good-fact".to_string(),
-            "a genuinely durable fact".to_string(),
-        )];
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(state_dir.path().to_path_buf());
-
-        let gated = apply_jev_harvest_gate(
-            accepted.clone(),
-            &cfg,
-            &state,
-            repo.path(),
-            "-work-repo",
-            now_secs(),
-        );
-
-        assert_eq!(gated, accepted);
     }
 
     /// Issue #37: shared writes must remain ordinary visible working-tree
@@ -10545,7 +10227,7 @@ This is part of the body too.\n";
     }
 
     #[test]
-    fn rollback_of_an_overwrite_re_applies_the_current_max_entry_bytes_cap() {
+    fn rollback_of_an_overwrite_restores_the_full_body_under_a_tighter_cap() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let mut cfg = CtxConfig::default();
@@ -10596,12 +10278,10 @@ This is part of the body too.\n";
         )
         .expect("get_scoped")
         .expect("entry exists");
-        assert!(
-            restored.body.len() <= cfg.memory.max_entry_bytes + "\n[truncated]".len(),
-            "a rollback that would exceed max_entry_bytes must truncate like a normal write: {} bytes",
-            restored.body.len()
+        assert_eq!(
+            restored.body, first.body,
+            "a rollback restores the whole body like a normal write stores it"
         );
-        assert!(restored.body.contains("[truncated]"));
     }
 
     #[test]

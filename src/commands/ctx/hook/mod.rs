@@ -51,6 +51,7 @@ pub(crate) use self::missing_tests_gate::MISSING_TESTS_DEFAULT_FLOOR;
 pub(crate) use self::missing_tests_gate::missing_tests_action;
 pub(crate) use self::missing_tests_gate::missing_tests_questions;
 pub(crate) use self::permission::command_family;
+pub(crate) use self::permission::transcript_tool_use_ids;
 pub(crate) use self::pretool_guard::orchestrator_advisory_should_surface;
 pub(crate) use self::pretool_tier::DISPATCH_TIER_FLOOR;
 pub use self::pretool_tier::PreToolInput;

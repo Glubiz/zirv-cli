@@ -1371,6 +1371,15 @@ impl ClaudeAdapter {
     }
 }
 
+/// The one rule for whether the skill plugin may attach: shared by `plugin_dir_args` and `lists_skills_natively` so the prompt never drops its skill list for a plugin the launch refuses.
+fn plugin_attaches(flags: &[String], role: crate::commands::ctx::prompt::PromptRole) -> bool {
+    use crate::commands::ctx::prompt::PromptRole;
+    !matches!(role, PromptRole::Worker | PromptRole::Single)
+        && !flags
+            .iter()
+            .any(|flag| flag == "--bare" || flag == "--disable-slash-commands")
+}
+
 /// Attest the safety hook on every launch. Native permission rules and
 /// PreToolUse hooks are independent gates; omit an escape-specific native
 /// ask rule so hook-approved retries can proceed. (#147, #334, #769)
@@ -2787,6 +2796,21 @@ impl AgentAdapter for ClaudeAdapter {
         args
     }
 
+    fn lists_skills_natively(
+        &self,
+        role: crate::commands::ctx::prompt::PromptRole,
+        flags: &[String],
+    ) -> bool {
+        if !plugin_attaches(flags, role) {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(forced) = &self.forced_plugin_dir {
+            return forced.is_some();
+        }
+        self.resolved_plugin_dir().is_some()
+    }
+
     /// Registers zirv's own host-registerable skills (built-in/operator,
     /// implicit-activation-on) as native Claude Code skills (`zirv:<id>`),
     /// so an agent that already knows the id can reach for it with its own
@@ -2811,14 +2835,7 @@ impl AgentAdapter for ClaudeAdapter {
         flags: &[String],
         role: crate::commands::ctx::prompt::PromptRole,
     ) -> Vec<String> {
-        use crate::commands::ctx::prompt::PromptRole;
-        if matches!(role, PromptRole::Worker | PromptRole::Single) {
-            return Vec::new();
-        }
-        if flags
-            .iter()
-            .any(|flag| flag == "--bare" || flag == "--disable-slash-commands")
-        {
+        if !plugin_attaches(flags, role) {
             return Vec::new();
         }
         match self.claude_plugin_dir() {
@@ -5086,6 +5103,32 @@ mod tests {
         );
     }
 
+    /// The prompt drops its skill list only where the plugin really attaches: a launch the
+    /// plugin refuses (`--bare`, `--disable-slash-commands`) must keep the list.
+    #[test]
+    fn lists_skills_natively_exactly_when_the_plugin_attaches() {
+        use crate::commands::ctx::prompt::PromptRole;
+        let state = tempfile::tempdir().expect("state");
+        let home = tempfile::tempdir().expect("home");
+        let adapter = ClaudeAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_live_plugin_dir(state.path().to_path_buf());
+        for flags in [
+            vec![],
+            vec!["--bare".to_string()],
+            vec!["--disable-slash-commands".to_string()],
+        ] {
+            assert_eq!(
+                adapter.lists_skills_natively(PromptRole::Orchestrator, &flags),
+                !adapter
+                    .plugin_dir_args(&flags, PromptRole::Orchestrator)
+                    .is_empty(),
+                "flags={flags:?}"
+            );
+        }
+        assert!(!adapter.lists_skills_natively(PromptRole::Orchestrator, &["--bare".to_string()]));
+    }
+
     /// Skill-listing overhead fix (wrapper-overhead benchmark, 2026-09-24):
     /// `PromptRole::Worker`/`PromptRole::Single` never register zirv's own
     /// skills as a native plugin -- they already carry the one-line
@@ -5108,11 +5151,19 @@ mod tests {
                 adapter.plugin_dir_args(&[], role).is_empty(),
                 "{role:?} must never register the native skill plugin"
             );
+            assert!(
+                !adapter.lists_skills_natively(role, &[]),
+                "{role:?} keeps the prompt pointer"
+            );
         }
         for role in [PromptRole::Orchestrator, PromptRole::SubOrchestrator] {
             assert!(
                 !adapter.plugin_dir_args(&[], role).is_empty(),
                 "{role:?} must still register the native skill plugin"
+            );
+            assert!(
+                adapter.lists_skills_natively(role, &[]),
+                "{role:?} gets the list through the plugin, so the prompt must not repeat it"
             );
         }
     }

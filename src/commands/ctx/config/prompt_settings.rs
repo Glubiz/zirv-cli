@@ -35,6 +35,9 @@ pub struct PromptConfig {
     /// Copied from `[supervise]` for prompt composition; serde skips it so the wrong `[prompt]` key hard-errors.
     #[serde(skip)]
     pub orchestrator_writes: OrchestratorWrites,
+    /// Set by `compile` when the host already lists the skills natively, so the prompt carries only the pointer; serde skips it, so it is no config key.
+    #[serde(skip)]
+    pub skill_index_native: bool,
 }
 
 impl Default for PromptConfig {
@@ -50,6 +53,7 @@ impl Default for PromptConfig {
             skill_index_repo_filter: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
+            skill_index_native: false,
         }
     }
 }

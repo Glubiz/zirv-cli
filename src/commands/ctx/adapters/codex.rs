@@ -1984,11 +1984,13 @@ impl AgentAdapter for CodexAdapter {
             }) = window::parse_rollout_record(line)
             {
                 latest = Some(TranscriptUsage {
-                    input_tokens: totals.input_tokens,
-                    // `RolloutTokenTotals` has no cache-class fields at all --
-                    // a guessed class would be worse than an honest zero.
+                    // Codex's input is inclusive of its cached portion; split it so pricing sees both.
+                    input_tokens: totals
+                        .input_tokens
+                        .saturating_sub(totals.cached_input_tokens),
+                    // Codex reports no cache-write class; a guess would be worse than an honest zero.
                     cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
+                    cache_read_input_tokens: totals.cached_input_tokens,
                     output_tokens: totals.output_tokens,
                 });
             }
@@ -3304,6 +3306,21 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.context_total(), usage.input_tokens);
+    }
+
+    /// Codex's `input_tokens` is INCLUSIVE of `cached_input_tokens`; reporting it whole with a
+    /// zero cache read made spend price every cached token at the full input rate.
+    #[test]
+    fn codex_splits_cached_tokens_out_of_input() {
+        let adapter = CodexAdapter::new(None);
+        let usage = adapter
+            .transcript_usage(
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":341108,"cached_input_tokens":291328,"output_tokens":1057}}}}"#,
+            )
+            .expect("usage");
+        assert_eq!(usage.input_tokens, 49780);
+        assert_eq!(usage.cache_read_input_tokens, 291328);
+        assert_eq!(usage.context_total(), 341108);
     }
 
     /// B: `--sandbox read-only` (verified against `codex exec --help` on

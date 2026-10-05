@@ -149,7 +149,6 @@ pub fn policy_fingerprint(cfg: &CtxConfig) -> String {
     let floor = |f: &super::config::JevSiteFloor| serde_json::json!({"min_confidence": f.min_confidence, "min_margin": f.min_margin});
     let value = serde_json::json!({
         "jev": {
-            "memory": jev.memory,
             "supervisor": jev.supervisor,
             "dispatch": jev.dispatch,
             "review": jev.review,
@@ -172,7 +171,6 @@ pub fn policy_fingerprint(cfg: &CtxConfig) -> String {
             "retry": jev.retry,
             "cache_ttl_secs": jev.cache_ttl_secs,
             "floors": {
-                "memory": floor(&jev.floors.memory),
                 "context": floor(&jev.floors.context),
                 "harvest_screen": floor(&jev.floors.harvest_screen),
                 "handoff_select": floor(&jev.floors.handoff_select),

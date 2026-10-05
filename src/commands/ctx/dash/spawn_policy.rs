@@ -520,22 +520,26 @@ pub(super) fn compose_worker_prompt(
     parent_short: Option<&str>,
 ) -> ComposedWorkerPrompt {
     // Compile memory and canonical context with the policy report (#44).
-    let composed = super::compile::compile(
+    let role = spawnreq::role_of(req);
+    let composed = super::compile::compile_with_launch_flags(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         false,
         cfg,
         adapter,
         // Honor the requested role only after depth checks; unknown roles resolve to Worker (#155).
-        spawnreq::role_of(req),
+        role,
         state,
         super::state::now_secs(),
+        role == prompt::PromptRole::Orchestrator,
         if req.interactive {
             super::adapters::LaunchMode::Interactive
         } else {
             super::adapters::LaunchMode::Headless
         },
         true,
+        // The same flags `policy_launch_args_for_surface` sees, so the prompt and the plugin agree.
+        &req.flags,
     )
     .composed;
     // Keep reviewer seat instructions in the composed prompt, since dropped argv flags cannot carry them.
@@ -2132,6 +2136,34 @@ mod tests {
             composed.sources
         );
         assert!(mail_entries.is_empty(), "no mail was waiting for this pane");
+    }
+
+    /// A sub-orchestrator launched with a flag that keeps the skill plugin off gets no native
+    /// skill listing, so its prompt must still carry the skill index.
+    #[test]
+    fn a_plugin_refusing_flag_keeps_the_skill_index_in_a_sub_orchestrator_prompt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let repo = tmp.path();
+        let slug = super::super::state::repo_slug(repo);
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None)
+            .with_live_plugin_dir(state.root().to_path_buf());
+        for (flags, indexed) in [(vec![], false), (vec!["--bare".to_string()], true)] {
+            let mut req = spawn_request("do the work", repo);
+            req.role = Some("sub-orchestrator".to_string());
+            req.flags = flags.clone();
+            let (composed, _, _) =
+                compose_worker_prompt(&req, &adapter, "cccc3333", &cfg, &state, repo, &slug, None);
+            let text = composed.expect("composed").text;
+            assert_eq!(
+                text.contains(prompt::SKILL_INDEX_HEADER),
+                indexed,
+                "flags={flags:?}"
+            );
+        }
     }
 
     /// Fix 5 (issue #249/#250 review), mainstream failure mode: the

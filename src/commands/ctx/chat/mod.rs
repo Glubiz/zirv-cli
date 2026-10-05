@@ -1027,7 +1027,7 @@ fn dash_orchestrator_pane_with_task(
 ) -> CtxResult<PaneSpec> {
     // Compile context and its policy report together (#44).
     let home = crate::utils::home_dir().ok();
-    let mut compiled = super::compile::compile(
+    let mut compiled = super::compile::compile_with_launch_flags(
         home.as_deref(),
         repo,
         simple,
@@ -1036,8 +1036,10 @@ fn dash_orchestrator_pane_with_task(
         launch.role,
         state,
         super::state::now_secs(),
+        launch.role == super::prompt::PromptRole::Orchestrator,
         super::adapters::LaunchMode::Interactive,
         true,
+        &launch.argv,
     );
     if let Some(task) = task.filter(|task| !task.trim().is_empty()) {
         super::compile::select_skill_descriptions_for_task(

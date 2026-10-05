@@ -4362,6 +4362,8 @@ mod tests {
             reason: Some("Builds the release binary.".into()),
             outside_sandbox: true,
             always: Some("cargo build".into()),
+            transcript_path: None,
+            tool_use_id: None,
         };
         let view = content::approval_view(&request);
         assert_eq!(

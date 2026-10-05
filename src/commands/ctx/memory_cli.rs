@@ -73,8 +73,7 @@ pub enum MemoryVerb {
     /// Reverses one journaled write by id (issue #295): restores the exact
     /// prior body for an overwrite, recreates a forgotten entry, or deletes
     /// an entry a create introduced. Replays through the normal write path,
-    /// so a restored shared entry still runs the secret screen and a
-    /// restored body over `max_entry_bytes` still truncates. Rolling back
+    /// so a restored shared entry still runs the secret screen. Rolling back
     /// the same id twice is a no-op, not a double-inverse.
     Rollback(RollbackArgs),
     /// Moves an entry up a tier (issue #295): from the session tier (if a
@@ -590,13 +589,6 @@ pub fn run_remember_with<W: Write>(
     let body = args.text.trim().to_string();
     if body.is_empty() {
         return Err("zirv memory remember: no text given".into());
-    }
-    if let Some(warning) = memory::truncation_warning(
-        "zirv memory remember",
-        body.len(),
-        cfg.memory.max_entry_bytes,
-    ) {
-        eprintln!("{warning}");
     }
     let written_by = env(AGENT_ENV)
         .filter(|v| !v.trim().is_empty())

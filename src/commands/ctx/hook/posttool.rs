@@ -8,9 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::checkpoints::cfg_or_operator_only_gate;
-use super::permission::{
-    attention_short, clear_resolved_approval, finding_kinds, hook_obfuscation_options,
-};
+use super::permission::{attention_short, finding_kinds, hook_obfuscation_options};
 use super::scope_guard::scope_guard_shell_checkpoint_note;
 use crate::commands::ctx::config::EnvLookup;
 use crate::commands::ctx::state::{StateDir, now_secs, repo_slug};
@@ -358,26 +356,13 @@ pub fn run_posttool_with<W: Write>(
     // A tool call proves any pending permission prompt has resolved; clear attention and the
     // inbox record before every later early return, the masked branch included (#456).
     if let (Some(payload), Ok(state)) = (&parsed, StateDir::resolve(env)) {
-        let short = attention_short(env, &payload.session_id);
-        let permission_id = crate::commands::ctx::approvals::request_id(
-            &short,
-            &payload.tool_name,
-            &payload.tool_input.command,
-            &payload.tool_input.preview_source(&payload.tool_name),
-        );
-        clear_resolved_approval(
+        super::permission::clear_finished_call(
             &state,
-            &short,
+            &attention_short(env, &payload.session_id),
+            &payload.tool_name,
+            &payload.tool_input,
+            &payload.agent_id,
             format!("permission resolved: {}", payload.tool_name),
-            now_secs(),
-            |open| open.id == permission_id && open.agent == payload.agent_id,
-        );
-        crate::commands::ctx::approvals::clear_for_tool(
-            &state,
-            &short,
-            &payload.tool_name,
-            &payload.tool_input.command,
-            &payload.tool_input.preview_source(&payload.tool_name),
         );
     }
 

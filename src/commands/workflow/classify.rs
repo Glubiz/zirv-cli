@@ -418,7 +418,7 @@ fn add_path_signal(
 const LEADING_FILLER: &[&str] = &[
     "please", "can", "could", "would", "you", "we", "i", "need", "needs", "want", "like", "to",
     "should", "must", "let", "lets", "s", "us", "kindly", "just", "help", "me", "go", "ahead",
-    "and",
+    "and", "also", "then",
 ];
 
 const BUGFIX_LEAD: &[&str] = &[
@@ -457,6 +457,8 @@ const SPIKE_LEAD: &[&str] = &[
     "explore",
     "research",
     "investigate",
+    "analyse",
+    "analyze",
     "evaluate",
     "experiment",
     "poc",
@@ -917,6 +919,11 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     classify_args(args, true)
 }
 
+/// `from_args` for team planning: like `workflow start`, planning precedes the work, so untracked files are not part of the change.
+pub fn from_plan_args(args: &ClassifyArgs) -> CtxResult<Classification> {
+    classify_args(args, false)
+}
+
 /// `from_args` for `zirv workflow start`: nothing has been written yet, so
 /// untracked files are not part of the change, and the task text can only
 /// raise complexity (an explicit `--complexity` stands).
@@ -1079,6 +1086,12 @@ mod tests {
                 "Investigate whether we can drop the tokio dependency",
                 Intent::Spike,
             ),
+            // A follow-up message opens with "also"/"then"; the real lead verb follows.
+            ("Also investigate how other people use Jev", Intent::Spike),
+            ("Analyse zirv response quality", Intent::Spike),
+            ("Also fix the login crash", Intent::Bugfix),
+            ("Also add a flag", Intent::Feature),
+            ("Then analyze the slow startup path", Intent::Spike),
             // "clean up" bigram.
             ("Clean up the adapters module", Intent::Refactor),
             // Adjustment (a), narrowed: a feature lead's nearby fix/bugfix/

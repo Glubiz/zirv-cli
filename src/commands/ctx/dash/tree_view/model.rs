@@ -101,10 +101,14 @@ impl<'a> Model<'a> {
                 children.entry(parent).or_default().push(node);
             }
         }
+        // A pane with no parent link at all (a restored independent session) is not the seat's agent; any parent,
+        // even a previous seat or a session not in the graph yet, keeps it.
+        let linked_to_seat = |n: &Node| n.parent.is_some();
         let in_scope = |n: &Node| match scope {
             Scope::All => true,
             Scope::Dashboard => {
-                is_seat(n) || facts.pane_shorts.contains(&sessions::short_id(&n.id))
+                is_seat(n)
+                    || (facts.pane_shorts.contains(&sessions::short_id(&n.id)) && linked_to_seat(n))
             }
             Scope::Repo => is_seat(n) || data.repo_ids.contains(&n.id) || n.kind == "delegation",
         };
@@ -486,6 +490,43 @@ mod tests {
         assert_eq!(w1, ["w3", "w4", "w5"], "every descendant, depth first");
         assert_eq!(model.total(), 2 + 3);
         assert_eq!(model.seat.map(|n| n.id.as_str()), Some("seat-1"));
+    }
+
+    #[test]
+    fn a_restored_pane_with_no_link_to_the_seat_is_not_the_seats_agent() {
+        let mut data = deep();
+        let mut restored = node("restored", None, "single", "fable", "running");
+        restored.kind = "session".into();
+        data.nodes.push(restored);
+        let mut f = all_facts();
+        f.pane_shorts.push("restored".into());
+        let model = Model::build(&data, &f, Scope::Dashboard);
+        let tops: Vec<&str> = model.agents.iter().map(|a| a.node.id.as_str()).collect();
+        assert_eq!(
+            tops,
+            ["w1", "w2"],
+            "linked panes stay, the unlinked one goes"
+        );
+        assert_eq!(model.total(), 2 + 3);
+        // Linked through a parent chain, it counts.
+        data.nodes.last_mut().expect("restored").parent = Some("w1".into());
+        let model = Model::build(&data, &f, Scope::Dashboard);
+        assert!(model.agent_index("restored").is_none());
+        assert!(model.agents[0].kids.iter().any(|k| k.id == "restored"));
+    }
+
+    /// After a restart the seat is new while live workers still name the previous one, or a session the graph lacks.
+    #[test]
+    fn panes_naming_a_previous_or_unknown_parent_stay_listed_after_a_seat_change() {
+        let mut data = deep();
+        data.nodes
+            .push(node("w9", Some("ghost"), "worker", "m", "running"));
+        let mut f = all_facts();
+        f.seat_session = Some("seat-2");
+        f.pane_shorts.push("w9".into());
+        let model = Model::build(&data, &f, Scope::Dashboard);
+        let tops: Vec<&str> = model.agents.iter().map(|a| a.node.id.as_str()).collect();
+        assert_eq!(tops, ["w1", "w9", "w2"]);
     }
 
     #[test]

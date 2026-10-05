@@ -509,6 +509,13 @@ fn expire_deliveries(state: &StateDir, now: u64) -> usize {
             .filter(|mail_path| state.mail().join(mail_path).is_file())
             .collect();
         if receipt_state(&receipts, true) == ReceiptState::Read && present.is_empty() {
+            // Settled and past the recent-flow window: nothing reads it again, but every
+            // prompt's `list` would re-parse it.
+            if now.saturating_sub(envelope.created_at) > RECENT_FLOW_SECONDS {
+                let _ = std::fs::remove_file(delivery_path(state, &envelope.id));
+                let _ = std::fs::remove_dir_all(receipts_dir(state, &envelope.id));
+                let _ = std::fs::remove_file(claim_path(state, &envelope.id));
+            }
             continue;
         }
         let dead_dir = delivery_dir(state).join("dead").join(&envelope.id);
@@ -7949,6 +7956,66 @@ This is part of the body too.\n";
         assert!(
             text.contains(&envelope.id),
             "the message is inspectable through `send --dead-letters` too: {text}"
+        );
+    }
+
+    /// Every prompt's `list` re-parses each `.delivery/*.json`; an envelope that is expired,
+    /// fully read and past the recent-flow window carries nothing the hot path needs.
+    #[test]
+    fn expire_deliveries_removes_old_settled_envelopes_but_keeps_live_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let target = sessions::Record::new(
+            "target01-1111-4111-8111-111111111111",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let short = target.short.clone();
+        let _target = sessions::SessionGuard::register(&state, target);
+        let env = env_map(&[(
+            super::super::state::STATE_ENV,
+            state_dir.to_str().expect("utf8"),
+        )]);
+        let send = |text: &str| {
+            let args = SendArgs {
+                to_session: Some(short.clone()),
+                message: Some(text.to_string()),
+                ..SendArgs::default()
+            };
+            let mut output = Vec::new();
+            run_send_with(
+                &args,
+                &mut output,
+                &repo,
+                &|key| env.get(key).cloned(),
+                &mut std::io::Cursor::new(Vec::<u8>::new()),
+            )
+            .expect("send");
+            resolve_envelope(&state, &created_id(&output)).expect("envelope")
+        };
+        let settled = send("old and read");
+        let live = send("still live");
+
+        let mut old = settled.clone();
+        old.created_at = now_secs().saturating_sub(2 * RECENT_FLOW_SECONDS);
+        old.expires_at = now_secs().saturating_sub(1);
+        write_envelope(&state, &old).expect("rewrite old envelope");
+        update_receipt(&state, &old, &short, ReceiptState::Read, now_secs()).expect("read receipt");
+        std::fs::remove_file(state.mail().join(&old.targets[0].mail_path)).expect("consumed file");
+
+        let _ = expire_deliveries(&state, now_secs());
+
+        assert!(
+            !delivery_path(&state, &settled.id).exists(),
+            "an old, expired, fully read envelope is dropped"
+        );
+        assert!(!receipts_dir(&state, &settled.id).exists());
+        assert!(
+            delivery_path(&state, &live.id).is_file(),
+            "an unexpired envelope stays"
         );
     }
 

@@ -136,6 +136,9 @@ pub struct RetrievalContext {
     /// archived entry stays reachable on purpose -- excluded from normal
     /// injection, never gone.
     pub include_archived: bool,
+    /// The per-entry cap the caller injects bodies at (`memory.max_entry_bytes`): selection budgets the
+    /// capped body a prompt will carry, not the stored one. `None` budgets the whole body.
+    pub entry_cap: Option<usize>,
 }
 
 /// One ranked candidate plus why it scored the way it did -- the
@@ -392,11 +395,15 @@ pub fn select<'a>(
             over_budget += 1;
             continue;
         }
-        let rendered = format!(
-            "{}\n{}",
-            entry.candidate.entry.key, entry.candidate.entry.body
-        )
-        .len();
+        let body = match ctx.entry_cap {
+            Some(cap) => super::memory::injected_body(
+                &entry.candidate.entry.key,
+                &entry.candidate.entry.body,
+                cap,
+            ),
+            None => entry.candidate.entry.body.clone(),
+        };
+        let rendered = format!("{}\n{}", entry.candidate.entry.key, body).len();
         let separator = if selected.is_empty() { 0 } else { 2 };
         if used_bytes + separator + rendered > max_bytes {
             over_budget += 1;
@@ -796,6 +803,19 @@ mod tests {
             vec!["small"],
             "the oversized entry must not starve the small one"
         );
+    }
+
+    #[test]
+    fn selection_budgets_the_capped_body_a_prompt_will_carry() {
+        let big = candidate("big", &"release ".repeat(640), false);
+        let candidates = vec![big];
+        let mut context = ctx("release");
+        assert!(
+            select(&candidates, &context, 1024, 6).selected.is_empty(),
+            "without a cap the whole body is budgeted"
+        );
+        context.entry_cap = Some(512);
+        assert_eq!(select(&candidates, &context, 1024, 6).selected.len(), 1);
     }
 
     // Gathering candidates from the store.

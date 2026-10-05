@@ -1202,7 +1202,9 @@ pub fn windows_from_rate_limits(
 /// pre-existing behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RolloutTokenTotals {
+    /// Inclusive of `cached_input_tokens`, as codex reports it.
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -1278,6 +1280,10 @@ pub fn parse_rollout_record(line: &str) -> Option<RolloutRecord> {
             let usage_at = |pointer: &str| {
                 payload.pointer(pointer).map(|t| RolloutTokenTotals {
                     input_tokens: t.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    cached_input_tokens: t
+                        .get("cached_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                     output_tokens: t.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
                 })
             };

@@ -1787,12 +1787,10 @@ pub(crate) fn handoff_select_action(
 }
 
 /// An off-by-default (`[jev] handoff_select`) keep/drop pass over a handoff's OPTIONAL
-/// items only -- `done`/`key_decisions`/`files_read`/`files_modified`/`gotchas`. Mirrors
-/// `compile::rerank_memory_candidates`/`memory::apply_jev_harvest_gate`'s own
-/// per-candidate noul shape exactly (one batched call, one noul question per candidate,
-/// only a margin-gated decisive rejection ever prunes), but never reorders: this is
-/// keep/drop only, so a surviving item keeps its original relative position within its own
-/// section (#783).
+/// items only -- `done`/`key_decisions`/`files_read`/`files_modified`/`gotchas`. One
+/// batched call, one noul question per candidate, only a margin-gated decisive rejection
+/// ever prunes, and never reorders: this is keep/drop only, so a surviving item keeps its
+/// original relative position within its own section (#783).
 ///
 /// Never touches `task`/`constraints`/`remaining`/`blocked`/`verification`/
 /// `next_step` -- [`optional_candidates`] never yields one of those, so this

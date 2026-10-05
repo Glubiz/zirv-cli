@@ -148,8 +148,7 @@ const NEAR_DUPLICATE_THRESHOLD: f64 = 0.6;
 const CONTRADICTION_SUBJECT_THRESHOLD: f64 = 0.3;
 
 /// Fraction of `cfg.memory.max_entry_bytes` at or beyond which a body is
-/// flagged `"oversized"` -- a warning ahead of the hard truncation
-/// `memory::remember`/`upsert_shared` would otherwise apply silently.
+/// flagged `"oversized"` -- a warning ahead of the truncation a prompt injection applies.
 const OVERSIZED_RATIO: f64 = 0.8;
 
 /// A body shorter than this is flagged `"low-value"` on size alone,
@@ -404,7 +403,7 @@ fn find_obsolete_paths(candidates: &[OptimizeCandidate]) -> Vec<Finding> {
 }
 
 /// Entries whose body is close to (or over) `cfg.memory.max_entry_bytes` --
-/// a warning ahead of the silent truncation the store would otherwise apply.
+/// a warning ahead of the truncation a prompt injection applies.
 fn find_oversized(candidates: &[OptimizeCandidate], cfg: &CtxConfig) -> Vec<Finding> {
     let threshold = ((cfg.memory.max_entry_bytes as f64) * OVERSIZED_RATIO) as usize;
     candidates
@@ -713,18 +712,12 @@ overlap enough to merge safely, answer with nothing at all.\n\n\
 /// codebase already uses) and applies the mandatory post-validation: the
 /// answered key must be exactly `survivor_key` (a model proposing a
 /// different key is rejected outright, never silently renamed or
-/// redirected), the body is truncated to `cfg.memory.max_entry_bytes` (the
-/// same cap every other entry gets), and dropped if truncation leaves
-/// nothing but whitespace.
-fn parse_and_validate_consolidation(
-    answer: &str,
-    survivor_key: &str,
-    cfg: &CtxConfig,
-) -> Option<String> {
+/// redirected), the body is kept whole (only injection is bounded by
+/// `cfg.memory.max_entry_bytes`), and dropped if it is nothing but whitespace.
+fn parse_and_validate_consolidation(answer: &str, survivor_key: &str) -> Option<String> {
     let (_, body) = memory::parse_harvest(answer)
         .into_iter()
         .find(|(key, _)| key == survivor_key)?;
-    let body = crate::utils::truncate_bytes(body, Some(cfg.memory.max_entry_bytes));
     if body.trim().is_empty() {
         return None;
     }
@@ -802,7 +795,7 @@ pub fn apply_consolidation(
         ) else {
             continue;
         };
-        let Some(merged_body) = parse_and_validate_consolidation(&answer, &group.survivor_key, cfg)
+        let Some(merged_body) = parse_and_validate_consolidation(&answer, &group.survivor_key)
         else {
             continue;
         };

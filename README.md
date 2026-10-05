@@ -508,12 +508,16 @@ A decision answers ONE call: the hook prints
 `hookSpecificOutput.decision.behavior` and sets `updatedPermissions` only for
 `^A Y` (always allow, below), so nothing else is cached as a lease. After `hold_secs`, on any error, a missing
 dashboard or a dashboard that quits, the hook prints nothing and the native
-dialog shows; the request then reads "waiting in pane" until a `PostToolUse`
-or `PermissionDenied` clears it. A request answered in the dashboard, or every
-prompt once you submit the session's next prompt, clears its wait at once;
-one answered in the pane's own dialog clears only at that `PostToolUse`, after
-the allowed command has finished, because Claude Code fires no hook when its
-dialog is answered. Mail and advisories are never typed into a pane while any
+dialog shows; the request then reads "waiting in pane" until a `PostToolUse`,
+`PostToolUseFailure` or `PermissionDenied` for that call clears it. A request
+answered in the dashboard, or every prompt once you submit the session's next
+prompt, clears its wait at once; one answered in the pane's own dialog clears
+only at that `PostToolUse`, after the allowed command has finished, because Claude
+Code fires no hook when its dialog is answered. Each dashboard tick also reads
+the last 256 KB of the session transcript for a released request: a `tool_result`
+for the call's `tool_use_id` (an allow or a deny in the pane, either one) clears
+it, ends its prompt and lowers the latch. That id is paired from the transcript
+when the request is made; without one, a request clears as before. Mail and advisories are never typed into a pane while any
 of its permission requests is open, shown or not. The installed `PermissionRequest` hook
 `timeout` is `hold_secs + 30` (only with the inbox on). `zirv setup apply` and
 zirv's own Claude launches register `zirv ctx hook permission` on
@@ -2737,11 +2741,13 @@ persists that choice across resume and prompt composition. Repository skills are
 they can request logical capabilities but never grant themselves filesystem,
 shell, network, or other permissions.
 
-An orchestrator or sub-orchestrator seat carries a standing skill index; a
-worker or single-seat session instead gets one fixed pointer line (run
-`zirv skill list`, then `zirv skill load <id>`), because a headless worker
-pays the full catalogue on every turn and loads a skill in only a small
-share of runs. The index is one line per
+An orchestrator or sub-orchestrator seat on a harness without a native skill
+listing (Codex) carries a standing skill index; a worker or single-seat
+session, and a Claude orchestrator whose plugin directory already lists the
+skills, instead get one fixed pointer line (run `zirv skill list`, then
+`zirv skill load <id>`), because a headless worker pays the full catalogue on
+every turn and loads a skill in only a small share of runs, and the plugin
+listing would duplicate the index. The index is one line per
 implicit-activation skill (`- <id>: <first sentence>`, the first sentence of
 the skill's own description, a repository-layer skill marked
 `(repository-untrusted)`), in a stable, task-independent layer so it never
@@ -4626,7 +4632,7 @@ stale_after_days = 90
 enabled = true
 harvest = false                # opt-in; see "Memory bank" below
 max_entries = 50               # entries kept per repo before the oldest (by Written) are pruned
-max_entry_bytes = 512          # per-entry body cap
+max_entry_bytes = 512          # per-entry cap at injection; banks keep the full body, a longer one ends "[truncated: zirv ctx recall --key <key>]"
 max_injected_bytes = 2048      # superseded by core_max_bytes; kept only so an old config does not error
 shared_enabled = true          # whether the repo-owned shared bank (<repo>/.zirv/memory/) is read at all
 core_max_bytes = 2048          # cap on the merged private+shared core layer folded into every session
@@ -4656,7 +4662,7 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 # the shared Jev client; each is also gated on the `[proxy.typesafe]`
 # credential actually being set (see "Harness proxy" above)
 [jev]
-memory = false      # reranks retrieval from numeric metadata only (never key/body text), gates harvest, records candidates_pruned effects; ZIRV_CTX_JEV_MEMORY
+memory = false      # deprecated and ignored (the memory rerank and harvest gate were removed); still parsed so old configs load; ZIRV_CTX_JEV_MEMORY
 supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_JEV_SUPERVISOR
 dispatch = false    # model tier for an omitted Agent model, from brief metadata only; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
@@ -4687,11 +4693,11 @@ Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zi
 site's real production question(s) for a fixture input `K` times (`1..=20`) with the
 cache disabled, applies that site's production floor (honouring
 `[jev.floors.<site>]`/`ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN`
-for the nine sites that have one -- the rest carry a fixed compiled
+for the eight sites that have one -- the rest carry a fixed compiled
 constant, exactly as production does)
 and production answer-to-action rule, and prints what production would have
-DONE on each rep -- `SITE` is one of all twenty-four the probe contract
-names: `memory-rerank`, `memory-harvest`, `context-report`, `context-skill`,
+DONE on each rep -- `SITE` is one of all twenty-two the probe contract
+names: `context-report`, `context-skill`,
 `harvest-screen`, `handoff-thin`, `handoff-select`, `compaction-select`,
 `dispatch`, `launch-effort`, `classify-domain`, `inject`, `crash`, `judge`,
 `approve-escalate`, `approve-lower`, `intake-plan`, `inject-screen`,
@@ -4925,7 +4931,7 @@ sticky decision is even reached).
 
 **`[jev.floors.<site>]`** (issue #803, off by default -- unset is
 byte-identical to today's compiled constants) tunes `min_confidence`/
-`min_margin` per site for the nine TUNABLE sites above: `memory`, `context`,
+`min_margin` per site for the eight TUNABLE sites above: `context`,
 `harvest_screen`, `handoff_select`, `compaction_select`, `dispatch`,
 `launch_effort`, `classify`, `inject`. Every safety/verification site
 (`approve`, `approve_allow`, `inject_screen`, `stop_verify`, `missing_tests`,

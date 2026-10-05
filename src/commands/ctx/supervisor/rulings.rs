@@ -114,9 +114,30 @@ pub(crate) fn parse_reply(
         RulingKind::Done => pair("DONE", "done", "NOT_DONE", "not_done"),
         RulingKind::Retry => pair("RETRY", "retry", "STOP", "stop"),
         RulingKind::Choice => {
-            let number: usize = head.strip_prefix("CHOICE:")?.trim().parse().ok()?;
+            // Helpers drift into markdown (`**Choice: 2 — why.**`): tolerate emphasis marks, case
+            // and prose after the number, but never guess a number that is not there.
+            let is_mark = |c: char| matches!(c, '*' | '_' | '`');
+            let head = head.trim_matches(is_mark);
+            let after = head
+                .get(..7)
+                .filter(|label| label.eq_ignore_ascii_case("CHOICE:"))
+                .map(|_| head[7..].trim_start_matches(|c: char| is_mark(c) || c == ' '))?;
+            let digits = after
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after.len());
+            let number: usize = after[..digits].parse().ok()?;
+            let tail = &after[digits..];
+            if tail.chars().next().is_some_and(char::is_alphanumeric) {
+                return None;
+            }
             let option = options.get(number.checked_sub(1)?)?;
-            let reason = rest.strip_prefix("REASON:").unwrap_or("").trim();
+            let reason = rest.strip_prefix("REASON:").unwrap_or(rest).trim();
+            let reason = if reason.is_empty() {
+                tail.trim_start_matches(|c: char| c.is_whitespace() || ".:,-—–".contains(c))
+                    .trim_end_matches(is_mark)
+            } else {
+                reason
+            };
             Some((option.clone(), reason.to_string()))
         }
     }
@@ -383,6 +404,36 @@ mod tests {
             None
         );
         assert_eq!(parse("[zirv]\nI pick the table"), None);
+    }
+
+    /// The live 2026-10-03 failure: the helper bolded its verdict and followed the number with
+    /// prose, so the strict `CHOICE: <n>` head never matched.
+    #[test]
+    fn a_decorated_choice_head_still_names_the_option() {
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &opts());
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            parse("**Choice: 2 — transcript-backed clearing.**\n\nA `tool_result` resolves it."),
+            pair("table", "A `tool_result` resolves it.")
+        );
+        assert_eq!(parse("Choice: 1"), pair("queue", ""));
+        // The live ts 1791180498 shape: mixed-case head, blank line, free prose with no REASON:.
+        assert_eq!(
+            parse("Choice: 1\n\nInject only the workflow bound to the composing session."),
+            pair(
+                "queue",
+                "Inject only the workflow bound to the composing session."
+            )
+        );
+        assert_eq!(
+            parse("`CHOICE: 2`\nREASON: simpler"),
+            pair("table", "simpler")
+        );
+        assert_eq!(
+            parse("CHOICE: 2. Simpler to run."),
+            pair("table", "Simpler to run.")
+        );
+        assert_eq!(parse("CHOICE: 2nd"), None);
     }
 
     #[test]

@@ -79,6 +79,7 @@ impl Default for ProxyTypesafeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevConfig {
+    /// Deprecated and ignored: the memory rerank and harvest-gate sites were removed. Parsed so existing configs load.
     pub memory: bool,
     pub supervisor: bool,
     pub dispatch: bool,
@@ -162,6 +163,7 @@ pub struct JevSiteFloor {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevFloorsConfig {
+    /// Deprecated and ignored, like `[jev] memory`; parsed so existing configs load.
     pub memory: JevSiteFloor,
     pub context: JevSiteFloor,
     pub harvest_screen: JevSiteFloor,

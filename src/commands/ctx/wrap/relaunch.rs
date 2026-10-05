@@ -482,8 +482,9 @@ pub(super) fn compiled_context_for_launch(
     state_dir: &StateDir,
     mode: super::adapters::LaunchMode,
     proxy_layer: Option<&str>,
+    launch_flags: &[String],
 ) -> super::compile::CompiledContext {
-    let compiled = super::compile::compile(
+    let compiled = super::compile::compile_with_launch_flags(
         crate::utils::home_dir().ok().as_deref(),
         repo,
         skip_injection,
@@ -492,8 +493,10 @@ pub(super) fn compiled_context_for_launch(
         role,
         state_dir,
         super::state::now_secs(),
+        role == PromptRole::Orchestrator,
         mode,
         true,
+        launch_flags,
     );
     super::compile::with_proxy_layer(compiled, proxy_layer)
 }
@@ -1056,6 +1059,7 @@ mod tests {
             &state,
             crate::commands::ctx::adapters::LaunchMode::Interactive,
             None,
+            &[],
         );
         let without_text = without.composed.as_ref().expect("composed").text.clone();
         assert!(
@@ -1072,6 +1076,7 @@ mod tests {
             &state,
             crate::commands::ctx::adapters::LaunchMode::Interactive,
             Some("[zirv proxy]\nexecution: bounded"),
+            &[],
         );
         let with_text = with.composed.expect("composed").text;
         assert!(

@@ -3,7 +3,7 @@
 //! input K times with the cache disabled, applies that site's production
 //! floor (`jev::floor`, itself honouring the operator's `[jev.floors.<site>]`
 //! config and `ZIRV_CTX_JEV_FLOOR_<SITE>_MIN_CONFIDENCE|_MIN_MARGIN` env
-//! overlays -- see `config::JevFloorsConfig` -- for the nine sites that have
+//! overlays -- see `config::JevFloorsConfig` -- for the eight sites that have
 //! one; the remaining sites have no `[jev.floors]` entry at all and keep
 //! their own compiled constant, exactly as production does) and production
 //! answer-to-action rule, and prints what production would have DONE on
@@ -76,18 +76,13 @@ use super::{
 use crate::commands::ctx::CtxResult;
 use crate::commands::workflow::{engine, profile, review, team};
 
-/// One measurable site, all twenty-four the probe contract names. The first
-/// twelve variants (`MemoryRerank` through `Inject`) were the original
-/// twelve; `Crash` through `InjectScreen` and `MissingTests` through
-/// `GateReclass` are the twelve added by the autoresearch probe-contract
-/// extension. `MemoryRerank`/`MemoryHarvest` and `ContextReport`/
-/// `ContextSkill` share a production advise-site LABEL and/or `jev::
-/// FloorSite`, but are distinct SITEs here: each has its own default floor
+/// One measurable site of the probe contract. `Crash` through `InjectScreen` and
+/// `MissingTests` through `GateReclass` were added by the autoresearch probe-contract
+/// extension. `ContextReport`/`ContextSkill` share a production advise-site LABEL and
+/// `jev::FloorSite`, but are distinct SITEs here: each has its own default floor
 /// constant a later retune targets independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Site {
-    MemoryRerank,
-    MemoryHarvest,
     ContextReport,
     ContextSkill,
     HarvestScreen,
@@ -115,8 +110,6 @@ enum Site {
 impl Site {
     fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
-            "memory-rerank" => Self::MemoryRerank,
-            "memory-harvest" => Self::MemoryHarvest,
             "context-report" => Self::ContextReport,
             "context-skill" => Self::ContextSkill,
             "harvest-screen" => Self::HarvestScreen,
@@ -149,7 +142,6 @@ impl Site {
     /// ledger.
     fn production_label(self) -> &'static str {
         match self {
-            Self::MemoryRerank | Self::MemoryHarvest => "memory",
             Self::ContextReport => "context-parent-reports",
             Self::ContextSkill => "context-skill-descriptions",
             Self::HarvestScreen => "harvest",
@@ -183,7 +175,6 @@ impl Site {
     /// output's own readability.
     fn floor_site(self) -> (Option<jev::FloorSite>, &'static str) {
         match self {
-            Self::MemoryRerank | Self::MemoryHarvest => (Some(jev::FloorSite::Memory), "memory"),
             Self::ContextReport | Self::ContextSkill => (Some(jev::FloorSite::Context), "context"),
             Self::HarvestScreen => (Some(jev::FloorSite::HarvestScreen), "harvest_screen"),
             Self::HandoffThin | Self::HandoffSelect => {
@@ -215,8 +206,6 @@ impl Site {
     /// is applied identically here.
     fn default_floor(self) -> (f32, f32) {
         match self {
-            Self::MemoryRerank => compile::MEMORY_RERANK_DEFAULT_FLOOR,
-            Self::MemoryHarvest => memory::MEMORY_HARVEST_DEFAULT_FLOOR,
             Self::ContextReport | Self::ContextSkill => compile::CONTEXT_DEFAULT_FLOOR,
             Self::HarvestScreen => (
                 memory::HARVEST_SCREEN_MIN_CONFIDENCE,
@@ -281,9 +270,7 @@ impl Site {
     fn requires_n(self) -> bool {
         matches!(
             self,
-            Self::MemoryRerank
-                | Self::MemoryHarvest
-                | Self::ContextReport
+            Self::ContextReport
                 | Self::ContextSkill
                 | Self::HandoffSelect
                 | Self::CompactionSelect
@@ -299,16 +286,6 @@ impl Site {
     /// floor and is out of scope here).
     fn build_request(self, case: &Case) -> Result<(Vec<jev::Question>, Vec<String>), String> {
         match self {
-            Self::MemoryRerank => {
-                let ids = numbered_ids("c", require_n(case)?);
-                let questions = compile::memory_rerank_questions(&ids);
-                Ok((questions, ids))
-            }
-            Self::MemoryHarvest => {
-                let ids = numbered_ids("c", require_n(case)?);
-                let questions = memory::memory_harvest_questions(&ids);
-                Ok((questions, ids))
-            }
             Self::ContextReport => {
                 let ids = numbered_ids("p", require_n(case)?);
                 let questions = ids
@@ -434,10 +411,6 @@ impl Site {
         min_margin: f32,
     ) -> String {
         let action = match self {
-            Self::MemoryRerank => compile::memory_rerank_action(answer, min_confidence, min_margin),
-            Self::MemoryHarvest => {
-                memory::memory_harvest_action(answer, min_confidence, min_margin)
-            }
             Self::ContextReport | Self::ContextSkill => {
                 if compile::parent_report_omit(answer, min_confidence, min_margin) {
                     "omit"
@@ -524,12 +497,9 @@ impl Site {
     /// rather than re-derived per rep.
     fn fallback_action(self) -> &'static str {
         match self {
-            Self::MemoryRerank
-            | Self::MemoryHarvest
-            | Self::ContextReport
-            | Self::ContextSkill
-            | Self::HandoffSelect
-            | Self::HandoffThin => "keep",
+            Self::ContextReport | Self::ContextSkill | Self::HandoffSelect | Self::HandoffThin => {
+                "keep"
+            }
             Self::HarvestScreen => "run",
             Self::CompactionSelect => "omit",
             Self::Dispatch => "deny",
@@ -996,7 +966,7 @@ mod tests {
             &serde_json::json!({"id": "c1", "state": {"_zirv_metadata_only": true, "facts": []}}),
         );
         let mut out = Vec::new();
-        let code = run_probe("memory-rerank", &case, 1, Some(dir.path()), &mut out).expect("run");
+        let code = run_probe("context-report", &case, 1, Some(dir.path()), &mut out).expect("run");
         assert_eq!(code, 2);
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("\"n\""), "{text}");

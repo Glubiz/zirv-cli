@@ -141,6 +141,7 @@ pub fn run_with(
         &state_dir,
         launch_mode_from_interactive(interactive_launch),
         args.proxy_layer.as_deref(),
+        &args.command,
     );
     // Merge an existing operator-supplied system prompt flag before adding
     // another one.
