@@ -317,11 +317,101 @@ pub fn script_like_files_at_root(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Runs `command` with stdin closed and returns its [`std::process::Output`],
+/// or an `io::ErrorKind::TimedOut` error once `timeout` elapses (the child is
+/// then killed and reaped). stdout and stderr are drained on threads so a
+/// large output cannot fill a pipe and deadlock the wait. Any spawn failure
+/// is returned as-is.
+pub(crate) fn run_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let grace = std::time::Duration::from_secs(1);
+                return Ok(std::process::Output {
+                    status,
+                    stdout: stdout.recv_timeout(grace).unwrap_or_default(),
+                    stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+                });
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("command timed out after {timeout:?}"),
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{create_dir_all, write};
     use tempfile::tempdir;
+
+    #[test]
+    fn run_with_timeout_kills_a_child_that_outlives_the_timeout() {
+        #[cfg(windows)]
+        let mut command = std::process::Command::new("ping");
+        #[cfg(windows)]
+        command.args(["-n", "4", "127.0.0.1"]);
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("sleep");
+        #[cfg(unix)]
+        command.arg("3");
+
+        let started = std::time::Instant::now();
+        let error = run_with_timeout(&mut command, std::time::Duration::from_millis(300))
+            .expect_err("a 3s child must time out at 300ms");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_output_of_a_fast_child() {
+        let mut command = std::process::Command::new("git");
+        command.arg("--version");
+        let output = run_with_timeout(&mut command, std::time::Duration::from_secs(10))
+            .expect("git --version finishes");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git"));
+    }
 
     /// The matrix is O(n*m) and the threshold is at most 3, so a mistyped
     /// megabyte of argv used to be compared character by character against

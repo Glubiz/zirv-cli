@@ -1,6 +1,6 @@
 //! Privacy-conscious workflow telemetry and aggregate statistics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -651,6 +651,65 @@ impl AdoptionStats {
     }
 }
 
+/// Whether started workflows made progress, not merely started (#878).
+/// `started` counts distinct workflow ids with a `WorkflowStarted` event;
+/// `advanced` those with at least one `PhaseCompleted`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct ProgressStats {
+    pub started: usize,
+    pub advanced: usize,
+    /// Median `PhaseCompleted` count across started workflows; `None` when
+    /// none started.
+    pub median_steps_completed: Option<f64>,
+}
+
+fn progress_stats(events: &[TelemetryEvent]) -> ProgressStats {
+    let mut started: BTreeSet<&str> = BTreeSet::new();
+    let mut completed: BTreeMap<&str, usize> = BTreeMap::new();
+    for event in events {
+        let Some(id) = event.workflow_id.as_deref() else {
+            continue;
+        };
+        match event.kind {
+            TelemetryKind::WorkflowStarted => {
+                started.insert(id);
+            }
+            TelemetryKind::PhaseCompleted => *completed.entry(id).or_default() += 1,
+            _ => {}
+        }
+    }
+    let mut counts: Vec<usize> = started
+        .iter()
+        .map(|id| completed.get(id).copied().unwrap_or(0))
+        .collect();
+    counts.sort_unstable();
+    let median_steps_completed = match counts.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(counts[n / 2] as f64),
+        n => Some((counts[n / 2 - 1] + counts[n / 2]) as f64 / 2.0),
+    };
+    ProgressStats {
+        started: counts.len(),
+        advanced: counts.iter().filter(|count| **count > 0).count(),
+        median_steps_completed,
+    }
+}
+
+/// `None` (line omitted) when no workflow started in the window.
+fn render_progress_line(stats: &ProgressStats) -> Option<String> {
+    let median = stats.median_steps_completed?;
+    Some(format!(
+        "progress: {}/{} started workflows advanced at least once; median steps completed {}",
+        stats.advanced,
+        stats.started,
+        if median.fract() == 0.0 {
+            format!("{median:.0}")
+        } else {
+            format!("{median:.1}")
+        }
+    ))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsReport {
     pub events: usize,
@@ -740,6 +799,7 @@ pub struct StatsReport {
     pub speed: SpeedStats,
     /// Adoption statistics render last. (#223)
     pub adoption: AdoptionStats,
+    pub progress: ProgressStats,
 }
 
 pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
@@ -1111,6 +1171,7 @@ pub fn aggregate(events: &[TelemetryEvent]) -> StatsReport {
         fix_rounds_unclassified,
         speed,
         adoption,
+        progress: progress_stats(events),
     }
 }
 
@@ -1339,6 +1400,9 @@ pub fn run_stats(args: &StatsArgs, writer: &mut impl Write) -> CtxResult<i32> {
         writeln!(writer, "{}", render_speed_line(&report.speed))?;
         // Render adoption last. (#223)
         writeln!(writer, "{}", render_adoption_line(&report.adoption))?;
+        if let Some(line) = render_progress_line(&report.progress) {
+            writeln!(writer, "{line}")?;
+        }
     }
     Ok(0)
 }
@@ -1938,6 +2002,37 @@ mod tests {
         assert_eq!(stats.recovered_after_nudge, 1);
         assert_eq!(stats.ran_a_workflow(), 2);
         assert_eq!(stats.rate(), Some(2.0 / 3.0));
+    }
+
+    /// #878: stats must show progress, not just starts.
+    #[test]
+    fn progress_counts_started_workflows_that_advanced() {
+        let event = |kind, id: &str| {
+            let mut event = TelemetryEvent::new(kind);
+            event.workflow_id = Some(id.to_string());
+            event
+        };
+        let events = [
+            event(TelemetryKind::WorkflowStarted, "a"),
+            event(TelemetryKind::WorkflowStarted, "b"),
+            event(TelemetryKind::WorkflowStarted, "c"),
+            event(TelemetryKind::PhaseCompleted, "a"),
+            event(TelemetryKind::PhaseCompleted, "a"),
+            event(TelemetryKind::PhaseCompleted, "b"),
+            // Completed without a start in the window: not counted.
+            event(TelemetryKind::PhaseCompleted, "old"),
+        ];
+        let progress = aggregate(&events).progress;
+        assert_eq!(progress.started, 3);
+        assert_eq!(progress.advanced, 2);
+        assert_eq!(progress.median_steps_completed, Some(1.0));
+        assert_eq!(
+            render_progress_line(&progress).as_deref(),
+            Some(
+                "progress: 2/3 started workflows advanced at least once; median steps completed 1"
+            )
+        );
+        assert_eq!(render_progress_line(&aggregate(&[]).progress), None);
     }
 
     #[test]
