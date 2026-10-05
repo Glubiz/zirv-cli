@@ -133,27 +133,23 @@ fn launch_effort_facts(prompt: &str, complexity: Complexity) -> Vec<u32> {
 
 pub(crate) const LAUNCH_EFFORT_DEFAULT_FLOOR: (f32, f32) = (0.0, jev::DEFAULT_MIN_MARGIN);
 
-/// A decisive answer selects high or low; other outcomes use the classifier.
+/// Only a decisive YES selects high. Anything else (a decisive no, an
+/// indecisive or missing answer) uses the classifier: "not unusually hard" is
+/// no evidence of a small follow-up, so Jev never lowers the pick.
 pub(crate) fn launch_effort_action(
     answer: Option<&jev::Answer>,
     min_confidence: f32,
     min_margin: f32,
 ) -> &'static str {
-    let Some(answer) = answer else {
-        return "classifier";
-    };
-    if !answer.decisive(min_confidence, min_margin) {
-        return "classifier";
-    }
-    match answer.as_noul() {
-        Some(value) if value >= 0.5 => "high",
-        Some(_) => "low",
-        None => "classifier",
-    }
+    let decisive_yes = answer.is_some_and(|answer| {
+        answer.decisive(min_confidence, min_margin)
+            && answer.as_noul().is_some_and(|value| value >= 0.5)
+    });
+    if decisive_yes { "high" } else { "classifier" }
 }
 
-/// Jev may steer configured effort tiers from numeric facts only; missing
-/// settings or uncertain answers fall back to classification. (#802)
+/// Jev may only RAISE the first launch to the configured `substantial` tier,
+/// from numeric facts only; every other outcome falls back to classification. (#802)
 fn jev_launch_effort(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -182,20 +178,16 @@ fn jev_launch_effort(
         LAUNCH_EFFORT_DEFAULT_FLOOR.0,
         LAUNCH_EFFORT_DEFAULT_FLOOR.1,
     );
-    let is_high = match launch_effort_action(Some(answer), min_confidence, min_margin) {
-        "high" => true,
-        "low" => false,
-        _ => return None,
-    };
-    let chosen = if is_high {
-        cfg.headless.effort.substantial.clone()
-    } else {
-        cfg.headless.effort.trivial.clone()
-    }?;
-    let effect = jev::JevEffect::new(
-        "launch_effort",
-        if is_high { "effort_high" } else { "effort_low" },
-    );
+    if launch_effort_action(Some(answer), min_confidence, min_margin) != "high" {
+        return None;
+    }
+    let chosen = cfg.headless.effort.substantial.clone()?;
+    if headless_effort_for(&cfg.headless.effort, complexity) == Some(chosen.as_str()) {
+        // Jev would not change the pick: the caller uses the identical
+        // deterministic value, and no effect is recorded.
+        return None;
+    }
+    let effect = jev::JevEffect::new("launch_effort", "effort_high");
     jev::record_effect(cfg, state, cfg.jev.launch_effort, &effect);
     Some(chosen)
 }
@@ -775,6 +767,101 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new("low")),
             "an indecisive answer must fall back to the deterministic Trivial -> low pick"
+        );
+    }
+
+    /// A decisive NO never lowers effort: a Substantial classification (8+
+    /// list items) keeps the `substantial` tier, not `trivial`, and no
+    /// `launch_effort` effect is recorded because Jev changed nothing.
+    #[test]
+    fn apply_headless_cost_levers_jev_launch_effort_decisive_no_never_lowers() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let body = r#"{"model": "jev-latest", "answers": {
+            "launch_effort_high": {"type": "noul", "noul": 0.02}},
+            "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let env = "EXEC_TEST_LAUNCH_EFFORT_NO";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let mut cfg = launch_effort_cfg(url, env);
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.substantial = Some("high".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let prompt = (1..=8)
+            .map(|n| format!("- change module number {n}\n"))
+            .collect::<String>();
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some(&prompt),
+            &state,
+            &SessionId::new_v4(),
+        );
+        handle.join().expect("server thread");
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("high")),
+            "a decisive no must keep the deterministic Substantial -> high pick, never lower it"
+        );
+        assert!(
+            !state.root().join("jev-effects.jsonl").exists(),
+            "Jev did not change the pick, so no effect is recorded"
+        );
+    }
+
+    /// A decisive YES on a prompt that already classifies Substantial changes
+    /// nothing: the substantial tier is used and no effect is recorded.
+    #[test]
+    fn apply_headless_cost_levers_jev_launch_effort_yes_on_substantial_records_no_effect() {
+        let _env =
+            crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
+        let body = r#"{"model": "jev-latest", "answers": {
+            "launch_effort_high": {"type": "noul", "noul": 0.97}},
+            "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let env = "EXEC_TEST_LAUNCH_EFFORT_YES_SUBSTANTIAL";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(env, "secret") };
+        let mut cfg = launch_effort_cfg(url, env);
+        cfg.headless.effort.trivial = Some("low".to_string());
+        cfg.headless.effort.substantial = Some("high".to_string());
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let prompt = (1..=8)
+            .map(|n| format!("- change module number {n}\n"))
+            .collect::<String>();
+
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &cfg,
+            "claude",
+            Some(&prompt),
+            &state,
+            &SessionId::new_v4(),
+        );
+        handle.join().expect("server thread");
+        unsafe { std::env::remove_var(env) };
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("high")),
+            "a decisive yes on a Substantial prompt yields the substantial tier"
+        );
+        assert!(
+            !state.root().join("jev-effects.jsonl").exists(),
+            "Jev did not change the pick, so no effect is recorded"
         );
     }
 }

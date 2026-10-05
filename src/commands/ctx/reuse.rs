@@ -493,8 +493,8 @@ pub fn is_excluded(repo: &Path, path: &Path, exclude: &[String]) -> bool {
 
 /// Why a walk stopped before it ran out of tree. `Deadline`/`Bytes` are the
 /// two budget halves and become a [`ProbeOutcome::Skipped`]; `Enough` means
-/// [`MAX_MATCHES`] were already found, which is a complete answer, not a
-/// truncated one.
+/// every incoming name is already known to be a multi-file convention, which
+/// is a complete answer, not a truncated one.
 enum Halt {
     Deadline,
     Bytes,
@@ -514,9 +514,17 @@ struct Scan<'a> {
     budget: Budget,
     started: Instant,
     scanned: usize,
-    /// Incoming names already reported, so one duplication is named once.
-    reported: BTreeSet<String>,
-    matches: Vec<Match>,
+    /// One entry per incoming name found anywhere in the repository.
+    hits: Vec<Hit>,
+}
+
+/// An incoming name's first existing definition plus every distinct file that
+/// defines an equivalent name. Two or more files make it a per-module
+/// convention (`register` in each command module), not a duplication.
+struct Hit {
+    name: String,
+    first: Match,
+    files: BTreeSet<String>,
 }
 
 impl Scan<'_> {
@@ -605,22 +613,37 @@ impl Scan<'_> {
                     let existing_variants: BTreeSet<String> =
                         variants(&existing).into_iter().collect();
                     for (name, candidate_variants) in self.wanted {
-                        if self.reported.contains(name)
-                            || candidate_variants.is_disjoint(&existing_variants)
-                        {
+                        if candidate_variants.is_disjoint(&existing_variants) {
                             continue;
                         }
-                        self.reported.insert(name.clone());
-                        self.matches.push(Match {
-                            kind,
-                            name: existing.clone(),
-                            path: path.clone(),
-                            line: number + 1,
-                        });
+                        match self.hits.iter_mut().find(|hit| hit.name == *name) {
+                            Some(hit) => {
+                                hit.files.insert(path.clone());
+                            }
+                            None => self.hits.push(Hit {
+                                name: name.clone(),
+                                first: Match {
+                                    kind,
+                                    name: existing.clone(),
+                                    path: path.clone(),
+                                    line: number + 1,
+                                },
+                                files: BTreeSet::from([path.clone()]),
+                            }),
+                        }
                     }
                 }
             }
-            if self.matches.len() >= MAX_MATCHES {
+            // Complete only once EVERY incoming name is known to be a
+            // convention (2+ files): a name seen in one file so far could
+            // still turn out to be one.
+            // Also complete once MAX_MATCHES single-file hits exist: the note
+            // cannot name more, and stopping there keeps the 4.49 cost bound.
+            let single_file_hits = self.hits.iter().filter(|hit| hit.files.len() == 1).count();
+            if single_file_hits >= MAX_MATCHES
+                || (self.hits.len() == self.wanted.len()
+                    && self.hits.iter().all(|hit| hit.files.len() >= 2))
+            {
                 return Err(Halt::Enough);
             }
         }
@@ -659,8 +682,7 @@ pub fn probe(
         budget,
         started: Instant::now(),
         scanned: 0,
-        reported: BTreeSet::new(),
-        matches: Vec::new(),
+        hits: Vec::new(),
     };
     match scan.walk(repo) {
         Err(Halt::Deadline) => ProbeOutcome::Skipped(format!(
@@ -671,7 +693,15 @@ pub fn probe(
             "probe byte budget of {} exceeded",
             budget.max_bytes
         )),
-        Err(Halt::Enough) | Ok(()) => ProbeOutcome::Matches(scan.matches),
+        Err(Halt::Enough) | Ok(()) => ProbeOutcome::Matches(
+            scan.hits
+                .into_iter()
+                // 2+ defining files: a per-module convention, not a duplicate.
+                .filter(|hit| hit.files.len() == 1)
+                .map(|hit| hit.first)
+                .take(MAX_MATCHES)
+                .collect(),
+        ),
     }
 }
 
@@ -1200,6 +1230,80 @@ mod tests {
             evaluate(repo.path(), &repo.path().join("src/y.rs"), &payload, &[]),
             Outcome::Skipped("payload too large".to_string())
         );
+    }
+
+    /// A name already defined in two or more other files is a per-module
+    /// convention (each command module's own `register`), not a duplicate.
+    #[test]
+    fn probe_treats_a_name_defined_in_two_files_as_a_convention() {
+        let repo = probe_repo();
+        std::fs::write(
+            repo.path().join("src/y.rs"),
+            "pub fn foo_bar() -> u8 {\n    1\n}\n",
+        )
+        .expect("write y.rs");
+        let target = repo.path().join("src/other.rs");
+        assert_eq!(
+            probe(
+                repo.path(),
+                &target,
+                &["foo_bar".to_string()],
+                &[],
+                Budget::default()
+            ),
+            ProbeOutcome::Matches(Vec::new()),
+            "two defining files make it a convention"
+        );
+        // A second definition in the SAME file does not make a convention.
+        let single = probe_repo();
+        std::fs::write(
+            single.path().join("src/x.rs"),
+            "pub fn foo_bar() {}\npub fn fooBar() {}\n",
+        )
+        .expect("rewrite x.rs");
+        let outcome = probe(
+            single.path(),
+            &single.path().join("src/other.rs"),
+            &["foo_bar".to_string()],
+            &[],
+            Budget::default(),
+        );
+        let ProbeOutcome::Matches(matches) = outcome else {
+            panic!("expected matches, got {outcome:?}");
+        };
+        assert_eq!(matches.len(), 1, "{matches:?}");
+    }
+
+    /// Five single-file hits end the walk (4.49 behaviour). `z/b.rs` would
+    /// turn `widget_0_total` into a convention (4 matches) if the walk went on,
+    /// so five matches prove it halted after `a.rs`.
+    #[test]
+    fn probe_halts_once_max_matches_single_file_hits_exist() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        let names: Vec<String> = (0..MAX_MATCHES)
+            .map(|n| format!("widget_{n}_total"))
+            .collect();
+        let body: String = names
+            .iter()
+            .map(|n| format!("pub fn {n}() {{}}\n"))
+            .collect();
+        std::fs::write(src.join("a.rs"), body).expect("write a.rs");
+        // Sorted after a.rs; reached only if the walk fails to halt.
+        std::fs::create_dir_all(src.join("z")).expect("z dir");
+        std::fs::write(src.join("z/b.rs"), "pub fn widget_0_total() {}\n").expect("write b.rs");
+        let outcome = probe(
+            repo.path(),
+            &src.join("new.rs"),
+            &names,
+            &[],
+            Budget::default(),
+        );
+        let ProbeOutcome::Matches(matches) = outcome else {
+            panic!("expected matches, got {outcome:?}");
+        };
+        assert_eq!(matches.len(), MAX_MATCHES, "{matches:?}");
     }
 
     #[test]
