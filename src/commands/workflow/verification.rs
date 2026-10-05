@@ -475,7 +475,10 @@ fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
 }
 
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
-    let root = git_root(repo);
+    changed_paths_at_root(&git_root(repo))
+}
+
+fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for args in [
         &["diff", "--name-only", "-z", "HEAD"][..],
@@ -487,7 +490,7 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             "--full-name",
         ][..],
     ] {
-        let output = git_at(&root).args(args).output()?;
+        let output = git_at(root).args(args).output()?;
         if !output.status.success() {
             return Err(format!(
                 "cannot inspect changed paths: {}",
@@ -564,20 +567,76 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     }
     let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
     input.push_str(&String::from_utf8_lossy(&diff.stdout));
-    for path in changed_paths(repo)? {
+    let paths = changed_paths_at_root(&root)?;
+    // One `hash-object` for every plain file; `--stdin-paths` splits on newlines and unquotes a
+    // leading `"`, so those names fall back to a spawn of their own below.
+    let batchable: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            !bytes.contains(&b'\n')
+                && !bytes.starts_with(b"\"")
+                && std::fs::symlink_metadata(root.join(path))
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        })
+        .collect();
+    let mut batched = std::collections::HashMap::new();
+    if !batchable.is_empty() {
+        let mut child = git_at(&root)
+            .args(["hash-object", "--no-filters", "--stdin-paths"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("cannot open git hash-object stdin")?;
+        // A thread feeds the paths so a large list cannot deadlock against git's output pipe.
+        let output = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for path in &batchable {
+                    let _ = stdin.write_all(path.as_os_str().as_encoded_bytes());
+                    let _ = stdin.write_all(b"\n");
+                }
+                drop(stdin);
+            });
+            child.wait_with_output()
+        })?;
+        let hashes = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || hashes.lines().count() != batchable.len() {
+            return Err(format!(
+                "cannot fingerprint changed paths: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        batched.extend(
+            batchable
+                .iter()
+                .copied()
+                .zip(hashes.lines().map(str::to_string)),
+        );
+    }
+    for path in &paths {
         input.push_str("\npath:");
         input.push_str(&path.to_string_lossy());
-        match std::fs::symlink_metadata(root.join(&path)) {
+        match std::fs::symlink_metadata(root.join(path)) {
             // Hash a symlink’s own target path because hashing through it misses retargets between equal-content files. (#287)
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                let target = std::fs::read_link(root.join(&path))?;
+                let target = std::fs::read_link(root.join(path))?;
                 input.push_str("\nsymlink:");
                 input.push_str(&target.to_string_lossy());
             }
             Ok(_) => {
+                input.push_str("\nhash:");
+                if let Some(hash) = batched.get(path) {
+                    input.push_str(hash);
+                    continue;
+                }
                 let hashed = git_at(&root)
                     .args(["hash-object", "--no-filters", "--"])
-                    .arg(&path)
+                    .arg(path)
                     .output()?;
                 if !hashed.status.success() {
                     return Err(format!(
@@ -587,7 +646,6 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
                     )
                     .into());
                 }
-                input.push_str("\nhash:");
                 input.push_str(String::from_utf8_lossy(&hashed.stdout).trim());
             }
             Err(_) => {
@@ -6215,6 +6273,49 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             "retargeting a symlink to different content of identical bytes must move the \
              fingerprint"
         );
+    }
+
+    /// The batched `hash-object` must produce the exact fingerprint the per-path spawn did, across
+    /// modified, untracked, quoted-name and symlinked paths.
+    #[test]
+    #[cfg(unix)]
+    fn change_fingerprint_equals_the_per_path_hash_object_reference() {
+        let repo = git_repo();
+        let root = repo.path();
+        std::fs::write(root.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "new\n").unwrap();
+        std::fs::write(root.join("quoted\"name.txt"), "q\n").unwrap();
+        std::os::unix::fs::symlink(root.join("untracked.txt"), root.join("link.txt")).unwrap();
+
+        let head = git_at(root).args(["rev-parse", "HEAD"]).output().unwrap();
+        let diff = git_at(root)
+            .args(["diff", "--raw", "HEAD"])
+            .output()
+            .unwrap();
+        let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
+        input.push_str(&String::from_utf8_lossy(&diff.stdout));
+        for path in changed_paths(root).unwrap() {
+            input.push_str("\npath:");
+            input.push_str(&path.to_string_lossy());
+            let full = root.join(&path);
+            match std::fs::symlink_metadata(&full) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    input.push_str("\nsymlink:");
+                    input.push_str(&std::fs::read_link(&full).unwrap().to_string_lossy());
+                }
+                Ok(_) => {
+                    let hashed = git_at(root)
+                        .args(["hash-object", "--no-filters", "--"])
+                        .arg(&path)
+                        .output()
+                        .unwrap();
+                    input.push_str("\nhash:");
+                    input.push_str(String::from_utf8_lossy(&hashed.stdout).trim());
+                }
+                Err(_) => input.push_str("\ndeleted"),
+            }
+        }
+        assert_eq!(change_fingerprint(root).unwrap(), input_hash(&input));
     }
 
     /// The `proves:`/`fix:` announcement must name the reason and never

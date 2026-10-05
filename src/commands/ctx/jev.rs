@@ -1625,11 +1625,12 @@ pub(crate) fn usage_rollup(
             entry.calls += 1;
             if row.cached {
                 entry.cache_hits += 1;
+            } else {
+                entry.wall_ms_samples.push(row.wall_ms);
             }
             if !row.fallbacks.is_empty() {
                 entry.errors += 1;
             }
-            entry.wall_ms_samples.push(row.wall_ms);
         }
     }
 
@@ -3530,6 +3531,36 @@ pub(crate) mod tests {
         });
     }
 
+    /// A cache hit never reached the model, so its near-zero wall time must not drag the
+    /// latency percentiles of the calls that did.
+    #[test]
+    fn usage_rollup_latency_percentiles_exclude_cached_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+        let row = |wall_ms: u64, cached: bool| {
+            format!(
+                "{{\"site\":\"memory\",\"ts\":{now},\"wall_ms\":{wall_ms},\"cached\":{cached},\"fallbacks\":[]}}\n"
+            )
+        };
+        let decisions = [
+            row(0, true),
+            row(0, true),
+            row(300, false),
+            row(400, false),
+            row(500, false),
+        ]
+        .concat();
+        std::fs::write(state.root().join("jev-decisions.jsonl"), decisions)
+            .expect("write decisions");
+
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
+        let usage = rollup.sites.get("memory").expect("memory site present");
+        assert_eq!(usage.calls, 5);
+        assert_eq!(usage.wall_ms_p50, Some(400));
+    }
+
     /// Issue #758: [`usage_rollup`] folds both logs, keyed by their shared
     /// `site` field, over the rollup window.
     #[test]
@@ -3562,7 +3593,11 @@ pub(crate) mod tests {
         );
         assert_eq!(usage.effect_rows, 2);
         assert_eq!(usage.removed_bytes, 750);
-        assert_eq!(usage.wall_ms_p50, Some(200));
+        assert_eq!(
+            usage.wall_ms_p50,
+            Some(300),
+            "the cached 200 ms row is excluded"
+        );
         assert_eq!(usage.wall_ms_p95, Some(300));
         let cache_hit_rate = usage.cache_hit_rate.expect("cache hit rate present");
         assert!(

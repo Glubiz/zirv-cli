@@ -538,8 +538,12 @@ impl CompiledContext {
                     )
                 }
                 // The skill index precedes volatile workflow content to preserve the cacheable prefix.
+                // It ends at the next layer separator: the user and repo blocks that may follow carry no anchor of their own.
                 PromptSource::SkillIndex => find_after(text, cursor, prompt::SKILL_INDEX_HEADER)
-                    .map(|header_at| (header_at + prompt::SKILL_INDEX_HEADER.len(), None, None)),
+                    .map(|header_at| {
+                        let start = header_at + prompt::SKILL_INDEX_HEADER.len();
+                        (start, find_after(text, start, "\n\n---\n\n"), None)
+                    }),
                 PromptSource::SkillDescriptions => {
                     find_after(text, cursor, prompt::SKILL_DESCRIPTIONS_HEADER).map(|header_at| {
                         (
@@ -999,16 +1003,24 @@ fn core_relevance_map(
 
 fn changed_repo_paths(repo: &Path) -> Vec<String> {
     let mut paths = std::collections::BTreeSet::new();
-    for args in [
-        &["diff", "--name-only", "--relative", "HEAD"][..],
-        &["ls-files", "--others", "--exclude-standard"][..],
-    ] {
-        let Ok(output) = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-        else {
+    let outputs = std::thread::scope(|scope| {
+        [
+            &["diff", "--name-only", "--relative", "HEAD"][..],
+            &["ls-files", "--others", "--exclude-standard"][..],
+        ]
+        .map(|args| {
+            scope.spawn(move || {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .output()
+            })
+        })
+        .map(|handle| handle.join())
+    });
+    for output in outputs {
+        let Ok(Ok(output)) = output else {
             continue;
         };
         if !output.status.success() {
@@ -4975,6 +4987,49 @@ mod tests {
         assert!(
             table.contains(&measure_row("skill index", layer.range.len(), "")),
             "got:\n{table}"
+        );
+    }
+
+    /// The skill index range ended "at the next anchor", so the unanchored user-layer block that
+    /// follows it was billed to the skill index row.
+    #[test]
+    fn the_skill_index_range_stops_before_the_user_layer() {
+        let repo = repo_with_context_files(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/system-prompt.md"),
+            "USER-LAYER-SENTINEL",
+        )
+        .expect("write");
+        let cfg = CtxConfig::default();
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+
+        let compiled = compile_with_harness_roster(
+            Some(home.path()),
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        let text = &compiled.composed.as_ref().expect("composed").text;
+        assert!(text.contains("USER-LAYER-SENTINEL"), "user layer present");
+        let layer = compiled
+            .emitted_layers()
+            .into_iter()
+            .find(|l| l.source == PromptSource::SkillIndex)
+            .expect("skill index layer");
+        assert!(
+            !text[layer.range].contains("USER-LAYER-SENTINEL"),
+            "the skill index row must not include the user layer"
         );
     }
 
