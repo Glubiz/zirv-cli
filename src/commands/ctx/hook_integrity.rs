@@ -186,9 +186,13 @@ pub(crate) fn record_baseline(
     let mut baseline = Baseline::load(state);
     let target_key = target.to_string_lossy().to_string();
     // Settings files that no longer exist (a test's tempdir, a removed config) leave dead targets.
-    baseline
-        .targets
-        .retain(|key, _| *key == target_key || Path::new(key).exists());
+    baseline.targets.retain(|key, _| {
+        *key == target_key
+            || !matches!(
+                std::fs::symlink_metadata(key),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+    });
     for (event, matcher, command) in written {
         baseline.set(&target_key, event, *matcher, command);
     }
@@ -1224,6 +1228,33 @@ mod tests {
         assert!(
             baseline
                 .get(&current.to_string_lossy(), "Stop", None)
+                .is_some()
+        );
+    }
+
+    /// A target whose metadata read fails for a reason other than "not found" is unreadable, not
+    /// gone: it keeps its baseline.
+    #[cfg(unix)]
+    #[test]
+    fn record_baseline_keeps_a_target_it_cannot_stat() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("state dir");
+        let state = state_at(dir.path());
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let hidden = locked.join("settings.json");
+        std::fs::write(&hidden, "{}").expect("write");
+        record_baseline(&state, &hidden, &[CURRENT]).expect("record hidden");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let unreadable = hidden.exists();
+
+        let current = dir.path().join("current-settings.json");
+        record_baseline(&state, &current, &[CURRENT]).expect("record current");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(!unreadable, "the fixture must make the stat fail");
+        assert!(
+            Baseline::load(&state)
+                .get(&hidden.to_string_lossy(), "Stop", None)
                 .is_some()
         );
     }

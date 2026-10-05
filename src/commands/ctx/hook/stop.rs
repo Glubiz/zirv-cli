@@ -21,6 +21,10 @@ use crate::commands::ctx::rot::{Score, Verdict};
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::{CtxResult, log, score, signal};
 
+/// Background-subagent dialogs observed waiting 62-380 s; a prompt older than this belongs to a
+/// subagent that died without SubagentStop.
+const SUBAGENT_PROMPT_MAX_AGE_SECS: u64 = 30 * 60;
+
 // Check diagnostics configuration before parsing the transcript so
 // disabled sessions pay no post-edit analysis cost (#308).
 fn diagnostics_stop_nudge(
@@ -161,12 +165,17 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         }
         // A main-thread turn boundary ends the main thread's prompts only: a native subagent shares
         // the session and its dialog may still be waiting. Closing them and clearing their latch
-        // share one lock, so a dialog confirmed meanwhile cannot outlive its entry (#864).
+        // share one lock, so a dialog confirmed meanwhile cannot outlive its entry (#864). A
+        // subagent killed without SubagentStop never closes its own, so one older than
+        // `SUBAGENT_PROMPT_MAX_AGE_SECS` is closed here too.
         let attention_short = super::permission::attention_short(env, &payload.session_id);
         crate::commands::ctx::attention::resolve_prompts(
             &state,
             &attention_short,
-            |open| open.agent.is_empty(),
+            |open| {
+                open.agent.is_empty()
+                    || now_secs().saturating_sub(open.at) > SUBAGENT_PROMPT_MAX_AGE_SECS
+            },
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
                 "turn completed cleanly",
@@ -896,12 +905,12 @@ mod tests {
                 OpenPrompt {
                     id: id.to_string(),
                     agent: agent.to_string(),
-                    at: 10,
+                    at: now_secs(),
                     ..Default::default()
                 },
             );
         }
-        attention::confirm_prompts(&state, short, "Bash: cargo", 11);
+        attention::confirm_prompts(&state, short, "Bash: cargo", now_secs());
         let env: std::collections::HashMap<String, String> = [
             (
                 crate::commands::ctx::state::STATE_ENV.to_string(),
@@ -924,6 +933,72 @@ mod tests {
         assert_eq!(left, 1, "only the subagent prompt remains");
         let main_left = attention::close_prompts(&state, short, |o| o.agent == "a-sub-1");
         assert_eq!(main_left, 0, "the main-thread prompt closed");
+    }
+
+    /// A subagent killed without SubagentStop never closes its prompt; a main-thread Stop closes
+    /// subagent prompts older than the bound, so the latch cannot outlive the session, and keeps
+    /// fresh ones.
+    #[test]
+    fn a_main_thread_stop_closes_a_stale_subagent_prompt_and_keeps_a_fresh_one() {
+        use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write");
+        let state_dir = dir.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let short = "aae6758d";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            (
+                SESSION_ENV.to_string(),
+                "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+            ),
+        ]
+        .into();
+        let stdin = stop_payload(&transcript, dir.path());
+        let stop = || run_stop(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("runs");
+        let now = now_secs();
+
+        attention::open_prompt(
+            &state,
+            short,
+            OpenPrompt {
+                id: "p-stale".to_string(),
+                agent: "a-dead".to_string(),
+                at: now - 31 * 60,
+                ..Default::default()
+            },
+        );
+        attention::confirm_prompts(&state, short, "Bash: cargo", now - 31 * 60);
+        stop();
+        assert_eq!(attention::load(&state, short).attention, Attention::None);
+        assert_eq!(attention::close_prompts(&state, short, |_| false), 0);
+
+        attention::open_prompt(
+            &state,
+            short,
+            OpenPrompt {
+                id: "p-fresh".to_string(),
+                agent: "a-live".to_string(),
+                at: now - 5 * 60,
+                ..Default::default()
+            },
+        );
+        attention::confirm_prompts(&state, short, "Bash: cargo", now - 5 * 60);
+        stop();
+        assert_eq!(
+            attention::load(&state, short).attention,
+            Attention::Approval
+        );
+        assert_eq!(attention::close_prompts(&state, short, |_| false), 1);
     }
 
     /// A supervisor cannot derive the agent's transcript path: the agent mints

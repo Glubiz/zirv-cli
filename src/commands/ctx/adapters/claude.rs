@@ -1255,6 +1255,7 @@ impl ClaudeAdapter {
         safety: &super::super::safety::SafetyPolicy,
         lean: bool,
         carried: Option<(&[String], &[String])>,
+        worktree_roots: &[PathBuf],
     ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
@@ -1297,7 +1298,7 @@ impl ClaudeAdapter {
         } else {
             path
         };
-        let mut launch_environment = LaunchEnvironment::resolve();
+        let mut launch_environment = LaunchEnvironment::resolve(worktree_roots);
         launch_environment.supervisor = supervisor;
         launch_environment.approvals_hook_timeout = self.approvals_hook_timeout;
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
@@ -1469,7 +1470,7 @@ struct LaunchEnvironment {
 }
 
 impl LaunchEnvironment {
-    fn resolve() -> Self {
+    fn resolve(worktree_roots: &[PathBuf]) -> Self {
         let state_write_root =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
@@ -1490,7 +1491,7 @@ impl LaunchEnvironment {
             .ok()
             .and_then(|repo| std::fs::canonicalize(repo).ok())
             .map(|repo| {
-                let mut roots = linked_worktree_roots(&repo);
+                let mut roots = worktree_roots.to_vec();
                 let home = crate::utils::home_dir().ok();
                 for root in sibling_repo_roots(&repo, home.as_deref()) {
                     if !roots.contains(&root) {
@@ -1504,7 +1505,8 @@ impl LaunchEnvironment {
             .map(|path| grant_path(path))
             .collect();
         #[cfg(test)]
-        let workspace_write_roots = Vec::new();
+        let workspace_write_roots: Vec<String> =
+            worktree_roots.iter().map(|path| grant_path(path)).collect();
 
         Self {
             state_write_root,
@@ -1855,7 +1857,6 @@ fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
 }
 
 const MAX_LINKED_WORKTREES: usize = 16;
-#[cfg(not(test))]
 const WORKTREE_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn parse_worktree_porcelain(output: &str) -> Vec<PathBuf> {
@@ -1891,21 +1892,22 @@ fn additional_worktree_roots(
 /// `additionalDirectories` instead, via [`sibling_repo_roots`] (issue #329).
 /// Discovery is best-effort, bounded, and never invokes a shell. Empty
 /// under `#[cfg(test)]`: git worktree discovery is a real subprocess call
-/// (see [`linked_worktree_roots`]), unexercised by unit tests, which use
+/// (see [`discover_worktree_roots`]), unexercised by unit tests, which use
 /// [`add_dir_edit_read_rules`] directly with fabricated paths instead.
+/// Listed fresh on every call and never memoized (a dashboard may create a worktree and launch
+/// into it at once): `default_sandbox_args` calls it once per launch and hands the list to
+/// [`LaunchEnvironment::resolve`], so a launch spawns git once.
 #[cfg(not(test))]
-fn current_worktree_grant_paths() -> Vec<String> {
+fn current_worktree_roots() -> Vec<PathBuf> {
     std::env::current_dir()
         .ok()
-        .map(|repo| linked_worktree_roots(&repo))
+        .and_then(|repo| std::fs::canonicalize(repo).ok())
+        .map(|repo| discover_worktree_roots(&repo))
         .unwrap_or_default()
-        .iter()
-        .map(|path| grant_path(path))
-        .collect()
 }
 
 #[cfg(test)]
-fn current_worktree_grant_paths() -> Vec<String> {
+fn current_worktree_roots() -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -1944,47 +1946,6 @@ fn grant_path(path: &Path) -> String {
     super::super::state::display_path(path)
 }
 
-/// The discovery half of [`current_worktree_grant_paths`], shared with
-/// [`LaunchEnvironment::resolve`] so the same bounded set that becomes a
-/// working directory also becomes a sandbox write grant (issue #329).
-#[cfg(not(test))]
-fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
-    let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
-        return Vec::new();
-    };
-    memoized_worktree_roots(&canonical_repo, || discover_worktree_roots(&canonical_repo))
-}
-
-/// How long one launch's worktree list is reused. Short on purpose: a dashboard that creates a
-/// worktree and then launches a worker must see the new worktree, but the two probes of ONE launch
-/// (`LaunchEnvironment::resolve` and `default_sandbox_args`) land milliseconds apart.
-const WORKTREE_MEMO_TTL: Duration = Duration::from_secs(5);
-
-type WorktreeMemo = Mutex<HashMap<PathBuf, (Instant, Vec<PathBuf>)>>;
-static WORKTREE_MEMO: OnceLock<WorktreeMemo> = OnceLock::new();
-
-fn memoized_worktree_roots(
-    canonical_repo: &Path,
-    discover: impl FnOnce() -> Vec<PathBuf>,
-) -> Vec<PathBuf> {
-    let memo = WORKTREE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(map) = memo.lock()
-        && let Some((at, roots)) = map.get(canonical_repo)
-        && at.elapsed() < WORKTREE_MEMO_TTL
-    {
-        return roots.clone();
-    }
-    let roots = discover();
-    if let Ok(mut map) = memo.lock() {
-        map.insert(
-            canonical_repo.to_path_buf(),
-            (Instant::now(), roots.clone()),
-        );
-    }
-    roots
-}
-
-#[cfg(not(test))]
 fn discover_worktree_roots(canonical_repo: &Path) -> Vec<PathBuf> {
     let Ok(mut child) = Command::new("git")
         .arg("-C")
@@ -2711,9 +2672,11 @@ impl AgentAdapter for ClaudeAdapter {
     ) -> Vec<String> {
         // Issue #504: computed once, up front, so the SAME bounded worktree
         // set both widens the interactive Edit/Read allow-list below AND
-        // becomes the `--add-dir` argv at the end. `LaunchEnvironment::resolve` asks for the same
-        // list; `linked_worktree_roots` memoizes it so a launch spawns git once.
-        let worktree_grant_paths = current_worktree_grant_paths();
+        // becomes the `--add-dir` argv at the end. The launch settings take the same list, so a
+        // launch spawns git once and a worktree created a moment ago is never missed.
+        let worktree_roots = current_worktree_roots();
+        let worktree_grant_paths: Vec<String> =
+            worktree_roots.iter().map(|path| grant_path(path)).collect();
 
         // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
         // scope, the harness dirs, WebFetch/WebSearch. These are outside
@@ -2877,7 +2840,7 @@ impl AgentAdapter for ClaudeAdapter {
         let carried = self
             .launches_through_cmd_shim()
             .then_some((allow_entries.as_slice(), deny_entries.as_slice()));
-        let settings = self.launch_settings_path(sandbox, safety, lean, carried);
+        let settings = self.launch_settings_path(sandbox, safety, lean, carried, &worktree_roots);
         // With no settings file to carry them, argv keeps the rules and the shim guard refuses the launch, never dropping the deny list.
         if carried.is_none() || settings.is_none() {
             args.push(format!("--allowedTools={allow}"));
@@ -5316,7 +5279,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&Default::default(), &policy, false, None)
+            .launch_settings_path(&Default::default(), &policy, false, None, &[])
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -5353,7 +5316,7 @@ mod tests {
         }
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve())
+            launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve(&[]))
                 .expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
@@ -5390,10 +5353,10 @@ mod tests {
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
         let lean_path = adapter
-            .launch_settings_path(&Default::default(), &policy, true, None)
+            .launch_settings_path(&Default::default(), &policy, true, None, &[])
             .expect("lean settings materialized");
         let plain_path = adapter
-            .launch_settings_path(&Default::default(), &policy, false, None)
+            .launch_settings_path(&Default::default(), &policy, false, None, &[])
             .expect("non-lean settings materialized");
 
         assert_ne!(
@@ -7301,19 +7264,55 @@ mod tests {
     }
 
     #[test]
-    fn a_second_worktree_list_for_the_same_repo_does_not_respawn_git() {
-        let repo = PathBuf::from("/memo-test/repo-a");
-        let calls = std::cell::Cell::new(0);
-        let discover = || {
-            calls.set(calls.get() + 1);
-            vec![PathBuf::from("/memo-test/wt")]
+    fn a_worktree_created_between_two_launches_is_seen_by_the_second() {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .expect("git")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
         };
-        let first = memoized_worktree_roots(&repo, discover);
-        let second = memoized_worktree_roots(&repo, discover);
-        assert_eq!(first, second);
-        assert_eq!(calls.get(), 1, "the second launch step reuses the list");
-        memoized_worktree_roots(Path::new("/memo-test/repo-b"), discover);
-        assert_eq!(calls.get(), 2, "another repo has its own list");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(dir.path()).expect("canonical");
+        let main = repo.join("main");
+        let wt = repo.join("wt");
+        std::fs::create_dir(&main).expect("mkdir");
+        git(&main, &["init", "-q"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let main = std::fs::canonicalize(&main).expect("canonical");
+        assert!(discover_worktree_roots(&main).is_empty());
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().expect("utf8")],
+        );
+        let second = discover_worktree_roots(&main);
+        assert_eq!(
+            second.len(),
+            1,
+            "the new worktree gets its grant: {second:?}"
+        );
+    }
+
+    /// The launch lists worktrees once and the settings layer uses that same list, rather than
+    /// listing again: whatever roots `default_sandbox_args` found are the ones granted.
+    #[test]
+    fn the_launch_settings_layer_uses_the_worktree_list_it_is_handed() {
+        let roots = [PathBuf::from("/work/wt-a")];
+        assert_eq!(
+            LaunchEnvironment::resolve(&roots).workspace_write_roots,
+            vec![grant_path(&roots[0])]
+        );
+        assert!(
+            LaunchEnvironment::resolve(&[])
+                .workspace_write_roots
+                .is_empty()
+        );
     }
 
     #[test]

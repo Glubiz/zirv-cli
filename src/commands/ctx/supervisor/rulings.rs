@@ -143,6 +143,10 @@ pub(crate) fn parse_reply(
             if after.chars().next().is_some_and(char::is_alphanumeric) {
                 return None;
             }
+            // `Done, but ...` and `Done? No, ...` hedge the verdict; they are not a bare `done`.
+            if verdict == "done" && after.starts_with([',', '?']) {
+                return None;
+            }
             let tail = after
                 .trim_start_matches(|c: char| {
                     is_mark(c) || c.is_whitespace() || ".:,-—–".contains(c)
@@ -515,6 +519,14 @@ mod tests {
             parse("Ruling: not verified. The diff alone is not enough."),
             None
         );
+    }
+
+    #[test]
+    fn a_hedged_done_head_is_not_a_done_ruling() {
+        let parse = |text: &str| parse_reply(RulingKind::Done, text, &opts());
+        assert_eq!(parse("Done, but the tests fail."), None);
+        assert_eq!(parse("Done? No, lint is missing"), None);
+        assert_eq!(parse("Ruling: done, but lint is missing"), None);
     }
 
     #[test]

@@ -446,6 +446,7 @@ mod tests {
     /// hits the ledger the run actually finished on.
     #[test]
     fn a_harness_handover_moves_the_reservation_and_reports_the_final_ledger() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -526,6 +527,7 @@ mod tests {
     /// injected text has switched to the fixed wrap-up instruction.
     #[test]
     fn exec_carries_the_objective_across_a_rot_restart_and_swaps_in_the_wrap_up_text() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -666,6 +668,7 @@ mod tests {
     /// does not depend on the rot scorer's own heuristics to fire on cue.
     #[test]
     fn a_restart_accumulates_spend_instead_of_resetting_the_budget_meter() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");

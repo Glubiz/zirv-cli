@@ -1237,8 +1237,39 @@ pub(crate) fn record_decision_row(
     (ts, session, principal)
 }
 
-/// Append one skip row for `site`. Best-effort like every recorder.
+/// Same (site, reason) skips closer together than this share one row.
+const SKIP_DEDUP_SECS: u64 = 3600;
+/// How much of the skips file's end the dedup check reads.
+const SKIP_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Whether the newest row for (`site`, `reason`) in the file's tail is under [`SKIP_DEDUP_SECS`] old.
+fn skip_recently_recorded(path: &Path, site: &str, reason: &str, now: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = len.saturating_sub(SKIP_TAIL_BYTES);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["site"] == site && row["reason"] == reason)
+        .and_then(|row| row["ts"].as_u64())
+        .is_some_and(|ts| now.saturating_sub(ts) < SKIP_DEDUP_SECS)
+}
+
+/// Append one skip row for `site`, unless the same (site, reason) was recorded within the last
+/// hour. Best-effort like every recorder.
 fn record_skip(state: &StateDir, site: &str, reason: &str) {
+    let path = state.root().join(JEV_SKIPS_FILE);
+    if skip_recently_recorded(&path, site, reason, state::now_secs()) {
+        return;
+    }
     let row = serde_json::json!({
         "site": site,
         "ts": state::now_secs(),
@@ -3788,6 +3819,33 @@ pub(crate) mod tests {
             scoped.sites.is_empty(),
             "the same row is silently excluded from a session-scoped view: {scoped:?}"
         );
+    }
+
+    /// A gated call that keeps skipping for the same reason writes one row an hour, not one per call.
+    #[test]
+    fn record_skip_dedups_a_repeated_site_and_reason_within_the_hour() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let rows = || {
+            std::fs::read_to_string(state.root().join(JEV_SKIPS_FILE))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        record_skip(&state, "memory", "no key");
+        record_skip(&state, "memory", "no key");
+        assert_eq!(rows(), 1, "a repeat inside the hour adds nothing");
+        record_skip(&state, "memory", "other reason");
+        assert_eq!(rows(), 2, "a different reason is its own row");
+
+        let old = state::now_secs() - SKIP_DEDUP_SECS - 1;
+        std::fs::write(
+            state.root().join(JEV_SKIPS_FILE),
+            format!("{{\"site\":\"memory\",\"ts\":{old},\"reason\":\"no key\"}}\n"),
+        )
+        .expect("write");
+        record_skip(&state, "memory", "no key");
+        assert_eq!(rows(), 2, "a repeat after the hour adds a second row");
     }
 
     /// Issue #758: a state dir with neither log file must roll up to empty,

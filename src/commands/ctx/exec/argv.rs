@@ -516,6 +516,7 @@ mod tests {
     /// and the restarted one rot and the budget runs out.
     #[test]
     fn a_rotted_run_is_killed_restarted_and_capped() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -596,6 +597,7 @@ mod tests {
     /// the run would exit 75 instead of 0.
     #[test]
     fn a_restart_supervises_the_new_sessions_transcript() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "88888888-2222-4333-8444-555555555555";
@@ -759,6 +761,7 @@ mod tests {
     /// the session check above rejects every signal the restart produces.
     #[test]
     fn a_restarted_child_is_told_its_own_session_id() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let session = "cccccccc-2222-4333-8444-555555555555";
@@ -883,6 +886,7 @@ mod tests {
 
     #[test]
     fn a_restart_relaunches_with_the_system_prompt_too() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -939,6 +943,7 @@ mod tests {
     /// meaningful regardless of what else shares the log.
     #[test]
     fn a_restart_preserves_the_users_own_extra_flags_not_just_zirvs() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -1007,6 +1012,7 @@ mod tests {
     /// entry must be logged under that id too, not only the first session's.
     #[test]
     fn injection_is_logged_again_for_each_restarts_own_session_id() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");

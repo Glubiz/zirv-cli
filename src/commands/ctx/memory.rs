@@ -4296,8 +4296,9 @@ const CADENCE_Z_THRESHOLD: f64 = 2.0;
 /// or large its writes are -- a human operator doing a deliberate bulk
 /// import is not the "looping worker" shape this signal exists to catch.
 const CADENCE_EXEMPT_WRITER: &str = "operator";
-/// Migration imports write the whole bank in one batch by design.
-const CADENCE_MIGRATION_WRITER: &str = "setup-migration";
+/// Migration imports write the whole bank in one batch by design; `setup-migration` is the older
+/// writer name still present in existing banks, `zirv-setup` the current one.
+const CADENCE_MIGRATION_WRITERS: &[&str] = &["setup-migration", "zirv-setup"];
 /// "This cycle": a burst is over within minutes and `status` is read soon after, so a finding
 /// older than an hour is history, not a signal. `cadence_for_shared` drops older ones.
 const CADENCE_RECENT_SECS: u64 = 3600;
@@ -4379,7 +4380,7 @@ pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
 
     let mut findings = Vec::new();
     for writer in writers {
-        if writer == CADENCE_EXEMPT_WRITER || writer == CADENCE_MIGRATION_WRITER {
+        if writer == CADENCE_EXEMPT_WRITER || CADENCE_MIGRATION_WRITERS.contains(&writer) {
             continue;
         }
         let mut samples: Vec<(u64, usize)> = window
@@ -11190,6 +11191,29 @@ This is part of the body too.\n";
         let mut spiky = migration.clone();
         spiky.push((ts + 1, 90_000, "setup-migration".to_string()));
         assert!(cadence(&spiky).is_empty(), "migration writers are exempt");
+    }
+
+    /// Current setup migrations write as `zirv-setup`; its size spike is exempt like the older name.
+    #[test]
+    fn a_zirv_setup_size_spike_is_not_flagged() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        let mut ts = 1_000u64;
+        for _ in 0..40 {
+            window.push((ts, 200, "zirv-setup".to_string()));
+            ts += 60;
+        }
+        for _ in 0..10 {
+            window.push((ts, 20_000, "zirv-setup".to_string()));
+            ts += 1;
+        }
+        assert!(cadence(&window).is_empty(), "zirv-setup is exempt");
+        for entry in &mut window {
+            entry.2 = "worker-a".to_string();
+        }
+        assert!(
+            !cadence(&window).is_empty(),
+            "the same shape from a worker is flagged"
+        );
     }
 
     #[test]

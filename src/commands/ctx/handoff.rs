@@ -5098,6 +5098,7 @@ mod tests {
     /// #452: with `jev.supervisor` off the verb never asks Jev and keeps the distilled handoff.
     #[test]
     fn the_verb_keeps_the_distilled_handoff_when_the_gate_is_off() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let home = tempfile::tempdir().expect("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let tmp = tempfile::tempdir().expect("tempdir");
