@@ -7171,6 +7171,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn a_harvest_that_returns_nothing_writes_nothing() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7205,6 +7206,7 @@ This is part of the body too.\n";
 
     #[test]
     fn a_distiller_failure_or_timeout_leaves_the_bank_untouched() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7238,6 +7240,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn a_harvested_entry_is_marked_as_coming_from_a_harvest_and_lands_in_the_shared_bank() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7281,6 +7284,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn harvesting_an_existing_key_refreshes_it_rather_than_duplicating_it() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7343,6 +7347,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn a_harvest_skips_a_credential_shaped_line_from_the_model_but_still_writes_the_rest() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7711,6 +7716,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn harvest_screen_off_makes_no_request_even_with_a_warm_cache_entry() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7756,6 +7762,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn harvest_screen_missing_credential_is_the_same_parity_as_gate_off() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -7883,6 +7890,7 @@ This is part of the body too.\n";
     #[cfg(unix)]
     #[test]
     fn harvest_screen_never_asks_or_skips_for_explicit_remember_material() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let repo = crate::commands::ctx::testenv::repo();
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));

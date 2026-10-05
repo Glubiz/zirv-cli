@@ -2233,6 +2233,7 @@ pub(crate) mod tests {
     /// merge, which is exactly what this task's fix restores.
     #[test]
     fn decide_with_the_helper_decider_keeps_baseline_validation_flags() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         // SAFETY (test-only): restored at the end of this test regardless
         // of outcome.
         let had_mode = std::env::var("FAKE_MODEL_MODE").ok();

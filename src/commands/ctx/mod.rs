@@ -307,6 +307,18 @@ pub(crate) mod testenv {
         }
     }
 
+    /// Points `ZIRV_CTX_STATE_DIR` at a fresh temp dir, so a test that reaches a metered helper call
+    /// (`handoff::helper_answer`) writes its delegation row there and never into the real state dir.
+    /// Bind both halves for the test's scope: the `TempDir` must outlive the `VarGuard`.
+    pub(crate) fn isolated_state_dir() -> (tempfile::TempDir, VarGuard) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = VarGuard::set(&[(
+            super::state::STATE_ENV,
+            Some(dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        (dir, guard)
+    }
+
     /// Stubs an executable-named file for every entry in
     /// [`super::adapters::ADAPTERS`] on a fresh, otherwise-empty `PATH`, so
     /// issue #298's liveness probe (`adapters::liveness_probe`) confirms
