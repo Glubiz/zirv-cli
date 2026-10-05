@@ -375,25 +375,8 @@ pub fn clear_released(state: &StateDir, short: &str, env: super::config::EnvLook
 /// The most of a transcript's end a sweep reads: a pending call's result is among its last lines.
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
-/// The last `TRANSCRIPT_TAIL_BYTES` of a file as text; `None` on any read error. A cut first line is dropped.
 pub(crate) fn transcript_tail(path: &std::path::Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(TRANSCRIPT_TAIL_BYTES);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut bytes = Vec::new();
-    file.take(TRANSCRIPT_TAIL_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    if start == 0 {
-        return Some(text);
-    }
-    Some(
-        text.split_once('\n')
-            .map_or_else(String::new, |(_, rest)| rest.to_string()),
-    )
+    super::models::read_transcript_tail(path, TRANSCRIPT_TAIL_BYTES)
 }
 
 /// Whether the transcript's tail shows `request`'s call answered: a `tool_result` for its `tool_use_id`, which

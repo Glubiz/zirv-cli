@@ -495,22 +495,21 @@ fn scan_claude_transcripts(root: &Path, now: u64) -> Vec<RegistryModel> {
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     let mut observations = Vec::new();
     for (_, path) in files.into_iter().take(MAX_TRANSCRIPTS) {
-        if let Some(text) = read_transcript_tail(&path) {
+        if let Some(text) = read_transcript_tail(&path, MAX_TRANSCRIPT_BYTES) {
             observations.extend(parse_claude_transcript(&text, now));
         }
     }
     observations
 }
 
-/// The last `MAX_TRANSCRIPT_BYTES` of a transcript as text. A seek can land inside a multibyte
+/// The last `max_bytes` of a transcript as text. A seek can land inside a multibyte
 /// character, so the bytes are decoded lossily and the first (partial) line is dropped.
-fn read_transcript_tail(path: &Path) -> Option<String> {
+pub(crate) fn read_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let truncated = len > MAX_TRANSCRIPT_BYTES;
+    let truncated = len > max_bytes;
     if truncated {
-        file.seek(std::io::SeekFrom::Start(len - MAX_TRANSCRIPT_BYTES))
-            .ok()?;
+        file.seek(std::io::SeekFrom::Start(len - max_bytes)).ok()?;
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
@@ -1289,7 +1288,7 @@ mod tests {
             content = format!("{filler}\n{line} \n");
         }
         std::fs::write(&path, content).expect("write");
-        let text = read_transcript_tail(&path).expect("tail");
+        let text = read_transcript_tail(&path, MAX_TRANSCRIPT_BYTES).expect("tail");
         assert_eq!(text.trim(), line);
         assert_eq!(parse_claude_transcript(&text, 1).len(), 1);
     }
