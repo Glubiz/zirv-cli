@@ -53,6 +53,9 @@ frontend-debug	debug	There is a visual bug in the frontend UI: the modal overflo
 frontend-test	test	Test the frontend UI for accessibility and state coverage.
 frontend-review	review	Review the rendered frontend UI; do the visual QA.
 frontend-verify	verify	Verify the frontend UI change is complete with fresh render evidence.
+fuck-around-and-find-out	-	Try competing approaches to reduce startup latency; measure against the baseline and share what each experiment proves.
+fuck-around-and-find-out	-	Fuck around and find out how to reach our common goal.
+fuck-around-and-find-out	-	FAFO until we know which approach is viable.
 # Negatives: nothing should be suggested for these.
 -	-	What time zone does the server log in?
 -	-	Rename the variable foo to bar in utils.

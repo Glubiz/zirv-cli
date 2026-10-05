@@ -2940,7 +2940,7 @@ shell -- records one `SkillActivated` event: `skill_id`, `skill_version`,
 `skill_content_hash`, `skill_source`, and `skill_surface` (`native-tool`,
 `mcp`, or `cli`). A refusal records nothing.
 
-**Catalogue.** 28 professional-domain skills ship as portable bundles under
+**Catalogue.** 29 professional-domain skills ship as portable bundles under
 `src/commands/workflow/skills/`, parsed through the identical loader a
 custom bundle uses, alongside the original 24 flat, in-binary built-ins
 (`brainstorm`, `write-plan`, `review`, the `frontend-*` family, and so on)
@@ -2958,6 +2958,24 @@ this README's earlier paragraphs already describe.
 | Docs | `technical-documentation` | none | no |
 | Code quality | `dependency-risk-review`, `simplify` | none | no |
 | Media | `motion-graphics` | none | no |
+| Experimentation | `fuck-around-and-find-out` | none | no |
+
+Use **fuck around and find out** (`fafo`) when the goal is clear but the path
+is uncertain. The orchestrator and agents run small, bounded experiments,
+share successful and failed findings, and converge on validated progress.
+The skill sets a shared goal, baseline, experiment budget, and stop conditions;
+it works sequentially or with independent agents and grants no extra permissions.
+The table's Writes column refers to external integration writes; local
+experimental changes still require the corresponding capabilities and authority.
+
+```bash
+zirv skill list --match "fafo"
+zirv skill load fuck-around-and-find-out
+```
+
+For example: "Fuck around and find out how to reduce startup time while
+keeping behavior unchanged. Compare against the current baseline and share
+what each experiment proves."
 
 **Contributing a built-in skill.** The catalogue's tests and the loader's own
 parse-time checks enforce:
