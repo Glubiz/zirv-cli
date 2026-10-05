@@ -83,6 +83,19 @@ fn binds(verdict: &str) -> bool {
     matches!(verdict, "revise" | "not_done" | "stop")
 }
 
+/// Helpers drift into markdown (`**Choice: 2 — why.**`): tolerate emphasis marks and case.
+fn is_mark(c: char) -> bool {
+    matches!(c, '*' | '_' | '`')
+}
+
+/// What follows a case-insensitive `label` at the start of `head`, without leading marks/spaces.
+fn after_label<'a>(head: &'a str, label: &str) -> Option<&'a str> {
+    let (start, rest) = (head.get(..label.len())?, head.get(label.len()..)?);
+    start
+        .eq_ignore_ascii_case(label)
+        .then(|| rest.trim_start_matches(|c: char| is_mark(c) || c == ' '))
+}
+
 /// Parse one kind's strict reply into `(verdict, reason)`. Anything unparseable is `None`.
 /// For a choice the verdict is the chosen option's own text.
 pub(crate) fn parse_reply(
@@ -97,8 +110,6 @@ pub(crate) fn parse_reply(
         .map_or(reply, |rest| rest.trim_start());
     let (head, rest) = reply.split_once('\n').unwrap_or((reply, ""));
     let (head, rest) = (head.trim(), rest.trim());
-    // Helpers drift into markdown (`**Choice: 2 — why.**`): tolerate emphasis marks and case.
-    let is_mark = |c: char| matches!(c, '*' | '_' | '`');
     let pair = |good: &str, good_verdict: &str, bad: &str, bad_verdict: &str| {
         if head == good {
             return Some((good_verdict.to_string(), rest.to_string()));
@@ -117,12 +128,7 @@ pub(crate) fn parse_reply(
             // The helper echoes the prompt's `Ruling:` label and writes the verdict as prose
             // (`Ruling: not done <why>`): accept the label, case and trailing text on the head.
             let head = head.trim_matches(is_mark);
-            let head = head
-                .get(..7)
-                .filter(|label| label.eq_ignore_ascii_case("RULING:"))
-                .map_or(head, |_| {
-                    head[7..].trim_start_matches(|c: char| is_mark(c) || c == ' ')
-                });
+            let head = after_label(head, "RULING:").unwrap_or(head);
             let lower = head.to_ascii_lowercase();
             let strip = |words: &[&str]| {
                 words
@@ -153,10 +159,7 @@ pub(crate) fn parse_reply(
         RulingKind::Choice => {
             // Tolerate prose after the number, but never guess a number that is not there.
             let head = head.trim_matches(is_mark);
-            let after = head
-                .get(..7)
-                .filter(|label| label.eq_ignore_ascii_case("CHOICE:"))
-                .map(|_| head[7..].trim_start_matches(|c: char| is_mark(c) || c == ' '))?;
+            let after = after_label(head, "CHOICE:")?;
             let digits = after
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(after.len());

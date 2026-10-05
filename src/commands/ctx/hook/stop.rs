@@ -162,9 +162,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // A main-thread turn boundary ends the main thread's prompts only: a native subagent shares
         // the session and its dialog may still be waiting. Closing them and clearing their latch
         // share one lock, so a dialog confirmed meanwhile cannot outlive its entry (#864).
+        let attention_short = super::permission::attention_short(env, &payload.session_id);
         crate::commands::ctx::attention::resolve_prompts(
             &state,
-            &super::permission::attention_short(env, &payload.session_id),
+            &attention_short,
             |open| open.agent.is_empty(),
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
@@ -177,7 +178,6 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         );
         // Stop marks the Working-to-Settled boundary and clears stale attention
         // from lower-ranked authorities (#349), unless a subagent dialog still holds the latch.
-        let attention_short = super::permission::attention_short(env, &payload.session_id);
         let mut settled = crate::commands::ctx::attention::Observation::new(
             crate::commands::ctx::attention::Authority::AdapterHook,
             "turn completed cleanly",
@@ -190,11 +190,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         }
         let _ =
             crate::commands::ctx::attention::record(&state, &attention_short, settled, now_secs());
-        crate::commands::ctx::approvals::clear_released(
-            &state,
-            &super::permission::attention_short(env, &payload.session_id),
-            env,
-        );
+        crate::commands::ctx::approvals::clear_released(&state, &attention_short, env);
         // A fresh process every turn has nothing to compare a repeated
         // summary against, and no `Announcer` of its own -- the decision-
         // log line above already covers this turn's own finding, so

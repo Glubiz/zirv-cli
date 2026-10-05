@@ -1442,10 +1442,11 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     let text = compiled.composed.as_ref().map_or("", |c| c.text.as_str());
     for layer in compiled.emitted_layers() {
         let label = match layer.source {
-            PromptSource::Adapter | PromptSource::Workflow | PromptSource::Mail => {
-                layer.source.label()
-            }
-            PromptSource::SkillPointer | PromptSource::SkillDescriptions => layer.source.label(),
+            PromptSource::Adapter
+            | PromptSource::Workflow
+            | PromptSource::Mail
+            | PromptSource::SkillPointer
+            | PromptSource::SkillDescriptions => layer.source.label(),
             _ => continue,
         };
         let layer_text = &text[layer.range.clone()];
