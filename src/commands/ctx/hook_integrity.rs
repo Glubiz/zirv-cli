@@ -185,6 +185,10 @@ pub(crate) fn record_baseline(
     }
     let mut baseline = Baseline::load(state);
     let target_key = target.to_string_lossy().to_string();
+    // Settings files that no longer exist (a test's tempdir, a removed config) leave dead targets.
+    baseline
+        .targets
+        .retain(|key, _| *key == target_key || Path::new(key).exists());
     for (event, matcher, command) in written {
         baseline.set(&target_key, event, *matcher, command);
     }
@@ -1193,6 +1197,34 @@ mod tests {
         assert_eq!(
             baseline.get("/some/settings.json", "Stop", None),
             Some(sha256_hex("zirv ctx hook stop")).as_deref()
+        );
+    }
+
+    #[test]
+    fn record_baseline_drops_targets_whose_settings_file_is_gone() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let state = state_at(dir.path());
+        let gone = dir.path().join("gone-settings.json");
+        let kept = dir.path().join("kept-settings.json");
+        let current = dir.path().join("current-settings.json");
+        std::fs::write(&gone, "{}").expect("write");
+        std::fs::write(&kept, "{}").expect("write");
+        record_baseline(&state, &gone, &[CURRENT]).expect("record gone");
+        record_baseline(&state, &kept, &[CURRENT]).expect("record kept");
+        std::fs::remove_file(&gone).expect("remove");
+
+        record_baseline(&state, &current, &[CURRENT]).expect("record current");
+        let baseline = Baseline::load(&state);
+        assert_eq!(baseline.get(&gone.to_string_lossy(), "Stop", None), None);
+        assert!(
+            baseline
+                .get(&kept.to_string_lossy(), "Stop", None)
+                .is_some()
+        );
+        assert!(
+            baseline
+                .get(&current.to_string_lossy(), "Stop", None)
+                .is_some()
         );
     }
 
