@@ -1952,9 +1952,43 @@ fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
     let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
         return Vec::new();
     };
+    memoized_worktree_roots(&canonical_repo, || discover_worktree_roots(&canonical_repo))
+}
+
+/// How long one launch's worktree list is reused. Short on purpose: a dashboard that creates a
+/// worktree and then launches a worker must see the new worktree, but the two probes of ONE launch
+/// (`LaunchEnvironment::resolve` and `default_sandbox_args`) land milliseconds apart.
+const WORKTREE_MEMO_TTL: Duration = Duration::from_secs(5);
+
+type WorktreeMemo = Mutex<HashMap<PathBuf, (Instant, Vec<PathBuf>)>>;
+static WORKTREE_MEMO: OnceLock<WorktreeMemo> = OnceLock::new();
+
+fn memoized_worktree_roots(
+    canonical_repo: &Path,
+    discover: impl FnOnce() -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let memo = WORKTREE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = memo.lock()
+        && let Some((at, roots)) = map.get(canonical_repo)
+        && at.elapsed() < WORKTREE_MEMO_TTL
+    {
+        return roots.clone();
+    }
+    let roots = discover();
+    if let Ok(mut map) = memo.lock() {
+        map.insert(
+            canonical_repo.to_path_buf(),
+            (Instant::now(), roots.clone()),
+        );
+    }
+    roots
+}
+
+#[cfg(not(test))]
+fn discover_worktree_roots(canonical_repo: &Path) -> Vec<PathBuf> {
     let Ok(mut child) = Command::new("git")
         .arg("-C")
-        .arg(&canonical_repo)
+        .arg(canonical_repo)
         .args(["worktree", "list", "--porcelain"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1984,7 +2018,7 @@ fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
                 let worktrees = parse_worktree_porcelain(&output)
                     .into_iter()
                     .filter_map(|path| std::fs::canonicalize(path).ok());
-                return additional_worktree_roots(&canonical_repo, worktrees);
+                return additional_worktree_roots(canonical_repo, worktrees);
             }
             Ok(Some(_)) => return Vec::new(),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -2032,9 +2066,74 @@ fn probe_system_prompt_file_support(program: &str, bin_args: &[String]) -> bool 
     if let Some(cached) = map.get(&key) {
         return *cached;
     }
-    let detected = detect_help_flag(program, bin_args);
+    #[cfg(not(test))]
+    let state =
+        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok();
+    #[cfg(test)]
+    let state = None;
+    let detected = cached_help_support(state.as_ref(), program, bin_args, || {
+        detect_help_flag(program, bin_args)
+    });
     map.insert(key, detected);
     detected
+}
+
+/// Names the exact binary a help probe ran against -- path, mtime and size, plus the same for any
+/// file among `bin_args` (`node cli.js`) -- so an upgraded binary never inherits an old answer.
+fn help_probe_disk_key(program: &str, bin_args: &[String]) -> Option<String> {
+    let binary = if program.contains(['/', '\\']) {
+        PathBuf::from(program)
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())?
+    };
+    let stamp = |path: &Path| -> Option<String> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!(
+            "{}:{}:{}",
+            path.display(),
+            mtime.as_nanos(),
+            meta.len()
+        ))
+    };
+    let mut key = stamp(&binary)?;
+    for arg in bin_args {
+        key.push('\u{2}');
+        key.push_str(&stamp(Path::new(arg)).unwrap_or_else(|| arg.clone()));
+    }
+    Some(key)
+}
+
+/// Persists a positive `--help` probe through the shared probe cache (a 1 h TTL, keyed on the
+/// binary's identity), so later launches skip the ~70 ms spawn. Only "supported" is stored: a
+/// timeout or a missing binary reads as unsupported and must be looked at again.
+fn cached_help_support(
+    state: Option<&super::super::state::StateDir>,
+    program: &str,
+    bin_args: &[String],
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    use super::probe::Liveness;
+
+    let (Some(state), Some(key)) = (state, help_probe_disk_key(program, bin_args)) else {
+        return probe();
+    };
+    let mut cache = super::ProbeCache::load(state, "claude-help", super::super::state::now_secs());
+    let verdict = cache.get_or_probe(&key, || {
+        if probe() {
+            Liveness::Live
+        } else {
+            Liveness::Unknown(String::new())
+        }
+    });
+    cache.save();
+    matches!(verdict, Liveness::Live)
 }
 
 /// Verified against the real CLI (`claude --help`, v2.1.220): the flag is not
@@ -2612,8 +2711,8 @@ impl AgentAdapter for ClaudeAdapter {
     ) -> Vec<String> {
         // Issue #504: computed once, up front, so the SAME bounded worktree
         // set both widens the interactive Edit/Read allow-list below AND
-        // becomes the `--add-dir` argv at the end -- one git worktree probe,
-        // not two independently-computed (and possibly drifting) ones.
+        // becomes the `--add-dir` argv at the end. `LaunchEnvironment::resolve` asks for the same
+        // list; `linked_worktree_roots` memoizes it so a launch spawns git once.
         let worktree_grant_paths = current_worktree_grant_paths();
 
         // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
@@ -7199,6 +7298,61 @@ mod tests {
             !probe_system_prompt_file_support("sh", &[unsupported.display().to_string()]),
             "the non-supporting script must get its own answer, not the cached true from above"
         );
+    }
+
+    #[test]
+    fn a_second_worktree_list_for_the_same_repo_does_not_respawn_git() {
+        let repo = PathBuf::from("/memo-test/repo-a");
+        let calls = std::cell::Cell::new(0);
+        let discover = || {
+            calls.set(calls.get() + 1);
+            vec![PathBuf::from("/memo-test/wt")]
+        };
+        let first = memoized_worktree_roots(&repo, discover);
+        let second = memoized_worktree_roots(&repo, discover);
+        assert_eq!(first, second);
+        assert_eq!(calls.get(), 1, "the second launch step reuses the list");
+        memoized_worktree_roots(Path::new("/memo-test/repo-b"), discover);
+        assert_eq!(calls.get(), 2, "another repo has its own list");
+    }
+
+    #[test]
+    fn the_help_probe_is_cached_on_disk_per_binary_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = super::super::super::state::StateDir::from_root(dir.path().join("state"));
+        let binary = dir.path().join("claude");
+        std::fs::write(&binary, "v1").expect("write");
+        let program = binary.display().to_string();
+        let calls = std::cell::Cell::new(0);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert_eq!(calls.get(), 1, "an unchanged binary is probed once");
+
+        std::fs::write(&binary, "version 2, different size").expect("rewrite");
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert_eq!(calls.get(), 2, "a changed binary is probed again");
+
+        let unsupported = || {
+            calls.set(calls.get() + 1);
+            false
+        };
+        assert!(!cached_help_support(
+            Some(&state),
+            &program,
+            &["x".into()],
+            unsupported
+        ));
+        assert!(!cached_help_support(
+            Some(&state),
+            &program,
+            &["x".into()],
+            unsupported
+        ));
+        assert_eq!(calls.get(), 4, "an unsupported answer is never frozen");
     }
 
     #[test]
