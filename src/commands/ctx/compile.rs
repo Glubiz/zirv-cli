@@ -1163,6 +1163,38 @@ pub fn compile_with_harness_roster(
     mode: super::adapters::LaunchMode,
     log_truncation: bool,
 ) -> CompiledContext {
+    compile_with_launch_flags(
+        home,
+        repo,
+        simple,
+        cfg,
+        adapter,
+        role,
+        state,
+        now,
+        include_harness_roster,
+        mode,
+        log_truncation,
+        &[],
+    )
+}
+
+/// `launch_flags` are the flags the launch will carry: the prompt drops its skill list only when they let the host list the skills itself.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_launch_flags(
+    home: Option<&Path>,
+    repo: &Path,
+    simple: bool,
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    state: &StateDir,
+    now: u64,
+    include_harness_roster: bool,
+    mode: super::adapters::LaunchMode,
+    log_truncation: bool,
+    launch_flags: &[String],
+) -> CompiledContext {
     let slug = super::state::repo_slug(repo);
     let (memory_entries, retrieved_memory) = gather_memory(state, repo, &slug, cfg, now);
     let core_memory = prompt::memory_injection_summary(&memory_entries, cfg.memory.core_max_bytes);
@@ -1183,7 +1215,7 @@ pub fn compile_with_harness_roster(
     let harness_lines = harness_report.lines;
 
     let prompt_cfg = super::config::PromptConfig {
-        skill_index_native: adapter.lists_skills_natively(role),
+        skill_index_native: adapter.lists_skills_natively(role, launch_flags),
         ..cfg.prompt.clone()
     };
     let composed = prompt::compose(

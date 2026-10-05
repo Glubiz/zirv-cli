@@ -850,7 +850,15 @@ pub(super) fn skill_index_text(
     home: Option<&Path>,
     filter_by_repo_signal: bool,
 ) -> Option<String> {
-    let lines = skill_index_entries(repo, home, filter_by_repo_signal)?
+    Some(format_skill_index(skill_index_entries(
+        repo,
+        home,
+        filter_by_repo_signal,
+    )?))
+}
+
+fn format_skill_index(entries: Vec<(String, String, bool)>) -> String {
+    entries
         .into_iter()
         .map(|(id, summary, repository)| {
             if repository {
@@ -859,8 +867,21 @@ pub(super) fn skill_index_text(
                 format!("- {id}: {summary}")
             }
         })
-        .collect::<Vec<_>>();
-    Some(lines.join("\n"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The index lines the host's native listing lacks: its plugin registers only built-in and operator skills, never repository ones.
+fn skill_index_text_beyond_plugin(
+    repo: &Path,
+    home: Option<&Path>,
+    filter_by_repo_signal: bool,
+) -> Option<String> {
+    let entries: Vec<_> = skill_index_entries(repo, home, filter_by_repo_signal)?
+        .into_iter()
+        .filter(|(_, _, repository)| *repository)
+        .collect();
+    (!entries.is_empty()).then(|| format_skill_index(entries))
 }
 
 pub(super) fn skill_index_entries(
@@ -1083,10 +1104,19 @@ pub fn compose(
     // Task-independent discovery belongs in the stable prefix; Worker/Single use a compact pointer (#539).
     // Disabling the layer leaves skills loadable by command.
     if cfg.skill_index {
-        if matches!(role, PromptRole::Worker | PromptRole::Single) || cfg.skill_index_native {
+        let pointer_only = matches!(role, PromptRole::Worker | PromptRole::Single);
+        if pointer_only || cfg.skill_index_native {
             text.push_str(SKILL_POINTER_LAYER);
             sources.push(PromptSource::SkillPointer);
-        } else if let Some(index) = skill_index_text(repo, home, cfg.skill_index_repo_filter) {
+        }
+        let index = if pointer_only {
+            None
+        } else if cfg.skill_index_native {
+            skill_index_text_beyond_plugin(repo, home, cfg.skill_index_repo_filter)
+        } else {
+            skill_index_text(repo, home, cfg.skill_index_repo_filter)
+        };
+        if let Some(index) = index {
             text.push_str(SKILL_INDEX_HEADER);
             text.push_str(&index);
             sources.push(PromptSource::SkillIndex);
@@ -2945,6 +2975,44 @@ mod tests {
             "got {}",
             composed.text
         );
+    }
+
+    /// The host's native plugin never registers repository skills, so a pointer-only seat
+    /// must still see them in the index, and only them.
+    #[test]
+    fn a_native_host_seat_still_lists_the_repository_skills_its_plugin_lacks() {
+        let (_tmp, home, repo) = tree();
+        let skills = repo.join(".zirv/skills");
+        std::fs::create_dir_all(&skills).expect("mkdir");
+        std::fs::write(
+            skills.join("fixture.yaml"),
+            "schema_version: 1\nid: repo-index-fixture\nversion: 1\nname: Repo fixture\n\
+             description: repository owned\ncontext_budget_bytes: 64\nphases: [implement]\n\
+             instructions: do the thing\n",
+        )
+        .expect("write fixture");
+        let cfg = PromptConfig {
+            skill_index_native: true,
+            ..PromptConfig::default()
+        };
+        let composed = compose(
+            Some(&home),
+            &repo,
+            false,
+            &cfg,
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+        let index = extract_between(&composed.text, SKILL_INDEX_HEADER, "\n\n---");
+        assert_eq!(
+            index, "- repo-index-fixture: repository owned (repository-untrusted)",
+            "got {}",
+            composed.text
+        );
+        assert!(composed.text.contains(SKILL_POINTER_LAYER));
     }
 
     /// The index is metadata only -- no built-in skill's own instruction-body
