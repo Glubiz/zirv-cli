@@ -844,6 +844,12 @@ fn frame(ruling: &Ruling) -> String {
     )
 }
 
+/// How much of a reply that failed to parse the decision log keeps.
+const UNPARSEABLE_EXCERPT_BYTES: usize = 1024;
+
+/// Detail cap: the reply excerpt plus its fixed prefix.
+const FALLBACK_DETAIL_BYTES: usize = UNPARSEABLE_EXCERPT_BYTES + 100;
+
 fn log_fallback(state: &StateDir, session: &str, detail: &str) {
     let _ = log::append(
         state,
@@ -854,7 +860,7 @@ fn log_fallback(state: &StateDir, session: &str, detail: &str) {
             verdict: "error",
             score: 0,
             action: "fallback",
-            detail: &crate::utils::truncate_bytes(detail.to_string(), Some(300)),
+            detail: &crate::utils::truncate_bytes(detail.to_string(), Some(FALLBACK_DETAIL_BYTES)),
             observed_at: None,
         },
     );
@@ -895,10 +901,16 @@ fn rule_with(
     *tokens = (prompt.len() / 4) as u64;
     let report = run_helper(&prompt)?;
     let Some((verdict, reason)) = rulings::parse_reply(kind, &report, &options) else {
-        let reply = crate::utils::truncate_bytes(
-            super::snapshot::redact_text(&report),
-            Some(cfg.supervisor.max_advice_bytes),
-        );
+        // One line, so the decision log stays greppable; empty replies are named, not blank.
+        let reply = super::snapshot::redact_text(&report)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let reply = if reply.is_empty() {
+            "(empty reply)".to_string()
+        } else {
+            crate::utils::truncate_bytes(reply, Some(UNPARSEABLE_EXCERPT_BYTES))
+        };
         log_fallback(
             state,
             session,
@@ -1895,6 +1907,46 @@ mod tests {
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(log.contains("unparseable done reply"), "{log}");
         assert!(log.contains("NO_ADVICE"), "the reply is logged: {log}");
+    }
+
+    /// A reply that fails to parse must stay diagnosable: a single-line excerpt of up to 1 KiB,
+    /// and a marker when the helper said nothing at all.
+    #[test]
+    fn an_unparseable_reply_logs_a_bounded_single_line_excerpt() {
+        let detail_of = |reply: &str| -> String {
+            let (_dir, state) = fresh_state();
+            let mut tokens = 0u64;
+            let outcome = rule_with(
+                &state,
+                &enabled_cfg(),
+                RulingKind::Choice,
+                "s1",
+                Path::new("."),
+                None,
+                "evidence",
+                &["a".to_string(), "b".to_string()],
+                &mut tokens,
+                &|_| Ok(reply.to_string()),
+            );
+            assert!(matches!(outcome, Ok(None)));
+            let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+            let row: serde_json::Value =
+                serde_json::from_str(log.lines().next().expect("row")).expect("json");
+            row["detail"].as_str().expect("detail").to_string()
+        };
+        let body = (0..600)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = detail_of(&format!("Line one\n{body}\nTail"));
+        assert!(!detail.contains('\n'), "{detail}");
+        assert!(detail.contains("Line one w0 w1"), "{detail}");
+        assert!(
+            (900..=1200).contains(&detail.len()),
+            "excerpt is bounded near 1 KiB: {}",
+            detail.len()
+        );
+        assert!(detail_of("").contains("(empty reply)"));
     }
 
     #[test]
