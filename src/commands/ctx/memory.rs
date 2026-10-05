@@ -2829,8 +2829,7 @@ fn write_durable(
 // A conservative, operator-gated advisory that may skip an optional
 // generation call outright -- the durable-harvest distiller itself, or, at
 // a clean session exit, the handoff distillation that exists solely to feed
-// it (`distill_or_structural`'s own doc comment names "the memory-harvest
-// note" among its non-restart callers, so skipping it here is exactly as
+// it (no session restarts onto that note, so skipping it here is exactly as
 // safe as skipping the helper call it feeds). Only ever narrows: a decisive
 // "no new durable knowledge" answer skips generation, everything else --
 // disabled, missing credential, an uncertain/partial/failed answer, or any
@@ -3250,9 +3249,7 @@ pub fn harvest_at_session_end(
         return Ok(0);
     }
     // Screens the clean-exit distillation itself, not just the helper call it feeds -- safe
-    // because this call exists solely to build `note` below (see `distill_or_structural`'s
-    // own doc comment naming "the memory-harvest note" among its non-restart callers,
-    // unlike the genuinely restart-bound `wrap::pump` call site) (#742).
+    // because this call exists solely to build `note` below; no session restarts onto it (#742).
     if jev_harvest_prescreen(
         ctx.user_messages
             .iter()
@@ -3276,7 +3273,9 @@ pub fn harvest_at_session_end(
         .ok()
         .flatten()
         .map(|(_, handoff)| handoff);
-    let (note, source) = super::handoff::distill_or_structural(
+    let (note, source) = super::handoff::distill_or_structural_with_jev(
+        cfg,
+        state,
         adapter,
         model,
         ctx,

@@ -1512,13 +1512,10 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
     handoff_thin_action(answers.get("quality"), min_confidence, min_margin) == "demote"
 }
 
-/// The gated wrapper around [`distill_or_structural`] for
-/// the one call site that is genuinely on the restart path (`wrap::pump`'s
-/// own `Action::Restart` handling) -- threading `cfg`/`state` into
-/// `distill_or_structural` itself (or into `Handoff::is_usable`) would mean
-/// touching every one of its other call sites (dash/handover previews, the
-/// memory-harvest note, `zirv ctx handoff` itself), most of which are not
-/// actually about to restart a session onto the result. When
+/// The gated wrapper around [`distill_or_structural`] every stored or delivered handoff goes
+/// through: wrap restarts and handover swaps, exec restarts, dashboard pane rollovers, the
+/// memory-harvest note and `zirv ctx handoff`. Only the read-only `zirv ctx handover --dry-run`
+/// preview keeps the plain call, so a preview never spends a Jev call or writes a row. When
 /// `distill_or_structural` returns a genuinely `"distilled"` handoff, one
 /// additional confident [`jev_handoff_is_thin`] verdict may demote it to the
 /// same structural fallback an `Err` from `distill` itself already takes;
@@ -2440,7 +2437,9 @@ pub fn run_with<W: Write>(
             "structural",
         )
     } else {
-        distill_or_structural(
+        distill_or_structural_with_jev(
+            &cfg,
+            &state,
             adapter.as_ref(),
             &resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
             &ctx,
@@ -4909,6 +4908,97 @@ mod tests {
             text.contains("Ship the webhook"),
             "the distilled task: {text}"
         );
+    }
+
+    /// `zirv ctx handoff --stdout` with a fake distiller and the given `[jev]`/endpoint env.
+    fn verb_handoff_markdown(tmp: &std::path::Path, jev_env: &[(&str, String)]) -> String {
+        let transcript = transcript_with(tmp, "ship the webhook");
+        let mut env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.join("state").display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                format!("sh {}", fixture("fake-model.sh").display()),
+            ),
+        ]
+        .into();
+        env.extend(jev_env.iter().map(|(k, v)| (k.to_string(), v.clone())));
+        let args = HandoffArgs {
+            transcript,
+            agent: None,
+            session_id: None,
+            stdout: true,
+            no_model: false,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp, &|k| env.get(k).cloned()).expect("runs");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// #452: a non-wrap path (`zirv ctx handoff`, like exec restarts and pane rollovers) reaches
+    /// the Jev thin check, so a decisive "thin" verdict demotes the distilled handoff.
+    #[test]
+    fn the_verb_demotes_a_handoff_jev_rules_thin() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "thin",
+                        "probabilities": {"thin": 0.95, "adequate": 0.05}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_VERB_452";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let text = verb_handoff_markdown(
+            tmp.path(),
+            &[
+                ("ZIRV_CTX_JEV_SUPERVISOR", "true".to_string()),
+                ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", url),
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+                    credential_env.to_string(),
+                ),
+            ],
+        );
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(
+            text.contains("ship the webhook") && !text.contains("Ship the webhook"),
+            "demoted to the structural task: {text}"
+        );
+        handle.join().expect("server thread must not panic");
+        let decisions =
+            std::fs::read_to_string(tmp.path().join("state/jev-decisions.jsonl")).expect("row");
+        assert!(decisions.contains("\"site\":\"handoff\""), "{decisions}");
+    }
+
+    /// #452: with `jev.supervisor` off the verb never asks Jev and keeps the distilled handoff.
+    #[test]
+    fn the_verb_keeps_the_distilled_handoff_when_the_gate_is_off() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let credential_env = "HANDOFF_TEST_JEV_VERB_OFF_452";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let text = verb_handoff_markdown(
+            tmp.path(),
+            &[
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
+                    "http://127.0.0.1:9".to_string(),
+                ),
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+                    credential_env.to_string(),
+                ),
+            ],
+        );
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(text.contains("Ship the webhook"), "distilled task: {text}");
+        assert!(!tmp.path().join("state/jev-decisions.jsonl").exists());
     }
 
     #[test]
