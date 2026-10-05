@@ -12,6 +12,10 @@ use super::state::{WorkflowState, load_active_for_session, load_from_path, repo_
 /// A workflow with no completed step is stale after this much idle time even when its session looks alive.
 pub const STALE_WORKFLOW_SECS: u64 = 3 * 24 * 60 * 60;
 
+/// The asking session's own unadvanced workflow is reported only after this much idle time, so a
+/// workflow auto-started seconds ago is not flagged.
+pub const OWN_WORKFLOW_IDLE_SECS: u64 = 60 * 60;
+
 /// Identity of what a session was last shown: workflow, step index and status.
 pub fn step_marker(state: &WorkflowState) -> String {
     format!("{}:{}:{:?}", state.id, state.current_step, state.status)
@@ -104,7 +108,8 @@ pub struct AbandonedWorkflow {
 
 /// This repo's in-flight workflows with zero completed steps that are abandoned: bound to a session
 /// that has ended, or idle for [`STALE_WORKFLOW_SECS`]. `current_session` (a short id) is reported
-/// with `this_session` set whenever its own workflow has not advanced. Read-only.
+/// with `this_session` once its own workflow has been idle for [`OWN_WORKFLOW_IDLE_SECS`]. A workflow
+/// several sessions are bound to is abandoned by session only when none of them is live. Read-only.
 pub fn abandoned_workflows(
     state_dir: &StateDir,
     repo: &Path,
@@ -135,10 +140,11 @@ pub fn abandoned_workflows(
         {
             continue;
         }
-        let owner = bindings
+        let owners: Vec<&str> = bindings
             .iter()
-            .find(|(_, bound)| *bound == state.id)
-            .map(|(short, _)| short.as_str());
+            .filter(|(_, bound)| *bound == state.id)
+            .map(|(short, _)| short.as_str())
+            .collect();
         let idle = now.saturating_sub(state.updated_at);
         let stale = idle >= STALE_WORKFLOW_SECS;
         let days = idle / 86_400;
@@ -148,14 +154,21 @@ pub fn abandoned_workflows(
             brief,
             this_session,
         };
-        if owner.is_some() && owner == current_session {
-            found.push(item(
-                "this session, not advanced".to_string(),
-                "this session, not advanced".to_string(),
-                true,
-            ));
-        } else if let Some(short) = owner
-            && !crate::commands::ctx::sessions::short_is_live(state_dir, short)
+        let dead_owner = owners
+            .iter()
+            .find(|short| !crate::commands::ctx::sessions::short_is_live(state_dir, short));
+        if current_session.is_some_and(|me| owners.contains(&me)) {
+            if idle >= OWN_WORKFLOW_IDLE_SECS {
+                found.push(item(
+                    "this session, not advanced".to_string(),
+                    "this session, not advanced".to_string(),
+                    true,
+                ));
+            }
+        } else if let Some(short) = dead_owner
+            && owners
+                .iter()
+                .all(|short| !crate::commands::ctx::sessions::short_is_live(state_dir, short))
         {
             found.push(item(
                 format!("abandoned: session {short} ended without advancing"),
@@ -303,8 +316,43 @@ mod tests {
         assert!(found[1].reason.starts_with("stale: no advance in"));
 
         // The asking session's own unadvanced workflow is reported but flagged.
-        let own = abandoned_workflows(&store, repo.path(), Some(&short_id(live_session)), now)
-            .expect("scan");
+        let own = abandoned_workflows(
+            &store,
+            repo.path(),
+            Some(&short_id(live_session)),
+            now + OWN_WORKFLOW_IDLE_SECS,
+        )
+        .expect("scan");
         assert!(own.iter().any(|w| w.id == "w-live" && w.this_session));
+
+        // Fresh (seconds old) own workflow is not reported.
+        let fresh_own =
+            abandoned_workflows(&store, repo.path(), Some(&short_id(live_session)), now)
+                .expect("scan");
+        assert!(!fresh_own.iter().any(|w| w.id == "w-live"), "{fresh_own:?}");
+    }
+
+    #[test]
+    fn a_workflow_shared_with_a_live_session_is_not_abandoned_by_a_dead_one() {
+        let state_dir = tempdir().expect("state");
+        let store = StateDir::from_root(state_dir.path().to_path_buf());
+        let repo = tempdir().expect("repo");
+        let mut shared = fresh(repo.path());
+        shared.id = "w-shared".into();
+        save(&store, &shared, false).expect("save");
+        let mut record = Record::new("deaddead00000000", "claude", repo.path(), Verb::Chat);
+        record.pid = 4_200_000;
+        record.start_time = None;
+        let _dead = SessionGuard::register(&store, record);
+        bind_workflow_id(&store, &short_id("deaddead00000000"), &shared.id);
+        let _live = SessionGuard::register(
+            &store,
+            Record::new("livelive00000000", "claude", repo.path(), Verb::Chat),
+        );
+        bind_workflow_id(&store, &short_id("livelive00000000"), &shared.id);
+
+        let found =
+            abandoned_workflows(&store, repo.path(), None, shared.updated_at + 10).expect("scan");
+        assert!(found.is_empty(), "{found:?}");
     }
 }

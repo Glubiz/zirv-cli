@@ -352,17 +352,29 @@ pub(crate) fn run_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A descendant holding a pipe open must not read as a successful empty output.
                 let grace = std::time::Duration::from_secs(1);
+                let drained = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| {
+                    rx.recv_timeout(grace).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "command output pipe stayed open after the command exited",
+                        )
+                    })
+                };
                 return Ok(std::process::Output {
                     status,
-                    stdout: stdout.recv_timeout(grace).unwrap_or_default(),
-                    stderr: stderr.recv_timeout(grace).unwrap_or_default(),
+                    stdout: drained(&stdout)?,
+                    stderr: drained(&stderr)?,
                 });
             }
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Ok(None) => {
+                // `cmd\git.exe` on Windows wraps the real git: kill the whole tree.
+                #[cfg(not(unix))]
+                let _ = crate::commands::ctx::supervise::kill_tree(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(std::io::Error::new(
