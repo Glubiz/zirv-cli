@@ -298,7 +298,11 @@ pub fn classify(input: &ClassificationInput) -> CtxResult<Classification> {
         ));
     }
     if reasons.is_empty() {
-        reasons.push("small, isolated deterministic change".to_string());
+        reasons.push(if changed_files == 0 && input.changed_lines == 0 {
+            "no repository signal measured".to_string()
+        } else {
+            "small, isolated deterministic change".to_string()
+        });
     }
     reasons.sort();
 
@@ -953,11 +957,14 @@ fn measured_input(
     }
 }
 
+/// The measured view including untracked files; production classifies with [`from_plan_args`].
+#[cfg(test)]
 pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     classify_args(args, true)
 }
 
-/// `from_args` for team planning: like `workflow start`, planning precedes the work, so untracked files are not part of the change.
+/// `zirv workflow classify` and team planning: like `workflow start`, untracked files (such as
+/// `.DS_Store`) are not part of the change.
 pub fn from_plan_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     classify_args(args, false)
 }
@@ -1496,6 +1503,33 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// #452: with nothing measured the fallback reason says so instead of calling it a small change.
+    #[test]
+    fn an_unmeasured_change_says_no_repository_signal_was_measured() {
+        let input = ClassificationInput {
+            task: String::new(),
+            paths: Vec::new(),
+            changed_lines: 0,
+            tests_changed: true,
+            intent_override: None,
+            complexity_override: None,
+            risk_override: None,
+        };
+        assert_eq!(
+            classify(&input).unwrap().reasons,
+            ["no repository signal measured"]
+        );
+        let measured = ClassificationInput {
+            paths: vec![PathBuf::from("src/util.rs")],
+            changed_lines: 5,
+            ..input
+        };
+        assert_eq!(
+            classify(&measured).unwrap().reasons,
+            ["small, isolated deterministic change"]
+        );
     }
 
     /// A start has written nothing yet: untracked root-level files are noise,
