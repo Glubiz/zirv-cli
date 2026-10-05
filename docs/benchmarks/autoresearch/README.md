@@ -325,7 +325,8 @@ item, its action list, label, and stability.
 
 ### `jev-cases/<floor_site>/` -- the per-site corpora
 
-Nine directories (`memory`, `context`, `harvest_screen`, `handoff_select`,
+The `memory` directory is obsolete: its memory-rerank and memory-harvest sites were
+removed from `zirv ctx jev probe`, which now refuses those cases. Nine directories (`memory`, `context`, `harvest_screen`, `handoff_select`,
 `compaction_select`, `dispatch`, `launch_effort`, `classify`, `inject`),
 each with `cases.jsonl`, `labels.jsonl`, `corpus.toml` (16 cases: 8 `dev`,
 5 `validation`, 3 `holdout`, `family = "jev-<floor_site>"`, `kind =

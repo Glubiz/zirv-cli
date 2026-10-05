@@ -273,7 +273,6 @@ fn jev_decision(row: &Value, cfg: &CtxConfig) -> Option<JevDecision> {
 /// The `[jev]` gates that are on, by their config key.
 pub fn enabled_sites(jev: &JevConfig) -> Vec<&'static str> {
     [
-        ("memory", jev.memory),
         ("supervisor", jev.supervisor),
         ("dispatch", jev.dispatch),
         ("review", jev.review),
@@ -568,7 +567,7 @@ mod tests {
         let body: String = (1..=60).map(row).collect();
         std::fs::write(tmp.path().join("jev-decisions.jsonl"), body).expect("write");
         let mut cfg = CtxConfig::default();
-        cfg.jev.memory = true;
+        cfg.jev.supervisor = true;
         cfg.jev.stop_verify = true;
         let feed = jev_feed(
             &state,
@@ -582,7 +581,7 @@ mod tests {
         );
         assert_eq!(feed.decisions.len(), KEEP);
         assert_eq!(feed.decisions[0].ts, 60);
-        assert_eq!(feed.enabled, vec!["memory", "stop_verify"]);
+        assert_eq!(feed.enabled, vec!["supervisor", "stop_verify"]);
     }
 
     #[test]

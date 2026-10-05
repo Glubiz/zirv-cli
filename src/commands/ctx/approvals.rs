@@ -79,6 +79,12 @@ pub struct Request {
     /// A short label for the "always allow" rule the harness itself offers; `None` when it offers none.
     #[serde(default)]
     pub always: Option<String>,
+    /// The session transcript and the call's `tool_use` id in it: a `tool_result` for that id there proves the
+    /// call was answered, wherever it was answered. Display-data only; a read failure leaves the request listed.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
 }
 
 /// What a request carries beyond its tool and input: set by the hook or the Codex dialog reader.
@@ -88,6 +94,8 @@ pub struct RequestDetails {
     pub reason: Option<String>,
     pub outside_sandbox: bool,
     pub always: Option<String>,
+    pub transcript_path: Option<String>,
+    pub tool_use_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,10 +260,14 @@ impl Request {
             reason: None,
             outside_sandbox: false,
             always: None,
+            transcript_path: None,
+            tool_use_id: None,
         }
     }
 
     pub fn with_details(mut self, details: RequestDetails) -> Self {
+        self.transcript_path = details.transcript_path;
+        self.tool_use_id = details.tool_use_id;
         self.cwd = details.cwd;
         self.reason = details.reason;
         self.outside_sandbox = details.outside_sandbox;
@@ -358,6 +370,66 @@ pub fn clear_released(state: &StateDir, short: &str, env: super::config::EnvLook
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// The most of a transcript's end a sweep reads: a pending call's result is among its last lines.
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The last `TRANSCRIPT_TAIL_BYTES` of a file as text; `None` on any read error. A cut first line is dropped.
+pub(crate) fn transcript_tail(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TRANSCRIPT_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if start == 0 {
+        return Some(text);
+    }
+    Some(
+        text.split_once('\n')
+            .map_or_else(String::new, |(_, rest)| rest.to_string()),
+    )
+}
+
+/// Whether the transcript's tail shows `request`'s call answered: a `tool_result` for its `tool_use_id`, which
+/// without a recorded one is the newest same-tool, same-input `tool_use` stamped no later than the request.
+fn transcript_shows_answered(request: &Request) -> bool {
+    let Some(tail) = request
+        .transcript_path
+        .as_deref()
+        .and_then(|path| transcript_tail(std::path::Path::new(path)))
+    else {
+        return false;
+    };
+    let Some(tool_use_id) = request.tool_use_id.clone().or_else(|| {
+        super::hook::transcript_tool_use_ids(&tail, &request.tool, Some(request.ts), |input| {
+            request_id(
+                &request.short,
+                &request.tool,
+                &input.command,
+                &input.preview_source(&request.tool),
+            ) == request.id
+        })
+        .into_iter()
+        .next()
+    }) else {
+        return false;
+    };
+    tail.lines()
+        .filter(|line| line.contains(&tool_use_id))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|line| {
+            line["message"]["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["type"] == "tool_result" && part["tool_use_id"] == tool_use_id.as_str()
+                })
+            })
+        })
 }
 
 /// Every live request record across all dashboards, oldest first. Records of dead dashboards are swept.
@@ -735,6 +807,41 @@ impl Hub {
                 let _ = std::fs::remove_file(record_path(state, &item.request));
             }
             keep
+        });
+        if !self
+            .items
+            .iter()
+            .any(|item| item.conn == self.selected_conn)
+        {
+            self.selected_conn = self.items.first().map_or(0, |item| item.conn);
+        }
+    }
+
+    /// Drop released requests whose call the session transcript shows answered, in the pane or anywhere else
+    /// (an allow, or a deny, both write a `tool_result`), and end their prompt and latch. Read errors keep the item.
+    pub fn drop_answered_released(&mut self) {
+        let state = &self.state;
+        self.items.retain(|item| {
+            let request = &item.request;
+            let answered = request.released && transcript_shows_answered(request);
+            if answered {
+                let _ = std::fs::remove_file(record_path(state, request));
+                let now = now_secs();
+                super::attention::resolve_prompts(
+                    state,
+                    &request.short,
+                    |open| open.id == request.id,
+                    super::attention::Observation::new(
+                        super::attention::Authority::Transcript,
+                        format!("permission answered in the pane: {}", request.tool),
+                        100,
+                        now,
+                    )
+                    .with_attention(super::attention::Attention::None),
+                    now,
+                );
+            }
+            !answered
         });
         if !self
             .items
@@ -1299,6 +1406,7 @@ mod tests {
                 reason: Some("Run the tests\nthen stop".to_string()),
                 outside_sandbox: true,
                 always: Some("cargo nextest run commands".to_string()),
+                ..RequestDetails::default()
             });
         assert_eq!(request.command.chars().count(), COMMAND_COLS);
         let secret = "echo ghp_1234567890abcdefghijklmnopqrstuvwx";
@@ -1574,6 +1682,133 @@ mod tests {
             }
             assert_eq!(waiter.join().expect("hook"), Some(Decision::Release));
             assert_eq!(hub.count(), 0);
+        }
+
+        /// A released request whose hook has gone and whose dialog is open in the pane; its prompt is confirmed.
+        fn released_request_with_transcript(
+            hub: &mut Hub,
+            state: &StateDir,
+            transcript: &Path,
+            tool_use_id: Option<&str>,
+        ) -> Request {
+            let sock = socket_path(state, std::process::id());
+            let req = request("abc123").with_details(RequestDetails {
+                transcript_path: Some(transcript.display().to_string()),
+                tool_use_id: tool_use_id.map(str::to_string),
+                ..RequestDetails::default()
+            });
+            write_record(state, &req).expect("record");
+            crate::commands::ctx::attention::open_prompt(
+                state,
+                "abc123",
+                crate::commands::ctx::attention::OpenPrompt {
+                    id: req.id.clone(),
+                    ..Default::default()
+                },
+            );
+            let client = {
+                let mut c = UnixStream::connect(&sock).expect("connect");
+                c.write_all(format!("{}\n", serde_json::to_string(&req).expect("json")).as_bytes())
+                    .expect("send");
+                c
+            };
+            wait_for(hub, 1);
+            drop(client);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !hub.items()[0].request.released && Instant::now() < deadline {
+                hub.poll(&|_| true);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(hub.items()[0].request.released);
+            crate::commands::ctx::attention::confirm_prompts(state, "abc123", "x", 2);
+            req
+        }
+
+        /// The per-tick sweep of dash/mod.rs without the transcript check, as it ran before.
+        fn hook_only_sweep(hub: &mut Hub, state: &StateDir) {
+            hub.poll(&|_| true);
+            hub.drop_released_unless(&|short| {
+                crate::commands::ctx::attention::load(state, short).attention
+                    == crate::commands::ctx::attention::Attention::Approval
+                    || crate::commands::ctx::attention::prompt_open(state, short)
+            });
+        }
+
+        #[test]
+        fn a_pane_denied_released_request_leaves_once_the_transcript_shows_its_rejection() {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let transcript = tmp.path().join("session.jsonl");
+            std::fs::write(&transcript, "").expect("transcript");
+            released_request_with_transcript(&mut hub, &state, &transcript, Some("toolu_pending"));
+            // The operator denies in the pane: Claude fires no hook, and writes this line.
+            std::fs::write(
+                &transcript,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"The user doesn't want to proceed with this tool use.","is_error":true,"tool_use_id":"toolu_pending"}]}}
+"#,
+            )
+            .expect("transcript");
+            hook_only_sweep(&mut hub, &state);
+            assert_eq!(
+                hub.count(),
+                1,
+                "the hook-only sweep never learns of the deny"
+            );
+            hub.drop_answered_released();
+            assert_eq!(
+                hub.count(),
+                0,
+                "handled in the pane, still listed in NEEDS YOU"
+            );
+            assert!(!crate::commands::ctx::attention::prompt_open(
+                &state, "abc123"
+            ));
+            assert_eq!(
+                crate::commands::ctx::attention::load(&state, "abc123").attention,
+                crate::commands::ctx::attention::Attention::None
+            );
+        }
+
+        #[test]
+        fn a_released_request_with_no_tool_result_yet_stays_listed() {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let transcript = tmp.path().join("session.jsonl");
+            std::fs::write(
+                &transcript,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"toolu_other"}]}}
+"#,
+            )
+            .expect("transcript");
+            released_request_with_transcript(&mut hub, &state, &transcript, Some("toolu_pending"));
+            hub.drop_answered_released();
+            assert_eq!(hub.count(), 1);
+            // An unreadable transcript leaves it alone too.
+            std::fs::remove_file(&transcript).expect("remove");
+            hub.drop_answered_released();
+            assert_eq!(hub.count(), 1);
+        }
+
+        #[test]
+        fn a_released_request_without_a_recorded_tool_use_id_is_matched_in_the_transcript() {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let transcript = tmp.path().join("session.jsonl");
+            // An older run of the same command (answered long ago) must not be taken for the pending call.
+            std::fs::write(
+                &transcript,
+                r#"{"timestamp":"2020-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_pending","name":"Bash","input":{"command":"cargo test"}}]}}
+{"timestamp":"2020-01-01T00:00:05.000Z","message":{"content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_pending","content":"The user doesn't want to proceed with this tool use."}]}}
+"#,
+            )
+            .expect("transcript");
+            released_request_with_transcript(&mut hub, &state, &transcript, None);
+            assert!(hub.items()[0].request.tool_use_id.is_none());
+            hub.drop_answered_released();
+            assert_eq!(hub.count(), 0, "the sweep must find the call itself");
         }
 
         #[test]

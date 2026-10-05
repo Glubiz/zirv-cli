@@ -58,6 +58,8 @@ pub(super) fn attention_short(env: EnvLookup<'_>, session_id_fallback: &str) -> 
 struct PermissionHookPayload {
     session_id: String,
     cwd: String,
+    /// The session transcript, where a pane answer leaves a `tool_result`.
+    transcript_path: String,
     permission_mode: String,
     /// Non-empty inside a native subagent.
     agent_id: String,
@@ -77,6 +79,66 @@ impl PermissionHookPayload {
     fn parse(raw: &str) -> CtxResult<Self> {
         Ok(serde_json::from_str(raw)?)
     }
+
+    /// The `tool_use` id of the call this request is for: the newest tool_use in the transcript's tail with this
+    /// tool and input that has no `tool_result` yet. `None` when the transcript is unreadable or has no such call.
+    fn transcript_tool_use_id(&self) -> Option<String> {
+        let tail =
+            crate::commands::ctx::approvals::transcript_tail(Path::new(&self.transcript_path))?;
+        let preview = self.tool_input.preview_source(&self.tool_name);
+        let answered: std::collections::HashSet<String> = tail
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .flat_map(|line| transcript_parts(&line))
+            .filter(|part| part["type"] == "tool_result")
+            .filter_map(|part| part["tool_use_id"].as_str().map(str::to_string))
+            .collect();
+        transcript_tool_use_ids(&tail, &self.tool_name, None, |input| {
+            input.command == self.tool_input.command
+                && input.preview_source(&self.tool_name) == preview
+        })
+        .into_iter()
+        .find(|id| !answered.contains(id))
+    }
+}
+
+fn transcript_parts(line: &serde_json::Value) -> Vec<serde_json::Value> {
+    line["message"]["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The ids of the transcript tail's `tool_use` parts for `tool` whose input `same` accepts, newest first.
+/// With `not_after`, a line stamped later than that Unix time is skipped; an unstamped line is kept.
+pub(crate) fn transcript_tool_use_ids(
+    tail: &str,
+    tool: &str,
+    not_after: Option<u64>,
+    same: impl Fn(&PermissionToolInput) -> bool,
+) -> Vec<String> {
+    let stamped_after = |line: &serde_json::Value| {
+        let stamp = line["timestamp"]
+            .as_str()
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
+        matches!((stamp, not_after), (Some(stamp), Some(limit)) if stamp.timestamp() > limit as i64)
+    };
+    let lines: Vec<serde_json::Value> = tail
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .filter(|line| !stamped_after(line))
+        .flat_map(|line| transcript_parts(line).into_iter().rev())
+        .filter(|part| part["type"] == "tool_use" && part["name"] == tool)
+        .filter(|part| {
+            serde_json::from_value::<PermissionToolInput>(part["input"].clone())
+                .is_ok_and(|input| same(&input))
+        })
+        .filter_map(|part| part["id"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -402,6 +464,8 @@ pub(super) fn run_permission<W: Write>(
                 reason: payload.tool_input.bash_description(&payload.tool_name),
                 outside_sandbox: payload.tool_input.outside_sandbox(),
                 always: rule.as_ref().map(|rule| rule.label.clone()),
+                transcript_path: Some(payload.transcript_path.clone()).filter(|p| !p.is_empty()),
+                tool_use_id: payload.transcript_tool_use_id(),
             };
             if let Some(json) = crate::commands::ctx::approvals::hold_for_dashboard(
                 &state,
@@ -472,6 +536,35 @@ pub(super) fn clear_resolved_approval(
     );
 }
 
+/// A tool call that finished or failed proves its permission prompt is over: close the prompt this
+/// exact call opened and delete its inbox record (#456).
+pub(super) fn clear_finished_call(
+    state: &StateDir,
+    short: &str,
+    tool_name: &str,
+    tool_input: &PermissionToolInput,
+    agent_id: &str,
+    evidence: String,
+) {
+    let preview_source = tool_input.preview_source(tool_name);
+    let permission_id = crate::commands::ctx::approvals::request_id(
+        short,
+        tool_name,
+        &tool_input.command,
+        &preview_source,
+    );
+    clear_resolved_approval(state, short, evidence, now_secs(), |open| {
+        open.id == permission_id && open.agent == agent_id
+    });
+    crate::commands::ctx::approvals::clear_for_tool(
+        state,
+        short,
+        tool_name,
+        &tool_input.command,
+        &preview_source,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::pretool_run::run_pretool;
@@ -479,6 +572,39 @@ mod tests {
         permission_env, permission_prompt_notification, permission_stdin, pretool_stdin,
     };
     use super::*;
+
+    #[test]
+    fn the_request_finds_the_unanswered_tool_use_of_a_repeated_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("t.jsonl");
+        let use_line = |id: &str| serde_json::json!({"message": {"content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {"command": "cargo test"}}]}});
+        let result_line = serde_json::json!({"message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_old"}]}});
+        let other = serde_json::json!({"message": {"content": [{"type": "tool_use", "id": "toolu_other", "name": "Bash", "input": {"command": "ls"}}]}});
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                use_line("toolu_old"),
+                result_line,
+                use_line("toolu_new"),
+                other
+            ),
+        )
+        .expect("write");
+        let mut payload = PermissionHookPayload::parse(&permission_stdin(
+            None,
+            "Bash",
+            serde_json::json!({"command": "cargo test"}),
+        ))
+        .expect("payload");
+        payload.transcript_path = transcript.display().to_string();
+        assert_eq!(
+            payload.transcript_tool_use_id().as_deref(),
+            Some("toolu_new")
+        );
+        payload.transcript_path = dir.path().join("missing").display().to_string();
+        assert_eq!(payload.transcript_tool_use_id(), None);
+    }
 
     #[test]
     fn permission_rows_normalize_bash_read_and_unknown_tools() {

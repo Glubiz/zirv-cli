@@ -1,3 +1,6 @@
+# OBSOLETE: the memory-rerank and memory-harvest probe sites were removed with `[jev] memory`, so
+# `zirv ctx jev probe` now refuses this corpus (exit 2). Kept as the record of how it was run.
+#
 # jev-determinism-memory: sweeps the "memory" Jev floor
 # (ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_CONFIDENCE/ZIRV_CTX_JEV_FLOOR_MEMORY_MIN_MARGIN) against the labelled jev-cases/memory/
 # corpus, measuring per-site DETERMINISM (`quality` = acted-decision

@@ -330,6 +330,7 @@ pub(crate) fn codex_approval_dialog(live_contents: &str) -> Option<CodexDialog> 
             reason,
             // Only an option Codex drew with a key can be selected, so only that is offered.
             always: always.filter(|_| always_key.is_some()),
+            ..super::super::approvals::RequestDetails::default()
         },
         allow_key,
         always_key,

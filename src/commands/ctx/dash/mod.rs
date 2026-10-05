@@ -806,6 +806,8 @@ fn run_dashboard_inner(
         // Approvals inbox (#840): drain requests, then give the strip its rows (none while nothing is pending).
         if let Some(hub) = approvals_hub.as_mut() {
             hub.poll(&|short| panes.iter().any(|pane| pane.short() == short));
+            // A pane answer, allow or deny, leaves a tool_result in the transcript; no hook need fire for it.
+            hub.drop_answered_released();
             // A released request stays while its prompt is open, latched or still unconfirmed (#864).
             hub.drop_released_unless(&|short| {
                 super::attention::load(state, short).attention

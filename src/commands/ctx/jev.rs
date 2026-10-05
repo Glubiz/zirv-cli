@@ -88,13 +88,12 @@ const _: () = assert!(
     "must clear every general-field flip margin (<= 0.14)"
 );
 
-/// The nine sites [`JevFloorsConfig`](crate::commands::ctx:: config::JevFloorsConfig) makes
+/// The eight sites [`JevFloorsConfig`](crate::commands::ctx:: config::JevFloorsConfig) makes
 /// tunable -- every other `decisive()` call site in this crate (safety/verification gates,
 /// the harness proxy's own intake thresholds) keeps its compiled constant and has no
 /// [`floor`] call at all (#803).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloorSite {
-    Memory,
     Context,
     HarvestScreen,
     HandoffSelect,
@@ -114,7 +113,6 @@ pub(crate) fn floor(
     default_margin: f32,
 ) -> (f32, f32) {
     let configured: &JevSiteFloor = match site {
-        FloorSite::Memory => &cfg.jev.floors.memory,
         FloorSite::Context => &cfg.jev.floors.context,
         FloorSite::HarvestScreen => &cfg.jev.floors.harvest_screen,
         FloorSite::HandoffSelect => &cfg.jev.floors.handoff_select,
@@ -1797,9 +1795,8 @@ pub fn credential_present(cfg: &CtxConfig) -> bool {
 /// dashboard's JEV sidebar section, dash refresh PR2: hidden entirely with
 /// every gate off, via the existing [`any_gate_enabled`]) does not hand-
 /// maintain its own copy that could drift from theirs.
-fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 18] {
+fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 17] {
     [
-        ("memory", cfg.jev.memory),
         ("supervisor", cfg.jev.supervisor),
         ("dispatch", cfg.jev.dispatch),
         ("review", cfg.jev.review),
@@ -1911,7 +1908,6 @@ fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serd
 
     serde_json::json!({
         "gates": {
-            "memory": cfg.jev.memory,
             "supervisor": cfg.jev.supervisor,
             "dispatch": cfg.jev.dispatch,
             "review": cfg.jev.review,
@@ -1982,7 +1978,7 @@ pub fn status(
             .collect::<Vec<_>>()
             .join(", ");
         if enabled_gates.is_empty() {
-            let _ = writeln!(diagnosis, "remedy: zirv ctx config set jev.memory true");
+            let _ = writeln!(diagnosis, "remedy: zirv ctx config set jev.review true");
         }
         "inactive"
     } else {
@@ -1993,7 +1989,7 @@ pub fn status(
         );
         let _ = writeln!(
             diagnosis,
-            "remedy: zirv ctx config set jev.memory true && export {}=<api-key>",
+            "remedy: zirv ctx config set jev.review true && export {}=<api-key>",
             cred_env
         );
         "inactive"
@@ -3352,7 +3348,7 @@ pub(crate) mod tests {
     fn floor_unset_returns_exactly_the_callers_own_defaults() {
         let cfg = CtxConfig::default();
         assert_eq!(
-            floor(&cfg, FloorSite::Memory, 0.0, DEFAULT_MIN_MARGIN),
+            floor(&cfg, FloorSite::Context, 0.0, DEFAULT_MIN_MARGIN),
             (0.0, DEFAULT_MIN_MARGIN)
         );
         assert_eq!(
@@ -3377,7 +3373,7 @@ pub(crate) mod tests {
         );
         // A different site's floor is untouched.
         assert_eq!(
-            floor(&cfg, FloorSite::Memory, 0.0, DEFAULT_MIN_MARGIN),
+            floor(&cfg, FloorSite::Context, 0.0, DEFAULT_MIN_MARGIN),
             (0.0, DEFAULT_MIN_MARGIN)
         );
     }
@@ -3493,7 +3489,7 @@ pub(crate) mod tests {
         let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_CRED_MISSING".to_string();
-        ctx_cfg.jev.memory = true;
+        ctx_cfg.jev.review = true;
 
         unsafe {
             std::env::remove_var(&ctx_cfg.proxy.typesafe.credential_env);
@@ -3518,7 +3514,7 @@ pub(crate) mod tests {
         let state = StateDir::from_path(state_dir.path().to_path_buf());
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_ACTIVE".to_string();
-        ctx_cfg.jev.memory = true;
+        ctx_cfg.jev.review = true;
 
         with_credential("JEV_TEST_STATUS_ACTIVE", "secret", || {
             let mut output = Vec::new();
@@ -3856,7 +3852,7 @@ pub(crate) mod tests {
     fn status_json_includes_a_usage_section_with_the_rollup() {
         let mut ctx_cfg = CtxConfig::default();
         ctx_cfg.proxy.typesafe.credential_env = "JEV_TEST_STATUS_JSON_USAGE".to_string();
-        ctx_cfg.jev.memory = true;
+        ctx_cfg.jev.review = true;
 
         let mut rollup = BTreeMap::new();
         rollup.insert(
@@ -3880,7 +3876,7 @@ pub(crate) mod tests {
         assert_eq!(value["usage"]["sites"]["memory"]["removed_bytes"], 750);
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p50"], 200);
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p95"], 300);
-        assert!(value["gates"]["memory"].as_bool().unwrap());
+        assert!(value["gates"]["review"].as_bool().unwrap());
     }
 
     /// #827: intake rows written under a launch's pre-minted session count for the runtime
