@@ -832,7 +832,7 @@ pub(super) const SKILL_POINTER_LAYER: &str = "\n\n---\n\nSkills: run `zirv skill
 one and `zirv skill load <id>` to load it before starting matching work.";
 
 /// Bounds descriptions to a sentence and first line so unvalidated text cannot forge extra index lines.
-fn first_sentence(description: &str) -> &str {
+pub(crate) fn first_sentence(description: &str) -> &str {
     let description = match description.find('\n') {
         Some(index) => &description[..index],
         None => description,
@@ -1232,7 +1232,7 @@ pub fn with_objective_layer(
     Some(composed)
 }
 
-const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
+pub(crate) const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
 choices through `zirv ctx supervisor ask \"<question>\" --option \"<a>\" --option \"<b>\"`, and follow \
 its ruling unless the operator overrides it. Run it as its own command (no `;`, `&&`, pipe, `cd` or \
 file redirect around it); if it reports a sandbox denial, run it again with the sandbox disabled.";
