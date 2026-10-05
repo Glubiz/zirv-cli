@@ -427,10 +427,10 @@ pub fn append_delegation(state: &StateDir, record: &Delegation<'_>) -> CtxResult
 }
 
 /// [`append_delegation`], but marking this row a CACHED Jev hit (issue #803
-/// follow-up) -- used only by `jev::record`, the one call site where whether
-/// an answer came from the decision cache genuinely varies per call; every
-/// other caller's row is never cached, so it keeps calling plain
-/// `append_delegation` unchanged.
+/// follow-up) -- used by `jev::record` and the proxy intake's own spend row,
+/// the call sites where whether an answer came from the decision cache
+/// genuinely varies per call; every other caller's row is never cached, so it
+/// keeps calling plain `append_delegation` unchanged.
 pub(crate) fn append_delegation_cached(
     state: &StateDir,
     record: &Delegation<'_>,

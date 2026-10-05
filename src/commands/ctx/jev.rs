@@ -1098,30 +1098,14 @@ pub(crate) fn has_credential(cfg: &ProxyTypesafeConfig) -> bool {
 /// session with every gate off, or no credential, would sit there accepting
 /// connections that never come, for no benefit at all.
 pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
-    cfg.memory
-        || cfg.supervisor
-        || cfg.dispatch
-        || cfg.review
-        || cfg.gates
-        || cfg.context
-        || cfg.intake_savings
-        || cfg.review_reuse
-        || cfg.harvest_screen
-        || cfg.admin_dispatch
-        || cfg.approve
-        || cfg.approve_allow
-        || cfg.classify
-        || cfg.handoff_select
-        || cfg.compaction_select
-        || cfg.inject_screen
-        || cfg.inject
-        || cfg.stop_verify
-        || cfg.missing_tests
-        || cfg.retry
+    gate_list(cfg).iter().any(|(_, on)| *on)
 }
 
 pub(crate) const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
 const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
+/// `{site, ts, reason, session}` rows for an enabled site that never asked (no credential, or a
+/// state the metadata guard refused); a separate file so decision-log readers see only calls (#452).
+const JEV_SKIPS_FILE: &str = "jev-skips.jsonl";
 /// `{ts, from, to}` rows naming a launch's pre-minted session (`from`) that became another
 /// session (`to`); a separate file so decision-log readers never see a non-decision row (#827).
 const JEV_ALIASES_FILE: &str = "jev-session-aliases.jsonl";
@@ -1251,6 +1235,21 @@ pub(crate) fn record_decision_row(
         let _ = writeln!(file, "{line}");
     }
     (ts, session, principal)
+}
+
+/// Append one skip row for `site`. Best-effort like every recorder.
+fn record_skip(state: &StateDir, site: &str, reason: &str) {
+    let row = serde_json::json!({
+        "site": site,
+        "ts": state::now_secs(),
+        "reason": reason,
+        "session": session_and_principal().0,
+    });
+    if state::create_private_dir_all(state.root()).is_ok()
+        && let Ok(mut file) = state::open_private_append(&state.root().join(JEV_SKIPS_FILE))
+    {
+        let _ = writeln!(file, "{row}");
+    }
 }
 
 /// Record that rows written under `from` belong to `to`, e.g. intake rows written under the id a
@@ -1449,6 +1448,16 @@ struct DecisionRollupRow {
     session: String,
 }
 
+/// One `jev-skips.jsonl` line (see [`record_skip`]).
+#[derive(Debug, Deserialize)]
+struct SkipRollupRow {
+    site: String,
+    ts: u64,
+    reason: String,
+    #[serde(default)]
+    session: String,
+}
+
 /// The subset of a `jev-effects.jsonl` line (see [`EffectRecord`])
 /// [`usage_rollup`] needs.
 #[derive(Debug, Deserialize)]
@@ -1632,6 +1641,24 @@ pub(crate) fn usage_rollup(
         }
     }
 
+    // A skip is an error the operator must see, never a call: no latency, no cache-hit share.
+    if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_SKIPS_FILE)) {
+        for line in text.lines() {
+            let Ok(row) = serde_json::from_str::<SkipRollupRow>(line.trim()) else {
+                continue;
+            };
+            if row.ts < cutoff || !in_scope(&row.session) {
+                continue;
+            }
+            recent_errors.push(JevErrorEntry {
+                ts: row.ts,
+                site: row.site.clone(),
+                reason: row.reason,
+            });
+            builders.entry(row.site).or_default().errors += 1;
+        }
+    }
+
     if let Ok(text) = std::fs::read_to_string(state.root().join(JEV_EFFECTS_FILE)) {
         for line in text.lines() {
             let line = line.trim();
@@ -1691,10 +1718,10 @@ pub(crate) enum AdvisoryStatus {
 }
 
 /// The one advisory entry point a `[jev]`-gated site calls: short-circuits
-/// to `None`, with no network call and no log line at all, when `enabled`
-/// is false or the `[proxy.typesafe]` credential is not set ([`available`])
-/// -- either way the caller's own pre-existing deterministic path runs
-/// byte-identical to today. Otherwise runs one bounded [`ask`] call and
+/// to `None` with no network call when `enabled` is false (no log line) or
+/// the `[proxy.typesafe]` credential is not set ([`available`], one
+/// `jev-skips.jsonl` row) -- either way the caller's own pre-existing
+/// deterministic path runs byte-identical to today. Otherwise runs one bounded [`ask`] call and
 /// [`record`]s the outcome either way: a successful call's own answers, or
 /// an empty answer set carrying the error's `Display` as the one fallback
 /// reason. Never panics, never propagates -- same posture as every other
@@ -1728,6 +1755,8 @@ pub(crate) fn advise_detailed(
         return AdvisoryStatus::Disabled;
     }
     if !available(&cfg.proxy.typesafe) {
+        let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
+        record_skip(state_dir, site, &reason.to_string());
         return AdvisoryStatus::MissingCredential;
     }
     let started = std::time::Instant::now();
@@ -1756,6 +1785,7 @@ pub(crate) fn advise_detailed(
         }
         Err(error) => {
             if matches!(error, JevError::UnsafeState) {
+                record_skip(state_dir, site, &error.to_string());
                 return AdvisoryStatus::Failed;
             }
             record(
@@ -1790,30 +1820,30 @@ pub fn credential_present(cfg: &CtxConfig) -> bool {
     available(&cfg.proxy.typesafe)
 }
 
-/// Every `[jev]` gate name and whether it is on, the same list `status`/
-/// `status_json` each built inline -- factored out so a third reader (the
-/// dashboard's JEV sidebar section, dash refresh PR2: hidden entirely with
-/// every gate off, via the existing [`any_gate_enabled`]) does not hand-
-/// maintain its own copy that could drift from theirs.
-fn gate_list(cfg: &CtxConfig) -> [(&'static str, bool); 17] {
+/// Every live `[jev]` gate name and whether it is on: the one list `status`, `status_json`,
+/// [`any_gate_enabled`] and the dashboard feed read. The deprecated `memory` key is not a gate.
+pub(crate) fn gate_list(cfg: &JevConfig) -> [(&'static str, bool); 20] {
     [
-        ("supervisor", cfg.jev.supervisor),
-        ("dispatch", cfg.jev.dispatch),
-        ("review", cfg.jev.review),
-        ("gates", cfg.jev.gates),
-        ("context", cfg.jev.context),
-        ("intake_savings", cfg.jev.intake_savings),
-        ("review_reuse", cfg.jev.review_reuse),
-        ("harvest_screen", cfg.jev.harvest_screen),
-        ("admin_dispatch", cfg.jev.admin_dispatch),
-        ("approve", cfg.jev.approve),
-        ("approve_allow", cfg.jev.approve_allow),
-        ("classify", cfg.jev.classify),
-        ("handoff_select", cfg.jev.handoff_select),
-        ("inject_screen", cfg.jev.inject_screen),
-        ("inject", cfg.jev.inject),
-        ("stop_verify", cfg.jev.stop_verify),
-        ("retry", cfg.jev.retry),
+        ("supervisor", cfg.supervisor),
+        ("dispatch", cfg.dispatch),
+        ("review", cfg.review),
+        ("gates", cfg.gates),
+        ("context", cfg.context),
+        ("intake_savings", cfg.intake_savings),
+        ("review_reuse", cfg.review_reuse),
+        ("harvest_screen", cfg.harvest_screen),
+        ("admin_dispatch", cfg.admin_dispatch),
+        ("approve", cfg.approve),
+        ("approve_allow", cfg.approve_allow),
+        ("classify", cfg.classify),
+        ("handoff_select", cfg.handoff_select),
+        ("compaction_select", cfg.compaction_select),
+        ("inject_screen", cfg.inject_screen),
+        ("inject", cfg.inject),
+        ("stop_verify", cfg.stop_verify),
+        ("missing_tests", cfg.missing_tests),
+        ("launch_effort", cfg.launch_effort),
+        ("retry", cfg.retry),
     ]
 }
 
@@ -1906,25 +1936,12 @@ fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serd
         "inactive_both"
     };
 
+    let gates: serde_json::Map<String, serde_json::Value> = gate_list(&cfg.jev)
+        .into_iter()
+        .map(|(name, on)| (name.to_string(), on.into()))
+        .collect();
     serde_json::json!({
-        "gates": {
-            "supervisor": cfg.jev.supervisor,
-            "dispatch": cfg.jev.dispatch,
-            "review": cfg.jev.review,
-            "gates": cfg.jev.gates,
-            "context": cfg.jev.context,
-            "intake_savings": cfg.jev.intake_savings,
-            "review_reuse": cfg.jev.review_reuse,
-            "harvest_screen": cfg.jev.harvest_screen,
-            "admin_dispatch": cfg.jev.admin_dispatch,
-            "approve": cfg.jev.approve,
-            "approve_allow": cfg.jev.approve_allow,
-            "classify": cfg.jev.classify,
-            "handoff_select": cfg.jev.handoff_select,
-            "inject_screen": cfg.jev.inject_screen,
-            "inject": cfg.jev.inject,
-            "stop_verify": cfg.jev.stop_verify,
-        },
+        "gates": gates,
         "credential_env": cred_env,
         "credential_present": cred_present,
         "endpoint": cfg.proxy.typesafe.base_url,
@@ -1954,7 +1971,7 @@ pub fn status(
     use std::fmt::Write as FmtWrite;
 
     // Determine if any gate is on
-    let gates = gate_list(cfg);
+    let gates = gate_list(&cfg.jev);
     let any_gate_on = any_gate_enabled(&cfg.jev);
 
     // Check credential
@@ -3877,6 +3894,98 @@ pub(crate) mod tests {
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p50"], 200);
         assert_eq!(value["usage"]["sites"]["memory"]["wall_ms_p95"], 300);
         assert!(value["gates"]["review"].as_bool().unwrap());
+    }
+
+    /// #452: an enabled site that never asks (no credential, or a state the metadata guard
+    /// refuses) leaves a skip row the rollup reports as an error, without counting a call.
+    #[test]
+    fn a_skipped_advisory_leaves_a_row_the_status_rollup_reports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_SKIP_ROW_452".into();
+        unsafe { std::env::remove_var("JEV_TEST_SKIP_ROW_452") };
+        let missing = advise_detailed(
+            &cfg,
+            &state,
+            "context",
+            true,
+            &sample_state(),
+            &sample_questions(),
+        );
+        assert!(matches!(missing, AdvisoryStatus::MissingCredential));
+        with_credential("JEV_TEST_SKIP_ROW_452", "secret", || {
+            let unsafe_state = advise_detailed(
+                &cfg,
+                &state,
+                "review",
+                true,
+                &legacy_state(),
+                &sample_questions(),
+            );
+            assert!(matches!(unsafe_state, AdvisoryStatus::Failed));
+        });
+
+        let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
+        let context = rollup.sites.get("context").expect("context skip counted");
+        assert_eq!((context.calls, context.errors), (0, 1));
+        assert_eq!(rollup.sites.get("review").map(|s| s.errors), Some(1));
+        let reasons: Vec<&str> = rollup
+            .recent_errors
+            .iter()
+            .map(|e| e.reason.as_str())
+            .collect();
+        assert!(
+            reasons.contains(&"credential env JEV_TEST_SKIP_ROW_452 unset"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&"unsafe Jev metadata projection"),
+            "{reasons:?}"
+        );
+        assert!(!dir.path().join(JEV_DECISIONS_FILE).exists());
+    }
+
+    /// #452: status lists every operator gate, not 17 of the 20.
+    #[test]
+    fn status_lists_every_jev_gate() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let mut output = Vec::new();
+        status(&cfg, &state, &mut output).expect("status");
+        let text = String::from_utf8_lossy(&output);
+        let gates = status_json(&cfg, &BTreeMap::new())["gates"].clone();
+        for key in [
+            "compaction_select",
+            "missing_tests",
+            "launch_effort",
+            "retry",
+        ] {
+            assert!(text.contains(&format!("jev.{key}")), "{key}: {text}");
+            assert_eq!(gates[key], false, "{key}: {gates}");
+        }
+        assert_eq!(gates.as_object().map(|g| g.len()), Some(20), "{gates}");
+    }
+
+    /// #452: `launch_effort` alone is a real gate, so it must start the relay a sandboxed seat needs.
+    #[test]
+    fn launch_effort_alone_counts_as_an_enabled_gate() {
+        let jev = JevConfig {
+            launch_effort: true,
+            ..JevConfig::default()
+        };
+        assert!(any_gate_enabled(&jev));
+    }
+
+    /// #452: the deprecated `memory` key is ignored everywhere, so it must not keep a relay alive.
+    #[test]
+    fn the_deprecated_memory_key_alone_enables_no_gate() {
+        let jev = JevConfig {
+            memory: true,
+            ..JevConfig::default()
+        };
+        assert!(!any_gate_enabled(&jev));
     }
 
     /// #827: intake rows written under a launch's pre-minted session count for the runtime

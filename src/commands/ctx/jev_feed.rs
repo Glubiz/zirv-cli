@@ -272,31 +272,10 @@ fn jev_decision(row: &Value, cfg: &CtxConfig) -> Option<JevDecision> {
 
 /// The `[jev]` gates that are on, by their config key.
 pub fn enabled_sites(jev: &JevConfig) -> Vec<&'static str> {
-    [
-        ("supervisor", jev.supervisor),
-        ("dispatch", jev.dispatch),
-        ("review", jev.review),
-        ("gates", jev.gates),
-        ("context", jev.context),
-        ("intake_savings", jev.intake_savings),
-        ("review_reuse", jev.review_reuse),
-        ("harvest_screen", jev.harvest_screen),
-        ("admin_dispatch", jev.admin_dispatch),
-        ("approve", jev.approve),
-        ("approve_allow", jev.approve_allow),
-        ("classify", jev.classify),
-        ("handoff_select", jev.handoff_select),
-        ("compaction_select", jev.compaction_select),
-        ("inject_screen", jev.inject_screen),
-        ("inject", jev.inject),
-        ("stop_verify", jev.stop_verify),
-        ("missing_tests", jev.missing_tests),
-        ("launch_effort", jev.launch_effort),
-        ("retry", jev.retry),
-    ]
-    .into_iter()
-    .filter_map(|(name, on)| on.then_some(name))
-    .collect()
+    super::jev::gate_list(jev)
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect()
 }
 
 /// The newest 40 decisions in `scope` at or after `since` (epoch seconds), plus the enabled `[jev]`
