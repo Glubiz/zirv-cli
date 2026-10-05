@@ -3919,6 +3919,19 @@ helper's role — `distiller`, `ask`, `optimize` or `seat` under `[roles]` in
 unchanged. A native attempt that fails still falls back to the harness rather
 than failing the caller.
 
+Every helper call, native or harness, appends one row to `logs/delegations.jsonl`
+as agent `helper` (principal `helper/<role>/<harness>`, with the model, wall time
+and, for native calls, the tokens), so `zirv ctx spend` shows the overhead. The
+model scorecard skips these rows. Codex rows written before 4.51.0 logged cached
+tokens as plain input; readers re-split them from the pinned rollout's final token
+count (recorded in `logs/delegations-codex-split.json`), so spend prices them at
+the cache rate.
+
+`zirv ctx compile --measure [--role orchestrator|sub-orchestrator|worker|single]`
+reports every layer a seat of that role receives, including the adapter layer,
+the supervisor line and the workflow step; the rows add up to the total. Tokens
+stay a bytes/4 estimate.
+
 The seats that are real delegated workers take `--runtime native` instead, so
 they reuse `zirv agent` end to end:
 
