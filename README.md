@@ -510,8 +510,8 @@ A decision answers ONE call: the hook prints
 dashboard or a dashboard that quits, the hook prints nothing and the native
 dialog shows; the request then reads "waiting in pane" until a `PostToolUse`,
 `PostToolUseFailure` or `PermissionDenied` for that call clears it. A request
-answered in the dashboard, or every prompt once you submit the session's next
-prompt, clears its wait at once; one answered in the pane's own dialog clears
+answered in the dashboard, or every main-thread prompt once you submit the
+session's next prompt (a subagent's open dialog stays until that subagent stops), clears its wait at once; one answered in the pane's own dialog clears
 only at that `PostToolUse`, after the allowed command has finished, because Claude
 Code fires no hook when its dialog is answered. Each dashboard tick also reads
 the last 256 KB of the session transcript for a released request: a `tool_result`

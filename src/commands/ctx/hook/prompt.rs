@@ -235,13 +235,14 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
             .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Working),
             now_secs(),
         );
-        // A turn boundary ends every prompt the session had open. The operator's own prompt also
-        // proves no dialog holds the input, so the latch goes too; a harness-started turn does not (#864).
+        // A turn boundary ends the main thread's prompts; a subagent's dialog may still wait. The
+        // operator's own prompt also proves no dialog holds the input, so the latch goes too unless
+        // a subagent prompt is confirmed; a harness-started turn does not (#864).
         if is_harness_injected_prompt(&prompt_text_from(stdin)) {
             crate::commands::ctx::attention::close_prompts(
                 &state,
                 &attention_short(env, &session_id),
-                |_| true,
+                |open| open.agent.is_empty(),
             );
         } else {
             clear_resolved_approval(
@@ -249,7 +250,7 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
                 &attention_short(env, &session_id),
                 "user prompt submitted".to_string(),
                 now_secs(),
-                |_| true,
+                |open| open.agent.is_empty(),
             );
         }
         crate::commands::ctx::approvals::clear_released(
@@ -1001,7 +1002,6 @@ mod tests {
                 short,
                 OpenPrompt {
                     id: "p1".to_string(),
-                    agent: "a1".to_string(),
                     at: 10,
                     confirmed: true,
                     ..Default::default()
@@ -1039,6 +1039,56 @@ mod tests {
             );
             assert_eq!(attention::load(&state, short).attention, latch, "{prompt}");
         }
+    }
+
+    /// A hand-back from one subagent is a main-thread turn boundary; another subagent's confirmed
+    /// dialog stays open and keeps the latch.
+    #[test]
+    fn a_harness_prompt_keeps_an_open_subagent_dialog() {
+        use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let state = StateDir::from_root(dir.path().join("state"));
+        let short = "aae6758d";
+        for (id, agent) in [("p-sub", "a-sub-1"), ("p-main", "")] {
+            attention::open_prompt(
+                &state,
+                short,
+                OpenPrompt {
+                    id: id.to_string(),
+                    agent: agent.to_string(),
+                    at: 10,
+                    ..Default::default()
+                },
+            );
+        }
+        attention::confirm_prompts(&state, short, "Bash: cargo", 11);
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.root().display().to_string(),
+            ),
+            (
+                SESSION_ENV.to_string(),
+                "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+            ),
+        ]
+        .into();
+        let stdin = serde_json::json!({
+            "session_id": "01a0f719-6df3-7e61-a600-1bde4d533862",
+            "cwd": dir.path(),
+            "prompt": "<agent-message from=\"a-other\">done</agent-message>"
+        })
+        .to_string();
+        run_prompt(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("hook");
+
+        assert_eq!(
+            attention::load(&state, short).attention,
+            Attention::Approval
+        );
+        assert_eq!(attention::close_prompts(&state, short, |_| false), 1);
+        let main_left = attention::close_prompts(&state, short, |o| o.agent == "a-sub-1");
+        assert_eq!(main_left, 0, "the main-thread prompt closed");
     }
 
     fn run_prompt_captured(

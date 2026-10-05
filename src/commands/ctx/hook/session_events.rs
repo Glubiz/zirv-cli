@@ -401,10 +401,37 @@ fn subagent_stop_violation(scan: &SubagentTranscriptScan) -> Option<String> {
 /// and are shared by its subagents (#774). Nothing here may `unwrap`,
 /// `expect` or return `Err`.
 pub fn run_subagent_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    close_subagent_prompts(stdin, env);
     let result = subagent_stop_gate(w, stdin, env);
     // After the gate, so no transcript is read for the graph before the gate decides.
     crate::commands::ctx::graph::record_subagent_stop(stdin, env);
     result
+}
+
+/// A subagent that stops has no dialog left; close its prompts and nobody else's.
+fn close_subagent_prompts(stdin: &str, env: EnvLookup<'_>) {
+    let Ok(payload) = HookPayload::parse(stdin) else {
+        return;
+    };
+    if payload.agent_id.is_empty() {
+        return;
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    crate::commands::ctx::attention::resolve_prompts(
+        &state,
+        &attention_short(env, &payload.session_id),
+        |open| open.agent == payload.agent_id,
+        crate::commands::ctx::attention::Observation::new(
+            crate::commands::ctx::attention::Authority::AdapterHook,
+            "subagent stopped",
+            100,
+            now_secs(),
+        )
+        .with_attention(crate::commands::ctx::attention::Attention::None),
+        now_secs(),
+    );
 }
 
 fn subagent_stop_gate<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
@@ -1194,6 +1221,42 @@ mod tests {
         assert!(block_reason(&out).is_some(), "the gate decided first");
         let found = walkdir_has(&dir.path().join("state"), "subagent-graph.json");
         assert!(found, "the node was recorded");
+    }
+
+    /// A subagent that ends with a dialog open must not leave it behind, and must not close
+    /// anyone else's.
+    #[test]
+    fn run_subagent_stop_closes_only_that_agents_prompts() {
+        use crate::commands::ctx::attention::{self, OpenPrompt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = subagent_state_env(dir.path());
+        let state = StateDir::from_root(dir.path().join("state"));
+        let short = attention_short(&|k| env.get(k).cloned(), "sess-sub-prompts");
+        for (id, agent) in [("p1", "a-sub-1"), ("p2", "a-sub-2"), ("p3", "")] {
+            attention::open_prompt(
+                &state,
+                &short,
+                OpenPrompt {
+                    id: id.to_string(),
+                    agent: agent.to_string(),
+                    at: 10,
+                    ..Default::default()
+                },
+            );
+        }
+        let stdin = serde_json::json!({
+            "session_id": "sess-sub-prompts",
+            "agent_id": "a-sub-1",
+            "cwd": "/work/repo",
+        })
+        .to_string();
+        run_subagent_stop(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(attention::close_prompts(&state, &short, |_| false), 2);
+        let others_left = attention::close_prompts(&state, &short, |o| o.agent != "a-sub-1");
+        assert_eq!(
+            others_left, 0,
+            "the stopped agent's prompt was already closed"
+        );
     }
 
     fn walkdir_has(root: &Path, name: &str) -> bool {
