@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -740,12 +741,12 @@ pub(crate) fn is_workflow_work_path(path: &Path) -> bool {
 /// plus removed lines. Shared by [`git_change_input`] (working tree vs a
 /// base) and [`git_change_input_for_branch`] (one named branch vs its own
 /// base, as pure refs).
-fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf>, usize)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
+fn numstat_paths_and_lines(
+    repo: &Path,
+    args: &[&str],
+    budget: Duration,
+) -> CtxResult<(Vec<PathBuf>, usize)> {
+    let output = git_output_within(repo, args, budget)?;
     if !output.status.success() {
         return Err(format!(
             "cannot inspect changed paths: {}",
@@ -773,7 +774,37 @@ fn numstat_paths_and_lines(repo: &Path, args: &[&str]) -> CtxResult<(Vec<PathBuf
 }
 
 pub fn git_change_input(repo: &Path, task: String) -> CtxResult<ClassificationInput> {
-    git_change_input_with(repo, task, true)
+    git_change_input_with(repo, task, true, GIT_MEASURE_BUDGET)
+}
+
+/// Upper bound on each git call classification makes. A checkout whose HEAD
+/// is far from the base (thousands of committed build artifacts) can make
+/// `git diff --numstat` run for 30s+, past Claude Code's hook timeout (#878).
+const GIT_MEASURE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Runs `git -C repo args...` bounded by `budget`; a timeout surfaces as an
+/// `io::ErrorKind::TimedOut` error (see [`is_git_timeout`]).
+fn git_output_within(
+    repo: &Path,
+    args: &[&str],
+    budget: Duration,
+) -> CtxResult<std::process::Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    Ok(crate::utils::run_with_timeout(&mut command, budget)?)
+}
+
+fn is_git_timeout(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+fn git_timeout_reason(budget: Duration) -> String {
+    format!(
+        "git measurement timed out after {}s; classified from the task text alone",
+        budget.as_secs_f32()
+    )
 }
 
 /// `git_change_input`, optionally leaving out untracked files: a workflow
@@ -782,28 +813,30 @@ fn git_change_input_with(
     repo: &Path,
     task: String,
     include_untracked: bool,
+    budget: Duration,
 ) -> CtxResult<ClassificationInput> {
     // Measure against the same merge base as review so committed branch changes remain visible to classification.
     let base = super::review::default_base(repo)?;
-    let (mut paths, mut lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base])?;
-    let untracked = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .output()?;
+    let (mut paths, mut lines) =
+        numstat_paths_and_lines(repo, &["diff", "--numstat", &base], budget)?;
     let untracked_stdout = if include_untracked {
-        untracked.stdout.as_slice()
+        let untracked = git_output_within(
+            repo,
+            &["ls-files", "--others", "--exclude-standard"],
+            budget,
+        )?;
+        if !untracked.status.success() {
+            return Err(format!(
+                "cannot inspect untracked paths: {}",
+                String::from_utf8_lossy(&untracked.stderr).trim()
+            )
+            .into());
+        }
+        untracked.stdout
     } else {
-        &[]
+        Vec::new()
     };
-    if !untracked.status.success() {
-        return Err(format!(
-            "cannot inspect untracked paths: {}",
-            String::from_utf8_lossy(&untracked.stderr).trim()
-        )
-        .into());
-    }
-    for path in String::from_utf8_lossy(untracked_stdout)
+    for path in String::from_utf8_lossy(&untracked_stdout)
         .lines()
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
@@ -851,7 +884,11 @@ pub fn git_change_input_for_branch(
     task: String,
 ) -> CtxResult<ClassificationInput> {
     let base = super::review::default_base_for(repo, branch)?;
-    let (mut paths, lines) = numstat_paths_and_lines(repo, &["diff", "--numstat", &base, branch])?;
+    let (mut paths, lines) = numstat_paths_and_lines(
+        repo,
+        &["diff", "--numstat", &base, branch],
+        GIT_MEASURE_BUDGET,
+    )?;
     paths.sort();
     paths.dedup();
     let tests_changed = paths.iter().any(|path| {
@@ -908,10 +945,11 @@ fn measured_input(
     branch: Option<&str>,
     task: String,
     include_untracked: bool,
+    budget: Duration,
 ) -> CtxResult<ClassificationInput> {
     match branch {
         Some(branch) => git_change_input_for_branch(repo, branch, task),
-        None => git_change_input_with(repo, task, include_untracked),
+        None => git_change_input_with(repo, task, include_untracked, budget),
     }
 }
 
@@ -944,8 +982,20 @@ pub fn from_start_args(args: &ClassifyArgs) -> CtxResult<Classification> {
 }
 
 fn classify_args(args: &ClassifyArgs, include_untracked: bool) -> CtxResult<Classification> {
+    classify_args_within(args, include_untracked, GIT_MEASURE_BUDGET)
+}
+
+/// `classify_args` with an explicit per-git-call `budget`. A measurement that
+/// times out never fails or hangs classification: it falls back to the task
+/// text with no measured paths and records the measurement as unavailable.
+fn classify_args_within(
+    args: &ClassifyArgs,
+    include_untracked: bool,
+    budget: Duration,
+) -> CtxResult<Classification> {
     let repo = args.repo.clone().unwrap_or(std::env::current_dir()?);
     let declared = !args.paths.is_empty() || args.changed_lines.is_some();
+    let mut timed_out = None;
     let mut input = if declared {
         ClassificationInput {
             task: args.task.clone(),
@@ -957,33 +1007,59 @@ fn classify_args(args: &ClassifyArgs, include_untracked: bool) -> CtxResult<Clas
             risk_override: None,
         }
     } else {
-        measured_input(
+        match measured_input(
             &repo,
             args.branch.as_deref(),
             args.task.clone(),
             include_untracked,
-        )?
+            budget,
+        ) {
+            Ok(input) => input,
+            Err(error) if is_git_timeout(error.as_ref()) => {
+                timed_out = Some(git_timeout_reason(budget));
+                ClassificationInput {
+                    task: args.task.clone(),
+                    paths: Vec::new(),
+                    changed_lines: 0,
+                    tests_changed: false,
+                    intent_override: None,
+                    complexity_override: None,
+                    risk_override: None,
+                }
+            }
+            Err(error) => return Err(error),
+        }
     };
     input.intent_override = args.intent;
     input.complexity_override = args.complexity;
     input.risk_override = args.risk;
     let mut classification = classify(&input)?;
+    if let Some(reason) = timed_out {
+        mark_unavailable(&mut classification, reason);
+        return Ok(classification);
+    }
     if !declared {
         return Ok(classification);
     }
     classification.declared_scope = true;
     // Combine declared and Git-measured risk at the higher band; if Git cannot be measured, record that state and raise risk one step so declarations cannot bypass review.
-    let Ok(mut measured) = measured_input(
+    let mut measured = match measured_input(
         &repo,
         args.branch.as_deref(),
         args.task.clone(),
         include_untracked,
-    ) else {
-        mark_unavailable(
-            &mut classification,
-            "git measurement unavailable (not a repository, or no commits)",
-        );
-        return Ok(classification);
+        budget,
+    ) {
+        Ok(measured) => measured,
+        Err(error) => {
+            let reason = if is_git_timeout(error.as_ref()) {
+                git_timeout_reason(budget)
+            } else {
+                "git measurement unavailable (not a repository, or no commits)".to_string()
+            };
+            mark_unavailable(&mut classification, reason);
+            return Ok(classification);
+        }
     };
     measured.intent_override = args.intent;
     measured.complexity_override = args.complexity;
@@ -1399,6 +1475,26 @@ mod tests {
             repo: Some(repo.to_path_buf()),
             branch: None,
             json: false,
+        }
+    }
+
+    /// #878: a git measurement that outlives its budget must not fail or hang
+    /// classification -- it falls back to the task text and records the
+    /// measurement as unavailable with a timeout reason.
+    #[test]
+    fn start_classification_degrades_when_git_measurement_times_out() {
+        let repo = repo_with_pending_file("src/auth/session.rs");
+        let classification = classify_args_within(
+            &start_args(repo.path(), "add a flag"),
+            false,
+            Duration::ZERO,
+        )
+        .expect("a timed-out measurement must not fail classification");
+        match classification.risk_measurement {
+            RiskMeasurement::Unavailable { reason } => {
+                assert!(reason.contains("timed out"), "reason: {reason}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 

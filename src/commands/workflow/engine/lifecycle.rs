@@ -594,7 +594,13 @@ pub fn active_skill_context(repo: &Path, session: Option<&str>) -> CtxResult<Opt
         return Ok(None);
     };
     match render_current_context(&state, repo, dirs::home_dir().as_deref()) {
-        Ok(context) => Ok(context),
+        Ok(context) => {
+            // The composed prompt carries this step, so the first prompt hook must not repeat it (#878).
+            if context.is_some() {
+                super::session_context::record_injected(&state_dir, short, &state);
+            }
+            Ok(context)
+        }
         // The caller composes a prompt and cannot fail over this, but a
         // silently dropped workflow layer is a session running without the
         // methodology it thinks it has. Say so once, on the channel a repo

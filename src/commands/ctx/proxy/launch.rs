@@ -54,7 +54,8 @@ pub fn start_workflow_for(
 
 /// The start behind [`start_workflow_for`]: `kind` `None` lets the engine
 /// classify and select the pack from `request`, and `class` `None` leaves
-/// complexity and risk to that classification.
+/// complexity and risk to that classification. An automatic start never
+/// interviews the operator, so the intent step is always `write-intent`.
 pub fn start_named_workflow(
     kind: Option<String>,
     class: Option<(Complexity, RiskBand)>,
@@ -86,7 +87,7 @@ pub fn start_named_workflow(
         branch: None,
         frontend_root: None,
         brainstorm: false,
-        no_brainstorm: false,
+        no_brainstorm: true,
         profile: None,
         json: false,
     };
@@ -219,6 +220,45 @@ mod tests {
                 reason: "no workflow named by this decision".to_string()
             }
         );
+    }
+
+    /// Issue #878: an automatic start never interviews the operator, for the kinds that default to it.
+    #[test]
+    fn an_automatic_start_uses_write_intent_never_brainstorm() {
+        for kind in ["spike", "feature"] {
+            let repo = tempdir().unwrap();
+            git_init_with_commit(repo.path());
+            let state_dir = tempdir().unwrap();
+            let outcome = start_named_workflow(
+                Some(kind.to_string()),
+                None,
+                state_dir.path(),
+                repo.path(),
+                "investigate the slow build",
+                None,
+            )
+            .expect("starts");
+            let WorkflowStart::Started { id } = outcome else {
+                panic!("expected a start for {kind}");
+            };
+            let state = CtxStateDir::from_path(state_dir.path().to_path_buf());
+            let workflow = engine::load(&state, repo.path(), &id).expect("load");
+            let skills: Vec<_> = workflow
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.phase == crate::commands::workflow::skill::WorkflowPhase::Intent
+                })
+                .map(|step| step.skill.as_str())
+                .collect();
+            assert!(
+                workflow.steps.iter().all(|step| step.skill != "brainstorm"),
+                "{kind} must not interview the operator"
+            );
+            if kind == "spike" {
+                assert_eq!(skills, ["write-intent"], "{kind}");
+            }
+        }
     }
 
     #[test]

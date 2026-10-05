@@ -678,46 +678,13 @@ const MOTION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// probe above cannot be reused directly, but the bounded
 /// spawn-pipe-then-poll shape is identical.
 fn run_bounded_probe(program: &str, args: &[&str]) -> Option<String> {
-    use std::io::Read;
-
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let mut stdout_pipe = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe.take() {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
-
-    let deadline = std::time::Instant::now() + MOTION_PROBE_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let bytes = rx.recv_timeout(std::time::Duration::from_secs(1)).ok()?;
-                return String::from_utf8(bytes).ok();
-            }
-            Ok(Some(_)) => return None,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let output = crate::utils::run_with_timeout(&mut command, MOTION_PROBE_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
     }
-    // Timed out: kill the child rather than leaking it.
-    let _ = child.kill();
-    let _ = child.wait();
-    None
+    String::from_utf8(output.stdout).ok()
 }
 
 /// Parses `node --version`'s own `"v22.9.0\n"` into a comparable (major,

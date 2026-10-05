@@ -2516,6 +2516,27 @@ distiller/handoff/memory model call, supervisor consults and `zirv ctx loop` cyc
 never inherits another session's workflow. An `INTERNAL` or `HEADLESS` session also gets no per-turn `[zirv]` health-marker
 instruction, so a helper or worker whose reply a script parses is never told to prefix it.
 
+The seat prompt is composed before that first prompt, so the starting turn
+carries the current step's resolved context (`zirv workflow context`, capped
+at `workflow.max_context_bytes`), not just a pointer. After that, any prompt
+that follows a step or status change of the session's bound workflow carries
+the new step's context once; the launch compile records what it already
+injected, so a resumed session is not shown the same step twice. An automatic
+start never interviews the operator: its intent step uses `write-intent`, not
+`brainstorm`. The start's `git diff --numstat` and untracked listing are
+each bounded to 5s; past that the task is classified from its text alone and
+the risk is raised one step, so a huge diff can no longer push the hook past
+the harness's hook timeout.
+
+Before starting, the hook closes (once per session) this repo's in-flight
+workflows that never completed a step and are abandoned: every session bound
+to them has ended, or they have been idle for 3 days. Each gets a recorded `closed_reason`
+(`abandoned: session <short> ended without advancing`, `stale: no advance in
+<n>d`). `zirv ctx status` lists the same set, plus this session's own
+workflow once it has gone an hour without advancing, as one `workflows:` line, and `zirv workflow stats`
+prints `progress: <a>/<s> started workflows advanced at least once; median
+steps completed <m>` next to the adoption line.
+
 ### Workflow adoption
 
 `[workflow] adoption = "off" | "advise" | "nudge" | "enforce"` in

@@ -91,6 +91,25 @@ pub fn workflow_id_for(state: &StateDir, short: &str) -> Option<String> {
         .map(|b| b.workflow_id)
 }
 
+/// Every `(short session id, workflow id)` binding on disk, read-only; unreadable entries are skipped.
+pub fn workflow_bindings(state: &StateDir) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(state.sessions()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("workflow") {
+                return None;
+            }
+            let short = path.file_stem()?.to_str()?.to_string();
+            let id = workflow_id_for(state, &short)?;
+            Some((short, id))
+        })
+        .collect()
+}
+
 /// Consume one dead session's in-flight witness without sweeping other
 /// records; malformed state is ignored and a failed clear may repeat it. (#281)
 pub fn take_interrupted_in_flight(state: &StateDir, repo: &Path) -> Option<InFlight> {
