@@ -343,6 +343,13 @@ fn claim_first_prompt(state: &StateDir, session: &str) -> bool {
     claimed
 }
 
+/// The zirv session id when set, else the hook payload's own.
+fn hook_session(payload_session: &str, env: EnvLookup<'_>) -> Option<String> {
+    env(SESSION_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))
+}
+
 /// Return a first-turn note only when all launch and classification gates
 /// are known; uncertainty leaves the prompt unchanged (#753).
 fn intake_discipline_note(
@@ -357,9 +364,7 @@ fn intake_discipline_note(
     {
         return None;
     }
-    let session = env(SESSION_ENV)
-        .filter(|value| !value.is_empty())
-        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let session = hook_session(payload_session, env)?;
     let state = StateDir::resolve(env).ok()?;
     if !claim_first_prompt(&state, &session) {
         return None;
@@ -403,9 +408,7 @@ fn auto_start_workflow_note(
     {
         return None;
     }
-    let session = env(SESSION_ENV)
-        .filter(|value| !value.is_empty())
-        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let session = hook_session(payload_session, env)?;
     let prompt = prompt_text_from(stdin);
     if is_harness_injected_prompt(&prompt) {
         return None;
@@ -501,9 +504,7 @@ fn workflow_step_change_note(
     {
         return None;
     }
-    let session = env(SESSION_ENV)
-        .filter(|value| !value.is_empty())
-        .or_else(|| (!payload_session.is_empty()).then(|| payload_session.to_string()))?;
+    let session = hook_session(payload_session, env)?;
     let state = StateDir::resolve(env).ok()?;
     let short = crate::commands::ctx::sessions::short_id(&session);
     engine::changed_step_context(&state, repo, &short, cfg.workflow.max_context_bytes)
