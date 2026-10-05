@@ -97,6 +97,8 @@ pub(crate) fn parse_reply(
         .map_or(reply, |rest| rest.trim_start());
     let (head, rest) = reply.split_once('\n').unwrap_or((reply, ""));
     let (head, rest) = (head.trim(), rest.trim());
+    // Helpers drift into markdown (`**Choice: 2 — why.**`): tolerate emphasis marks and case.
+    let is_mark = |c: char| matches!(c, '*' | '_' | '`');
     let pair = |good: &str, good_verdict: &str, bad: &str, bad_verdict: &str| {
         if head == good {
             return Some((good_verdict.to_string(), rest.to_string()));
@@ -111,12 +113,45 @@ pub(crate) fn parse_reply(
     };
     match kind {
         RulingKind::Plan => pair("APPROVE", "approve", "REVISE", "revise"),
-        RulingKind::Done => pair("DONE", "done", "NOT_DONE", "not_done"),
+        RulingKind::Done => {
+            // The helper echoes the prompt's `Ruling:` label and writes the verdict as prose
+            // (`Ruling: not done <why>`): accept the label, case and trailing text on the head.
+            let head = head.trim_matches(is_mark);
+            let head = head
+                .get(..7)
+                .filter(|label| label.eq_ignore_ascii_case("RULING:"))
+                .map_or(head, |_| {
+                    head[7..].trim_start_matches(|c: char| is_mark(c) || c == ' ')
+                });
+            let lower = head.to_ascii_lowercase();
+            let strip = |words: &[&str]| {
+                words
+                    .iter()
+                    .find(|word| lower.starts_with(**word))
+                    .map(|word| &head[word.len()..])
+            };
+            let (verdict, after) = match strip(&["not_done", "not done", "not-done"]) {
+                Some(after) => ("not_done", after),
+                None => ("done", strip(&["done"])?),
+            };
+            if after.chars().next().is_some_and(char::is_alphanumeric) {
+                return None;
+            }
+            let tail = after
+                .trim_start_matches(|c: char| {
+                    is_mark(c) || c.is_whitespace() || ".:,-—–".contains(c)
+                })
+                .trim_end_matches(is_mark);
+            let reason = [tail, rest]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (verdict == "done" || !reason.is_empty()).then(|| (verdict.to_string(), reason))
+        }
         RulingKind::Retry => pair("RETRY", "retry", "STOP", "stop"),
         RulingKind::Choice => {
-            // Helpers drift into markdown (`**Choice: 2 — why.**`): tolerate emphasis marks, case
-            // and prose after the number, but never guess a number that is not there.
-            let is_mark = |c: char| matches!(c, '*' | '_' | '`');
+            // Tolerate prose after the number, but never guess a number that is not there.
             let head = head.trim_matches(is_mark);
             let after = head
                 .get(..7)
@@ -434,6 +469,49 @@ mod tests {
             pair("table", "Simpler to run.")
         );
         assert_eq!(parse("CHOICE: 2nd"), None);
+    }
+
+    /// The live 2026-10-05 failures (decisions.jsonl): the helper echoed the prompt's `Ruling:`
+    /// label and wrote the verdict as prose on the same line.
+    #[test]
+    fn a_done_head_with_the_ruling_label_still_parses() {
+        let parse = |text: &str| parse_reply(RulingKind::Done, text, &opts());
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            parse(
+                "Ruling: done\n\nThe 12 CRM identifier additions match the documented UK brand assignments."
+            ),
+            pair(
+                "done",
+                "The 12 CRM identifier additions match the documented UK brand assignments."
+            )
+        );
+        assert_eq!(
+            parse("Ruling: done The new journal link resolves and matches its entry’s summary."),
+            pair(
+                "done",
+                "The new journal link resolves and matches its entry’s summary."
+            )
+        );
+        assert_eq!(
+            parse(
+                "Ruling: not done Required lint and test results are absent. Run `bun run lint`."
+            ),
+            pair(
+                "not_done",
+                "Required lint and test results are absent. Run `bun run lint`."
+            )
+        );
+        assert_eq!(
+            parse("**Ruling: NOT_DONE: no tests**\nrun them"),
+            pair("not_done", "no tests\nrun them")
+        );
+        assert_eq!(parse("Ruling: not done"), None);
+        assert_eq!(parse("Ruling: donefor"), None);
+        assert_eq!(
+            parse("Ruling: not verified. The diff alone is not enough."),
+            None
+        );
     }
 
     #[test]
