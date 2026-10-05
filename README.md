@@ -2523,17 +2523,17 @@ that follows a step or status change of the session's bound workflow carries
 the new step's context once; the launch compile records what it already
 injected, so a resumed session is not shown the same step twice. An automatic
 start never interviews the operator: its intent step uses `write-intent`, not
-`brainstorm`. The start's git measurement is bounded to 5s per call; past
-that the task is classified from its text alone and the risk is raised one
-step, so a huge diff can no longer push the hook past the harness's hook
-timeout.
+`brainstorm`. The start's `git diff --numstat` and untracked listing are
+each bounded to 5s; past that the task is classified from its text alone and
+the risk is raised one step, so a huge diff can no longer push the hook past
+the harness's hook timeout.
 
 Before starting, the hook closes (once per session) this repo's in-flight
-workflows that never completed a step and are abandoned: bound to a session
-that has ended, or idle for 3 days. Each gets a recorded `closed_reason`
+workflows that never completed a step and are abandoned: every session bound
+to them has ended, or they have been idle for 3 days. Each gets a recorded `closed_reason`
 (`abandoned: session <short> ended without advancing`, `stale: no advance in
 <n>d`). `zirv ctx status` lists the same set, plus this session's own
-unadvanced workflow, as one `workflows:` line, and `zirv workflow stats`
+workflow once it has gone an hour without advancing, as one `workflows:` line, and `zirv workflow stats`
 prints `progress: <a>/<s> started workflows advanced at least once; median
 steps completed <m>` next to the adoption line.
 
