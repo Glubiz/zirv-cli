@@ -677,6 +677,7 @@ pub(crate) fn gather_memory(
         changed_paths: changed_paths.clone(),
         // Active task and step text provide the launch-time retrieval query (#241).
         query: active_workflow_query(state, repo),
+        entry_cap: Some(cfg.memory.max_entry_bytes),
         ..Default::default()
     };
     let selection = retrieval::select(
@@ -2402,6 +2403,89 @@ mod tests {
         }));
     }
 
+    /// An active workflow whose task is `task`, which gives retrieval its query.
+    fn start_workflow_for_test(state: &StateDir, repo: &Path, task: &str) {
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: String::new(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        crate::commands::workflow::engine::save(
+            state,
+            &crate::commands::workflow::engine::WorkflowState::start(
+                repo.to_path_buf(),
+                task.into(),
+                crate::commands::workflow::engine::WorkflowKind::Feature,
+                None,
+                true,
+                classification,
+            ),
+            true,
+        )
+        .expect("save active workflow");
+    }
+
+    /// Retrieval budgets the capped body a prompt carries, so one relevant long entry is not skipped as over budget.
+    #[test]
+    fn a_relevant_long_entry_is_retrieved_with_the_truncation_pointer() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        cfg.memory.core_max_bytes = 20;
+        cfg.memory.retrieval_max_bytes = 1024;
+        cfg.memory.max_entry_bytes = 512;
+        let entry = |key: &str, body: String, verified: u64| memory::Entry {
+            key: key.to_string(),
+            body,
+            written: verified,
+            verified,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        // The newest entry is the one core keeps; the long, older one can only arrive through retrieval.
+        for entry in [
+            entry("fresh-note", "unrelated".to_string(), 10),
+            entry("release-process", "release steps ".repeat(400), 1),
+        ] {
+            memory::upsert_scoped(
+                memory::MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                &entry,
+            )
+            .expect("store the entry");
+        }
+        start_workflow_for_test(&state, repo.path(), "document the release process");
+
+        let (_, retrieved) = gather_memory(&state, repo.path(), &slug, &cfg, now_secs());
+
+        let line = retrieved
+            .iter()
+            .find(|line| line.key == "release-process")
+            .expect("the relevant long entry is retrieved");
+        assert!(
+            line.body
+                .ends_with("[truncated: zirv ctx recall --key release-process]"),
+            "{}",
+            line.body
+        );
+    }
+
     /// `[jev] memory` is a deprecated key: `true` still loads, and the memory path asks Jev nothing.
     #[test]
     fn the_deprecated_jev_memory_key_loads_and_gather_memory_makes_no_jev_call() {
@@ -2442,31 +2526,7 @@ mod tests {
         )
         .expect("store the entry");
         // An active workflow gives retrieval a query, so it selects the entry: the old rerank asked Jev here.
-        let classification = crate::commands::workflow::classify::classify(
-            &crate::commands::workflow::classify::ClassificationInput {
-                task: String::new(),
-                paths: Vec::new(),
-                changed_lines: 0,
-                tests_changed: true,
-                intent_override: None,
-                complexity_override: None,
-                risk_override: None,
-            },
-        )
-        .expect("classify");
-        crate::commands::workflow::engine::save(
-            &state,
-            &crate::commands::workflow::engine::WorkflowState::start(
-                repo.path().to_path_buf(),
-                "run the database migration".into(),
-                crate::commands::workflow::engine::WorkflowKind::Feature,
-                None,
-                true,
-                classification,
-            ),
-            true,
-        )
-        .expect("save active workflow");
+        start_workflow_for_test(&state, repo.path(), "run the database migration");
 
         let (core, retrieved) = gather_memory(&state, repo.path(), &slug, &cfg, now_secs());
         unsafe { std::env::remove_var(credential_env) };

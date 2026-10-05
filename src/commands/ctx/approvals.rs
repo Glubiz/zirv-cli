@@ -389,6 +389,8 @@ fn transcript_shows_answered(request: &Request) -> bool {
     else {
         return false;
     };
+    // A guessed id may belong to an earlier identical call, so its result only counts if it came after the request.
+    let guessed = request.tool_use_id.is_none();
     let Some(tool_use_id) = request.tool_use_id.clone().or_else(|| {
         super::hook::transcript_tool_use_ids(&tail, &request.tool, Some(request.ts), |input| {
             request_id(
@@ -406,6 +408,13 @@ fn transcript_shows_answered(request: &Request) -> bool {
     tail.lines()
         .filter(|line| line.contains(&tool_use_id))
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| {
+            !guessed
+                || line["timestamp"]
+                    .as_str()
+                    .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                    .is_some_and(|stamp| stamp.timestamp() >= request.ts as i64)
+        })
         .any(|line| {
             line["message"]["content"].as_array().is_some_and(|parts| {
                 parts.iter().any(|part| {
@@ -710,6 +719,9 @@ pub struct Hub {
     /// The selected request's connection id; `0` while none is.
     selected_conn: u64,
     drawn: std::cell::Cell<Drawn>,
+    /// Each released request's transcript (length, mtime) at its last unanswered check, so the per-tick sweep
+    /// does not re-read a transcript that has not changed.
+    transcript_checks: std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
 }
 
 impl Hub {
@@ -722,6 +734,7 @@ impl Hub {
             items: Vec::new(),
             selected_conn: 0,
             drawn: std::cell::Cell::new(Drawn::Never),
+            transcript_checks: Default::default(),
         })
     }
 
@@ -804,9 +817,24 @@ impl Hub {
     /// (an allow, or a deny, both write a `tool_result`), and end their prompt and latch. Read errors keep the item.
     pub fn drop_answered_released(&mut self) {
         let state = &self.state;
+        let checks = &mut self.transcript_checks;
         self.items.retain(|item| {
             let request = &item.request;
-            let answered = request.released && transcript_shows_answered(request);
+            if !request.released {
+                return true;
+            }
+            let stamp = request
+                .transcript_path
+                .as_deref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| (meta.len(), meta.modified().ok()));
+            if stamp.is_some() && checks.get(&request.id) == stamp.as_ref() {
+                return true;
+            }
+            let answered = transcript_shows_answered(request);
+            if let Some(stamp) = stamp {
+                checks.insert(request.id.clone(), stamp);
+            }
             if answered {
                 let _ = std::fs::remove_file(record_path(state, request));
                 let now = now_secs();
@@ -826,6 +854,8 @@ impl Hub {
             }
             !answered
         });
+        let items = &self.items;
+        checks.retain(|id, _| items.iter().any(|item| &item.request.id == id));
         if !self
             .items
             .iter()
@@ -1249,6 +1279,7 @@ mod tests {
             items: Vec::new(),
             selected_conn: 0,
             drawn: std::cell::Cell::new(Drawn::Never),
+            transcript_checks: Default::default(),
         };
         for (conn, short) in [(1, "aaaa"), (2, "bbbb")] {
             hub.items.push(Item {
@@ -1284,6 +1315,7 @@ mod tests {
             items: Vec::new(),
             selected_conn: 0,
             drawn: std::cell::Cell::new(Drawn::Never),
+            transcript_checks: Default::default(),
         };
         for (conn, short) in [(1, "aaaa"), (2, "bbbb")] {
             hub.items.push(Item {
@@ -1328,6 +1360,7 @@ mod tests {
             items: Vec::new(),
             selected_conn: 0,
             drawn: std::cell::Cell::new(Drawn::Never),
+            transcript_checks: Default::default(),
         };
         let mut released = request("aaaa");
         released.released = true;
@@ -1418,6 +1451,7 @@ mod tests {
             items: Vec::new(),
             selected_conn: 0,
             drawn: std::cell::Cell::new(Drawn::Never),
+            transcript_checks: Default::default(),
         };
         for (conn, request) in requests {
             hub.items.push(Item {
@@ -1784,7 +1818,7 @@ mod tests {
             std::fs::write(
                 &transcript,
                 r#"{"timestamp":"2020-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_pending","name":"Bash","input":{"command":"cargo test"}}]}}
-{"timestamp":"2020-01-01T00:00:05.000Z","message":{"content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_pending","content":"The user doesn't want to proceed with this tool use."}]}}
+{"timestamp":"2099-01-01T00:00:05.000Z","message":{"content":[{"type":"tool_result","is_error":true,"tool_use_id":"toolu_pending","content":"The user doesn't want to proceed with this tool use."}]}}
 "#,
             )
             .expect("transcript");
@@ -1792,6 +1826,58 @@ mod tests {
             assert!(hub.items()[0].request.tool_use_id.is_none());
             hub.drop_answered_released();
             assert_eq!(hub.count(), 0, "the sweep must find the call itself");
+        }
+
+        #[test]
+        fn a_guessed_call_answered_before_the_request_stays_listed() {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let transcript = tmp.path().join("session.jsonl");
+            // The same command ran and was answered long before the request was raised.
+            std::fs::write(
+                &transcript,
+                r#"{"timestamp":"2020-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_old","name":"Bash","input":{"command":"cargo test"}}]}}
+{"timestamp":"2020-01-01T00:00:05.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_old","content":"ok"}]}}
+"#,
+            )
+            .expect("transcript");
+            released_request_with_transcript(&mut hub, &state, &transcript, None);
+            hub.drop_answered_released();
+            assert_eq!(
+                hub.count(),
+                1,
+                "the old result is not this request's answer"
+            );
+        }
+
+        #[test]
+        fn an_unchanged_transcript_is_not_read_again() {
+            let (tmp, mut hub) = live_hub();
+            let state =
+                StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
+            let transcript = tmp.path().join("session.jsonl");
+            let line = |id: &str| {
+                format!(
+                    "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{id}\",\"content\":\"ok\"}}]}}}}\n"
+                )
+            };
+            std::fs::write(&transcript, line("toolu_pend2")).expect("transcript");
+            released_request_with_transcript(&mut hub, &state, &transcript, Some("toolu_pend1"));
+            hub.drop_answered_released();
+            assert_eq!(hub.count(), 1);
+            // The answer lands, but the file keeps its length and mtime: the sweep must not re-read it.
+            let mtime = std::fs::metadata(&transcript)
+                .and_then(|meta| meta.modified())
+                .expect("mtime");
+            std::fs::write(&transcript, line("toolu_pend1")).expect("transcript");
+            std::fs::File::options()
+                .write(true)
+                .open(&transcript)
+                .and_then(|file| file.set_modified(mtime))
+                .expect("restore mtime");
+            hub.drop_answered_released();
+            assert_eq!(hub.count(), 1, "an unchanged transcript is skipped");
         }
 
         #[test]
