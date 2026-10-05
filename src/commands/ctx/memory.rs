@@ -4297,14 +4297,19 @@ const CADENCE_Z_THRESHOLD: f64 = 2.0;
 /// or large its writes are -- a human operator doing a deliberate bulk
 /// import is not the "looping worker" shape this signal exists to catch.
 const CADENCE_EXEMPT_WRITER: &str = "operator";
+/// Migration imports write the whole bank in one batch by design.
+const CADENCE_MIGRATION_WRITER: &str = "setup-migration";
+/// "This cycle": a burst is over within minutes and `status` is read soon after, so a finding
+/// older than an hour is history, not a signal. `cadence_for_shared` drops older ones.
+const CADENCE_RECENT_SECS: u64 = 3600;
 
 /// Which signal one [`CadenceFinding`] fired on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CadenceReason {
-    /// The gap since this writer's previous write was an outlier (too
-    /// short OR too long) relative to that writer's own recent baseline.
+    /// The gap since this writer's previous write was unusually short relative to that
+    /// writer's own recent baseline. A long pause is never a finding.
     Interval,
-    /// This write's own byte length was an outlier relative to that
+    /// This write's own byte length was unusually large relative to that
     /// writer's own recent baseline.
     Size,
 }
@@ -4320,6 +4325,8 @@ pub struct CadenceFinding {
     pub writer: String,
     pub reason: CadenceReason,
     pub z_score: f64,
+    /// Unix seconds of the write that tripped it.
+    pub at: u64,
 }
 
 /// Every index `i >= baseline_len` in `values` whose z-score against the
@@ -4359,7 +4366,9 @@ fn z_outliers(values: &[f64], baseline_len: usize) -> Vec<(usize, f64)> {
 /// [`CADENCE_BASELINE`] establish a baseline with no verdict; every sample
 /// after that is tested against the (growing) baseline on both its
 /// inter-write interval and its own byte length, and `|z| >
-/// CADENCE_Z_THRESHOLD` on either flags a [`CadenceFinding`]. Never blocks a
+/// CADENCE_Z_THRESHOLD` flags a [`CadenceFinding`] only for a burst: an
+/// unusually short interval or an unusually large write, never a long pause or
+/// a small write. `setup-migration` is exempt like `operator`. Never blocks a
 /// write -- report-only, the same posture `screen.rs` uses.
 pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
     let mut writers: Vec<&str> = Vec::new();
@@ -4371,7 +4380,7 @@ pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
 
     let mut findings = Vec::new();
     for writer in writers {
-        if writer == CADENCE_EXEMPT_WRITER {
+        if writer == CADENCE_EXEMPT_WRITER || writer == CADENCE_MIGRATION_WRITER {
             continue;
         }
         let mut samples: Vec<(u64, usize)> = window
@@ -4389,12 +4398,15 @@ pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
         }
 
         let sizes: Vec<f64> = samples.iter().map(|(_, bytes)| *bytes as f64).collect();
-        for (_, z) in z_outliers(&sizes, CADENCE_BASELINE) {
-            findings.push(CadenceFinding {
-                writer: writer.to_string(),
-                reason: CadenceReason::Size,
-                z_score: z,
-            });
+        for (i, z) in z_outliers(&sizes, CADENCE_BASELINE) {
+            if z > 0.0 {
+                findings.push(CadenceFinding {
+                    writer: writer.to_string(),
+                    reason: CadenceReason::Size,
+                    z_score: z,
+                    at: samples[i].0,
+                });
+            }
         }
 
         let intervals: Vec<f64> = samples
@@ -4405,12 +4417,15 @@ pub fn cadence(window: &[(u64, usize, String)]) -> Vec<CadenceFinding> {
         // so the interval baseline needs one fewer sample than the size
         // baseline to cover the same set of tested writes.
         let interval_baseline = CADENCE_BASELINE.saturating_sub(1);
-        for (_, z) in z_outliers(&intervals, interval_baseline) {
-            findings.push(CadenceFinding {
-                writer: writer.to_string(),
-                reason: CadenceReason::Interval,
-                z_score: z,
-            });
+        for (k, z) in z_outliers(&intervals, interval_baseline) {
+            if z < 0.0 {
+                findings.push(CadenceFinding {
+                    writer: writer.to_string(),
+                    reason: CadenceReason::Interval,
+                    z_score: z,
+                    at: samples[k + 1].0,
+                });
+            }
         }
     }
     findings
@@ -4428,6 +4443,7 @@ pub fn cadence_for_shared(
     state: &StateDir,
     slug: &str,
     cfg: &CtxConfig,
+    now: u64,
 ) -> Vec<CadenceFinding> {
     let mut entries = list_scoped(MemoryScope::Shared, repo, state, slug, cfg).unwrap_or_default();
     entries.sort_by_key(|(_, entry)| entry.written);
@@ -4435,7 +4451,9 @@ pub fn cadence_for_shared(
         .into_iter()
         .map(|(_, entry)| (entry.written, entry.body.len(), entry.written_by))
         .collect();
-    cadence(&window)
+    let mut findings = cadence(&window);
+    findings.retain(|finding| finding.at.saturating_add(CADENCE_RECENT_SECS) >= now);
+    findings
 }
 
 #[cfg(test)]
@@ -11139,6 +11157,53 @@ This is part of the body too.\n";
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         let state = StateDir::from_root(dir.path().join("state"));
         let cfg = CtxConfig::default();
-        assert!(cadence_for_shared(&repo, &state, "slug", &cfg).is_empty());
+        assert!(cadence_for_shared(&repo, &state, "slug", &cfg, 1_000).is_empty());
+    }
+
+    /// An overnight gap after bulk writes scored z=583 as a "long pause" and was reported as
+    /// bursty. Only bursts are findings now; the same window with the gap yields none, and a
+    /// finding older than the recency window is dropped by `cadence_for_shared`.
+    #[test]
+    fn a_long_pause_after_batched_writes_is_not_a_burst() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        // A bulk batch lands within seconds (intervals 0 and 1), then nothing for 18.2 h.
+        let mut ts = 1_000u64;
+        for i in 0..12 {
+            window.push((ts, 200, "claude".to_string()));
+            ts += i % 2;
+        }
+        ts += 65_520;
+        window.push((ts, 200, "claude".to_string()));
+        let findings = cadence(&window);
+        assert!(findings.is_empty(), "a pause is not a burst: {findings:?}");
+        let migration: Vec<_> = window
+            .iter()
+            .map(|(t, b, _)| (*t, *b * 100, "setup-migration".to_string()))
+            .collect();
+        let mut spiky = migration.clone();
+        spiky.push((ts + 1, 90_000, "setup-migration".to_string()));
+        assert!(cadence(&spiky).is_empty(), "migration writers are exempt");
+    }
+
+    #[test]
+    fn a_burst_finding_carries_its_write_time() {
+        let mut window: Vec<(u64, usize, String)> = Vec::new();
+        let mut ts = 1_000u64;
+        for _ in 0..40 {
+            window.push((ts, 200, "worker-a".to_string()));
+            ts += 60;
+        }
+        for _ in 0..10 {
+            window.push((ts, 20_000, "worker-a".to_string()));
+            ts += 1;
+        }
+        let findings = cadence(&window);
+        let last = findings
+            .iter()
+            .map(|f| f.at)
+            .max()
+            .expect("a burst finding");
+        assert!(last > 1_000 + 40 * 60 && last <= ts);
+        assert!(findings.iter().all(|f| f.at > 1_000 + 40 * 60));
     }
 }
