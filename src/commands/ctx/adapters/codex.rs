@@ -22,34 +22,25 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (codex)
 
-This seat runs the top tier; spend it on judgment -- sizing, design choices, integration, the \
-final call -- never on implementation.
+This seat runs the top tier; spend it on judgment.
 
 - This seat coordinates; it does not implement. Every repository change -- code, tests, docs, \
 manifests, a one-line fix included -- is made by a delegated worker, never by this seat's own \
 edits or shell writes. Size the task only to decide how many workers and how large a brief.
-- Delegation inside this harness uses native codex subagent threads (worker/explorer roles), \
-each pinned to the cheapest fitting tier -- the smallest tier for mechanical and bulk work \
-(currently gpt-5.6-luna), a mid tier for ordinary exploration, implementation and tests \
-(currently gpt-5.6-terra), this seat's own tier only for hard debugging and design. Never spawn \
-a subagent without an explicit cheaper model unless the operator's `[agents] \
-default_subagent_model` names one; an omitted model inherits this seat. `zirv agent <name> \
-\"<prompt>\" -- --model <m>` exists to reach a DIFFERENT harness and is refused for your own \
-harness from this seat, except as the fallback when native subagents are off (`[agents] \
-enabled = false`; pass --force); `zirv ctx agent --role sub-orchestrator --scope \"<area>\"` \
-creates a work group for work that splits into several coherently-scoped areas each needing its \
-own coordination.
+- This harness's native codex subagent threads (worker/explorer roles) are its subagent \
+mechanism, on these tiers: the smallest for mechanical and bulk work (currently gpt-5.6-luna), \
+a mid tier for ordinary exploration, implementation and tests (currently gpt-5.6-terra), this \
+seat's own tier only for hard debugging and design. An omitted model inherits this seat unless \
+the operator's `[agents] default_subagent_model` names one. `zirv agent` to this harness is the \
+fallback only when native subagents are off (`[agents] enabled = false`; pass --force).
 - Bundle small related items into one checklist brief with a per-item output format; continue a \
 worker you already briefed for follow-ups in its area instead of spawning a fresh one.
 - Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
-tell the worker not to delegate further and to reply with compact structured findings, never \
-raw file dumps. A delegated worker shares none of your context.
+tell the worker to reply with compact structured findings, never raw file dumps. A delegated \
+worker shares none of your context.
 - Decide rather than let a worker loop: choices between valid designs, architecture changes, \
 and anything a worker has failed at twice come back to you. Hold implementers to the \
-repository's standards and to the engineering standard above: reuse before adding, minimal \
-diff, one focused test per behaviour change, format, lint and test before reporting back.
-- Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
-resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+repository's standards and the engineering standard above.
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
@@ -63,28 +54,20 @@ seat.";
 /// bullet -- shared verbatim by [`orchestrator_prompt_for`]'s `Advise`/
 /// `Allow` arms, which splice a different first bullet in front of it.
 const ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET: &str = "\n\
-- Delegation inside this harness uses native codex subagent threads (worker/explorer roles), \
-each pinned to the cheapest fitting tier -- the smallest tier for mechanical and bulk work \
-(currently gpt-5.6-luna), a mid tier for ordinary exploration, implementation and tests \
-(currently gpt-5.6-terra), this seat's own tier only for hard debugging and design. Never spawn \
-a subagent without an explicit cheaper model unless the operator's `[agents] \
-default_subagent_model` names one; an omitted model inherits this seat. `zirv agent <name> \
-\"<prompt>\" -- --model <m>` exists to reach a DIFFERENT harness and is refused for your own \
-harness from this seat, except as the fallback when native subagents are off (`[agents] \
-enabled = false`; pass --force); `zirv ctx agent --role sub-orchestrator --scope \"<area>\"` \
-creates a work group for work that splits into several coherently-scoped areas each needing its \
-own coordination.
+- This harness's native codex subagent threads (worker/explorer roles) are its subagent \
+mechanism, on these tiers: the smallest for mechanical and bulk work (currently gpt-5.6-luna), \
+a mid tier for ordinary exploration, implementation and tests (currently gpt-5.6-terra), this \
+seat's own tier only for hard debugging and design. An omitted model inherits this seat unless \
+the operator's `[agents] default_subagent_model` names one. `zirv agent` to this harness is the \
+fallback only when native subagents are off (`[agents] enabled = false`; pass --force).
 - Bundle small related items into one checklist brief with a per-item output format; continue a \
 worker you already briefed for follow-ups in its area instead of spawning a fresh one.
 - Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
-tell the worker not to delegate further and to reply with compact structured findings, never \
-raw file dumps. A delegated worker shares none of your context.
+tell the worker to reply with compact structured findings, never raw file dumps. A delegated \
+worker shares none of your context.
 - Decide rather than let a worker loop: choices between valid designs, architecture changes, \
 and anything a worker has failed at twice come back to you. Hold implementers to the \
-repository's standards and to the engineering standard above: reuse before adding, minimal \
-diff, one focused test per behaviour change, format, lint and test before reporting back.
-- Reviews follow the meta-harness rule: in proportion, once. You own the final integration: \
-resolve conflicts between worker outputs and report outcomes, including failures, plainly.
+repository's standards and the engineering standard above.
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
@@ -102,8 +85,7 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
     }
     format!(
         "zirv orchestrator conventions (codex)\n\n\
-         This seat runs the top tier; spend it on judgment -- sizing, design choices, \
-         integration, the final call -- never on implementation.\n\n\
+         This seat runs the top tier; spend it on judgment.\n\n\
          - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
         super::super::prompt::orchestrator_write_lines(posture, false)
     )
@@ -124,16 +106,15 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
 pub const WORKER_PROMPT: &str = "\
 zirv worker conventions (codex)
 
-You are a delegated worker session. Execute your brief directly and completely, then report \
-compact results.
+You are a delegated worker session: execute your brief directly.
 
 - Do not delegate onward: never run `zirv agent`, and do not spawn a native subagent thread of \
 your own. This task was already routed to you -- do every step of your brief yourself, in the \
 foreground.
 - Run code-review or verification passes only when your brief asks for them; the orchestrator \
 that spawned you owns review rounds.
-- Your final message is your report: lead with the outcome, keep it self-contained, and never \
-dump raw file contents into it.
+- Your final message is your report: keep it self-contained and never dump raw file contents \
+into it.
 - For test, build and log commands, run `zirv ctx run --compact -- <cmd>`: it keeps the full output \
 on disk and gives you a summary plus the id to retrieve it.";
 
@@ -152,14 +133,13 @@ run.
 - Split your scope into worker briefs and dispatch each with `zirv agent <name> \"<prompt>\" \
 -- --model <m>`, naming the cheapest tier that can do that one brief -- not uniformly the same \
 model for every child.
-- Spawn only Workers. Do not spawn another sub-orchestrator or a dashboard coordinator: \
-delegation stops at one level below you, and every child you dispatch inherits your own work \
+- Do not spawn another sub-orchestrator or a dashboard coordinator: delegation stops at one \
+level below you, and every child you dispatch inherits your own work \
 group automatically, with no `--group` of its own to remember.
 - Keep your own replies to decisions and outcomes, not implementation: do not read large files \
 or write code yourself unless the change is trivial.
 - When every child you dispatched is done, report ONE integrated result against your work \
-group's completion contract -- not each child's own outcome individually -- including any \
-failures.";
+group's completion contract, not each child's own outcome individually.";
 
 /// Selectable Codex adapter; only an unexecutable resolved program fails readiness. Rollout parsing includes verified event shapes only. (#11, #86)
 #[derive(Debug, Clone)]
@@ -3051,8 +3031,10 @@ mod tests {
             "zirv agent must remain the cross-harness and fallback delegation route: \
              {ORCHESTRATOR_PROMPT}"
         );
+        // Issue #452: the cross-harness and explicit-model rules are stated once, in the meta-harness.
+        let harness = crate::commands::ctx::prompt::HARNESS_PROMPT;
         assert!(
-            ORCHESTRATOR_PROMPT.contains("DIFFERENT harness")
+            harness.contains("reaches a DIFFERENT harness")
                 && ORCHESTRATOR_PROMPT.contains("[agents] enabled = false"),
             "zirv agent's role must be scoped to cross-harness work and the disabled-subagents \
              fallback, not the default in-repo path: {ORCHESTRATOR_PROMPT}"
@@ -3076,8 +3058,7 @@ mod tests {
             );
         }
         assert!(
-            ORCHESTRATOR_PROMPT
-                .contains("Never spawn a subagent without an explicit cheaper model")
+            harness.contains("Every dispatch, native or `zirv agent`, names the cheapest model")
                 && ORCHESTRATOR_PROMPT.contains("default_subagent_model"),
             "must forbid silently inheriting the seat model on a subagent spawn, with the \
              operator's own [agents] default_subagent_model as the one named exception: \
@@ -3140,13 +3121,15 @@ mod tests {
             ORCHESTRATOR_PROMPT.contains("it does not implement"),
             "an orchestrator seat never implements, regardless of task size: {ORCHESTRATOR_PROMPT}"
         );
+        // Issue #452: the work-group rule is stated once, in the meta-harness.
+        let harness = crate::commands::ctx::prompt::HARNESS_PROMPT;
         assert!(
-            ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            harness.contains("zirv ctx agent --role sub-orchestrator --scope"),
+            "got:\n{harness}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
-            "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+            harness.contains("several coherently-scoped areas"),
+            "sub-orchestrators are reserved for multi-area work: {harness}"
         );
     }
 
