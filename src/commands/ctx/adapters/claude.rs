@@ -120,7 +120,8 @@ const LEAN_UNUSED_TOOLS: [&str; 4] = [
 /// Appended to the orchestrator layer only when zirv's plugin attaches to the launch.
 const PLUGIN_WORKER_ROUTING: &str = "- Dispatch implementation, test, doc and review workers with \
 `subagent_type: \"zirv:worker\"` (a lean general-purpose worker without the Artifact and Agent tools), \
-still naming a model per the tiers above.";
+still naming a model per the tiers above; a worker that must publish an artifact is dispatched as \
+`general-purpose` instead, which keeps `Artifact`.";
 
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
