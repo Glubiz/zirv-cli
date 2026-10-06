@@ -805,6 +805,19 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
+    /// `default_sandbox_args` for a launch whose prompt role is known; adapters that narrow the tool surface by role override it.
+    fn default_sandbox_args_for_role(
+        &self,
+        sandbox: &super::config::SandboxConfig,
+        safety: &super::safety::SafetyPolicy,
+        network_allowlist: &[super::policy::NetworkTarget],
+        mode: LaunchMode,
+        role: Option<super::prompt::PromptRole>,
+    ) -> Vec<String> {
+        let _ = role;
+        self.default_sandbox_args(sandbox, safety, network_allowlist, mode)
+    }
+
     /// Add only launch-specific worktree and zirv state roots, using the adapter's verified CLI mechanism at the actual spawn seam.
     /// Caller contract: only call for a launch that is actually happening, never
     /// speculatively. The state roots are `StateDir::workload_writable_dirs`,
@@ -1982,11 +1995,12 @@ mod tests {
                     "{argv:?}"
                 );
             } else if resolved_cfg.sandbox.enabled {
-                let sandbox_args = adapter.default_sandbox_args(
+                let sandbox_args = adapter.default_sandbox_args_for_role(
                     &resolved_cfg.sandbox,
                     &resolved_cfg.safety,
                     &[],
                     LaunchMode::Headless,
+                    Some(crate::commands::ctx::prompt::PromptRole::Worker),
                 );
                 if !sandbox_args.is_empty() {
                     let sandbox_pos = find_subsequence(&argv, &sandbox_args).unwrap_or_else(|| {
