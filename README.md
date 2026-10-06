@@ -2834,6 +2834,16 @@ use it. Repository skills are never registered with the host -- their
 descriptions are repository-authored, untrusted text -- and stay reachable
 through the standing skill index only.
 
+The same plugin directory also carries a lean `worker` agent
+(`agents/worker.md`, dispatched as `subagent_type: "zirv:worker"`): the
+built-in `general-purpose` body verbatim, with `Artifact`, `Agent` and a few
+other tools a delegated worker never needs removed through `disallowedTools`
+(the `Artifact` definition alone is ~13.7k tokens per subagent). An
+orchestrator seat's prompt names it only when the plugin actually attaches to
+that launch, and the expensive-seat guard and dispatch-tier right-sizing treat
+it like `general-purpose` (an omitted model is denied or filled in; an
+explicit model is honoured).
+
 A dispatched Claude Code subagent (the `Agent`/`Task` tool) never inherits its
 parent's system prompt, so the standing skill index above never reaches it.
 `zirv ctx hook pretool` closes that gap: for any zirv-supervised session

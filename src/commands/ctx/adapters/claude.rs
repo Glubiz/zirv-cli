@@ -109,6 +109,11 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
     )
 }
 
+/// Appended to the orchestrator layer only when zirv's plugin attaches to the launch.
+const PLUGIN_WORKER_ROUTING: &str = "- Dispatch implementation, test, doc and review workers with \
+`subagent_type: \"zirv:worker\"` (a lean general-purpose worker without the Artifact and Agent tools), \
+still naming a model per the tiers above.";
+
 /// Claude's own layer for a delegated **Worker** session (see
 /// `AgentAdapter::worker_system_prompt`), spliced in place of
 /// [`ORCHESTRATOR_PROMPT`] for `PromptRole::Worker`. A worker never gets that
@@ -2905,6 +2910,10 @@ impl AgentAdapter for ClaudeAdapter {
             Some(dir) => vec!["--plugin-dir".to_string(), dir.display().to_string()],
             None => Vec::new(),
         }
+    }
+
+    fn plugin_worker_routing(&self) -> Option<&'static str> {
+        Some(PLUGIN_WORKER_ROUTING)
     }
 
     /// Use the catalogue Standard tier only when the operator has no worker model override, avoiding inheritance of the interactive seat model.

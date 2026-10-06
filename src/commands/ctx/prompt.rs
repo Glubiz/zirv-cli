@@ -1576,7 +1576,14 @@ fn adapter_layer_for(
     cfg: &PromptConfig,
 ) -> Option<String> {
     match role {
-        PromptRole::Orchestrator => adapter.base_system_prompt(cfg.orchestrator_writes),
+        PromptRole::Orchestrator => {
+            adapter
+                .base_system_prompt(cfg.orchestrator_writes)
+                .map(|layer| match adapter.plugin_worker_routing() {
+                    Some(routing) if cfg.skill_index_native => format!("{layer}\n{routing}"),
+                    _ => layer,
+                })
+        }
         PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
         PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
         // Single is neither dispatched nor delegating, so no adapter role layer applies (#537).
@@ -7443,6 +7450,20 @@ mod tests {
     /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
     /// together with `with_workflow_layer`, directly against the extracted
     /// function instead. Issue #537 (T3) widened the gate to also admit
+    #[test]
+    fn the_orchestrator_layer_routes_to_the_plugin_worker_only_when_the_plugin_attaches() {
+        for (attached, want) in [(true, true), (false, false)] {
+            let cfg = PromptConfig {
+                skill_index_native: attached,
+                ..PromptConfig::default()
+            };
+            let layer =
+                adapter_layer_for(&ClaudeAdapter::new(None), PromptRole::Orchestrator, &cfg)
+                    .expect("claude orchestrator layer");
+            assert_eq!(layer.contains("zirv:worker"), want, "attached={attached}");
+        }
+    }
+
     /// A registered session sees only the workflow bound to it: the repo-wide pointer must not
     /// inject another session's (possibly long-finished) task into it.
     #[test]
