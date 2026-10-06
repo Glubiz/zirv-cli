@@ -3,14 +3,16 @@
 Goal: cut wall time and/or cost of zirv-wrapped headless sessions, or raise
 quality, without lowering hidden-test pass rate or judge score.
 
-Outcome: one lever cleared the operator's bar (>=4% on time, cost or quality,
-same direction in two independent rounds) and was implemented: headless
-effort `low` by default (cost -10.1%, agent time -8.9%, hidden tests +1.1 pts,
-judge -1.75 pts). The worker-prompt rules (part 1) and chain compaction
-(part 2) did not clear it.
+Outcome: two levers cleared the operator's bar (>=4% on time, cost or quality,
+same direction in independent rounds) and were implemented: headless effort
+`low` by default (cost -10.1%, agent time -8.9%, judge -1.75 pts; validated
+again in part 3) and headless cache TTL `5m` by default (cost -18%, two
+rounds; 222 recorded sessions -17% to -22%). `lean` cleared it too (-9.6% cost,
+quality unchanged) but stays opt-in pending the operator. The worker-prompt
+rules (part 1) and chain compaction (part 2) did not clear it.
 
 Part 1 (worker-prompt rules on the XL grid) is below; part 2 (chains and
-effort) follows it.
+effort) and part 3 (macOS validation, headless levers) follow it.
 
 ## Setup
 
@@ -97,3 +99,42 @@ operator value, `ZIRV_CTX_HEADLESS_EFFORT_*`, `CLAUDE_CODE_EFFORT_LEVEL` or
   re-run t23/t24b with more reps to settle the chain effect of `low`.
 - Compaction only pays when contexts are far above the point where the
   summary turn and re-reads are amortised; t24b at 160k is not that point.
+
+## Part 3: validation on macOS and the headless levers (2026-10-06)
+
+Setup: macOS, zirv 4.54.0 built from this branch, Claude Code 2.1.291, sonnet,
+`zirv-nojev`, XL t13-t22 x 2 reps per arm, `--parallel 1 --stagger-s 30
+--noninteractive`, bench root outside `$HOME`, launched from `env -i` with
+pace, supervisor and memory harvest off. A harness copy took `FAFO_EFFORT`
+(`unset` = no effort env, so the built default applies) and `FAFO_LEVERS=off`
+(no TTL or lean env). Analysis: `reprice.py` in this folder (paired bootstrap
+over the 10 tasks, cache writes repriced at one TTL; reconstruction of
+`total_cost_usd` is exact for every run). Spend: 100 XL runs plus about 60
+Haiku one-turn probes; the 5-hour window went from 26% to 69% (all session
+activity included).
+
+Arms: A = built default (effort low by default; harness 5m TTL + lean),
+M = A with effort `medium`, S = shipped defaults (no TTL or lean env, built
+default effort). Round G ran A, M, S together; round H replicated A and S.
+
+| ID | hypothesis | probe / baseline | evidence | outcome |
+|---|---|---|---|---|
+| X0 | zirv's per-launch overhead (MCP wait, hooks, post-exit writes; 3.66 s vs 1.19 s bare in r8) still has >= 2 s to cut | 6 one-turn Haiku launches per arm: bare `claude -p`, zirv, zirv without its MCP server, without claude.ai connectors, with `MCP_CONNECTION_NONBLOCKING` | wrapper overhead now 1.91 s vs 1.41 s bare (+0.5 s, all before Claude's first transcript line); the 1.65 s queue-to-user stall is gone (0.02 s); no zirv post-exit cost; no MCP server -383 tokens; connectors 0; non-blocking -0.44 s from one outlier | rejected: about 1% of an XL run |
+| X2 | a 5m cache TTL beats Claude Code's 1h default on real headless work | reprice 222 recorded `sdk-cli` sessions (last 30 days) at 5m and 1h, no spend | no request gap > 5 min (p99 51 s); real -21.9% (-17.2% charging cold shared prefixes), bench -24.4%; 0 of 169 real sessions lose; reconciliation 1.000 | supported for short sessions; long or resumed workers absent from the data |
+| V1 | the built 4.54.0 default (low) keeps the E/F result | G: A vs M | M - A: cost +6.6% [-0.8%, +15%], agent time +6.6% n.s., output +9.5%*, judge +2.0*; against A pooled over G+H: cost +6.3%*, wall +12.6%*, judge +1.75* | validated: third round, same direction and trade-off |
+| L1 | the harness's forced levers (5m TTL + lean) are worth shipping | S vs A, G and H | S - A total cost: G +37.3%*, H +30.7%*, pooled +33.5%*; wall, agent time, tests, judge n.s. in both rounds | supported; split below |
+| L1a | 5m TTL alone | S repriced at 1h vs 5m | -17.8% (G), -18.0% (H): writes bill 1.25x instead of 2x input, every gap < 5 min | **success, implemented**: `[headless] prompt_cache_ttl` defaults to "5m" |
+| L1b | lean alone | S - A at equal (5m) pricing | G +12.9%*, H +7.2% (CI touches 0), pooled +9.6%*; write tokens +15.4%* (both rounds *); judge +1.0, tests -0.1 n.s. | clears 4% with quality unchanged; left opt-in (behaviour change: auto-memory, bundled skills and Workflow off) pending the operator |
+
+Side findings:
+- Four runs (A and M, t13/t14 rep 2) were excluded: a ~50-minute
+  network outage (Claude: `ENOTFOUND`) stalled every arm from 12:31 to 13:20
+  UTC; S was between runs. The harness's timeout kill left the `claude` child
+  running until the network returned.
+- The orchestrator write guard denies a relative write after `cd` into `/tmp`
+  (#883); the supervisor's helper reply failed to parse once (#877).
+- Bench numbers include lean, which is not a shipped default: the harness
+  still forces it.
+
+Next probe: a headless worker workload with tool calls longer than 5 minutes
+(or `--resume` after a pause) to price the 5m TTL's downside directly.
