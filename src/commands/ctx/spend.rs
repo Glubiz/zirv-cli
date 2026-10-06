@@ -393,8 +393,10 @@ pub fn run_with<W: Write>(
         session: None,
         ..args.clone()
     };
+    // A cached Jev hit made no request and cost nothing, so it is not a run (#452).
     let rows: Vec<DelegationRow> = super::log::read_delegations(state, usize::MAX)
         .into_iter()
+        .filter(|row| !row.cached)
         .filter(|row| {
             matches_filters(row, args, now)
                 || (aliased.contains(&row.session) && matches_filters(row, &unscoped, now))
@@ -907,5 +909,57 @@ mod tests {
             text.contains("$2.00"),
             "only the aliased row counts: {text}"
         );
+    }
+
+    /// #452: a cached Jev answer made no request, so it is not a run.
+    #[test]
+    fn cached_jev_hits_are_not_counted_as_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        for (input_tokens, cached) in [(900, false), (0, true), (0, true)] {
+            crate::commands::ctx::log::append_delegation_cached(
+                &state,
+                &crate::commands::ctx::log::Delegation {
+                    ts: 1_700_000_000,
+                    session: "s",
+                    parent_session: "",
+                    work_group_id: None,
+                    agent: "typesafe",
+                    model: Some("jev-1.13.0"),
+                    input_tokens,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                    wall_ms: 300,
+                    exit_code: 0,
+                    outcome: "ok",
+                    mode: None,
+                    task_class: None,
+                    principal: "root",
+                    envelope_sha256: None,
+                },
+                cached,
+            )
+            .expect("append");
+        }
+        let args = SpendArgs {
+            session: None,
+            group: None,
+            since: None,
+            by: SpendDimension::Harness,
+            json: true,
+        };
+        let mut out = Vec::new();
+        run_with(
+            &state,
+            &CtxConfig::default(),
+            &args,
+            &mut out,
+            1_700_000_100,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["total"]["runs"], 1, "{text}");
     }
 }

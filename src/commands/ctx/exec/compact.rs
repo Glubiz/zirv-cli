@@ -572,6 +572,7 @@ healthy
 
     #[test]
     fn an_unverified_compaction_falls_through_to_restart_with_the_reason() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");

@@ -639,7 +639,7 @@ canonical context: common     4080     1020
 canonical context: claude     3143      786
 memory: core                  2045      511
 total (session prefix)       19170     4793
-per-turn hook context           89       22  paid uncached every user turn
+per-turn hook context           89       22  stable text: read from cache after its first turn
 ~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)
 
 $ zirv ctx compile --agent codex --measure
@@ -651,7 +651,7 @@ canonical context: common     4080     1020
 canonical context: codex      2528      632
 memory: core                  2045      511
 total (session prefix)       18555     4639
-per-turn hook context           89       22  paid uncached every user turn
+per-turn hook context           89       22  stable text: read from cache after its first turn
 ~tokens = bytes / 4 (estimate; cache reads bill this prefix every turn)
 ```
 
@@ -844,7 +844,8 @@ enough to embed verbatim:
 | Before | "Start every final answer in this session with the prefix [zirv] on the first line. Mid-turn status notes do not need it. This is a context-health marker read by zirv ctx." | 170 | 42 |
 | After | "Prefix each final answer with [zirv] on line 1 (mid-turn exempt): zirv ctx health marker." | 89 | 26 |
 
-Δ16 tokens (38.1%), paid uncached on every single user turn — smaller in
+Δ16 tokens (38.1%), carried on every single user turn (the text is stable, so
+it is read from cache after its first turn) — smaller in
 absolute terms than the dedupe row, but the only row in this table whose
 saving repeats every turn rather than once per session.
 

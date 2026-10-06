@@ -1193,7 +1193,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
             }
         }
         WorkflowSubcommand::Classify(args) => {
-            let classification = classify::from_args(args)?;
+            let classification = classify::from_plan_args(args)?;
             // Registry selection is best-effort; an unreadable registry must not break classify. (#542)
             let repo = resolve_repo(args.repo.as_deref())?;
             // Derive profile from the same classification; optional Jev refinement precedes pack selection and leaves defaults intact when unavailable. (#541, #782)
@@ -3267,6 +3267,34 @@ mod tests {
             error.contains("cannot resume") && error.contains("Closed"),
             "{error}"
         );
+    }
+
+    /// #452: `zirv workflow classify` sizes the change like `workflow start` does, so an untracked
+    /// `.DS_Store` is not part of it.
+    #[test]
+    fn classify_ignores_untracked_files_like_start() {
+        let home = tempdir().unwrap();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = git_repo_with_pending_files(0);
+        std::fs::write(repo.path().join(".DS_Store"), "junk\n").unwrap();
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Classify(classify::ClassifyArgs {
+                task: "fix the dashboard".into(),
+                paths: Vec::new(),
+                changed_lines: None,
+                tests_changed: false,
+                intent: None,
+                complexity: None,
+                risk: None,
+                repo: Some(repo.path().to_path_buf()),
+                branch: None,
+                json: true,
+            }),
+        };
+        let mut out = Vec::new();
+        run(&args, &mut out).expect("classify runs");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(value["changed_files"], 0, "{value}");
     }
 
     /// A committed repository with a few pending (untracked) files, so

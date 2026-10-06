@@ -29,41 +29,31 @@ use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 pub const ORCHESTRATOR_PROMPT: &str = "\
 zirv orchestrator conventions (claude)
 
-This seat runs the most capable model; spend it on judgment -- sizing, design choices, \
-integration, the final call -- never on implementation.
+This seat runs the most capable model; spend it on judgment.
 
 - This seat coordinates; it does not implement. Every repository change -- code, tests, docs, \
 manifests, a one-line fix included -- is made by a delegated worker, never by this seat's own \
 Edit/Write or a shell write: a PreToolUse hook denies repository writes from this seat, and \
 that denial is the cue to dispatch, not to retry another way. Size the task only to decide how \
 many workers and how large a brief.
-- Routing rule, which outranks any operator or repository layer that says otherwise: \
-same-harness delegation uses this harness's native Agent tool (visible in this session, result \
-returned directly); `zirv agent <name>` is for reaching a different harness or a work group, never \
-for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
-agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
-several coherently-scoped areas each needing its own coordination. Delegated work stays \
-observable: a worker attaches as a pane to any live dashboard, otherwise it runs inline in the \
-caller's terminal with its result on stdout. Bundle small related items into one checklist brief with a per-item \
-output format, dispatch independent work together in the background, and continue a worker you \
-already briefed for follow-ups in its area instead of spawning a fresh one.
-- Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
-for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
-design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
-here; forks always inherit the seat model. Agents in .claude/agents that pin their own model \
-keep it, except that reviews always run on the roster's review model.
+- Routing rule, which outranks any operator or repository layer that says otherwise: the \
+meta-harness delegation bullet below; inside this harness that means the native Agent tool \
+(visible in this session, result returned directly). Bundle small related items into one \
+checklist brief with a per-item output format, dispatch independent work together in the \
+background, and continue a worker you already briefed for follow-ups in its area instead of \
+spawning a fresh one.
+- Agent dispatch tiers: haiku for mechanical and bulk work, sonnet for ordinary exploration, \
+implementation, tests and review, opus only for hard debugging or design; an omitted model \
+inherits this seat. Never use `subagent_type: \"fork\"` here; forks always inherit the seat \
+model. Agents in .claude/agents that pin their own model keep it.
 - Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
 tell the worker to run tests in the FOREGROUND and reply with compact structured findings, \
 never raw file dumps. Subagents share none of your context.
 - Decide rather than let a worker loop: choices between valid designs, architecture changes, \
 and anything a worker has failed at twice come back to you. Hold implementers to the \
-repository's standards and to the engineering standard above: reuse before adding, minimal \
-diff, one focused test per behaviour change, format, lint and test before reporting back.
-- Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
-runs at low or medium effort on the roster's review model, never high or above (that forks \
-this seat's model), and never when a `zirv workflow` review gate covers the change. Its paired \
-simplify pass is one Agent worker on that same review model that loads the zirv `simplify` \
-skill (`zirv skill load simplify`), never this seat.
+repository's standards and the engineering standard above.
+- This harness's own /code-review runs at low or medium effort, never high or above (that \
+forks this seat's model).
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
@@ -77,33 +67,24 @@ seat.";
 /// bullet -- shared verbatim by [`orchestrator_prompt_for`]'s `Advise`/
 /// `Allow` arms, which splice a different first bullet in front of it.
 const ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET: &str = "\n\
-- Routing rule, which outranks any operator or repository layer that says otherwise: \
-same-harness delegation uses this harness's native Agent tool (visible in this session, result \
-returned directly); `zirv agent <name>` is for reaching a different harness or a work group, never \
-for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
-agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
-several coherently-scoped areas each needing its own coordination. Delegated work stays \
-observable: a worker attaches as a pane to any live dashboard, otherwise it runs inline in the \
-caller's terminal with its result on stdout. Bundle small related items into one checklist brief with a per-item \
-output format, dispatch independent work together in the background, and continue a worker you \
-already briefed for follow-ups in its area instead of spawning a fresh one.
-- Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
-for ordinary exploration, implementation, tests and review, opus only for hard debugging or \
-design -- because an omitted model inherits this seat. Never use `subagent_type: \"fork\"` \
-here; forks always inherit the seat model. Agents in .claude/agents that pin their own model \
-keep it, except that reviews always run on the roster's review model.
+- Routing rule, which outranks any operator or repository layer that says otherwise: the \
+meta-harness delegation bullet below; inside this harness that means the native Agent tool \
+(visible in this session, result returned directly). Bundle small related items into one \
+checklist brief with a per-item output format, dispatch independent work together in the \
+background, and continue a worker you already briefed for follow-ups in its area instead of \
+spawning a fresh one.
+- Agent dispatch tiers: haiku for mechanical and bulk work, sonnet for ordinary exploration, \
+implementation, tests and review, opus only for hard debugging or design; an omitted model \
+inherits this seat. Never use `subagent_type: \"fork\"` here; forks always inherit the seat \
+model. Agents in .claude/agents that pin their own model keep it.
 - Briefs are self-contained -- goal, constraints, relevant paths, exact output format -- and \
 tell the worker to run tests in the FOREGROUND and reply with compact structured findings, \
 never raw file dumps. Subagents share none of your context.
 - Decide rather than let a worker loop: choices between valid designs, architecture changes, \
 and anything a worker has failed at twice come back to you. Hold implementers to the \
-repository's standards and to the engineering standard above: reuse before adding, minimal \
-diff, one focused test per behaviour change, format, lint and test before reporting back.
-- Reviews follow the meta-harness rule: in proportion, once. This harness's own /code-review \
-runs at low or medium effort on the roster's review model, never high or above (that forks \
-this seat's model), and never when a `zirv workflow` review gate covers the change. Its paired \
-simplify pass is one Agent worker on that same review model that loads the zirv `simplify` \
-skill (`zirv skill load simplify`), never this seat.
+repository's standards and the engineering standard above.
+- This harness's own /code-review runs at low or medium effort, never high or above (that \
+forks this seat's model).
 - Before delegating substantial work, run `zirv workflow team plan \"<objective>\" --json` and \
 spawn only the seats it returns, briefing each from `zirv workflow team brief <seat>` and \
 honoring its authority, independence and omissions; `--seat <id>` overrides for a deliberate \
@@ -122,8 +103,7 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
     }
     format!(
         "zirv orchestrator conventions (claude)\n\n\
-         This seat runs the most capable model; spend it on judgment -- sizing, design \
-         choices, integration, the final call -- never on implementation.\n\n\
+         This seat runs the most capable model; spend it on judgment.\n\n\
          - {}{ORCHESTRATOR_PROMPT_TAIL_AFTER_WRITE_GUARD_BULLET}",
         super::super::prompt::orchestrator_write_lines(posture, true)
     )
@@ -139,18 +119,14 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
 pub const WORKER_PROMPT: &str = "\
 zirv worker conventions (claude)
 
-You are a delegated worker session. Execute your brief directly and completely, then report \
-compact results.
+You are a delegated worker session: execute your brief directly.
 
-- Do not delegate onward: never run `zirv agent` or spawn further zirv workers; this task was \
-already routed to you.
-- If you use subagents for fan-out within your task, set each dispatch's model explicitly to the \
-cheapest one that can do the job, never one above your own session's model, and never use \
-fork-type subagents, which inherit this session's model and ignore overrides.
+- Do not delegate onward: never run `zirv agent`, and never spawn agents, teammates or forks; \
+this task was already routed to you.
 - Run code-review or verification passes only when your brief asks for them; the orchestrator that \
 spawned you owns review rounds.
-- Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
-raw file contents into it.
+- Your final message is your report: keep it self-contained and never dump raw file contents \
+into it.
 - For test, build and log commands, run `zirv ctx run --compact -- <cmd>`: it keeps the full output \
 on disk and gives you a summary plus the id to retrieve it.";
 
@@ -165,13 +141,13 @@ work group with its own budget and completion contract. You do not decide which 
 - Split your scope into worker briefs and dispatch each with `zirv agent <name> \"<prompt>\" -- \
 --model <m>`, naming the cheapest tier that can do that one brief -- not uniformly the same model \
 for every child.
-- Spawn only Workers. Do not spawn another sub-orchestrator or a dashboard coordinator: delegation \
-stops at one level below you, and every child you dispatch inherits your own work group \
+- Do not spawn another sub-orchestrator or a dashboard coordinator: delegation stops at one \
+level below you, and every child you dispatch inherits your own work group \
 automatically, with no `--group` of its own to remember.
 - Keep your own replies to decisions and outcomes, not implementation: do not read large files or \
 write code yourself unless the change is trivial.
 - When every child you dispatched is done, report ONE integrated result against your work group's \
-completion contract -- not each child's own outcome individually -- including any failures.";
+completion contract, not each child's own outcome individually.";
 
 /// The raw text of a `tool_result` block's `content`, falling back to a
 /// JSON-stringified form for a non-string (array/object) content shape.
@@ -1255,6 +1231,7 @@ impl ClaudeAdapter {
         safety: &super::super::safety::SafetyPolicy,
         lean: bool,
         carried: Option<(&[String], &[String])>,
+        worktree_roots: &[PathBuf],
     ) -> Option<PathBuf> {
         #[cfg(test)]
         if let Some(forced) = &self.forced_launch_settings {
@@ -1297,7 +1274,7 @@ impl ClaudeAdapter {
         } else {
             path
         };
-        let mut launch_environment = LaunchEnvironment::resolve();
+        let mut launch_environment = LaunchEnvironment::resolve(worktree_roots);
         launch_environment.supervisor = supervisor;
         launch_environment.approvals_hook_timeout = self.approvals_hook_timeout;
         launch_environment.scrub_subprocess_env = sandbox.scrub_subprocess_env;
@@ -1469,7 +1446,7 @@ struct LaunchEnvironment {
 }
 
 impl LaunchEnvironment {
-    fn resolve() -> Self {
+    fn resolve(worktree_roots: &[PathBuf]) -> Self {
         let state_write_root =
             super::super::state::StateDir::resolve(&super::super::config::env_from_process())
                 .ok()
@@ -1490,7 +1467,7 @@ impl LaunchEnvironment {
             .ok()
             .and_then(|repo| std::fs::canonicalize(repo).ok())
             .map(|repo| {
-                let mut roots = linked_worktree_roots(&repo);
+                let mut roots = worktree_roots.to_vec();
                 let home = crate::utils::home_dir().ok();
                 for root in sibling_repo_roots(&repo, home.as_deref()) {
                     if !roots.contains(&root) {
@@ -1504,7 +1481,8 @@ impl LaunchEnvironment {
             .map(|path| grant_path(path))
             .collect();
         #[cfg(test)]
-        let workspace_write_roots = Vec::new();
+        let workspace_write_roots: Vec<String> =
+            worktree_roots.iter().map(|path| grant_path(path)).collect();
 
         Self {
             state_write_root,
@@ -1855,7 +1833,6 @@ fn warn_launch_settings_once(path: &Path, error: &std::io::Error) {
 }
 
 const MAX_LINKED_WORKTREES: usize = 16;
-#[cfg(not(test))]
 const WORKTREE_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn parse_worktree_porcelain(output: &str) -> Vec<PathBuf> {
@@ -1891,21 +1868,22 @@ fn additional_worktree_roots(
 /// `additionalDirectories` instead, via [`sibling_repo_roots`] (issue #329).
 /// Discovery is best-effort, bounded, and never invokes a shell. Empty
 /// under `#[cfg(test)]`: git worktree discovery is a real subprocess call
-/// (see [`linked_worktree_roots`]), unexercised by unit tests, which use
+/// (see [`discover_worktree_roots`]), unexercised by unit tests, which use
 /// [`add_dir_edit_read_rules`] directly with fabricated paths instead.
+/// Listed fresh on every call and never memoized (a dashboard may create a worktree and launch
+/// into it at once): `default_sandbox_args` calls it once per launch and hands the list to
+/// [`LaunchEnvironment::resolve`], so a launch spawns git once.
 #[cfg(not(test))]
-fn current_worktree_grant_paths() -> Vec<String> {
+fn current_worktree_roots() -> Vec<PathBuf> {
     std::env::current_dir()
         .ok()
-        .map(|repo| linked_worktree_roots(&repo))
+        .and_then(|repo| std::fs::canonicalize(repo).ok())
+        .map(|repo| discover_worktree_roots(&repo))
         .unwrap_or_default()
-        .iter()
-        .map(|path| grant_path(path))
-        .collect()
 }
 
 #[cfg(test)]
-fn current_worktree_grant_paths() -> Vec<String> {
+fn current_worktree_roots() -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -1944,17 +1922,10 @@ fn grant_path(path: &Path) -> String {
     super::super::state::display_path(path)
 }
 
-/// The discovery half of [`current_worktree_grant_paths`], shared with
-/// [`LaunchEnvironment::resolve`] so the same bounded set that becomes a
-/// working directory also becomes a sandbox write grant (issue #329).
-#[cfg(not(test))]
-fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
-    let Ok(canonical_repo) = std::fs::canonicalize(repo) else {
-        return Vec::new();
-    };
+fn discover_worktree_roots(canonical_repo: &Path) -> Vec<PathBuf> {
     let Ok(mut child) = Command::new("git")
         .arg("-C")
-        .arg(&canonical_repo)
+        .arg(canonical_repo)
         .args(["worktree", "list", "--porcelain"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1984,7 +1955,7 @@ fn linked_worktree_roots(repo: &Path) -> Vec<PathBuf> {
                 let worktrees = parse_worktree_porcelain(&output)
                     .into_iter()
                     .filter_map(|path| std::fs::canonicalize(path).ok());
-                return additional_worktree_roots(&canonical_repo, worktrees);
+                return additional_worktree_roots(canonical_repo, worktrees);
             }
             Ok(Some(_)) => return Vec::new(),
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -2032,9 +2003,74 @@ fn probe_system_prompt_file_support(program: &str, bin_args: &[String]) -> bool 
     if let Some(cached) = map.get(&key) {
         return *cached;
     }
-    let detected = detect_help_flag(program, bin_args);
+    #[cfg(not(test))]
+    let state =
+        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok();
+    #[cfg(test)]
+    let state = None;
+    let detected = cached_help_support(state.as_ref(), program, bin_args, || {
+        detect_help_flag(program, bin_args)
+    });
     map.insert(key, detected);
     detected
+}
+
+/// Names the exact binary a help probe ran against -- path, mtime and size, plus the same for any
+/// file among `bin_args` (`node cli.js`) -- so an upgraded binary never inherits an old answer.
+fn help_probe_disk_key(program: &str, bin_args: &[String]) -> Option<String> {
+    let binary = if program.contains(['/', '\\']) {
+        PathBuf::from(program)
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())?
+    };
+    let stamp = |path: &Path| -> Option<String> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!(
+            "{}:{}:{}",
+            path.display(),
+            mtime.as_nanos(),
+            meta.len()
+        ))
+    };
+    let mut key = stamp(&binary)?;
+    for arg in bin_args {
+        key.push('\u{2}');
+        key.push_str(&stamp(Path::new(arg)).unwrap_or_else(|| arg.clone()));
+    }
+    Some(key)
+}
+
+/// Persists a positive `--help` probe through the shared probe cache (a 1 h TTL, keyed on the
+/// binary's identity), so later launches skip the ~70 ms spawn. Only "supported" is stored: a
+/// timeout or a missing binary reads as unsupported and must be looked at again.
+fn cached_help_support(
+    state: Option<&super::super::state::StateDir>,
+    program: &str,
+    bin_args: &[String],
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    use super::probe::Liveness;
+
+    let (Some(state), Some(key)) = (state, help_probe_disk_key(program, bin_args)) else {
+        return probe();
+    };
+    let mut cache = super::ProbeCache::load(state, "claude-help", super::super::state::now_secs());
+    let verdict = cache.get_or_probe(&key, || {
+        if probe() {
+            Liveness::Live
+        } else {
+            Liveness::Unknown(String::new())
+        }
+    });
+    cache.save();
+    matches!(verdict, Liveness::Live)
 }
 
 /// Verified against the real CLI (`claude --help`, v2.1.220): the flag is not
@@ -2612,9 +2648,11 @@ impl AgentAdapter for ClaudeAdapter {
     ) -> Vec<String> {
         // Issue #504: computed once, up front, so the SAME bounded worktree
         // set both widens the interactive Edit/Read allow-list below AND
-        // becomes the `--add-dir` argv at the end -- one git worktree probe,
-        // not two independently-computed (and possibly drifting) ones.
-        let worktree_grant_paths = current_worktree_grant_paths();
+        // becomes the `--add-dir` argv at the end. The launch settings take the same list, so a
+        // launch spawns git once and a worktree created a moment ago is never missed.
+        let worktree_roots = current_worktree_roots();
+        let worktree_grant_paths: Vec<String> =
+            worktree_roots.iter().map(|path| grant_path(path)).collect();
 
         // The non-`Bash(...)` surface is pre-approved in BOTH modes: file
         // scope, the harness dirs, WebFetch/WebSearch. These are outside
@@ -2778,7 +2816,7 @@ impl AgentAdapter for ClaudeAdapter {
         let carried = self
             .launches_through_cmd_shim()
             .then_some((allow_entries.as_slice(), deny_entries.as_slice()));
-        let settings = self.launch_settings_path(sandbox, safety, lean, carried);
+        let settings = self.launch_settings_path(sandbox, safety, lean, carried, &worktree_roots);
         // With no settings file to carry them, argv keeps the rules and the shim guard refuses the launch, never dropping the deny list.
         if carried.is_none() || settings.is_none() {
             args.push(format!("--allowedTools={allow}"));
@@ -5217,7 +5255,7 @@ mod tests {
         let fingerprint =
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
         let path = adapter
-            .launch_settings_path(&Default::default(), &policy, false, None)
+            .launch_settings_path(&Default::default(), &policy, false, None, &[])
             .expect("settings materialized");
         assert_eq!(
             path,
@@ -5254,7 +5292,7 @@ mod tests {
         }
         assert_eq!(
             written,
-            launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve())
+            launch_settings_value(&policy, &policy_path, &LaunchEnvironment::resolve(&[]))
                 .expect("settings")
         );
         let snapshotted: super::super::super::safety::SafetyPolicy = serde_json::from_str(
@@ -5291,10 +5329,10 @@ mod tests {
             super::super::super::safety::policy_fingerprint(&policy).expect("fingerprint");
 
         let lean_path = adapter
-            .launch_settings_path(&Default::default(), &policy, true, None)
+            .launch_settings_path(&Default::default(), &policy, true, None, &[])
             .expect("lean settings materialized");
         let plain_path = adapter
-            .launch_settings_path(&Default::default(), &policy, false, None)
+            .launch_settings_path(&Default::default(), &policy, false, None, &[])
             .expect("non-lean settings materialized");
 
         assert_ne!(
@@ -6916,12 +6954,20 @@ mod tests {
             !layer.contains("spend it on judgment"),
             "the worker layer must not carry the orchestrator's own coaching: {layer}"
         );
-        for claim in ["never run `zirv agent`", "fork-type subagents"] {
+        // Issue #452: a worker never spawns agents, teammates or forks, so no fan-out allowance.
+        for claim in [
+            "never run `zirv agent`",
+            "never spawn agents, teammates or forks",
+        ] {
             assert!(
                 layer.contains(claim),
                 "the worker layer must say '{claim}': {layer}"
             );
         }
+        assert!(
+            !layer.contains("fan-out"),
+            "the worker layer must not allow subagent fan-out: {layer}"
+        );
     }
 
     /// The trimmed coordination layer is real text, materially shorter than
@@ -7202,6 +7248,97 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_created_between_two_launches_is_seen_by_the_second() {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .expect("git")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = std::fs::canonicalize(dir.path()).expect("canonical");
+        let main = repo.join("main");
+        let wt = repo.join("wt");
+        std::fs::create_dir(&main).expect("mkdir");
+        git(&main, &["init", "-q"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let main = std::fs::canonicalize(&main).expect("canonical");
+        assert!(discover_worktree_roots(&main).is_empty());
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().expect("utf8")],
+        );
+        let second = discover_worktree_roots(&main);
+        assert_eq!(
+            second.len(),
+            1,
+            "the new worktree gets its grant: {second:?}"
+        );
+    }
+
+    /// The launch lists worktrees once and the settings layer uses that same list, rather than
+    /// listing again: whatever roots `default_sandbox_args` found are the ones granted.
+    #[test]
+    fn the_launch_settings_layer_uses_the_worktree_list_it_is_handed() {
+        let roots = [PathBuf::from("/work/wt-a")];
+        assert_eq!(
+            LaunchEnvironment::resolve(&roots).workspace_write_roots,
+            vec![grant_path(&roots[0])]
+        );
+        assert!(
+            LaunchEnvironment::resolve(&[])
+                .workspace_write_roots
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_help_probe_is_cached_on_disk_per_binary_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = super::super::super::state::StateDir::from_root(dir.path().join("state"));
+        let binary = dir.path().join("claude");
+        std::fs::write(&binary, "v1").expect("write");
+        let program = binary.display().to_string();
+        let calls = std::cell::Cell::new(0);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert_eq!(calls.get(), 1, "an unchanged binary is probed once");
+
+        std::fs::write(&binary, "version 2, different size").expect("rewrite");
+        assert!(cached_help_support(Some(&state), &program, &[], probe));
+        assert_eq!(calls.get(), 2, "a changed binary is probed again");
+
+        let unsupported = || {
+            calls.set(calls.get() + 1);
+            false
+        };
+        assert!(!cached_help_support(
+            Some(&state),
+            &program,
+            &["x".into()],
+            unsupported
+        ));
+        assert!(!cached_help_support(
+            Some(&state),
+            &program,
+            &["x".into()],
+            unsupported
+        ));
+        assert_eq!(calls.get(), 4, "an unsupported answer is never frozen");
+    }
+
+    #[test]
     fn the_prompt_args_compose_with_the_existing_command_builders() {
         let adapter = ClaudeAdapter::new(None);
         let mut extra = adapter.system_prompt_args("be consistent");
@@ -7342,23 +7479,33 @@ mod tests {
     /// configured review model rather than let it silently run on this
     /// seat's own model, must cap fan-out at a single-reviewer effort level,
     /// and the model-routing bullet's "pin" clause must carve out that one
-    /// exception rather than blanket-forbid every override.
+    /// exception rather than blanket-forbid every override. Issue #452: the
+    /// review-model rule and its precedence over the pin clause are stated
+    /// once, in the roster's own code-review line.
     #[test]
     fn the_orchestrator_prompt_routes_review_to_the_rosters_configured_model() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
+        let roster = crate::commands::ctx::adapters::harness_prompt_lines(
+            &crate::commands::ctx::config::CtxConfig::default(),
+            "claude",
+        );
+        let review_line = roster
+            .iter()
+            .find(|line| line.starts_with("- code review:"))
+            .expect("a live claude gets a review line");
         assert!(
-            ORCHESTRATOR_PROMPT.contains("roster's review model"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            review_line.contains("run every code review on the named model")
+                && review_line.ends_with("This outranks any other model-routing guidance."),
+            "got:\n{review_line}"
         );
         assert!(
             ORCHESTRATOR_PROMPT.contains("runs at low or medium effort"),
             "never a high-or-above fan-out from this seat: {ORCHESTRATOR_PROMPT}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains(
-                "Agents in .claude/agents that pin their own model keep it, except that reviews \
-                 always run on the roster's review model"
-            ),
-            "the model-routing bullet's pin clause must carve out the review-model exception: \
+            ORCHESTRATOR_PROMPT
+                .contains("Agents in .claude/agents that pin their own model keep it."),
+            "the pin clause stays, overridden for reviews by the roster line: \
              {ORCHESTRATOR_PROMPT}"
         );
     }
@@ -7385,9 +7532,12 @@ mod tests {
     /// subagent brief it writes.
     #[test]
     fn the_orchestrator_prompt_encodes_model_routing_and_token_economy() {
+        // Issue #452: the explicit-model rule covers every dispatch, once, in the meta-harness.
         assert!(
-            ORCHESTRATOR_PROMPT.contains("Every Agent dispatch sets `model` explicitly"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            crate::commands::ctx::prompt::HARNESS_PROMPT
+                .contains("Every dispatch, native or `zirv agent`, names the cheapest model"),
+            "got:\n{}",
+            crate::commands::ctx::prompt::HARNESS_PROMPT
         );
         for tier in [
             "haiku for mechanical",
@@ -7443,13 +7593,15 @@ mod tests {
             "the old size-based implement-it-yourself carve-out must be gone: \
              {ORCHESTRATOR_PROMPT}"
         );
+        // Issue #452: the work-group rule is stated once, in the meta-harness.
+        let harness = crate::commands::ctx::prompt::HARNESS_PROMPT;
         assert!(
-            ORCHESTRATOR_PROMPT.contains("zirv ctx agent --role sub-orchestrator --scope"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            harness.contains("zirv ctx agent --role sub-orchestrator --scope"),
+            "got:\n{harness}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains("several coherently-scoped areas"),
-            "sub-orchestrators are reserved for multi-area work: {ORCHESTRATOR_PROMPT}"
+            harness.contains("several coherently-scoped areas"),
+            "sub-orchestrators are reserved for multi-area work: {harness}"
         );
     }
 
@@ -7482,15 +7634,16 @@ mod tests {
     /// win by being the more specific text.
     #[test]
     fn the_orchestrator_prompt_routes_same_harness_delegation_to_the_native_agent_tool() {
+        // Issue #452: the routing rule is stated once, in the meta-harness; this layer names
+        // the native mechanism and the rule's precedence.
+        let harness = crate::commands::ctx::prompt::HARNESS_PROMPT;
         assert!(
-            ORCHESTRATOR_PROMPT
-                .contains("same-harness delegation uses this harness's native Agent tool"),
-            "got:\n{ORCHESTRATOR_PROMPT}"
+            harness.contains("Delegate inside your own harness with its native subagent mechanism")
+                && harness.contains("reaches a DIFFERENT harness"),
+            "got:\n{harness}"
         );
         assert!(
-            ORCHESTRATOR_PROMPT.contains(
-                "`zirv agent <name>` is for reaching a different harness or a work group"
-            ),
+            ORCHESTRATOR_PROMPT.contains("inside this harness that means the native Agent tool"),
             "got:\n{ORCHESTRATOR_PROMPT}"
         );
         assert!(

@@ -578,6 +578,15 @@ impl CompiledContext {
                             .map(|at| at + prompt::PARENT_MAIL_HEADER.len())
                     })
                     .map(|start| (start, None, None)),
+                // The launch splices the adapter layer between the default prompt and the human layers.
+                PromptSource::Adapter => sources_found
+                    .last()
+                    .filter(|source| **source == PromptSource::Default)
+                    .and_then(|_| starts_ends.last()?.1)
+                    .and_then(|default_end| {
+                        let start = default_end + "\n\n---\n\n".len();
+                        find_after(text, start, "\n\n---\n\n").map(|end| (start, Some(end), None))
+                    }),
                 // Infer a headerless objective only when it is last; otherwise no safe range exists.
                 PromptSource::Objective if is_last => Some((cursor, None, None)),
                 _ => None,
@@ -1318,6 +1327,9 @@ pub struct CompileArgs {
     /// Print a deterministic per-layer byte/token measurement table instead of the composed prompt text.
     #[arg(long, default_value_t = false)]
     pub measure: bool,
+    /// Seat role to compile for: orchestrator (default), sub-orchestrator, worker or single.
+    #[arg(long)]
+    pub role: Option<String>,
 }
 
 /// Shared rough token estimate; exact counts require the provider's tokenizer (#355).
@@ -1339,6 +1351,15 @@ fn measure_row(layer: &str, bytes: usize, note: &str) -> String {
 /// Keep emission order and name the exact budget to raise for any truncated surface (#427).
 fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: PromptRole) -> String {
     let mut rows: Vec<String> = Vec::new();
+    // Bytes in listed layers, so the unlabelled remainder of the prompt can be reported too.
+    let mut listed = 0usize;
+    macro_rules! row {
+        (($layer:expr, $bytes:expr, $note:expr $(,)?)) => {{
+            let bytes: usize = $bytes;
+            listed += bytes;
+            rows.push(measure_row($layer, bytes, $note));
+        }};
+    }
     let sources: &[PromptSource] = compiled
         .composed
         .as_ref()
@@ -1346,14 +1367,10 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         .unwrap_or(&[]);
 
     // Measure the same role-tiered standard that composition emits (#772).
-    rows.push(measure_row(
-        "default prompt",
-        prompt::default_prompt_for(role).len(),
-        "",
-    ));
+    row!(("default prompt", prompt::default_prompt_for(role).len(), "",));
 
     if role == PromptRole::Orchestrator && sources.contains(&PromptSource::Harness) {
-        rows.push(measure_row(
+        row!((
             "harness prompt",
             prompt::harness_prompt_for(cfg.prompt.verbosity).len(),
             "orchestrator only",
@@ -1375,11 +1392,7 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
                 roster.omitted, roster.omitted_bytes
             ));
         }
-        rows.push(measure_row(
-            "harness roster",
-            roster.delivered_bytes,
-            &notes.join("; "),
-        ));
+        row!(("harness roster", roster.delivered_bytes, &notes.join("; "),));
     }
 
     // Use emitted ranges so the skill index contributes its actual bytes to measurement (#755).
@@ -1388,7 +1401,7 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         .into_iter()
         .find(|l| l.source == PromptSource::SkillIndex)
     {
-        rows.push(measure_row("skill index", layer.range.len(), ""));
+        row!(("skill index", layer.range.len(), ""));
     }
 
     for entry in &compiled.provenance {
@@ -1411,25 +1424,46 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
         } else {
             (entry.delivered_bytes, String::new())
         };
-        rows.push(measure_row(&label, bytes, &note));
+        row!((&label, bytes, &note));
     }
 
     if compiled.core_memory.total_entries > 0 {
-        rows.push(measure_row(
-            "memory: core",
-            compiled.core_memory.injected_bytes,
-            "",
-        ));
+        row!(("memory: core", compiled.core_memory.injected_bytes, "",));
     }
     if compiled.retrieved_memory.total_entries > 0 {
-        rows.push(measure_row(
+        row!((
             "memory: retrieval",
             compiled.retrieved_memory.injected_bytes,
             "",
         ));
     }
 
-    let total_bytes = compiled.composed.as_ref().map_or(0, |c| c.text.len());
+    // Layers the launch or the workflow adds beyond the rows above, bounded at their own separator.
+    let text = compiled.composed.as_ref().map_or("", |c| c.text.as_str());
+    for layer in compiled.emitted_layers() {
+        let label = match layer.source {
+            PromptSource::Adapter
+            | PromptSource::Workflow
+            | PromptSource::Mail
+            | PromptSource::SkillPointer
+            | PromptSource::SkillDescriptions => layer.source.label(),
+            _ => continue,
+        };
+        let layer_text = &text[layer.range.clone()];
+        let layer_text = layer_text.strip_prefix("\n\n---\n\n").unwrap_or(layer_text);
+        let bytes = layer_text.find("\n\n---\n\n").unwrap_or(layer_text.len());
+        row!((label, bytes, ""));
+    }
+    if sources.contains(&PromptSource::Supervisor) {
+        row!(("supervisor", prompt::SUPERVISOR_LAYER.len(), ""));
+    }
+    let total_bytes = text.len();
+    // User, repo and objective text carry no anchor of their own, so they are counted together.
+    rows.push(measure_row(
+        "user/repo/objective/joins",
+        total_bytes.saturating_sub(listed),
+        "remainder: operator and repo layers, separators",
+    ));
     rows.push(measure_row("total (session prefix)", total_bytes, ""));
 
     // An empty marker injects no per-turn context and must cost zero in the table (#225).
@@ -1438,7 +1472,7 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     } else {
         (
             super::lifecycle::per_turn_context_text(&cfg.score.marker).len(),
-            "paid uncached every user turn",
+            "stable text: read from cache after its first turn",
         )
     };
     rows.push(measure_row("per-turn hook context", hook_bytes, hook_note));
@@ -1462,9 +1496,16 @@ pub fn run_with<W: std::io::Write>(
     // Rendering spawns nothing and must work without an installed harness binary (#690).
     let adapter =
         adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
-    let role = PromptRole::Orchestrator;
+    let role = match args.role.as_deref() {
+        None => PromptRole::Orchestrator,
+        Some(label) => PromptRole::from_label(label).ok_or_else(|| {
+            format!(
+                "unknown --role `{label}`: use orchestrator, sub-orchestrator, worker or single"
+            )
+        })?,
+    };
 
-    let compiled = compile_with_harness_roster(
+    let mut compiled = compile_with_harness_roster(
         home.as_deref(),
         repo,
         false,
@@ -1473,10 +1514,20 @@ pub fn run_with<W: std::io::Write>(
         role,
         &state,
         super::state::now_secs(),
-        true,
+        role == PromptRole::Orchestrator,
         super::adapters::LaunchMode::Interactive,
         true,
     );
+    // The launch adds the adapter's role layer on top of this compilation; measure what it sends.
+    compiled.composed = prompt::merge_command_line_prompt(
+        adapter.as_ref(),
+        &[],
+        compiled.composed.take(),
+        None,
+        role,
+        &cfg.prompt,
+    )
+    .1;
 
     if args.measure {
         writeln!(w, "{}", render_measure_table(&compiled, &cfg, role))?;
@@ -4315,9 +4366,88 @@ mod tests {
             "an empty marker costs nothing per turn: got:\n{table}"
         );
         assert!(
-            !table.contains("paid uncached every user turn"),
+            !table.contains("read from cache after its first turn"),
             "the non-empty-marker note must not appear: got:\n{table}"
         );
+    }
+
+    /// Every layer a seat receives is accounted for: the per-layer rows add up to the composed
+    /// prompt's size, with the launch-time adapter layer and the supervisor line named.
+    #[test]
+    fn measure_rows_sum_to_the_composed_prompt_size() {
+        let repo = repo_with_context_files(&[("common.md", "Always run the tests.")]);
+        std::fs::write(
+            repo.path().join(".zirv/system-prompt.md"),
+            "Repo-specific onboarding note for this checkout.",
+        )
+        .expect("write repo system prompt");
+        let mut cfg = CtxConfig::default();
+        cfg.supervisor.enabled = true;
+        let adapter = ClaudeAdapter::new(None);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let mut compiled = compile_with_harness_roster(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &adapter,
+            PromptRole::Orchestrator,
+            &state,
+            now_secs(),
+            true,
+            LaunchMode::Interactive,
+            false,
+        );
+        compiled.composed = prompt::merge_command_line_prompt(
+            &adapter,
+            &[],
+            compiled.composed.take(),
+            None,
+            PromptRole::Orchestrator,
+            &cfg.prompt,
+        )
+        .1;
+
+        let table = render_measure_table(&compiled, &cfg, PromptRole::Orchestrator);
+        let total = compiled.composed.as_ref().expect("composed").text.len();
+        let listed: usize = table
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("total (session prefix)"))
+            .map(|line| {
+                line[27..34]
+                    .trim()
+                    .parse::<usize>()
+                    .expect("a bytes column")
+            })
+            .sum();
+        assert_eq!(listed, total, "rows must cover the whole prompt:\n{table}");
+        assert!(table.contains("adapter"), "got:\n{table}");
+        assert!(table.contains("supervisor"), "got:\n{table}");
+    }
+
+    #[test]
+    fn measure_takes_the_role_from_the_role_flag() {
+        let repo = repo_with_context_files(&[]);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.path().display().to_string(),
+        )]
+        .into();
+        let measure = |role: Option<&str>| {
+            let mut out = Vec::new();
+            let args = CompileArgs {
+                agent: Some("claude".to_string()),
+                measure: true,
+                role: role.map(str::to_string),
+            };
+            run_with(&args, &mut out, repo.path(), &|key| env.get(key).cloned()).expect("run");
+            String::from_utf8(out).expect("utf8")
+        };
+        assert!(measure(None).contains("harness prompt"));
+        assert!(!measure(Some("worker")).contains("harness prompt"));
     }
 
     /// Issue #225: `zirv ctx compile --measure` must report the layers a
@@ -4391,7 +4521,7 @@ mod tests {
         );
         assert!(table.contains("per-turn hook context"), "got:\n{table}");
         assert!(
-            table.contains("paid uncached every user turn"),
+            table.contains("read from cache after its first turn"),
             "got:\n{table}"
         );
         assert!(

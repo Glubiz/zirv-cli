@@ -168,8 +168,8 @@ fn harness_roster_lines(
 /// harness's resolved
 /// review model (an operator override or the ladder default, each marked as
 /// such) and states the rule that outranks any other model-routing guidance
-/// a session's own base prompt carries (see `ORCHESTRATOR_PROMPT`'s
-/// model-routing bullet in claude.rs, which now points back at this line).
+/// a session's own base prompt carries; no other built-in layer restates the
+/// review-model rule (#452).
 /// Returns `None` when no harness is both enabled and roster-listed --
 /// absence, not a line naming zero harnesses.
 ///

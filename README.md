@@ -510,8 +510,8 @@ A decision answers ONE call: the hook prints
 dashboard or a dashboard that quits, the hook prints nothing and the native
 dialog shows; the request then reads "waiting in pane" until a `PostToolUse`,
 `PostToolUseFailure` or `PermissionDenied` for that call clears it. A request
-answered in the dashboard, or every prompt once you submit the session's next
-prompt, clears its wait at once; one answered in the pane's own dialog clears
+answered in the dashboard, or every main-thread prompt once you submit the
+session's next prompt (a subagent's open dialog stays until that subagent stops), clears its wait at once; one answered in the pane's own dialog clears
 only at that `PostToolUse`, after the allowed command has finished, because Claude
 Code fires no hook when its dialog is answered. Each dashboard tick also reads
 the last 256 KB of the session transcript for a released request: a `tool_result`
@@ -702,7 +702,10 @@ proxy` itself never prompts; it keeps printing `needs_clarification` as a
 plain field, same as every other value. A launch that never got the chance to
 ask (a dashboard pane, a resumed session) still carries a `clarify: ask the
 user one precise question before acting` line in its `[zirv proxy]` prompt
-layer when the same threshold-and-decisive condition holds.
+layer when the same threshold-and-decisive condition holds. The Typesafe
+metadata intake asks only when it can also name what is missing: without a
+decisive `target`/`behavior`/`constraint` category (confidence at least 0.7),
+the decision is marked not decisive and nothing asks.
 
 **When it takes over.** Bare `zirv` and `zirv chat` open the proxy's intake
 view first only when `[proxy] enabled = true`, the configured decider has a
@@ -1332,7 +1335,9 @@ to the section that documents it in depth.
   value), and the endpoint and model in use, plus a per-site usage rollup
   (calls, cache-hit rate, p50/p95 latency, error count, and effect size —
   bytes removed / rows changed) over the last 7 days, folded read-only from
-  `jev-decisions.jsonl` and `jev-effects.jsonl` (`jev-session-aliases.jsonl` maps a launch's pre-minted session to the persistent-runtime session it became, so a session-scoped rollup still counts its intake rows). See [Harness
+  `jev-decisions.jsonl`, `jev-effects.jsonl` and `jev-skips.jsonl` (an enabled site
+  that could not ask -- credential missing, or a state the metadata guard refused --
+  counts as an error with its reason, never a call; `jev-session-aliases.jsonl` maps a launch's pre-minted session to the persistent-runtime session it became, so a session-scoped rollup still counts its intake rows). See [Harness
   proxy](#harness-proxy).
 - **Configured capabilities** — `capabilities` reports every non-shell
   integration a native session can use — MCP servers, web search/fetch,
@@ -2053,7 +2058,7 @@ untouched-template check always runs first.
 ```bash
 zirv workflow list [--json] [--built-in-only] [--repo <path>]        # registry ids: layer/version/hash/domains
 zirv workflow show feature [--json] [--built-in-only] [--repo <path>] # one definition's steps
-zirv workflow classify --task "..."               # classify without starting
+zirv workflow classify --task "..."               # classify without starting; like start, untracked files are not part of the change
 zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
 zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, Jev tags, per-step wall-clock, and pinned definition/drift
 zirv workflow resume <id>                         # restore as the active workflow
@@ -3263,7 +3268,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
-| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl`/`jev-skips.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo <dir>]` | Measurement only: asks one Jev site's real production question(s) for a fixture input `K` times (1..=20) with the cache disabled, applies that site's production floor and answer-to-action rule, and prints what production would have DONE on each rep — spends real Jev calls and writes the normal decision/spend log rows, never any other side effect — see [Measuring floor determinism](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
@@ -3913,6 +3918,19 @@ helper's role — `distiller`, `ask`, `optimize` or `seat` under `[roles]` in
 `~/.zirv/native.toml` — and otherwise keeps its existing harness path
 unchanged. A native attempt that fails still falls back to the harness rather
 than failing the caller.
+
+Every helper call, native or harness, appends one row to `logs/delegations.jsonl`
+as agent `helper` (principal `helper/<role>/<harness>`, with the model, wall time
+and, for native calls, the tokens), so `zirv ctx spend` shows the overhead. The
+model scorecard skips these rows. Codex rows written before 4.51.0 logged cached
+tokens as plain input; readers re-split them from the pinned rollout's final token
+count (recorded in `logs/delegations-codex-split.json`), so spend prices them at
+the cache rate.
+
+`zirv ctx compile --measure [--role orchestrator|sub-orchestrator|worker|single]`
+reports every layer a seat of that role receives, including the adapter layer,
+the supervisor line and the workflow step; the rows add up to the total. Tokens
+stay a bytes/4 estimate.
 
 The seats that are real delegated workers take `--runtime native` instead, so
 they reuse `zirv agent` end to end:
@@ -4701,8 +4719,8 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 # the shared Jev client; each is also gated on the `[proxy.typesafe]`
 # credential actually being set (see "Harness proxy" above)
 [jev]
-memory = false      # deprecated and ignored (the memory rerank and harvest gate were removed); still parsed so old configs load; ZIRV_CTX_JEV_MEMORY
-supervisor = false  # judge pre-filter, crash triage, handoff quality; ZIRV_CTX_JEV_SUPERVISOR
+memory = false      # deprecated and ignored (the memory rerank and harvest gate were removed); still parsed so old configs load, never counts as an enabled gate; ZIRV_CTX_JEV_MEMORY
+supervisor = false  # judge pre-filter, crash triage, handoff quality (every stored handoff: wrap/exec restarts, handover swaps, pane rollovers, the harvest note, `zirv ctx handoff`; not the `--dry-run` preview); ZIRV_CTX_JEV_SUPERVISOR
 dispatch = false    # model tier for an omitted Agent model, from brief metadata only; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
@@ -5739,7 +5757,8 @@ secret). Accounts that share quota share a `pool`, and the usage windows
 (`zirv ctx usage`) aggregate per pool, so two accounts on one plan are not
 double-counted. `zirv ctx spend --by` groups the delegation ledger by
 `harness`, `model`, `task-class`, or `worker` instead -- it has no `pool`
-dimension of its own.
+dimension of its own. A cached Jev answer made no request, so its row is not
+counted as a run.
 
 **Choosing the default.** `~/.zirv/ctx.toml`'s `[runtime]` table decides which
 backend a session gets when the command line does not say:

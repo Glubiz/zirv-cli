@@ -154,7 +154,9 @@ pub(super) fn perform_handover_swap(
     let (note, source) = if req.structural_only {
         (handoff::structural(&ctx), "structural")
     } else {
-        handoff::distill_or_structural(
+        handoff::distill_or_structural_with_jev(
+            cfg,
+            state_dir,
             adapter.as_ref(),
             distiller_model.as_str(),
             &ctx,

@@ -1145,6 +1145,11 @@ pub fn helper_answer_with_env(
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (protected_prompt, _) =
         super::obfuscate_store::protect_text_with_env(&repo, prompt, "helper_model_input", env)?;
+    let started = Instant::now();
+    let mut harness = adapter.name();
+    let mut served = model.to_string();
+    let mut usage = super::provider::adapter::ProviderUsage::default();
+    let mut native_text = None;
     if helper::available(&repo, role, None, env) {
         match helper::run(
             &HelperRequest {
@@ -1159,7 +1164,12 @@ pub fn helper_answer_with_env(
             },
             env,
         ) {
-            Ok(answer) => return Ok(answer.text),
+            Ok(answer) => {
+                harness = "native";
+                served = answer.model;
+                usage = answer.usage;
+                native_text = Some(answer.text);
+            }
             Err(helper::HelperError::Unconfigured(_)) => {}
             Err(error) => {
                 crate::output::warn(format!(
@@ -1168,7 +1178,59 @@ pub fn helper_answer_with_env(
             }
         }
     }
-    run_model(adapter, model, &protected_prompt, timeout)
+    let result = match native_text {
+        Some(text) => Ok(text),
+        None => run_model(adapter, model, &protected_prompt, timeout),
+    };
+    record_helper_call(
+        env,
+        role,
+        harness,
+        &served,
+        &usage,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
+}
+
+/// Meters one helper-model call as a delegation row, agent `helper` so scorecards skip it.
+/// Tokens are zero where the harness path reports none. Best-effort: never fails the call.
+pub(super) fn record_helper_call(
+    env: EnvLookup<'_>,
+    role: &str,
+    harness: &str,
+    model: &str,
+    usage: &super::provider::adapter::ProviderUsage,
+    elapsed: Duration,
+    ok: bool,
+) {
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let ts = now_secs();
+    let _ = log::append_delegation(
+        &state,
+        &log::Delegation {
+            ts,
+            session: &format!("helper-{role}-{ts}"),
+            parent_session: &env(adapters::SESSION_ENV).unwrap_or_default(),
+            work_group_id: None,
+            agent: "helper",
+            model: Some(model).filter(|model| !model.is_empty()),
+            input_tokens: usage.input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            output_tokens: usage.output_tokens,
+            wall_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            exit_code: i32::from(!ok),
+            outcome: if ok { "ok" } else { "failed" },
+            mode: None,
+            task_class: None,
+            principal: &format!("helper/{role}/{harness}"),
+            envelope_sha256: None,
+        },
+    );
 }
 
 /// Runs one fresh model call through the resolved coding harness and returns
@@ -1512,13 +1574,10 @@ fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> 
     handoff_thin_action(answers.get("quality"), min_confidence, min_margin) == "demote"
 }
 
-/// The gated wrapper around [`distill_or_structural`] for
-/// the one call site that is genuinely on the restart path (`wrap::pump`'s
-/// own `Action::Restart` handling) -- threading `cfg`/`state` into
-/// `distill_or_structural` itself (or into `Handoff::is_usable`) would mean
-/// touching every one of its other call sites (dash/handover previews, the
-/// memory-harvest note, `zirv ctx handoff` itself), most of which are not
-/// actually about to restart a session onto the result. When
+/// The gated wrapper around [`distill_or_structural`] every stored or delivered handoff goes
+/// through: wrap restarts and handover swaps, exec restarts, dashboard pane rollovers, the
+/// memory-harvest note and `zirv ctx handoff`. Only the read-only `zirv ctx handover --dry-run`
+/// preview keeps the plain call, so a preview never spends a Jev call or writes a row. When
 /// `distill_or_structural` returns a genuinely `"distilled"` handoff, one
 /// additional confident [`jev_handoff_is_thin`] verdict may demote it to the
 /// same structural fallback an `Err` from `distill` itself already takes;
@@ -2440,7 +2499,9 @@ pub fn run_with<W: Write>(
             "structural",
         )
     } else {
-        distill_or_structural(
+        distill_or_structural_with_jev(
+            &cfg,
+            &state,
             adapter.as_ref(),
             &resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref()),
             &ctx,
@@ -2786,6 +2847,7 @@ mod tests {
 
     #[test]
     fn distillation_parses_a_well_formed_answer() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = fake_model_adapter();
         let handoff =
             distill(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, None).expect("distills");
@@ -2800,6 +2862,7 @@ mod tests {
 
     #[test]
     fn the_distiller_receives_the_prompt_on_stdin() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let log = tempfile::NamedTempFile::new().expect("tempfile");
         // NEW-1: a guard -- `distill` below can panic via `expect`, which
         // used to skip the restore entirely.
@@ -2832,6 +2895,7 @@ mod tests {
     /// wrote for those two sections.
     #[test]
     fn distillation_unions_files_read_and_modified_with_the_previous_handoff() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = fake_model_adapter();
         let handoff = distill(
             &adapter,
@@ -2869,6 +2933,7 @@ mod tests {
 
     #[test]
     fn a_failing_distiller_is_an_error() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         unsafe {
             std::env::set_var("FAKE_MODEL_MODE", "fail");
         }
@@ -2883,6 +2948,7 @@ mod tests {
 
     #[test]
     fn an_unusable_answer_is_an_error_so_callers_can_fall_back() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         for mode in ["garbage", "partial"] {
             unsafe {
                 std::env::set_var("FAKE_MODEL_MODE", mode);
@@ -2901,6 +2967,7 @@ mod tests {
 
     #[test]
     fn distill_or_structural_falls_back_and_reports_which_path_it_took() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = fake_model_adapter();
         let (handoff, source) =
             distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false, None);
@@ -3018,6 +3085,7 @@ mod tests {
     /// available.
     #[test]
     fn distill_or_structural_with_jev_is_identical_to_the_plain_call_when_the_gate_is_off() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = fake_model_adapter();
         let credential_env = "HANDOFF_TEST_JEV_GATE_OFF";
         // The credential looks available, so a bug that ignored the gate
@@ -3657,6 +3725,7 @@ mod tests {
     /// instead carried over from `previous` verbatim, with no model call.
     #[test]
     fn structural_fallback_carries_constraints_and_key_decisions_over_from_previous() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         unsafe {
             std::env::set_var("FAKE_MODEL_MODE", "garbage");
         }
@@ -3700,6 +3769,7 @@ mod tests {
     /// this does not assert the announcement's own stderr output.
     #[test]
     fn distill_or_structural_reaches_the_announce_path_for_an_adapter_with_a_residual() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(Some(
             "/nonexistent/codex-model-binary",
         ))
@@ -3864,6 +3934,7 @@ mod tests {
     /// terminal for the user with no way out but killing the wrapper.
     #[test]
     fn a_distiller_that_never_answers_is_given_up_on() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         unsafe {
             std::env::set_var("FAKE_MODEL_MODE", "hang");
         }
@@ -3894,6 +3965,7 @@ mod tests {
 
     #[test]
     fn a_hung_distiller_still_produces_a_structural_handoff() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         unsafe {
             std::env::set_var("FAKE_MODEL_MODE", "hang");
         }
@@ -3924,6 +3996,7 @@ mod tests {
     /// would take every distiller, ask, optimize and harvest call with it.
     #[test]
     fn helper_answer_falls_back_to_the_harness_when_no_native_route_exists() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let home = tempfile::tempdir().expect("home");
         let _home = super::super::testenv::HomeGuard::set(home.path());
         let adapter = fake_model_adapter();
@@ -3973,6 +4046,51 @@ mod tests {
         )
         .expect("the injected state dir is enough; the process env is never consulted for it");
         assert!(answer.contains("## Task"), "the harness answer: {answer}");
+    }
+
+    /// A helper call is real spend: the chokepoint appends exactly one delegation row naming the
+    /// role, harness and model, and the existing spend reader parses it.
+    #[test]
+    fn a_helper_call_appends_exactly_one_delegation_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let state_root = tmp.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_root.display().to_string(),
+            ),
+            (adapters::SESSION_ENV.to_string(), "parent01".to_string()),
+        ]
+        .into();
+        let adapter = fake_model_adapter();
+        helper_answer_with_env(
+            super::super::helper::ROLE_DISTILLER,
+            &adapter,
+            "haiku",
+            "anything",
+            Duration::from_secs(30),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("the harness answers");
+
+        let state = StateDir::from_path(state_root);
+        let rows = log::read_delegations(&state, 10);
+        assert_eq!(rows.len(), 1, "one row per helper call: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.agent, "helper");
+        assert_eq!(row.model.as_deref(), Some("haiku"));
+        assert_eq!(row.principal, "helper/distiller/claude");
+        assert_eq!(row.parent_session, "parent01");
+        assert_eq!(row.outcome, "ok");
+        let spend = super::super::spend::aggregate(
+            &rows,
+            super::super::spend::SpendDimension::Harness,
+            &super::super::price::built_in_table(),
+        );
+        assert_eq!(spend.len(), 1, "the spend reader folds the row");
     }
 
     #[test]
@@ -4134,6 +4252,7 @@ mod tests {
 
     #[test]
     fn a_missing_distiller_binary_falls_back_instead_of_panicking() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let adapter = ClaudeAdapter::new(Some("/nonexistent/model-binary"));
         let (handoff, source) =
             distill_or_structural(&adapter, "haiku", &ctx_sample(), TEST_TIMEOUT, false, None);
@@ -4873,6 +4992,7 @@ mod tests {
 
     #[test]
     fn the_verb_stores_a_handoff_and_prints_its_path() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = tempfile::tempdir().expect("tempdir");
         let transcript = transcript_with(tmp.path(), "ship the webhook");
         let state = tmp.path().join("state");
@@ -4909,6 +5029,98 @@ mod tests {
             text.contains("Ship the webhook"),
             "the distilled task: {text}"
         );
+    }
+
+    /// `zirv ctx handoff --stdout` with a fake distiller and the given `[jev]`/endpoint env.
+    fn verb_handoff_markdown(tmp: &std::path::Path, jev_env: &[(&str, String)]) -> String {
+        let transcript = transcript_with(tmp, "ship the webhook");
+        let mut env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.join("state").display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_AGENT_BIN".to_string(),
+                format!("sh {}", fixture("fake-model.sh").display()),
+            ),
+        ]
+        .into();
+        env.extend(jev_env.iter().map(|(k, v)| (k.to_string(), v.clone())));
+        let args = HandoffArgs {
+            transcript,
+            agent: None,
+            session_id: None,
+            stdout: true,
+            no_model: false,
+        };
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp, &|k| env.get(k).cloned()).expect("runs");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// #452: a non-wrap path (`zirv ctx handoff`, like exec restarts and pane rollovers) reaches
+    /// the Jev thin check, so a decisive "thin" verdict demotes the distilled handoff.
+    #[test]
+    fn the_verb_demotes_a_handoff_jev_rules_thin() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = r#"{"model": "jev-latest", "answers": {
+            "quality": {"type": "choice", "choice": "thin",
+                        "probabilities": {"thin": 0.95, "adequate": 0.05}, "confidence": 0.95}
+        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
+        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
+        let credential_env = "HANDOFF_TEST_JEV_VERB_452";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let text = verb_handoff_markdown(
+            tmp.path(),
+            &[
+                ("ZIRV_CTX_JEV_SUPERVISOR", "true".to_string()),
+                ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", url),
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+                    credential_env.to_string(),
+                ),
+            ],
+        );
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(
+            text.contains("ship the webhook") && !text.contains("Ship the webhook"),
+            "demoted to the structural task: {text}"
+        );
+        handle.join().expect("server thread must not panic");
+        let decisions =
+            std::fs::read_to_string(tmp.path().join("state/jev-decisions.jsonl")).expect("row");
+        assert!(decisions.contains("\"site\":\"handoff\""), "{decisions}");
+    }
+
+    /// #452: with `jev.supervisor` off the verb never asks Jev and keeps the distilled handoff.
+    #[test]
+    fn the_verb_keeps_the_distilled_handoff_when_the_gate_is_off() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let credential_env = "HANDOFF_TEST_JEV_VERB_OFF_452";
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var(credential_env, "secret") };
+        let text = verb_handoff_markdown(
+            tmp.path(),
+            &[
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_BASE_URL",
+                    "http://127.0.0.1:9".to_string(),
+                ),
+                (
+                    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
+                    credential_env.to_string(),
+                ),
+            ],
+        );
+        unsafe { std::env::remove_var(credential_env) };
+        assert!(text.contains("Ship the webhook"), "distilled task: {text}");
+        assert!(!tmp.path().join("state/jev-decisions.jsonl").exists());
     }
 
     #[test]

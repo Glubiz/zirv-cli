@@ -13,6 +13,7 @@
 use std::path::Path;
 
 use super::config::EnvLookup;
+use super::provider::adapter::ProviderUsage;
 use super::runtime;
 use super::runtime::native::{self, NativeLimits, NativeStatus};
 
@@ -102,6 +103,7 @@ pub struct HelperAnswer {
     pub route: String,
     pub model: String,
     pub status: NativeStatus,
+    pub usage: ProviderUsage,
 }
 
 /// Why a helper call could not produce an answer. Typed because the callers
@@ -232,6 +234,7 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
                 .clone()
                 .unwrap_or(status.configured_model),
             status: status.status,
+            usage: status.usage.clone(),
         }),
         NativeStatus::Completed => Err(HelperError::Empty),
         NativeStatus::Failed => {
@@ -251,6 +254,7 @@ pub fn run(request: &HelperRequest<'_>, env: EnvLookup<'_>) -> Result<HelperAnsw
                 .clone()
                 .unwrap_or(status.configured_model),
             status: other,
+            usage: status.usage.clone(),
         }),
         other => Err(HelperError::Refused(
             status

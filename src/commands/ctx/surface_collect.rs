@@ -5343,6 +5343,7 @@ mod tests {
 
     #[test]
     fn the_verb_prints_a_report_and_stores_a_copy() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let (tmp, home, repo) = fixture_tree();
         let state = tmp.path().join("state");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));
@@ -5438,6 +5439,7 @@ mod tests {
     /// coverage here rather than only claude's.
     #[test]
     fn the_verb_never_modifies_an_analysed_file() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         for agent in ["claude", "codex"] {
             let (tmp, home, repo) = fixture_tree();
             let state = tmp.path().join("state");
@@ -5471,6 +5473,7 @@ mod tests {
 
     #[test]
     fn a_failing_model_still_reports_the_deterministic_findings() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let (tmp, home, repo) = fixture_tree();
         let state = tmp.path().join("state");
         let env = verb_env(&state, &fixture("fake-optimizer.sh"));

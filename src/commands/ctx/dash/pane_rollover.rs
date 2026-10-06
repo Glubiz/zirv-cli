@@ -333,7 +333,9 @@ pub(super) fn handover_pane(
     let (note, _source) = if req.structural_only {
         (handoff::structural(&ctx), "structural")
     } else {
-        handoff::distill_or_structural(
+        handoff::distill_or_structural_with_jev(
+            cfg,
+            state,
             old_adapter.as_ref(),
             &distiller_model,
             &ctx,

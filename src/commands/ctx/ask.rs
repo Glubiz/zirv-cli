@@ -163,6 +163,7 @@ fn native_ask_answer(
 ) -> CtxResult<String> {
     use super::helper::{self, HelperBudget, HelperRequest, ROLE_ASK};
 
+    let started = std::time::Instant::now();
     match helper::run(
         &HelperRequest {
             repo,
@@ -174,7 +175,18 @@ fn native_ask_answer(
         },
         env,
     ) {
-        Ok(answer) => return Ok(answer.text),
+        Ok(answer) => {
+            super::handoff::record_helper_call(
+                env,
+                ROLE_ASK,
+                "native",
+                &answer.model,
+                &answer.usage,
+                started.elapsed(),
+                true,
+            );
+            return Ok(answer.text);
+        }
         Err(helper::HelperError::Unconfigured(_)) => {}
         Err(error) => {
             crate::output::warn(format!(
@@ -184,7 +196,18 @@ fn native_ask_answer(
     }
     let adapter = adapters::select(None, &[], cfg)?;
     let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
-    super::handoff::run_model(adapter.as_ref(), &model, prompt, timeout)
+    let started = std::time::Instant::now();
+    let result = super::handoff::run_model(adapter.as_ref(), &model, prompt, timeout);
+    super::handoff::record_helper_call(
+        env,
+        ROLE_ASK,
+        adapter.name(),
+        &model,
+        &Default::default(),
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 pub fn run_with<W: Write>(
@@ -342,6 +365,7 @@ mod tests {
 
     #[test]
     fn a_live_session_is_asked_and_answers_from_its_own_transcript() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(home.path());
@@ -404,6 +428,7 @@ mod tests {
     /// the explicit absence of the two markers a real `nudge` leaves.
     #[test]
     fn asking_never_touches_the_transcript_the_registry_record_or_leaves_a_nudge_or_mail() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tempfile::tempdir().expect("tempdir");
         let _home = HomeGuard::set(home.path());

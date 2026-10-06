@@ -159,27 +159,15 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 &payload.session_id,
             );
         }
-        // Stop marks the Working-to-Settled boundary and clears stale attention
-        // from lower-ranked authorities (#349).
-        let _ = crate::commands::ctx::attention::record(
-            &state,
-            &super::permission::attention_short(env, &payload.session_id),
-            crate::commands::ctx::attention::Observation::new(
-                crate::commands::ctx::attention::Authority::AdapterHook,
-                "turn completed cleanly",
-                100,
-                now_secs(),
-            )
-            .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Settled)
-            .with_attention(crate::commands::ctx::attention::Attention::None),
-            now_secs(),
-        );
-        // A turn boundary ends every prompt the session had open. Closing them and clearing their
-        // latch share one lock, so a dialog confirmed since the record above cannot outlive its entry (#864).
+        // A main-thread turn boundary ends the main thread's prompts only: a native subagent shares
+        // the session and its dialog may still be waiting. Closing them and clearing their latch
+        // share one lock, so a dialog confirmed meanwhile cannot outlive its entry (#864). A
+        // subagent's own prompts close on its SubagentStop or its hand-back, never on age.
+        let attention_short = super::permission::attention_short(env, &payload.session_id);
         crate::commands::ctx::attention::resolve_prompts(
             &state,
-            &super::permission::attention_short(env, &payload.session_id),
-            |_| true,
+            &attention_short,
+            |open| open.agent.is_empty(),
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
                 "turn completed cleanly",
@@ -189,11 +177,21 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .with_attention(crate::commands::ctx::attention::Attention::None),
             now_secs(),
         );
-        crate::commands::ctx::approvals::clear_released(
-            &state,
-            &super::permission::attention_short(env, &payload.session_id),
-            env,
-        );
+        // Stop marks the Working-to-Settled boundary and clears stale attention
+        // from lower-ranked authorities (#349), unless a subagent dialog still holds the latch.
+        let mut settled = crate::commands::ctx::attention::Observation::new(
+            crate::commands::ctx::attention::Authority::AdapterHook,
+            "turn completed cleanly",
+            100,
+            now_secs(),
+        )
+        .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Settled);
+        if !crate::commands::ctx::attention::prompt_open(&state, &attention_short) {
+            settled = settled.with_attention(crate::commands::ctx::attention::Attention::None);
+        }
+        let _ =
+            crate::commands::ctx::attention::record(&state, &attention_short, settled, now_secs());
+        crate::commands::ctx::approvals::clear_released(&state, &attention_short, env);
         // A fresh process every turn has nothing to compare a repeated
         // summary against, and no `Announcer` of its own -- the decision-
         // log line above already covers this turn's own finding, so
@@ -874,6 +872,109 @@ mod tests {
             attention::Lifecycle::default(),
             "and must not write under the harness conversation's short"
         );
+    }
+
+    /// A main-thread Stop only proves the main thread's own dialogs are over; a native subagent
+    /// shares the session, and its confirmed dialog must stay open and keep the latch.
+    #[test]
+    fn a_main_thread_stop_keeps_an_open_subagent_dialog_latched() {
+        use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write");
+        let state_dir = dir.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let short = "aae6758d";
+        for (id, agent) in [("p-sub", "a-sub-1"), ("p-main", "")] {
+            attention::open_prompt(
+                &state,
+                short,
+                OpenPrompt {
+                    id: id.to_string(),
+                    agent: agent.to_string(),
+                    at: now_secs(),
+                    ..Default::default()
+                },
+            );
+        }
+        attention::confirm_prompts(&state, short, "Bash: cargo", now_secs());
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            (
+                SESSION_ENV.to_string(),
+                "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+            ),
+        ]
+        .into();
+        let stdin = stop_payload(&transcript, dir.path());
+        run_stop(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        assert_eq!(
+            attention::load(&state, short).attention,
+            Attention::Approval
+        );
+        let left = attention::close_prompts(&state, short, |_| false);
+        assert_eq!(left, 1, "only the subagent prompt remains");
+        let main_left = attention::close_prompts(&state, short, |o| o.agent == "a-sub-1");
+        assert_eq!(main_left, 0, "the main-thread prompt closed");
+    }
+
+    /// A subagent dialog the operator has left waiting for hours is still waiting: a main-thread
+    /// Stop never closes it by age, only SubagentStop or the subagent's hand-back does.
+    #[test]
+    fn a_main_thread_stop_keeps_an_old_subagent_prompt_and_its_latch() {
+        use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input_tokens\":1}}}\n",
+        )
+        .expect("write");
+        let state_dir = dir.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let short = "aae6758d";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.display().to_string(),
+            ),
+            (
+                SESSION_ENV.to_string(),
+                "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+            ),
+        ]
+        .into();
+        let stdin = stop_payload(&transcript, dir.path());
+        let stop = || run_stop(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("runs");
+        let now = now_secs();
+
+        attention::open_prompt(
+            &state,
+            short,
+            OpenPrompt {
+                id: "p-old".to_string(),
+                agent: "a-waiting".to_string(),
+                at: now - 3 * 60 * 60,
+                ..Default::default()
+            },
+        );
+        attention::confirm_prompts(&state, short, "Bash: cargo", now - 3 * 60 * 60);
+        stop();
+        assert_eq!(
+            attention::load(&state, short).attention,
+            Attention::Approval
+        );
+        assert_eq!(attention::close_prompts(&state, short, |_| false), 1);
     }
 
     /// A supervisor cannot derive the agent's transcript path: the agent mints

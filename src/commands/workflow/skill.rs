@@ -12,6 +12,7 @@ use super::skill_activation::score_skills;
 use super::skill_render;
 use super::skill_tools::{self, SkillLoadSurface};
 use crate::commands::ctx::CtxResult;
+use crate::commands::ctx::prompt::first_sentence;
 use crate::commands::ctx::state::{StateDir, write_atomic_bytes};
 
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
@@ -1419,6 +1420,20 @@ struct ClaudePluginManifest<'a> {
     version: &'a str,
 }
 
+/// What Claude's skill listing carries for a skill: the first sentence plus the "Not for ..."
+/// clause that tells similar skills apart. The full description stays in `zirv skill show`.
+fn plugin_listing_description(description: &str) -> String {
+    let first = first_sentence(description);
+    let rest = &description[first.len()..];
+    match rest.find("Not for ") {
+        Some(index) => format!(
+            "{first} {}",
+            rest[index..].lines().next().unwrap_or_default().trim_end()
+        ),
+        None => first.to_string(),
+    }
+}
+
 /// A stub never carries zirv's own instructions -- the operator's design
 /// rule is "zirv provides skills, the agent chooses" -- only a pointer at the
 /// journaled, refusal-checked load path.
@@ -1484,8 +1499,10 @@ pub fn sync_claude_plugin_dir(
         desired.insert(skill.manifest.id.clone());
         let stub_dir = skills_dir.join(&skill.manifest.id);
         std::fs::create_dir_all(&stub_dir)?;
-        let document =
-            render_claude_plugin_skill_md(&skill.manifest.id, &skill.manifest.description)?;
+        let document = render_claude_plugin_skill_md(
+            &skill.manifest.id,
+            &plugin_listing_description(&skill.manifest.description),
+        )?;
         write_if_changed(&stub_dir.join("SKILL.md"), &document)?;
     }
 
@@ -3474,13 +3491,53 @@ mod tests {
         assert_eq!(frontmatter["name"], "design");
         assert_eq!(
             frontmatter["description"],
-            registry.get("design").unwrap().manifest.description
+            plugin_listing_description(&registry.get("design").unwrap().manifest.description)
         );
         assert_eq!(
             body,
             "Run `zirv skill load design` in a shell now and follow the instructions it \
              prints. If it refuses, report the refusal; do not improvise around it.\n"
         );
+    }
+
+    #[test]
+    fn claude_plugin_listing_keeps_the_first_sentence_and_the_not_for_clause() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let out = tempdir().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        let listed = |id: &str| {
+            let stub =
+                std::fs::read_to_string(out.path().join(format!("skills/{id}/SKILL.md"))).unwrap();
+            let frontmatter: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+                stub.split_once("---\n\n")
+                    .unwrap()
+                    .0
+                    .trim_start_matches("---\n"),
+            )
+            .unwrap();
+            frontmatter["description"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            listed("design"),
+            "Clarify what is being asked and choose a design proportional to it, fitting the \
+             existing architecture, before any code is written. Not for critiquing an existing \
+             proposal -- that is `design-review`."
+        );
+        assert_eq!(
+            plugin_listing_description("Does a thing. Use when asked. Also more."),
+            "Does a thing."
+        );
+        assert_eq!(
+            plugin_listing_description("Does a thing. Use when asked.\nSecond line."),
+            "Does a thing."
+        );
+        let (mut full, mut listing) = (0, 0);
+        for skill in registry.list().filter(|skill| host_registerable(skill)) {
+            full += skill.manifest.description.len();
+            listing += listed(&skill.manifest.id).len();
+        }
+        assert!(listing < full, "listing {listing} B vs full {full} B");
     }
 
     #[test]

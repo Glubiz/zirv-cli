@@ -269,6 +269,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_contract_parses_on_the_first_try() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         with_mode("proxy", || {
             let adapter = fake_model_adapter();
             let answers = decide(
@@ -287,6 +288,7 @@ mod tests {
 
     #[test]
     fn garbage_both_times_is_an_error_after_one_repair() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         with_mode("proxy_garbage", || {
             let adapter = fake_model_adapter();
             let error = decide(

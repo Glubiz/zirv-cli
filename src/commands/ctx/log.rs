@@ -427,10 +427,10 @@ pub fn append_delegation(state: &StateDir, record: &Delegation<'_>) -> CtxResult
 }
 
 /// [`append_delegation`], but marking this row a CACHED Jev hit (issue #803
-/// follow-up) -- used only by `jev::record`, the one call site where whether
-/// an answer came from the decision cache genuinely varies per call; every
-/// other caller's row is never cached, so it keeps calling plain
-/// `append_delegation` unchanged.
+/// follow-up) -- used by `jev::record` and the proxy intake's own spend row,
+/// the call sites where whether an answer came from the decision cache
+/// genuinely varies per call; every other caller's row is never cached, so it
+/// keeps calling plain `append_delegation` unchanged.
 pub(crate) fn append_delegation_cached(
     state: &StateDir,
     record: &Delegation<'_>,
@@ -672,11 +672,83 @@ pub fn tail_delegations(state: &StateDir, count: usize) -> CtxResult<Vec<String>
 /// read failure at all (missing file, unreadable file), exactly like
 /// `tail_delegations` itself already does for a missing file.
 pub fn read_delegations(state: &StateDir, count: usize) -> Vec<DelegationRow> {
-    tail_delegations(state, count)
+    let mut rows: Vec<DelegationRow> = tail_delegations(state, count)
         .unwrap_or_default()
         .iter()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+        .collect();
+    resplit_unsplit_codex_rows(state, &mut rows);
+    rows
+}
+
+const CODEX_SPLIT_FILE: &str = "delegations-codex-split.json";
+const ROLLOUT_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Codex rows logged before 4.51.0 carry their cached tokens inside `input_tokens` with
+/// `cache_read_input_tokens == 0`, so every consumer priced them at the full input rate. Re-split
+/// them from the pinned rollout's final token totals. The `(input, cached)` totals are recorded per
+/// session in a sidecar, so a rollout is read once and the split survives the rollout going away.
+fn resplit_unsplit_codex_rows(state: &StateDir, rows: &mut [DelegationRow]) {
+    let unsplit = |row: &DelegationRow| {
+        row.agent == "codex"
+            && row.input_tokens > 0
+            && row.cache_read_input_tokens == 0
+            && row.cache_creation_input_tokens == 0
+    };
+    if !rows.iter().any(unsplit) {
+        return;
+    }
+    let sidecar = state.logs().join(CODEX_SPLIT_FILE);
+    let mut known: std::collections::BTreeMap<String, (u64, u64)> =
+        std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+    let mut learned = false;
+    for row in rows.iter_mut().filter(|row| unsplit(row)) {
+        let (total, cached) = match known.get(&row.session) {
+            Some(totals) => *totals,
+            None => {
+                let Some(totals) = rollout_final_totals(state, &row.session) else {
+                    continue;
+                };
+                known.insert(row.session.clone(), totals);
+                learned = true;
+                totals
+            }
+        };
+        if total == 0 || cached == 0 {
+            continue;
+        }
+        let moved = (u128::from(row.input_tokens) * u128::from(cached) / u128::from(total)) as u64;
+        row.cache_read_input_tokens = moved;
+        row.input_tokens -= moved;
+    }
+    if learned && let Ok(text) = serde_json::to_string(&known) {
+        let _ = super::state::write_private(&sidecar, &text);
+    }
+}
+
+/// `(input, cached_input)` from the last token count of the rollout pinned for `session`. `None`
+/// while no rollout is pinned or readable, so a later read retries; `(0, 0)` when it has none.
+fn rollout_final_totals(state: &StateDir, session: &str) -> Option<(u64, u64)> {
+    let short = super::sessions::short_id(session);
+    let pin = std::fs::read_to_string(state.rollouts().join(format!("{short}.path"))).ok()?;
+    let mut file = std::fs::File::open(pin.trim()).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = len.saturating_sub(ROLLOUT_TAIL_BYTES);
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let totals =
+        text.lines()
+            .rev()
+            .find_map(|line| match super::window::parse_rollout_record(line)? {
+                super::window::RolloutRecord::TokenCount { totals, .. } => totals,
+                _ => None,
+            });
+    Some(totals.map_or((0, 0), |t| (t.input_tokens, t.cached_input_tokens)))
 }
 
 #[cfg(test)]
@@ -1321,6 +1393,82 @@ mod tests {
         assert_eq!(
             rows[0].mode, None,
             "an older row has no honest mode to report"
+        );
+    }
+
+    fn codex_row<'a>(session: &'a str, input: u64, cache_read: u64) -> Delegation<'a> {
+        Delegation {
+            ts: 1_700_000_000,
+            session,
+            parent_session: "sess-parent",
+            work_group_id: None,
+            agent: "codex",
+            model: Some("gpt-6-astra"),
+            input_tokens: input,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cache_read,
+            output_tokens: 5,
+            wall_ms: 1_000,
+            exit_code: 0,
+            outcome: "ok",
+            mode: None,
+            task_class: None,
+            principal: "root",
+            envelope_sha256: None,
+        }
+    }
+
+    /// A pre-4.51.0 codex row logged cached tokens inside `input_tokens`; reading it re-splits
+    /// the row from the pinned rollout's final token totals, and records the answer so the
+    /// rollout is not read twice.
+    #[test]
+    fn read_delegations_resplits_an_unsplit_codex_row_from_its_rollout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let rollout = tmp.path().join("rollout.jsonl");
+        let token_count = |input: u64, cached: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-08-20T10:00:05.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\"output_tokens\":5}}}}}}}}\n"
+            )
+        };
+        std::fs::write(
+            &rollout,
+            format!("{}{}", token_count(500, 400), token_count(1_000, 900)),
+        )
+        .expect("rollout");
+        std::fs::create_dir_all(state.rollouts()).expect("rollouts");
+        std::fs::write(
+            state.rollouts().join("aaaa1111.path"),
+            rollout.display().to_string(),
+        )
+        .expect("pin");
+        append_delegation(&state, &codex_row("aaaa1111-0000", 1_000, 0)).expect("append");
+        append_delegation(&state, &codex_row("bbbb2222-0000", 700, 0)).expect("append");
+        append_delegation(&state, &codex_row("cccc3333-0000", 100, 60)).expect("append");
+
+        let rows = read_delegations(&state, 10);
+        assert_eq!(
+            (rows[0].input_tokens, rows[0].cache_read_input_tokens),
+            (100, 900),
+            "the unsplit row is re-split from the rollout"
+        );
+        assert_eq!(
+            (rows[1].input_tokens, rows[1].cache_read_input_tokens),
+            (700, 0),
+            "a row with no rollout is left alone"
+        );
+        assert_eq!(
+            (rows[2].input_tokens, rows[2].cache_read_input_tokens),
+            (100, 60),
+            "an already split row is left alone"
+        );
+
+        std::fs::remove_file(&rollout).expect("drop rollout");
+        let again = read_delegations(&state, 10);
+        assert_eq!(
+            (again[0].input_tokens, again[0].cache_read_input_tokens),
+            (100, 900),
+            "the recorded split survives the rollout going away"
         );
     }
 

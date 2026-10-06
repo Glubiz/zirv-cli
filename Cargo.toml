@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "4.52.1"
+version = "4.53.0"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -83,8 +83,7 @@ windows-sys = { version = "0.61.2", features = [
 winresource = "0.1"
 
 [profile.release]
-opt-level       = "z"
-lto             = true
+lto            = true
 codegen-units   = 1
 debug           = false
 debug-assertions = false

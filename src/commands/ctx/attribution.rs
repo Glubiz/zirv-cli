@@ -647,14 +647,18 @@ pub fn reconcile(receipts: &[Receipt], prices: &PriceTable, filter: &Attribution
 ///   which decider (`typesafe` vs `helper`) produced a decision onto the spend
 ///   row, so a `"helper"`-decider intake decision is folded into `Intake`
 ///   here, same as a `"typesafe"`-decider one, rather than `Helper`. `Source::
-///   Helper`/`Source::Agent`/`Source::Judge`/`Source::Proposer` are therefore
+///   Agent`/`Source::Judge`/`Source::Proposer` are therefore
 ///   never produced by THIS function -- they only ever appear via an
 ///   externally supplied receipt (`--receipts`), e.g. a benchmark harness's
 ///   own harness-reported cost for the orchestrating session itself.
+/// - `agent == "helper"` is a helper-model call made through `handoff::helper_answer_with_env`
+///   (distiller, ask, optimize, objective judge, harvest) -- `Source::Helper`.
 /// - anything else is a delegated worker (`zirv ctx agent`, a dash pane, or a
 ///   native run settlement) -- `Source::Worker`.
 fn source_for_delegation(agent: &str, model: Option<&str>) -> Source {
-    if agent == "typesafe" {
+    if agent == "helper" {
+        Source::Helper
+    } else if agent == "typesafe" {
         if model == Some("jev-latest") {
             Source::Intake
         } else {

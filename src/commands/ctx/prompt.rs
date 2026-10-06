@@ -19,7 +19,7 @@ pub const SINGLE_PROMPT_FILE: &str = "system-prompt.single.md";
 
 /// Shared engineering rules govern proportionality; role layers decide who implements (#328, #334, #326).
 pub const DEFAULT_PROMPT: &str = "\
-zirv engineering standard (v7)
+zirv engineering standard (v8)
 
 Work the way a top-tier engineer works: judgment first, process in proportion, nothing wasted.
 
@@ -27,16 +27,15 @@ Work the way a top-tier engineer works: judgment first, process in proportion, n
 fix, a doc or comment): one change, the one check that could catch a mistake, a one-sentence \
 report. Bounded (one area, one intent): read what you need once, make the change, run the \
 tests that cover it. Substantial (several areas, real design choices, or elevated risk): plan \
-briefly, then work in verifiable steps. Never apply a heavier tier's ceremony to a lighter \
-task.
+briefly, then work in verifiable steps.
 - Read before you write: understand the code you're changing and mirror its naming, \
-structure and style. Touch only what the task needs.
+structure and style.
 - Choose the simplest design that fully meets the requirement. Reuse before adding; prefer \
 deleting to adding; no speculative abstractions, flags, options, or future-proofing \
-nobody asked for. When two designs both work, take the one with less code and fewer moving \
-parts.
-- Deliver exactly what was asked: no quiet narrowing, no bonus refactors, no drive-by \
-improvements. Mention further ideas in one line instead of building them.
+nobody asked for.
+- Deliver exactly what was asked: no bonus refactors, no drive-by improvements, no \
+unrequested metered calls (benchmark rounds, paid probes). Mention further ideas in one line \
+instead of building them.
 - Decide routine ambiguity yourself. Ask only when the readings would lead to materially \
 different work, with one precise question; otherwise name the assumption in your report.
 - Debug by evidence: reproduce first, fix the root cause not the symptom, one change at a \
@@ -46,9 +45,8 @@ run `zirv ctx search`.
 - Stuck twice on the same error: stop retrying variants. Step back, re-read the evidence, \
 change approach, or ask one precise question.
 - Verify with evidence, once. Run the check that would catch the failure this change could \
-cause, read its result, and trust it: do not re-run a passing suite, re-read a file you \
-already read, or re-check a fact already established this session unless something has \
-changed it. Before calling a multi-part request done, check each stated detail -- names, \
+cause, read its result, and trust it: do not re-run a passing suite or re-check a fact \
+already established this session unless something has changed it. Before calling a multi-part request done, check each stated detail -- names, \
 spellings, messages, exit codes, formats -- against your change.
 - No slop: no filler or narration, no comments that restate the code, no defensive code for \
 impossible states, no redundant docs or hedging, no recap of what you just did. Delete \
@@ -57,34 +55,37 @@ whatever it orphans -- code, imports, tests, docs -- and rename what no longer f
 never re-print output already shown.
 - Think like QA: what could this break, which edge case is uncovered -- empty or null input, \
 a boundary, partial failure, concurrency, the unhappy path? Test behaviour, not \
-implementation -- one focused test per behaviour change, none for a change that cannot alter \
-behaviour.
+implementation -- one focused test per behaviour change, failing before the change and \
+passing after it; none for a change that cannot alter behaviour. A speed or cost change needs \
+a before/after measurement taken the same way on the same input; drop and report a gain within \
+noise.
 - When a change touches a user interface, think like a designer: take the fewest steps to \
-the goal, cover loading, empty and error states, keep keyboard and screen-reader basics -- \
-never redesign what wasn't asked.
-- Follow the repository's own conventions, style, test layout and commit format; a repo \
-instruction file wins over these defaults. Run the exact command given and read its result \
-instead of assuming it worked.
+the goal, cover loading, empty and error states, keep keyboard and screen-reader basics.
+- Follow the repository's own conventions, test layout and commit format; a repo instruction \
+file wins over these defaults. Run the exact command given.
 - Finish the whole task: never hand back partial work for the user to finish. If genuinely \
 blocked, finish the rest and say exactly what's left and why.
-- No flattery, no agreeing to be agreeable: when the user or a reviewer is wrong, say so with \
-evidence, then do what they decide.
+- No flattery: when the user or a reviewer is wrong, say so with evidence, then do what they \
+decide.
 - Report honestly and briefly: lead with the outcome. If a command failed, a test did not \
-pass, or a step was skipped, say so and show the output. Never call unverified work done.";
+pass, or a step was skipped, say so and show the output. Never call unverified work done. An \
+analysis finding cites code, a test or recorded data and is validated before reporting; \
+discard what cannot be confirmed rather than estimate it.";
 
 /// Compact rules for Worker/Single turns avoid repeatedly paying for dispatcher guidance (#772).
 pub const DEFAULT_PROMPT_WORKER: &str = "\
-zirv engineering standard (worker, v1)
+zirv engineering standard (worker, v2)
 
 Work the way a top-tier engineer works: judgment first, nothing wasted. Your task is already \
-sized by whoever dispatched you -- match it, no more.
+sized by whoever dispatched you.
 
 - Read before you write: understand the code you're changing and mirror its naming, structure \
-and style. Touch only what the task needs.
+and style.
 - Choose the simplest design that fully meets the requirement. Reuse before adding; prefer \
 deleting to adding; no speculative abstractions, flags, or future-proofing nobody asked for.
-- Deliver exactly what was asked: no quiet narrowing, no bonus refactors, no drive-by \
-improvements. Mention further ideas in one line instead of building them.
+- Deliver exactly what was asked: no bonus refactors, no drive-by improvements, no \
+unrequested metered calls (benchmark rounds, paid probes). Mention further ideas in one line \
+instead of building them.
 - Decide routine ambiguity yourself and name the assumption in your report; ask only when the \
 readings would lead to materially different work.
 - Debug by evidence: reproduce first, fix the root cause not the symptom, one change at a time. \
@@ -99,16 +100,20 @@ hedging. Delete whatever it orphans and rename what no longer fits.
 output already shown.
 - Change files with the Edit tool after a ranged Read; never splice code through heredoc \
 scripts, `sed -i` or string replacement, which silently break escapes and indentation.
-- Think like QA: one focused test per behaviour change, including the unhappy path; none for a \
-change that cannot alter behaviour.
-- Follow the repository's own conventions, style, test layout and commit format; a repo \
-instruction file wins over these defaults.
+- Think like QA: one focused test per behaviour change, including the unhappy path, failing \
+before the change and passing after it; none for a change that cannot alter behaviour. A speed \
+or cost change needs a before/after measurement taken the same way on the same input; drop and \
+report a gain within noise.
+- Follow the repository's own conventions, test layout and commit format; a repo instruction \
+file wins over these defaults.
 - Finish the whole task: never hand back partial work. If genuinely blocked, finish the rest \
 and say exactly what's left and why.
 - No flattery: when the user or a reviewer is wrong, say so with evidence, then do what they \
 decide.
 - Report honestly and briefly: lead with the outcome. If a command failed, a test did not \
-pass, or a step was skipped, say so and show the output. Never call unverified work done.";
+pass, or a step was skipped, say so and show the output. Never call unverified work done. An \
+analysis finding cites code, a test or recorded data and is validated before reporting; \
+discard what cannot be confirmed rather than estimate it.";
 
 /// Shared role selection keeps composition, splice offsets and byte accounting consistent (#772).
 pub fn default_prompt_for(role: PromptRole) -> &'static str {
@@ -134,20 +139,17 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool
              brief."
         }
         OrchestratorWrites::Advise if hook_enforced => {
-            "This seat coordinates. Delegate substantial implementation, tests and docs to \
-             workers; make trivial edits (a few lines, a doc or config line, an integration \
-             fix) directly rather than dispatching for them. Repository writes from this seat \
-             are recorded; zirv nudges when they pile up."
+            "This seat may make trivial edits (a few lines, a doc or config line, an \
+             integration fix) directly rather than dispatching for them. Repository writes \
+             from this seat are recorded; zirv nudges when they pile up."
         }
         OrchestratorWrites::Advise => {
-            "This seat coordinates. Delegate substantial implementation, tests and docs to \
-             workers; make trivial edits (a few lines, a doc or config line, an integration \
-             fix) directly rather than dispatching for them."
+            "This seat may make trivial edits (a few lines, a doc or config line, an \
+             integration fix) directly rather than dispatching for them."
         }
         OrchestratorWrites::Allow => {
-            "This seat coordinates. Delegate substantial implementation, tests and docs to \
-             workers; make trivial edits (a few lines, a doc or config line, an integration \
-             fix) directly rather than dispatching for them."
+            "This seat may make trivial edits (a few lines, a doc or config line, an \
+             integration fix) directly rather than dispatching for them."
         }
     }
 }
@@ -155,7 +157,7 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool
 // Orchestrator-only, vendor-neutral guidance prevents worker recursion (#94, #204, #205, #228).
 // Bounded checkpoint/discovery commands limit recurring context cost (#225, #246, #355).
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v21)
+zirv meta-harness (v22)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
@@ -164,11 +166,13 @@ Delegate inside your own harness with its native subagent mechanism. `zirv agent
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
-your own harness from an orchestrator seat. `zirv ctx agent --role sub-orchestrator --scope \
-\"<area>\"` creates a coordinated work group. Name the cheapest model that can do the job, pass \
-`--workdir <path>` for another repo or worktree (otherwise the worker stays confined to this \
-one and reports BLOCKED), and trust the result exactly as you would a native subagent's. A \
-worker runs unattended and must not delegate further.
+your own harness from an orchestrator seat. Pass `--workdir <path>` for another repo or \
+worktree (otherwise it stays confined to this one and reports BLOCKED), and trust the result \
+exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrator --scope \
+\"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
+Every dispatch, native or `zirv agent`, names the cheapest model that \
+can do the job and tells the worker it runs unattended and must not delegate further: no \
+agents, teammates or forks (a sub-orchestrator work group is the one exception).
 - Checkpoints: `zirv ctx status` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
@@ -185,12 +189,12 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff on the review model named in the roster. Substantial or risky: \
-that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
-self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+independent review of the diff. Substantial or risky: that review plus one review worker per \
+other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
+bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
-what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+what it touched), then re-runs the checks. If \
 a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
@@ -211,11 +215,13 @@ Delegate inside your own harness with its native subagent mechanism. `zirv agent
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
-your own harness from an orchestrator seat. `zirv ctx agent --role sub-orchestrator --scope \
-\"<area>\"` creates a coordinated work group. Name the cheapest model that can do the job, pass \
-`--workdir <path>` for another repo or worktree (otherwise the worker stays confined to this \
-one and reports BLOCKED), and trust the result exactly as you would a native subagent's. A \
-worker runs unattended and must not delegate further.
+your own harness from an orchestrator seat. Pass `--workdir <path>` for another repo or \
+worktree (otherwise it stays confined to this one and reports BLOCKED), and trust the result \
+exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrator --scope \
+\"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
+Every dispatch, native or `zirv agent`, names the cheapest model that \
+can do the job and tells the worker it runs unattended and must not delegate further: no \
+agents, teammates or forks (a sub-orchestrator work group is the one exception).
 - Checkpoints: `zirv ctx status` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
@@ -232,12 +238,12 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff on the review model named in the roster. Substantial or risky: \
-that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
-self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+independent review of the diff. Substantial or risky: that review plus one review worker per \
+other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
+bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
-what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+what it touched), then re-runs the checks. If \
 a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
@@ -256,11 +262,13 @@ Delegate inside your own harness with its native subagent mechanism. `zirv agent
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
 pane's short id, and the worker mails its outcome back (`zirv ctx inbox`) -- and is refused for \
-your own harness from an orchestrator seat. `zirv ctx agent --role sub-orchestrator --scope \
-\"<area>\"` creates a coordinated work group. Name the cheapest model that can do the job, pass \
-`--workdir <path>` for another repo or worktree (otherwise the worker stays confined to this \
-one and reports BLOCKED), and trust the result exactly as you would a native subagent's. A \
-worker runs unattended and must not delegate further.
+your own harness from an orchestrator seat. Pass `--workdir <path>` for another repo or \
+worktree (otherwise it stays confined to this one and reports BLOCKED), and trust the result \
+exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrator --scope \
+\"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
+Every dispatch, native or `zirv agent`, names the cheapest model that \
+can do the job and tells the worker it runs unattended and must not delegate further: no \
+agents, teammates or forks (bar sub-orchestrators).
 - Check `zirv ctx status`/`zirv ctx inbox` at checkpoints; a `[zirv \u{25b8} mail]` line means \
 mail is already waiting -- run `zirv ctx inbox` (never `--peek`) right away. Steer one session \
 with `zirv ctx send --to-session <short>` or `zirv ctx nudge`; an undirected send is claimed by \
@@ -274,12 +282,12 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff on the review model named in the roster. Substantial or risky: \
-that review plus one review worker per other enabled harness (`zirv agent <name>`) with a \
-self-contained brief naming the diff and asking for confirmed, concrete findings; a harness the \
-roster marks capacity-limited gets only small, bounded briefs. Before each review round on code, \
+independent review of the diff. Substantial or risky: that review plus one review worker per \
+other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
+bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
-what it touched), replacing re-implemented code with existing code, then re-runs the checks. If \
+what it touched), then re-runs the checks. If \
 a `zirv workflow` review gate is active for the change, its `simplify` step (code packs) and `zirv workflow \
 review run` ARE the round and nothing else runs. Fix what is real, re-review only what the fixes \
 touched, stop as soon as a round yields no new confirmed findings, and hard-stop after 2 fix \
@@ -832,7 +840,7 @@ pub(super) const SKILL_POINTER_LAYER: &str = "\n\n---\n\nSkills: run `zirv skill
 one and `zirv skill load <id>` to load it before starting matching work.";
 
 /// Bounds descriptions to a sentence and first line so unvalidated text cannot forge extra index lines.
-fn first_sentence(description: &str) -> &str {
+pub(crate) fn first_sentence(description: &str) -> &str {
     let description = match description.find('\n') {
         Some(index) => &description[..index],
         None => description,
@@ -1232,7 +1240,7 @@ pub fn with_objective_layer(
     Some(composed)
 }
 
-const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
+pub(crate) const SUPERVISOR_LAYER: &str = "\n\n---\n\nA supervisor is on. Route real design or approach \
 choices through `zirv ctx supervisor ask \"<question>\" --option \"<a>\" --option \"<b>\"`, and follow \
 its ruling unless the operator overrides it. Run it as its own command (no `;`, `&&`, pipe, `cd` or \
 file redirect around it); if it reports a sandbox denial, run it again with the sandbox disabled.";
@@ -1441,7 +1449,8 @@ fn render_report_back_block(requested_by: &str, verified_parent: Option<&str>) -
     block.push_str(
         "\n\nReplace <summary> with a short plain-text summary of what you did or why you \
          stopped. Send it when you finish. If your supervising session sends follow-up steering \
-         by mail, act on it and send a further report when done.",
+         by mail, act on it and send a further report when done. Do not delegate onward: never run \
+         `zirv agent`, and never spawn agents, teammates or forks.",
     );
     Some(block)
 }
@@ -4852,7 +4861,7 @@ mod tests {
             composed.text
         );
         assert!(
-            !composed.text.contains("zirv meta-harness (v21)"),
+            !composed.text.contains("zirv meta-harness (v22)"),
             "must not carry the verbose header too:\n{}",
             composed.text
         );
@@ -4907,7 +4916,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v21)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v22)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4967,7 +4976,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v21)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v22)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -5005,7 +5014,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v21)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v22)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -5082,7 +5091,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v21)"),
+            HARNESS_PROMPT.contains("(v22)"),
             "a changed instruction layer must bump its own version token"
         );
     }
@@ -8038,7 +8047,7 @@ mod tests {
     #[test]
     fn the_default_prompt_carries_the_v5_marker_and_new_wording() {
         assert!(
-            DEFAULT_PROMPT.contains("zirv engineering standard (v7)"),
+            DEFAULT_PROMPT.contains("zirv engineering standard (v8)"),
             "got {DEFAULT_PROMPT}"
         );
         assert!(
@@ -8054,7 +8063,7 @@ mod tests {
     #[test]
     fn a_composed_prompt_carries_the_v5_marker_and_new_wording() {
         let (_tmp, home, repo) = tree();
-        // Issue #772: this pins the FULL `DEFAULT_PROMPT` text and its "(v7)"
+        // Issue #772: this pins the FULL `DEFAULT_PROMPT` text and its "(v8)"
         // marker specifically, which only an Orchestrator/SubOrchestrator
         // session's composed prompt still carries verbatim -- a Worker
         // session gets the compact `DEFAULT_PROMPT_WORKER` instead (see
@@ -8073,7 +8082,7 @@ mod tests {
         .expect("composed");
 
         assert!(
-            composed.text.contains("zirv engineering standard (v7)"),
+            composed.text.contains("zirv engineering standard (v8)"),
             "got {}",
             composed.text
         );
@@ -8119,12 +8128,12 @@ mod tests {
         assert!(
             composed
                 .text
-                .contains("zirv engineering standard (worker, v1)"),
+                .contains("zirv engineering standard (worker, v2)"),
             "got {}",
             composed.text
         );
         assert!(
-            !composed.text.contains("zirv engineering standard (v7)"),
+            !composed.text.contains("zirv engineering standard (v8)"),
             "a worker must not also carry the full standard: {}",
             composed.text
         );
@@ -8642,5 +8651,304 @@ mod tests {
             with.map(|c| c.text),
             "a ZIRV.md file must never change the composed wrapped-harness prompt"
         );
+    }
+
+    /// Every seat type's built-in prompt, composed through the launch path's own functions.
+    fn built_in_seat_prompts() -> Vec<(&'static str, String)> {
+        let (_tmp, home, repo) = tree();
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
+        let thresholds = super::super::screen::Thresholds::default();
+        let deny = PromptConfig {
+            orchestrator_writes: OrchestratorWrites::Deny,
+            ..PromptConfig::default()
+        };
+        let advise = PromptConfig::default();
+        // A live plugin lists skills natively, as on a real claude seat.
+        let claude = ClaudeAdapter::new(None).with_live_plugin_dir(home.clone());
+        let codex = CodexAdapter::new(None);
+        let compose_for = |adapter: &dyn AgentAdapter, role: PromptRole, cfg: &PromptConfig| {
+            let roster = crate::commands::ctx::adapters::harness_prompt_lines(
+                &crate::commands::ctx::config::CtxConfig::default(),
+                adapter.name(),
+            );
+            let cfg = PromptConfig {
+                skill_index_native: adapter.lists_skills_natively(role, &[]),
+                ..cfg.clone()
+            };
+            compose(
+                Some(&home),
+                &repo,
+                false,
+                &cfg,
+                role,
+                &roster,
+                usize::MAX,
+                &thresholds,
+            )
+        };
+        let launch = |adapter: &dyn AgentAdapter, role: PromptRole, cfg: &PromptConfig| {
+            let composed = compose_for(adapter, role, cfg);
+            merge_command_line_prompt(adapter, &[], composed, None, role, cfg)
+                .1
+                .expect("composed")
+                .text
+        };
+        // A dashboard worker pane adds report-back to the compiled prompt and no adapter layer.
+        let pane = with_report_back_layer(
+            compose_for(&claude, PromptRole::Worker, &advise),
+            "abcd1234",
+            None,
+        )
+        .expect("composed")
+        .text;
+        vec![
+            (
+                "orchestrator claude (deny)",
+                launch(&claude, PromptRole::Orchestrator, &deny),
+            ),
+            (
+                "orchestrator claude (advise)",
+                launch(&claude, PromptRole::Orchestrator, &advise),
+            ),
+            (
+                "orchestrator codex (deny)",
+                launch(&codex, PromptRole::Orchestrator, &deny),
+            ),
+            (
+                "orchestrator codex (advise)",
+                launch(&codex, PromptRole::Orchestrator, &advise),
+            ),
+            (
+                "sub-orchestrator claude",
+                launch(&claude, PromptRole::SubOrchestrator, &advise),
+            ),
+            ("single", launch(&claude, PromptRole::Single, &advise)),
+            ("dashboard pane worker", pane),
+            (
+                "headless worker claude",
+                launch(&claude, PromptRole::Worker, &advise),
+            ),
+        ]
+    }
+
+    /// Issue #452: each built-in rule is stated exactly once per seat type. A rule lists every
+    /// phrasing a layer has used for it, so a restatement in other words still counts twice.
+    #[test]
+    fn every_built_in_rule_is_stated_exactly_once_per_seat() {
+        const STANDARD: &[(&str, &[&str])] = &[
+            (
+                "scope: deliver exactly what was asked",
+                &[
+                    "Touch only what the task needs",
+                    "no drive-by improvements",
+                    "match it, no more",
+                    "redesign what wasn't asked",
+                ],
+            ),
+            (
+                "simplest design",
+                &["Choose the simplest design", "When two designs both work"],
+            ),
+            (
+                "mirror the code's style",
+                &["structure and style", "conventions, style,"],
+            ),
+            (
+                "no flattery",
+                &["No flattery", "no agreeing to be agreeable"],
+            ),
+            (
+                "finish the whole task",
+                &[
+                    "quiet narrowing",
+                    "never hand back partial work",
+                    "directly and completely",
+                ],
+            ),
+            ("read the check's result", &["read its result"]),
+            (
+                "reuse before adding",
+                &[
+                    "Reuse before adding",
+                    "reuse before adding",
+                    "re-implemented code",
+                ],
+            ),
+            (
+                "one focused test per behaviour change",
+                &["one focused test per behaviour change"],
+            ),
+            (
+                "report briefly",
+                &["Report honestly and briefly", "report compact results"],
+            ),
+            ("lead with the outcome", &["lead with the outcome"]),
+            (
+                "report failures",
+                &[
+                    "say so and show the output",
+                    "including failures, plainly",
+                    "including any failures",
+                ],
+            ),
+            (
+                "proof: a test fails before and passes after",
+                &["failing before the change and passing after it"],
+            ),
+            (
+                "proof: speed or cost needs a measurement",
+                &["before/after measurement"],
+            ),
+            (
+                "analysis findings are validated",
+                &["cites code, a test or recorded data"],
+            ),
+            ("no unrequested metered calls", &["metered calls"]),
+        ];
+        // Only the full standard (orchestrator and sub-orchestrator seats) sizes tasks itself.
+        const FULL_STANDARD: &[(&str, &[&str])] = &[
+            (
+                "the task's size sets the process",
+                &[
+                    "let the size set everything else",
+                    "heavier tier's ceremony",
+                ],
+            ),
+            (
+                "read what you need once",
+                &["read what you need once", "re-read a file you already read"],
+            ),
+        ];
+        const ORCHESTRATOR: &[(&str, &[&str])] = &[
+            (
+                "implementation goes to workers",
+                &[
+                    "never on implementation",
+                    "Delegate substantial implementation",
+                    "implementation, tests and docs are a worker's",
+                ],
+            ),
+            (
+                "same-harness work uses the native mechanism",
+                &[
+                    "same-harness delegation uses",
+                    "Delegate inside your own harness",
+                    "Delegation inside this harness uses",
+                ],
+            ),
+            (
+                "`zirv agent` reaches a different harness",
+                &[
+                    "is for reaching a different harness",
+                    "reaches a DIFFERENT harness",
+                    "exists to reach a DIFFERENT harness",
+                ],
+            ),
+            (
+                "`zirv agent` is refused for the seat's own harness",
+                &[
+                    "zirv refuses it from this seat",
+                    "refused for your own harness",
+                ],
+            ),
+            (
+                "work groups",
+                &["creates a coordinated work group", "creates a work group"],
+            ),
+            (
+                "a `zirv agent` worker attaches as a pane",
+                &["attaches as a pane", "spawns an attached pane"],
+            ),
+            (
+                "every dispatch names a cheaper model",
+                &[
+                    "Name the cheapest model",
+                    "names the cheapest model",
+                    "sets `model` explicitly",
+                    "without an explicit cheaper model",
+                ],
+            ),
+            (
+                "an omitted model inherits the seat",
+                &["omitted model inherits"],
+            ),
+            ("review in proportion", &["in proportion, once"]),
+            (
+                "reviews run on the roster's review model",
+                &[
+                    "run every code review on the named model",
+                    "review of the diff on the review model",
+                    "effort on the roster's review model",
+                    "reviews always run on the roster's review model",
+                ],
+            ),
+            (
+                "a simplify pass precedes review",
+                &["runs the `simplify` skill", "paired simplify pass"],
+            ),
+            (
+                "a workflow review gate is the round",
+                &["review gate is active", "review gate covers the change"],
+            ),
+            (
+                "git integration stays on the seat",
+                &["Git integration", "final integration"],
+            ),
+            (
+                "briefs are self-contained",
+                &["Briefs are self-contained", "with a self-contained brief"],
+            ),
+            (
+                "workers do not delegate further",
+                &["must not delegate further", "not to delegate further"],
+            ),
+            (
+                "no agents, teammates or forks below a worker",
+                &["teammates or forks"],
+            ),
+        ];
+        const SUB_ORCHESTRATOR: &[(&str, &[&str])] = &[(
+            "a sub-orchestrator spawns only workers",
+            &[
+                "Spawn only Workers",
+                "Do not spawn another sub-orchestrator",
+            ],
+        )];
+        // A fan-out allowance creeping back counts as a second, contradicting statement.
+        const WORKER: &[(&str, &[&str])] = &[(
+            "a worker never spawns agents, teammates or forks",
+            &[
+                "never spawn agents, teammates or forks",
+                "subagents for fan-out",
+                "fork-type subagents",
+            ],
+        )];
+        let mut failures = Vec::new();
+        for (seat, text) in built_in_seat_prompts() {
+            println!("{seat}: {} bytes", text.len());
+            let orchestrator: &[(&str, &[&str])] = if seat.starts_with("orchestrator") {
+                ORCHESTRATOR
+            } else if seat.starts_with("sub-orchestrator") {
+                SUB_ORCHESTRATOR
+            } else if seat.starts_with("headless worker")
+                || seat.starts_with("dashboard pane worker")
+            {
+                WORKER
+            } else {
+                &[]
+            };
+            let full_standard: &[(&str, &[&str])] = if seat.contains("orchestrator") {
+                FULL_STANDARD
+            } else {
+                &[]
+            };
+            for (rule, phrasings) in STANDARD.iter().chain(full_standard).chain(orchestrator) {
+                let count: usize = phrasings.iter().map(|p| text.matches(p).count()).sum();
+                if count != 1 {
+                    failures.push(format!("{seat}: '{rule}' stated {count} times"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

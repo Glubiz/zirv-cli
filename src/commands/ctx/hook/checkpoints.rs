@@ -853,10 +853,14 @@ pub(super) fn verify_on_stop_nudge(
     // No specific workflow branch in view here (a generic advisory nudge),
     // so this never widens to a sibling worktree's evidence -- see
     // `latest_is_fresh_and_passing`'s own doc comment.
-    if verification::latest_is_fresh_and_passing(state, repo, false, None).unwrap_or(true) {
+    // The freshness check lists the changed paths; the same scan serves the owed-check decision.
+    let mut scan = verification::ChangeScan::new(repo);
+    if verification::latest_is_fresh_and_passing_scan(state, repo, &mut scan, false, None)
+        .unwrap_or(true)
+    {
         return None;
     }
-    let changed = verification::changed_paths(repo).ok()?;
+    let changed = scan.paths().ok()?.to_vec();
     let active_phase = engine::load_active_for_session(
         state,
         repo,

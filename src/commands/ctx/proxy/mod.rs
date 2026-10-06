@@ -406,6 +406,7 @@ pub fn decide(
             ),
         }
     }
+    let cached = matches!(typesafe_result, Some(Ok((_, _, true))));
     let typesafe_result =
         typesafe_result.map(|call| call.map(|(answers, usage, _)| (answers, usage)));
     if let Some(typesafe_result) = typesafe_result {
@@ -424,6 +425,13 @@ pub fn decide(
                     && result.needs_clarification_decisive
                 {
                     result.clarification_category = clarification_category(&answers, cfg);
+                    // Coarse metadata cannot say what is missing, and the generic question went unanswered 9 of 9 times. (#452)
+                    if result.clarification_category.is_none() {
+                        result.needs_clarification_decisive = false;
+                        result.reasons.push(
+                            "needs_clarification: no informative category, not asking".to_string(),
+                        );
+                    }
                 }
                 winner = Decider::Typesafe;
                 usage = Some(model_usage);
@@ -468,6 +476,7 @@ pub fn decide(
         state_dir,
         &result,
         Some(&cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
+        cached,
     );
     result
 }
@@ -650,13 +659,16 @@ struct ProxyDecisionWire<'a> {
 
 #[cfg(test)]
 pub(crate) fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
-    persist_with(state_dir, d, None)
+    persist_with(state_dir, d, None, false)
 }
 
+/// `cached`: the Jev answer came from the decision cache, so the spend row is marked like
+/// `jev::record`'s and spend counts never see it as a request (#452).
 fn persist_with(
     state_dir: &Path,
     d: &ProxyDecision,
     operator_override: Option<&decision::ProxyOverride>,
+    cached: bool,
 ) -> CtxResult<()> {
     state::create_private_dir_all(state_dir)?;
     let mut file = state::open_private_append(&state_dir.join(PROXY_DECISIONS_FILE))?;
@@ -671,7 +683,7 @@ fn persist_with(
     if let Some(usage) = &d.usage {
         let wrapped = state::StateDir::from_path(state_dir.to_path_buf());
         let (session, principal) = jev::session_and_principal();
-        let _ = log::append_delegation(
+        let _ = log::append_delegation_cached(
             &wrapped,
             &log::Delegation {
                 ts: d.created_at,
@@ -692,6 +704,7 @@ fn persist_with(
                 principal: &principal,
                 envelope_sha256: None,
             },
+            cached,
         );
     }
     Ok(())
@@ -1049,6 +1062,35 @@ pub(crate) mod tests {
         assert_eq!(spend.len(), 1, "exactly one spend row per live call");
     }
 
+    /// #452: an intake answer served from the Jev cache made no request, so its zero-token spend
+    /// row is marked cached like every other site's, and `zirv ctx spend` does not count it.
+    #[test]
+    fn a_cached_intake_answer_writes_a_cached_spend_row() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_CACHED_452".to_string();
+        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.02}},"usage":{"input_tokens":23,"output_tokens":3}}"#;
+        let (base_url, server) = jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_CACHED_452", "test-key") };
+        for _ in 0..2 {
+            decide(
+                &cfg,
+                state_tmp.path(),
+                repo.path(),
+                "change the service",
+                false,
+            );
+        }
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_CACHED_452") };
+        server.join().expect("one live request");
+        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
+        let cached: Vec<bool> = spend.iter().map(|row| row.cached).collect();
+        assert_eq!(cached, [false, true], "{spend:?}");
+    }
+
     /// A failed intake call is still a live request: one fallback decision row and one zero-usage
     /// spend row, as `advise_detailed` writes.
     #[test]
@@ -1145,6 +1187,45 @@ pub(crate) mod tests {
         assert!(!metadata.contains("without downtime"));
         assert!(metadata.contains("_zirv_metadata_only"));
         assert_eq!(safe_intake_questions().len(), 2);
+    }
+
+    /// One `decide()` against a fake Jev that answers `body`, cache off.
+    fn decide_against_fake_jev(body: &'static str, request: &str, key_env: &str) -> ProxyDecision {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state_tmp = tempfile::tempdir().expect("state");
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.decider = ProxyDecider::Typesafe;
+        cfg.proxy.typesafe.credential_env = key_env.to_string();
+        cfg.jev.cache_ttl_secs = 0;
+        let (base_url, server) = jev::tests::one_shot_server(200, body);
+        cfg.proxy.typesafe.base_url = base_url;
+        unsafe { std::env::set_var(key_env, "test-key") };
+        let decision = decide(&cfg, state_tmp.path(), repo.path(), request, false);
+        unsafe { std::env::remove_var(key_env) };
+        server.join().expect("one request");
+        decision
+    }
+
+    /// #452 J1: a decisive needs_clarification with a sub-threshold category asks nothing, since
+    /// the question would be the generic one; an informative category still asks.
+    #[test]
+    fn clarification_is_asked_only_with_an_informative_category() {
+        let generic = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.6,"behavior":0.2,"constraint":0.1,"other":0.1},"confidence":0.6}},"usage":{"input_tokens":9,"output_tokens":1}}"#;
+        let silent =
+            decide_against_fake_jev(generic, "change the service", "JEV_TEST_KEY_GENERIC_452");
+        assert!(!silent.needs_clarification_decisive, "{:?}", silent.reasons);
+        assert!(silent.clarification_category.is_none());
+        assert!(!prompt_layer(&silent, None).contains("clarify:"));
+
+        let informative = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.96,"behavior":0.02,"constraint":0.01,"other":0.01},"confidence":0.96}},"usage":{"input_tokens":9,"output_tokens":1}}"#;
+        let asked = decide_against_fake_jev(
+            informative,
+            "change the service",
+            "JEV_TEST_KEY_INFORMATIVE_452",
+        );
+        assert!(asked.needs_clarification_decisive);
+        assert_eq!(asked.clarification_category.as_deref(), Some("target"));
+        assert!(prompt_layer(&asked, None).contains(INTERACTIVE_CLARIFY_LINE));
     }
 
     #[test]
@@ -2152,6 +2233,7 @@ pub(crate) mod tests {
     /// merge, which is exactly what this task's fix restores.
     #[test]
     fn decide_with_the_helper_decider_keeps_baseline_validation_flags() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         // SAFETY (test-only): restored at the end of this test regardless
         // of outcome.
         let had_mode = std::env::var("FAKE_MODEL_MODE").ok();

@@ -1474,16 +1474,18 @@ fn render_report<W: Write>(
             // Best-effort: an unreadable or disabled bank yields no
             // findings, never an error, so `status` never fails on this.
             let slug = repo_slug(repo);
-            for finding in super::memory::cadence_for_shared(repo, &state, &slug, cfg) {
+            let now = super::state::now_secs();
+            for finding in super::memory::cadence_for_shared(repo, &state, &slug, cfg, now) {
                 writeln!(
                     w,
                     "{}",
                     style::paint(
                         &format!(
-                            "memory cadence: {} {} (z={:.1})",
+                            "memory cadence: {} {} (z={:.1}, {} min ago)",
                             terminal_safe_writer_label(&finding.writer, 64),
                             cadence_phrase(finding.reason, finding.z_score),
-                            finding.z_score
+                            finding.z_score,
+                            now.saturating_sub(finding.at) / 60
                         ),
                         Tone::Warn,
                         colour

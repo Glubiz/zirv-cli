@@ -285,6 +285,7 @@ mod tests {
 
     #[test]
     fn a_limit_hit_hands_over_to_an_enabled_alternate_before_parking() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -365,6 +366,7 @@ mod tests {
     /// so the claude leg's own pre-launch gate is exercised for real.
     #[test]
     fn a_provider_switch_restart_still_paces_into_a_throttled_provider() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -632,6 +634,7 @@ mod tests {
     /// returned as a bare `exit 1`.
     #[test]
     fn a_capacity_error_restarts_within_budget_with_a_backoff() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -957,6 +960,7 @@ mod tests {
     /// on that relaunch even though it never existed at the initial launch.
     #[test]
     fn a_nudge_on_an_explicit_command_codex_run_delivers_the_nudge_mail_on_the_relaunch() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1163,6 +1167,7 @@ mod tests {
     /// place.
     #[test]
     fn a_nudge_on_a_simple_codex_run_still_delivers_its_own_guidance() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1293,6 +1298,7 @@ mod tests {
     /// but never popping a mode.
     #[test]
     fn a_post_nudge_park_carries_the_nudges_own_mail_not_the_stale_launch_mail() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1486,6 +1492,7 @@ mod tests {
 
     #[test]
     fn a_headless_worker_stops_at_the_next_poll_and_relaunches_with_the_guidance() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1579,6 +1586,7 @@ mod tests {
     /// `"timeout"` verdict) must never fire at all.
     #[test]
     fn a_nudge_restart_does_not_spend_the_rot_restart_budget() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1660,6 +1668,7 @@ mod tests {
     /// `"{source} handoff at {path}"` already reads for the ordinary path.
     #[test]
     fn a_nudge_restart_carries_a_handoff_forward_like_every_other_restart() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");
@@ -1740,6 +1749,7 @@ mod tests {
     /// silently dropped.
     #[test]
     fn consecutive_nudge_restarts_are_capped_and_the_message_is_left_unread() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state_dir = tmp.path().join("state");

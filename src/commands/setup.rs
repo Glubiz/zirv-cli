@@ -1323,11 +1323,20 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
         current_shapes.retain(|&(event, matcher, command)| {
             command_live_at_slot(&settings, event, matcher, command)
         });
-        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+        if let Some(state) = baseline_state_for(home) {
             let _ = ctx::hook_integrity::record_baseline(&state, &settings_path, &current_shapes);
         }
     }
     Ok((hooks_added, statusline_added))
+}
+
+/// The state dir whose hook baseline belongs to the settings under `home`: only this process's own
+/// home qualifies, so applying setup to any other home never writes into the operator's state dir.
+fn baseline_state_for(home: &Path) -> Option<ctx::state::StateDir> {
+    if crate::utils::home_dir().ok().as_deref() != Some(home) {
+        return None;
+    }
+    ctx::state::StateDir::resolve(&ctx::config::env_from_process()).ok()
 }
 
 fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupResult<usize> {
@@ -1368,7 +1377,7 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
         // still records a baseline. Best-effort: a write failure here
         // leaves these entries `NoBaseline` in `zirv ctx hook status`
         // instead of failing `setup apply`.
-        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+        if let Some(state) = baseline_state_for(home) {
             // Issue #420 (delta-review fix): same reasoning as
             // `install_claude_integration`'s own identical filter -- only
             // baseline a shape actually live at its own scoped slot.
@@ -5356,6 +5365,29 @@ mod tests {
                 "every claude slot must have a baseline after either apply: {row:?}"
             );
         }
+    }
+
+    /// A setup apply against a home that is not this process's own (a test's tempdir) must not
+    /// record a baseline for it in the operator's state dir.
+    #[test]
+    fn install_integration_for_a_foreign_home_leaves_the_state_dir_untouched() {
+        let own_home = tempfile::tempdir().expect("own home");
+        let _home = HomeGuard::set(own_home.path());
+        let _claude_home = VarGuard::set(&[("CLAUDE_CONFIG_DIR", None), ("CODEX_HOME", None)]);
+        let state_dir = own_home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let foreign_home = tempfile::tempdir().expect("foreign home");
+        install_claude_integration(foreign_home.path(), false).expect("claude apply");
+        install_codex_integration(foreign_home.path(), false).expect("codex apply");
+
+        assert!(
+            !state_dir.join("hooks/baseline.json").exists(),
+            "a foreign home's settings must not be baselined into this state dir"
+        );
     }
 
     /// Codex counterpart of

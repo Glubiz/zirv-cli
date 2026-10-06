@@ -1123,7 +1123,9 @@ fn run_with_clock_inner<W: Write>(
                 .ok()
                 .flatten()
                 .map(|(_, h)| h);
-            let (note, source) = handoff::distill_or_structural(
+            let (note, source) = handoff::distill_or_structural_with_jev(
+                &cfg,
+                &state,
                 adapter.as_ref(),
                 &distiller_model,
                 &ctx,
@@ -1383,7 +1385,9 @@ fn run_with_clock_inner<W: Write>(
                     .ok()
                     .flatten()
                     .map(|(_, h)| h);
-                let (note, source) = handoff::distill_or_structural(
+                let (note, source) = handoff::distill_or_structural_with_jev(
+                    &cfg,
+                    &state,
                     adapter.as_ref(),
                     &distiller_model,
                     &ctx,
@@ -1870,7 +1874,9 @@ fn run_with_clock_inner<W: Write>(
             .ok()
             .flatten()
             .map(|(_, h)| h);
-        let (note, source) = handoff::distill_or_structural(
+        let (note, source) = handoff::distill_or_structural_with_jev(
+            &cfg,
+            &state,
             adapter.as_ref(),
             &distiller_model,
             &ctx,

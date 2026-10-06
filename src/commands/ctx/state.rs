@@ -1019,6 +1019,42 @@ pub fn prune_to_newest(dir: &Path, keep: usize) {
     }
 }
 
+#[cfg(not(test))]
+fn state_override(env: EnvLookup<'_>) -> Option<String> {
+    env(STATE_ENV)
+}
+
+/// A test never reaches a real state dir: only an override inside the system temp dir is
+/// honoured; any other (or none) resolves to a per-process temp dir.
+#[cfg(test)]
+fn state_override(env: EnvLookup<'_>) -> Option<String> {
+    let temp = std::env::temp_dir();
+    let temp = temp.canonicalize().unwrap_or(temp);
+    let honoured = env(STATE_ENV).filter(|raw| {
+        let path = Path::new(raw);
+        let Some((ancestor, canonical)) = path
+            .ancestors()
+            .find_map(|a| Some((a, a.canonicalize().ok()?)))
+        else {
+            return false;
+        };
+        let Ok(rest) = path.strip_prefix(ancestor) else {
+            return false;
+        };
+        let escapes = rest
+            .components()
+            .any(|c| c == std::path::Component::ParentDir);
+        !escapes && canonical.join(rest).starts_with(&temp)
+    });
+    honoured.or_else(|| {
+        let fallback = temp
+            .join(format!("zirv-test-state-{}", std::process::id()))
+            .join("zirv")
+            .join("ctx");
+        Some(fallback.display().to_string())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir(PathBuf);
 
@@ -1044,7 +1080,7 @@ impl StateDir {
     /// `ZIRV_CTX_STATE_DIR`, else the platform state dir, else the platform
     /// local data dir (macOS and Windows have no state dir), plus `zirv/ctx`.
     pub fn resolve(env: EnvLookup<'_>) -> CtxResult<Self> {
-        if let Some(raw) = env(STATE_ENV) {
+        if let Some(raw) = state_override(env) {
             return Ok(Self(PathBuf::from(raw)));
         }
         let base = dirs::state_dir()
@@ -1485,6 +1521,32 @@ impl StateDir {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_test_never_resolves_a_state_dir_outside_the_temp_dir() {
+        let fallback = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp")
+            .join(format!("zirv-test-state-{}", std::process::id()))
+            .join("zirv/ctx");
+        for outside in [
+            Some("/Users/someone/Library/Application Support/zirv/ctx".to_string()),
+            Some(format!("{}/../escape", std::env::temp_dir().display())),
+            None,
+        ] {
+            let env: HashMap<String, String> = outside
+                .iter()
+                .map(|raw| (STATE_ENV.to_string(), raw.clone()))
+                .collect();
+            let state = StateDir::resolve(&|k| env.get(k).cloned()).expect("resolve");
+            assert_eq!(state.root(), fallback, "{outside:?}");
+        }
+        let inside = tempfile::tempdir().expect("tempdir").keep().join("state");
+        let env: HashMap<String, String> =
+            [(STATE_ENV.to_string(), inside.display().to_string())].into();
+        let state = StateDir::resolve(&|k| env.get(k).cloned()).expect("resolve");
+        assert_eq!(state.root(), inside);
+    }
 
     #[test]
     fn env_override_wins_and_paths_hang_off_root() {
