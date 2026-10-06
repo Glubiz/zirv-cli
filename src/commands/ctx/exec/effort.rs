@@ -2,8 +2,9 @@
 
 use super::*;
 
-/// Apply operator-only Claude headless cost settings; unset settings and
-/// other adapters leave the launch unchanged. (#788)
+/// Apply operator-only Claude headless cost settings. Effort defaults to
+/// `low` for every class; every other unset setting, and other adapters,
+/// leave the launch unchanged. (#788)
 pub(super) fn apply_headless_cost_levers(
     command: &mut Command,
     cfg: &CtxConfig,
@@ -35,7 +36,7 @@ pub(super) fn apply_headless_cost_levers(
         let arg = arg.to_string_lossy();
         arg == "--effort" || arg.starts_with("--effort=")
     });
-    if argv_has_effort || headless.effort == super::config::HeadlessEffortConfig::default() {
+    if argv_has_effort {
         return;
     }
     if let Some(effort) = sticky_headless_effort(state, cfg, session, prompt) {
@@ -61,7 +62,15 @@ fn sticky_headless_effort(
     let deterministic = classification
         .as_ref()
         .and_then(|classification| headless_effort_for(&headless.effort, classification.complexity))
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            // No prompt or no classification: only a value shared by every
+            // class is unambiguous (the shipped all-`low` default).
+            let e = &headless.effort;
+            (e.trivial == e.bounded && e.bounded == e.substantial)
+                .then(|| e.trivial.clone())
+                .flatten()
+        });
     let effort = match (prompt, &classification) {
         (Some(prompt), Some(classification)) => {
             jev_launch_effort(state, cfg, prompt, classification.complexity).or(deterministic)
@@ -242,12 +251,11 @@ fn headless_effort_for(
 mod tests {
     use super::*;
 
-    /// Issue #788: with every `[headless]` key unset (the shipped default),
-    /// a headless launch stays byte-identical to one built before this
-    /// table existed -- no `CLAUDE_CODE_PROMPT_CACHE_TTL`/`CLAUDE_CODE_
-    /// EFFORT_LEVEL` env is added, whatever prompt text is passed.
+    /// With no operator config, a headless launch carries
+    /// `CLAUDE_CODE_EFFORT_LEVEL=low` for every class (and no cache-TTL env);
+    /// an explicit operator value for a class still wins over the default.
     #[test]
-    fn apply_headless_cost_levers_is_a_noop_with_unset_config() {
+    fn apply_headless_cost_levers_defaults_effort_to_low_and_explicit_value_wins() {
         let _env = crate::commands::ctx::testenv::VarGuard::set(&[
             ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
             ("FORCE_PROMPT_CACHING_5M", None),
@@ -255,6 +263,15 @@ mod tests {
             ("CLAUDE_CODE_EFFORT_LEVEL", None),
         ]);
         let cfg = CtxConfig::default();
+        let low = Some("low".to_string());
+        assert_eq!(
+            (
+                &cfg.headless.effort.trivial,
+                &cfg.headless.effort.bounded,
+                &cfg.headless.effort.substantial
+            ),
+            (&low, &low, &low)
+        );
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
         let session = SessionId::new_v4();
@@ -268,10 +285,52 @@ mod tests {
             &state,
             &session,
         );
+        let envs: Vec<_> = command.get_envs().collect();
         assert_eq!(
-            command.get_envs().count(),
-            0,
-            "an unconfigured [headless] table must add no env"
+            envs,
+            vec![(
+                std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
+                Some(std::ffi::OsStr::new("low"))
+            )],
+            "an unconfigured [headless] table must add only effort=low"
+        );
+
+        // No prompt text (nothing to classify): the shared default still applies.
+        let mut bare = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut bare,
+            &cfg,
+            "claude",
+            None,
+            &state,
+            &SessionId::new_v4(),
+        );
+        assert_eq!(
+            bare.get_envs().collect::<Vec<_>>(),
+            vec![(
+                std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
+                Some(std::ffi::OsStr::new("low"))
+            )]
+        );
+
+        // An explicit operator value wins over the default for its class.
+        let mut explicit = CtxConfig::default();
+        explicit.headless.effort.trivial = Some("medium".to_string());
+        let mut command = Command::new("claude");
+        apply_headless_cost_levers(
+            &mut command,
+            &explicit,
+            "claude",
+            Some("do a small thing"),
+            &state,
+            &SessionId::new_v4(),
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("medium"))
         );
     }
 
@@ -317,9 +376,10 @@ mod tests {
             &state,
             &SessionId::new_v4(),
         );
-        assert_eq!(
-            command.get_envs().count(),
-            0,
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != "CLAUDE_CODE_PROMPT_CACHE_TTL"),
             "the operator's own FORCE_PROMPT_CACHING_5M must win over a configured ttl"
         );
     }
@@ -335,7 +395,9 @@ mod tests {
             crate::commands::ctx::testenv::VarGuard::set(&[("CLAUDE_CODE_EFFORT_LEVEL", None)]);
         let mut cfg = CtxConfig::default();
         cfg.headless.effort.trivial = Some("low".to_string());
-        // `bounded` is deliberately left unset.
+        // `bounded` is deliberately cleared (the shipped default is `low`).
+        cfg.headless.effort.bounded = None;
+        cfg.headless.effort.substantial = None;
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 

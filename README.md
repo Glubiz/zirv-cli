@@ -4937,7 +4937,7 @@ sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
 claude` headless workers (they share `ctx exec`'s own launch builder).
 Interactive `wrap`/`chat`/dash sessions never read this table.
 
-Every key is unset or off by default. The example below is an opt-in configuration, not the defaults:
+Effort defaults to `low` for every class (measured against Claude Code's `medium` over 10 XL tasks x 4 runs x 2 rounds: cost -10%, agent time -9%, hidden-test pass rate +1 pt, blind judge -1.75 pts); set a class to `medium` to restore Claude Code's own default. Every other key is unset or off by default. The example below is an opt-in configuration, not the defaults:
 
 ```toml
 [headless]
@@ -4946,7 +4946,7 @@ lean = true                      # adds "autoMemoryEnabled": false and "disableB
 disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
 
 [headless.effort]
-trivial = "low"                  # low | medium | high | xhigh | max, unset by default; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
+trivial = "low"                  # low | medium | high | xhigh | max, "low" by default for all three classes; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
 bounded = "medium"               # ZIRV_CTX_HEADLESS_EFFORT_BOUNDED
 substantial = "medium"           # ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL -- also what an Architectural-complexity request reads; see below
 ```
@@ -4961,8 +4961,9 @@ complexity has a configured value; an operator's own `CLAUDE_CODE_EFFORT_LEVEL`
 or an argv that already carries `--effort` wins over it. `lean` and
 `disallowed_tools` only ever narrow a HEADLESS launch -- an interactive
 session, where a human is present, is untouched. With every key unset (the
-shipped default) a headless launch is byte-identical to one built before
-this table existed.
+shipped default) a headless launch differs from one built before this table
+existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`. A launch with no prompt text to
+classify uses the effort shared by all three classes.
 
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
 
@@ -4979,7 +4980,8 @@ classifier's own complexity index, and whether the prompt reads as a question
 unusually hard" is no evidence of a small follow-up. A decisive no, an
 indecisive answer, a failed call, an unavailable credential, or a decisive
 yes whose `substantial` tier has no configured value all keep the plain
-deterministic classification above, exactly as with the gate off. Whichever
+deterministic classification above, exactly as with the gate off. With the
+all-`low` default the gate changes nothing until `substantial` is set higher. Whichever
 value wins goes through the SAME sticky, per-session record as the
 deterministic path: a resumed session never re-asks and never changes effort
 mid-conversation, and this can never override an explicit `--effort` or the
@@ -5101,7 +5103,7 @@ keep only your own.
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
-| `[headless]` cost levers | operator home or environment only | off by default; a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort and a lean/`--disallowedTools` tool surface -- with every key unset the launch is byte-identical to before this table existed; an interactive `wrap`/`chat`/dash session is never narrowed by it |
+| `[headless]` cost levers | operator home or environment only | a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort (defaults to `low`) and a lean/`--disallowedTools` tool surface (off by default) -- with every key unset the launch differs from before this table existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 | Autoresearch campaign manifest (`zirv workflow research plan\|run`) and every file it references (corpus, fixture, evaluator, candidate patch) | operator input, like a script | a `[[candidates]]` env overlay may only use a key that is in BOTH the manifest's own `[candidate_space] allow_env` AND a compiled-in allowlist (non-safety Jev gates/floors, `ZIRV_CTX_PROXY_MIN_CONFIDENCE`/`MIN_MARGIN`, the handover ladder, `[headless]` effort, `[score]` token ratios); anything permission/sandbox/safety/credential/base_url-shaped, and the fixed Jev safety gates (approve/approve_allow/inject_screen/stop_verify/missing_tests/review/gates/admin_dispatch), are always refused regardless of what the manifest declares; repo-owned `.zirv/` files cannot widen either list, and a `requires_receipts` entry outside the compiled prefixes is refused at `plan` time |

@@ -176,14 +176,27 @@ pub struct JevFloorsConfig {
 }
 
 /// Operator-only, opt-in Claude headless controls; interactive wrap/chat/dashboard paths never read them (#788).
-/// Repos cannot change billing, effort or tool/memory scope; unset keys leave launches unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// Repos cannot change billing, effort or tool/memory scope. Effort defaults to `low` for every class
+/// (measured: cost -10%, time -9%); set a class to `medium` for Claude Code's own default. The
+/// other `[headless]` keys are off by default and leave launches unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadlessEffortConfig {
     pub trivial: Option<String>,
     pub bounded: Option<String>,
     /// Also covers Architectural: the text-only classifier cannot produce that class, so no separate key is needed.
     pub substantial: Option<String>,
+}
+
+impl Default for HeadlessEffortConfig {
+    fn default() -> Self {
+        let low = || Some("low".to_string());
+        Self {
+            trivial: low(),
+            bounded: low(),
+            substantial: low(),
+        }
+    }
 }
 
 /// Operator-only headless controls with the scope and trust constraints of [`HeadlessEffortConfig`] (#788).
@@ -193,7 +206,7 @@ pub struct HeadlessConfig {
     /// Optional `5m`/`1h` cache TTL; existing `CLAUDE_CODE_PROMPT_CACHE_TTL`,
     /// `FORCE_PROMPT_CACHING_5M` or `ENABLE_PROMPT_CACHING_1H` environment values take precedence.
     pub prompt_cache_ttl: Option<String>,
-    /// Optional per-class effort; existing `CLAUDE_CODE_EFFORT_LEVEL` or `--effort` wins.
+    /// Per-class effort, `low` by default; existing `CLAUDE_CODE_EFFORT_LEVEL` or `--effort` wins.
     /// Classification is pure unless `[jev] launch_effort` enables first-launch metadata refinement.
     pub effort: HeadlessEffortConfig,
     /// Disable auto-memory and bundled skills in the headless settings layer.
