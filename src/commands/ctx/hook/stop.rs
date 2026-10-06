@@ -21,10 +21,6 @@ use crate::commands::ctx::rot::{Score, Verdict};
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::{CtxResult, log, score, signal};
 
-/// Background-subagent dialogs observed waiting 62-380 s; a prompt older than this belongs to a
-/// subagent that died without SubagentStop.
-const SUBAGENT_PROMPT_MAX_AGE_SECS: u64 = 30 * 60;
-
 // Check diagnostics configuration before parsing the transcript so
 // disabled sessions pay no post-edit analysis cost (#308).
 fn diagnostics_stop_nudge(
@@ -166,16 +162,12 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         // A main-thread turn boundary ends the main thread's prompts only: a native subagent shares
         // the session and its dialog may still be waiting. Closing them and clearing their latch
         // share one lock, so a dialog confirmed meanwhile cannot outlive its entry (#864). A
-        // subagent killed without SubagentStop never closes its own, so one older than
-        // `SUBAGENT_PROMPT_MAX_AGE_SECS` is closed here too.
+        // subagent's own prompts close on its SubagentStop or its hand-back, never on age.
         let attention_short = super::permission::attention_short(env, &payload.session_id);
         crate::commands::ctx::attention::resolve_prompts(
             &state,
             &attention_short,
-            |open| {
-                open.agent.is_empty()
-                    || now_secs().saturating_sub(open.at) > SUBAGENT_PROMPT_MAX_AGE_SECS
-            },
+            |open| open.agent.is_empty(),
             crate::commands::ctx::attention::Observation::new(
                 crate::commands::ctx::attention::Authority::AdapterHook,
                 "turn completed cleanly",
@@ -935,11 +927,10 @@ mod tests {
         assert_eq!(main_left, 0, "the main-thread prompt closed");
     }
 
-    /// A subagent killed without SubagentStop never closes its prompt; a main-thread Stop closes
-    /// subagent prompts older than the bound, so the latch cannot outlive the session, and keeps
-    /// fresh ones.
+    /// A subagent dialog the operator has left waiting for hours is still waiting: a main-thread
+    /// Stop never closes it by age, only SubagentStop or the subagent's hand-back does.
     #[test]
-    fn a_main_thread_stop_closes_a_stale_subagent_prompt_and_keeps_a_fresh_one() {
+    fn a_main_thread_stop_keeps_an_old_subagent_prompt_and_its_latch() {
         use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
@@ -971,28 +962,13 @@ mod tests {
             &state,
             short,
             OpenPrompt {
-                id: "p-stale".to_string(),
-                agent: "a-dead".to_string(),
-                at: now - 31 * 60,
+                id: "p-old".to_string(),
+                agent: "a-waiting".to_string(),
+                at: now - 3 * 60 * 60,
                 ..Default::default()
             },
         );
-        attention::confirm_prompts(&state, short, "Bash: cargo", now - 31 * 60);
-        stop();
-        assert_eq!(attention::load(&state, short).attention, Attention::None);
-        assert_eq!(attention::close_prompts(&state, short, |_| false), 0);
-
-        attention::open_prompt(
-            &state,
-            short,
-            OpenPrompt {
-                id: "p-fresh".to_string(),
-                agent: "a-live".to_string(),
-                at: now - 5 * 60,
-                ..Default::default()
-            },
-        );
-        attention::confirm_prompts(&state, short, "Bash: cargo", now - 5 * 60);
+        attention::confirm_prompts(&state, short, "Bash: cargo", now - 3 * 60 * 60);
         stop();
         assert_eq!(
             attention::load(&state, short).attention,

@@ -172,7 +172,7 @@ exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrato
 \"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
 Every dispatch, native or `zirv agent`, names the cheapest model that \
 can do the job and tells the worker it runs unattended and must not delegate further: no \
-agents, teammates or forks.
+agents, teammates or forks (a sub-orchestrator work group is the one exception).
 - Checkpoints: `zirv ctx status` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
@@ -221,7 +221,7 @@ exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrato
 \"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
 Every dispatch, native or `zirv agent`, names the cheapest model that \
 can do the job and tells the worker it runs unattended and must not delegate further: no \
-agents, teammates or forks.
+agents, teammates or forks (a sub-orchestrator work group is the one exception).
 - Checkpoints: `zirv ctx status` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
@@ -268,7 +268,7 @@ exactly as you would a native subagent's. `zirv ctx agent --role sub-orchestrato
 \"<area>\"` creates a work group for work that splits into several coherently-scoped areas. \
 Every dispatch, native or `zirv agent`, names the cheapest model that \
 can do the job and tells the worker it runs unattended and must not delegate further: no \
-agents, teammates or forks.
+agents, teammates or forks (bar sub-orchestrators).
 - Check `zirv ctx status`/`zirv ctx inbox` at checkpoints; a `[zirv \u{25b8} mail]` line means \
 mail is already waiting -- run `zirv ctx inbox` (never `--peek`) right away. Steer one session \
 with `zirv ctx send --to-session <short>` or `zirv ctx nudge`; an undirected send is claimed by \
@@ -1449,7 +1449,8 @@ fn render_report_back_block(requested_by: &str, verified_parent: Option<&str>) -
     block.push_str(
         "\n\nReplace <summary> with a short plain-text summary of what you did or why you \
          stopped. Send it when you finish. If your supervising session sends follow-up steering \
-         by mail, act on it and send a further report when done.",
+         by mail, act on it and send a further report when done. Do not delegate onward: never run \
+         `zirv agent`, and never spawn agents, teammates or forks.",
     );
     Some(block)
 }
@@ -8929,7 +8930,9 @@ mod tests {
                 ORCHESTRATOR
             } else if seat.starts_with("sub-orchestrator") {
                 SUB_ORCHESTRATOR
-            } else if seat.starts_with("headless worker") {
+            } else if seat.starts_with("headless worker")
+                || seat.starts_with("dashboard pane worker")
+            {
                 WORKER
             } else {
                 &[]

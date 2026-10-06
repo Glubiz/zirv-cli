@@ -149,9 +149,21 @@ pub(crate) fn parse_reply(
             }
             let tail = after
                 .trim_start_matches(|c: char| {
-                    is_mark(c) || c.is_whitespace() || ".:,-—–".contains(c)
+                    is_mark(c) || c.is_whitespace() || ".:;,-—–".contains(c)
                 })
                 .trim_end_matches(is_mark);
+            // `Done. But ...`, `Done - not yet` and `Done: no, ...` hedge it after punctuation.
+            let first_word: String = tail
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let hedges = [
+                "but", "however", "no", "not", "except", "although", "yet", "unless",
+            ];
+            if verdict == "done" && hedges.contains(&first_word.as_str()) {
+                return None;
+            }
             let reason = [tail, rest]
                 .into_iter()
                 .filter(|part| !part.is_empty())
@@ -527,6 +539,19 @@ mod tests {
         assert_eq!(parse("Done, but the tests fail."), None);
         assert_eq!(parse("Done? No, lint is missing"), None);
         assert_eq!(parse("Ruling: done, but lint is missing"), None);
+        for hedged in [
+            "Done. But the tests fail",
+            "Done - not yet",
+            "Done; however lint is missing",
+            "Done: no, lint is missing",
+            "Done. Except the docs",
+            "DONE - Although partial",
+            "Done: yet to run tests",
+            "Done. Unless CI fails",
+        ] {
+            assert_eq!(parse(hedged), None, "{hedged}");
+        }
+        assert!(parse("Done. Nothing left to do").is_some());
     }
 
     #[test]

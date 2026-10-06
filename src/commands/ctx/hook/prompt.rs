@@ -238,11 +238,14 @@ pub(super) fn run_prompt<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -
         // A turn boundary ends the main thread's prompts; a subagent's dialog may still wait. The
         // operator's own prompt also proves no dialog holds the input, so the latch goes too unless
         // a subagent prompt is confirmed; a harness-started turn does not (#864).
-        if is_harness_injected_prompt(&prompt_text_from(stdin)) {
+        let prompt_text = prompt_text_from(stdin);
+        if is_harness_injected_prompt(&prompt_text) {
+            // A hand-back or task notification naming a subagent proves that subagent is done.
+            let finished = handed_back_agent(&prompt_text);
             crate::commands::ctx::attention::close_prompts(
                 &state,
                 &attention_short(env, &session_id),
-                |open| open.agent.is_empty(),
+                |open| open.agent.is_empty() || finished.as_deref() == Some(open.agent.as_str()),
             );
         } else {
             clear_resolved_approval(
@@ -292,6 +295,27 @@ pub(super) fn is_harness_injected_prompt(prompt: &str) -> bool {
         head.get(..wrapper.len())
             .is_some_and(|start| start.eq_ignore_ascii_case(wrapper))
     })
+}
+
+/// The subagent id a harness-injected hand-back names: `<agent-message from="ID">`,
+/// `<teammate-message teammate_id="ID">` or `<task-notification><task-id>ID</task-id>`.
+fn handed_back_agent(prompt: &str) -> Option<String> {
+    let head = prompt.trim_start();
+    let between = |open: &str, close: char| {
+        let rest = &head[head.find(open)? + open.len()..];
+        let id = &rest[..rest.find(close)?];
+        (!id.is_empty()).then(|| id.to_string())
+    };
+    if head.starts_with("<agent-message") {
+        return between("from=\"", '"');
+    }
+    if head.starts_with("<teammate-message") {
+        return between("teammate_id=\"", '"');
+    }
+    if head.starts_with("<task-notification") {
+        return between("<task-id>", '<');
+    }
+    None
 }
 
 /// One-turn discipline note for a substantial first prompt, capped to
@@ -1089,6 +1113,65 @@ mod tests {
         assert_eq!(attention::close_prompts(&state, short, |_| false), 1);
         let main_left = attention::close_prompts(&state, short, |o| o.agent == "a-sub-1");
         assert_eq!(main_left, 0, "the main-thread prompt closed");
+    }
+
+    /// A hand-back or task notification naming subagent X proves X is done: its prompt closes,
+    /// subagent Y's stays open and keeps the latch.
+    #[test]
+    fn a_hand_back_closes_only_the_named_subagents_prompts() {
+        use crate::commands::ctx::attention::{self, Attention, OpenPrompt};
+        for prompt in [
+            "<agent-message from=\"a-x\">\n[Subagent hand-back] report</agent-message>",
+            "<teammate-message teammate_id=\"a-x\" color=\"blue\">done</teammate-message>",
+            "<task-notification>\n<task-id>a-x</task-id>\n<status>completed</status>\n</task-notification>",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+            let state = StateDir::from_root(dir.path().join("state"));
+            let short = "aae6758d";
+            for (id, agent) in [("p-x", "a-x"), ("p-y", "a-y")] {
+                attention::open_prompt(
+                    &state,
+                    short,
+                    OpenPrompt {
+                        id: id.to_string(),
+                        agent: agent.to_string(),
+                        at: 10,
+                        ..Default::default()
+                    },
+                );
+            }
+            attention::confirm_prompts(&state, short, "Bash: cargo", 11);
+            let env: std::collections::HashMap<String, String> = [
+                (
+                    crate::commands::ctx::state::STATE_ENV.to_string(),
+                    state.root().display().to_string(),
+                ),
+                (
+                    SESSION_ENV.to_string(),
+                    "aae6758d-d494-4880-a064-d8a231483405".to_string(),
+                ),
+            ]
+            .into();
+            let stdin = serde_json::json!({
+                "session_id": "01a0f719-6df3-7e61-a600-1bde4d533862",
+                "cwd": dir.path(),
+                "prompt": prompt
+            })
+            .to_string();
+            run_prompt(&mut Vec::new(), &stdin, &|k| env.get(k).cloned()).expect("hook");
+
+            assert_eq!(
+                attention::load(&state, short).attention,
+                Attention::Approval,
+                "{prompt}"
+            );
+            assert_eq!(
+                attention::close_prompts(&state, short, |_| false),
+                1,
+                "only y's prompt remained: {prompt}"
+            );
+        }
     }
 
     fn run_prompt_captured(
