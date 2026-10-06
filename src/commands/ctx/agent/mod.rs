@@ -2584,11 +2584,12 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let flags = vec!["--model".to_string(), "opus".to_string()];
-        let mut expected = adapter.default_sandbox_args(
+        let mut expected = adapter.default_sandbox_args_for_role(
             &Default::default(),
             &Default::default(),
             &[],
             super::super::adapters::LaunchMode::Headless,
+            Some(crate::commands::ctx::prompt::PromptRole::Worker),
         );
         expected.extend(flags.iter().cloned());
         assert_eq!(
@@ -2598,11 +2599,12 @@ mod tests {
         );
 
         let joined = vec!["--model=opus".to_string()];
-        let mut expected_joined = adapter.default_sandbox_args(
+        let mut expected_joined = adapter.default_sandbox_args_for_role(
             &Default::default(),
             &Default::default(),
             &[],
             super::super::adapters::LaunchMode::Headless,
+            Some(crate::commands::ctx::prompt::PromptRole::Worker),
         );
         expected_joined.extend(joined.iter().cloned());
         assert_eq!(
@@ -2740,11 +2742,12 @@ mod tests {
         let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
         let cfg = CtxConfig::default();
         let mut expected = vec!["--model".to_string(), "sonnet".to_string()];
-        expected.extend(adapter.default_sandbox_args(
+        expected.extend(adapter.default_sandbox_args_for_role(
             &Default::default(),
             &Default::default(),
             &[],
             super::super::adapters::LaunchMode::Headless,
+            Some(crate::commands::ctx::prompt::PromptRole::Worker),
         ));
         assert_eq!(worker_launch_flags(&cfg, "claude", &adapter, &[]), expected);
     }
@@ -2827,11 +2830,12 @@ mod tests {
 
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude.extend(claude.default_sandbox_args(
+        expected_claude.extend(claude.default_sandbox_args_for_role(
             &Default::default(),
             &Default::default(),
             &[],
             super::super::adapters::LaunchMode::Headless,
+            Some(crate::commands::ctx::prompt::PromptRole::Worker),
         ));
         assert_eq!(
             worker_launch_flags(&cfg, "claude", &claude, &[]),
@@ -3251,11 +3255,12 @@ mod tests {
         let claude = super::super::adapters::claude::ClaudeAdapter::new(None);
         let claude_flags = worker_launch_flags(&cfg, "claude", &claude, &[]);
         let mut expected_claude = vec!["--model".to_string(), "sonnet".to_string()];
-        expected_claude.extend(claude.default_sandbox_args(
+        expected_claude.extend(claude.default_sandbox_args_for_role(
             &Default::default(),
             &Default::default(),
             &[],
             super::super::adapters::LaunchMode::Headless,
+            Some(crate::commands::ctx::prompt::PromptRole::Worker),
         ));
         expected_claude.push("--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string());
         assert_eq!(claude_flags, expected_claude);

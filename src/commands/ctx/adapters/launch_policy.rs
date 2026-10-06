@@ -746,11 +746,12 @@ pub fn policy_launch_args_for_surface(
     // Neither CLI option accepts a second occurrence from the baseline.
     let policy_supplies_sandbox = adapter.name() == "codex" && flags_pin_policy(&policy);
     let mut out = if cfg.sandbox.enabled && !policy_supplies_sandbox {
-        adapter.default_sandbox_args(
+        adapter.default_sandbox_args_for_role(
             &cfg.sandbox,
             &cfg.safety,
             &cfg.policy.network_allowlist,
             approval_mode,
+            Some(role),
         )
     } else {
         Vec::new()

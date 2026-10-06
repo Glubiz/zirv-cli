@@ -2646,6 +2646,17 @@ impl AgentAdapter for ClaudeAdapter {
         network_allowlist: &[crate::commands::ctx::policy::NetworkTarget],
         mode: super::LaunchMode,
     ) -> Vec<String> {
+        self.default_sandbox_args_for_role(sandbox, safety, network_allowlist, mode, None)
+    }
+
+    fn default_sandbox_args_for_role(
+        &self,
+        sandbox: &crate::commands::ctx::config::SandboxConfig,
+        safety: &crate::commands::ctx::safety::SafetyPolicy,
+        network_allowlist: &[crate::commands::ctx::policy::NetworkTarget],
+        mode: super::LaunchMode,
+        role: Option<crate::commands::ctx::prompt::PromptRole>,
+    ) -> Vec<String> {
         // Issue #504: computed once, up front, so the SAME bounded worktree
         // set both widens the interactive Edit/Read allow-list below AND
         // becomes the `--add-dir` argv at the end. The launch settings take the same list, so a
@@ -2757,6 +2768,20 @@ impl AgentAdapter for ClaudeAdapter {
             // `lean` drops the bundled workflow-authoring skill, which Claude Code then inlines into the Workflow tool's description.
             if self.headless.lean {
                 deny_entries.push("Workflow".to_string());
+                // A headless session never schedules, onboards, lists agents or reports findings; each tool definition is paid for on every request.
+                deny_entries.extend(
+                    [
+                        "ScheduleWakeup",
+                        "ShareOnboardingGuide",
+                        "ListAgents",
+                        "ReportFindings",
+                    ]
+                    .map(String::from),
+                );
+                // `Agent` stays for roles that may spawn workers.
+                if role.is_some_and(|role| !role.may_spawn_workers()) {
+                    deny_entries.push("Agent".to_string());
+                }
             }
         }
         let deny = deny_entries.join(",");
@@ -5851,8 +5876,17 @@ mod tests {
                 .iter()
                 .map(|(rule, _)| rule.to_string()),
         );
-        // `[headless] lean` is on by default and denies the `Workflow` tool last.
-        expected_deny.push("Workflow".to_string());
+        // `[headless] lean` is on by default and denies `Workflow` and the four always-unused tools last (no role, so `Agent` stays).
+        expected_deny.extend(
+            [
+                "Workflow",
+                "ScheduleWakeup",
+                "ShareOnboardingGuide",
+                "ListAgents",
+                "ReportFindings",
+            ]
+            .map(String::from),
+        );
 
         assert_eq!(
             args,
@@ -5986,6 +6020,63 @@ mod tests {
             Some(off),
             super::super::LaunchMode::Interactive
         )));
+    }
+
+    /// A lean headless launch also denies the tools it never uses, and `Agent` only for roles that may not spawn workers; `lean = false` and interactive launches deny none of them.
+    #[test]
+    fn a_lean_headless_launch_denies_unused_tools_and_agent_only_for_non_spawning_roles() {
+        use crate::commands::ctx::prompt::PromptRole;
+        let deny_of = |lean: bool, mode: super::super::LaunchMode, role: PromptRole| {
+            ClaudeAdapter::new(None)
+                .with_headless_config(crate::commands::ctx::config::HeadlessConfig {
+                    lean,
+                    ..Default::default()
+                })
+                .default_sandbox_args_for_role(
+                    &Default::default(),
+                    &Default::default(),
+                    &[],
+                    mode,
+                    Some(role),
+                )
+                .into_iter()
+                .find(|a| a.starts_with("--disallowedTools="))
+                .expect("a --disallowedTools= token")
+                .trim_start_matches("--disallowedTools=")
+                .split(',')
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let headless = super::super::LaunchMode::Headless;
+        let interactive = super::super::LaunchMode::Interactive;
+        let four = [
+            "ScheduleWakeup",
+            "ShareOnboardingGuide",
+            "ListAgents",
+            "ReportFindings",
+        ];
+        for role in [PromptRole::Worker, PromptRole::Single] {
+            let deny = deny_of(true, headless, role);
+            for tool in four.iter().chain(&["Workflow", "Agent"]) {
+                assert!(deny.iter().any(|t| t == tool), "{role:?} must deny {tool}");
+            }
+        }
+        for role in [PromptRole::Orchestrator, PromptRole::SubOrchestrator] {
+            let deny = deny_of(true, headless, role);
+            for tool in four {
+                assert!(deny.iter().any(|t| t == tool), "{role:?} must deny {tool}");
+            }
+            assert!(!deny.iter().any(|t| t == "Agent"), "{role:?} keeps Agent");
+        }
+        for (lean, mode) in [(false, headless), (true, interactive), (false, interactive)] {
+            let deny = deny_of(lean, mode, PromptRole::Worker);
+            for tool in four.iter().chain(&["Workflow", "Agent"]) {
+                assert!(
+                    !deny.iter().any(|t| t == tool),
+                    "lean={lean} must not deny {tool}"
+                );
+            }
+        }
     }
 
     /// Benchmark finding: `lean` removes the bundled `workflow-authoring` skill, so Claude Code
