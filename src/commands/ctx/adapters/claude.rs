@@ -109,6 +109,14 @@ fn orchestrator_prompt_for(posture: super::super::config::OrchestratorWrites) ->
     )
 }
 
+/// Tools a lean headless session never uses; denied so their definitions are not paid for on every request.
+const LEAN_UNUSED_TOOLS: [&str; 4] = [
+    "ScheduleWakeup",
+    "ShareOnboardingGuide",
+    "ListAgents",
+    "ReportFindings",
+];
+
 /// Appended to the orchestrator layer only when zirv's plugin attaches to the launch.
 const PLUGIN_WORKER_ROUTING: &str = "- Dispatch implementation, test, doc and review workers with \
 `subagent_type: \"zirv:worker\"` (a lean general-purpose worker without the Artifact and Agent tools), \
@@ -2774,15 +2782,7 @@ impl AgentAdapter for ClaudeAdapter {
             if self.headless.lean {
                 deny_entries.push("Workflow".to_string());
                 // A headless session never schedules, onboards, lists agents or reports findings; each tool definition is paid for on every request.
-                deny_entries.extend(
-                    [
-                        "ScheduleWakeup",
-                        "ShareOnboardingGuide",
-                        "ListAgents",
-                        "ReportFindings",
-                    ]
-                    .map(String::from),
-                );
+                deny_entries.extend(LEAN_UNUSED_TOOLS.map(String::from));
                 // `Agent` stays for roles that may spawn workers.
                 if role.is_some_and(|role| !role.may_spawn_workers()) {
                     deny_entries.push("Agent".to_string());
@@ -5886,16 +5886,8 @@ mod tests {
                 .map(|(rule, _)| rule.to_string()),
         );
         // `[headless] lean` is on by default and denies `Workflow` and the four always-unused tools last (no role, so `Agent` stays).
-        expected_deny.extend(
-            [
-                "Workflow",
-                "ScheduleWakeup",
-                "ShareOnboardingGuide",
-                "ListAgents",
-                "ReportFindings",
-            ]
-            .map(String::from),
-        );
+        expected_deny.push("Workflow".to_string());
+        expected_deny.extend(LEAN_UNUSED_TOOLS.map(String::from));
 
         assert_eq!(
             args,
@@ -6058,12 +6050,7 @@ mod tests {
         };
         let headless = super::super::LaunchMode::Headless;
         let interactive = super::super::LaunchMode::Interactive;
-        let four = [
-            "ScheduleWakeup",
-            "ShareOnboardingGuide",
-            "ListAgents",
-            "ReportFindings",
-        ];
+        let four = LEAN_UNUSED_TOOLS;
         for role in [PromptRole::Worker, PromptRole::Single] {
             let deny = deny_of(true, headless, role);
             for tool in four.iter().chain(&["Workflow", "Agent"]) {

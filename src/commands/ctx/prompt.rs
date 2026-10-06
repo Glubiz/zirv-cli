@@ -7441,15 +7441,6 @@ mod tests {
         );
     }
 
-    /// `workflow_context_for_role` is issue #253's gate extracted out of
-    /// `compose` into its own independently-callable, independently-tested
-    /// function (see its own doc comment for why: `compose` could not make
-    /// the prompt-cache-motivated move to after the canonical context layer
-    /// on its own, since `compile.rs` only adds that layer after `compose`
-    /// returns). Exercises the same three-role gate `the_workflow_step_
-    /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
-    /// together with `with_workflow_layer`, directly against the extracted
-    /// function instead. Issue #537 (T3) widened the gate to also admit
     #[test]
     fn the_orchestrator_layer_routes_to_the_plugin_worker_only_when_the_plugin_attaches() {
         for (attached, want) in [(true, true), (false, false)] {
@@ -7464,6 +7455,15 @@ mod tests {
         }
     }
 
+    /// `workflow_context_for_role` is issue #253's gate extracted out of
+    /// `compose` into its own independently-callable, independently-tested
+    /// function (see its own doc comment for why: `compose` could not make
+    /// the prompt-cache-motivated move to after the canonical context layer
+    /// on its own, since `compile.rs` only adds that layer after `compose`
+    /// returns). Exercises the same three-role gate `the_workflow_step_
+    /// layer_reaches_only_the_orchestrator_role` exercises through `compose`
+    /// together with `with_workflow_layer`, directly against the extracted
+    /// function instead. Issue #537 (T3) widened the gate to also admit
     /// A registered session sees only the workflow bound to it: the repo-wide pointer must not
     /// inject another session's (possibly long-finished) task into it.
     #[test]
