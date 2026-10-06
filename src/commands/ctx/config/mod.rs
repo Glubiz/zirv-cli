@@ -2960,6 +2960,14 @@ mod tests {
         assert_eq!(cfg.headless.effort.trivial.as_deref(), Some("low"));
         assert_eq!(cfg.headless.effort.bounded.as_deref(), Some("medium"));
         assert_eq!(cfg.headless.effort.substantial.as_deref(), Some("high"));
+
+        // `lean` and the TTL default on; the operator's env turns lean off.
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_LEAN", "false")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(!cfg.headless.lean);
+        assert_eq!(cfg.headless.prompt_cache_ttl.as_deref(), Some("5m"));
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("load");
+        assert!(cfg.headless.lean);
     }
 
     /// `headless.prompt_cache_ttl` and `headless.effort.*` are constrained to

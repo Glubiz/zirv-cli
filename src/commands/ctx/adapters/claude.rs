@@ -4363,10 +4363,10 @@ mod tests {
 
     /// Issue #788: `[headless] lean` adds `autoMemoryEnabled: false` and
     /// `disableBundledSkills: true` to the settings layer only when the
-    /// caller (`default_sandbox_args`, headless-only) resolved `lean` true --
-    /// same opt-in shape as `scrub_subprocess_env` right above.
+    /// caller (`default_sandbox_args`, headless-only) resolved `lean` true;
+    /// a bare `LaunchEnvironment` (what an interactive launch builds) has none.
     #[test]
-    fn launch_settings_emit_the_lean_keys_only_on_operator_opt_in() {
+    fn launch_settings_emit_the_lean_keys_only_when_the_caller_resolved_lean() {
         let policy = super::super::super::safety::SafetyPolicy::default();
         let policy_path = Path::new("zirv-test-safety-policy.json");
         let settings = launch_settings_value(
@@ -5851,6 +5851,8 @@ mod tests {
                 .iter()
                 .map(|(rule, _)| rule.to_string()),
         );
+        // `[headless] lean` is on by default and denies the `Workflow` tool last.
+        expected_deny.push("Workflow".to_string());
 
         assert_eq!(
             args,
@@ -5946,6 +5948,44 @@ mod tests {
             !deny_arg.contains("WebFetch"),
             "interactive must not be narrowed by a headless-only lever: {deny_arg}"
         );
+    }
+
+    /// `[headless] lean` is on by default: a headless launch with no operator config denies the
+    /// `Workflow` tool and uses the lean settings file, `lean = false` turns both off, and an
+    /// interactive launch is untouched either way.
+    #[test]
+    fn a_headless_launch_is_lean_by_default_and_lean_false_turns_it_off() {
+        let args_of = |headless: Option<crate::commands::ctx::config::HeadlessConfig>,
+                       mode: super::super::LaunchMode| {
+            let mut adapter = ClaudeAdapter::new(None);
+            if let Some(headless) = headless {
+                adapter = adapter.with_headless_config(headless);
+            }
+            adapter.default_sandbox_args(&Default::default(), &Default::default(), &[], mode)
+        };
+        let denies_workflow = |args: &[String]| {
+            args.iter()
+                .find(|a| a.starts_with("--disallowedTools="))
+                .expect("a --disallowedTools= token")
+                .trim_start_matches("--disallowedTools=")
+                .split(',')
+                .any(|t| t == "Workflow")
+        };
+        let headless = super::super::LaunchMode::Headless;
+        assert!(denies_workflow(&args_of(None, headless)));
+        let off = crate::commands::ctx::config::HeadlessConfig {
+            lean: false,
+            ..Default::default()
+        };
+        assert!(!denies_workflow(&args_of(Some(off.clone()), headless)));
+        assert!(!denies_workflow(&args_of(
+            None,
+            super::super::LaunchMode::Interactive
+        )));
+        assert!(!denies_workflow(&args_of(
+            Some(off),
+            super::super::LaunchMode::Interactive
+        )));
     }
 
     /// Benchmark finding: `lean` removes the bundled `workflow-authoring` skill, so Claude Code

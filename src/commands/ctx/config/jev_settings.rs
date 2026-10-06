@@ -175,11 +175,12 @@ pub struct JevFloorsConfig {
     pub inject: JevSiteFloor,
 }
 
-/// Operator-only, opt-in Claude headless controls; interactive wrap/chat/dashboard paths never read them (#788).
+/// Operator-only Claude headless controls; interactive wrap/chat/dashboard paths never read them (#788).
 /// Repos cannot change billing, effort or tool/memory scope. Effort defaults to `low` for every class
 /// (measured: cost -10%, time -9%); set a class to `medium` for Claude Code's own default. The cache
-/// TTL defaults to `5m` (measured: cost -18%); set `1h` for Claude Code's own default. The other
-/// `[headless]` keys are off by default and leave launches unchanged.
+/// TTL defaults to `5m` (measured: cost -18%); set `1h` for Claude Code's own default. `lean` defaults
+/// to `true` (measured: cost -9.6%); set `lean = false` to restore auto-memory, bundled skills and
+/// `Workflow`. `disallowed_tools` is empty by default and leaves launches unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadlessEffortConfig {
@@ -210,7 +211,7 @@ pub struct HeadlessConfig {
     /// Per-class effort, `low` by default; existing `CLAUDE_CODE_EFFORT_LEVEL` or `--effort` wins.
     /// Classification is pure unless `[jev] launch_effort` enables first-launch metadata refinement.
     pub effort: HeadlessEffortConfig,
-    /// Disable auto-memory and bundled skills in the headless settings layer.
+    /// Disable auto-memory, bundled skills and the `Workflow` tool in headless launches; `true` by default.
     pub lean: bool,
     /// Additional headless `--disallowedTools` entries; empty by default.
     pub disallowed_tools: Vec<String>,
@@ -221,7 +222,7 @@ impl Default for HeadlessConfig {
         Self {
             prompt_cache_ttl: Some("5m".to_string()),
             effort: HeadlessEffortConfig::default(),
-            lean: false,
+            lean: true,
             disallowed_tools: Vec::new(),
         }
     }

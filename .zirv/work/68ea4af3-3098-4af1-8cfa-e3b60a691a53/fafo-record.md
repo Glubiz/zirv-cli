@@ -3,12 +3,12 @@
 Goal: cut wall time and/or cost of zirv-wrapped headless sessions, or raise
 quality, without lowering hidden-test pass rate or judge score.
 
-Outcome: two levers cleared the operator's bar (>=4% on time, cost or quality,
+Outcome: three levers cleared the operator's bar (>=4% on time, cost or quality,
 same direction in independent rounds) and were implemented: headless effort
 `low` by default (cost -10.1%, agent time -8.9%, judge -1.75 pts; validated
-again in part 3) and headless cache TTL `5m` by default (cost -18%, two
-rounds; 222 recorded sessions -17% to -22%). `lean` cleared it too (-9.6% cost,
-quality unchanged) but stays opt-in pending the operator. The worker-prompt
+again in part 3), headless cache TTL `5m` by default (cost -18%, two
+rounds; 222 recorded sessions -17% to -22%) and `lean` on by default (-9.6%
+cost, quality unchanged; operator decision 2026-10-06). The worker-prompt
 rules (part 1) and chain compaction (part 2) did not clear it.
 
 Part 1 (worker-prompt rules on the XL grid) is below; part 2 (chains and
@@ -124,7 +124,7 @@ default effort). Round G ran A, M, S together; round H replicated A and S.
 | V1 | the built 4.54.0 default (low) keeps the E/F result | G: A vs M | M - A: cost +6.6% [-0.8%, +15%], agent time +6.6% n.s., output +9.5%*, judge +2.0*; against A pooled over G+H: cost +6.3%*, wall +12.6%*, judge +1.75* | validated: third round, same direction and trade-off |
 | L1 | the harness's forced levers (5m TTL + lean) are worth shipping | S vs A, G and H | S - A total cost: G +37.3%*, H +30.7%*, pooled +33.5%*; wall, agent time, tests, judge n.s. in both rounds | supported; split below |
 | L1a | 5m TTL alone | S repriced at 1h vs 5m | -17.8% (G), -18.0% (H): writes bill 1.25x instead of 2x input, every gap < 5 min | **success, implemented**: `[headless] prompt_cache_ttl` defaults to "5m" |
-| L1b | lean alone | S - A at equal (5m) pricing | G +12.9%*, H +7.2% (CI touches 0), pooled +9.6%*; write tokens +15.4%* (both rounds *); judge +1.0, tests -0.1 n.s. | clears 4% with quality unchanged; left opt-in (behaviour change: auto-memory, bundled skills and Workflow off) pending the operator |
+| L1b | lean alone | S - A at equal (5m) pricing | G +12.9%*, H +7.2% (CI touches 0), pooled +9.6%*; write tokens +15.4%* (both rounds *); judge +1.0, tests -0.1 n.s. | **success, implemented** (operator decision 2026-10-06): `[headless] lean` defaults to true |
 
 Side findings:
 - Four runs (A and M, t13/t14 rep 2) were excluded: a ~50-minute
@@ -133,8 +133,8 @@ Side findings:
   running until the network returned.
 - The orchestrator write guard denies a relative write after `cd` into `/tmp`
   (#883); the supervisor's helper reply failed to parse once (#877).
-- Bench numbers include lean, which is not a shipped default: the harness
-  still forces it.
+- Bench numbers include lean, which is now a shipped default; the harness
+  mirrors it.
 
 Next probe: a headless worker workload with tool calls longer than 5 minutes
 (or `--resume` after a pause) to price the 5m TTL's downside directly.
