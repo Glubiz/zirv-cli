@@ -3,8 +3,8 @@
 use super::*;
 
 /// Apply operator-only Claude headless cost settings. Effort defaults to
-/// `low` for every class; every other unset setting, and other adapters,
-/// leave the launch unchanged. (#788)
+/// `low` for every class and the cache TTL to `5m`; every other unset
+/// setting, and other adapters, leave the launch unchanged. (#788)
 pub(super) fn apply_headless_cost_levers(
     command: &mut Command,
     cfg: &CtxConfig,
@@ -288,11 +288,17 @@ mod tests {
         let envs: Vec<_> = command.get_envs().collect();
         assert_eq!(
             envs,
-            vec![(
-                std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
-                Some(std::ffi::OsStr::new("low"))
-            )],
-            "an unconfigured [headless] table must add only effort=low"
+            vec![
+                (
+                    std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
+                    Some(std::ffi::OsStr::new("low"))
+                ),
+                (
+                    std::ffi::OsStr::new("CLAUDE_CODE_PROMPT_CACHE_TTL"),
+                    Some(std::ffi::OsStr::new("5m"))
+                ),
+            ],
+            "an unconfigured [headless] table must add only effort=low and ttl=5m"
         );
 
         // No prompt text (nothing to classify): the shared default still applies.
@@ -307,10 +313,16 @@ mod tests {
         );
         assert_eq!(
             bare.get_envs().collect::<Vec<_>>(),
-            vec![(
-                std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
-                Some(std::ffi::OsStr::new("low"))
-            )]
+            vec![
+                (
+                    std::ffi::OsStr::new("CLAUDE_CODE_EFFORT_LEVEL"),
+                    Some(std::ffi::OsStr::new("low"))
+                ),
+                (
+                    std::ffi::OsStr::new("CLAUDE_CODE_PROMPT_CACHE_TTL"),
+                    Some(std::ffi::OsStr::new("5m"))
+                ),
+            ]
         );
 
         // An explicit operator value wins over the default for its class.
@@ -332,6 +344,46 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(std::ffi::OsStr::new("medium"))
         );
+    }
+
+    /// With no operator config or env, a headless launch carries
+    /// `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` (the shipped default); an operator
+    /// `1h` still wins over it and the operator's own env still skips it.
+    #[test]
+    fn apply_headless_cost_levers_defaults_prompt_cache_ttl_to_5m() {
+        let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("CLAUDE_CODE_PROMPT_CACHE_TTL", None),
+            ("FORCE_PROMPT_CACHING_5M", None),
+            ("ENABLE_PROMPT_CACHING_1H", None),
+        ]);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let launch_ttl = |cfg: &CtxConfig| {
+            let mut command = Command::new("claude");
+            apply_headless_cost_levers(
+                &mut command,
+                cfg,
+                "claude",
+                None,
+                &state,
+                &SessionId::new_v4(),
+            );
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CODE_PROMPT_CACHE_TTL")
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+
+        let mut cfg = CtxConfig::default();
+        assert_eq!(launch_ttl(&cfg).as_deref(), Some("5m"));
+        cfg.headless.prompt_cache_ttl = Some("1h".to_string());
+        assert_eq!(launch_ttl(&cfg).as_deref(), Some("1h"));
+
+        let _operator_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ENABLE_PROMPT_CACHING_1H",
+            Some("1"),
+        )]);
+        assert_eq!(launch_ttl(&CtxConfig::default()), None);
     }
 
     /// Issue #788: `headless.prompt_cache_ttl` sets `CLAUDE_CODE_PROMPT_
@@ -433,7 +485,10 @@ mod tests {
             &SessionId::new_v4(),
         );
         assert_eq!(
-            command.get_envs().count(),
+            command
+                .get_envs()
+                .filter(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .count(),
             0,
             "a 150-word request floors to Bounded, which has no configured effort"
         );
@@ -485,7 +540,10 @@ mod tests {
                 &SessionId::new_v4(),
             );
             assert_eq!(
-                command.get_envs().count(),
+                command
+                    .get_envs()
+                    .filter(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                    .count(),
                 0,
                 "the operator's own CLAUDE_CODE_EFFORT_LEVEL must win"
             );
@@ -504,7 +562,10 @@ mod tests {
             &SessionId::new_v4(),
         );
         assert_eq!(
-            command.get_envs().count(),
+            command
+                .get_envs()
+                .filter(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+                .count(),
             0,
             "an argv that already carries --effort must win"
         );

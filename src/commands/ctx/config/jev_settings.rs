@@ -177,8 +177,9 @@ pub struct JevFloorsConfig {
 
 /// Operator-only, opt-in Claude headless controls; interactive wrap/chat/dashboard paths never read them (#788).
 /// Repos cannot change billing, effort or tool/memory scope. Effort defaults to `low` for every class
-/// (measured: cost -10%, time -9%); set a class to `medium` for Claude Code's own default. The
-/// other `[headless]` keys are off by default and leave launches unchanged.
+/// (measured: cost -10%, time -9%); set a class to `medium` for Claude Code's own default. The cache
+/// TTL defaults to `5m` (measured: cost -18%); set `1h` for Claude Code's own default. The other
+/// `[headless]` keys are off by default and leave launches unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadlessEffortConfig {
@@ -200,10 +201,10 @@ impl Default for HeadlessEffortConfig {
 }
 
 /// Operator-only headless controls with the scope and trust constraints of [`HeadlessEffortConfig`] (#788).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadlessConfig {
-    /// Optional `5m`/`1h` cache TTL; existing `CLAUDE_CODE_PROMPT_CACHE_TTL`,
+    /// `5m` (default) or `1h` cache TTL; existing `CLAUDE_CODE_PROMPT_CACHE_TTL`,
     /// `FORCE_PROMPT_CACHING_5M` or `ENABLE_PROMPT_CACHING_1H` environment values take precedence.
     pub prompt_cache_ttl: Option<String>,
     /// Per-class effort, `low` by default; existing `CLAUDE_CODE_EFFORT_LEVEL` or `--effort` wins.
@@ -213,6 +214,17 @@ pub struct HeadlessConfig {
     pub lean: bool,
     /// Additional headless `--disallowedTools` entries; empty by default.
     pub disallowed_tools: Vec<String>,
+}
+
+impl Default for HeadlessConfig {
+    fn default() -> Self {
+        Self {
+            prompt_cache_ttl: Some("5m".to_string()),
+            effort: HeadlessEffortConfig::default(),
+            lean: false,
+            disallowed_tools: Vec::new(),
+        }
+    }
 }
 
 /// Operator-only review-model overrides; unset values use the adapter ladder below the orchestrator model.

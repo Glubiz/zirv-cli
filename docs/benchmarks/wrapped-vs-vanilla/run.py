@@ -143,6 +143,8 @@ JEV_PROXY_LIKE_CONDS = {"zirv-proxy", NOJEV_COND, *JEV_ABLATION_CONDS}
 # effort by intake class, lean launch), set on every zirv condition through
 # their `ZIRV_CTX_HEADLESS_*` env vars so a grid never depends on what the
 # operator's ~/.zirv/ctx.toml happens to hold. vanilla never gets them.
+# The TTL and effort entries mirror the shipped defaults; `lean` is forced here and is NOT a
+# shipped default (measured -9.6% cost at equal TTL pricing, quality unchanged).
 ZIRV_HEADLESS_LEVERS = {
     "ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL": "5m",
     "ZIRV_CTX_HEADLESS_LEAN": "true",

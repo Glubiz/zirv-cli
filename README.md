@@ -4931,17 +4931,17 @@ subscription-window waiting.
 
 #### Headless cost levers
 
-Operator-only, off-by-default cost levers for the Claude Code
+Operator-only cost levers for the Claude Code
 sessions zirv launches HEADLESSLY (`-p`/`--print`) -- `ctx exec`'s
 `--prompt` path and its `-- claude -p ...` passthrough, plus `zirv agent
 claude` headless workers (they share `ctx exec`'s own launch builder).
 Interactive `wrap`/`chat`/dash sessions never read this table.
 
-Effort defaults to `low` for every class (measured against Claude Code's `medium` over 10 XL tasks x 4 runs x 2 rounds: cost -10%, agent time -9%, hidden-test pass rate +1 pt, blind judge -1.75 pts); set a class to `medium` to restore Claude Code's own default. Every other key is unset or off by default. The example below is an opt-in configuration, not the defaults:
+Effort defaults to `low` for every class (measured against Claude Code's `medium` over 10 XL tasks x 4 runs x 2 rounds: cost -10%, agent time -9%, hidden-test pass rate +1 pt, blind judge -1.75 pts); set a class to `medium` to restore Claude Code's own default. The cache TTL defaults to `5m`: measured 2026-10-06 (macOS, sonnet, 10 XL tasks x 2 reps per arm, two independent rounds, every request gap under 5 minutes), it cut cost by 18% (17.8% and 18.0%; cache writes bill at 1.25x input instead of 2x), and repricing 222 recorded headless sessions gave -17% to -22% with no session losing. The trade-off: a headless session that idles more than 5 minutes between turns (a tool call running longer than 5 minutes, or a `--resume` follow-up after a pause) re-writes its whole cache at that turn, so set `"1h"` (Claude Code's own default) for such workloads. `lean` and `disallowed_tools` are off by default. The example below shows every key, with `lean` opted in:
 
 ```toml
 [headless]
-prompt_cache_ttl = "5m"          # "5m" | "1h", unset by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
+prompt_cache_ttl = "5m"          # "5m" | "1h", "5m" by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
 lean = true                      # adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer and denies the `Workflow` tool (else Claude Code inlines its authoring guide, ~6k tokens); ZIRV_CTX_HEADLESS_LEAN
 disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
 
@@ -4962,10 +4962,10 @@ or an argv that already carries `--effort` wins over it. `lean` and
 `disallowed_tools` only ever narrow a HEADLESS launch -- an interactive
 session, where a human is present, is untouched. With every key unset (the
 shipped default) a headless launch differs from one built before this table
-existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`. A launch with no prompt text to
+existed only by `CLAUDE_CODE_EFFORT_LEVEL=low` and `CLAUDE_CODE_PROMPT_CACHE_TTL=5m`. A launch with no prompt text to
 classify uses the effort shared by all three classes.
 
-The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. A `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at every turn.
+The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. The default `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at that turn (set `"1h"`).
 
 The effort decision is made ONCE, from the FIRST headless launch of a conversation, and every later launch of that SAME session -- a `--resume`, an in-place compaction, any other relaunch that keeps the id -- reuses it regardless of its own prompt text, including a bare resume with no new prompt at all. Changing `CLAUDE_CODE_EFFORT_LEVEL` mid-conversation invalidates Claude's whole prompt cache, not just that turn's own addition to it, so re-classifying every launch independently was actively counter-productive.
 
