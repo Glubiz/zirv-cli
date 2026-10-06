@@ -834,6 +834,11 @@ pub trait AgentAdapter: std::fmt::Debug {
         false
     }
 
+    /// One orchestrator-prompt sentence routing workers to the host plugin's lean worker agent; appended only when the plugin attaches (`lists_skills_natively`).
+    fn plugin_worker_routing(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Register native host skills when the launch permits them; worker and single-seat prompts already carry the compact skill index.
     fn plugin_dir_args(&self, flags: &[String], role: super::prompt::PromptRole) -> Vec<String> {
         let _ = (flags, role);

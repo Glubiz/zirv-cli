@@ -25,8 +25,15 @@ pub const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "Task"];
 /// parameter means "inherit the caller's". Matched exactly and
 /// case-sensitively: these are literal values of the dispatch's own
 /// `subagent_type` parameter, not free text.
-pub const GENERIC_SUBAGENT_TYPES: [&str; 5] =
-    ["fork", "claude", "general-purpose", "Explore", "Plan"];
+pub const GENERIC_SUBAGENT_TYPES: [&str; 6] = [
+    "fork",
+    "claude",
+    "general-purpose",
+    "Explore",
+    "Plan",
+    // zirv's own plugin worker: general-purpose minus tools, same inherited model.
+    "zirv:worker",
+];
 
 /// Model-name fragments that mark a seat too expensive to inherit silently.
 /// Matched case-insensitively as substrings, so a vendor-qualified id
@@ -613,6 +620,24 @@ mod tests {
             ..ToolIntent::default()
         };
         assert_eq!(subagent_admission(Some("claude-mythos-5"), &intent), None);
+    }
+
+    #[test]
+    fn subagent_admission_treats_the_plugin_worker_like_general_purpose() {
+        let dispatch = |model: &str| ToolIntent {
+            tool: "Agent".to_string(),
+            subagent: Some(SubagentIntent {
+                prompt: "do the thing".to_string(),
+                subagent_type: "zirv:worker".to_string(),
+                model: model.to_string(),
+            }),
+            ..ToolIntent::default()
+        };
+        assert!(subagent_admission(Some("claude-mythos-5"), &dispatch("")).is_some());
+        assert_eq!(
+            subagent_admission(Some("claude-mythos-5"), &dispatch("sonnet")),
+            None
+        );
     }
 
     #[test]

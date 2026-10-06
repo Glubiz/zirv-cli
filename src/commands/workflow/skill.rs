@@ -1400,6 +1400,35 @@ pub fn export_bundle(skill: &RegisteredSkill, out_dir: &Path) -> CtxResult<PathB
 /// `zirv:<skill id>` to the host's own `Skill` tool.
 const CLAUDE_PLUGIN_NAME: &str = "zirv";
 
+/// Frontmatter of the plugin's lean `worker` agent: the built-in
+/// `general-purpose` type minus the tool definitions a delegated worker never
+/// needs (`Artifact` alone is ~13.7k tokens; workers must not delegate).
+const CLAUDE_WORKER_AGENT_FRONTMATTER: &str = "\
+---
+name: worker
+description: General-purpose worker for delegated implementation, test, doc and review tasks.
+disallowedTools: Artifact, Agent, ScheduleWakeup, ShareOnboardingGuide, ListAgents, ReportFindings, Workflow
+---
+";
+
+/// Claude Code's built-in `general-purpose` agent body, kept verbatim so the
+/// lean worker behaves identically apart from its tool set.
+const CLAUDE_WORKER_AGENT_BODY: &str = "You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.
+
+Your strengths:
+- Searching for code, configurations, and patterns across large codebases
+- Analyzing multiple files to understand system architecture
+- Investigating complex questions that require exploring many files
+- Performing multi-step research tasks
+
+Guidelines:
+- For file searches: search broadly when you don't know where something lives. Use Read when you know the specific file path.
+- For analysis: Start broad and narrow down. Use multiple search strategies if the first doesn't yield results.
+- Be thorough: Check multiple locations, consider different naming conventions, look for related files.
+- NEVER create files unless they're absolutely necessary for achieving your goal. ALWAYS prefer editing an existing file to creating a new one.
+- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested.
+- You are already the dedicated agent for this task. Do the work directly — do not re-delegate your entire assignment to another single subagent.";
+
 /// A repository skill's description is repository-authored, untrusted text
 /// (see [`SkillSource::Repository`]'s own doc comment) -- registering it with
 /// the host would hand that text to Claude's own skill-selection surface.
@@ -1491,6 +1520,13 @@ pub fn sync_claude_plugin_dir(
     let mut manifest_json = serde_json::to_string_pretty(&manifest)?;
     manifest_json.push('\n');
     write_if_changed(&plugin_dir.join("plugin.json"), &manifest_json)?;
+
+    let agents_dir = dir.join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    write_if_changed(
+        &agents_dir.join("worker.md"),
+        &format!("{CLAUDE_WORKER_AGENT_FRONTMATTER}\n{CLAUDE_WORKER_AGENT_BODY}\n"),
+    )?;
 
     let skills_dir = dir.join("skills");
     std::fs::create_dir_all(&skills_dir)?;
@@ -3469,6 +3505,32 @@ mod tests {
         let text = std::fs::read_to_string(bundle_dir.join("SKILL.md")).unwrap();
         let reloaded = parse_skill_md(&text, "roundtrip").unwrap();
         assert_eq!(reloaded, skill.manifest);
+    }
+
+    #[test]
+    fn claude_plugin_sync_writes_the_lean_worker_agent_idempotently() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let out = tempdir().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        let path = out.path().join("agents/worker.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (frontmatter, body) = text.split_once("---\n\n").expect("frontmatter then body");
+        assert_eq!(
+            frontmatter,
+            "---\nname: worker\ndescription: General-purpose worker for delegated implementation, test, doc and review tasks.\ndisallowedTools: Artifact, Agent, ScheduleWakeup, ShareOnboardingGuide, ListAgents, ReportFindings, Workflow\n"
+        );
+        assert_eq!(body, format!("{CLAUDE_WORKER_AGENT_BODY}\n"));
+        assert!(body.starts_with("You are an agent for Claude Code"));
+        assert!(body.ends_with("another single subagent.\n"));
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        sync_claude_plugin_dir(&registry, out.path(), "1.0.0").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]
