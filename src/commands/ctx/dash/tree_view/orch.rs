@@ -2053,6 +2053,32 @@ fn chat_nodes<'a>(model: &Model<'a>) -> Vec<Sel> {
         .collect()
 }
 
+/// The id of the session a chat node belongs to: the node's attributed session, else the top of
+/// its parent chain. The seat is rooted like its agents (a restarted seat hangs under its
+/// predecessor); only a seat with no node falls back to its own id.
+fn session_root<'a>(model: &Model<'a>, sel: &Sel) -> Option<&'a str> {
+    let Some(node) = model.node(sel) else {
+        return (*sel == Sel::Seat)
+            .then_some(model.facts.seat_session)
+            .flatten();
+    };
+    if let Some(session) = node.session.as_deref() {
+        return Some(session);
+    }
+    let mut top = node;
+    for _ in 0..16 {
+        let Some(parent) = top
+            .parent
+            .as_deref()
+            .and_then(|id| model.data.nodes.iter().find(|n| n.id == id))
+        else {
+            break;
+        };
+        top = parent;
+    }
+    Some(top.id.as_str())
+}
+
 /// The pane short id of the chat that is open.
 pub(super) fn focused_short<'a>(facts: &'a TreeFacts<'_>) -> Option<&'a str> {
     facts.focused.as_ref().map(|(short, _, _)| short.as_str())
@@ -2209,8 +2235,13 @@ pub(super) fn build_chat(area: Rect, model: &Model, view: &TreeView) -> Option<S
         0
     };
     let mut entries: Vec<(Sel, String, Rgb, char, Rgb, String)> = Vec::new();
+    // Only the agents of the open chat's own session, not every session the scope shows.
+    let root = open
+        .as_ref()
+        .and_then(|sel| session_root(model, sel))
+        .or_else(|| session_root(model, &Sel::Seat));
     for other in chat_nodes(model) {
-        if Some(&other) == open.as_ref() {
+        if Some(&other) == open.as_ref() || session_root(model, &other) != root {
             continue;
         }
         let o = subject(model, &other);
@@ -3782,6 +3813,77 @@ mod tests {
         let buffer = draw_buffer(160, 45, &v, &f);
         assert_eq!(buffer[(60, 20)].symbol(), " ");
         assert_eq!(buffer[(60, 20)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn the_others_strip_counts_only_the_open_chats_own_session() {
+        let (mut data, wf, jev) = busy();
+        // Other registered sessions are top-level too, and so are their agents' hosts.
+        for i in 0..40 {
+            let mut other = node_k(
+                &format!("x{i}"),
+                "seat-1",
+                "session",
+                "claude",
+                "sonnet",
+                &format!("Foreign{i}"),
+                "live",
+            );
+            other.parent = None;
+            data.nodes.push(other);
+        }
+        let mut f = orch_facts(&wf, &jev);
+        f.focused = Some(("w1".into(), "worker".into(), "codex".into()));
+        let mut v = chat_view(data);
+        v.scope = Scope::All;
+        let text = draw(160, 45, &v, &f);
+        let strip = text.lines().nth(42).expect("strip");
+        assert!(strip.contains("Explore"), "{strip:?}");
+        assert!(
+            !strip.contains("Foreign") && !strip.contains('+'),
+            "another session's agents are not this session's: {strip:?}"
+        );
+    }
+
+    #[test]
+    fn a_restarted_seat_and_its_agents_share_a_strip() {
+        let mut prev = node_k("seat-0", "x", "session", "claude", "fable", "chat", "ended");
+        prev.parent = None;
+        let mut seat = node_k(
+            "seat-1", "seat-0", "session", "claude", "fable", "chat", "live",
+        );
+        seat.harness = Some("claude".into());
+        let mut nodes = vec![prev, seat];
+        for id in ["a1", "a2"] {
+            nodes.push(node_k(
+                id, "seat-1", "subagent", "claude", "sonnet", id, "running",
+            ));
+        }
+        for n in &mut nodes {
+            n.session = Some("seat-0".into());
+        }
+        let data = TreeData {
+            loaded: true,
+            nodes,
+            ..TreeData::default()
+        };
+        let (_, wf, jev) = busy();
+        let mut f = orch_facts(&wf, &jev);
+        f.focused = Some(("seat1".into(), "seat".into(), "claude".into()));
+        let v = chat_view(data);
+        let strip = draw(160, 45, &v, &f)
+            .lines()
+            .nth(42)
+            .expect("strip")
+            .to_string();
+        assert!(strip.contains("a1") && strip.contains("a2"), "{strip:?}");
+        f.focused = Some(("a1".into(), "a1".into(), "claude".into()));
+        let strip = draw(160, 45, &v, &f)
+            .lines()
+            .nth(42)
+            .expect("strip")
+            .to_string();
+        assert!(strip.contains("seat") && strip.contains("a2"), "{strip:?}");
     }
 
     #[test]
