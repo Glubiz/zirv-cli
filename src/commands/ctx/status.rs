@@ -918,11 +918,10 @@ fn describe_supervisor(cfg: &CtxConfig, colour: bool) -> String {
         );
     }
     format!(
-        "{} on, {} {}, {} consults per session",
+        "{} on, {} {}",
         label(colour, "supervisor:"),
         supervisor.harness,
-        supervisor.model,
-        supervisor.max_calls
+        supervisor.model
     )
 }
 
@@ -4213,7 +4212,7 @@ mod tests {
         cfg.supervisor.model = "claude-fable-5-1".to_string();
         assert_eq!(
             describe_supervisor(&cfg, false),
-            "supervisor: on, claude claude-fable-5-1, 3 consults per session"
+            "supervisor: on, claude claude-fable-5-1"
         );
     }
 

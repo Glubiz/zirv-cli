@@ -96,6 +96,47 @@ fn after_label<'a>(head: &'a str, label: &str) -> Option<&'a str> {
         .then(|| rest.trim_start_matches(|c: char| is_mark(c) || c == ' '))
 }
 
+/// One line as a choice verdict: `CHOICE: 2`, `Ruling: choice 2`, `Ruling: 2` or a letter
+/// (`Choice: B.`), with emphasis marks tolerated. Returns the 1-based option number and the text
+/// after it; prose after the number is fine, but a second candidate (`1 or 2`, `1/2`) is not.
+fn choice_head(line: &str) -> Option<(usize, &str)> {
+    let line = line.trim().trim_matches(is_mark);
+    let ruled = after_label(line, "RULING:");
+    let line = ruled.unwrap_or(line);
+    let after = after_label(line, "CHOICE:")
+        .or_else(|| ruled.and_then(|_| after_label(line, "CHOICE ")))
+        .or(ruled)?;
+    let digits = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    let (number, tail) = match after[..digits].parse::<usize>() {
+        Ok(number) => (number, &after[digits..]),
+        Err(_) => {
+            let letter = after.chars().next().filter(char::is_ascii_uppercase)?;
+            let tail = &after[1..];
+            // `Choice: A simpler store` is prose, not option A.
+            if !tail.is_empty() && !tail.starts_with(['.', ':', ')', '-', '—', '–', '*', '_', '`'])
+            {
+                return None;
+            }
+            ((letter as u8 - b'A') as usize + 1, tail)
+        }
+    };
+    if tail.chars().next().is_some_and(char::is_alphanumeric) {
+        return None;
+    }
+    let next = tail.trim_start();
+    let lower = next.to_ascii_lowercase();
+    let second = lower
+        .strip_prefix("or ")
+        .or_else(|| lower.strip_prefix("and "))
+        .and_then(|rest| rest.chars().next());
+    if next.starts_with('/') || second.is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((number, tail))
+}
+
 /// Parse one kind's strict reply into `(verdict, reason)`. Anything unparseable is `None`.
 /// For a choice the verdict is the chosen option's own text.
 pub(crate) fn parse_reply(
@@ -173,22 +214,34 @@ pub(crate) fn parse_reply(
         }
         RulingKind::Retry => pair("RETRY", "retry", "STOP", "stop"),
         RulingKind::Choice => {
-            // Tolerate prose after the number, but never guess a number that is not there.
-            let head = head.trim_matches(is_mark);
-            let after = after_label(head, "CHOICE:")?;
-            let digits = after
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(after.len());
-            let number: usize = after[..digits].parse().ok()?;
-            let tail = &after[digits..];
-            if tail.chars().next().is_some_and(char::is_alphanumeric) {
+            // The verdict is the first line after any blank or code-fence opener (a preamble
+            // line stays a rejection), and no later verdict line may name another option.
+            let mut lines = reply.lines().skip_while(|line| {
+                let line = line.trim();
+                line.is_empty() || line.starts_with("```")
+            });
+            let (number, tail) = choice_head(lines.next()?)?;
+            let following: Vec<&str> = lines.collect();
+            if following
+                .iter()
+                .filter_map(|line| choice_head(line))
+                .any(|(other, _)| other != number)
+            {
                 return None;
             }
             let option = options.get(number.checked_sub(1)?)?;
-            let reason = rest.strip_prefix("REASON:").unwrap_or(rest).trim();
+            let following = following.join("\n");
+            let following = following.trim();
+            let reason = following
+                .strip_prefix("REASON:")
+                .unwrap_or(following)
+                .trim();
+            let reason = reason.strip_suffix("```").unwrap_or(reason).trim_end();
             let reason = if reason.is_empty() {
-                tail.trim_start_matches(|c: char| c.is_whitespace() || ".:,-—–".contains(c))
-                    .trim_end_matches(is_mark)
+                tail.trim_start_matches(|c: char| {
+                    c.is_whitespace() || is_mark(c) || ".:,-—–".contains(c)
+                })
+                .trim_end_matches(is_mark)
             } else {
                 reason
             };
@@ -488,6 +541,58 @@ mod tests {
             pair("table", "Simpler to run.")
         );
         assert_eq!(parse("CHOICE: 2nd"), None);
+    }
+
+    /// The live 2026-10-06/07 failures (decisions.jsonl, issue #877): a letter instead of a
+    /// number, the `Ruling:` label echoed in place of `CHOICE:`, and the verdict wrapped in
+    /// a code fence or prose.
+    #[test]
+    fn a_wrapped_or_relabelled_choice_still_names_the_option() {
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &opts());
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            parse("Choice: A. Stamp the first page only."),
+            pair("queue", "Stamp the first page only.")
+        );
+        assert_eq!(
+            parse("**Choice: B.** It is clearer."),
+            pair("table", "It is clearer.")
+        );
+        assert_eq!(
+            parse("Ruling: 2 Flip the TTL only."),
+            pair("table", "Flip the TTL only.")
+        );
+        assert_eq!(
+            parse("Ruling: choice 2 — early-stop. It targets the loss."),
+            pair("table", "early-stop. It targets the loss.")
+        );
+        assert_eq!(parse("```\nCHOICE: 2\n```"), pair("table", ""));
+        assert_eq!(
+            parse("```text\n**CHOICE: 1**\nREASON: simpler\n```"),
+            pair("queue", "simpler")
+        );
+        assert_eq!(
+            parse("CHOICE: 2\nREASON: simpler\nCHOICE: 2").map(|(verdict, _)| verdict),
+            Some("table".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_choice_reply_still_fails() {
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &opts());
+        for text in [
+            "CHOICE: 1\nCHOICE: 2",
+            "Choice: 1 or 2",
+            "I weighed both.\n\nCHOICE: 1",
+            "Choice: 1/2",
+            "Choice: A simpler store wins.",
+            "Choice: C",
+            "Ruling: 3",
+            "Ruling: use the table",
+            "Here is the plan.\nNo pick.",
+        ] {
+            assert_eq!(parse(text), None, "{text:?}");
+        }
     }
 
     /// The live 2026-10-05 failures (decisions.jsonl): the helper echoed the prompt's `Ruling:`

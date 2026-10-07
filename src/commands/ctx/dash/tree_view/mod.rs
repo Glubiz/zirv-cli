@@ -79,7 +79,6 @@ pub(super) struct SupervisorFact {
     pub(super) harness: String,
     pub(super) model: String,
     pub(super) calls: u32,
-    pub(super) max_calls: u32,
     pub(super) tokens_read: u64,
     /// First line of the last advice, capped.
     pub(super) advice: String,
@@ -134,7 +133,7 @@ fn supervisor_node(fact: &SupervisorFact, seat: Option<&str>) -> Node {
         started_at: fact.updated.filter(|_| fact.advising),
         ended_at: fact.updated.filter(|_| !fact.advising && !steps.is_empty()),
         tokens: None,
-        label: Some(format!("{}/{}", fact.calls, fact.max_calls)),
+        label: Some(fact.calls.to_string()),
         name: Some("supervisor".to_string()),
         job: None,
         workflow: None,
@@ -221,7 +220,6 @@ fn supervisor_fact(
         harness: cfg.supervisor.harness.clone(),
         model: cfg.supervisor.model.clone(),
         calls: snap.calls,
-        max_calls: cfg.supervisor.max_calls,
         tokens_read: snap.tokens_read,
         advice: capped_first_line(&snap.last_advice, ADVICE_CHARS),
         advising: snap.advising,
@@ -991,7 +989,6 @@ mod testkit {
                 harness: "codex".into(),
                 model: "gpt-6-astra".into(),
                 calls: 1,
-                max_calls: 3,
                 tokens_read: 224_000,
                 advice: "fixture path wrong, check tests/fixtures before the next run".into(),
                 advising: false,
@@ -1558,7 +1555,7 @@ mod tests {
         cfg.supervisor.harness = "codex".into();
         cfg.supervisor.model = "gpt-6-astra".into();
         let idle = supervisor_fact(&state, &cfg, Some("seat0001")).expect("enabled");
-        assert_eq!((idle.calls, idle.max_calls, idle.last), (0, 3, None));
+        assert_eq!((idle.calls, idle.last), (0, None));
         let long = format!("fixture path wrong\nsecond line\n{}", "x".repeat(200));
         assert_eq!(capped_first_line(&long, 60), "fixture path wrong");
         assert_eq!(capped_first_line(&"y".repeat(100), 10).chars().count(), 10);
@@ -1583,7 +1580,7 @@ mod tests {
         assert_eq!(node.parent.as_deref(), Some("seat-1"));
         assert_eq!(
             (node.status.as_str(), node.label.as_deref()),
-            ("idle", Some("0/3"))
+            ("idle", Some("0"))
         );
     }
 

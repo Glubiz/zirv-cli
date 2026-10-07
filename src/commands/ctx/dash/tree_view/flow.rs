@@ -71,7 +71,7 @@ pub(super) fn age_word(node: &Node, st: St, wall: u64) -> String {
 
 /// The NOW line of a card or of SELECTED: what the agent is doing, with its colour.
 pub(super) fn now_line(node: &Node, st: St) -> (String, Rgb) {
-    // The supervisor's label is its consult budget (`1/3`), shown on every state.
+    // The supervisor's label is its consult count (`1`), shown on every state.
     if node.kind == "supervisor" {
         let budget = format!("{} consults", node.label.as_deref().unwrap_or_default());
         return match (st, node_steps(node).last()) {
@@ -713,7 +713,7 @@ fn card(s: &mut Scene, ctx: &Ctx, agent: &Agent, (x, y, w, h): (i32, i32, i32, i
         s.grid.put(i, y + 4, '─', Some(rule), None, false);
     }
     let (mut now_text, nc) = now_line(node, st);
-    // The supervisor's budget is never cut mid-word: `2/3 consults` gives way to `2/3`.
+    // The supervisor's count is never cut mid-word: `2 consults` gives way to `2`.
     if node.kind == "supervisor" && now_text.chars().count() as i32 > iw {
         now_text = now_text
             .strip_suffix(" consults")

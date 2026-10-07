@@ -1073,7 +1073,6 @@ mod tests {
             harness: "codex".into(),
             model: "gpt-6-astra".into(),
             calls: 1,
-            max_calls: 3,
             tokens_read: 0,
             advice: String::new(),
             advising: false,
