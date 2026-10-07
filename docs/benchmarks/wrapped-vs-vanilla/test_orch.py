@@ -287,7 +287,7 @@ class ArgvEnvTests(unittest.TestCase):
         for flag in ("-p", "--output-format"):
             self.assertNotIn(flag, argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
         self.assertIn(f"--allowedTools={run_module.VANILLA_ALLOWED_TOOLS}", argv)
         self.assertEqual(argv[argv.index("--plugin-dir") + 1], "C:/sp")
 
@@ -452,6 +452,38 @@ class SuperpowersTests(unittest.TestCase):
         self.assertIsNotNone(run_module.check_vanilla_plugin_dir(None))
         self.assertIsNotNone(run_module.check_vanilla_plugin_dir("C:/definitely/not/here"))
         self.assertIsNone(run_module.check_vanilla_plugin_dir(tempfile.gettempdir()))
+
+
+class NudgeAndModeTests(unittest.TestCase):
+    def test_needs_nudge_only_when_the_last_paragraph_asks(self):
+        self.assertTrue(orch.needs_nudge("Done with parts 1-3.\n\nShould I continue with part 4?"))
+        self.assertTrue(orch.needs_nudge("Which store format do you prefer?"))
+        self.assertFalse(orch.needs_nudge("Why did it fail? Because of X.\n\nAll five parts are done."))
+        self.assertFalse(orch.needs_nudge("All parts done."))
+        self.assertFalse(orch.needs_nudge(""))
+        self.assertFalse(orch.needs_nudge(None))
+
+    def test_nudge_reply_is_fixed_and_capped_at_three(self):
+        self.assertEqual(orch.NUDGE_REPLY, "Nobody is available to answer. Make reasonable decisions yourself "
+                                           "and continue until the whole request is done.")
+        self.assertEqual(orch.MAX_NUDGES, 3)
+
+    def test_permission_modes_read_from_transcript_records(self):
+        recs = [{"type": "permission-mode", "permissionMode": "bypassPermissions"},
+                {"type": "user", "permissionMode": "bypassPermissions", "message": {"content": "x"}},
+                {"type": "assistant", "permissionMode": "plan"}, {"type": "last-prompt"}]
+        self.assertEqual(orch.permission_modes(recs), {"bypassPermissions": 2})
+
+    def test_check_permission_mode(self):
+        self.assertEqual(orch.check_permission_mode({"bypassPermissions": 5}), ("bypassPermissions", None))
+        mode, why = orch.check_permission_mode({"dontAsk": 3})
+        self.assertEqual(mode, "dontAsk")
+        self.assertIn("!= bypassPermissions", why)
+        mode, why = orch.check_permission_mode({"dontAsk": 1, "bypassPermissions": 4})
+        self.assertTrue(mode.startswith("mixed:"))
+        self.assertIsNotNone(why)
+        self.assertIsNone(orch.check_permission_mode({})[0])
+        self.assertIsNotNone(orch.check_permission_mode({})[1])
 
 
 if __name__ == "__main__":

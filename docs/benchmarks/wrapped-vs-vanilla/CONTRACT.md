@@ -183,7 +183,7 @@ step, so there is no per-step quality figure to average.
 
 **`--check-graders [--tasks t1,t2,...]`** (issue #801, no provider call):
 for every task shipping a reference solution -- `reference.patch` for a
-non-chain `tests`-kind task (t16-t22 today; t02-t15 have none checked in),
+non-chain `tests`-kind task (t17-t22 today; t13 and t15 have none checked in),
 `reference/step_NN.patch` per `tests`-kind step of a chain task (t23, t24,
 t24b, t25) -- applies it to a pristine template copy and grades it (must
 score full marks), then grades an UNCHANGED pristine copy (must score below
@@ -196,26 +196,44 @@ check this way and are skipped, not failed.
 Every directory under `tasks/` appears exactly once in `corpus.toml`'s
 `[[task]]` list, with `family` (`"ledgerlite"` today -- reports flag
 `single_family` per the design spec's non-goals), `class` (`mechanical|
-bounded|bug|feature|architecture|ambiguous|sensitive|long_session`), `split`
-(`dev|validation|holdout`), and `kind` (mirrors each task's own `kind.txt`).
-Loaded/validated by `run.py`'s `load_corpus_toml`/`validate_corpus`
-(stdlib `tomllib`).
+bounded|bug|feature|architecture|ambiguous|sensitive|long_session|
+orchestration`), `split` (`dev|validation|holdout|orch`), `kind` (mirrors each
+task's own `kind.txt`) and `lane` (below). Loaded/validated by `run.py`'s
+`load_corpus_toml`/`validate_corpus` (stdlib `tomllib`), which also rejects an
+unknown lane or a lane/kind mismatch.
+
+**Lanes** say what a task is for:
+
+- `long` -- `kind=chain` long-session tasks, the zirv-vs-vanilla headline:
+  `t24_long_haul`, `t24b_long_haul` (t26/t27 will be added).
+- `orch` -- `kind=orch`, run by `orch.py` (interactive session through a ConPTY),
+  never by `run.py` (`--tasks all` skips them): `o01_ledger_suite`.
+- `jev` -- the short tasks `t13`, `t15`, `t17`-`t22`, used ONLY for measuring the Jev
+  proxy (`zirv-jev-full` / `zirv-proxy` vs vanilla + superpowers), never in the
+  zirv-vs-vanilla headline.
+- `autoresearch` -- `t23_afternoon`, `t25_sticky_notes`: chains the autoresearch
+  campaigns use, too short to count as `long` tasks.
+
+The short tasks t01-t12, t14 and t16 were removed from the benchmark (archived
+results under `results/` are untouched).
 
 Splits are assigned by TASK GROUP, not individually, so near-duplicates
 never straddle a split boundary: `t24_long_haul` and `t24b_long_haul` are
 byte-identical except for two step prompts (see `tasks/README.md`), so
 using one for iterative screening and the other as the "unseen" holdout
 would leak almost the whole task into candidate selection -- both sit in
-`holdout` together. `dev` (13 tasks: t01-t12, t23) is the cheap, small-task
-screening set; `validation` (t13-t19, t25) and `holdout` (t20-t22, t24,
-t24b) each cover several `class` values -- and `dev`/`validation`/`holdout`
-each carry at least one `long_session` chain task (t23, t25, and t24/t24b
-respectively) so a manifest's `[stages.*] classes = ["long_session"]`
-filter has something to screen/validate/holdout against on every stage.
+`holdout` together (both stay in the `long` lane). With the short tasks gone the
+splits are: `dev` = t13, t15, t23 (the cheap screening set); `validation` = t17,
+t18, t19, t25; `holdout` = t20, t21, t22, t24, t24b; each still carries one
+`long_session` chain task (t23, t25, t24/t24b) so a manifest's `[stages.*]
+classes = ["long_session"]` filter has something on every stage, and the
+non-chain stages keep `feature`/`architecture`/`ambiguous` tasks. Change from the
+earlier rule: `dev` was 13 tasks (t01-t12, t23) and is now 3, and the former
+`mechanical`/`bounded`/`bug` classes no longer have a task (the classes stay valid).
 
-The orchestration lane's `kind=orch` tasks (`orch.py`, README "Orchestration lane") live in their own
-`orch` split (class `orchestration`): each recombines the hidden suites of tasks that already sit in
-validation/holdout, so it must not be screened or held out beside them. `run.py --tasks all` skips them.
+The `orch` split holds the orchestration task alone: it recombines the hidden
+suites of tasks that already sit in validation/holdout, so it must not be
+screened or held out beside them.
 
 The protected evaluator set a campaign hash-pins at start and re-verifies
 before every trial and before promotion (design spec #801) is, for this

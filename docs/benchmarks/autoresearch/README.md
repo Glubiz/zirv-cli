@@ -85,7 +85,7 @@ python - <<'PY'
 import json, pathlib
 pathlib.Path("spec.json").write_text(json.dumps({
     "schema": 1, "campaign": "manual", "candidate": "baseline", "trial_id": "manual-1",
-    "task": "t02_pagination", "rep": 1, "split": "dev", "stage": "screen",
+    "task": "t13_recurring", "rep": 1, "split": "dev", "stage": "screen",
     "route": {"harness": "claude", "model": "sonnet"},
     "env": {}, "state_dir": "manual-state", "timeout_secs": 1200,
     "zirv_dir": None, "strategy": None, "cache_mode": "cold", "pressure": "natural",

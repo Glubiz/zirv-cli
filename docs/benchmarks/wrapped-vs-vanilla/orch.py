@@ -40,6 +40,14 @@ ORCH_CONDS = ["vanilla", H.NOJEV_COND, H.JEV_FULL_COND]
 DEFAULT_TIMEOUT_MIN = 60
 DEFAULT_IDLE_S = 20.0
 DEFAULT_RUNS_SUBDIR = "orch-runs"
+# Both arms must run in the same permission mode: bypassPermissions changes the
+# system prompt's tool guidance (use Bash/sed/heredocs), so dontAsk vs bypass would
+# make the arms differ for reasons unrelated to what is measured.
+EXPECTED_PERMISSION_MODE = "bypassPermissions"
+MAX_NUDGES = 3
+NUDGE_SETTLE_S = 30.0
+NUDGE_REPLY = ("Nobody is available to answer. Make reasonable decisions yourself and continue until "
+               "the whole request is done.")
 SCREEN_ROWS, SCREEN_COLS = 50, 200
 
 # --------------------------------------------------------------------------
@@ -242,6 +250,36 @@ def transcript_state(main_records, sub_records_by_id):
             "turns_seen": sum(1 for o in main_records if o.get("type") == "assistant")}
 
 
+def needs_nudge(text):
+    """True when a finished turn plainly isn't the end of the work: the final
+    assistant text's last paragraph contains a question mark (it is asking the user)."""
+    paras = [p for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    return bool(paras and "?" in paras[-1])
+
+
+def permission_modes(records):
+    """Counter-like {mode: count} of the `permissionMode` Claude Code stamps on the
+    transcript's permission-mode and user records."""
+    modes = {}
+    for o in records:
+        m = o.get("permissionMode")
+        if isinstance(m, str) and o.get("type") in ("permission-mode", "user"):
+            modes[m] = modes.get(m, 0) + 1
+    return modes
+
+
+def check_permission_mode(modes, expected=EXPECTED_PERMISSION_MODE):
+    """(permission_mode, invalid_reason): the single mode seen (or "mixed:a,b", or
+    None with no transcript evidence); invalid when it is not `expected`."""
+    seen = sorted(modes)
+    if not seen:
+        return None, f"no permissionMode in transcript (expected {expected})"
+    if seen == [expected]:
+        return expected, None
+    label = seen[0] if len(seen) == 1 else "mixed:" + ",".join(seen)
+    return label, f"permission mode {label} != {expected}"
+
+
 def is_complete(state, idle_for_s, idle_s=DEFAULT_IDLE_S):
     """True when the run is over: main transcript ended with end_turn, no pending
     tool call, no subagent still running, and nothing (screen or transcript) moved
@@ -393,7 +431,7 @@ def build_argv(cond, seat_model, plugin_dir, zirv_exe=None, claude_exe=None):
     claude_exe = claude_exe or H.CLAUDE_EXE
     if cond == "vanilla":
         argv = [claude_exe, "--model", seat_model, "--setting-sources", "project,local",
-                "--permission-mode", "dontAsk", f"--allowedTools={H.VANILLA_ALLOWED_TOOLS}"]
+                "--permission-mode", EXPECTED_PERMISSION_MODE, f"--allowedTools={H.VANILLA_ALLOWED_TOOLS}"]
         if plugin_dir:
             argv += ["--plugin-dir", str(plugin_dir)]
         plugins = H.operator_plugin_settings()
@@ -563,7 +601,7 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
     t0 = time.time()
     run = PtyRun(argv, cwd, env, log_path)
     out = {"dialogs": [], "timed_out": False, "completed": False, "usage_limit": False,
-           "startup_ok": False, "forced_kill": False, "wall_s": None, "submit_at": None}
+           "startup_ok": False, "forced_kill": False, "nudges": 0, "wall_s": None, "submit_at": None}
     try:
         # 1. startup: dialogs until the input box shows
         quiet_ok_since = None
@@ -588,7 +626,7 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
         submit = time.time()
         out["submit_at"] = submit
         # 3. wait for completion
-        seen_files = set()
+        last_nudge_at = 0.0
         while True:
             now = time.time()
             if now - submit > timeout_s:
@@ -604,8 +642,12 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
             if mains:
                 main = mains[0]
                 subs = subagent_files(main)
-                state = transcript_state(read_records(main), {s.stem: read_records(s) for s in subs})
+                main_recs = read_records(main)
+                state = transcript_state(main_recs, {s.stem: read_records(s) for s in subs})
                 last_activity = max(newest_mtime([main] + subs), run.last_change)
+                if now - last_nudge_at < NUDGE_SETTLE_S:
+                    time.sleep(2.0)
+                    continue
                 # a permission/confirmation dialog mid-run: answer it, count it
                 keys = detect_dialog(run.screen_text())
                 if keys and now - run.last_change >= 3.0:
@@ -615,6 +657,14 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
                     time.sleep(1.5)
                     continue
                 if is_complete(state, now - last_activity, idle_s):
+                    if out["nudges"] < MAX_NUDGES and needs_nudge(final_text(main_recs)):
+                        # the turn ended on a question nobody will answer: tell it to carry on
+                        out["nudges"] += 1
+                        last_nudge_at = now
+                        run.send(NUDGE_REPLY)
+                        time.sleep(1.0)
+                        run.send(ENTER)
+                        continue
                     out["completed"] = True
                     out["wall_s"] = newest_mtime([main] + subs) - submit
                     break
@@ -753,7 +803,7 @@ def do_one_run(bench_root, task, cond, rep, args):
         return result
     result.update({"wall_s": d["wall_s"], "timed_out": d["timed_out"], "completed": d["completed"],
                    "usage_limit": d["usage_limit"], "startup_ok": d["startup_ok"], "forced_kill": d["forced_kill"],
-                   "dialogs": d["dialogs"], "driver_total_s": time.time() - t_start})
+                   "dialogs": d["dialogs"], "nudges": d["nudges"], "driver_total_s": time.time() - t_start})
     (run_dir / "final_screen.txt").write_text(d.get("final_screen") or "", encoding="utf-8")
     ana = analyze_transcripts(repo)
     archive_transcripts(run_dir, ana)
@@ -763,6 +813,14 @@ def do_one_run(bench_root, task, cond, rep, args):
                    "subagents_spawned": ana["subagents_spawned"], "subagents": ana["subagents"],
                    "agent_launches": ana["agent_launches"]})
     result["is_error"] = not d["completed"]
+    main_modes = {}
+    for p in ana["transcripts"]:
+        for k, v in permission_modes(read_records(p)).items():
+            main_modes[k] = main_modes.get(k, 0) + v
+    result["permission_mode"], mode_problem = check_permission_mode(main_modes)
+    if mode_problem:
+        result["is_error"] = True
+        result["invalid_reason"] = mode_problem
     if cond == "vanilla":
         loaded, invoked = H.superpowers_in_transcripts(ana["transcripts"])
         result["superpowers_loaded"] = loaded

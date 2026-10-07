@@ -84,7 +84,7 @@ class ReceiptBuildingTests(unittest.TestCase):
 
 def _base_single_result(**overrides):
     result = {
-        "task": "t02_pagination", "cond": "zirv-proxy", "rep": 1, "model": "sonnet",
+        "task": "t13_recurring", "cond": "zirv-proxy", "rep": 1, "model": "sonnet",
         "wall_s": 12.0, "session_id": "sess-a", "agent_cost_usd": 0.5, "model_used": "sonnet",
         "input_tokens": 100, "output_tokens": 40,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -405,24 +405,49 @@ class CorpusTomlTests(unittest.TestCase):
 
     def test_validate_corpus_catches_missing_task(self):
         corpus = {"schema": 1, "version": "1", "task": []}
-        problems = run_module.validate_corpus(corpus, ["t01_tiebreak"])
+        problems = run_module.validate_corpus(corpus, ["t13_recurring"])
         self.assertTrue(any("missing tasks" in p for p in problems))
 
     def test_validate_corpus_catches_duplicate_id(self):
         corpus = {"schema": 1, "version": "1", "task": [
-            {"id": "t01_tiebreak", "family": "f", "class": "mechanical", "split": "dev", "kind": "answer"},
-            {"id": "t01_tiebreak", "family": "f", "class": "mechanical", "split": "dev", "kind": "answer"},
+            {"id": "t13_recurring", "family": "f", "class": "mechanical", "split": "dev", "kind": "answer"},
+            {"id": "t13_recurring", "family": "f", "class": "mechanical", "split": "dev", "kind": "answer"},
         ]}
-        problems = run_module.validate_corpus(corpus, ["t01_tiebreak"])
+        problems = run_module.validate_corpus(corpus, ["t13_recurring"])
         self.assertTrue(any("appears 2 times" in p for p in problems))
 
     def test_validate_corpus_catches_invalid_split_and_class(self):
         corpus = {"schema": 1, "version": "1", "task": [
-            {"id": "t01_tiebreak", "family": "f", "class": "bogus", "split": "prod", "kind": "answer"},
+            {"id": "t13_recurring", "family": "f", "class": "bogus", "split": "prod", "kind": "answer"},
         ]}
-        problems = run_module.validate_corpus(corpus, ["t01_tiebreak"])
+        problems = run_module.validate_corpus(corpus, ["t13_recurring"])
         self.assertTrue(any("invalid split" in p for p in problems))
         self.assertTrue(any("invalid class" in p for p in problems))
+
+
+    def test_validate_corpus_catches_bad_lane_and_lane_kind_mismatch(self):
+        base = {"family": "f", "class": "feature", "split": "dev", "kind": "tests"}
+        corpus = {"schema": 1, "version": "1", "task": [
+            {**base, "id": "a", "lane": "bogus"},
+            {**base, "id": "b", "lane": "long"},
+            {**base, "id": "c"},
+        ]}
+        problems = run_module.validate_corpus(corpus, ["a", "b", "c"])
+        self.assertTrue(any("a: invalid lane" in p for p in problems))
+        self.assertTrue(any("b: lane 'long' requires kind" in p for p in problems))
+        self.assertTrue(any("c: invalid lane None" in p for p in problems))
+
+    def test_committed_corpus_lanes(self):
+        corpus = run_module.load_corpus_toml(self.corpus_path)
+        lanes = {}
+        for t in corpus["task"]:
+            lanes.setdefault(t["lane"], []).append(t["id"])
+        self.assertEqual(sorted(lanes["long"]), ["t24_long_haul", "t24b_long_haul"])
+        self.assertEqual(lanes["orch"], ["o01_ledger_suite"])
+        self.assertEqual(sorted(lanes["jev"]), ["t13_recurring", "t15_reports", "t17_schema_migration",
+                                                "t18_ledger_layer", "t19_goals_saga", "t20_audit_log",
+                                                "t21_search", "t22_envelopes"])
+        self.assertEqual(sorted(lanes["autoresearch"]), ["t23_afternoon", "t25_sticky_notes"])
 
 
 class CheckGradersSyntheticTaskTests(unittest.TestCase):
@@ -535,6 +560,29 @@ class FakeCompletedProc:
         return 0
 
 
+SYNTH_GRADE_PY = """#!/usr/bin/env python3
+import json, re, sys
+from pathlib import Path
+
+PATTERNS = [r"(rules\\.py|categorize)", r"priorit", r"(earliest|first|list order)"]
+text = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
+n = sum(1 for p in PATTERNS if re.search(p, text, re.IGNORECASE))
+print(json.dumps({"score": round(n / len(PATTERNS), 4), "passed": n, "total": len(PATTERNS),
+                  "visible_ok": True, "details": ""}))
+"""
+
+
+def write_synthetic_answer_task(bench_root, name="t00_synth_answer"):
+    """A tiny kind=answer task (regex grader, no judge) so integration tests
+    never depend on a real corpus task."""
+    d = Path(bench_root) / "tasks" / name
+    d.mkdir(parents=True)
+    (d / "kind.txt").write_text("answer", encoding="utf-8")
+    (d / "prompt.txt").write_text("Explain how categorize breaks ties between rules.", encoding="utf-8")
+    (d / "grade.py").write_text(SYNTH_GRADE_PY, encoding="utf-8")
+    return name
+
+
 class RunSingleTrialIntegrationTests(unittest.TestCase):
     """Exercises `do_one_run` through the real `--trial` code path
     (`run_dir_override`/`spec_env`, receipts_from_result, map_result_to_trial)
@@ -542,7 +590,7 @@ class RunSingleTrialIntegrationTests(unittest.TestCase):
     replaced by a fake that writes a canned `-p --output-format json` result
     -- everything else (template copy, `git status`, the task's own
     `grade.py`) runs for real, exactly as `--check-graders` already does.
-    Uses `t01_tiebreak` (kind=answer) and `cond="zirv"` specifically because
+    Uses a synthetic kind=answer task and `cond="zirv"` specifically because
     neither path calls a judge, so nothing here can reach a provider.
     """
 
@@ -586,8 +634,7 @@ class RunSingleTrialIntegrationTests(unittest.TestCase):
             # bench_root with its own freshly-committed template/ copy,
             # exactly what an operator does before ever running run.py.
             bench_root = Path(tmp) / "bench_root"
-            shutil.copytree(real_bench_root / "tasks" / "t01_tiebreak",
-                             bench_root / "tasks" / "t01_tiebreak")
+            task_id = write_synthetic_answer_task(bench_root)
             shutil.copytree(real_bench_root / "template", bench_root / "template")
             subprocess.run([run_module.GIT_EXE, "init", "-q"], cwd=str(bench_root / "template"), check=True)
             subprocess.run([run_module.GIT_EXE, "config", "user.email", "t@example.com"],
@@ -601,7 +648,7 @@ class RunSingleTrialIntegrationTests(unittest.TestCase):
             out_dir = Path(tmp) / "trial-out"
             spec_env = {"ZIRV_CTX_JEV_MEMORY": "true"}
             result = run_module.do_one_run(
-                bench_root, "t01_tiebreak", "zirv", 1, "sonnet", 1200.0,
+                bench_root, task_id, "zirv", 1, "sonnet", 1200.0,
                 resume=False, k=1, total=1, run_dir_override=out_dir, spec_env=spec_env)
 
             self.assertFalse(result["is_error"])

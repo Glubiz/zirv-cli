@@ -16,9 +16,11 @@ list. Nothing below this point changes for an ordinary `--tasks/--conds/
 
 ## What it measures
 
-Each task in `tasks/` (t01-t12 small, t13-t15 large, t16-t21 XL -- see
-"Large-task grid" below) is run against a fresh copy of the `template/`
-("ledgerlite") repo under one of these conditions:
+The corpus is organised in three lanes (see "Lanes" below): `long`
+(multi-step chain tasks), `orch` (interactive orchestration, `orch.py`) and
+`jev` (short tasks, Jev-proxy measurement only). Each task in `tasks/` is run
+against a fresh copy of the `template/` ("ledgerlite") repo under one of
+these conditions:
 
 - `vanilla` -- `claude -p` directly, prompt on stdin. With
   `--vanilla-plugin-dir` (used for the current grid) it instead loads a
@@ -133,6 +135,19 @@ numbers. A run with no transcripts scores zero on all of them.
 | Edit-guard denials | tool results containing `zirv edit guard:` (the PreToolUse denial of such edits) | lower |
 | `zirv ctx run` calls | commands that use `zirv ctx run` | higher |
 
+## Lanes
+
+`corpus.toml` tags every task with a `lane`:
+
+| lane | tasks | what it measures | how it runs |
+|---|---|---|---|
+| `long` | `t24_long_haul`, `t24b_long_haul` (kind=chain) | zirv vs vanilla + superpowers over a long multi-step session -- the headline | `run.py` |
+| `orch` | `o01_ledger_suite` | zirv-wrapped vs vanilla interactive Opus seat on one long multi-feature request | `orch.py` (see "Orchestration lane") |
+| `jev` | `t13`, `t15`, `t17`-`t22` | ONLY the Jev proxy (`zirv-jev-full` / `zirv-proxy` vs vanilla + superpowers); never in the zirv-vs-vanilla headline | `run.py` |
+| `autoresearch` | `t23_afternoon`, `t25_sticky_notes` | autoresearch screening/validation chains; too short to count as a `long` task | `run.py --trial` |
+
+`t26`/`t27` will join the `long` lane later.
+
 ## Reproducing the recorded grids
 
 From this directory, current grid (zirv under test vs. vanilla + superpowers,
@@ -148,8 +163,9 @@ python run.py --tasks all --conds vanilla,zirv --reps 2 --model haiku --runs-sub
 python aggregate.py --runs runs-haiku --out report-opt-haiku.md
 ```
 
-Earlier grids used fewer tasks and different vanilla conditions -- pass
-`--tasks t01,t02,...,t12` to hold the task set at twelve, drop
+Earlier grids used a different task set (the t01-t12, t14 and t16 short tasks
+were dropped from the benchmark; their recorded results stay under
+`results/`) and different vanilla conditions -- drop
 `--vanilla-plugin-dir`/`--noninteractive` to reproduce the original
 disableAllHooks vanilla, or keep
 `--vanilla-plugin-dir` without `--noninteractive` to reproduce the
@@ -194,30 +210,23 @@ in every arm and are not ablation conditions. With every effort class at `low`
 (the shipped default), `launch_effort` changes nothing unless a run sets
 `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` higher.
 
-## Large-task grid (t16-t21 XL, t22 EPIC)
+## Short Jev-lane tasks (t13, t15, t17-t22)
 
-t13-t15 ("LARGE") turned out to still be small for a wrapper built for
-long-running work -- vanilla Sonnet finished even the largest of them in
-under a minute for well under $0.20. `t16_tags`, `t17_schema_migration`,
-`t18_ledger_layer`, `t19_goals_saga`, `t20_audit_log`, and `t21_search`
-("XL") are sized for roughly 10-30 minutes each (t19_goals_saga, a
-7-phase saga, is meant to be the longest of the XL tasks, at 30+ minutes),
-each spanning several files. `t22_envelopes` ("EPIC") is bigger still: 10
-ordered phases building an envelope-budgeting subsystem across 6
-new/touched modules, a 512-line reference diff, and 41 hidden cases --
-sized for 30-60+ minutes. All seven are `kind=tests`, each with a
-`reference.patch` solution proven end to end (pristine template scores 0,
-the reference solution scores 1.0 with `visible_ok: true`) -- see
-`tasks/README.md` for the per-task grid and shapes. Reproduce the combined
-large-task grid (t13-t15 + t16-t21 + t22) with `--timeout-min 60` (raised
-from 45 to give t22 enough room):
+These are the old "large" and "XL" tasks, kept ONLY for measuring the Jev
+proxy (`zirv-jev-full` / `zirv-proxy` vs vanilla + superpowers); they are
+never part of the zirv-vs-vanilla headline. `t13_recurring` and `t15_reports`
+are still small for a wrapper built for long-running work (vanilla Sonnet
+finishes them in under a minute for well under $0.20); `t17_schema_migration`,
+`t18_ledger_layer`, `t19_goals_saga`, `t20_audit_log` and `t21_search` ("XL")
+are sized for roughly 10-30 minutes each, and `t22_envelopes` ("EPIC", 10
+phases, 41 hidden cases) for 30-60+ minutes. All are `kind=tests`; t17-t22
+each have a `reference.patch` proven end to end (pristine template scores 0,
+reference scores 1.0 with `visible_ok: true`) -- see `tasks/README.md`.
+Reproduce the grid with `--timeout-min 60`:
 
 ```
-python run.py --tasks t13_recurring,t14_bugsweep,t15_reports,t16_tags,t17_schema_migration,t18_ledger_layer,t19_goals_saga,t20_audit_log,t21_search,t22_envelopes \
-  --conds vanilla,zirv,zirv-proxy --reps 3 --model sonnet --parallel 2 --stagger-s 90 --timeout-min 60 \
-  --runs-subdir runs-large \
-  --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
-python aggregate.py --runs runs-large --out report-large-sonnet.md
+python run.py --tasks t13_recurring,t15_reports,t17_schema_migration,t18_ledger_layer,t19_goals_saga,t20_audit_log,t21_search,t22_envelopes   --conds vanilla,zirv-proxy --reps 3 --model sonnet --parallel 2 --stagger-s 90 --timeout-min 60   --runs-subdir runs-jev   --noninteractive --vanilla-plugin-dir <path to obra/superpowers plugin> --zirv-dir <path to zirv.exe under test>
+python aggregate.py --runs runs-jev --out report-jev-sonnet.md
 ```
 
 `reference.patch` files live under `tasks/<id>/` for reference only; like
@@ -402,8 +411,10 @@ graders, judge, env and `cond_env_for`/`isolate_state`.
   tests and pristine = 0.
 - Arms (`--conds`, default `vanilla,zirv-nojev`; also `zirv-jev-full`):
   `vanilla` = `claude --model <seat> --setting-sources project,local
-  --permission-mode dontAsk --allowedTools=... --plugin-dir <superpowers>`
-  (run.py's vanilla argv minus `-p/--output-format`); zirv arms =
+  --permission-mode bypassPermissions --allowedTools=... --plugin-dir <superpowers>`
+  (run.py's vanilla argv minus `-p/--output-format`, but in `bypassPermissions` like wrap, so
+  both arms get the same tool guidance; each run records `permission_mode` from the transcript and
+  is invalid if it is not `bypassPermissions`); zirv arms =
   `zirv ctx wrap --force-pace -- claude --model <seat>` with the cond's env and
   its own `ZIRV_CTX_STATE_DIR`, WITHOUT the headless-only `ZIRV_HEADLESS_LEVERS`.
   Outer-session markers (`CLAUDECODE`, `CLAUDE_CODE_*`, `ZIRV_CTX_SESSION*`,
@@ -420,6 +431,9 @@ graders, judge, env and `cond_env_for`/`isolate_state`.
   --report` prints per-cond mean/median of `wall_s, cost_usd, turns,
   subagents_spawned, score, quality_score` over finished runs. Run it in a
   real console session, foreground; a 5-part run takes tens of minutes.
+- Auto-continue: when a turn ends (`end_turn`) with a last paragraph that contains a question mark,
+  the driver sends "Nobody is available to answer. Make reasonable decisions yourself and continue
+  until the whole request is done." (max 3 times per run, both arms; count in `nudges`).
 - Driver: answers the startup dialogs (trust folder, ...) and any mid-run
   confirmation dialog (listed in `dialogs`), pastes the request, then declares
   the run complete when the parent transcript's last turn is an `end_turn`

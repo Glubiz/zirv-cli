@@ -1,110 +1,49 @@
-# wrapped-vs-vanilla task corpus (issue #801).
+# wrapped-vs-vanilla task corpus (issue #801), organised in lanes.
 #
-# Every task directory under tasks/ must appear here exactly once. `split`
-# partitions tasks by GROUP so near-duplicates never straddle a split
-# boundary: t24_long_haul and t24b_long_haul are byte-identical except for
-# two step prompts (see tasks/README.md's "t24b_long_haul" note), so both
-# sit in `holdout` together -- using one for screening and the other as the
-# "unseen" holdout would leak almost the whole task into iterative candidate
-# selection. `dev` is the cheap small-task set used for autoresearch
-# screening (#802); `dev`/`validation`/`holdout` each cover several `class`
-# values and each carries at least one `long_session` chain task (dev:
-# t23_afternoon; validation: t25_sticky_notes; holdout: t24_long_haul +
-# t24b_long_haul) so a `[stages.*] classes = ["long_session"]` filter has
-# something to screen/validate/holdout against on every stage, per #801's
-# evaluation contract. See CONTRACT.md's "Task corpus and splits" section
-# for the full rule this file follows.
+# `lane` says what a task is FOR (README.md "Lanes"):
+#   long          kind=chain long-session tasks: the zirv-vs-vanilla headline
+#                 (t24_long_haul, t24b_long_haul; t26/t27 will join).
+#   orch          interactive orchestration (orch.py): o01_ledger_suite.
+#   jev           short tasks used ONLY to measure the Jev proxy (zirv-jev-full /
+#                 zirv-proxy vs vanilla+superpowers), never in the zirv-vs-vanilla
+#                 headline (t13, t15, t17-t22).
+#   autoresearch  chains kept for the autoresearch campaigns (t23_afternoon,
+#                 t25_sticky_notes): too short to count as `long` tasks.
 #
-# Today there is exactly one project family (`ledgerlite`); every report
-# built from this corpus must flag `single_family` per the design spec's
-# non-goals ("no new benchmark project families").
+# `split` partitions tasks by GROUP so near-duplicates never straddle a split
+# boundary: t24_long_haul and t24b_long_haul are byte-identical except for two
+# step prompts (see tasks/README.md), so both sit in `holdout` together. `dev`
+# (t13, t15, t23) is the cheap screening set for autoresearch (#802), `validation`
+# (t17, t18, t19, t25) and `holdout` (t20, t21, t22, t24, t24b) cover several
+# `class` values; the `long_session` chain tasks are t23 (dev), t25 (validation),
+# t24/t24b (holdout) so a `[stages.*] classes = ["long_session"]` filter still has
+# something on every stage. The `orch` split holds the orchestration task alone: it
+# recombines the hidden suites of tasks that sit in validation/holdout, so it must
+# not be screened or held out beside them. See CONTRACT.md's "Task corpus and
+# splits" section for the rule this file follows.
+#
+# Today there is exactly one project family (`ledgerlite`); every report built from
+# this corpus must flag `single_family` per the design spec's non-goals ("no new
+# benchmark project families").
 
 schema = 1
-version = "1"
+version = "2"
 
 [[task]]
-id = "t01_tiebreak"
-family = "ledgerlite"
-class = "bounded"
-split = "dev"
-kind = "answer"
-
-[[task]]
-id = "t02_pagination"
-family = "ledgerlite"
-class = "bug"
-split = "dev"
-kind = "tests"
-
-[[task]]
-id = "t03_money"
-family = "ledgerlite"
-class = "bug"
-split = "dev"
-kind = "tests"
-
-[[task]]
-id = "t04_budget"
+id = "t13_recurring"
 family = "ledgerlite"
 class = "feature"
 split = "dev"
 kind = "tests"
+lane = "jev"
 
 [[task]]
-id = "t05_dedupe"
-family = "ledgerlite"
-class = "architecture"
-split = "dev"
-kind = "judge"
-
-[[task]]
-id = "t06_currency"
+id = "t15_reports"
 family = "ledgerlite"
 class = "feature"
 split = "dev"
 kind = "tests"
-
-[[task]]
-id = "t07_redtest"
-family = "ledgerlite"
-class = "bug"
-split = "dev"
-kind = "tests"
-
-[[task]]
-id = "t08_usage_doc"
-family = "ledgerlite"
-class = "mechanical"
-split = "dev"
-kind = "judge"
-
-[[task]]
-id = "t09_count"
-family = "ledgerlite"
-class = "mechanical"
-split = "dev"
-kind = "answer"
-
-[[task]]
-id = "t10_shares"
-family = "ledgerlite"
-class = "feature"
-split = "dev"
-kind = "tests"
-
-[[task]]
-id = "t11_export"
-family = "ledgerlite"
-class = "feature"
-split = "dev"
-kind = "tests"
-
-[[task]]
-id = "t12_deadcode"
-family = "ledgerlite"
-class = "mechanical"
-split = "dev"
-kind = "answer"
+lane = "jev"
 
 [[task]]
 id = "t23_afternoon"
@@ -112,34 +51,7 @@ family = "ledgerlite"
 class = "long_session"
 split = "dev"
 kind = "chain"
-
-[[task]]
-id = "t13_recurring"
-family = "ledgerlite"
-class = "feature"
-split = "validation"
-kind = "tests"
-
-[[task]]
-id = "t14_bugsweep"
-family = "ledgerlite"
-class = "bug"
-split = "validation"
-kind = "tests"
-
-[[task]]
-id = "t15_reports"
-family = "ledgerlite"
-class = "feature"
-split = "validation"
-kind = "tests"
-
-[[task]]
-id = "t16_tags"
-family = "ledgerlite"
-class = "feature"
-split = "validation"
-kind = "tests"
+lane = "autoresearch"
 
 [[task]]
 id = "t17_schema_migration"
@@ -147,6 +59,7 @@ family = "ledgerlite"
 class = "architecture"
 split = "validation"
 kind = "tests"
+lane = "jev"
 
 [[task]]
 id = "t18_ledger_layer"
@@ -154,6 +67,7 @@ family = "ledgerlite"
 class = "architecture"
 split = "validation"
 kind = "tests"
+lane = "jev"
 
 [[task]]
 id = "t19_goals_saga"
@@ -161,6 +75,7 @@ family = "ledgerlite"
 class = "feature"
 split = "validation"
 kind = "tests"
+lane = "jev"
 
 [[task]]
 id = "t25_sticky_notes"
@@ -168,6 +83,7 @@ family = "ledgerlite"
 class = "long_session"
 split = "validation"
 kind = "chain"
+lane = "autoresearch"
 
 [[task]]
 id = "t20_audit_log"
@@ -175,6 +91,7 @@ family = "ledgerlite"
 class = "architecture"
 split = "holdout"
 kind = "tests"
+lane = "jev"
 
 [[task]]
 id = "t21_search"
@@ -182,6 +99,7 @@ family = "ledgerlite"
 class = "ambiguous"
 split = "holdout"
 kind = "tests"
+lane = "jev"
 
 [[task]]
 id = "t22_envelopes"
@@ -189,17 +107,17 @@ family = "ledgerlite"
 class = "architecture"
 split = "holdout"
 kind = "tests"
+lane = "jev"
 
-# t24_long_haul and t24b_long_haul are the SAME task group (see the file
-# header) -- both belong in holdout together, never split across
-# validation/holdout, so neither run is a "seen" near-duplicate of the
-# other's holdout use.
+# t24_long_haul and t24b_long_haul are the SAME task group -- both belong in
+# holdout together, never split across validation/holdout.
 [[task]]
 id = "t24_long_haul"
 family = "ledgerlite"
 class = "long_session"
 split = "holdout"
 kind = "chain"
+lane = "long"
 
 [[task]]
 id = "t24b_long_haul"
@@ -207,15 +125,14 @@ family = "ledgerlite"
 class = "long_session"
 split = "holdout"
 kind = "chain"
+lane = "long"
 
-# Orchestration lane (orch.py). o01_ledger_suite is ONE request combining five
-# validation/holdout feature tasks (t17, t20, t22, t21, t19), so it reuses their
-# hidden suites; it gets its own `orch` split (and `orchestration` class) rather
-# than straddling validation and holdout, and no autoresearch stage selects it
-# unless a manifest asks for split = "orch".
+# Orchestration lane (orch.py): ONE request combining five jev-lane tasks (t17,
+# t20, t22, t21, t19), so it reuses their hidden suites; own split and class.
 [[task]]
 id = "o01_ledger_suite"
 family = "ledgerlite"
 class = "orchestration"
 split = "orch"
 kind = "orch"
+lane = "orch"

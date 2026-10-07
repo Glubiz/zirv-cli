@@ -3065,6 +3065,11 @@ def print_check_graders_report(rows):
 # tasks recombine the hidden suites of tasks that already sit in validation and
 # holdout, so they must not be screened or held out alongside them.
 VALID_SPLITS = {"dev", "validation", "holdout", "orch"}
+# Lanes (README "Lanes"): `long` = chain tasks (headline), `orch` = orch.py,
+# `jev` = short tasks for Jev-proxy measurement only, `autoresearch` = chains kept
+# for the autoresearch campaigns (too short to be `long`).
+VALID_LANES = {"long", "orch", "jev", "autoresearch"}
+LANE_KINDS = {"long": {"chain"}, "orch": {"orch"}, "autoresearch": {"chain"}}
 VALID_TASK_CLASSES = {
     "mechanical", "bounded", "bug", "feature", "architecture", "ambiguous",
     "sensitive", "long_session", "orchestration",
@@ -3105,6 +3110,12 @@ def validate_corpus(corpus, all_task_ids):
             problems.append(f"{tid}: missing family")
         if not entry.get("kind"):
             problems.append(f"{tid}: missing kind")
+        lane = entry.get("lane")
+        if lane not in VALID_LANES:
+            problems.append(f"{tid}: invalid lane {lane!r}")
+        elif LANE_KINDS.get(lane) and entry.get("kind") not in LANE_KINDS[lane]:
+            problems.append(f"{tid}: lane {lane!r} requires kind in {sorted(LANE_KINDS[lane])}, "
+                            f"got {entry.get('kind')!r}")
     for tid, count in seen.items():
         if count > 1:
             problems.append(f"{tid}: appears {count} times (must be exactly once)")

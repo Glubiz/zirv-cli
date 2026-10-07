@@ -1,1 +1,0 @@
-Please write docs/USAGE.md documenting every CLI command with its flags, and one example invocation for each.

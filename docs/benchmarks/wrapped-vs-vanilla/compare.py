@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compliance  # noqa: E402
 
-XL_TASKS = {"t16_tags", "t17_schema_migration", "t18_ledger_layer", "t19_goals_saga",
+XL_TASKS = {"t17_schema_migration", "t18_ledger_layer", "t19_goals_saga",
             "t20_audit_log", "t21_search", "t22_envelopes"}
 COND_LABELS = {
     "vanilla": "Vanilla + superpowers",
@@ -181,8 +181,8 @@ def split_table(rows, conds, base, tasks):
     out = ["| Task group | Metric | " + " | ".join(COND_LABELS.get(c, c) for c in conds) + " |",
            "|---|---|" + "---:|" * len(conds)]
     chain = {r["task"] for r in rows if r.get("steps")}
-    groups = [("Small/large (t01-t15)", [t for t in tasks if t not in XL_TASKS and t not in chain]),
-              ("XL (t16-t22)", [t for t in tasks if t in XL_TASKS]),
+    groups = [("Short (t13, t15)", [t for t in tasks if t not in XL_TASKS and t not in chain]),
+              ("XL (t17-t22)", [t for t in tasks if t in XL_TASKS]),
               ("Long-session chain", [t for t in tasks if t in chain])]
     for gname, gtasks in groups:
         if not gtasks:
