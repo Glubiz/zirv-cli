@@ -105,10 +105,20 @@ def usage_cost(bucket, model):
 # --------------------------------------------------------------------------
 # Transcripts
 # --------------------------------------------------------------------------
+def win_long(path):
+    """`path` with the Windows long-path prefix: subagent transcripts sit under the
+    project dir Claude Code derives from the run's repo path and pass MAX_PATH (260),
+    where plain open/stat fail with OSError."""
+    s = str(Path(path).absolute())
+    if os.name == "nt" and not s.startswith("\\\\?\\"):
+        return "\\\\?\\" + s
+    return s
+
+
 def read_records(path):
     out = []
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        text = Path(win_long(path)).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return out
     for ln in text.splitlines():
@@ -492,7 +502,7 @@ def newest_mtime(paths):
     ts = []
     for p in paths:
         try:
-            ts.append(Path(p).stat().st_mtime)
+            ts.append(Path(win_long(p)).stat().st_mtime)
         except OSError:
             pass
     return max(ts) if ts else 0.0
@@ -721,7 +731,7 @@ def analyze_transcripts(repo):
         meta = {}
         mp = sp.with_suffix(".meta.json")
         try:
-            meta = json.loads(mp.read_text(encoding="utf-8"))
+            meta = json.loads(Path(win_long(mp)).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
         used = collect_usage([recs])
@@ -748,9 +758,9 @@ def archive_transcripts(run_dir, ana):
     dest = Path(run_dir) / "transcripts"
     dest.mkdir(exist_ok=True)
     for p in ana["transcripts"]:
-        shutil.copyfile(p, dest / p.name)
+        shutil.copyfile(win_long(p), dest / p.name)
     for p in ana["subagent_paths"]:
-        shutil.copyfile(p, dest / f"{p.parent.parent.name}__{p.name}")
+        shutil.copyfile(win_long(p), dest / f"{p.parent.parent.name}__{p.name}")
 
 
 def proxy_decisions(run_dir):

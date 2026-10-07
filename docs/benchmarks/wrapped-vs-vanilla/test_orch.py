@@ -61,6 +61,20 @@ class PriceTests(unittest.TestCase):
 
 
 class UsageTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "MAX_PATH is a Windows limit")
+    def test_reads_and_stats_a_transcript_past_max_path(self):
+        # Subagent transcripts under a bench run's project dir are ~300 chars long.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, orch.win_long(tmp))  # plain rmtree fails past MAX_PATH too
+        deep = Path(orch.win_long(Path(tmp) / ("d" * 120) / ("e" * 120)))
+        deep.mkdir(parents=True)
+        f = Path(str(deep) + "\\agent-x.jsonl")
+        f.write_text(json.dumps(asst("r1", stop="end_turn")) + "\n", encoding="utf-8")
+        plain = Path(str(f)[4:])
+        self.assertGreater(len(str(plain)), 260)
+        self.assertEqual(len(orch.read_records(plain)), 1)
+        self.assertGreater(orch.newest_mtime([plain]), 0.0)
+
     def test_dedupes_block_records_by_request_id_keeping_max_output(self):
         a = asst("r1", usage={"output_tokens": 4})
         b = asst("r1", stop="end_turn", usage={"output_tokens": 900})
