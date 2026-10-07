@@ -213,6 +213,10 @@ each carry at least one `long_session` chain task (t23, t25, and t24/t24b
 respectively) so a manifest's `[stages.*] classes = ["long_session"]`
 filter has something to screen/validate/holdout against on every stage.
 
+The orchestration lane's `kind=orch` tasks (`orch.py`, README "Orchestration lane") live in their own
+`orch` split (class `orchestration`): each recombines the hidden suites of tasks that already sit in
+validation/holdout, so it must not be screened or held out beside them. `run.py --tasks all` skips them.
+
 The protected evaluator set a campaign hash-pins at start and re-verifies
 before every trial and before promotion (design spec #801) is, for this
 harness: `run.py`, `corpus.toml`, every task's `grade.py`/`hidden/`/

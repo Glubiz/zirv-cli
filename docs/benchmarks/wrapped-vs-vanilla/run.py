@@ -819,6 +819,81 @@ def transcript_effort_counts(path):
     return counts
 
 
+SUPERPOWERS_MARKER = "<EXTREMELY_IMPORTANT>\nYou have superpowers."
+SUPERPOWERS_INVALID = "superpowers not loaded"
+
+
+def check_vanilla_plugin_dir(plugin_dir):
+    """Error text when the vanilla arm's plugin dir is unusable (a vanilla run
+    without superpowers is invalid), else None."""
+    if not plugin_dir:
+        return "vanilla needs --vanilla-plugin-dir (the superpowers plugin dir): a vanilla run without superpowers is invalid"
+    if not Path(plugin_dir).is_dir():
+        return f"--vanilla-plugin-dir {plugin_dir!r} does not exist (superpowers plugin dir required)"
+    return None
+
+
+def superpowers_in_records(records):
+    """(loaded, skills_invoked) from parsed transcript records: `loaded` is true
+    when a `hook_additional_context` attachment carries the superpowers
+    SessionStart text ("<EXTREMELY_IMPORTANT>\nYou have superpowers."),
+    `skills_invoked` counts Skill tool_use calls naming a `superpowers:` skill."""
+    loaded, invoked = False, 0
+    for ev in records:
+        if not isinstance(ev, dict):
+            continue
+        att = ev.get("attachment")
+        if ev.get("type") == "attachment" and isinstance(att, dict) and att.get("type") == "hook_additional_context":
+            content = att.get("content")
+            texts = content if isinstance(content, list) else [content]
+            if any(isinstance(t, str) and t.lstrip().startswith(SUPERPOWERS_MARKER) for t in texts):
+                loaded = True
+        message = ev.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if ev.get("type") == "assistant" and isinstance(blocks, list):
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Skill":
+                    name = str((b.get("input") or {}).get("skill") or "")
+                    if name.startswith("superpowers:"):
+                        invoked += 1
+    return loaded, invoked
+
+
+def superpowers_in_transcripts(paths):
+    """`superpowers_in_records` over transcript files (any file loading it counts)."""
+    loaded, invoked = False, 0
+    for path in paths:
+        recs = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        recs.append(json.loads(line))
+                    except ValueError:
+                        pass
+        except OSError:
+            continue
+        l, n = superpowers_in_records(recs)
+        loaded, invoked = loaded or l, invoked + n
+    return loaded, invoked
+
+
+def apply_superpowers_check(result, transcript_paths):
+    """Vanilla + superpowers runs only: record `superpowers_loaded` and
+    `superpowers_skills_invoked`, and mark the run invalid (`is_error`, reason
+    "superpowers not loaded") when the plugin's SessionStart context is absent,
+    so `--resume` re-runs it."""
+    if result.get("cond") != "vanilla" or not VANILLA_PLUGIN_DIR:
+        return
+    loaded, invoked = superpowers_in_transcripts(transcript_paths)
+    result["superpowers_loaded"] = loaded
+    result["superpowers_skills_invoked"] = invoked
+    if not loaded:
+        result["is_error"] = True
+        result["invalid_reason"] = SUPERPOWERS_INVALID
+        result["details"] = ((result.get("details") or "") + "; " if result.get("details") else "") + SUPERPOWERS_INVALID
+
+
 def record_run_provenance(run_dir, result, session_ids, projects_root=None):
     """Archive every session transcript of this run into `<run_dir>/transcripts/`
     and record `claude_version`, `effort` (the most common effort level seen in
@@ -827,6 +902,7 @@ def record_run_provenance(run_dir, result, session_ids, projects_root=None):
     projects_root = Path(projects_root) if projects_root else Path(os.path.expanduser("~")) / ".claude" / "projects"
     effort_counts = {}
     archived = []
+    found_paths = []
     for session_id in dict.fromkeys(s for s in session_ids if s):
         matches = glob.glob(str(projects_root / "*" / f"{session_id}.jsonl"))
         if not matches:
@@ -835,12 +911,14 @@ def record_run_provenance(run_dir, result, session_ids, projects_root=None):
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(matches[0], dest_dir / f"{session_id}.jsonl")
         archived.append(f"{session_id}.jsonl")
+        found_paths.append(matches[0])
         for level, n in transcript_effort_counts(matches[0]).items():
             effort_counts[level] = effort_counts.get(level, 0) + n
     result["claude_version"] = claude_version()
     result["effort"] = max(effort_counts, key=effort_counts.get) if effort_counts else None
     result["effort_counts"] = effort_counts
     result["transcripts"] = archived
+    apply_superpowers_check(result, found_paths)
 
 
 def iso_utc_ms(epoch_s):
@@ -2983,10 +3061,13 @@ def print_check_graders_report(rows):
 # only (Python 3.11+).
 # ---------------------------------------------------------------------------
 
-VALID_SPLITS = {"dev", "validation", "holdout"}
+# `orch` is the orchestration lane's own split (orch.py, kind=orch tasks): its
+# tasks recombine the hidden suites of tasks that already sit in validation and
+# holdout, so they must not be screened or held out alongside them.
+VALID_SPLITS = {"dev", "validation", "holdout", "orch"}
 VALID_TASK_CLASSES = {
     "mechanical", "bounded", "bug", "feature", "architecture", "ambiguous",
-    "sensitive", "long_session",
+    "sensitive", "long_session", "orchestration",
 }
 
 
@@ -3069,6 +3150,12 @@ def main():
     VANILLA_PLUGIN_DIR = args.vanilla_plugin_dir
     bench_root = Path(args.bench_root) if args.bench_root else Path(__file__).resolve().parent
 
+    if not args.check_graders and not args.trial and "vanilla" in (args.conds or "").split(","):
+        err = check_vanilla_plugin_dir(args.vanilla_plugin_dir) if args.vanilla_plugin_dir else None
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            sys.exit(2)
+
     if args.check_graders:
         tasks = None
         if args.tasks and args.tasks != "all":
@@ -3098,7 +3185,9 @@ def main():
     tasks_dir = bench_root / "tasks"
 
     if args.tasks == "all":
-        tasks = sorted(p.name for p in tasks_dir.iterdir() if p.is_dir())
+        # kind=orch tasks belong to orch.py (an interactive PTY lane); run.py cannot run them.
+        tasks = sorted(p.name for p in tasks_dir.iterdir() if p.is_dir()
+                       and read_text(p / "kind.txt").strip() != "orch")
     else:
         tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
 

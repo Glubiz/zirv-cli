@@ -1,0 +1,6 @@
+# source tasks, in the order their reference solutions compose
+t17_schema_migration
+t20_audit_log
+t22_envelopes
+t21_search
+t19_goals_saga

@@ -1,0 +1,371 @@
+This is one request with 5 separate parts, all for the ledgerlite repo in the current directory. The parts share files (notably ledgerlite/cli.py and ledgerlite/store.py), so when you are done all 5 must work together, and every existing test must still pass. Each part's contract is exact. Finish with a short summary of what you did per part.
+
+=== Part 1 of 5 ===
+
+I want to be able to add one-off transactions by hand (not just via CSV
+import), and I'd like the ledger file's format to be future-proofed with an
+explicit version number so I can tell old exports apart from new ones. Please
+add both, plus a way to upgrade an old ledger file in place.
+
+1. New module `ledgerlite/schema.py`:
+   - `CURRENT_VERSION = 2`.
+   - `migrate_payload(payload)` -- a pure function (must not mutate its
+     `payload` argument or any of the dicts inside it) that takes the raw
+     dict decoded from a ledger JSON file and returns a new dict in the
+     current schema: `schema_version` set to `CURRENT_VERSION`, and every
+     dict in `transactions` given a `"source"` key of `"import"` if it
+     doesn't already have one (an existing `"source"` value, whatever it
+     is, is left alone). This must work whether the input already has
+     `schema_version: 2` (in which case it's effectively a no-op besides
+     backfilling any missing `"source"`) or has no `schema_version` at all
+     (today's format, treated as the implicit starting point).
+
+2. `Transaction` (`ledgerlite/models.py`) gets a new field `source: str`,
+   defaulting to `"manual"` when a `Transaction` is constructed directly in
+   Python without specifying it.
+
+3. `ledgerlite/store.py`:
+   - `save()` always writes the current schema: a top-level
+     `"schema_version": 2` key alongside `"transactions"`, and every
+     transaction dict includes `"source"`.
+   - `load()` must keep working on a file written by today's format (no
+     `"schema_version"` key, no per-transaction `"source"` key) by running
+     the decoded payload through `schema.migrate_payload` before building
+     `Transaction` objects -- a migrated transaction with no prior
+     `"source"` becomes `source="import"` (matching how every transaction
+     in an old file actually got there: through CSV import). `load()` does
+     **not** rewrite the file on disk by itself; only `save()` (or the new
+     `migrate` command below) does that.
+
+4. `ledgerlite/parse.py::read_csv` sets `source="import"` explicitly on every
+   `Transaction` it produces.
+
+5. A new `add` CLI command: `python -m ledgerlite add --date YYYY-MM-DD
+   --amount AMOUNT --payee NAME [--memo TEXT] [--category CAT] --store
+   PATH`. It loads the existing store (migrating transparently if it's an
+   old file), assigns the new transaction the id `(highest existing id) +
+   1` (or `1` if the store is empty or the file doesn't exist yet), sets
+   `source="manual"`, defaults `--memo` to `""` and `--category` to
+   uncategorized when omitted, appends it, saves (which writes the current
+   schema), and prints `Added transaction <id>`.
+
+6. A new `migrate` CLI command: `python -m ledgerlite migrate --store PATH
+   [--backup]`. If the file at `PATH` already has `"schema_version": 2`,
+   print exactly `Already up to date.` and exit 0 without modifying the
+   file (and without creating a backup, even if `--backup` was passed).
+   Otherwise: if `--backup` was given, first copy the file's current exact
+   contents to `PATH + ".bak"`; then rewrite `PATH` in the current schema
+   (reusing the same migration `load()` already performs, followed by
+   `save()`) and print `Migrated <n> transactions to schema version 2`
+   where `<n>` is the number of transactions in the file.
+
+Existing commands (`list`, `summary`, `categorize`) must keep working
+exactly as before against both an old-format file and a current-format
+file, with no visible change in their behaviour from this change alone.
+
+=== Part 2 of 5 ===
+
+I share this ledger file with my accountant and I want a record of what
+changed it and when (in terms of "which operation happened, in what order",
+not wall-clock time -- I don't need real timestamps, just an ordered
+history). Please add an audit log.
+
+1. New module `ledgerlite/audit.py`:
+   - An `AuditEntry` type with fields `sequence` (int), `action` (str), and
+     `detail` (str).
+   - `append_entry(path, action, detail)` -- appends a new entry to the
+     audit trail stored under a top-level `"audit"` key in the same JSON
+     store file used by `--store` (a sibling of `"transactions"`, left
+     completely alone by this). The new entry's `sequence` is one more than
+     the number of entries already there (so the very first entry in a
+     file is `1`); entries are never reordered or removed by this
+     function. Returns the `AuditEntry` that was appended.
+   - `read_log(path)` -- returns the list of `AuditEntry` stored at `path`,
+     in the order they were appended (`[]` if the file has no `"audit"`
+     key, or doesn't exist).
+
+2. `ledgerlite/store.py`'s `save()` currently overwrites the whole store
+   file with just `{"transactions": [...]}`. Change it to preserve any
+   other top-level keys already present in the file (such as the new
+   `"audit"` key) instead of discarding them -- otherwise every `import` or
+   `categorize` after the first would wipe out the audit trail written
+   before it.
+
+3. Every existing command that changes the stored transactions must record
+   one audit entry, right after it successfully saves:
+   - `import <csv_path>`: `action="import"`,
+     `detail=f"Imported {n} transactions from {csv_path}"` (`n` is the same
+     count already printed).
+   - `categorize`: `action="categorize"`,
+     `detail=f"Re-categorized {changed} of {total} transactions"` (same
+     numbers already printed).
+   Commands that only read (`list`, `summary`) must not write any audit
+   entry.
+
+4. Two new CLI commands:
+   - `python -m ledgerlite audit log --store PATH` -- prints one line per
+     audit entry, oldest first: `f"{sequence}. {action}: {detail}"`. If
+     there are no entries, print exactly `No audit entries.`.
+   - `python -m ledgerlite audit summary --store PATH` -- prints how many
+     entries there are of each action, alphabetically by action name, one
+     per line, as `<action>: <count>`. If there are no entries, print
+     exactly `No audit entries.`.
+
+Sequence numbers must keep counting up across every command that runs
+against the same store file (e.g. an `import` followed by a `categorize`
+produces entries `1` and `2`, in that order) -- they are never reset or
+renumbered.
+
+=== Part 3 of 5 ===
+
+I want a full envelope-budgeting subsystem: named "envelopes" that each
+budget a fixed amount per month against one or more categories, with
+rollover, transfers between envelopes, an allocation helper, overspend
+alerts, and CSV import/export. This is a big feature -- please build it in
+these phases, in order, since later phases depend on earlier ones:
+
+**Phase 1 -- the model.** New module `ledgerlite/envelopes.py`:
+- An `Envelope` type: `name` (str), `categories` (list of str -- a
+  transaction counts toward this envelope if its `category` is any one of
+  them), `monthly_budget` (`Decimal`, always meant to be positive),
+  `start_month` (a `"YYYY-MM"` string -- the first month this envelope
+  applies to), `rollover` (bool, default `False`), `starting_balance`
+  (`Decimal`, default `0` -- the balance carried in from before
+  `start_month`), `closed_through` (an optional `"YYYY-MM"` string, default
+  `None` -- see Phase 7), and `adjustments` (a dict of `"YYYY-MM"` ->
+  `Decimal`, default empty -- see Phase 4).
+- `spent_in_month(envelope, txns, year, month)`: the sum of `abs(amount)`
+  over every transaction in `txns` dated in that calendar year/month whose
+  `category` is in `envelope.categories`.
+- `balance_through_month(envelope, txns, year, month)`: the envelope's
+  remaining balance for that month.
+  - If `envelope.rollover` is `False`: the balance for a month is just
+    `monthly_budget - spent_in_month(that month) + adjustments.get(that
+    month, 0)` -- months don't affect each other.
+  - If `envelope.rollover` is `True`: starting from `starting_balance` as
+    the balance for the month *before* whichever of (`closed_through`, if
+    set) or (the month before `start_month`, if not) applies, walk forward
+    one calendar month at a time up to and including the requested month,
+    each step adding that month's `monthly_budget - spent_in_month(that
+    month) + adjustments.get(that month, 0)` to the running balance.
+  - Requesting a month strictly before `start_month` (or before
+    `closed_through`, once set) is invalid -- raise `ValueError`.
+
+**Phase 2 -- persistence and basic CLI.** Envelopes are saved under a
+top-level `"envelopes"` key in the same JSON store file used by `--store`
+(a sibling of `"transactions"`), each with all of `Envelope`'s fields
+(`monthly_budget`/`starting_balance` as strings, `adjustments` as a
+`{"YYYY-MM": "amount"}` object).
+- `python -m ledgerlite envelope add --name NAME --monthly-budget AMOUNT
+  --category CAT [--category CAT2 ...] --start-month YYYY-MM [--rollover]
+  [--starting-balance AMOUNT] --store PATH` appends a new envelope
+  (categories kept in the order given) and prints `Added envelope <name>`.
+- `python -m ledgerlite envelope list --store PATH` prints one line per
+  saved envelope, in the order saved:
+  `<name>: budget <monthly_budget>/mo categories <cat1,cat2> from
+  <start_month>` with ` (rollover)` appended only when that envelope has
+  rollover on. If there are no saved envelopes, print exactly `No
+  envelopes.`.
+
+**Phase 3 -- monthly status.** `python -m ledgerlite envelope status NAME
+--year Y --month M --store PATH` (`NAME` positional) prints
+`f"{name}: spent {spent:.2f}/{budget:.2f} for {year:04d}-{month:02d},
+balance {balance:.2f}"`. If `NAME` doesn't match any saved envelope, or the
+requested year/month is invalid for that envelope per Phase 1's rule
+(`ValueError` from `balance_through_month`), print an error to stderr and
+exit with status 2, printing nothing to stdout.
+
+**Phase 4 -- transfers.** `python -m ledgerlite envelope transfer --from A
+--to B --amount AMOUNT --year Y --month M --store PATH` moves `AMOUNT` from
+envelope `A`'s balance to envelope `B`'s for that month: it subtracts
+`AMOUNT` from `A`'s `adjustments["YYYY-MM"]` (adding to any adjustment
+already there for that month, default `0`) and adds `AMOUNT` to `B`'s the
+same way, then saves. Prints `Transferred <amount> from <A> to <B> for
+<YYYY-MM>`. Rejects (error to stderr, exit 2, no changes saved) if `A`
+equals `B`, or if either name doesn't match a saved envelope.
+
+**Phase 5 -- allocation suggestions.** New module `ledgerlite/allocation.py`
+with `suggest_allocations(envelopes, total_income)`: returns a dict mapping
+each envelope's `name` to a `Decimal` amount, proportional to its
+`monthly_budget` relative to the sum of every envelope's `monthly_budget`,
+such that the amounts sum to *exactly* `total_income` (to 2 decimal
+places) -- use the largest-remainder method (compute each envelope's exact
+share, floor to 2 decimals, then hand out the leftover cents one at a time
+to the envelopes with the largest fractional remainder, breaking any tie
+alphabetically by name). If every envelope's `monthly_budget` is `0` (or
+there are no envelopes), every amount in the result is `Decimal("0.00")`
+regardless of `total_income`. `python -m ledgerlite envelope suggest
+--income AMOUNT --store PATH` prints one line per envelope, alphabetically
+by name: `<name>: <amount>`. If there are no saved envelopes, print exactly
+`No envelopes.`.
+
+**Phase 6 -- overspend alerts.** `python -m ledgerlite envelope alerts
+--year Y --month M --store PATH` computes each envelope's balance for that
+month (skipping any envelope for which that year/month is invalid per
+Phase 1 -- i.e. before its `start_month`/`closed_through`, silently, not as
+an error) and prints one line for every envelope whose balance is negative,
+sorted by balance ascending (most overspent first), ties broken
+alphabetically by name: `<name>: over by <amount>` (`amount` is the
+positive `abs()` of the balance, `:.2f`). If none are overspent, print
+exactly `No envelopes over budget.`.
+
+**Phase 7 -- closing a month.** `python -m ledgerlite envelope close-month
+--year Y --month M --store PATH` permanently folds every *rollover*
+envelope's balance through that month into its `starting_balance`, for
+every rollover envelope where that year/month is at or after
+`start_month` and strictly after `closed_through` (or `closed_through` is
+unset): computes `balance_through_month` for that envelope through that
+month (using its current state), sets `starting_balance` to that value and
+`closed_through` to `"YYYY-MM"`, and removes every entry in `adjustments`
+whose month is `<=` that `"YYYY-MM"` (they're now folded in; later months'
+adjustments are untouched). Non-rollover envelopes, and rollover envelopes
+already closed through that month or later, are left alone. Prints `Closed
+<YYYY>-<MM> for <n> envelope(s)` where `<n>` counts only the envelopes
+actually closed.
+
+**Phase 8 -- CSV export.** `python -m ledgerlite envelope export --store
+PATH --out CSVPATH` writes a CSV (via Python's `csv` module) with header
+`Name,Category,MonthlyBudget,Rollover,StartMonth,StartingBalance`, one row
+per saved envelope sorted alphabetically by name: `Category` is that
+envelope's categories comma-joined in their stored order, `Rollover` is
+the literal string `true` or `false`, `MonthlyBudget`/`StartingBalance` are
+formatted to exactly 2 decimal places. Prints `Exported <n> envelope(s) to
+<CSVPATH>`.
+
+**Phase 9 -- CSV import.** `python -m ledgerlite envelope import-csv
+--store PATH --file CSVPATH` reads that same CSV format back. For each
+row: if an envelope with that `Name` already exists, it is *replaced
+entirely* by the row's values (`closed_through` reset to `None` and
+`adjustments` reset to empty, since the old ones no longer correspond to
+the freshly-declared parameters) in its original list position; otherwise
+a brand-new envelope (also with `closed_through=None`,
+`adjustments={}`) is appended, in CSV row order. Saves, then prints
+`Imported <n> envelope(s) from <CSVPATH>` (`<n>` = number of data rows
+read).
+
+**Phase 10 -- validation and removal.** `envelope add` rejects (error to
+stderr, exit 2, nothing saved): a `--monthly-budget` that is not strictly
+positive, a `--start-month` not in `YYYY-MM` form, or a `--name` that
+already exists. `python -m ledgerlite envelope remove NAME --store PATH`
+removes the matching envelope and prints `Removed envelope <name>`; if
+`NAME` isn't found, print an error to stderr and exit with status 2 (no
+changes).
+
+=== Part 4 of 5 ===
+
+I want a way to search my transactions -- I'm not 100% sure what the most
+useful shape for this is, so use your judgement on the details, but
+whatever you build has to satisfy all of these acceptance criteria exactly,
+since that's what I'll be checking:
+
+- AC1: `python -m ledgerlite search --payee-contains TEXT --store PATH`
+  matches transactions whose `payee` contains `TEXT` as a substring,
+  case-insensitively.
+- AC2: `--min-amount AMOUNT` and `--max-amount AMOUNT` filter on the
+  transaction's signed `amount` (not its absolute value), inclusive on both
+  ends; either may be given alone.
+- AC3: `--category CAT` matches transactions whose `category` equals `CAT`
+  exactly (case-sensitive, same as category strings are stored today).
+- AC4: `--uncategorized-only` matches transactions with no category
+  (`category is None`). Passing both `--category` and
+  `--uncategorized-only` together is invalid: print an error to stderr and
+  exit with status 2, printing nothing to stdout.
+- AC5: `--since YYYY-MM-DD` and `--until YYYY-MM-DD` filter on `date`,
+  inclusive on both ends.
+- AC6: Every filter given must match (AND, not OR) for a transaction to be
+  included.
+- AC7: If no filters are given at all, every stored transaction matches.
+- AC8: `--sort {date,amount,payee}` controls display order (default
+  `date`), always ascending, with ties broken by `id` ascending; `payee` is
+  compared case-insensitively.
+- AC9: `--limit N` caps how many matching rows are printed, applied after
+  sorting; omitting it prints every match.
+- AC10: Matching rows are printed with exactly the same header and
+  per-row format the existing `list` command already uses.
+- AC11: If nothing matches, print exactly `No transactions match those
+  criteria.` and exit 0.
+- AC12: If `--min-amount` is greater than `--max-amount` (when both are
+  given), print an error to stderr and exit with status 2, printing
+  nothing to stdout.
+
+Also add `ledgerlite/report.py::search(txns, payee_contains=None,
+min_amount=None, max_amount=None, category=None, uncategorized_only=False,
+date_from=None, date_to=None)` -- a pure function implementing the
+filtering from AC1-AC7 (not the sorting/limit/printing, which are the CLI
+command's job) and returning the matching transactions in their original
+input order.
+
+=== Part 5 of 5 ===
+
+I'd like to track savings/spending goals against my categories -- like "save
+$500 toward vacation" or "keep dining under some running total". This is a
+fairly big feature, so here's the whole thing, phase by phase; please build
+it in this order since later phases build on earlier ones, and each phase
+should work correctly on its own once you reach it.
+
+**Phase 1 -- the model.** New module `ledgerlite/goals.py`:
+- A `Goal` type with fields `name` (str), `target` (a `Decimal`, always
+  meant to be positive), `categories` (a list of category strings -- a
+  transaction counts toward this goal if its `category` is any one of
+  them), `target_date` (an optional `date`, default `None`), and
+  `milestones` (a list of ints, default an empty list -- built out in
+  Phase 4).
+- A function `progress(goal, txns)` that returns a `Decimal`: the sum of
+  `abs(amount)` over every transaction in `txns` whose `category` is in
+  `goal.categories`.
+
+**Phase 2 -- persistence and basic CLI.** Goals are saved under a top-level
+`"goals"` key in the same JSON store file used by `--store` (a sibling of
+`"transactions"`), each serialized with its fields (`target` as a string,
+`target_date` as an ISO date string or `null`, `milestones` as a list of
+ints).
+- `python -m ledgerlite goal add --name NAME --target AMOUNT --category CAT
+  [--category CAT2 ...] [--target-date YYYY-MM-DD] --store PATH` appends a
+  new goal (categories kept in the order given) and prints `Added goal
+  <name>`.
+- `python -m ledgerlite goal list --store PATH` prints one line per saved
+  goal, in the order they were saved:
+  `<name>: target <target> categories <cat1>,<cat2>[ by <target-date>]`
+  (categories comma-joined in the order stored; the trailing
+  `by <target-date>` part appears only when that goal has one). If there
+  are no saved goals, print exactly `No goals.`.
+
+**Phase 3 -- checking progress.** `python -m ledgerlite goal progress NAME
+--store PATH` (a positional goal name) prints
+`f"{name}: {progress:.2f}/{target:.2f} ({percent:.1f}%)"`, where `percent`
+is `progress / target * 100` (`0` if `target` is `0`). If `NAME` doesn't
+match any saved goal, print an error to stderr and exit with status 2.
+
+**Phase 4 -- milestones.** `goal add` accepts a repeatable `--milestone N`
+(integer percentage); store the given milestones deduplicated and sorted
+ascending on the goal. Add `reached_milestones(goal, txns)` to
+`ledgerlite/goals.py`: returns the sorted list of milestones from
+`goal.milestones` whose threshold is `<=` the goal's exact (unrounded)
+percent complete. `goal progress`'s output gains a suffix: if the goal has
+any milestones defined, append
+`" milestones reached: 25,50"` (comma-joined ascending, or the literal word
+`none` if none are reached yet); a goal with no milestones defined at all
+gets no suffix, exactly as in Phase 3.
+
+**Phase 5 -- an overview report.** `python -m ledgerlite goal report --store
+PATH` prints a header line `Goal            Progress` followed by one row
+per goal, **sorted by percent complete descending, ties broken
+alphabetically by name ascending**:
+`f"{name:<16}{percent:>6.1f}%  {progress:.2f}/{target:.2f}"`. If there are
+no saved goals, print just the header line.
+
+**Phase 6 -- an overall total.** Add `--overall` to `goal report`. When
+given, print one more line after everything else:
+`f"TOTAL: {percent:.1f}%"` where `percent` is
+`sum(progress across all goals) / sum(target across all goals) * 100`
+(`0` if that total target is `0`, including when there are no goals at
+all -- in which case the output is just the header line followed by
+`TOTAL: 0.0%`).
+
+**Phase 7 -- validation and removal.** `goal add` rejects (prints an error
+to stderr, exits 2, saves nothing) a `--target` that is not strictly
+positive, and rejects adding a goal whose `--name` exactly matches a
+goal that's already saved. Add `python -m ledgerlite goal remove NAME
+--store PATH` (positional name): removes the matching goal and prints
+`Removed goal <name>`; if `NAME` isn't found, print an error to stderr and
+exit with status 2 (no changes).
