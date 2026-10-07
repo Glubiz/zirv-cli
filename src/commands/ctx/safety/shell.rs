@@ -164,12 +164,30 @@ pub(crate) fn canonical_shell_syntax(command: &str) -> Option<String> {
 /// Split shell separators while preserving quoted data and marking pipe
 /// joins. Recognize multi-character operators before their prefixes (#334).
 pub(super) fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
+    tokenize_segments_joined(command)
+        .into_iter()
+        .map(|(text, preceded_by_pipe, _)| (text, preceded_by_pipe))
+        .collect()
+}
+
+/// The separator right before a segment: `&&` (runs only on success), `||`
+/// (runs only on failure) or anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Join {
+    And,
+    Or,
+    Other,
+}
+
+/// [`tokenize_segments`] plus each segment's preceding [`Join`].
+pub(super) fn tokenize_segments_joined(command: &str) -> Vec<(String, bool, Join)> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut preceded_by_pipe = false;
+    let mut join = Join::Other;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -193,32 +211,40 @@ pub(super) fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
             current.push(c);
             i += 1;
         } else if c == ';' || c == '\n' {
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
             preceded_by_pipe = false;
+            join = Join::Other;
             i += 1;
         } else if c == '|' && next == Some('&') {
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
             preceded_by_pipe = true;
+            join = Join::Other;
             i += 2;
         } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
             preceded_by_pipe = false;
+            join = if c == '&' { Join::And } else { Join::Or };
             i += 2;
+            // A newline right after `&&`/`||` continues the list.
+            while chars.get(i) == Some(&'\n') {
+                i += 1;
+            }
         } else if (c == '|' && !current.ends_with('>'))
             || (c == '&'
                 && !matches!(current.chars().next_back(), Some('>' | '<'))
                 && next != Some('>'))
         {
             let is_pipe = c == '|';
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
             preceded_by_pipe = is_pipe;
+            join = Join::Other;
             i += 1;
         } else {
             current.push(c);
             i += 1;
         }
     }
-    segments.push((current, preceded_by_pipe));
+    segments.push((current, preceded_by_pipe, join));
     segments
 }
 

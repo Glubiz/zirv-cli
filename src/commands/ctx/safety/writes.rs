@@ -578,8 +578,11 @@ pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String])
 // -- orchestrator repo-write guard (issues #328/#334) ---------------------
 
 /// Mask heredoc openers before redirect scanning so `<<` does not look
-/// like a dangling input redirect and hide an earlier real write target.
+/// like a dangling input redirect and hide an earlier real write target. The
+/// redacted-body placeholder's closing `>` would read as an output redirect
+/// onto the delimiter inside a `$(...)` (#887), so it is blanked too.
 fn neutralize_heredoc_operator(segment: &str) -> String {
+    let segment = segment.replace(super::shell::OPAQUE_HEREDOC_BODY_PLACEHOLDER, " ");
     let chars: Vec<char> = segment.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0;
@@ -865,8 +868,20 @@ pub(crate) fn orchestrator_repo_write_target(
     // Track only the immediately preceding diff-producing git segment;
     // reset at each other segment before considering a patch-apply exemption.
     let mut previous_diff_producing_git = false;
-    for (segment, preceded_by_pipe) in split_segments_with_pipe_marker(&sanitized) {
-        let collapsed = collapse_whitespace(&segment);
+    // Directory relative targets resolve against; a literal top-level `cd`
+    // moves it only for segments chained to it by `&&` (#883). Any other
+    // separator may run the next segment without the `cd` having taken effect,
+    // so the session cwd applies again. `cd` inside `( )`/`$( )` never
+    // reaches here as a segment-leading `cd`, so it cannot leak.
+    let session_cwd = cwd.to_string();
+    let mut cwd = session_cwd.clone();
+    let segments = tokenize_segments_joined(&sanitized);
+    for (index, (segment, preceded_by_pipe, join)) in segments.iter().enumerate() {
+        let preceded_by_pipe = *preceded_by_pipe;
+        if *join != Join::And {
+            cwd = session_cwd.clone();
+        }
+        let collapsed = collapse_whitespace(segment);
         let Some(tokens) = sql_tokens(&collapsed) else {
             previous_diff_producing_git = false;
             continue;
@@ -876,6 +891,35 @@ pub(crate) fn orchestrator_repo_write_target(
             continue;
         };
         let program = sql_program_name(first);
+
+        // Anything but a plain leading `cd` that may change the directory
+        // (group/subshell, `pushd`, `builtin cd`, ...) makes the cwd unknown.
+        let may_change_dir = program.starts_with(['(', '{'])
+            || (program != "cd"
+                && tokens
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "cd" | "pushd" | "popd")));
+        if may_change_dir {
+            cwd = session_cwd.clone();
+        }
+
+        if program == "cd" {
+            previous_diff_producing_git = false;
+            // A piped `cd` runs in a subshell and does not move this shell;
+            // after `||` it may be skipped (`true || cd x && cmd`).
+            let piped = preceded_by_pipe || segments.get(index + 1).is_some_and(|(_, p, _)| *p);
+            if piped || *join == Join::Or {
+                continue;
+            }
+            // A `cd` this guard cannot resolve literally may land anywhere.
+            cwd = match tokens.as_slice() {
+                [_, path] if !path.starts_with('-') => resolve_repo_write_target(path, &cwd)
+                    .filter(|resolved| Path::new(resolved).is_absolute())
+                    .unwrap_or_else(|| session_cwd.clone()),
+                _ => session_cwd.clone(),
+            };
+            continue;
+        }
 
         // Parse the actual git action past global flags so `apply`/`am` cannot
         // inherit the blanket exemption for other git commands (#334).
@@ -905,9 +949,9 @@ pub(crate) fn orchestrator_repo_write_target(
         }
         previous_diff_producing_git = false;
 
-        if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(&segment)) {
+        if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(segment)) {
             for target in &targets {
-                if let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env) {
+                if let Some(hit) = repo_write_violation(target, &cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -917,7 +961,7 @@ pub(crate) fn orchestrator_repo_write_target(
             && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
         {
             for target in sed_perl_inplace_targets(&program, &tokens) {
-                if let Some(hit) = repo_write_violation(&target, cwd, repo_root_of, env) {
+                if let Some(hit) = repo_write_violation(&target, &cwd, repo_root_of, env) {
                     return Some(hit);
                 }
             }
@@ -925,7 +969,7 @@ pub(crate) fn orchestrator_repo_write_target(
 
         if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
             && let Some(target) = last_non_flag_argument(&tokens)
-            && let Some(hit) = repo_write_violation(target, cwd, repo_root_of, env)
+            && let Some(hit) = repo_write_violation(target, &cwd, repo_root_of, env)
         {
             return Some(hit);
         }
@@ -1282,6 +1326,139 @@ mod tests {
             assert_eq!(
                 orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
                 None,
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #887: a heredoc delimiter inside or outside `$(...)` is never a
+    /// file write, while a real redirect next to a heredoc still is.
+    #[test]
+    fn orchestrator_repo_write_target_ignores_heredocs_inside_command_substitutions() {
+        let cwd = "/work/repo";
+        for command in [
+            "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n- one line\n\nmore text > not a redirect\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<EOF\nbody\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<\"EOF\"\nbody\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<-EOF\n\tbody\n\tEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            "cat > notes.md <<'EOF'\nhi\nEOF",
+            "cat <<'EOF' > notes.md\nhi\nEOF",
+            "echo \"$(cat <<'EOF' > notes.md\nhi\nEOF\n)\"",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                Some("notes.md".to_string()),
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #883: relative targets resolve against the effective directory
+    /// after a literal `cd` in the same chain; subshell/substitution `cd`
+    /// does not leak.
+    #[test]
+    fn orchestrator_repo_write_target_resolves_relative_targets_after_cd() {
+        let cwd = "/work/repo";
+        for command in [
+            "cd /tmp/x && mkdir -p y",
+            "cd /tmp/x && a && mkdir -p y",
+            "cd /tmp/x && cd .. && mkdir -p y",
+            "cd /work/repo/sub && cd /tmp/x && mkdir -p y",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for (command, target) in [
+            ("cd /work/repo/sub && mkdir -p y", "y"),
+            ("cd sub && mkdir -p y", "y"),
+            ("cd /tmp/x && cd /work/repo && mkdir -p y", "y"),
+            ("(cd /tmp/x) && mkdir -p y", "y"),
+            ("echo $(cd /tmp/x) && mkdir -p y", "y"),
+            ("cd $VAR && mkdir -p y", "y"),
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                Some(target.to_string()),
+                "{command}"
+            );
+        }
+    }
+
+    /// A `cd` only carries to segments chained by `&&`; any other separator
+    /// may run the next segment without the `cd` having taken effect.
+    #[test]
+    fn orchestrator_repo_write_target_cd_only_carries_across_and_chains() {
+        let cwd = "/work/repo";
+        for command in [
+            "cd /tmp/x; mkdir y",
+            "cd /tmp/x || mkdir y",
+            "cd /tmp/x & mkdir y",
+            "cd /tmp/x && true; mkdir y",
+            "cd /tmp/x; echo a > y/out.txt",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// Groups, `||`-skipped cds and other dir-changing builtins must not leave
+    /// a stale tracked cwd; a `cd` after `;` or a continued `&&` still counts.
+    #[test]
+    fn orchestrator_repo_write_target_cd_bypasses_reset_the_tracked_cwd() {
+        let cwd = "/work/repo";
+        for command in [
+            "cd /tmp && (cd /work/repo && mkdir y)",
+            "cd /tmp && { cd /work/repo && mkdir y; }",
+            "true || cd /tmp && mkdir y",
+            "cd /tmp && pushd /work/repo && mkdir y",
+            "cd /tmp && popd && mkdir y",
+            "cd /tmp && builtin cd /work/repo && mkdir y",
+            "cd /tmp && command cd /work/repo && mkdir y",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+        for command in ["x; cd /tmp/x && mkdir -p y", "cd /tmp/x &&\nmkdir -p y"] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// A `cd` the guard cannot resolve literally resets to the session cwd.
+    #[test]
+    fn orchestrator_repo_write_target_unresolvable_cd_resets_the_tracked_cwd() {
+        let cwd = "/work/repo";
+        for command in [
+            "cd /tmp && cd - && mkdir x",
+            "cd /tmp && cd $VAR && mkdir y",
+            "cd /tmp && cd && mkdir y",
+            "cd /tmp && cd -P x && mkdir y",
+            "cd /tmp && cd ~ && mkdir y",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
                 "{command}"
             );
         }
