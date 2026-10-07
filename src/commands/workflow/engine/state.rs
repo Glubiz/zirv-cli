@@ -366,6 +366,63 @@ pub(super) fn work_dir_is_gitignored(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Keeps zirv's own bookkeeping out of a repository's `git status`: in a repo
+/// that does not track anything under `.zirv/`, adds `.zirv/work/` (and
+/// `.zirv/verify.toml`, only while that file does not exist yet, so a file the
+/// operator authored is never hidden) to the repo-local `.git/info/exclude`.
+/// Never touches `.gitignore` or any tracked file; idempotent; best-effort
+/// (any git/IO failure is a silent no-op). A repo that already tracks `.zirv/`
+/// (zirv's own, which commits `.zirv/work/` on purpose) is left unchanged.
+pub(crate) fn exclude_zirv_artifacts_from_git(repo: &Path) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+    };
+    let Some(tracked) = git(&["ls-files", "--", ".zirv"]) else {
+        return;
+    };
+    if !tracked.stdout.is_empty() {
+        return;
+    }
+    let Some(path) = git(&["rev-parse", "--git-path", "info/exclude"]) else {
+        return;
+    };
+    let rel = String::from_utf8_lossy(&path.stdout).trim().to_string();
+    if rel.is_empty() {
+        return;
+    }
+    let exclude = repo.join(rel);
+    let mut wanted = vec![".zirv/work/"];
+    if !repo.join(".zirv").join("verify.toml").exists() {
+        wanted.push(".zirv/verify.toml");
+    }
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let missing: Vec<&str> = wanted
+        .into_iter()
+        .filter(|line| !existing.lines().any(|have| have.trim() == *line))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for line in missing {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&exclude, out);
+}
+
 pub(super) fn workflow_artifact_path(
     state: &WorkflowState,
     stage: ArtifactStage,
@@ -1958,6 +2015,73 @@ mod tests {
     /// The probe is best-effort, never authoritative: a path with no git
     /// repository at all must read as "not ignored" rather than erroring
     /// `workflow start` on an environment `git` cannot make sense of.
+    fn git_init(dir: &Path) {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+    }
+
+    fn git_porcelain(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn exclude_adds_zirv_paths_in_a_fresh_repo_idempotently() {
+        let repo = tempdir().unwrap();
+        git_init(repo.path());
+        exclude_zirv_artifacts_from_git(repo.path());
+        exclude_zirv_artifacts_from_git(repo.path());
+        let text = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(text.matches(".zirv/work/\n").count(), 1);
+        assert_eq!(text.matches(".zirv/verify.toml\n").count(), 1);
+        std::fs::create_dir_all(repo.path().join(".zirv/work/w")).unwrap();
+        std::fs::write(repo.path().join(".zirv/work/w/intent.md"), "x").unwrap();
+        std::fs::write(repo.path().join(".zirv/verify.toml"), "x").unwrap();
+        assert_eq!(git_porcelain(repo.path()), "");
+        assert!(!repo.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn exclude_changes_nothing_when_repo_tracks_zirv() {
+        let repo = tempdir().unwrap();
+        git_init(repo.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["add", ".zirv/ctx.toml"])
+            .output()
+            .unwrap();
+        let exclude = repo.path().join(".git/info/exclude");
+        let before = std::fs::read_to_string(&exclude).unwrap_or_default();
+        exclude_zirv_artifacts_from_git(repo.path());
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&exclude).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn exclude_does_not_hide_an_existing_verify_toml() {
+        let repo = tempdir().unwrap();
+        git_init(repo.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).unwrap();
+        std::fs::write(repo.path().join(".zirv/verify.toml"), "x").unwrap();
+        exclude_zirv_artifacts_from_git(repo.path());
+        let text = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(!text.contains("verify.toml"));
+    }
+
     #[test]
     fn work_dir_is_gitignored_fails_open_outside_a_git_repository() {
         let not_a_repo = tempdir().unwrap();

@@ -1119,6 +1119,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     }
     // Starting a workflow must never pre-create an unfilled artifact or mutate the worktree/index; context still exposes its path and template.
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
+    exclude_zirv_artifacts_from_git(&state.repo);
     save(state_dir, &state, true)?;
     // Bind the workflow to this session for pane-specific status; absent session context is a quiet best-effort skip.
     bind_started_workflow_to_calling_session(state_dir, &state.id);

@@ -2396,7 +2396,13 @@ index (issue F6: a blind reviewer flagged the untouched, unfilled file as a
 stray addition), so nothing appears in the worktree until the agent actually
 fills it in. `zirv workflow status`/`context` print both the path and the
 template text for a step whose artifact does not exist yet, so it stays
-discoverable either way. `zirv workflow approve` treats a still-missing file
+discoverable either way. In a repository that tracks nothing under `.zirv/`,
+`zirv workflow start` also adds `.zirv/work/` (and `.zirv/verify.toml`, if that
+file does not exist yet) to the repo-local `.git/info/exclude`, so a plain `git
+add -A` never commits zirv's bookkeeping into a project that did not opt in;
+`.gitignore` and tracked files are never touched, and a repo that already
+tracks `.zirv/` (like zirv's own) is left unchanged. Use `git add -f` to commit
+one deliberately. `zirv workflow approve` treats a still-missing file
 exactly like an untouched template and refuses it the same way, then pins the
 accepted file's SHA-256 digest and timestamp in private state once it is
 genuinely filled in; a later step folds only accepted, hash-matching artifacts

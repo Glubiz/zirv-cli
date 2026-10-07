@@ -25,8 +25,8 @@ pub use session_context::{
 };
 pub(crate) use state::{
     ARTIFACT_SUBSTANCE_DEFAULT_FLOOR, ARTIFACT_SUBSTANCE_LABEL, artifact_substance_action,
-    artifact_substance_questions, hash_bytes, load_active_read_only, read_accepted_artifact, save,
-    save_preserving_active,
+    artifact_substance_questions, exclude_zirv_artifacts_from_git, hash_bytes,
+    load_active_read_only, read_accepted_artifact, save, save_preserving_active,
 };
 pub use state::{WorkflowState, load, load_active, load_active_for_session, state_mtime_secs};
 pub(crate) use transition::{

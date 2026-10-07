@@ -304,6 +304,7 @@ fn create_incident_workflow(
     }
     state.status = WorkflowStatus::AwaitingApproval;
     let work_dir = repo.join(".zirv").join("work").join(&state.id);
+    engine::exclude_zirv_artifacts_from_git(repo);
     std::fs::create_dir_all(&work_dir)?;
     write_shared(&work_dir.join("intent.md"), &incident_intent(detector))?;
     let active = engine::load_active(state_dir, repo)?.is_none();
