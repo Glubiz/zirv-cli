@@ -10,7 +10,6 @@ mod pretool_tier;
 mod prompt;
 mod scope_guard;
 mod session_events;
-mod shell_edit_guard;
 mod stop;
 mod stop_verify;
 mod tool_failure;

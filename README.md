@@ -6369,17 +6369,6 @@ own `ZIRV_CTX_SCOPE_GUARD_ENABLED`), never force it on for an operator who
 disabled it; disabled means no record is ever written, no checkpoint is ever
 shown, and Stop never blocks for it.
 
-**Shell edit guard** (no config key; zirv-supervised sessions only, i.e. those
-with `ZIRV_CTX_SESSION` set): `PreToolUse` denies a `Bash` command that runs an
-inline interpreter script (`python`/`python3`/`py`/`node`/`ruby`/`perl` with a
-heredoc, `-c` or `-e`) containing a file-write call when one of its quoted path
-literals is a git-tracked file, and points the agent at the `Edit` tool instead
-(scripted string splices break escapes and indentation). Each distinct command
-is denied at most once per session: re-issuing the identical command is
-allowed, so a false positive costs one retry. A safety deny/ask still wins, a
-denial is logged as `hook`/`deny`/`edit-guard`, and any doubt (not a git repo,
-git missing or timing out, unreadable state) allows silently.
-
 The Stop hook is also how a supervisor learns which file the agent is writing:
 the agent mints its own session id, so the transcript path travels on the turn
 signal the hook sends. Register it, or `wrap` has nothing to verify a
