@@ -23,6 +23,9 @@ pub struct Task {
     pub split: Split,
     #[serde(default)]
     pub kind: String,
+    /// What the task is for (`long`, `orch`, `jev`, `autoresearch`); informational.
+    #[serde(default)]
+    pub lane: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +128,17 @@ family = "ledgerlite"
 class = "bug"
 split = "holdout"
 "#
+    }
+
+    #[test]
+    fn parses_a_task_with_a_lane_and_the_orch_split() {
+        let corpus = Corpus::parse(
+            "schema = 1\nversion = \"2\"\n[[task]]\nid = \"o1\"\nfamily = \"f\"\nclass = \"orchestration\"\nsplit = \"orch\"\nkind = \"orch\"\nlane = \"orch\"\n",
+        )
+        .unwrap();
+        assert_eq!(corpus.tasks[0].lane, "orch");
+        assert_eq!(corpus.tasks[0].split, Split::Orch);
+        assert!(corpus.tasks_for_split(Split::Dev).is_empty());
     }
 
     #[test]

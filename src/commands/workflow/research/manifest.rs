@@ -153,6 +153,8 @@ pub enum Split {
     Dev,
     Validation,
     Holdout,
+    /// Orchestration-only corpus tasks; campaign stages never select it.
+    Orch,
 }
 
 impl Split {
@@ -161,6 +163,7 @@ impl Split {
             Split::Dev => "dev",
             Split::Validation => "validation",
             Split::Holdout => "holdout",
+            Split::Orch => "orch",
         }
     }
 }
@@ -462,6 +465,9 @@ impl Manifest {
                 self.stages.screen.split
             )
             .into());
+        }
+        if self.stages.screen.split == Split::Orch || self.stages.validate.split == Split::Orch {
+            return Err("stages may only select the dev, validation or holdout splits".into());
         }
         if self.stages.screen.split == Split::Holdout {
             return Err(

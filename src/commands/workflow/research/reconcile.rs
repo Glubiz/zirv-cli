@@ -303,6 +303,7 @@ pub(crate) fn reconcile_unfinished(
                         split: match split.as_str() {
                             "dev" => Split::Dev,
                             "validation" => Split::Validation,
+                            "orch" => Split::Orch,
                             _ => Split::Holdout,
                         },
                         attempt: *attempt,
