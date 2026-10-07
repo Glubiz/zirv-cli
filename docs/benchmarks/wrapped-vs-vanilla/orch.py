@@ -292,7 +292,7 @@ def is_complete(state, idle_for_s, idle_s=DEFAULT_IDLE_S):
 # Screen / dialogs
 # --------------------------------------------------------------------------
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Z0-9]|\x1b[=>]")
-SELECTED_RE = re.compile(r"^[\s│|]*(?:[❯›]\s*(?:\d+[.)]\s*)?|>\s*\d+[.)]\s*)(\S.*?)[\s│|]*$")
+SELECTED_RE = re.compile(r"^[\s│|]*(?:[❯›>]\s*(?:\d+[.)]\s*)?)(\S.*?)[\s│|]*$")
 DOWN, ENTER = "\x1b[B", "\r"
 
 
@@ -840,7 +840,7 @@ def do_one_run(bench_root, task, cond, rep, args):
         result["zirv_state"] = zirv_state_summary(run_dir)
         H.attach_jev_telemetry(run_dir, result)
     H.write_result(run_dir, result)
-    print(f"{task} {cond} r{rep}: wall={result['wall_s']:.0f}s cost=${result['cost_usd']:.2f} "
+    print(f"{task} {cond} r{rep}: wall={result['wall_s'] or 0:.0f}s cost=${result['cost_usd'] or 0:.2f} "
           f"turns={result['turns']} subagents={result['subagents_spawned']} score={result['score']} "
           f"q={q} completed={result['completed']}", flush=True)
     return result
