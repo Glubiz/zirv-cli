@@ -288,7 +288,10 @@ fn run_pretool_bash_or_powershell<W: Write>(
 
     // Safety stays the final word above; only now may the edit guard refuse a
     // scripted rewrite of a tracked file, once per distinct command.
-    if let Some(reason) = super::shell_edit_guard::shell_edit_guard_reason(payload, env) {
+    let edit_guard_on = cfg.as_ref().is_some_and(|cfg| cfg.edit_guard.enabled);
+    if edit_guard_on
+        && let Some(reason) = super::shell_edit_guard::shell_edit_guard_reason(payload, env)
+    {
         let _ = writeln!(w, "{}", pretool_output(&reason));
         let first_line = payload
             .tool_input
@@ -1359,11 +1362,27 @@ mod tests {
 
     /// One Bash `run_pretool` call; returns whatever it printed.
     fn run_bash_guarded(repo: &Path, state_dir: &Path, supervised: bool, command: &str) -> String {
+        run_bash_guard_cfg(repo, state_dir, supervised, true, command)
+    }
+
+    fn run_bash_guard_cfg(
+        repo: &Path,
+        state_dir: &Path,
+        supervised: bool,
+        guard_enabled: bool,
+        command: &str,
+    ) -> String {
         let mut env: std::collections::HashMap<String, String> = [(
             crate::commands::ctx::state::STATE_ENV.to_string(),
             state_dir.display().to_string(),
         )]
         .into();
+        if guard_enabled {
+            env.insert(
+                "ZIRV_CTX_EDIT_GUARD_ENABLED".to_string(),
+                "true".to_string(),
+            );
+        }
         if supervised {
             env.insert(SESSION_ENV.to_string(), "zirv-sess-edit-guard".to_string());
         }
@@ -1427,6 +1446,14 @@ mod tests {
         let repo = repo_with_tracked_module();
         let state_dir = tempfile::tempdir().expect("state dir");
         let printed = run_bash_guarded(repo.path(), state_dir.path(), false, SPLICE);
+        assert!(!is_edit_guard_deny(&printed), "got {printed}");
+    }
+
+    #[test]
+    fn run_pretool_edit_guard_is_off_by_default() {
+        let repo = repo_with_tracked_module();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let printed = run_bash_guard_cfg(repo.path(), state_dir.path(), true, false, SPLICE);
         assert!(!is_edit_guard_deny(&printed), "got {printed}");
     }
 

@@ -43,6 +43,8 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // The scope-creep guard: a repo may switch it off, never on for an
     // operator who disabled it (`narrow_scope_guard_enabled`).
     "scope_guard.enabled",
+    // The opt-in shell edit guard: a repo may switch it off, never on.
+    "edit_guard.enabled",
     // A repository may request the narrower `mask`, never restore `keep` against operator policy. (#466)
     "obfuscate.email_domain",
     // `chat.model` is deliberately not `REPO_FORBIDDEN` (see [[Untrusted

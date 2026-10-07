@@ -98,8 +98,6 @@ stated detail -- names, spellings, messages, exit codes, formats -- against your
 hedging. Delete whatever it orphans and rename what no longer fits.
 - Keep tool output small: quiet flags, --stat/-n limits, ranged file reads, never re-print \
 output already shown.
-- Change files with the Edit tool after a ranged Read; never splice code through heredoc \
-scripts, `sed -i` or string replacement, which silently break escapes and indentation.
 - Think like QA: one focused test per behaviour change, including the unhappy path, failing \
 before the change and passing after it; none for a change that cannot alter behaviour. A speed \
 or cost change needs a before/after measurement taken the same way on the same input; drop and \
@@ -114,6 +112,10 @@ decide.
 pass, or a step was skipped, say so and show the output. Never call unverified work done. An \
 analysis finding cites code, a test or recorded data and is validated before reporting; \
 discard what cannot be confirmed rather than estimate it.";
+
+/// Worker/Single rule added to the adapter layer only while `[edit_guard]` is enabled.
+const WORKER_EDIT_TOOL_RULE: &str = "- Change files with the Edit tool after a ranged Read; never splice code through heredoc \
+scripts, `sed -i` or string replacement, which silently break escapes and indentation.";
 
 /// Shared role selection keeps composition, splice offsets and byte accounting consistent (#772).
 pub fn default_prompt_for(role: PromptRole) -> &'static str {
@@ -1575,6 +1577,15 @@ fn adapter_layer_for(
     role: PromptRole,
     cfg: &PromptConfig,
 ) -> Option<String> {
+    let worker_layer = |base: Option<&str>| {
+        if cfg.edit_guard {
+            return Some(match base {
+                Some(base) => format!("{base}\n{WORKER_EDIT_TOOL_RULE}"),
+                None => WORKER_EDIT_TOOL_RULE.to_string(),
+            });
+        }
+        base.map(str::to_string)
+    };
     match role {
         PromptRole::Orchestrator => {
             adapter
@@ -1585,9 +1596,9 @@ fn adapter_layer_for(
                 })
         }
         PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
-        PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
+        PromptRole::Worker => worker_layer(adapter.worker_system_prompt()),
         // Single is neither dispatched nor delegating, so no adapter role layer applies (#537).
-        PromptRole::Single => None,
+        PromptRole::Single => worker_layer(None),
     }
     .filter(|layer| !layer.trim().is_empty())
 }
@@ -3911,6 +3922,33 @@ mod tests {
             "the user's own text must survive: {}",
             merged.text
         );
+    }
+
+    #[test]
+    fn the_worker_edit_tool_rule_follows_the_edit_guard_toggle() {
+        let adapter = ClaudeAdapter::new(None);
+        let (_tmp, home, repo) = tree();
+        let worker_prompt = |edit_guard: bool| {
+            let cfg = PromptConfig {
+                edit_guard,
+                ..PromptConfig::default()
+            };
+            let composed = compose(
+                Some(&home),
+                &repo,
+                false,
+                &cfg,
+                PromptRole::Worker,
+                &[],
+                usize::MAX,
+                &super::super::screen::Thresholds::default(),
+            );
+            relayer_recomposed(&adapter, composed, None, PromptRole::Worker, &cfg)
+                .expect("composed")
+                .text
+        };
+        assert!(!worker_prompt(false).contains(WORKER_EDIT_TOOL_RULE));
+        assert!(worker_prompt(true).contains(WORKER_EDIT_TOOL_RULE));
     }
 
     #[test]

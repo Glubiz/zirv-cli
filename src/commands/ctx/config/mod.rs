@@ -81,6 +81,7 @@ pub struct CtxConfig {
     pub missing_tests_gate: MissingTestsGateConfig,
     pub subagent_stop_gate: SubagentStopGateConfig,
     pub scope_guard: ScopeGuardConfig,
+    pub edit_guard: EditGuardConfig,
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
@@ -392,6 +393,8 @@ impl CtxConfig {
             bool_at(take_nested(&mut merged, "subagent_stop_gate", "enabled"));
         // Lift before merge so repos cannot enable a scope guard the operator disabled.
         let home_scope_guard_enabled = bool_at(take_nested(&mut merged, "scope_guard", "enabled"));
+        // Lift before merge so repos cannot enable an edit guard the operator left off.
+        let home_edit_guard_enabled = bool_at(take_nested(&mut merged, "edit_guard", "enabled"));
         // Repo compaction advice may only become less eager (#312).
         let home_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut merged,
@@ -556,6 +559,8 @@ impl CtxConfig {
         ));
         let repo_scope_guard_enabled =
             bool_at(take_nested(&mut repo_layer, "scope_guard", "enabled"));
+        let repo_edit_guard_enabled =
+            bool_at(take_nested(&mut repo_layer, "edit_guard", "enabled"));
         let repo_compact_advisory_min_reclaim = integer_at(take_nested(
             &mut repo_layer,
             "compact_advisory",
@@ -925,6 +930,17 @@ impl CtxConfig {
             )),
         );
 
+        let default_edit_guard = EditGuardConfig::default();
+        insert_path(
+            &mut merged,
+            &["edit_guard", "enabled"],
+            toml::Value::Boolean(narrow_min(
+                home_edit_guard_enabled.unwrap_or(default_edit_guard.enabled),
+                repo_edit_guard_enabled,
+                true,
+            )),
+        );
+
         let default_compact_advisory = CompactAdvisoryConfig::default();
         let home_compact_advisory_min_reclaim_tokens = home_compact_advisory_min_reclaim
             .and_then(|v| u64::try_from(v).ok())
@@ -1253,6 +1269,7 @@ impl CtxConfig {
 
         // Copy write posture only after narrowing and env resolution so every prompt consumer sees the effective value.
         cfg.prompt.orchestrator_writes = cfg.supervise.orchestrator_writes;
+        cfg.prompt.edit_guard = cfg.edit_guard.enabled;
 
         if let Some(raw) = env("ZIRV_CTX_FALLBACK_ORDER") {
             cfg.fallback.order = split_csv_list(&raw);
@@ -3914,6 +3931,58 @@ mod tests {
         assert!(
             cfg.scope_guard.enabled,
             "ZIRV_CTX_SCOPE_GUARD_ENABLED must override the home layer"
+        );
+    }
+
+    /// `edit_guard` is opt-in: off by default, a repo layer cannot enable it,
+    /// and only the operator environment override turns it on.
+    #[test]
+    fn edit_guard_is_off_by_default_and_a_repo_layer_cannot_enable_it() {
+        let home_dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home_dir.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[edit_guard]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.edit_guard.enabled, "a repo may not enable edit_guard");
+
+        let env = env_map(&[("ZIRV_CTX_EDIT_GUARD_ENABLED", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(
+            cfg.edit_guard.enabled,
+            "the env override enables edit_guard"
+        );
+
+        std::fs::create_dir_all(home_dir.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home_dir.path().join(".zirv/ctx.toml"),
+            "[edit_guard]\nenabled = true\n",
+        )
+        .expect("write");
+
+        let bare_repo = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::load(bare_repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            cfg.edit_guard.enabled,
+            "a home layer enables edit_guard with no repo layer"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[edit_guard]\nenabled = false\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(
+            !cfg.edit_guard.enabled,
+            "a repo may disable an operator-enabled edit_guard"
         );
     }
 

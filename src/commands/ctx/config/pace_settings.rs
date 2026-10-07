@@ -368,6 +368,14 @@ impl Default for ScopeGuardConfig {
     }
 }
 
+/// Opt-in PreToolUse guard that denies a scripted rewrite of a tracked file once per command.
+/// Off by default; repos may only disable it.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditGuardConfig {
+    pub enabled: bool,
+}
+
 /// Opt-in local compiler diagnostics after edits; emit only bounded findings new since the session baseline (#308).
 /// Off by default because it spawns a process; repos may only disable, lower the count or shorten the timeout.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
