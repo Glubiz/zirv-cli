@@ -1,0 +1,165 @@
+Morning! Big one today, and I'd like you to do all of it in this one go. My flatmates and I want to use ledgerlite as a shared household ledger, so this is about people sharing money. This is one request with 20 numbered parts, all for the ledgerlite repo in the current directory. The parts share files (the store, the CLI, the new household module), so when you are done all 20 must work together, and every existing test must still pass. Each part's contract is exact: names, messages, formats and orderings below are what gets checked. Finish with a short summary of what you did per part.
+
+=== Part 1 of 20: store file, errors and format version ===
+
+Everything lives in the one `--store PATH` JSON file the transactions already live in, side by side under top-level keys: `transactions` (existing), `members`, `expenses`, `transfers`, `history`, and a new `version`. `store.save()` currently rewrites the whole file with only `{"transactions": [...]}`, which would wipe everything else the next time somebody runs `import` or `categorize`. Make saving transactions leave every other top-level key alone (and saving household data must leave the transactions alone too). `import` still replaces the transactions but nothing else.
+
+Error convention for every household command: a user error prints `error: <message>` to stderr, nothing to stdout, exits with status 2, and leaves the store file unchanged. (Messages are given in the parts below.)
+
+Store format version 2:
+
+- The file has a top-level `"version": 2`. EVERY write to the store file by ANY command (including `import` and `categorize`) stamps it.
+- `members` is a list of objects `{"name": NAME, "archived": false}`, in the order they were added. `expenses`, `transfers`, `history` and `transactions` keep the shapes described in the other parts.
+- A file with no `version` key (or `"version": 1`) is a version 1 file: same layout, except `members` is a list of plain name strings, and transfers or history entries written back then may lack keys that newer ones have. Version 1 files must keep working everywhere: any command that reads one behaves exactly as if it were a version 2 file with every member not archived. They are migrated when something next writes the file (the upgraded file keeps all its expenses, transfers and transactions untouched). A command that only reads must NOT rewrite the file. Change-history entries already in an old file must still undo correctly after the migration.
+- A file whose `version` is higher than 2 was written by something newer and must not be touched: every command that opens the store (the old transaction commands included) fails with `error: unsupported store version: N` (N from the file), exit status 2, file left unchanged.
+
+=== Part 2 of 20: members: add and list ===
+
+Put the household logic in a new module `ledgerlite/household.py` and wire a `member` command family into the CLI.
+
+- `python -m ledgerlite member add NAME --store PATH` adds a member and prints `Added member NAME`. Surrounding whitespace in NAME is stripped first. Names are unique case-insensitively: `error: member already exists: NAME` (NAME exactly as typed, after stripping), and an empty or all-whitespace name is `error: member name cannot be empty`. An archived member's name stays reserved (same `member already exists` error, any capitalisation).
+- `python -m ledgerlite member list --store PATH` prints one name per line, in the order they were added, archived members left out. `member list --all` prints everyone in the order they were added, with ` (archived)` appended to archived ones, e.g. `Cara (archived)`. If nobody is left to show it prints `No members.`
+
+=== Part 3 of 20: archiving members ===
+
+`python -m ledgerlite member archive NAME --store PATH` sets the member's `archived` flag and prints `Archived member NAME` (stored spelling). NAME matches case-insensitively. Errors, checked in this order: unknown name (`error: unknown member: NAME`, NAME as typed), already archived (`error: member already archived: NAME`), and a member whose balance isn't exactly zero (`error: member has a non-zero balance: NAME`).
+
+What archiving changes:
+
+- A new expense is only shared between the members who aren't archived: "everyone in the household" means the active members. An archived member can't be an expense's payer (on `expense add` or `expense edit --payer`), can't be named in `--split`, and can't be the sender or receiver of a new transfer: all of those are `error: member is archived: NAME` (stored spelling). For transfers that check comes right after the unknown-member and same-member checks and before the amount checks; for `expense add`/`edit` it comes right after the payer is looked up (and for `--split`, as each name is looked up).
+- `balance` leaves archived members out when their balance is zero, but if an archived member does have a non-zero balance (e.g. an old expense they took part in got edited) it still shows them. `settle suggest`, `settle apply` and the reports treat archived members like any other member.
+- Old expenses are never touched by archiving: editing an old expense's amount re-splits it between the same people as before, archived or not.
+
+=== Part 4 of 20: renaming members ===
+
+`python -m ledgerlite member rename OLD NEW --store PATH` renames a member and prints `Renamed member OLD to NEW` (OLD in its stored spelling, NEW with surrounding whitespace stripped).
+
+- OLD is matched case-insensitively; unknown is `error: unknown member: NAME`. NEW must follow the rules for a new member's name: not empty (`error: member name cannot be empty`) and unique: if it matches any OTHER member, archived ones included, it's `error: member already exists: NEW`. Renaming to a different capitalisation of the member's own name (`Ana` -> `ANA`) is fine. OLD checks come before NEW checks.
+- The new name shows up everywhere the old one was stored: the member entry (archived status unchanged, same position in the list), every expense's payer, weights and shares (keeping their order), and the entries of every transfer. Afterwards every command shows exactly the same numbers as before, just under the new name, and `account OLD` is now an unknown member.
+- It is a household change like the others: recorded in the history (label `member rename OLD NEW`, OLD as stored, NEW as stripped) and undoable. History entries that are already there are never rewritten, so they keep showing the old name.
+
+=== Part 5 of 20: expenses ===
+
+`python -m ledgerlite expense add --payer NAME --amount AMOUNT --desc TEXT [--date YYYY-MM-DD] --store PATH`
+
+- PAYER must be an existing member (case-insensitive; the stored spelling is used everywhere), otherwise `error: unknown member: NAME` (as typed).
+- AMOUNT is a money amount like `12.34` and must be positive: `error: invalid amount: TEXT` if it can't be read as a number, `error: amount must be positive` if it is zero or negative. (Decimal-place rule: part 9.)
+- `--date` defaults to today; a bad date is `error: invalid date: TEXT`.
+- Without `--split` the expense is split equally between all active members at the moment it is added (later joiners never get a share of an old expense). Work in whole cents. Each share is rounded down to a cent first, and the leftover cents are handed out one at a time, forward through the participants in participant order, wrapping from the last back to the first. Where it starts depends on the expense's id: for expense number N with P participants it starts at participant number `(N - 1) mod P` counting from 0. So expense 1 starts at the first participant, expense 2 at the second, and so on; with P=3, expense 4 starts at the first again. Expense 1 of 10.00 between Ana, Ben and Cara is Ana 3.34, Ben 3.33, Cara 3.33; expense 2 of the same amount is Ana 3.33, Ben 3.34, Cara 3.33. This rule applies to every expense, equal splits and `--split` ones alike, and to re-splits in `expense edit`. Stored shares of an expense are never recomputed later except by an edit of its amount.
+- Expense ids are 1, 2, 3, ... in the order added. It prints `Added expense ID: AMOUNT paid by PAYER` with AMOUNT to exactly two decimals, e.g. `Added expense 1: 30.00 paid by Ana`.
+
+Storage: a top-level `expenses` list, each expense an object with exactly these keys: `id` (int), `date` (`YYYY-MM-DD`), `payer` (stored member name), `amount` (integer cents), `description`, `weights` (object: participant name -> int; for an equal split everyone has weight 1) and `shares` (object: participant name -> integer cents, in participant order, summing to `amount`).
+
+=== Part 6 of 20: weighted splits ===
+
+`expense add` takes `--split NAME=WEIGHT,NAME=WEIGHT,...`:
+
+- Only the listed members take part, in the order they are listed (that is the participant order, not the order members were added). Each share is proportional to the member's weight (`--split Ana=1,Ben=2` gives Ben twice Ana's share). Weights are positive whole numbers; the payer doesn't have to take part. Rounding and leftover cents work exactly as in part 5.
+- Names match case-insensitively and are stored in their member spelling; `weights` and `shares` in storage use the participant order.
+- Errors: a name that isn't a member is `error: unknown member: NAME`; a malformed or non-positive weight, or anything else that isn't `NAME=WEIGHT` pairs, is `error: invalid split: TEXT` (TEXT the whole `--split` value as typed); the same member twice is `error: duplicate member in split: NAME`.
+
+=== Part 7 of 20: listing and showing expenses ===
+
+- `expense list` prints one line per expense in id order: `ID: DATE AMOUNT PAYER DESC`, e.g. `1: 2024-03-01 30.00 Ana groceries`, or `No expenses.` With `--payer NAME` only that member's expenses are printed, same format and order (NAME case-insensitive; unknown is `error: unknown member: NAME`; if that member paid nothing, `No expenses.`).
+- `expense show ID` prints `Expense ID: AMOUNT paid by PAYER on DATE (DESC)` and then one line per participant in stored order: `NAME: SHARE` (two decimals). Unknown id is `error: no such expense: ID`.
+
+=== Part 8 of 20: editing an expense ===
+
+`python -m ledgerlite expense edit ID [--amount AMOUNT] [--payer NAME] [--desc TEXT] [--date YYYY-MM-DD] --store PATH`
+
+- At least one of the four options is required, otherwise `error: nothing to edit`. Unknown id is `error: no such expense: ID`. Payer, amount and date are validated exactly like in `expense add` (same messages, plus the archived-payer rule); if anything is invalid the expense is left entirely unchanged.
+- Changing the amount re-splits it: same participants, same weights it was originally split with, leftover cents handled by the rule of part 5 for an expense of that id. Changing only payer, description or date leaves the shares alone.
+- It prints `Updated expense ID`, and every other command reflects the new numbers immediately.
+
+=== Part 9 of 20: amounts have at most two decimals ===
+
+An amount with more than two decimal places is rejected, never rounded or truncated: `error: amount has more than 2 decimal places: TEXT` (TEXT exactly as typed), exit 2, nothing written to the store and nothing recorded in the history. A value that is numerically a whole number of cents is fine however it is written: `10`, `10.5`, `10.50` and `10.500` are all fine (10.500 is 10.50). The check happens right after the text has been read as a number (so `abc` is still `invalid amount`) and before the "must be positive" check, so `0.001` reports the decimal-places error. This holds at EVERY place an amount is entered by the household commands (`expense add`, `expense edit`, `transfer add`, and anything else that takes one), with the existing messages and behaviour for valid amounts unchanged.
+
+=== Part 10 of 20: balance ===
+
+`python -m ledgerlite balance --store PATH` prints one line per member in the order they were added: `NAME: AMOUNT`, where AMOUNT is what the member has paid out for expenses minus the sum of their shares of all expenses, adjusted by settling transfers (part 12), with exactly two decimals. Paid more than their share = positive balance (the household owes them); paid less = negative, with a leading minus, e.g. `Ben: -10.00`. Nothing going on is `0.00`. With no members at all it prints `No members.` (archived members with zero balance are left out, part 3.) Keep the calculation in `household.py` as its own function, not in the CLI handler; other commands use the same numbers.
+
+=== Part 11 of 20: settle suggest ===
+
+`python -m ledgerlite settle suggest --store PATH` prints a short list of payments that would bring everybody back to zero, based on the same balances `balance` reports. It must not change the store. Greedy procedure:
+
+1. Among members who owe money (negative balance) take the one who owes the most; among those who are owed money take the one owed the most. Ties in either group go to whoever was added as a member first.
+2. The first pays the second the smaller of "what the debtor still owes" and "what the creditor is still owed". Print `PAYER pays RECEIVER AMOUNT` (two decimals), e.g. `Ben pays Ana 10.00`.
+3. Reduce both balances by that amount, drop anyone who reaches zero, repeat until nobody is left.
+
+Payments are printed in the order generated, one per line. If nobody owes anything: `Everyone is settled up.` The logic lives in `household.py`, not the CLI handler.
+
+=== Part 12 of 20: transfers ===
+
+`python -m ledgerlite transfer add --from NAME --to NAME --amount AMOUNT [--note TEXT] [--date YYYY-MM-DD] [--settles] --store PATH` records that FROM handed AMOUNT to TO and prints `Added transfer ID: AMOUNT FROM -> TO` (two decimals, stored spellings, e.g. `Added transfer 1: 10.00 Ben -> Ana`). Ids are 1, 2, 3, ... in the order added, separate from expense ids. Note defaults to empty, date to today. Validation, in this order: unknown member (`error: unknown member: NAME`, FROM checked before TO), FROM and TO the same member (`error: cannot transfer to the same member`), archived member (part 3), then amount and date with exactly the same rules and messages as `expense add`.
+
+A transfer is stored as a PAIR of entries written in the same save, never one without the other: a top-level `transfers` list, each item `{"id": int, "date": "YYYY-MM-DD", "note": str, "settles": bool, "entries": [{"member": FROM, "amount": -CENTS}, {"member": TO, "amount": CENTS}]}` (integer cents, debit entry first). `settles` is true only when `--settles` was given. Transfers stored without a `settles` key (older files) count as settling.
+
+Effect on balances: only a settling transfer counts. With `--settles` the sender's balance goes UP by the amount and the receiver's goes DOWN by the same amount. Without it the transfer is just recorded (still stored as its pair of entries, still in `transfer list` and `account`) and has no effect at all on `balance`, `settle suggest`, `settle apply`, or the `Sent`, `Received` and `Net` lines of `report member`.
+
+=== Part 13 of 20: transfer list and account ===
+
+- `transfer list` prints one line per transfer in id order: `ID: DATE AMOUNT FROM -> TO`, with ` (NOTE)` appended when the note isn't empty, and then ` [settles]` as the very last thing on the line for settling transfers, e.g. `1: 2024-03-02 10.00 Ben -> Ana (pizza) [settles]`. `No transfers.` if there are none.
+- `account NAME --store PATH` shows one member's side of the transfers (settling or not): one line per entry belonging to that member, in transfer id order, `TID: AMOUNT OTHER` where TID is `T` plus the transfer id, AMOUNT is the entry's signed amount with two decimals, OTHER the member on the other side, e.g. `T1: -10.00 Ana` for Ben and `T1: 10.00 Ben` for Ana. `No entries.` if none; unknown name is `error: unknown member: NAME`.
+
+=== Part 14 of 20: report member ===
+
+`python -m ledgerlite report member NAME --store PATH` prints exactly these six lines (money with two decimals, stored spelling, NAME case-insensitive):
+
+```
+Member: Ana
+Paid: 30.00
+Share: 10.00
+Sent: 0.00
+Received: 10.00
+Net: 20.00
+```
+
+`Paid` = total of the expenses this member paid; `Share` = total of their shares across all expenses; `Sent` / `Received` = totals of the SETTLING transfers they sent / received; `Net` = their balance, exactly what `balance` prints for them (the two must never disagree). Unknown name is `error: unknown member: NAME`.
+
+=== Part 15 of 20: report month ===
+
+`python -m ledgerlite report month YYYY-MM --store PATH` looks only at expenses whose `date` falls in that month and prints:
+
+```
+Month: 2024-03
+Ana: paid 30.00 share 10.00 net 20.00
+Ben: paid 0.00 share 10.00 net -10.00
+Cara: paid 0.00 share 10.00 net -10.00
+```
+
+One line per member in the order they were added; `paid` = what they paid out for expenses in that month, `share` = their shares of those expenses, `net` = paid minus share (two decimals, minus sign when negative). Transfers are not part of this report. Active members always appear (even with zeros); an archived member appears only if they paid or had a share in an expense of that month. If there are no expenses in that month at all it prints `No expenses in YYYY-MM.` (month as typed). A month that isn't a four-digit year, a dash and a month 01 to 12 is `error: invalid month: TEXT`.
+
+=== Part 16 of 20: settle apply ===
+
+`python -m ledgerlite settle apply [--date YYYY-MM-DD] --store PATH` works out the same payments `settle suggest` would print, in the same order, and records each as a settling transfer: exactly what `transfer add --from PAYER --to RECEIVER --amount AMOUNT --settles` would have stored, with note `settle apply` and the given date (default today; a bad date is `error: invalid date: TEXT` with nothing recorded). Ids continue after the existing transfers. Afterwards everybody's balance is zero, including an archived member who still owes or is owed something (archiving must not stop the payments being recorded). It prints `Settled N payments` (N = transfers recorded). If there is nothing to settle it prints `Everyone is settled up.`, records no transfers and no history entry. The whole run is ONE history entry (label `settle apply`), so a single `undo` removes all the transfers it recorded.
+
+=== Part 17 of 20: change history ===
+
+Every command that CHANGES household data appends one entry to a top-level `history` list in the store file, only when it succeeded (a command that fails records nothing). Read-only commands (`balance`, `settle suggest`, reports, `list`/`show`, `account`, `check`...) and the transaction commands (`import`, `categorize`, `list`, `summary`) record nothing. An entry has a sequence number `seq` (1, 2, 3, ..., never reused or reordered), a `label`, and whatever else you need to restore the household data (members, expenses, transfers) to exactly what it was before that change. Labels: `member add NAME` (stored spelling), `member archive NAME` (stored spelling), `member rename OLD NEW`, `expense add ID`, `expense edit ID`, `transfer add ID`, `settle apply`, and `undo #SEQ` (part 18). `python -m ledgerlite history --store PATH` prints one line per entry, oldest first: `SEQ: LABEL`, or `No history.` when empty. Anything that changes household data must be recorded this way.
+
+=== Part 18 of 20: undo ===
+
+`python -m ledgerlite undo --store PATH` undoes the most recent change that hasn't been undone yet: the household data goes back to exactly what it was before that change (so an id the undone change handed out gets handed out again next time) and it prints `Undid #SEQ: LABEL` with the undone entry's seq and label. Calling it again goes one change further back. If there is nothing left to undo it prints `Nothing to undo.` and exits 0. `undo` never touches the transactions that `import` put in the file. The history is append-only: undo must not delete or edit earlier entries; the undo itself is appended as a new entry labelled `undo #SEQ` (SEQ = seq of the entry it undid) and shows up in `history`. Undo entries themselves can't be undone, and an entry that has already been undone is skipped when looking for the next thing to undo.
+
+=== Part 19 of 20: check ===
+
+`python -m ledgerlite check --store PATH` is a sanity check that only READS: it never rewrites the file (not even to migrate an old version) and doesn't touch the history. It prints one line per problem: all expenses first, in stored order, then all transfers in stored order.
+
+For each expense, in this order:
+
+- `expense ID: shares total X.XX but amount is Y.YY` when the integer-cent shares don't add up to the amount (two decimals each);
+- `expense ID: unknown member NAME` for every name that isn't a member (archived members are members): payer first, then the `weights` names, then the `shares` names, each distinct unknown name reported once, in order of first appearance. Names compare exactly, capitalisation included.
+
+For each transfer, in this order:
+
+- `transfer ID: entries do not balance` when it doesn't have exactly two entries, or their amounts don't add up to zero;
+- `transfer ID: unknown member NAME`, same rules, over the entries' members in order.
+
+No problems: prints `ok` and exits 0. Problems: prints them and exits 1. A store that doesn't exist yet, or is empty, is `ok`. It works on version 1 files too, without rewriting them. Nothing the other commands do should ever produce a problem here.
+
+=== Part 20 of 20: code layout and scope ===
+
+Household logic (members, expenses, balances, settle, transfers, reports, history, check) lives in `ledgerlite/household.py`, not in CLI handlers. `cli.py` was a tidy 100-ish lines and must not become a wall of household argparse code: ALL the household commands (`member`, `expense`, `balance`, `settle`, `transfer`, `account`, `report`, `history`, `undo`, `check`) have both their argparse setup and their handler functions in a new module `ledgerlite/household_cli.py`. It exposes one function, `register(sub)`, taking the top-level subparsers object (what `parser.add_subparsers(dest="command", ...)` returns), adding every household subcommand to it, and returning a dict mapping each of those top-level command names to its handler (a callable taking the parsed `argparse` namespace and returning the exit status). `cli.py` keeps only the original `import` / `list` / `summary` / `categorize` commands, calls `register(sub)` when it builds the parser, and dispatches to the right handler, including the `error: ...` / exit 2 handling for household errors; none of the household command names or handler code is left in `cli.py`.
+
+Scope: the old transaction side of the app (`list` and its paging, the category rules, the CSV parsing) has a few things in it that look wrong or inconsistent. Yes, I know. Don't touch them: I have a separate plan for that code and it needs to behave exactly as it does now. Only household features today.

@@ -4,6 +4,7 @@ only (CONTRACT.md forbids pytest); synthetic transcript records in the shape
 Claude Code writes, no PTY, no billed commands."""
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -287,6 +288,8 @@ class PromptTests(unittest.TestCase):
                       if (p / "kind.txt").exists() and run_module.read_text(p / "kind.txt").strip() == "orch"]
         self.assertTrue(orch_tasks, "at least one kind=orch task must ship")
         for task_dir in orch_tasks:
+            if orch.has_own_hidden(task_dir):
+                continue  # self-contained task: covered by OwnHiddenTaskTests
             sources = orch.read_sources(task_dir)
             self.assertGreaterEqual(len(sources), 4, task_dir.name)
             self.assertEqual((task_dir / "prompt.txt").read_text(encoding="utf-8"),
@@ -297,6 +300,73 @@ class PromptTests(unittest.TestCase):
     def test_launch_prompt_prepends_the_noninteractive_note(self):
         self.assertTrue(orch.launch_prompt("X").startswith(run_module.NONINTERACTIVE_NOTE))
         self.assertTrue(orch.launch_prompt("X").endswith("X"))
+
+
+class OwnHiddenTaskTests(unittest.TestCase):
+    """An orch task that carries its own consolidated `hidden/` suite and
+    reference (o02, o03) instead of `sources.txt`."""
+
+    def _synthetic(self, root):
+        task_dir = root / "tasks" / "oX"
+        (task_dir / "hidden").mkdir(parents=True)
+        (task_dir / "hidden" / "test_x.py").write_text(
+            "import unittest\n\n\nclass T(unittest.TestCase):\n"
+            "    def test_a(self):\n        pass\n\n"
+            "    def test_b(self):\n        self.fail('nope')\n", encoding="utf-8")
+        repo = root / "repo"
+        (repo / "tests").mkdir(parents=True)
+        (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (repo / "tests" / "test_v.py").write_text(
+            "import unittest\n\n\nclass V(unittest.TestCase):\n    def test_v(self):\n        pass\n",
+            encoding="utf-8")
+        return task_dir, repo
+
+    def test_read_sources_is_empty_without_sources_txt(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            task_dir, _repo = self._synthetic(root)
+            self.assertEqual(orch.read_sources(task_dir), [])
+            self.assertTrue(orch.has_own_hidden(task_dir))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_grade_sources_runs_the_tasks_own_hidden_suite(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            task_dir, repo = self._synthetic(root)
+            g = orch.grade_sources(root, task_dir, repo, repo / "NONE.txt")
+            self.assertEqual((g["passed"], g["total"]), (1, 2))
+            self.assertEqual(g["score"], 0.5)
+            self.assertEqual(g["per_source"], {"oX": 0.5})
+            self.assertTrue(g["visible_ok"])
+            self.assertFalse((repo / "tests_hidden").exists(), "hidden tests must not stay in the repo")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_source_based_task_is_not_own_hidden(self):
+        self.assertFalse(orch.has_own_hidden(BENCH / "tasks" / "o01_ledger_suite"))
+
+    def test_committed_own_hidden_tasks_are_complete(self):
+        found = 0
+        for task_dir in sorted((BENCH / "tasks").iterdir()):
+            if not (task_dir / "kind.txt").exists() or \
+                    run_module.read_text(task_dir / "kind.txt").strip() != orch.ORCH_KIND:
+                continue
+            if not orch.has_own_hidden(task_dir):
+                continue
+            found += 1
+            self.assertEqual(orch.read_sources(task_dir), [], task_dir.name)
+            self.assertTrue((task_dir / "reference" / "final.patch").exists(), task_dir.name)
+            tests = list((task_dir / "hidden").glob("test*.py"))
+            self.assertGreaterEqual(len(tests), 10, task_dir.name)
+            prompt = (task_dir / "prompt.txt").read_text(encoding="utf-8")
+            n = len(re.findall(r"^=== Part \d+ of \d+", prompt, re.MULTILINE))
+            self.assertGreaterEqual(n, 18, task_dir.name)
+            self.assertEqual(re.findall(r"^=== Part (\d+) of (\d+)", prompt, re.MULTILINE),
+                             [(str(i), str(n)) for i in range(1, n + 1)], task_dir.name)
+            # one request: no step numbers or history leaking from the source chain
+            self.assertNotRegex(prompt, r"(?i)\bstep \d+\b", task_dir.name)
+        self.assertGreaterEqual(found, 2, "o02 and o03 must ship")
 
 
 class ArgvEnvTests(unittest.TestCase):

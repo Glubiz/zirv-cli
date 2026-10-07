@@ -142,7 +142,7 @@ numbers. A run with no transcripts scores zero on all of them.
 | lane | tasks | what it measures | how it runs |
 |---|---|---|---|
 | `long` | `t24_long_haul`, `t24b_long_haul` (kind=chain) | zirv vs vanilla + superpowers over a long multi-step session -- the headline | `run.py` |
-| `orch` | `o01_ledger_suite` | zirv-wrapped vs vanilla interactive Opus seat on one long multi-feature request | `orch.py` (see "Orchestration lane") |
+| `orch` | `o01_ledger_suite`, `o02_household_suite`, `o03_tax_suite` | zirv-wrapped vs vanilla interactive Opus seat on one long multi-feature request | `orch.py` (see "Orchestration lane") |
 | `jev` | `t13`, `t15`, `t17`-`t22` | ONLY the Jev proxy (`zirv-jev-full` / `zirv-proxy` vs vanilla + superpowers); never in the zirv-vs-vanilla headline | `run.py` |
 | `autoresearch` | `t23_afternoon`, `t25_sticky_notes` | autoresearch screening/validation chains; too short to count as a `long` task | `run.py --trial` |
 
@@ -413,6 +413,12 @@ graders, judge, env and `cond_env_for`/`isolate_state`.
   the sources' reference solutions re-based so they stack;
   `python verify_orch_reference.py` proves reference = 1.0 on all 125 hidden
   tests and pristine = 0.
+- Large tasks: `o02_household_suite` and `o03_tax_suite` are the same lane at about 4x the size
+  (20 numbered parts each, sized so one Opus seat needs 25-40 minutes alone, where o01 takes about 6
+  and delegation cannot pay off). They carry their OWN `hidden/` suite and `reference/final.patch`
+  instead of `sources.txt` (`orch.has_own_hidden`; `grade_sources` then grades that one suite and
+  reports it as a single source named after the task); see `tasks/README.md`. Raise `--timeout-min`
+  (e.g. 90) for them.
 - Arms (`--conds`, default `vanilla,zirv-nojev`; also `zirv-jev-full`):
   `vanilla` = `claude --model <seat> --setting-sources project,local
   --permission-mode bypassPermissions --allowedTools=... --plugin-dir <superpowers>`

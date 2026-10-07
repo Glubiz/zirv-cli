@@ -380,6 +380,8 @@ class Screen:
 # --------------------------------------------------------------------------
 def read_sources(task_dir):
     p = Path(task_dir) / "sources.txt"
+    if not p.exists():  # a self-contained task (own hidden/ suite) has no sources
+        return []
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
 
@@ -404,10 +406,26 @@ def launch_prompt(task_prompt):
     return H.NONINTERACTIVE_NOTE + task_prompt
 
 
+def has_own_hidden(task_dir):
+    """True for a self-contained orch task: it ships its own consolidated `hidden/`
+    suite (flat *.py files, unittest-discoverable as a package) instead of reusing
+    other tasks' graders through `sources.txt`."""
+    return (Path(task_dir) / "hidden").is_dir()
+
+
 def grade_sources(bench_root, task_dir, repo, result_txt):
-    """Run every source task's own grade.py against `repo`. Returns
-    {score (mean of per-source scores), per_source {id: score}, passed, total,
-    visible_ok, details}."""
+    """Grade `repo` for an orch task. Returns {score, per_source {id: score},
+    passed, total, visible_ok, details}.
+
+    A task with its own `hidden/` dir is graded on that single suite (copied in,
+    run with the visible suite, removed again: `run.grade_step_tests`), reported as
+    one source named after the task. Otherwise every source task's own grade.py is
+    run and the score is the mean of their scores."""
+    if has_own_hidden(task_dir):
+        g = H.grade_step_tests(repo, Path(task_dir) / "hidden")
+        return {"score": g["score"], "per_source": {Path(task_dir).name: g["score"]},
+                "passed": g["passed"], "total": g["total"], "visible_ok": g["visible_ok"],
+                "details": g["details"]}
     per, passed, total, visible, details = {}, 0, 0, True, []
     for src in read_sources(task_dir):
         grade_py = Path(bench_root) / "tasks" / src / "grade.py"

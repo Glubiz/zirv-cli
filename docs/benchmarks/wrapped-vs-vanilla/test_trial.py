@@ -443,7 +443,7 @@ class CorpusTomlTests(unittest.TestCase):
         for t in corpus["task"]:
             lanes.setdefault(t["lane"], []).append(t["id"])
         self.assertEqual(sorted(lanes["long"]), ["t24_long_haul", "t24b_long_haul", "t26_household", "t27_tax_season"])
-        self.assertEqual(lanes["orch"], ["o01_ledger_suite"])
+        self.assertEqual(sorted(lanes["orch"]), ["o01_ledger_suite", "o02_household_suite", "o03_tax_suite"])
         self.assertEqual(sorted(lanes["jev"]), ["t13_recurring", "t15_reports", "t17_schema_migration",
                                                 "t18_ledger_layer", "t19_goals_saga", "t20_audit_log",
                                                 "t21_search", "t22_envelopes"])

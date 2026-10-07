@@ -1,6 +1,6 @@
 # ledgerlite benchmark tasks
 
-Eleven tasks plus the orchestration task `o01_ledger_suite` against the `ledgerlite` template (see `../template/`,
+Eleven tasks plus the orchestration tasks `o01_ledger_suite`, `o02_household_suite` and `o03_tax_suite` against the `ledgerlite` template (see `../template/`,
 which is FROZEN). The short tasks t01-t12, t14 and t16 were dropped from the benchmark (their recorded
 results stay under `../results/`); what remains is t13/t15 (LARGE), t17-t21 (XL) and t22 (EPIC), which the
 corpus puts in the `jev` lane (Jev-proxy measurement only, see `../README.md` "Lanes"), the chain tasks t23, t24,
@@ -335,3 +335,34 @@ template's one baseline-red test; the previous step's patch fails step N's own
 tests) and `python run.py --check-graders --tasks t26_household` (pristine
 scores in the last column). Steps 12 and 22 are judge-graded through
 `rubric/step_NN.md`.
+
+## o02_household_suite and o03_tax_suite: large orchestration tasks
+
+`o01_ledger_suite` (5 parts) is small enough that one Opus seat finishes it alone in about 6 minutes, so
+delegating to subagents cannot pay off. `o02_household_suite` and `o03_tax_suite` are the same lane
+(`kind=orch`, `lane=orch`, split `orch`, driven by `orch.py`) at about 4x the size: ONE request of 20
+numbered parts, written to describe the END state of a long chain, for a single seat expected to need
+25-40 minutes.
+
+- `o02_household_suite` = the final feature set of `t26_household` (members incl. archive/rename, weighted
+  rotating-remainder expenses and edit, amounts <= 2 decimals, balance, settle suggest/apply, settling vs
+  non-settling transfers, report member/month, append-only history and undo, store format v2 with
+  migration, `check`, the `household_cli.register(sub)` split). 184 hidden tests in 20 files.
+- `o03_tax_suite` = the final feature set of `t27_tax_season` (user rules with newest-wins ties and
+  `rules explain`, merchant normalisation, one-to-one `merge`, cent-exact `split`/`amend`, tax flags,
+  April fiscal-year `tax summary`/`tax export`, `doctor` incl. missing-receipt, receipts, `search`,
+  `backup`/`restore`, `CliError`). 134 hidden tests in 19 files (the shared `_h.py` helper is stored once).
+
+Each prompt applies every change of plan in its final form (no "first X, later Y"), states every
+requirement a hidden test checks, mentions no step numbers, and leaves out the judge-only steps (docs,
+decision logs, README, final summary). Layout: `prompt.txt` (hand-written, not generated), `kind.txt`,
+`hidden/` (flat, the union of the chain's step suites), `reference/final.patch` (the chain's final
+cumulative patch, copied verbatim). Superseded tests are dropped: for o03 the two files in t27's
+`SUPERSEDED` map (`test_step1_tiebreak.py`, `test_step6_tax_summary.py`); for o02 the seven methods whose
+names carry `superseded_by_13` / `superseded_by_16` (t26's convention), stripped from their files.
+
+Grading (`orch.grade_sources`): the single `hidden/` suite plus the visible suite (baseline-red test
+tolerated), reported as one source named after the task. `python verify_orch_reference.py` proves the
+reference scores 1.0 and the pristine template stays under 0.15 (not 0: the kept regression and
+scope-trap tests, such as t26's untouched-old-code and refactor checks, pass on untouched code by design;
+measured 0.038 for o02, 0.042 for o03).

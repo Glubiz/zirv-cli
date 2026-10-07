@@ -3,7 +3,8 @@
 # `lane` says what a task is FOR (README.md "Lanes"):
 #   long          kind=chain long-session tasks: the zirv-vs-vanilla headline
 #                 (t24_long_haul, t24b_long_haul, t26_household, t27_tax_season).
-#   orch          interactive orchestration (orch.py): o01_ledger_suite.
+#   orch          interactive orchestration (orch.py): o01_ledger_suite, o02_household_suite,
+#                 o03_tax_suite.
 #   jev           short tasks used ONLY to measure the Jev proxy (zirv-jev-full /
 #                 zirv-proxy vs vanilla+superpowers), never in the zirv-vs-vanilla
 #                 headline (t13, t15, t17-t22).
@@ -17,8 +18,8 @@
 # (t17, t18, t19, t25, t26) and `holdout` (t20, t21, t22, t24, t24b, t27) cover several
 # `class` values; the `long_session` chain tasks are t23 (dev), t25/t26 (validation),
 # t24/t24b/t27 (holdout) so a `[stages.*] classes = ["long_session"]` filter still has
-# something on every stage. The `orch` split holds the orchestration task alone: it
-# recombines the hidden suites of tasks that sit in validation/holdout, so it must
+# something on every stage. The `orch` split holds the orchestration tasks alone: they
+# recombine the hidden suites of tasks that sit in validation/holdout, so it must
 # not be screened or held out beside them. See CONTRACT.md's "Task corpus and
 # splits" section for the rule this file follows.
 #
@@ -147,6 +148,25 @@ lane = "long"
 # t20, t22, t21, t19), so it reuses their hidden suites; own split and class.
 [[task]]
 id = "o01_ledger_suite"
+family = "ledgerlite"
+class = "orchestration"
+split = "orch"
+kind = "orch"
+lane = "orch"
+
+# o02/o03: LARGE single-request orchestration tasks (about 20 features each). They carry
+# their own consolidated hidden suite (the FINAL feature set of t26_household / t27_tax_season,
+# superseded tests dropped) and reference, so they sit in the `orch` split with o01.
+[[task]]
+id = "o02_household_suite"
+family = "ledgerlite"
+class = "orchestration"
+split = "orch"
+kind = "orch"
+lane = "orch"
+
+[[task]]
+id = "o03_tax_suite"
 family = "ledgerlite"
 class = "orchestration"
 split = "orch"

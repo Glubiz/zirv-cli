@@ -1,0 +1,154 @@
+Morning! Big day ahead and I'd like you to do all of it in this one go. Tax season is coming and my ledger is a mess, so this is a pile of cleanup and bookkeeping work on ledgerlite. This is one request with 20 numbered parts, all for the ledgerlite repo in the current directory. The parts share files (the store, the CLI, the transaction model, the categorisation code), so when you are done all 20 must work together, and every existing test must still pass. Each part's contract is exact: names, messages, formats and orderings below are what gets checked. Finish with a short summary of what you did per part.
+
+Conventions for everything below: user errors print `error: <message>` to stderr, print nothing to stdout, exit with status 2 and leave the store file untouched, unless a part says otherwise. All commands take `--store PATH` (the ledger JSON file); a store file that doesn't exist yet behaves as an empty ledger.
+
+=== Part 1 of 20: one store file, several kinds of data ===
+
+I'll be keeping more kinds of data in the one ledger JSON file, so `store.save()` (which currently rewrites the whole document with only `transactions`) must never wipe out any other top-level key already in the file (rules, and other things), and saving other keys must never wipe the transactions. `import` still replaces the TRANSACTIONS with the new file's rows, but everything else in the store survives it.
+
+`Transaction` gets these new fields, each read and written by the JSON store under the same name, and old store files without the key must still load with the default: `raw_payee: str = ""`, `splits` (a list, empty = not split), `deductible: bool = False`, and `receipt` (`None`, or a dict `{"path": ..., "sha256": ...}`; stored as null when there is none). Every command that rewrites the store (split, tax mark, normalize, amend, merge, ...) must keep all of these fields as they were.
+
+=== Part 2 of 20: my own categorisation rules ===
+
+Add a module `ledgerlite/rulebook.py` for user rules, stored under a top-level `"rules"` key as a list of objects with `id`, `pattern`, `category` and `priority`.
+
+- `python -m ledgerlite rules add --pattern P --category C [--priority N] --store PATH` adds a rule (priority an int, default 0) and prints `Added rule ID: P -> C (priority N)`. Ids are 1, 2, 3... (one more than the highest existing id). An empty or whitespace-only pattern is `error: pattern must not be empty`.
+- `python -m ledgerlite rules list --store PATH` prints one line per rule in id order, `ID: P -> C (priority N)`, or `No rules.` when there are none (also when the store file doesn't exist yet).
+
+Matching: a rule matches a transaction when its pattern appears, case-insensitively, anywhere in the payee or the memo. When several of my rules match one transaction, the winner is the one with the highest priority; if priorities tie, the MOST RECENTLY added rule wins (the highest id), regardless of how long the patterns are. My rules always beat the built-in `DEFAULT_RULES`, whatever their priorities; the built-ins are only consulted when no user rule matches.
+
+This applies everywhere rules get applied: `categorize` (same `Re-categorized X of Y transactions` output as today), `import` (still only touching rows that arrive without a category; read the user rules from the `--store` file before it gets overwritten, if the file exists) and `merge` (part 7).
+
+=== Part 3 of 20: rules explain ===
+
+`python -m ledgerlite rules explain TEXT --store PATH` treats TEXT as a payee (with an empty memo) and shows which of MY rules (not the built-in defaults) match it, best first, in exactly the order the rule engine picks a winner: the first line is `winner: ` followed by the rule written the way `rules list` writes it, and every other matching rule follows on its own line as `also: ` plus the rule, in descending order of preference. If none of my rules match, print `No user rule matches`. Matching is the same as when categorising. It never modifies the store, and the winner it names is the one `categorize` would actually apply.
+
+=== Part 4 of 20: clean merchant names ===
+
+My statements are full of noise (`WHOLE FOODS MARKET #221`, `LYFT RIDE 001`, `ALDI 2044`). Add `ledgerlite/merchants.py` with `normalize_payee(raw: str) -> str`. The canonical form:
+
+1. collapse any run of whitespace to a single space and trim the ends;
+2. drop every token that is `#` followed only by digits (`#221`);
+3. then, if more than one token is left and the LAST token is made only of digits and is at least 3 digits long, drop it too (`LYFT RIDE 001` -> `LYFT RIDE`, but `SHELL 12` stays and so does `T-1234`);
+4. keep the original letter case;
+5. if that leaves nothing at all (e.g. the payee was just `#55`), return the whitespace-collapsed input unchanged.
+
+`import` normalises every row's payee. When normalisation actually changes the payee, `payee` holds the clean name and `raw_payee` holds the original statement text; when it doesn't change, `raw_payee` stays `""`. Normalise BEFORE categorising, so categorisation sees the clean payee.
+
+=== Part 5 of 20: normalize command ===
+
+`python -m ledgerlite normalize --store PATH` applies the same normalisation to the transactions already in the store and prints `Normalized N payees`, N being how many transactions' payee changed. Running it twice is safe (the second run says `Normalized 0 payees`), and if a transaction already has a `raw_payee`, that original text is kept rather than overwritten with the intermediate name.
+
+=== Part 6 of 20: merge a statement without duplicates ===
+
+`python -m ledgerlite merge CSV_PATH --store PATH [--window DAYS]` reads the CSV exactly like `import` does (same payee normalisation, same categorisation with my rules and the built-ins), but instead of replacing the ledger it ADDS the new rows to the transactions already in `--store` (a missing file starts a fresh ledger). New rows get ids continuing after the highest id already in the store (an empty or new store starts at 1), in CSV order.
+
+An incoming row is a DUPLICATE, and is skipped, when the ledger already holds a transaction with the same payee after normalisation (compared case-insensitively, normalising the stored transaction's payee too, since old rows may still carry noisy statement text), exactly the same signed amount (a refund of the same size is NOT a duplicate of the charge), and a date within `--window` days of the incoming row's date, either side, inclusive. The window defaults to 2 days; `--window 0` means same date only. A negative window is `error: window must be >= 0`, touching nothing.
+
+Print `Merged A new transactions, skipped D duplicates` (always that wording, even for 1): A rows added, D skipped. Everything else in the store (rules etc.) stays untouched. Put the duplicate check in its own module `ledgerlite/dedupe.py`, and share whatever import and merge have in common instead of copying it.
+
+=== Part 7 of 20: merge matches one-to-one ===
+
+An existing transaction may cancel out only ONE incoming row. Go through the incoming rows in file order; each is matched against the existing (already-in-the-ledger) transactions that fit the duplicate rules of part 6 and that have NOT already been matched by an earlier row of this same file. If several unmatched existing transactions fit, take the one whose date is closest to the incoming row's date, and if two are equally close, the one with the lower id. A matched row is skipped as a duplicate; a row with no unmatched partner left is added as new. Rows from the same file never match each other (two identical rows are both new if the ledger has nothing like them); only transactions that were in the ledger before this merge can absorb a row. So one coffee in the ledger plus two identical ones in the file means one duplicate skipped and one new coffee added, and merging the exact same file a second time adds nothing. Output wording is as in part 6.
+
+=== Part 8 of 20: split a transaction across categories ===
+
+Add `ledgerlite/splits.py` and two commands.
+
+`python -m ledgerlite split ID --part CATEGORY=PERCENT [--part ...] --store PATH` splits transaction ID. Percentages may be decimals (`33.33`) and must add up to exactly 100; at least two `--part` options are required. Parts are kept in the order given. On success print `Split transaction ID into N parts`. Errors (stderr, exit 2, store untouched): `need at least two --part options`, `percentages must sum to 100`, `bad --part 'TEXT' (expected CATEGORY=PERCENT)` (for a malformed or non-positive part), and `no transaction with id N`. Splitting an already-split transaction replaces its old split.
+
+`python -m ledgerlite split-show ID --store PATH` prints one line per part, `CATEGORY: AMOUNT` (2 decimal places, with the transaction's sign), in the stored order. For a transaction that isn't split it prints `Transaction ID is not split` (exit 0). Unknown id is the same `no transaction with id N` error.
+
+The money: each part's amount is a whole number of cents and the parts add up to the transaction's amount EXACTLY. Each part gets floor(|amount| in cents x percent / 100) cents; the leftover cents (fewer than there are parts) are handed out one cent each to the FIRST parts, in the order given. All parts carry the transaction's sign. Example: -100.01 split 50/50 is -50.01 and -50.00; -10.01 split 33.33/33.33/33.34 is -3.34, -3.34, -3.33.
+
+Storage: a split transaction gets a `"splits"` list of objects `{"category": ..., "percent": ..., "amount": ...}` in part order, all three values strings (`percent` exactly as typed, `amount` like `"-50.01"`); unsplit transactions have an empty list. The transaction's own `category` and `amount` stay exactly as they were.
+
+=== Part 9 of 20: amend an amount ===
+
+`python -m ledgerlite amend ID --amount N --store PATH` sets transaction ID's amount to N (signed, same formats the CSV import accepts) and prints `Amended transaction ID: OLD -> NEW`, both to 2 decimal places, e.g. `Amended transaction 2: -10.00 -> -12.50`. Nothing else about the transaction changes (payee, category, tax flag, receipt...). Errors: `error: no transaction with id N`, and `error: invalid amount 'TEXT'` when N can't be parsed. If the transaction is split, its split follows the new amount: same categories and percentages, the new amount re-divided between the parts by the same cent rule as part 8, so the parts still add up exactly to the new amount.
+
+=== Part 10 of 20: tax-deductible flags ===
+
+- `python -m ledgerlite tax mark ID [ID ...] --store PATH` sets the `deductible` flag on those transactions and prints `Marked N transactions as tax-deductible`, N = the number of DISTINCT ids given (marking one that's already flagged is harmless and still counts). `tax unmark ID [ID ...]` clears the flag and prints `Unmarked N transactions`. If any id doesn't exist: `error: no transaction with id N`, and nothing at all is changed (not even the valid ids).
+- `python -m ledgerlite tax list --store PATH` prints the flagged transactions in id order, one per line: id, ISO date, amount (as stored, e.g. `-100.00`) and payee, separated by single spaces. If nothing is flagged: `No tax-deductible transactions.`
+
+Splitting, normalising and the other commands leave the flag alone.
+
+=== Part 11 of 20: tax summary ===
+
+`python -m ledgerlite tax summary YEAR --store PATH [--calendar]` covers flagged tax-deductible transactions in the fiscal year YEAR: it starts on 1 April of YEAR and ends 31 March of YEAR+1, both days included (`tax summary 2024` is 2024-04-01 to 2025-03-31). With `--calendar` it covers 1 January to 31 December of YEAR instead. Only money going OUT counts (negative amounts, shown as positive numbers; positive amounts on a flagged transaction are ignored, not netted).
+
+Print one line per category, `CATEGORY: AMOUNT` (2 decimals), ordered by amount, largest first, categories with the same amount ordered by name, then a final `TOTAL: AMOUNT` line. Transactions without a category are grouped under `uncategorized`. If nothing qualifies, print just `TOTAL: 0.00`. A split transaction counts through its parts: each part's category and its own (cent-exact) amount, instead of the transaction's own category, so the totals are exact to the cent. Put the logic in a new `ledgerlite/taxes.py`, not in `cli.py`.
+
+=== Part 12 of 20: tax export ===
+
+`python -m ledgerlite tax export YEAR --format json|markdown --out FILE --store PATH [--calendar]` writes the same tax summary `tax summary` prints (same period rules, same figures, same category order) to FILE and prints `Wrote tax summary for YEAR to FILE`. `--format` is required and must be exactly `json` or `markdown`.
+
+JSON: an object with `year` (a number), `start` and `end` (ISO dates of the period), `categories` (a list of `{"category": ..., "amount": ...}` objects in the on-screen order) and `total`, every amount a string with exactly 2 decimal places, pretty-printed with an indent of 2 and a trailing newline.
+
+Markdown, exactly this shape (one trailing newline):
+
+    # Tax summary YEAR
+
+    Period: START to END
+
+    | Category | Amount |
+    |---|---|
+    | CATEGORY | AMOUNT |
+    | **Total** | TOTAL |
+
+with one `| CATEGORY | AMOUNT |` row per category, amounts to 2 decimals, START/END ISO dates. `tax summary` and the export are fed by the same code, never a second copy of the summary logic, so they can never disagree.
+
+=== Part 13 of 20: doctor ===
+
+`python -m ledgerlite doctor --store PATH` (logic in a new `ledgerlite/doctor.py`) reads the ledger, never modifies it, and reports:
+
+- `duplicate-id`: two or more transactions share an id (once per duplicated id, not once per row);
+- `split-mismatch`: a split transaction whose parts' amounts don't add up exactly to the transaction's amount;
+- `uncategorized-deductible`: a transaction flagged tax-deductible that has no category and isn't split (a split one is fine, its parts carry the categories);
+- `missing-receipt`: a transaction flagged tax-deductible, with no receipt attached, whose amount is 75.00 or more in absolute value (75.00 itself counts, 74.99 doesn't). A split transaction is judged by its whole amount, and the sign doesn't matter.
+
+Output: one line per problem, `CODE id=N`, sorted by id and then by code (alphabetically); then a last line `N issues found` (always that wording, even for 1). No problems: just `No issues found`. Exit code 0 when clean, 1 when it found anything.
+
+=== Part 14 of 20: receipts ===
+
+I don't want the ledger swallowing PDFs, so just record WHERE each receipt lives plus a checksum. The `receipt` field is `{"path": ..., "sha256": ...}` (path exactly as given on the command line, sha256 the lowercase hex digest of the file's bytes); never put the file's contents in the store.
+
+- `python -m ledgerlite receipt attach ID PATH --store PATH` records the receipt and prints `Attached receipt to transaction ID`. Attaching again replaces the old one. Errors: `error: no such file: PATH` and `error: no transaction with id N`.
+- `receipt show ID` prints `path=PATH sha256=HEX`, or `No receipt for transaction ID` (exit 0) when there isn't one; unknown id is the usual error.
+- `receipt verify` re-checks every transaction that has a receipt, in id order, one line each: `OK id=N` if the file is there and still matches the checksum, `MISSING id=N` if the file is gone, `MISMATCH id=N` if it is there but its checksum changed. Exit 1 if any line wasn't OK, else 0. If no transaction has a receipt print `No receipts attached.` and exit 0.
+
+Put the file/checksum logic in `ledgerlite/receipts.py`. The other commands keep the receipt when they rewrite the store.
+
+=== Part 15 of 20: search ===
+
+`python -m ledgerlite search QUERY --store PATH`, where QUERY is ONE string made of terms separated by whitespace; shell-style quotes work inside it, so `payee:"whole foods"` is a single term. A transaction is a hit only if it satisfies EVERY term. Terms:
+
+- `payee:TEXT`: TEXT appears (case-insensitive) in the transaction's payee as a clean merchant name, i.e. the same cleaned-up form the duplicate detection compares, not the raw statement noise;
+- `category:NAME`: the category equals NAME (case-insensitive, whole name, not a substring); for a split transaction a match on ANY of its parts' categories counts too;
+- `year:YYYY`: dated in that calendar year;
+- `tax:yes` / `tax:no`: the tax-deductible flag;
+- `amount>N`, `amount<N`, `amount>=N`, `amount<=N`: compare the ABSOLUTE value of the amount (so `amount>40` finds a -45.67 expense and a 2500.00 paycheque alike);
+- a bare word (no colon): the word appears case-insensitively in the payee or the memo.
+
+Print one line per hit in the same row format `tax list` uses (id, date, amount, payee), ordered by date and then id, followed by a final line `N matches` (always that wording, even for 1; `0 matches` for none; an empty query matches everything). A term with an unknown field (`colour:red`) is `error: unknown search term 'colour:red'`; a bad value (`tax:maybe`, `year:abc`, `amount>lots`) is `error: bad value in search term 'TERM'`; both go to stderr with exit 2 and nothing on stdout. Search never modifies the store. Put the parser in a new `ledgerlite/query.py`.
+
+=== Part 16 of 20: backup ===
+
+Logic in a new `ledgerlite/backup.py`. `python -m ledgerlite backup --store PATH --out FILE` copies the store file to FILE byte for byte (everything in the store, all top-level keys, not just transactions), and next to it writes a checksum file named FILE plus `.sha256` (e.g. `backup.json.sha256`) holding the lowercase SHA-256 hex digest of FILE's bytes followed by a newline. Print `Backed up N transactions to FILE`, N = the number of transactions in the store. If the store file doesn't exist: `error: no such file: PATH`, exit 2, nothing written.
+
+=== Part 17 of 20: restore ===
+
+`python -m ledgerlite restore FILE --store PATH` replaces the store with the backup, but only after the integrity check: FILE's own SHA-256 must equal the digest in the checksum file (compare ignoring case and surrounding whitespace). It prints `Restored N transactions into PATH`. If FILE doesn't exist: `error: no such file: FILE`. If the checksum file is missing: `error: missing checksum file FILE.sha256` (with the real path). If the digest doesn't match: `error: backup integrity check failed`. Every error exits 2 and leaves the current store completely untouched (the integrity check happens BEFORE anything is written). The store file is created if it didn't exist.
+
+=== Part 18 of 20: one place for CLI errors ===
+
+Add `ledgerlite/errors.py` with a `CliError(Exception)` class (constructed with just the message; `str()` of it is the message). Handlers `raise CliError("...")` for every user-facing failure instead of printing and returning 2 themselves, and `main()` is the one place that catches `CliError`, prints `error: <message>` to stderr and returns 2. This is also how the new commands report their errors. Every command, flag, output line, error message and exit code of the pre-existing commands (`import`, `list`, `summary`, `categorize`) behaves exactly as before.
+
+=== Part 19 of 20: keep wiring consistent ===
+
+Wire every new command into the CLI (`rules`, `normalize`, `merge`, `split`, `split-show`, `amend`, `tax`, `doctor`, `receipt`, `search`, `backup`, `restore`) so that `python -m ledgerlite ...` and `ledgerlite.cli.main([...])` both work for all of them, put each command's logic in the module named in its part rather than in `cli.py`, and make `import`, `merge` and `categorize` all use the same single categorisation path (user rules first, then the built-ins).
+
+=== Part 20 of 20: leave the other orderings alone ===
+
+Only the commands described above change. In particular, the ordering rule of part 11 (biggest first) applies to `tax summary` and `tax export` ONLY. Everything else keeps its current ordering exactly: `summary` stays alphabetical by category with its existing `Category Total Share` header and format, `rules list` stays in id order, `tax list` stays in id order, `split-show` keeps the stored part order, and `list` and the other pre-existing commands behave as they do now.
